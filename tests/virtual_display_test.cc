@@ -438,6 +438,34 @@ std::string read_all(const std::filesystem::path& path) {
                        std::istreambuf_iterator<char>());
 }
 
+bool set_protected_dacl(const std::filesystem::path& path, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor,
+                                                             nullptr) == FALSE) {
+        return false;
+    }
+    BOOL present = FALSE;
+    PACL acl = nullptr;
+    BOOL defaulted = FALSE;
+    const bool ok =
+        GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted) != FALSE &&
+        SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, acl, nullptr) == ERROR_SUCCESS;
+    LocalFree(descriptor);
+    return ok;
+}
+
+// Package fixtures live under %TEMP%, which inherits whatever DACL the
+// machine gives it; a sandboxed desktop can add another writable account and
+// the product then rightly refuses the directory. Give the fixture an
+// explicit private DACL: SYSTEM, Administrators and the owner, which is the
+// current user.
+bool harden_package_dir(const std::filesystem::path& path) {
+    return set_protected_dacl(path,
+                              L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;CO)");
+}
+
 void test_manifest_parsing() {
     std::vector<chast::VirtualDisplayManifestEntry> entries;
     std::string error;
@@ -489,6 +517,7 @@ void test_package_verification() {
         return;
     }
     TempDir temp;
+    check(harden_package_dir(temp.path), "the package fixture gets a private DACL");
     const std::vector<std::string> required = {
         "deviceinstaller64.exe", "usbmmidd.inf",    "usbmmidd.cat",
         "x64/usbmmidd.dll",      "win32/usbmmidd.dll", "license.txt",
@@ -654,6 +683,7 @@ void test_package_guard() {
         check(true, "no WHQL catalog is installed; the guard test is skipped");
         return;
     }
+    check(harden_package_dir(package), "the guarded package gets a private DACL");
     chast::VirtualDisplayPackageGuard guard;
     std::string detail;
     const chast::VirtualDisplayPackageStatus status = chast::verify_virtual_display_package(
@@ -695,7 +725,9 @@ void test_package_reparse() {
     if (!build_signed_package(package)) {
         check(true, "no WHQL catalog is installed; the reparse test is skipped");
         return;
-    }    const std::filesystem::path link = temp.path / L"package-link";
+    }
+    check(harden_package_dir(package), "the linked package gets a private DACL");
+    const std::filesystem::path link = temp.path / L"package-link";
     if (CreateSymbolicLinkW(link.c_str(), package.c_str(),
                             SYMBOLIC_LINK_FLAG_DIRECTORY |
                                 SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == FALSE) {
@@ -730,24 +762,6 @@ class ScopedProgramData {
   private:
     std::wstring previous_;
 };
-
-bool set_protected_dacl(const std::filesystem::path& path, const wchar_t* sddl) {
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor,
-                                                             nullptr) == FALSE) {
-        return false;
-    }
-    BOOL present = FALSE;
-    PACL acl = nullptr;
-    BOOL defaulted = FALSE;
-    const bool ok =
-        GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted) != FALSE &&
-        SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
-                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                              nullptr, nullptr, acl, nullptr) == ERROR_SUCCESS;
-    LocalFree(descriptor);
-    return ok;
-}
 
 bool set_users_write_acl(const std::filesystem::path& path) {
     return set_protected_dacl(path, L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GW;;;BU)");

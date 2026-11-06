@@ -1288,6 +1288,16 @@ bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_u
     return true;
 }
 
+bool valid_gesture_event(const GestureEvent& event) {
+    if (event.x < -kMaxGestureDelta || event.x > kMaxGestureDelta ||
+        event.y < -kMaxGestureDelta || event.y > kMaxGestureDelta ||
+        (event.x == 0 && event.y == 0)) {
+        return false;
+    }
+    return event.action == GestureAction::Pan ||
+           (event.action == GestureAction::Zoom && event.x == 0);
+}
+
 std::vector<uint8_t> make_input_event(const InputEvent& event) {
     std::vector<uint8_t> payload(24);
     uint8_t* cursor = payload.data();
@@ -1327,6 +1337,11 @@ std::vector<uint8_t> make_input_event(const InputEvent& event) {
             flags = event.pen.flags;
             tilt_x = event.pen.tilt_x;
             tilt_y = event.pen.tilt_y;
+            break;
+        case InputKind::Gesture:
+            action = static_cast<uint8_t>(event.gesture.action);
+            x = static_cast<uint32_t>(event.gesture.x);
+            y = static_cast<uint32_t>(event.gesture.y);
             break;
     }
     put_u8(cursor, static_cast<uint8_t>(event.kind));
@@ -1471,6 +1486,27 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
             event.pen.tilt_x = tilt_x;
             event.pen.tilt_y = tilt_y;
             break;
+        case static_cast<uint8_t>(InputKind::Gesture): {
+            if (action > static_cast<uint8_t>(GestureAction::Zoom)) {
+                set_error(error, "InputEvent names unknown gesture action " +
+                                     std::to_string(action));
+                return false;
+            }
+            if (buttons != 0 || hid_usage != 0 || pressure != 0 || contact != 0 ||
+                flags != 0 || tilt_x != 0 || tilt_y != 0) {
+                set_error(error, "InputEvent gesture carries non-gesture fields");
+                return false;
+            }
+            const GestureEvent gesture{static_cast<GestureAction>(action),
+                                       static_cast<int32_t>(x), static_cast<int32_t>(y)};
+            if (!valid_gesture_event(gesture)) {
+                set_error(error, "InputEvent carries an invalid gesture");
+                return false;
+            }
+            event.kind = InputKind::Gesture;
+            event.gesture = gesture;
+            break;
+        }
         default:
             set_error(error, "InputEvent names unknown kind " + std::to_string(kind));
             return false;
@@ -3325,6 +3361,104 @@ bool parse_remote_config_state(const std::vector<uint8_t>& payload,
         set_error(error, "RemoteConfigState carries a malformed reason");
         return false;
     }
+    return true;
+}
+
+std::vector<uint8_t> make_display_control(const DisplayControlRequest& request) {
+    std::vector<uint8_t> payload(6);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(request.action));
+    put_u8(cursor, request.value);
+    put_u32(cursor, request.target);
+    DisplayControlRequest checked;
+    if (!parse_display_control(payload, checked)) return {};
+    return make_control(ControlType::DisplayControl, payload);
+}
+
+bool parse_display_control(const std::vector<uint8_t>& payload, DisplayControlRequest& request,
+                           std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t action = 0, value = 0;
+    uint32_t target = 0;
+    if (!reader.u8(action) || !reader.u8(value) || !reader.u32(target) || !reader.at_end() ||
+        action > static_cast<uint8_t>(DisplayControlAction::ToggleOutput) ||
+        (action == static_cast<uint8_t>(DisplayControlAction::SetCount)
+             ? value > 4
+             : action >= static_cast<uint8_t>(DisplayControlAction::SelectPrivacy) ? value > 1
+                                                                                   : value != 0) ||
+        (action == static_cast<uint8_t>(DisplayControlAction::ToggleOutput) ? target == 0
+                                                                           : target != 0)) {
+        set_error(error, "malformed DisplayControl");
+        return false;
+    }
+    request = {static_cast<DisplayControlAction>(action), value, target};
+    return true;
+}
+
+std::vector<uint8_t> make_display_control_state(const DisplayControlState& state) {
+    if (state.count > 4 || state.outputs.size() > 4 ||
+        static_cast<uint8_t>(state.privacy) > static_cast<uint8_t>(PrivacyImplementation::VirtualDisplay) ||
+        static_cast<uint8_t>(state.code) > static_cast<uint8_t>(DisplayControlCode::Failed)) {
+        return {};
+    }
+    const std::string reason = truncate_utf8_reason(state.reason, kMaxPrivacyModeReason);
+    std::vector<uint8_t> payload(8 + reason.size() + state.outputs.size() * 5);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, state.supported ? 1 : 0);
+    put_u8(cursor, state.managed ? 1 : 0);
+    put_u8(cursor, state.count);
+    put_u8(cursor, static_cast<uint8_t>(state.privacy));
+    put_u8(cursor, static_cast<uint8_t>(state.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) std::memcpy(cursor, reason.data(), reason.size());
+    cursor += reason.size();
+    put_u8(cursor, static_cast<uint8_t>(state.outputs.size()));
+    std::vector<uint32_t> ids;
+    for (const ControlledDisplay& output : state.outputs) {
+        if (output.id == 0 || std::find(ids.begin(), ids.end(), output.id) != ids.end()) {
+            return {};
+        }
+        ids.push_back(output.id);
+        put_u32(cursor, output.id);
+        put_u8(cursor, output.active ? 1 : 0);
+    }
+    return make_control(ControlType::DisplayControlState, payload);
+}
+
+bool parse_display_control_state(const std::vector<uint8_t>& payload, DisplayControlState& state,
+                                 std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t supported = 0, managed = 0, count = 0, privacy = 0, code = 0, entries = 0;
+    uint16_t size = 0;
+    std::string reason;
+    if (!reader.u8(supported) || !reader.u8(managed) || !reader.u8(count) ||
+        !reader.u8(privacy) || !reader.u8(code) || !reader.u16(size) ||
+        !reader.string(reason, size) || !reader.u8(entries) || supported > 1 || managed > 1 ||
+        count > 4 || entries > 4 ||
+        privacy > static_cast<uint8_t>(PrivacyImplementation::VirtualDisplay) ||
+        code > static_cast<uint8_t>(DisplayControlCode::Failed) || size > kMaxPrivacyModeReason ||
+        (!reason.empty() && !valid_utf8(reason))) {
+        set_error(error, "malformed DisplayControlState");
+        return false;
+    }
+    std::vector<ControlledDisplay> outputs;
+    for (uint8_t i = 0; i < entries; ++i) {
+        uint32_t id = 0;
+        uint8_t active = 0;
+        if (!reader.u32(id) || !reader.u8(active) || id == 0 || active > 1 ||
+            std::any_of(outputs.begin(), outputs.end(),
+                        [&](const ControlledDisplay& item) { return item.id == id; })) {
+            set_error(error, "invalid or duplicate virtual display identity");
+            return false;
+        }
+        outputs.push_back({id, active != 0});
+    }
+    if (!reader.at_end()) {
+        set_error(error, "trailing display state data");
+        return false;
+    }
+    state = {supported != 0, managed != 0, count, static_cast<PrivacyImplementation>(privacy),
+             static_cast<DisplayControlCode>(code), std::move(reason), std::move(outputs)};
     return true;
 }
 

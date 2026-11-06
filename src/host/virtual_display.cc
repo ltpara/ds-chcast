@@ -102,6 +102,8 @@ bool has_conflict_marker(const std::string& value) {
         "virtualdisplaydriver",
         "parsecvdd",
         "rustdeskidd",
+        "tdidd",
+        "todeskvdd",
     };
     const std::string lower = lower_ascii(value);
     for (const char* marker : markers) {
@@ -683,19 +685,18 @@ bool set_handle_security(HANDLE file, bool directory, std::string* error) {
     return ok;
 }
 
-bool has_virtual_display_marker(const std::wstring& value) {
-    const std::string text = lower_ascii(to_utf8(value));
-    return text.find("usbmmid") != std::string::npos ||
-           text.find("usb mobile monitor") != std::string::npos;
-}
-
 std::wstring find_usbmmidd_display() {
     DISPLAY_DEVICEW device{};
     device.cb = sizeof(device);
     for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index) {
-        if (has_virtual_display_marker(device.DeviceString) ||
-            has_virtual_display_marker(device.DeviceID)) {
-            return device.DeviceName;
+        if ((device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0) {
+            DISPLAY_DEVICEW monitor{};
+            monitor.cb = sizeof(monitor);
+            for (DWORD child = 0; EnumDisplayDevicesW(device.DeviceName, child, &monitor,
+                                                     EDD_GET_DEVICE_INTERFACE_NAME); ++child) {
+                if (is_usbmmidd_monitor(monitor.DeviceID)) return device.DeviceName;
+                monitor.cb = sizeof(monitor);
+            }
         }
         device.cb = sizeof(device);
     }
@@ -1095,6 +1096,15 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
             return false;
         }
         const VirtualDisplayProbe probe = probe_virtual_display();
+        if (!probe.scan_error.empty() || (!probe.conflicting_driver.empty() && count > 0)) {
+            if (error != nullptr) {
+                *error = !probe.scan_error.empty()
+                             ? probe.scan_error
+                             : "another virtual display driver is present: " +
+                                   probe.conflicting_driver;
+            }
+            return false;
+        }
         if (!probe.adapter_present && !probe.service_registered) {
             if (error != nullptr) {
                 *error = "usbmmidd is not installed";
@@ -1102,7 +1112,7 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
             return false;
         }
         if (probe.active_monitors == count) {
-            return true;
+            return count == 0 || attach_virtual_display_outputs(count, error);
         }
         VirtualDisplayPackageGuard guard;
         std::string detail;
@@ -1163,7 +1173,7 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
             }
             current = probe_virtual_display().active_monitors;
         }
-        return true;
+        return count == 0 || attach_virtual_display_outputs(count, error);
     }
 
     bool select_mode(const VirtualDisplayMode& mode, std::string* error) override {
@@ -1173,6 +1183,7 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
             }
             return false;
         }
+        if (!attach_virtual_display_outputs(1, error)) return false;
         const std::wstring device = find_usbmmidd_display();
         if (device.empty()) {
             if (error != nullptr) {
@@ -1230,6 +1241,75 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
 };
 
 }  // namespace
+
+bool is_usbmmidd_monitor(const std::wstring& monitor_interface) {
+    if (monitor_interface.empty()) return false;
+    HDEVINFO info = SetupDiCreateDeviceInfoList(nullptr, nullptr);
+    if (info == INVALID_HANDLE_VALUE) return false;
+    SP_DEVICE_INTERFACE_DATA iface{};
+    iface.cbSize = sizeof(iface);
+    SP_DEVINFO_DATA device{};
+    device.cbSize = sizeof(device);
+    DWORD needed = 0;
+    bool matched = false;
+    if (SetupDiOpenDeviceInterfaceW(info, monitor_interface.c_str(), 0, &iface)) {
+        SetupDiGetDeviceInterfaceDetailW(info, &iface, nullptr, 0, &needed, nullptr);
+        if (needed >= sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) && needed < 65536) {
+            std::vector<BYTE> storage(needed);
+            auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(storage.data());
+            detail->cbSize = sizeof(*detail);
+            if (SetupDiGetDeviceInterfaceDetailW(info, &iface, detail, needed, nullptr, &device)) {
+                DEVINST node = device.DevInst;
+                for (int depth = 0; depth < 8; ++depth) {
+                    DEVINST parent = 0;
+                    if (CM_Get_Parent(&parent, node, 0) != CR_SUCCESS) break;
+                    node = parent;
+                    for (ULONG property : {ULONG(CM_DRP_HARDWAREID), ULONG(CM_DRP_SERVICE)}) {
+                        wchar_t values[4096]{};
+                        ULONG size = sizeof(values) - 2 * sizeof(wchar_t);
+                        if (CM_Get_DevNode_Registry_PropertyW(node, property, nullptr, values,
+                                                             &size, 0) != CR_SUCCESS) continue;
+                        for (const wchar_t* value = values; *value; value += wcslen(value) + 1) {
+                            matched = matched || has_usbmmidd_marker(to_utf8(value));
+                        }
+                    }
+                    if (matched) break;
+                }
+            }
+        }
+    }
+    SetupDiDestroyDeviceInfoList(info);
+    return matched;
+}
+
+bool virtual_display_privacy_busy() {
+    HANDLE lease = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\chast-display-privacy-v1");
+    if (lease) {
+        CloseHandle(lease);
+        return true;
+    }
+    return GetLastError() != ERROR_FILE_NOT_FOUND;
+}
+
+std::wstring virtual_display_device_name(const std::wstring& monitor_interface) {
+    if (!is_usbmmidd_monitor(monitor_interface)) return {};
+    DISPLAY_DEVICEW device{};
+    device.cb = sizeof(device);
+    for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index) {
+        DISPLAY_DEVICEW monitor{};
+        monitor.cb = sizeof(monitor);
+        for (DWORD child = 0; EnumDisplayDevicesW(device.DeviceName, child, &monitor,
+                                                 EDD_GET_DEVICE_INTERFACE_NAME); ++child) {
+            if (_wcsicmp(monitor.DeviceID, monitor_interface.c_str()) == 0 &&
+                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) {
+                return device.DeviceName;
+            }
+            monitor.cb = sizeof(monitor);
+        }
+        device.cb = sizeof(device);
+    }
+    return {};
+}
 
 VirtualDisplayStatus classify_virtual_display_probe(const VirtualDisplayProbe& probe) {
     VirtualDisplayStatus status;
@@ -1480,6 +1560,16 @@ VirtualDisplayPrepareResult prepare_virtual_display(
     }
     if (provider == nullptr) {
         result.detail = "no virtual display provider is available";
+        return result;
+    }
+    HANDLE lease = CreateMutexW(nullptr, FALSE, L"Local\\chast-display-privacy-v1");
+    const DWORD lease_error = GetLastError();
+    const auto close_lease = [](void* handle) {
+        if (handle) CloseHandle(handle);
+    };
+    std::unique_ptr<void, decltype(close_lease)> held(lease, close_lease);
+    if (!lease || lease_error == ERROR_ALREADY_EXISTS) {
+        result.detail = "virtual display privacy or another display operation is active";
         return result;
     }
     result.status = provider->status();
@@ -2298,6 +2388,31 @@ VdisplayCommand parse_vdisplay_command(const std::vector<std::wstring>& args) {
     return command;
 }
 
+int finish_virtual_display_install(VirtualDisplayProvider& provider,
+                                   VirtualDisplayInstallRecord record, uint32_t count,
+                                   std::string* error) {
+    std::string failure;
+    record.last_error.clear();
+    if (!write_install_record(record, &failure)) {
+        if (error != nullptr) {
+            *error = "cannot persist driver ownership: " + failure;
+        }
+        return kVdisplayExitInstall;
+    }
+    if (!provider.set_monitor_count(count, &failure)) {
+        record.last_error = failure;
+        std::string save_error;
+        if (!write_install_record(record, &save_error)) {
+            failure += "; cannot save activation error: " + save_error;
+        }
+        if (error != nullptr) {
+            *error = "monitor count failed after install: " + failure;
+        }
+        return kVdisplayExitNoDevice;
+    }
+    return kVdisplayExitOk;
+}
+
 int run_vdisplay_command(const std::vector<std::wstring>& args) {
     VdisplayCommand command = parse_vdisplay_command(args);
     const std::wstring log_path =
@@ -2330,6 +2445,16 @@ int run_vdisplay_command(const std::vector<std::wstring>& args) {
             " active=" + std::to_string(status.active_monitors) +
             " max=" + std::to_string(status.max_monitors) + " detail=" + status.detail);
         return kVdisplayExitOk;
+    }
+    HANDLE lease = CreateMutexW(nullptr, FALSE, L"Local\\chast-display-privacy-v1");
+    const DWORD lease_error = GetLastError();
+    const auto close_lease = [](void* handle) {
+        if (handle) CloseHandle(handle);
+    };
+    std::unique_ptr<void, decltype(close_lease)> held(lease, close_lease);
+    if (!lease || lease_error == ERROR_ALREADY_EXISTS) {
+        log("display operation refused: another operation or privacy recovery is active");
+        return kVdisplayExitCount;
     }
     if (!process_elevated()) {
         log("administrator privileges are required for install, uninstall and set-count");
@@ -2401,20 +2526,21 @@ int run_vdisplay_command(const std::vector<std::wstring>& args) {
             if (record.installed_at.empty()) {
                 record.installed_at = virtual_display_timestamp_utc();
             }
-            if (!record.owned) {
-                record.owned =
-                    provider->status().state != VirtualDisplayState::NotInstalled;
-            }
+            const VirtualDisplayStatus after = provider->status();
+            record.owned = (have_previous && previous.owned) ||
+                           (!already_present &&
+                            (after.state == VirtualDisplayState::Installed ||
+                             after.state == VirtualDisplayState::Active));
             record.last_error = error;
-            std::string ignored;
-            write_install_record(record, &ignored);
+            std::string save_error;
+            if (!write_install_record(record, &save_error)) {
+                log("cannot persist driver ownership: " + save_error);
+                log("install failed: " + error);
+                return kVdisplayExitInstall;
+            }
             log("install failed: " + error);
             return error.find("timed out") != std::string::npos ? kVdisplayExitNoDevice
                                                                 : kVdisplayExitInstall;
-        }
-        if (!provider->set_monitor_count(command.count, &error)) {
-            log("monitor count failed after install: " + error);
-            return kVdisplayExitNoDevice;
         }
         VirtualDisplayInstallRecord record;
         if (have_previous) {
@@ -2426,8 +2552,12 @@ int run_vdisplay_command(const std::vector<std::wstring>& args) {
         record.package_version = version;
         record.package_sha256 = package_sha256;
         record.owned = (have_previous && previous.owned) || !already_present;
-        std::string ignored;
-        write_install_record(record, &ignored);
+        const int completed =
+            finish_virtual_display_install(*provider, record, command.count, &error);
+        if (completed != kVdisplayExitOk) {
+            log(error);
+            return completed;
+        }
         const VirtualDisplayStatus status = provider->status();
         log("installed usbmmidd with " + std::to_string(status.active_monitors) +
             " active monitor(s)");

@@ -55,6 +55,15 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSetAudioProcessing,
     required this.privacyAvailable,
     required this.privacyEnabled,
+    this.displayControlAvailable = false,
+    this.displayControlSupported = false,
+    this.displayControlManaged = false,
+    this.displayControlBusy = false,
+    this.displayControlCount = 0,
+    this.displayControlPrivacy = 0,
+    this.onControlDisplays,
+    this.displayControlOutputs = const <ViewerControlledDisplay>[],
+    this.onToggleVirtualDisplay,
     this.osLoginAvailable = false,
     this.onOsLogin,
     this.sessionSelectAvailable = false,
@@ -67,6 +76,7 @@ class RemoteToolbar extends StatelessWidget {
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
+    this.onOpenDisplayWindow,
     required this.followCursor,
     required this.followWindow,
     required this.onToggleFollowCursor,
@@ -162,6 +172,15 @@ class RemoteToolbar extends StatelessWidget {
   final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
+  final bool displayControlAvailable;
+  final bool displayControlSupported;
+  final bool displayControlManaged;
+  final bool displayControlBusy;
+  final int displayControlCount;
+  final int displayControlPrivacy;
+  final void Function(int action, int value)? onControlDisplays;
+  final List<ViewerControlledDisplay> displayControlOutputs;
+  final void Function(int target, bool enabled)? onToggleVirtualDisplay;
 
   /// The host granted input and OS login, so the viewer may offer a password
   /// dialog. The host still refuses the password unless it is at a logon or
@@ -193,6 +212,10 @@ class RemoteToolbar extends StatelessWidget {
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
+
+  /// Starts a second session window fixed to one output; null hides the
+  /// per-display entries.
+  final ValueChanged<int>? onOpenDisplayWindow;
 
   /// The host switched output to the display under the remote pointer (or
   /// the window with foreground focus) on its own.
@@ -514,6 +537,7 @@ class RemoteToolbar extends StatelessWidget {
                 followWindow: followWindow,
                 inputAvailable: inputAvailable,
                 onSelected: onSelectDisplay,
+                onOpenWindow: onOpenDisplayWindow,
                 onToggleFollowCursor: onToggleFollowCursor,
                 onToggleFollowWindow: onToggleFollowWindow,
               ),
@@ -679,6 +703,92 @@ class RemoteToolbar extends StatelessWidget {
                 disabled: !voiceAvailable || voicePending,
                 active: voiceEnabled,
                 onTap: onToggleVoiceCall,
+              ),
+              PopupMenuButton<int>(
+                tooltip: tr('虚拟显示器与隐私设置'),
+                enabled: displayControlAvailable && !displayControlBusy,
+                icon: Icon(
+                  Icons.settings_display_outlined,
+                  size: 18,
+                  color: displayControlAvailable
+                      ? Colors.white70
+                      : Colors.white24,
+                ),
+                onSelected: (int choice) {
+                  if (choice >= 100) {
+                    onToggleVirtualDisplay
+                        ?.call((choice - 100) ~/ 2, (choice - 100).isOdd);
+                  } else if (choice == 20) {
+                    onControlDisplays?.call(2, 0);
+                  } else if (choice == 21) {
+                    onControlDisplays?.call(0, 0);
+                  } else if (choice >= 10) {
+                    onControlDisplays?.call(3, choice - 10);
+                  } else {
+                    onControlDisplays?.call(1, choice);
+                  }
+                },
+                itemBuilder: (_) => <PopupMenuEntry<int>>[
+                  PopupMenuItem<int>(
+                    enabled: false,
+                    child: Text(tr('临时虚拟屏，断线后恢复原布局')),
+                  ),
+                  for (int count = 0; count <= 4; ++count)
+                    CheckedPopupMenuItem<int>(
+                      value: count,
+                      checked: displayControlCount == count,
+                      enabled: displayControlSupported &&
+                          inputAvailable &&
+                          privacyAvailable &&
+                          !privacyEnabled,
+                      child: Text(
+                        tr('启用 {p1} 个虚拟屏',
+                            <String, Object?>{'p1': count}),
+                      ),
+                    ),
+                  if (displayControlOutputs.isNotEmpty)
+                    const PopupMenuDivider(),
+                  for (final output in displayControlOutputs)
+                    CheckedPopupMenuItem<int>(
+                      value: 100 + output.id * 2 + (output.active ? 0 : 1),
+                      checked: output.active,
+                      enabled: displayControlSupported &&
+                          inputAvailable &&
+                          privacyAvailable &&
+                          !privacyEnabled,
+                      child: Text(
+                        tr('虚拟屏 {p1}',
+                            <String, Object?>{'p1': output.id}),
+                      ),
+                    ),
+                  PopupMenuItem<int>(
+                    value: 20,
+                    enabled: displayControlManaged,
+                    child: Text(tr('恢复原显示布局')),
+                  ),
+                  const PopupMenuDivider(),
+                  CheckedPopupMenuItem<int>(
+                    value: 10,
+                    checked: displayControlPrivacy == 0,
+                    enabled: privacyAvailable &&
+                        !privacyEnabled &&
+                        !displayControlManaged,
+                    child: Text(tr('隐私方式：遮罩')),
+                  ),
+                  CheckedPopupMenuItem<int>(
+                    value: 11,
+                    checked: displayControlPrivacy == 1,
+                    enabled: privacyAvailable &&
+                        displayControlSupported &&
+                        !privacyEnabled &&
+                        !displayControlManaged,
+                    child: Text(tr('隐私方式：虚拟屏')),
+                  ),
+                  PopupMenuItem<int>(
+                    value: 21,
+                    child: Text(tr('刷新显示状态')),
+                  ),
+                ],
               ),
               _BarButton(
                 icon: privacyEnabled
@@ -1178,6 +1288,7 @@ class _DisplayButton extends StatelessWidget {
     required this.followWindow,
     required this.inputAvailable,
     required this.onSelected,
+    this.onOpenWindow,
     required this.onToggleFollowCursor,
     required this.onToggleFollowWindow,
   });
@@ -1188,13 +1299,16 @@ class _DisplayButton extends StatelessWidget {
   final bool followWindow;
   final bool inputAvailable;
   final ValueChanged<int> onSelected;
+  final ValueChanged<int>? onOpenWindow;
   final VoidCallback onToggleFollowCursor;
   final VoidCallback onToggleFollowWindow;
 
   // Negative ids keep the follow toggles apart from display indexes and the
-  // kViewerDisplayAuto/kViewerDisplayAll sentinels.
+  // kViewerDisplayAuto/kViewerDisplayAll sentinels. Per-display window entries
+  // sit far below them so their count never collides with the toggles.
   static const int _followCursorItem = -1;
   static const int _followWindowItem = -2;
+  static const int _openWindowItemBase = -1000;
 
   @override
   Widget build(BuildContext context) {
@@ -1217,6 +1331,8 @@ class _DisplayButton extends StatelessWidget {
             onToggleFollowCursor();
           } else if (value == _followWindowItem) {
             onToggleFollowWindow();
+          } else if (value <= _openWindowItemBase) {
+            onOpenWindow?.call(_openWindowItemBase - value);
           } else {
             onSelected(value);
           }
@@ -1249,6 +1365,18 @@ class _DisplayButton extends StatelessWidget {
               followAvailable,
               Icons.web_asset_rounded,
             ),
+            if (onOpenWindow != null) ...<PopupMenuEntry<int>>[
+              const PopupMenuDivider(height: 8),
+              for (final ViewerDisplay display in displays)
+                PopupMenuItem<int>(
+                  value: _openWindowItemBase - display.index,
+                  child: Text(
+                    tr('在新窗口打开显示器 {p1}', <String, Object?>{
+                      'p1': display.index + 1,
+                    }),
+                  ),
+                ),
+            ],
           ];
         },
         child: SizedBox(

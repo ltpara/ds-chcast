@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'store_lock.dart';
+
 /// View state the viewer remembers across launches: how the picture is fitted
 /// (RustDesk's view style), whether the stats overlay is shown, how the file
 /// browser sorts, and the local mouse remapping. All live in `ui.json` next to
@@ -102,26 +104,28 @@ class ViewPreferences {
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap()
-      ..[_fitKey] = prefs.fit == 1 ? 1 : 0
-      ..[_statsKey] = prefs.stats
-      ..[_fileSortKey] = prefs.fileSort >= 0 && prefs.fileSort <= 2
-          ? prefs.fileSort
-          : 0
-      ..[_fileSortAscendingKey] = prefs.fileSortAscending
-      ..[_browserDirectoryKey] = normalizeDirectory(prefs.browserDirectory)
-      ..[_terminalFontSizeKey] =
-          prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
-          ? prefs.terminalFontSize
-          : 13
-      ..[_reverseWheelKey] = prefs.reverseWheel
-      ..[_swapButtonsKey] = prefs.swapButtons;
-    try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // A view preference; failing to persist it is not fatal.
-    }
+    withStoreLockSync(file, () {
+      final Map<String, Object?> payload = _readMap()
+        ..[_fitKey] = prefs.fit == 1 ? 1 : 0
+        ..[_statsKey] = prefs.stats
+        ..[_fileSortKey] = prefs.fileSort >= 0 && prefs.fileSort <= 2
+            ? prefs.fileSort
+            : 0
+        ..[_fileSortAscendingKey] = prefs.fileSortAscending
+        ..[_browserDirectoryKey] = normalizeDirectory(prefs.browserDirectory)
+        ..[_terminalFontSizeKey] =
+            prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
+            ? prefs.terminalFontSize
+            : 13
+        ..[_reverseWheelKey] = prefs.reverseWheel
+        ..[_swapButtonsKey] = prefs.swapButtons;
+      try {
+        file.parent.createSync(recursive: true);
+        file.writeAsStringSync(jsonEncode(payload));
+      } catch (_) {
+        // A view preference; failing to persist it is not fatal.
+      }
+    });
   }
 
   static Map<String, Object?> _readMap() {
@@ -129,18 +133,20 @@ class ViewPreferences {
     if (file == null) {
       return <String, Object?>{};
     }
-    try {
-      if (!file.existsSync()) {
-        return <String, Object?>{};
+    return withStoreLockSync(file, () {
+      try {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
+      } catch (_) {
+        // A corrupt settings file must not stop the viewer from starting.
       }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
-    } catch (_) {
-      // A corrupt settings file must not stop the viewer from starting.
-    }
-    return <String, Object?>{};
+      return <String, Object?>{};
+    });
   }
 
   static File? _file() {

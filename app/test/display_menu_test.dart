@@ -33,6 +33,7 @@ void main() {
     required List<ViewerDisplay> announced,
     required int active,
     required ValueChanged<int> onSelect,
+    ValueChanged<int>? onOpenDisplayWindow,
     bool followCursor = false,
     bool followWindow = false,
     VoidCallback? onToggleFollowCursor,
@@ -83,6 +84,17 @@ void main() {
     ValueChanged<ViewerHostAction>? onHostAction,
     bool remoteConfigAvailable = false,
     VoidCallback? onRemoteConfig,
+    bool displayControlAvailable = true,
+    bool displayControlSupported = false,
+    bool displayControlManaged = false,
+    bool displayControlBusy = false,
+    int displayControlCount = 0,
+    int displayControlPrivacy = 0,
+    List<ViewerControlledDisplay> displayControlOutputs =
+        const <ViewerControlledDisplay>[],
+    void Function(int action, int value)? onControlDisplays,
+    void Function(int target, bool enabled)? onToggleVirtualDisplay,
+    bool privacyAvailable = true,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -117,7 +129,16 @@ void main() {
           voiceEnabled: false,
           voicePending: false,
           onToggleVoiceCall: () {},
-          privacyAvailable: true,
+          displayControlAvailable: displayControlAvailable,
+          displayControlSupported: displayControlSupported,
+          displayControlManaged: displayControlManaged,
+          displayControlBusy: displayControlBusy,
+          displayControlCount: displayControlCount,
+          displayControlPrivacy: displayControlPrivacy,
+          displayControlOutputs: displayControlOutputs,
+          onControlDisplays: onControlDisplays,
+          onToggleVirtualDisplay: onToggleVirtualDisplay,
+          privacyAvailable: privacyAvailable,
           privacyEnabled: false,
           displays: announced,
           activeDisplay: active,
@@ -126,6 +147,7 @@ void main() {
           onToggleFollowCursor: onToggleFollowCursor ?? () {},
           onToggleFollowWindow: onToggleFollowWindow ?? () {},
           onSelectDisplay: onSelect,
+          onOpenDisplayWindow: onOpenDisplayWindow,
           modes: modes,
           modeChangeAvailable: modeChangeAvailable,
           onSelectMode: onSelectMode ?? (_) {},
@@ -869,5 +891,105 @@ void main() {
     await tester.tap(find.text('相对鼠标'));
     await tester.pumpAndSettle();
     expect(lock, 1);
+  });
+
+  testWidgets('the virtual display menu toggles outputs by stable id',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1800, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final List<Object> calls = <Object>[];
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      displayControlSupported: true,
+      displayControlOutputs: const <ViewerControlledDisplay>[
+        ViewerControlledDisplay(id: 31, active: true),
+        ViewerControlledDisplay(id: 7, active: false),
+      ],
+      onToggleVirtualDisplay: (int id, bool enabled) =>
+          calls.add(<Object>[id, enabled]),
+    ));
+
+    await tester.tap(find.byTooltip('虚拟显示器与隐私设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+        find.widgetWithText(CheckedPopupMenuItem<int>, '虚拟屏 31'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('虚拟显示器与隐私设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+        find.widgetWithText(CheckedPopupMenuItem<int>, '虚拟屏 7'));
+    await tester.pumpAndSettle();
+
+    expect(calls, <Object>[
+      <Object>[31, false],
+      <Object>[7, true],
+    ]);
+  });
+
+  testWidgets('display mutation follows consent while restore stays available',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final List<int> actions = <int>[];
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      displayControlSupported: true,
+      displayControlManaged: true,
+      privacyAvailable: false,
+      onControlDisplays: (int action, int value) => actions.add(action),
+    ));
+
+    await tester.tap(find.byTooltip('虚拟显示器与隐私设置'));
+    await tester.pumpAndSettle();
+    final CheckedPopupMenuItem<int> create = tester.widget(
+      find.widgetWithText(CheckedPopupMenuItem<int>, '启用 1 个虚拟屏'),
+    );
+    expect(create.enabled, isFalse);
+
+    await tester.tap(find.text('恢复原显示布局'));
+    await tester.pumpAndSettle();
+    expect(actions, <int>[2]);
+  });
+
+  testWidgets('per-display window entries report the display index',
+      (WidgetTester tester) async {
+    int? opened;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onOpenDisplayWindow: (int index) => opened = index,
+    ));
+
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('在新窗口打开显示器 1'), findsOneWidget);
+    expect(find.text('在新窗口打开显示器 2'), findsOneWidget);
+
+    await tester.tap(find.text('在新窗口打开显示器 2'));
+    await tester.pumpAndSettle();
+    expect(opened, 1);
+  });
+
+  testWidgets('per-display entries stay hidden without a window opener',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+    ));
+
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('在新窗口打开显示器 1'), findsNothing);
+    expect(find.text('在新窗口打开显示器 2'), findsNothing);
   });
 }

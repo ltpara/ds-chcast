@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'l10n_en.dart';
+import 'store_lock.dart';
 
 /// The two UI languages the viewer ships. Chinese is the source language, so
 /// every string in the app is written in Chinese and [tr] looks up the English
@@ -48,20 +49,22 @@ class AppLanguage {
     if (file == null) {
       return;
     }
-    try {
-      if (!file.existsSync()) {
-        return;
-      }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        final Object? language = decoded['language'];
-        if (language == kLanguageEnglish) {
-          current.value = kLanguageEnglish;
+    withStoreLockSync(file, () {
+      try {
+        if (!file.existsSync()) {
+          return;
         }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          final Object? language = decoded['language'];
+          if (language == kLanguageEnglish) {
+            current.value = kLanguageEnglish;
+          }
+        }
+      } catch (_) {
+        // A corrupt settings file must not stop the viewer from starting.
       }
-    } catch (_) {
-      // A corrupt settings file must not stop the viewer from starting.
-    }
+    });
   }
 
   static void _save(String code) {
@@ -69,15 +72,17 @@ class AppLanguage {
     if (file == null) {
       return;
     }
-    // Other preferences (the picture choices) share this file, so a language
-    // change merges instead of replacing the whole map.
-    final Map<String, Object?> payload = _readMap()..['language'] = code;
-    try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // Language is a preference; failing to persist it is not fatal.
-    }
+    withStoreLockSync(file, () {
+      // Other preferences (the picture choices) share this file, so a language
+      // change merges instead of replacing the whole map.
+      final Map<String, Object?> payload = _readMap()..['language'] = code;
+      try {
+        file.parent.createSync(recursive: true);
+        file.writeAsStringSync(jsonEncode(payload));
+      } catch (_) {
+        // Language is a preference; failing to persist it is not fatal.
+      }
+    });
   }
 
   static Map<String, Object?> _readMap() {
@@ -85,18 +90,20 @@ class AppLanguage {
     if (file == null) {
       return <String, Object?>{};
     }
-    try {
-      if (!file.existsSync()) {
-        return <String, Object?>{};
+    return withStoreLockSync(file, () {
+      try {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
+      } catch (_) {
+        // A corrupt settings file must not stop the viewer from starting.
       }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
-    } catch (_) {
-      // A corrupt settings file must not stop the viewer from starting.
-    }
-    return <String, Object?>{};
+      return <String, Object?>{};
+    });
   }
 
   static File? _file() {

@@ -49,12 +49,17 @@ class TerminalPanel extends StatefulWidget {
     required this.onSendInput,
     required this.onResize,
     required this.onDismiss,
+    this.terminalId = 1,
     this.resumeServiceId = 0,
     this.initialFontSize = 13,
     this.onFontSizeChanged,
   });
 
   final ViewerStatus status;
+  /// Which remote console this panel shows (1..[kViewerMaxTerminals]). The
+  /// transport callbacks already point at the slot; this only picks the
+  /// matching status out of [status].
+  final int terminalId;
   final FocusNode focusNode;
   /// Opens a console. A non-zero [serviceId] attaches to one the host kept
   /// after an earlier disconnect instead of starting a fresh shell.
@@ -397,11 +402,13 @@ class _TerminalPanelState extends State<TerminalPanel> {
     );
   }
 
+  ViewerTerminalStatus get _terminal => widget.status.terminal(widget.terminalId);
+
   bool get _canType =>
       !_ended &&
       !_openFailed &&
-      (widget.status.terminalPhase == ViewerTerminalPhase.open ||
-          widget.status.terminalPhase == ViewerTerminalPhase.requesting);
+      (_terminal.phase == ViewerTerminalPhase.open ||
+          _terminal.phase == ViewerTerminalPhase.requesting);
 
   void _scheduleScrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -609,8 +616,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
 
   @override
   Widget build(BuildContext context) {
-    final bool busy =
-        widget.status.terminalPhase == ViewerTerminalPhase.requesting;
+    final bool busy = _terminal.phase == ViewerTerminalPhase.requesting;
     return Focus(
       focusNode: widget.focusNode,
       onKeyEvent: _onKey,
@@ -650,7 +656,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
 
   Widget _buildHeader(bool busy) {
     final String shellTitle = _grid.title.isEmpty ? tr('远程终端') : _grid.title;
-    final int serviceId = widget.status.terminalServiceId;
+    final int serviceId = _terminal.serviceId;
     final String title = serviceId == 0 ? shellTitle : '$shellTitle · #$serviceId';
     return Container(
       height: 36,
@@ -775,7 +781,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
   }
 
   String _phaseLabel() {
-    switch (widget.status.terminalPhase) {
+    switch (_terminal.phase) {
       case ViewerTerminalPhase.requesting:
         return tr('申请中…');
       case ViewerTerminalPhase.open:
@@ -965,23 +971,23 @@ class _TerminalPanelState extends State<TerminalPanel> {
       return tr('无法打开终端：主机未授权、已有控制台，或上一个控制台尚未收尾');
     }
     if (_ended) {
-      final String reason = widget.status.terminalReason;
+      final String reason = _terminal.reason;
       return reason.isEmpty
           ? tr('主机已结束该控制台')
           : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
     }
-    switch (widget.status.terminalPhase) {
+    switch (_terminal.phase) {
       case ViewerTerminalPhase.requesting:
         return '';
       case ViewerTerminalPhase.ended:
-        final String reason = widget.status.terminalReason;
+        final String reason = _terminal.reason;
         return reason.isEmpty
             ? tr('主机已结束该控制台')
             : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
       case ViewerTerminalPhase.failed:
-        final String detail = widget.status.terminalError.isNotEmpty
-            ? widget.status.terminalError
-            : widget.status.terminalReason;
+        final String detail = _terminal.error.isNotEmpty
+            ? _terminal.error
+            : _terminal.reason;
         return detail.isEmpty ? tr('终端不可用（主机拒绝或权限已撤销）') : detail;
       default:
         return '';
@@ -1028,7 +1034,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
             ),
           ),
           Text(
-            tr('{p3} 字节', <String, Object?>{'p3': widget.status.terminalBytes}),
+            tr('{p3} 字节', <String, Object?>{'p3': _terminal.bytes}),
             style: const TextStyle(fontSize: 10, color: Colors.white24),
           ),
         ],

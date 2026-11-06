@@ -1113,15 +1113,23 @@ const char* terminal_phase_name(chast_viewer::TerminalPhase phase) {
     return "unknown";
 }
 
-std::string terminal_failure(const chast_viewer::ViewerStatus& status) {
-    std::string text = std::string(terminal_phase_name(status.terminal_phase)) + " code " +
-                       std::to_string(status.terminal_code);
-    const std::string& detail =
-        status.terminal_reason.empty() ? status.terminal_error : status.terminal_reason;
+std::string terminal_failure(const chast_viewer::ViewerTerminalStatus& status) {
+    std::string text = std::string(terminal_phase_name(status.phase)) + " code " +
+                       std::to_string(status.code);
+    const std::string& detail = status.reason.empty() ? status.error : status.reason;
     if (!detail.empty()) {
         text += ": " + detail;
     }
     return text;
+}
+
+std::string terminal_failure(const chast_viewer::ViewerStatus& status) {
+    chast_viewer::ViewerTerminalStatus first;
+    first.phase = status.terminal_phase;
+    first.code = status.terminal_code;
+    first.reason = status.terminal_reason;
+    first.error = status.terminal_error;
+    return terminal_failure(first);
 }
 
 // Drives the session's remote console the way the terminal panel does: open at
@@ -1209,6 +1217,146 @@ bool run_terminal(chast_viewer::ViewerEngine& engine, std::chrono::milliseconds 
         std::this_thread::sleep_for(5ms);
     }
 
+    // A second console opens beside the first. The host keeps both shells
+    // alive and each slot must be able to echo, resize and close on its own
+    // while the other stays untouched; chunk merges that serialize the slots
+    // or mix their output queues get caught here.
+    if (!engine.OpenTerminal(90, 28, 2)) {
+        *error = "OpenTerminal(90x28, slot 2) was refused";
+        return false;
+    }
+    deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        const chast_viewer::ViewerTerminalStatus& first = status.terminals[0];
+        const chast_viewer::ViewerTerminalStatus& second = status.terminals[1];
+        if (first.phase != chast_viewer::TerminalPhase::kOpen || first.columns != 100 ||
+            first.rows != 30) {
+            *error = "the first terminal changed while the second opened: " +
+                     terminal_failure(first);
+            return false;
+        }
+        if (second.phase == chast_viewer::TerminalPhase::kOpen) {
+            if (second.columns != 90 || second.rows != 28) {
+                *error = "the second terminal opened at " +
+                         std::to_string(second.columns) + "x" +
+                         std::to_string(second.rows);
+                return false;
+            }
+            break;
+        }
+        if (second.phase != chast_viewer::TerminalPhase::kRequesting) {
+            *error = "the second terminal did not open: " + terminal_failure(second);
+            return false;
+        }
+        if (status.state != chast_viewer::ViewerState::kStreaming) {
+            *error = "the session ended before the second terminal opened";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error = "the second terminal did not open in time";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+
+    if (!engine.SendTerminalInput("echo chast-probe-second\r\n", 2)) {
+        *error = "SendTerminalInput(slot 2) was refused";
+        return false;
+    }
+    deadline = std::chrono::steady_clock::now() + timeout;
+    std::string second_transcript;
+    bool saw_second_marker = false;
+    for (;;) {
+        std::vector<uint8_t> data;
+        bool second_ended = false;
+        while (engine.TakeTerminalOutput(data, second_ended, 2)) {
+            second_transcript.append(reinterpret_cast<const char*>(data.data()),
+                                     data.size());
+        }
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        const chast_viewer::ViewerTerminalStatus& first = status.terminals[0];
+        const chast_viewer::ViewerTerminalStatus& second = status.terminals[1];
+        if (!saw_second_marker &&
+            second_transcript.find("chast-probe-second") != std::string::npos) {
+            saw_second_marker = true;
+            if (!engine.ResizeTerminal(110, 32, 2)) {
+                *error = "ResizeTerminal(110x32, slot 2) was refused";
+                return false;
+            }
+        }
+        if (first.phase != chast_viewer::TerminalPhase::kOpen || first.columns != 100 ||
+            first.rows != 30) {
+            *error = "the first terminal changed during the second console's checks: " +
+                     terminal_failure(first);
+            return false;
+        }
+        if (saw_second_marker && second.columns == 110 && second.rows == 32) {
+            break;
+        }
+        if (second.phase == chast_viewer::TerminalPhase::kFailed ||
+            second.phase == chast_viewer::TerminalPhase::kEnded) {
+            *error = "the second terminal ended before the checks finished: " +
+                     terminal_failure(second);
+            return false;
+        }
+        if (status.state != chast_viewer::ViewerState::kStreaming) {
+            *error = "the session ended during the second terminal's checks";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error = saw_second_marker
+                         ? "the second terminal did not apply the resize"
+                         : "the second terminal never echoed the marker";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+
+    engine.CloseTerminal(2);
+    deadline = std::chrono::steady_clock::now() + timeout;
+    bool second_ended = false;
+    for (;;) {
+        std::vector<uint8_t> data;
+        while (engine.TakeTerminalOutput(data, second_ended, 2)) {
+            second_transcript.append(reinterpret_cast<const char*>(data.data()),
+                                     data.size());
+        }
+        if (second_ended) {
+            break;
+        }
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        if (status.terminals[1].phase == chast_viewer::TerminalPhase::kFailed) {
+            *error = "the second terminal failed while closing: " +
+                     terminal_failure(status.terminals[1]);
+            return false;
+        }
+        if (status.state != chast_viewer::ViewerState::kStreaming) {
+            *error = "the session ended while the second terminal was closing";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error = "the second terminal did not finish closing";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    {
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        if (status.terminals[1].phase != chast_viewer::TerminalPhase::kClosed ||
+            status.terminals[1].code != 0) {
+            *error = "the second terminal closed as " +
+                     terminal_failure(status.terminals[1]);
+            return false;
+        }
+        if (status.terminals[0].phase != chast_viewer::TerminalPhase::kOpen ||
+            status.terminals[0].columns != 100 || status.terminals[0].rows != 30) {
+            *error = "the first terminal changed when the second closed: " +
+                     terminal_failure(status.terminals[0]);
+            return false;
+        }
+    }
+
     engine.CloseTerminal();
     deadline = std::chrono::steady_clock::now() + timeout;
     bool ended = false;
@@ -1241,7 +1389,7 @@ bool run_terminal(chast_viewer::ViewerEngine& engine, std::chrono::milliseconds 
         *error = "the terminal closed as " + terminal_failure(closed);
         return false;
     }
-    *bytes = closed.terminal_bytes;
+    *bytes = closed.terminals[0].bytes + closed.terminals[1].bytes;
     return true;
 }
 
@@ -1914,7 +2062,9 @@ int main(int argc, char** argv) {
                                     } else {
                                         std::printf(
                                             "viewer-probe: terminal 80x24 -> marker echoed, "
-                                            "resized to 100x30, closed (%llu bytes)\n",
+                                            "resized to 100x30; second console 90x28 -> "
+                                            "marker echoed, resized to 110x32 and closed "
+                                            "independently (%llu bytes total)\n",
                                             static_cast<unsigned long long>(terminal_bytes));
                                         std::string first_shot;
                                         std::string second_shot;

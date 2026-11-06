@@ -533,6 +533,15 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_privacy_mode)) {
                 warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
             }
+        } else if (key == "privacy_mode_impl") {
+            const std::string impl = lower(value);
+            if (impl == "overlay" || impl == "virtual_display") {
+                settings.privacy_mode_impl = impl;
+            } else {
+                // A typo must not silently select a different privacy policy.
+                settings.privacy_mode_impl = "invalid";
+                warn(result.warning, "privacy_mode_impl must be overlay or virtual_display");
+            }
         } else if (key == "restart") {
             if (!parse_bool(value, settings.allow_restart)) {
                 warn(result.warning, "restart '" + value + "' is not a boolean");
@@ -558,6 +567,14 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.lock_after_session_end)) {
                 warn(result.warning,
                      "lock_after_session_end '" + value + "' is not a boolean");
+            }
+        } else if (key == "auto_disconnect_minutes") {
+            uint32_t minutes = 0;
+            if (!parse_u32(value, minutes) || minutes > 10080) {
+                warn(result.warning, "auto_disconnect_minutes '" + value +
+                                         "' is not 0..10080; leaving it off");
+            } else {
+                settings.auto_disconnect_minutes = minutes;
             }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
@@ -910,6 +927,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "audio_silence_gate_ms=" << settings.audio_silence_gate_ms << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
+         << "privacy_mode_impl=" << settings.privacy_mode_impl << "\n"
          << "restart=" << (settings.allow_restart ? 1 : 0) << "\n"
          << "block_input=" << (settings.allow_block_input ? 1 : 0) << "\n"
          << "os_login=" << (settings.allow_os_login ? 1 : 0) << "\n"
@@ -917,6 +935,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "allow_remote_config=" << (settings.allow_remote_config ? 1 : 0) << "\n"
          << "lock_after_session_end=" << (settings.lock_after_session_end ? 1 : 0)
          << "\n"
+         << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

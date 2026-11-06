@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 43.
+// The chast wire protocol, version 48.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 46;
+inline constexpr uint16_t kProtocolVersion = 48;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -397,6 +397,25 @@ enum class ControlType : uint16_t {
     // RemoteConfigCode), reason length (u16), UTF-8 reason. A non-Ok answer
     // leaves every switch unchanged.
     RemoteConfigState = 66,
+    // Viewer -> host: query or change this session's display topology.
+    // Payload: action (u8, see DisplayControlAction), value (u8) and target
+    // (u32, a host-issued session display id). Query, SetCount and Restore
+    // change no target; SelectPrivacy carries the wanted
+    // PrivacyImplementation in `value`; ToggleOutput carries the new active
+    // state in `value` and the session display id in `target`. SetCount and
+    // ToggleOutput require kPermissionPrivacyMode and kPermissionInput, the
+    // other actions require kPermissionPrivacyMode, and Restore is also
+    // accepted after a revocation so a viewer can undo its own change. The
+    // host answers DisplayControlState. Protocol v47.
+    DisplayControl = 67,
+    // Host -> viewer: the display state after a DisplayControl request and
+    // the current session display list. Payload: supported (u8), managed
+    // (u8), count (u8), privacy (u8, see PrivacyImplementation), code (u8,
+    // see DisplayControlCode), reason length (u16), UTF-8 reason, entry
+    // count (u8), then per entry id (u32), active (u8). Count is the number
+    // of attached desktop outputs, not allocated PnP monitors, and ids stay
+    // stable for the session so a list index is never a wire identity.
+    DisplayControlState = 68,
 };
 
 // ----- input -----
@@ -425,6 +444,11 @@ enum class InputKind : uint8_t {
     // and hold, two-finger scroll, pinch) instead of a synthesized mouse.
     Touch = 3,
     Pen = 4,
+    // Precision-touchpad pan and pinch (protocol v48). Gestures are not touch
+    // contacts: the viewer turns a trackpad's two-finger motion into bounded
+    // wheel deltas, so the host scrolls or zooms exactly like a mouse wheel
+    // without synthesizing a digitizer contact.
+    Gesture = 5,
 };
 
 // Simultaneous touch contacts the protocol and the Windows injector accept.
@@ -519,6 +543,20 @@ struct PenEvent {
     int16_t tilt_y = 0;
 };
 
+// Gestures carry bounded wheel deltas (120 units per notch). Each Zoom is a
+// complete Ctrl+wheel operation: no modifier survives an interrupted gesture.
+enum class GestureAction : uint8_t {
+    Pan = 0,
+    Zoom = 1,
+};
+inline constexpr int32_t kMaxGestureDelta = 1200;
+struct GestureEvent {
+    GestureAction action = GestureAction::Pan;
+    int32_t x = 0;  // positive scrolls right; zero for Zoom
+    int32_t y = 0;  // positive scrolls up / zooms in
+};
+bool valid_gesture_event(const GestureEvent& event);
+
 // Bit positions in InputEvent::modifiers. Bits 0..7 are the modifier keys on
 // HID usage page 0x07 (0xE0..0xE7) in that order; every event, pointer or
 // keyboard, carries the set the client saw held at that moment. The injector
@@ -557,6 +595,7 @@ struct InputEvent {
     KeyEvent key;
     TouchEvent touch;
     PenEvent pen;
+    GestureEvent gesture;
     // Modifier keys held and lock keys on, when the event happened; see
     // ModifierBit and LockStateBit.
     uint16_t modifiers = 0;
@@ -2109,6 +2148,35 @@ bool parse_remote_config_request(const std::vector<uint8_t>& payload,
 std::vector<uint8_t> make_remote_config_state(const RemoteConfigState& state);
 bool parse_remote_config_state(const std::vector<uint8_t>& payload,
                                RemoteConfigState& state, std::string* error);
+
+// Session-scoped topology management. Restore is allowed after revocation.
+enum class DisplayControlAction : uint8_t { Query, SetCount, Restore, SelectPrivacy, ToggleOutput };
+enum class PrivacyImplementation : uint8_t { Overlay, VirtualDisplay };
+enum class DisplayControlCode : uint8_t { Ok, Denied, Unsupported, Busy, Failed };
+struct DisplayControlRequest {
+    DisplayControlAction action = DisplayControlAction::Query;
+    uint8_t value = 0;
+    uint32_t target = 0; // host-issued session identity, never a display-list index
+};
+struct ControlledDisplay {
+    uint32_t id = 0;
+    bool active = false;
+};
+struct DisplayControlState {
+    bool supported = false;
+    bool managed = false;
+    uint8_t count = 0;  // attached desktop outputs, not allocated PnP monitors
+    PrivacyImplementation privacy = PrivacyImplementation::Overlay;
+    DisplayControlCode code = DisplayControlCode::Ok;
+    std::string reason;
+    std::vector<ControlledDisplay> outputs;
+};
+std::vector<uint8_t> make_display_control(const DisplayControlRequest& request);
+bool parse_display_control(const std::vector<uint8_t>& payload, DisplayControlRequest& request,
+                           std::string* error = nullptr);
+std::vector<uint8_t> make_display_control_state(const DisplayControlState& state);
+bool parse_display_control_state(const std::vector<uint8_t>& payload, DisplayControlState& state,
+                                 std::string* error = nullptr);
 
 // Viewer -> host mode list request for one announced display.
 std::vector<uint8_t> make_list_display_modes(uint16_t display_index);

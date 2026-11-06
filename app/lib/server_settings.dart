@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:chast_viewer/l10n.dart';
 
+import 'store_lock.dart';
+
 /// How a server-assisted viewer reaches the host. Direct and relay are meant
 /// for troubleshooting and for validating one path at a time; auto is the
 /// product default.
@@ -267,65 +269,70 @@ class ServerSettingsStore {
   }
 
   Future<ServerSettings> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return const ServerSettings();
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is Map && decoded['protected'] is String) {
-        final ServerKeyUnprotector? unprotect = _unprotector;
-        if (unprotect == null) {
-          return const ServerSettings();
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
+        return const ServerSettings();
+      }
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is Map && decoded['protected'] is String) {
+          final ServerKeyUnprotector? unprotect = _unprotector;
+          if (unprotect == null) {
+            return const ServerSettings();
+          }
+          return ServerSettings.fromJson(
+            jsonDecode(await unprotect(decoded['protected'] as String)),
+          );
         }
-        return ServerSettings.fromJson(
-          jsonDecode(await unprotect(decoded['protected'] as String)),
-        );
+        final ServerSettings settings = ServerSettings.fromJson(decoded);
+        if ((settings.key.isNotEmpty || settings.proxy.isNotEmpty) &&
+            _protector != null) {
+          // Replace a legacy plaintext secret with its protected envelope.
+          await save(settings);
+        }
+        return settings;
+      } catch (_) {
+        return const ServerSettings();
       }
-      final ServerSettings settings = ServerSettings.fromJson(decoded);
-      if ((settings.key.isNotEmpty || settings.proxy.isNotEmpty) &&
-          _protector != null) {
-        // Replace a legacy plaintext secret with its protected envelope.
-        await save(settings);
-      }
-      return settings;
-    } catch (_) {
-      return const ServerSettings();
-    }
+    });
   }
 
   Future<void> save(ServerSettings settings) async {
-    final File? file = _file();
-    if (file == null) {
-      return;
-    }
-    String text = jsonEncode(settings.toJson());
-    final ServerKeyProtector? protect = _protector;
-    if (protect != null &&
-        (settings.key.isNotEmpty || settings.proxy.isNotEmpty)) {
-      try {
-        final String blob = await protect(text);
-        text = jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
-      } catch (_) {
-        // Never fall back to writing secrets in the clear: keep the
-        // non-secret fields on disk and leave them for this run only.
-        final bool proxyHasCredentials = settings.proxy.contains('@');
-        text = jsonEncode(
-          settings
-              .copyWith(
-                key: '',
-                proxy: proxyHasCredentials ? '' : settings.proxy,
-              )
-              .toJson(),
-        );
+    await withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null) {
+        return;
       }
-    }
-    try {
-      await file.parent.create(recursive: true);
-      await file.writeAsString(text);
-    } catch (_) {
-      // The address book still works against per-device servers; a lost
-      // default only costs retyping the URL next time.
-    }
+      String text = jsonEncode(settings.toJson());
+      final ServerKeyProtector? protect = _protector;
+      if (protect != null &&
+          (settings.key.isNotEmpty || settings.proxy.isNotEmpty)) {
+        try {
+          final String blob = await protect(text);
+          text =
+              jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
+        } catch (_) {
+          // Never fall back to writing secrets in the clear: keep the
+          // non-secret fields on disk and leave them for this run only.
+          final bool proxyHasCredentials = settings.proxy.contains('@');
+          text = jsonEncode(
+            settings
+                .copyWith(
+                  key: '',
+                  proxy: proxyHasCredentials ? '' : settings.proxy,
+                )
+                .toJson(),
+          );
+        }
+      }
+      try {
+        await file.parent.create(recursive: true);
+        await file.writeAsString(text);
+      } catch (_) {
+        // The address book still works against per-device servers; a lost
+        // default only costs retyping the URL next time.
+      }
+    });
   }
 }

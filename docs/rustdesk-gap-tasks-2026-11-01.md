@@ -428,11 +428,24 @@ P2 = 平台扩展。
   码率/延迟不劣于现有后端。
 - 测试：工厂单测（无硬件走回退）；硬件机器回环实测。
 
-### DEV-10 跨子网/中继协助 Wake-on-LAN（P2）
+### DEV-10 跨子网/中继协助 Wake-on-LAN（P2，2026-11-06 完成）
 
 - 目标：超出 RustDesk 的增强，支持跨子网唤醒。
-- 实施：服务器/同网段代理代发魔术包；鉴权与防滥用；可选审计。
+- 实施：服务端内存唤醒队列（作业 60 s 有效、每目标 30 s 冷却、最多
+  64 个作业，按注册续期逐 agent 投递一次）与
+  `POST /v1/hosts/{id}/wake`；server-key 或账号令牌鉴权，管理员、
+  地址簿与共享地址簿内的目标可唤醒，审计动作 `device_wake`。主机代理
+  `--wake-relay` 在续期时取走作业，向受限广播与各网卡定向广播发送
+  102 字节魔法包，`--wake-targets` 供本机诊断。查看器设备菜单保留
+  同网段直发，并新增“通过连接服务转发”。
 - 验收：跨子网可唤醒；未授权请求被拒；与现有同网段直发共存。
+- 验证（2026-11-06，main 真实回环）：三个 Go 包测试、`TestWake` API
+  测试、全量 `go test ./...`、`flutter analyze` 与三个定向 Flutter
+  测试文件通过；server-key 请求返回 202 后约 2.3 s，同链路代理记录
+  `wake relayed ... packets=1`，UDP 监听收到 102 字节；30 s 冷却窗口内
+  重复请求返回 429 与 `Retry-After: 30`；匿名 401、坏 MAC 400、未知
+  主机 404。账号令牌与地址簿闸门由 Go/Dart 测试覆盖；真实跨子网链路、
+  网卡唤醒与账号令牌端到端仍需多网段/双机环境。
 - 说明：RustDesk 同样只支持同网段，本项不计入对齐缺口。
 
 ## C. 平台与驱动（PLAT）
@@ -571,7 +584,7 @@ WebSocket、便携模式、RDP）补一轮。
 | DEV-06 | 已完成（2026-11-05） | 投递账本按日期+内容哈希去重，HTTP `Idempotency-Key` 绑定内容；迟到行按事件日受控重写合并并重放去重，标记丢失补标记、内容变化再投递，详见同日小节。 |
 | DEV-08 | 已完成（2026-11-05） | 地址簿搜索改为分词子串/全拼/拼音首字母匹配，两个视图的搜索词分键持久化；同批补齐反向滚轮、左右键互换与相对鼠标，Request Elevation 评估为不实施，详见同日小节。 |
 | DEV-09 | 暂缓 | 需要 NVENC/QSV/AMF 等硬件；必须沿用零拷贝链路，新增后端只能直接写入现有 GPU 缓冲，不接受 CPU fallback。 |
-| DEV-10 | 暂缓 | 超出 RustDesk 对齐面的可选增强，按实际需求排期。 |
+| DEV-10 | 已完成（2026-11-06） | 服务端内存唤醒队列与 `POST /v1/hosts/{id}/wake`（server-key/账号令牌、管理员与地址簿可唤醒、审计 `device_wake`），主机代理 `--wake-relay` 在续期时向受限/定向广播发送 102 字节魔法包，查看器新增“通过连接服务转发”；真实回环 202 → `wake relayed` → 102 字节 UDP 与 429 冷却已验证，详见同日小节。 |
 
 ### PLAT：维持暂缓
 
@@ -1348,6 +1361,77 @@ chast 的两端是分离产品：查看器只有 QUIC 客户端、解码/渲染�
   产品面，不计为对齐缺口；`PluginRequest` 属插件机制，也不是产品功能缺口。
 - 虚拟显示器、远程打印、非 Windows/Web/移动客户端仍由 PLAT-01～03 跟踪，
   本表不重复登记。
+
+## 显示管理与隐私移植（2026-11-06，协议 v47）
+
+归档并行分支 `origin/feat/windows-session-display-20261105` 的显示管理
+能力已按模块移植到主线（不整体合并）。协议从 v46 升到 v47，在可靠控制流上
+新增 `DisplayControl(67)` / `DisplayControlState(68)`；归档分支使用的
+58/59 已被 `OsLoginRequest/OsLoginResult` 占用，因此顺延编号。
+
+- **协议**：请求为 action(u8) + value(u8) + target(u32)，应答为
+  supported/managed/count/privacy/code + reason(UTF-8) + 输出条目
+  (id u32, active u8)。id 在会话内稳定，列表下标不作为线上身份。
+  `SetCount`/`ToggleOutput` 需要 `kPermissionPrivacyMode` 与
+  `kPermissionInput`，`Query`/`SelectPrivacy` 需要隐私权限，
+  `Restore` 在撤权后仍被接受，允许查看者撤销自己的改动。
+- **主机**：`display_mode` 保存/恢复 `QueryDisplayConfig` 拓扑快照；
+  `VirtualDisplayPrivacy` 以命名互斥量租约与独立
+  `chast-display-guard.exe` 守卫恢复原布局；隐私期间返回 Busy，服务/
+  跟随/仅文件会话按权限拒绝。所有拓扑变更先在备用采集器上完成 GPU 采集、
+  NV12 与硬件编码证明，成功后才原子换入，失败自动回滚。
+- **设置**：`privacy_mode_impl`（`overlay` 默认 / `virtual_display`）
+  写入 `host.ini` 并接入托盘安全设置页；非法值保留原串并告警。
+- **查看器**：工具栏新增“虚拟显示器与隐私设置”菜单（数量 0～4、逐输出
+  开关、恢复布局、隐私方式、刷新状态），桥接发布 `displayControl*`
+  状态；失败时以“显示设置未应用”提示原因，文案中英双语。
+
+验证：C++ Release 构建通过；`protocol`、`display_privacy`、
+`host_settings`、`host_i18n` 定向 ctest 通过（`virtual_display` 的 6 项
+包签名校验因本机沙箱 `%TEMP%` ACL 被拒，属已知环境限制）；
+`flutter analyze` 无问题、`flutter test` 全量通过（新增两项显示菜单
+组件测试）、Windows release 构建通过。
+
+边界：本机未安装 usbmmidd/虚拟显示驱动，只能验证 Query/Unsupported 与
+拒绝路径；真实拓扑变更、守卫接管、双机端到端与虚拟屏定位（PLAT-01 G1）
+仍待专用测试机验收。
+
+## 精密触控板手势移植（2026-11-06，协议 v48）
+
+从归档分支移植 G11 的触控板平移与捏合，不移植归档把触摸屏当作鼠标的
+手势模拟：主线已有 DEV-22 的真实 Touch/Pen 注入，照搬会回退现有行为。
+协议从 v47 升到 v48，新增 `InputKind::Gesture=5` 与
+`GestureEvent{action,x,y}`。Pan 携带两轴滚轮增量，Zoom 只允许纵向增量；
+单轴上限 ±1200，动作越界、两轴皆零、Zoom 带横向增量，以及携带按钮/
+触摸/笔字段的事件一律拒绝。
+
+- **查看器**：`app/lib/widgets/remote_view.dart` 监听 Flutter 的
+  pointer pan/zoom 事件。平移把 `localPanDelta` 按 120/53 像素换算成
+  滚轮格并保留小数累积；捏合按 `log(scale)/log(1.1)*120` 累积，超过
+  ±60 才算捏合，按 ±10 格限幅发出，成为捏合后不再同时滚动；手势结束、
+  失去焦点或撤权时清空累积，避免下一次手势继承残量。
+- **主机**：`src/win/input.cc` 把 Pan 注入横向/纵向
+  `MOUSEEVENTF_HWHEEL/WHEEL`；Zoom 合成为完整 Ctrl+滚轮，未按 Ctrl 时
+  临时按下、滚一格后恢复报告状态，不遗留修饰键；沿用注入器既有的状态
+  对账与 dry-run。
+- **桥接**：`viewer_bridge.cc` 的 `sendInput` 增加 kind=5，校验动作、
+  按钮为零、增量范围与互斥字段；Dart 新增 `ViewerBridge.sendGesture`，
+  会话页在获得控制权时接线。
+- **零拷贝**：只新增输入控制面，采集、编码、解码与渲染路径未改动。
+
+验证：`protocol` ctest 通过（新增平移/缩放往返与未知动作、零增量、超限、
+Zoom 横向增量、携带按钮/压力的拒绝用例，以及注入器 dry-run 的
+“捏合=按下 Ctrl、一格滚轮、释放 Ctrl 共 3 次注入”和“双轴平移=2 次
+滚轮注入”）；`flutter analyze` 无问题、`flutter test` 630 项全部通过
+（新增触控板平移坐标、捏合累积与结束清空、撤权丢弃、桥接修饰键四项）；
+QUIC 回环 `chast-quic verify --input` 的“每个事件完整按序到达并全部
+注入”通过（工具脚本加入 Pan/Zoom 并按 3/2 次注入修正计数断言）；
+Windows release 构建通过。
+
+边界：本机没有精密触控板，真机两指平移/捏合与宿主应用的实际缩放效果仍需
+实机验收；只处理 Flutter 上报的 precision-trackpad pan/zoom，不改变触摸
+屏的 Touch/Pen 语义，也不转发触摸 hover。协议升到 v48，旧版对端需同步
+升级。
 
 ## 完成定义
 

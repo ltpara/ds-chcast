@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import 'server_settings.dart';
+import 'store_lock.dart';
 
 /// The rendezvous server's long-term Ed25519 public key.
 ///
@@ -130,30 +131,33 @@ class ServerIdentityStore {
   }
 
   Future<Map<String, ServerIdentityPin>> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return <String, ServerIdentityPin>{};
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map) {
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
         return <String, ServerIdentityPin>{};
       }
-      final Map<String, ServerIdentityPin> pins = <String, ServerIdentityPin>{};
-      decoded.forEach((Object? key, Object? value) {
-        if (key is! String) {
-          return;
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is! Map) {
+          return <String, ServerIdentityPin>{};
         }
-        final String url = normalizeServerUrl(key);
-        final ServerIdentityPin? pin = ServerIdentityPin.fromJson(value);
-        if (url.isNotEmpty && pin != null) {
-          pins[url] = pin;
-        }
-      });
-      return pins;
-    } catch (_) {
-      return <String, ServerIdentityPin>{};
-    }
+        final Map<String, ServerIdentityPin> pins =
+            <String, ServerIdentityPin>{};
+        decoded.forEach((Object? key, Object? value) {
+          if (key is! String) {
+            return;
+          }
+          final String url = normalizeServerUrl(key);
+          final ServerIdentityPin? pin = ServerIdentityPin.fromJson(value);
+          if (url.isNotEmpty && pin != null) {
+            pins[url] = pin;
+          }
+        });
+        return pins;
+      } catch (_) {
+        return <String, ServerIdentityPin>{};
+      }
+    });
   }
 
   Future<ServerIdentityPin?> pinFor(String serverUrl) async {
@@ -175,20 +179,22 @@ class ServerIdentityStore {
     if (url.isEmpty) {
       return ServerIdentityPin(identity: identity, pinnedAt: DateTime.now());
     }
-    final ServerIdentityPin record = ServerIdentityPin(
-      identity: identity,
-      pinnedAt: DateTime.now().toUtc(),
-    );
-    final Map<String, ServerIdentityPin> pins = await load();
-    pins[url] = record;
-    await _save(pins);
-    await _audit(
-      server: url,
-      action: previous == null ? 'tofu' : 'rotate',
-      identity: identity,
-      previousFingerprint: previous?.identity.fingerprint ?? '',
-    );
-    return record;
+    return withStoreLock(_file(), () async {
+      final ServerIdentityPin record = ServerIdentityPin(
+        identity: identity,
+        pinnedAt: DateTime.now().toUtc(),
+      );
+      final Map<String, ServerIdentityPin> pins = await load();
+      pins[url] = record;
+      await _save(pins);
+      await _audit(
+        server: url,
+        action: previous == null ? 'tofu' : 'rotate',
+        identity: identity,
+        previousFingerprint: previous?.identity.fingerprint ?? '',
+      );
+      return record;
+    });
   }
 
   /// Removes the pin so the next connection asks again unconditionally.
@@ -197,17 +203,19 @@ class ServerIdentityStore {
     if (url.isEmpty) {
       return;
     }
-    final Map<String, ServerIdentityPin> pins = await load();
-    final ServerIdentityPin? previous = pins.remove(url);
-    if (previous == null) {
-      return;
-    }
-    await _save(pins);
-    await _audit(
-      server: url,
-      action: 'forget',
-      previousFingerprint: previous.identity.fingerprint,
-    );
+    await withStoreLock(_file(), () async {
+      final Map<String, ServerIdentityPin> pins = await load();
+      final ServerIdentityPin? previous = pins.remove(url);
+      if (previous == null) {
+        return;
+      }
+      await _save(pins);
+      await _audit(
+        server: url,
+        action: 'forget',
+        previousFingerprint: previous.identity.fingerprint,
+      );
+    });
   }
 
   Future<void> _save(Map<String, ServerIdentityPin> pins) async {

@@ -36,6 +36,7 @@ const (
 	AuditDeviceLabels      = "device_labels"
 	AuditDeviceReset       = "device_reset"
 	AuditDeviceLeaseRemove = "device_lease_remove"
+	AuditDeviceWake        = "device_wake"
 	AuditRecordingUpload   = "recording_upload"
 	AuditRecordingDelete   = "recording_delete"
 

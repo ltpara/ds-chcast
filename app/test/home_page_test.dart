@@ -76,6 +76,15 @@ class _MemoryDevices extends DeviceStore {
   }
 
   @override
+  Future<List<Device>> setFavorite(String key, bool favorite) async {
+    final int index = devices.indexWhere((Device device) => device.key == key);
+    if (index >= 0) {
+      devices[index] = devices[index].copyWith(favorite: favorite);
+    }
+    return List<Device>.of(devices);
+  }
+
+  @override
   Future<List<Device>> updateTags(String key, List<String> tags) async {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
@@ -1972,6 +1981,90 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('wake can be relayed through the connection service', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final DateTime now = DateTime.now();
+    final _MemoryDevices devices = _MemoryDevices(<Device>[
+      Device(
+        id: 'devbox',
+        name: '办公室',
+        server: 'http://127.0.0.1:8443',
+        saved: true,
+        addedAt: now.subtract(const Duration(hours: 1)),
+      ),
+    ]);
+    final List<String> local = <String>[];
+    final List<String> relayed = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: devices,
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(
+            AccountSession(
+              server: 'http://127.0.0.1:8443',
+              username: 'alice',
+              token: 'tok',
+              expiresAt: now.toUtc().add(const Duration(hours: 1)),
+              bookRevision: 1,
+            ),
+          ),
+          lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+              const BatchLookupResult(hosts: <String, HostInfo>{}),
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async =>
+                  const AddressBookSnapshot(
+                    revision: 1,
+                    peers: <AddressBookPeer>[],
+                  ),
+          wakeSender: (String mac) async => local.add(mac),
+          relayWaker:
+              (
+                ServerSettings server,
+                String token,
+                String hostId,
+                String mac,
+              ) async {
+                relayed.add('$hostId $mac $token');
+              },
+        ),
+      ),
+    );
+    for (int i = 0; i < 8; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.tap(find.byTooltip('设备操作'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('唤醒'));
+    await tester.pumpAndSettle();
+    expect(find.text('通过连接服务转发'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('wake-mac')),
+      'aa-bb-cc-dd-ee-ff',
+    );
+    await tester.tap(find.byKey(const Key('wake-relay')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('唤醒').last);
+    await tester.pumpAndSettle();
+    expect(local, isEmpty);
+    expect(relayed, <String>['devbox AA:BB:CC:DD:EE:FF tok']);
+    expect(find.text('已请求主机代理转发唤醒包'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('account tags can be edited locally and are uploaded', (
     WidgetTester tester,
   ) async {
@@ -3678,6 +3771,97 @@ void main() {
     expect(find.text('实验室'), findsOneWidget);
     expect(ViewFilter.loadSearch(SearchView.devices), isEmpty);
     expect(ViewFilter.loadSearch(SearchView.shared), 'carol');
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('devices can be favorited, filtered and the filter persists', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final DateTime now = DateTime.now();
+    final _MemoryDevices devices = _MemoryDevices(<Device>[
+      Device(
+        id: 'studio',
+        name: '工作室',
+        server: 'http://127.0.0.1:8443',
+        saved: true,
+        favorite: true,
+        addedAt: now,
+      ),
+      Device(
+        id: 'lab',
+        name: '实验室',
+        server: 'http://127.0.0.1:8443',
+        saved: true,
+        addedAt: now.subtract(const Duration(minutes: 1)),
+      ),
+    ]);
+    Widget buildHome() => MaterialApp(
+      home: HomePage(
+        deviceStore: devices,
+        serverStore: _MemoryServers(
+          const ServerSettings(url: 'http://127.0.0.1:8443'),
+        ),
+        identityStore: _MemoryIdentity(),
+        trustStore: _MemoryTrust(<String, String>{}),
+        accountStore: _MemoryAccount(),
+        lookupBatch: (ServerSettings server, List<String> hostIds) async {
+          return const BatchLookupResult(hosts: <String, HostInfo>{});
+        },
+      ),
+    );
+
+    await tester.pumpWidget(buildHome());
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(find.byKey(const Key('favorite-filter')), findsOneWidget);
+    expect(find.byKey(const Key('device-favorite-studio')), findsOneWidget);
+    expect(find.byKey(const Key('device-favorite-lab')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('favorite-filter')));
+    await tester.pump();
+    expect(ViewFilter.loadFavoritesOnly(), isTrue);
+    expect(_savedCount(tester), '1/2');
+    expect(find.text('工作室'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
+
+    await tester.tap(find.byTooltip('设备操作'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('取消收藏'));
+    await tester.pumpAndSettle();
+    expect(devices.devices.every((Device device) => !device.favorite), isTrue);
+    expect(_savedCount(tester), '0/2');
+    expect(find.text('还没有收藏的设备'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('device-filter-reset-empty')));
+    await tester.pump();
+    expect(_savedCount(tester), '2');
+    expect(ViewFilter.loadFavoritesOnly(), isFalse);
+
+    await tester.tap(find.byTooltip('设备操作').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('收藏'));
+    await tester.pumpAndSettle();
+    expect(devices.devices.any((Device device) => device.favorite), isTrue);
+    expect(find.byKey(const Key('device-favorite-studio')), findsOneWidget);
+
+    // A fresh launch restores the persisted favorites-only filter.
+    ViewFilter.saveFavoritesOnly(true);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpWidget(buildHome());
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(_savedCount(tester), '1/2');
+    expect(find.text('工作室'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
 
     await tester.pumpWidget(const SizedBox());
   });

@@ -78,6 +78,8 @@ func runHost(args []string) error {
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
 	proxyURL := fs.String("proxy", "", "outbound http://, https://, socks5:// or socks5h:// proxy for the API and TCP carrier (falls back to CHAST_PROXY)")
+	wakeRelay := fs.Bool("wake-relay", false, "relay cross-subnet Wake-on-LAN jobs from the server onto this machine's link")
+	wakeTargets := fs.String("wake-targets", "", "comma-separated broadcast destinations for wake relays, e.g. 127.0.0.1:9 for a local diagnostic")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
@@ -87,6 +89,12 @@ func runHost(args []string) error {
 	}
 	if *lanPort < 1 || *lanPort > 65535 {
 		return fmt.Errorf("invalid --lan-port %d", *lanPort)
+	}
+	targets := splitCSV(*wakeTargets)
+	for _, target := range targets {
+		if _, _, err := net.SplitHostPort(target); err != nil {
+			return fmt.Errorf("invalid --wake-targets %q: %w", target, err)
+		}
 	}
 	tlsConfig, err := netutil.ClientTLSConfig(*tlsCA, *tlsCert, *tlsKey)
 	if err != nil {
@@ -132,6 +140,8 @@ func runHost(args []string) error {
 		UpdateDir:                 *autoUpdateDir,
 		PublisherPublicKey:        *publisherPubKey,
 		RequirePublisherSignature: *requirePublisher,
+		WakeRelay:                 *wakeRelay,
+		WakeTargets:               targets,
 		TLS:                       tlsConfig,
 		Logger:                    log,
 		OnInfo: func(info agent.HostInfo) {

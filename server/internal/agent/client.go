@@ -17,6 +17,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/netproxy"
+	"github.com/ltpara/ds-chcast/server/internal/wake"
 )
 
 // Version is reported to the server as peer metadata and can be overridden at
@@ -96,6 +97,9 @@ type registerResult struct {
 	Software          *softwareInfo `json:"software"`
 	ConfigSerial      int64         `json:"config_serial"`
 	RendezvousServers []string      `json:"rendezvous_servers"`
+	// Wake carries cross-subnet Wake-on-LAN jobs queued since the previous
+	// registration. Only agents started with the relay enabled act on them.
+	Wake []wake.Job `json:"wake"`
 }
 
 type lookupResult struct {

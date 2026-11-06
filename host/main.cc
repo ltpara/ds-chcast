@@ -1876,6 +1876,7 @@ enum SecurityDialogId {
     kSecAllowSessionSelect,
     kSecAllowRemoteConfig,
     kSecLockAfterEnd,
+    kSecIdleMinutes,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1889,6 +1890,7 @@ enum SecurityDialogId {
     kSecVirtualDisplayPolicy,
     kSecVirtualDisplayCount,
     kSecVirtualDisplayResolution,
+    kSecPrivacyModeImpl,
     kSecSave,
     kSecCancel,
 };
@@ -1929,6 +1931,7 @@ struct SecurityDialogState {
     HWND allow_session_select = nullptr;
     HWND allow_remote_config = nullptr;
     HWND lock_after_end = nullptr;
+    HWND idle_minutes = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -1942,6 +1945,7 @@ struct SecurityDialogState {
     HWND virtual_display_policy = nullptr;
     HWND virtual_display_count = nullptr;
     HWND virtual_display_resolution = nullptr;
+    HWND privacy_mode_impl = nullptr;
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
@@ -2165,6 +2169,20 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_session_select = is_checked(dialog.allow_session_select);
     updated.allow_remote_config = is_checked(dialog.allow_remote_config);
     updated.lock_after_session_end = is_checked(dialog.lock_after_end);
+    if (dialog.idle_minutes != nullptr) {
+        const std::string minutes_text =
+            trim_ascii(narrow(control_text(dialog.idle_minutes)));
+        unsigned long minutes = 0;
+        const bool digits =
+            !minutes_text.empty() && minutes_text.size() <= 5 &&
+            std::all_of(minutes_text.begin(), minutes_text.end(),
+                        [](char c) { return c >= '0' && c <= '9'; });
+        if (!digits ||
+            (minutes = std::strtoul(minutes_text.c_str(), nullptr, 10)) > 10080) {
+            return complain(tr(L"空闲断开必须是 0 到 10080 之间的整数分钟。"));
+        }
+        updated.auto_disconnect_minutes = static_cast<uint32_t>(minutes);
+    }
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2290,6 +2308,11 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
             }
             updated.virtual_display_resolution = normalized;
         }
+    }
+    if (dialog.privacy_mode_impl != nullptr) {
+        const LRESULT selected =
+            SendMessageW(dialog.privacy_mode_impl, CB_GETCURSEL, 0, 0);
+        updated.privacy_mode_impl = selected == 1 ? "virtual_display" : "overlay";
     }
 
     updated.token_auth = is_checked(dialog.token_auth);
@@ -2809,6 +2832,14 @@ bool edit_security_settings(HostSettings& result) {
         add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
             WS_EX_CLIENTEDGE, virtual_display_left, 606, 260, 200, kSecVirtualDisplayPolicy,
             nullptr, &dialog.advanced_page);
+    const wchar_t* privacy_impl_label = tr(L"隐私方式");
+    const int privacy_impl_left = virtual_display_left + 260 + 16;
+    add(L"STATIC", privacy_impl_label, SS_LEFT, 0, privacy_impl_left, 610,
+        text_px(privacy_impl_label) + 8, 20, 0, nullptr, &dialog.advanced_page);
+    dialog.privacy_mode_impl =
+        add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+            WS_EX_CLIENTEDGE, privacy_impl_left + text_px(privacy_impl_label) + 8, 606, 120,
+            200, kSecPrivacyModeImpl, nullptr, &dialog.advanced_page);
     const wchar_t* virtual_count_label = tr(L"数量（1–4）");
     const int virtual_count_label_width = text_px(virtual_count_label);
     add(L"STATIC", virtual_count_label, SS_LEFT, 0, 32, 640, virtual_count_label_width + 8, 20, 0,
@@ -2838,6 +2869,19 @@ bool edit_security_settings(HostSettings& result) {
     add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 720, 90, 32,
         kSecCancel, nullptr, nullptr);
 
+    // The advanced page has no free row left, so the idle timeout sits beside
+    // the buttons. It applies to every session, not just the advanced tab, so
+    // it stays visible on all pages like save and cancel.
+    const wchar_t* idle_label = tr(L"空闲断开（分钟，0 表示关闭）");
+    const int idle_label_width = text_px(idle_label) + 8;
+    add(L"STATIC", idle_label, SS_LEFT, 0, 32, 724, idle_label_width, 20, 0, nullptr,
+        nullptr);
+    dialog.idle_minutes =
+        add(L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+            32 + idle_label_width + 12, 720, 80, 26, kSecIdleMinutes, nullptr, nullptr);
+    add(L"STATIC", tr(L"无输入、聊天或剪贴板操作达到此时长即关闭会话。"), SS_LEFT, 0, 32,
+        748, sec_cancel_left - 10 - 90 - 32 - 12, 20, 0, nullptr, nullptr);
+
     // ----- initial state -----
     const HostSettings& settings = g_app->settings;
     SendMessageW(settings.auth_mode == HostAuthMode::Click ? dialog.mode_click
@@ -2861,6 +2905,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_session_select, settings.allow_session_select);
     set_check(dialog.allow_remote_config, settings.allow_remote_config);
     set_check(dialog.lock_after_end, settings.lock_after_session_end);
+    set_text(dialog.idle_minutes, widen(std::to_string(settings.auto_disconnect_minutes)));
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2883,6 +2928,12 @@ bool edit_security_settings(HostSettings& result) {
                                  ? 1
                                  : settings.virtual_display == VirtualDisplayPolicy::On ? 2 : 0;
     SendMessageW(dialog.virtual_display_policy, CB_SETCURSEL, policy_index, 0);
+    for (const wchar_t* item : {tr(L"黑屏遮罩"), tr(L"虚拟显示器")}) {
+        SendMessageW(dialog.privacy_mode_impl, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(item));
+    }
+    SendMessageW(dialog.privacy_mode_impl, CB_SETCURSEL,
+                 settings.privacy_mode_impl == "virtual_display" ? 1 : 0, 0);
     set_text(dialog.virtual_display_count,
              widen(std::to_string(settings.virtual_display_monitors)));
     int resolution_index = -1;

@@ -4,7 +4,7 @@
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--adaptive-jitter] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--file-browse] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
-//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
+//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--idle-disconnect] [--encoder auto|vpl|ffmpeg]
 //                      [--netem [--audio [--audio-stream] [--play [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]]]]] [--record out.mp4]
 //                      [--netem-delay-ms N] [--netem-jitter-ms N] [--netem-loss-percent X] [--netem-rate-kbps N]
 //
@@ -901,6 +901,10 @@ struct Options {
     // the real secure desktop; a second probe checks a host with no callback
     // answers Unsupported instead.
     bool sas = false;
+    // verify only: cover the idle auto-disconnect. Viewer input must keep the
+    // session alive across the timeout; a quiet session must be closed by the
+    // host itself, and a host with the timeout off must leave it open.
+    bool idle_disconnect = false;
     // verify only: walk the viewer's picture preferences. A quality/frame-rate
     // change and its restore must be answered with the effective values and
     // followed by a StreamInfo; the other encoder family is requested to prove
@@ -1226,6 +1230,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.privacy = true;
             } else if (arg == "--sas") {
                 options.sas = true;
+            } else if (arg == "--idle-disconnect") {
+                options.idle_disconnect = true;
             } else if (arg == "--stream-options") {
                 options.stream_options = true;
             } else if (arg == "--send-clipboard" && i + 1 < argc) {
@@ -1500,6 +1506,10 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.sas && options.mode != "verify") {
         std::fprintf(stderr, "--sas only applies to verify\n");
+        return false;
+    }
+    if (options.idle_disconnect && options.mode != "verify") {
+        std::fprintf(stderr, "--idle-disconnect only applies to verify\n");
         return false;
     }
     if (options.stream_options && options.mode != "verify") {
@@ -2130,7 +2140,8 @@ struct ReceiverStats {
 // The input script connect and verify replay. It exercises every action the
 // protocol carries: an absolute move, a click, both wheel axes, a relative
 // move, a chord that leaves a modifier down across other events, a two-finger
-// touch gesture, and a pen stroke with barrel and tilt.
+// touch gesture, a pen stroke with barrel and tilt, and a precision-trackpad
+// pan and pinch.
 std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, bool keys) {
     std::vector<chast::InputEvent> events;
     auto mouse = [&](chast::MouseAction action, uint16_t buttons, int32_t x, int32_t y) {
@@ -2174,6 +2185,14 @@ std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, 
         event.pen.tilt_y = tilt_y;
         events.push_back(event);
     };
+    auto gesture = [&](chast::GestureAction action, int32_t x, int32_t y) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Gesture;
+        event.gesture.action = action;
+        event.gesture.x = x;
+        event.gesture.y = y;
+        events.push_back(event);
+    };
 
     mouse(chast::MouseAction::Move, 0, origin_x + 10, origin_y + 10);
     mouse(chast::MouseAction::ButtonDown, chast::kMouseLeft, 0, 0);
@@ -2196,8 +2215,26 @@ std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, 
         pen(chast::TouchAction::Move, origin_x + 70, origin_y + 65, 450,
             chast::kPenBarrel, 12, -6);
         pen(chast::TouchAction::Up, origin_x + 70, origin_y + 65, 0, 0, 0, 0);
+        gesture(chast::GestureAction::Pan, -WHEEL_DELTA, WHEEL_DELTA);
+        gesture(chast::GestureAction::Zoom, 0, WHEEL_DELTA);
     }
     return events;
+}
+
+// Gestures do not map one-to-one onto injections: a pan expands to one wheel
+// step per moved axis, and a zoom wraps its wheel step in Ctrl down/up.
+size_t injection_count(const std::vector<chast::InputEvent>& events) {
+    size_t count = 0;
+    for (const chast::InputEvent& event : events) {
+        if (event.kind != chast::InputKind::Gesture) {
+            ++count;
+        } else if (event.gesture.action == chast::GestureAction::Zoom) {
+            count += 3;
+        } else {
+            count += (event.gesture.x != 0 ? 1u : 0u) + (event.gesture.y != 0 ? 1u : 0u);
+        }
+    }
+    return count;
 }
 
 bool same_event(const chast::InputEvent& a, const chast::InputEvent& b) {
@@ -2218,6 +2255,9 @@ bool same_event(const chast::InputEvent& a, const chast::InputEvent& b) {
             return a.pen.action == b.pen.action && a.pen.x == b.pen.x && a.pen.y == b.pen.y &&
                    a.pen.pressure == b.pen.pressure && a.pen.flags == b.pen.flags &&
                    a.pen.tilt_x == b.pen.tilt_x && a.pen.tilt_y == b.pen.tilt_y;
+        case chast::InputKind::Gesture:
+            return a.gesture.action == b.gesture.action && a.gesture.x == b.gesture.x &&
+                   a.gesture.y == b.gesture.y;
     }
     return false;
 }
@@ -2388,6 +2428,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         static_cast<unsigned>(event.touch.action),
                         static_cast<unsigned>(event.touch.contact), event.touch.x, event.touch.y,
                         static_cast<unsigned>(event.touch.pressure), event.modifiers);
+        } else if (event.kind == chast::InputKind::Gesture) {
+            std::printf("input: gesture action=%u x=%d y=%d state=0x%03X\n",
+                        static_cast<unsigned>(event.gesture.action), event.gesture.x,
+                        event.gesture.y, event.modifiers);
         } else {
             std::printf("input: pen action=%u x=%d y=%d pressure=%u flags=0x%02X tilt=%d,%d "
                         "state=0x%03X\n",
@@ -7711,13 +7755,15 @@ bool wait_host_listening(chast::HostServer& server, std::chrono::milliseconds ti
 }
 
 std::unique_ptr<chast::HostServer> start_probe_host(
-    uint16_t port, const std::function<void(chast::HostSettings&)>& setup, std::string* error) {
+    uint16_t port, const std::function<void(chast::HostSettings&)>& setup, std::string* error,
+    uint32_t auto_disconnect_ms = 0) {
     chast::HostServerConfig host;
     host.settings.bind_address = "127.0.0.1";
     host.settings.port = port;
     host.settings.auth_mode = chast::HostAuthMode::Password;
     host.settings.password_hash = chast::hash_password("open-sesame");
     host.serve_once = true;
+    host.auto_disconnect_ms = auto_disconnect_ms;
     setup(host.settings);
     std::unique_ptr<chast::HostServer> server =
         chast::HostServer::create(std::move(host), error);
@@ -8249,6 +8295,147 @@ bool secure_auth_wiring_works(uint16_t port, std::string* detail) {
             *detail = "an address outside the allow-list was not refused: " + refused.error;
             return false;
         }
+    }
+    return true;
+}
+
+// The idle timeout, end to end: viewer input keeps a session alive across two
+// timeout windows, quiet then closes it without an error, and the off switch
+// leaves the same quiet session open.
+bool idle_disconnect_works(uint16_t port, std::string* detail) {
+    constexpr uint32_t kIdleMs = 2000;
+    std::string error;
+    std::unique_ptr<chast::HostServer> host = start_probe_host(
+        port, [](chast::HostSettings& settings) { settings.allow_input = true; }, &error,
+        kIdleMs);
+    if (!host) {
+        *detail = "idle host: " + error;
+        return false;
+    }
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 5000;
+    client_config.pinned_fingerprint = host->status().fingerprint;
+    client_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        host->stop();
+        return false;
+    }
+    chast::ServerInfo info;
+    chast::Error connected = client->connect(std::chrono::seconds(10));
+    chast::Error handshaken =
+        connected.ok() ? client->handshake(info, std::chrono::seconds(10),
+                                           chast::kDisplayAuto)
+                       : connected;
+    if (!handshaken.ok()) {
+        *detail = "the viewer did not connect: " + handshaken.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // Keep interacting across two full timeout windows: each mouse move must
+    // reset the timer, or the host would close the session at kIdleMs.
+    for (int step = 0; step < 5; ++step) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Mouse;
+        event.mouse.action = chast::MouseAction::Move;
+        event.mouse.x = step * 10;
+        event.mouse.y = step * 10;
+        const chast::Error sent = client->send_input(event);
+        if (!sent.ok()) {
+            *detail = "the host closed an active session: " + sent.to_string();
+            client.reset();
+            host->stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    if (host->status().state != chast::HostState::Streaming) {
+        *detail = "the host left an interacted session before the viewer went quiet";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // Quiet again: one more timeout window must end the session by itself.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline &&
+           host->status().state == chast::HostState::Streaming) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const bool stopped = host->status().state != chast::HostState::Streaming;
+    // A multi-viewer host copies a worker's stats to the listener while it
+    // reaps the worker, so the counter can trail the state by a poll tick.
+    uint64_t idle_closes = 0;
+    const auto stats_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < stats_deadline) {
+        idle_closes = host->status().stats.idle_disconnects;
+        if (idle_closes != 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    client.reset();
+    host->stop();
+    if (!stopped) {
+        *detail = "the host kept an idle session open past the timeout";
+        return false;
+    }
+    if (idle_closes != 1) {
+        *detail = "the host counted " + std::to_string(idle_closes) +
+                  " idle close(s) for one idle session";
+        return false;
+    }
+
+    // Timeout off: the same quiet session must stay open.
+    const uint16_t off_port = static_cast<uint16_t>(port + 1);
+    std::string off_error;
+    std::unique_ptr<chast::HostServer> off_host = start_probe_host(
+        off_port, [](chast::HostSettings&) {}, &off_error);
+    if (!off_host) {
+        *detail = "timeout-off host: " + off_error;
+        return false;
+    }
+    chast::QuicClientConfig off_config;
+    off_config.host = "127.0.0.1";
+    off_config.port = off_port;
+    off_config.idle_timeout_ms = 5000;
+    off_config.pinned_fingerprint = off_host->status().fingerprint;
+    off_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> off_client =
+        chast::QuicSession::create_client(off_config, &off_error);
+    if (!off_client) {
+        *detail = "timeout-off client: " + off_error;
+        off_host->stop();
+        return false;
+    }
+    chast::ServerInfo off_info;
+    chast::Error off_connected = off_client->connect(std::chrono::seconds(10));
+    chast::Error off_handshaken =
+        off_connected.ok() ? off_client->handshake(off_info, std::chrono::seconds(10),
+                                                   chast::kDisplayAuto)
+                           : off_connected;
+    if (!off_handshaken.ok()) {
+        *detail = "the timeout-off viewer did not connect: " + off_handshaken.to_string();
+        off_client.reset();
+        off_host->stop();
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kIdleMs + 500));
+    const bool still_open = off_host->status().state == chast::HostState::Streaming;
+    const uint64_t off_closes = off_host->status().stats.idle_disconnects;
+    off_client.reset();
+    off_host->stop();
+    if (!still_open) {
+        *detail = "a host without a timeout closed a quiet session";
+        return false;
+    }
+    if (off_closes != 0) {
+        *detail = "a host without a timeout counted an idle close";
+        return false;
     }
     return true;
 }
@@ -8852,6 +9039,15 @@ int run_verify(const Options& options) {
             std::printf("     SAS gate probe: %s\n", detail.c_str());
         }
     }
+    if (local.idle_disconnect) {
+        std::string detail;
+        const bool passed =
+            idle_disconnect_works(static_cast<uint16_t>(probe_base + 22), &detail);
+        check(passed, "an idle session closes itself and an active one stays open");
+        if (!passed) {
+            std::printf("     idle disconnect probe: %s\n", detail.c_str());
+        }
+    }
     {
         std::string detail;
         const bool passed =
@@ -9149,7 +9345,7 @@ int run_verify(const Options& options) {
         }
         check(same, "input events arrived intact and in order");
         check(sent.input_stats.applied ==
-                  received.input_sent.size() +
+                  injection_count(received.input_sent) +
                       (received.text_sent ? utf8_code_point_count(kViewerTextLine)
                                           : 0),
               "every input event was injected");

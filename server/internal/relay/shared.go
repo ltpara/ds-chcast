@@ -46,6 +46,7 @@ type SharedCarrier struct {
 }
 
 type sharedHost struct {
+	mux     *muxCarrier
 	carrier *SharedCarrier
 	id      string
 	conn    net.Conn
@@ -300,7 +301,7 @@ func (sc *SharedCarrier) serveHost(conn net.Conn, br *bufio.Reader) {
 		sc.refuse(conn, "host has no live registration")
 		return
 	}
-	challenge, err := json.Marshal(carrier.HostChallenge{Nonce: nonce})
+	challenge, err := json.Marshal(carrier.HostChallenge{Nonce: nonce, Multiplex: hello.Multiplex})
 	if err != nil {
 		sc.refuse(conn, "could not issue a challenge")
 		return
@@ -324,7 +325,11 @@ func (sc *SharedCarrier) serveHost(conn net.Conn, br *bufio.Reader) {
 		sc.refuse(conn, "malformed host proof")
 		return
 	}
-	message := identity.CarrierHostMessage(hello.HostID, "", proof.Nonce)
+	capability := ""
+	if hello.Multiplex {
+		capability = "MUX1"
+	}
+	message := identity.CarrierHostMessage(hello.HostID, capability, proof.Nonce)
 	if proof.HostID != hello.HostID || proof.Nonce != nonce ||
 		!sc.auth.CheckChallenge(hello.HostID, identity.DomainCarrierHost, proof.Nonce, string(message), proof.Signature) {
 		sc.refuse(conn, "host proof was not accepted")
@@ -337,6 +342,18 @@ func (sc *SharedCarrier) serveHost(conn net.Conn, br *bufio.Reader) {
 	_ = conn.SetDeadline(time.Time{})
 
 	link := &sharedHost{carrier: sc, id: hello.HostID, conn: conn, send: carrier.NewFrameWriter(conn)}
+	if hello.Multiplex {
+		link.mux = newMuxCarrier(sc.policy, hello.HostID, "shared:"+hello.HostID, "", 0,
+			link.sendFrame, func(toHost bool, n int) {
+				sc.mu.Lock()
+				defer sc.mu.Unlock()
+				if toHost {
+					sc.toHost += uint64(n)
+				} else {
+					sc.toViewer += uint64(n)
+				}
+			})
+	}
 	sc.mu.Lock()
 	if sc.closed {
 		sc.mu.Unlock()
@@ -367,6 +384,9 @@ func (sc *SharedCarrier) serveHost(conn net.Conn, br *bufio.Reader) {
 
 func (sc *SharedCarrier) hostLoop(link *sharedHost, br *bufio.Reader) {
 	defer link.shutdown()
+	if link.mux != nil {
+		defer link.mux.close()
+	}
 	frames := carrier.NewFrameReader(br)
 	for {
 		_ = link.conn.SetReadDeadline(time.Now().Add(hostIdle))
@@ -390,6 +410,10 @@ func (sc *SharedCarrier) hostLoop(link *sharedHost, br *bufio.Reader) {
 			if err := link.sendFrame(nil); err != nil {
 				return
 			}
+			continue
+		}
+		if link.mux != nil {
+			link.mux.receive(payload)
 			continue
 		}
 		if viewer == nil {
@@ -427,6 +451,20 @@ func (sc *SharedCarrier) serveViewer(v *carrierViewer, hello carrier.SharedViewe
 	host := sc.hosts[hello.HostID]
 	if host == nil {
 		sc.mu.Unlock()
+		return
+	}
+	if host.mux != nil {
+		sc.viewers++
+		sc.mu.Unlock()
+		defer func() {
+			sc.mu.Lock()
+			if sc.viewers > 0 {
+				sc.viewers--
+			}
+			sc.mu.Unlock()
+		}()
+		sc.log.Info("shared carrier viewer attached", "host", hello.HostID, "remote", v.peer)
+		host.mux.serve(v)
 		return
 	}
 	if host.viewer != nil {

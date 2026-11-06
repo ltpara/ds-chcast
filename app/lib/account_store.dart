@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -196,70 +197,76 @@ class AccountSessionStore {
   }
 
   Future<AccountSession?> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return null;
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is Map && decoded['protected'] is String) {
-        final SecretUnprotector? unprotect = _unprotector;
-        if (unprotect == null) {
-          return null;
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
+        return null;
+      }
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is Map && decoded['protected'] is String) {
+          final SecretUnprotector? unprotect = _unprotector;
+          if (unprotect == null) {
+            return null;
+          }
+          final String plaintext =
+              await unprotect(decoded['protected'] as String);
+          return AccountSession.fromJson(jsonDecode(plaintext));
         }
-        final String plaintext =
-            await unprotect(decoded['protected'] as String);
-        return AccountSession.fromJson(jsonDecode(plaintext));
+        final AccountSession? session = AccountSession.fromJson(decoded);
+        if (session != null && _protector != null) {
+          // Replace a legacy plaintext token with its protected envelope.
+          await save(session);
+        }
+        return session;
+      } catch (_) {
+        return null;
       }
-      final AccountSession? session = AccountSession.fromJson(decoded);
-      if (session != null && _protector != null) {
-        // Replace a legacy plaintext token with its protected envelope.
-        await save(session);
-      }
-      return session;
-    } catch (_) {
-      return null;
-    }
+    });
   }
 
   Future<void> save(AccountSession session) async {
-    final File? file = _file();
-    if (file == null) {
-      return;
-    }
-    final String payload = jsonEncode(session.toJson());
-    String text = payload;
-    final SecretProtector? protect = _protector;
-    if (protect != null) {
-      try {
-        final String blob = await protect(payload);
-        text =
-            jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
-      } catch (_) {
-        // Never write the access and refresh tokens in the clear: losing the
-        // remembered session only costs one sign-in.
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null) {
         return;
       }
-    }
-    try {
-      await file.parent.create(recursive: true);
-      await file.writeAsString(text);
-    } catch (_) {
-      // A lost session only costs one login; never block the app on it.
-    }
+      final String payload = jsonEncode(session.toJson());
+      String text = payload;
+      final SecretProtector? protect = _protector;
+      if (protect != null) {
+        try {
+          final String blob = await protect(payload);
+          text =
+              jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
+        } catch (_) {
+          // Never write the access and refresh tokens in the clear: losing the
+          // remembered session only costs one sign-in.
+          return;
+        }
+      }
+      try {
+        await file.parent.create(recursive: true);
+        await file.writeAsString(text);
+      } catch (_) {
+        // A lost session only costs one login; never block the app on it.
+      }
+    });
   }
 
   Future<void> clear() async {
-    final File? file = _file();
-    if (file == null) {
-      return;
-    }
-    try {
-      if (await file.exists()) {
-        await file.delete();
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null) {
+        return;
       }
-    } catch (_) {
-      // The next load tolerates a malformed or stale file.
-    }
+      try {
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (_) {
+        // The next load tolerates a malformed or stale file.
+      }
+    });
   }
 }

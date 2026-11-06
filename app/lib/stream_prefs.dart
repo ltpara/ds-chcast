@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'store_lock.dart';
+
 /// Picture choices the viewer remembers across launches, the same way
 /// RustDesk keeps its image quality and codec selection. Values are the
 /// `code` fields of [ViewerStreamCodec] and [ViewerStreamQuality]; the frame
@@ -50,16 +52,18 @@ class StreamPreferences {
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap()
-      ..[_codecKey] = _choice(prefs.codec, _codecValues)
-      ..[_qualityKey] = _choice(prefs.quality, _qualityValues)
-      ..[_maxFpsKey] = _fps(prefs.maxFps);
-    try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // A picture preference; failing to persist it is not fatal.
-    }
+    withStoreLockSync(file, () {
+      final Map<String, Object?> payload = _readMap()
+        ..[_codecKey] = _choice(prefs.codec, _codecValues)
+        ..[_qualityKey] = _choice(prefs.quality, _qualityValues)
+        ..[_maxFpsKey] = _fps(prefs.maxFps);
+      try {
+        file.parent.createSync(recursive: true);
+        file.writeAsStringSync(jsonEncode(payload));
+      } catch (_) {
+        // A picture preference; failing to persist it is not fatal.
+      }
+    });
   }
 
   static int _choice(Object? raw, int max) {
@@ -81,18 +85,20 @@ class StreamPreferences {
     if (file == null) {
       return <String, Object?>{};
     }
-    try {
-      if (!file.existsSync()) {
-        return <String, Object?>{};
+    return withStoreLockSync(file, () {
+      try {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
+      } catch (_) {
+        // A corrupt settings file must not stop the viewer from starting.
       }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
-    } catch (_) {
-      // A corrupt settings file must not stop the viewer from starting.
-    }
-    return <String, Object?>{};
+      return <String, Object?>{};
+    });
   }
 
   static File? _file() {

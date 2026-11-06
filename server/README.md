@@ -27,7 +27,7 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | 地址簿搜索与筛选 | 查看器本地 | 名称/ID/标签的大小写不敏感子串搜索；标签芯片多选按并集匹配，筛选同时收窄分组标题与成员计数，可一键清除 |
 | 按分组共享与分组 ACL | `/v1/addressbook/grants`、`/v1/addressbook/shared/{owner}/...` | 授权可选 `group_id`（空为整本）；读取按授权范围过滤条目与分组，读写权限只作用于被授权分组，整本 `control` 才能管理授权；删除分组时同一事务撤销其授权 |
 | 离线清空标签/分组 | 查看器本地意图 + 同步 `PATCH` | 清空全部标签或移出分组会持久化显式意图；离线期间不被服务端旧值回填，恢复后上传空值，成功或服务端已匹配才撤销意图 |
-| Wake-on-LAN | 查看器本地广播 | 设备菜单可为已保存或最近设备填写 MAC，向 `255.255.255.255:9` 发送 102 字节魔法包；MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
+| Wake-on-LAN | 查看器本地广播 + 跨子网中继 | 设备菜单可为已保存或最近设备填写 MAC：默认向 `255.255.255.255:9` 发送 102 字节魔法包；勾选“通过连接服务转发”时改为 `POST /v1/hosts/{id}/wake`，由目标链路上带 `--wake-relay` 的主机代理在注册续期时取走作业并代发。MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
 | `PeerDiscovery` 局域网发现 | `chast-tunnel host --lan-discovery` + `chast-tunnel discover` | 主机在 UDP 21129 应答 `CHASTL1` ping，返回 ID/主机名/用户名/平台/版本/MAC；`discover` 向受限广播、各网卡定向广播与回环探测，并按 ID 合并同一主机的多个来源地址。无认证、只暴露展示元数据、不授权连接；主机侧默认开启，可 `--lan-discovery=false` 关闭 |
 | `SoftwareUpdate` | `--software-version`/`--software-url`（+ 可选 `--software-dir`）+ `chast-tunnel host --auto-update` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；设置 `--software-dir` 时由服务端在 `/software/{name}` 只读托管发布文件，并在通告中附 SHA-256、大小与服务器 Ed25519 签名；主机代理可固定服务器公钥后自动校验、暂存并启动安装器，未开启时只记提示；查看器固定服务器身份后可“下载并安装”，由随包 `chast-tunnel apply-update` 在查看器退出后换入并重启 |
 | `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 交换观察到的公网地址并让双方互发探针 |
@@ -458,9 +458,17 @@ Authorization: Bearer <account token>
 设备菜单“唤醒”向同网段广播 Wake-on-LAN 魔法包（6 个 `0xFF` 后跟 16 份
 MAC），目标端口 9。MAC 接受 `AA:BB:CC:DD:EE:FF`、`AA-BB-...` 与无分隔的
 12 位十六进制，保存前统一成大写冒号格式；无效输入清空已存地址。MAC 只保存在
-本地 `devices.json`，不上传账号地址簿。该功能要求查看器与目标处于同一广播域、
-目标网卡与固件已开启 WOL，且不使用中继或跨网段；查看器不会绕过主机权限或
-代替远程开机流程。
+本地 `devices.json`，不上传账号地址簿。同网段直发要求查看器与目标处于同一
+广播域、目标网卡与固件已开启 WOL。
+
+跨子网时勾选“通过连接服务转发”，查看器改为
+`POST /v1/hosts/{id}/wake`（`{"mac":"AA:BB:CC:DD:EE:FF"}`）。服务端把请求
+放入内存队列（作业 60 s 有效、每目标 30 s 冷却、最多 64 个作业），由带
+`--wake-relay` 的主机代理在注册续期时取走，并向受限广播与各网卡定向广播
+发送同样的 102 字节包；`--wake-targets` 可覆盖目标（逗号分隔的
+`host:port`，用于本机诊断）。鉴权接受 server-key 或账号令牌：管理员可唤醒
+任意在线目标，其他账号只能唤醒地址簿或共享地址簿内的目标；成功与冷却/队列
+拒绝都写入 `device_wake` 审计。查看器不会绕过主机权限或代替远程开机流程。
 
 `alias`/`tags` 只能由运营者经带 server-key 的 `PATCH` 或回环管理台维护；
 主机注册和续约不会改写它们，离线记录同样保留。账号令牌只解锁

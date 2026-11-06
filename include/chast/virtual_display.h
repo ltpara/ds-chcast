@@ -82,6 +82,15 @@ VirtualDisplayStatus classify_virtual_display_probe(const VirtualDisplayProbe& p
 VirtualDisplayProbe probe_virtual_display();
 VirtualDisplayProviderKind detect_virtual_display_provider();
 
+// Resolve a CCD monitor interface through its PnP ancestry. Friendly names
+// are deliberately excluded from provider identity checks.
+bool is_usbmmidd_monitor(const std::wstring& monitor_interface);
+std::wstring virtual_display_device_name(const std::wstring& monitor_interface);
+bool virtual_display_privacy_busy();
+// Attach already plugged-in usbmmidd outputs without changing physical
+// outputs. Used after privacy restored a topology that predates the monitor.
+bool attach_virtual_display_outputs(uint32_t count, std::string* error);
+
 // Exact resolution first, then the nearest aspect ratio, then the nearest
 // area. An empty list yields the 1920x1080 fallback.
 VirtualDisplayMode select_virtual_display_mode(const std::vector<VirtualDisplayMode>& modes,
@@ -290,6 +299,12 @@ bool virtual_display_state_directory_trusted();
 // DACL and an Administrators owner, then atomically replaces the record. The
 // state directory must already be hardened.
 bool write_install_record(const VirtualDisplayInstallRecord& record, std::string* error);
+
+// Persist ownership before enabling monitors. A failed enable keeps the
+// record available for retry/uninstall; a failed write prevents activation.
+int finish_virtual_display_install(VirtualDisplayProvider& provider,
+                                   VirtualDisplayInstallRecord record, uint32_t count,
+                                   std::string* error);
 
 enum class VdisplayAction {
     None,

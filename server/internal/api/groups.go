@@ -116,7 +116,7 @@ func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID stri
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return account.User{}, "", false
 	}
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		return account.User{}, "server-key", true
 	}
 	token, ok := bearerToken(r)
@@ -162,7 +162,7 @@ func (s *server) auditGroupFilter(w http.ResponseWriter, r *http.Request) (strin
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return "", false
 	}
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		return groupID, true
 	}
 	token, ok := bearerToken(r)
@@ -199,7 +199,7 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 		user       account.User
 		globalPerm = consolePermission(-1)
 	)
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		globalPerm = consoleAdmin
 	} else {
 		token, ok := bearerToken(r)

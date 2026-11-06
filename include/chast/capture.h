@@ -270,6 +270,13 @@ std::unique_ptr<IDxgiCapturer> create_capturer(const DisplayInfo& display,
                                                const CaptureConfig& config,
                                                std::string* error = nullptr);
 
+// Concurrent viewers share one desktop duplication per output. Each reader
+// owns GPU textures and an independent NV12 scaler; no pixels enter sysmem.
+std::unique_ptr<IDxgiCapturer> create_shared_capturer(size_t display_index,
+    const CaptureConfig& config, std::string* error = nullptr);
+std::unique_ptr<IDxgiCapturer> create_shared_capturer(const DisplayInfo& display,
+    const CaptureConfig& config, std::string* error = nullptr);
+
 // Creates a capturer that lays every display out in virtual-desktop order and
 // publishes the union as one picture. All displays must be on the same
 // adapter: their frames are copied into one canvas on that adapter's device,

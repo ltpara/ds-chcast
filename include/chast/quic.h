@@ -606,6 +606,25 @@ public:
     // Answers a RemoteConfigRequest with the switch state now stored on the
     // host. A non-Ok code must carry flags=0; the maker refuses anything else.
     Error send_remote_config_state(const RemoteConfigState& state);
+    // Pops the newest DisplayControl request. Only the newest is kept: a
+    // viewer that toggles several outputs in a row wants the final topology.
+    // The host checks the permissions itself so a refusal still gets an
+    // answer, then replies with send_display_control_state().
+    bool take_display_control_request(DisplayControlRequest& request);
+    // Number of DisplayControl requests received. Observation hook for tools
+    // and the host's own counters.
+    uint64_t display_control_requests() const;
+    // Answers a DisplayControl request with the state now in effect. The
+    // maker refuses more than four outputs, duplicate ids and an unknown code.
+    Error send_display_control_state(const DisplayControlState& state);
+    // Asks the host for its display state or to change it. Returns
+    // PermissionDenied for a desktop action when the host did not grant the
+    // privacy permission; Query and Restore need no permission so a viewer can
+    // always read the state and undo its own change after a revocation.
+    Error request_display_control(const DisplayControlRequest& request);
+    // Pops the newest DisplayControlState. The host sends it as the answer and
+    // unsolicited when it releases a topology itself.
+    bool take_display_control_state(DisplayControlState& state);
     // Releases anything the viewer still holds, then types the password and
     // Return through the server's input injector. The injection thread checks
     // the input desktop before applying, but the caller must still confirm the

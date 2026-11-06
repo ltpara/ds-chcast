@@ -1836,6 +1836,80 @@ void test_display_modes() {
           "DisplayModeResult with trailing bytes is rejected");
 }
 
+void test_display_control() {
+    chast::DisplayControlRequest request;
+    for (const auto action : {chast::DisplayControlAction::Query,
+                              chast::DisplayControlAction::SetCount,
+                              chast::DisplayControlAction::Restore,
+                              chast::DisplayControlAction::SelectPrivacy}) {
+        const uint8_t value = action == chast::DisplayControlAction::SetCount ? 4 : 0;
+        check(chast::parse_display_control(
+                  payload_of(chast::make_display_control({action, value})), request) &&
+                  request.action == action && request.value == value,
+              "display control request round-trips");
+    }
+    for (const std::vector<uint8_t> invalid :
+         {std::vector<uint8_t>{}, {4, 0}, {1, 5}, {3, 2}, {0, 1}, {2, 1}, {1}, {1, 1, 0}}) {
+        check(!chast::parse_display_control(invalid, request),
+              "invalid display action/value/length rejected");
+    }
+    chast::DisplayControlState state{true, true, 4, chast::PrivacyImplementation::VirtualDisplay,
+                                     chast::DisplayControlCode::Failed, "GPU preflight failed"};
+    chast::DisplayControlState decoded;
+    state.outputs = {{31, true}, {7, false}};
+    check(chast::parse_display_control(payload_of(chast::make_display_control(
+              {chast::DisplayControlAction::ToggleOutput, 0, 31})),
+              request) &&
+              request.target == 31 && request.value == 0,
+          "targeted display request carries a stable identity");
+    check(chast::make_display_control({chast::DisplayControlAction::ToggleOutput, 1, 0}).empty() &&
+              chast::make_display_control({chast::DisplayControlAction::SetCount, 1, 31}).empty(),
+          "target is required only for a targeted action");
+    for (const std::vector<uint8_t> invalid :
+         {std::vector<uint8_t>{5, 0, 0, 0, 0, 0}, {1, 5, 0, 0, 0, 0}, {3, 2, 0, 0, 0, 0},
+          {0, 1, 0, 0, 0, 0}, {2, 1, 0, 0, 0, 0}, {4, 2, 1, 0, 0, 0}}) {
+        check(!chast::parse_display_control(invalid, request),
+              "invalid six-byte display request rejected");
+    }
+    const auto payload = payload_of(chast::make_display_control_state(state));
+    check(chast::parse_display_control_state(payload, decoded) && decoded.supported &&
+              decoded.managed && decoded.count == 4 && decoded.privacy == state.privacy &&
+              decoded.code == state.code && decoded.reason == state.reason,
+          "display result preserves the actual layout and failure");
+    check(decoded.outputs.size() == 2 && decoded.outputs[0].id == 31 &&
+              decoded.outputs[0].active && decoded.outputs[1].id == 7 &&
+              !decoded.outputs[1].active,
+          "display identity list survives reordering");
+    auto duplicate = state;
+    duplicate.outputs[1].id = 31;
+    check(chast::make_display_control_state(duplicate).empty(),
+          "encoder rejects duplicate output identities");
+    auto bad_output = payload;
+    const size_t entry = 8 + state.reason.size();
+    std::copy(bad_output.begin() + entry, bad_output.begin() + entry + 4,
+              bad_output.begin() + entry + 5);
+    check(!chast::parse_display_control_state(bad_output, decoded),
+          "decoder rejects duplicate output identities");
+    bad_output = payload;
+    bad_output[entry + 4] = 2;
+    check(!chast::parse_display_control_state(bad_output, decoded),
+          "decoder rejects an invalid output activation flag");
+    for (size_t field = 0; field < 5; ++field) {
+        auto invalid = payload;
+        invalid[field] = 255;
+        check(!chast::parse_display_control_state(invalid, decoded),
+              "invalid display state field rejected");
+    }
+    auto invalid = payload;
+    invalid.push_back(0);
+    check(!chast::parse_display_control_state(invalid, decoded),
+          "trailing display state data rejected");
+    invalid = payload;
+    invalid[7] = 255;
+    check(!chast::parse_display_control_state(invalid, decoded),
+          "malformed display UTF-8 rejected");
+}
+
 void test_frame_header() {
     chast::FrameHeader sent;
     sent.seq = 42;
@@ -3128,6 +3202,32 @@ void test_input_events() {
           "pen event keeps its button flags");
     check(got.pen.tilt_x == -45 && got.pen.tilt_y == 30, "pen event keeps signed tilt");
 
+    chast::InputEvent pan;
+    pan.kind = chast::InputKind::Gesture;
+    pan.gesture.action = chast::GestureAction::Pan;
+    pan.gesture.x = -120;
+    pan.gesture.y = 240;
+    pan.modifiers = chast::kModifierLeftShift;
+    check(chast::parse_input_event(payload_of(chast::make_input_event(pan)), got, &error),
+          "pan gesture round-trips");
+    check(got.kind == chast::InputKind::Gesture &&
+              got.gesture.action == chast::GestureAction::Pan,
+          "pan gesture keeps kind and action");
+    check(got.gesture.x == -120 && got.gesture.y == 240,
+          "pan gesture keeps both signed deltas");
+    check(got.modifiers == chast::kModifierLeftShift, "pan gesture keeps the input state");
+
+    chast::InputEvent zoom;
+    zoom.kind = chast::InputKind::Gesture;
+    zoom.gesture.action = chast::GestureAction::Zoom;
+    zoom.gesture.y = -120;
+    check(chast::parse_input_event(payload_of(chast::make_input_event(zoom)), got, &error),
+          "zoom gesture round-trips");
+    check(got.kind == chast::InputKind::Gesture &&
+              got.gesture.action == chast::GestureAction::Zoom && got.gesture.x == 0 &&
+              got.gesture.y == -120,
+          "zoom gesture keeps a vertical-only delta");
+
     auto rejects = [&](std::vector<uint8_t> payload, const char* what) {
         chast::InputEvent dropped;
         check(!chast::parse_input_event(payload, dropped, &error), what);
@@ -3187,6 +3287,31 @@ void test_input_events() {
     std::vector<uint8_t> key_buttons = payload_of(chast::make_input_event(key));
     key_buttons[2] = 1;
     rejects(key_buttons, "key event carrying mouse buttons is rejected");
+
+    const std::vector<uint8_t> pan_body = payload_of(chast::make_input_event(pan));
+    std::vector<uint8_t> pan_action = pan_body;
+    pan_action[1] = 2;
+    rejects(pan_action, "unknown gesture action is rejected");
+    std::vector<uint8_t> empty_gesture = pan_body;
+    empty_gesture[4] = empty_gesture[5] = empty_gesture[6] = empty_gesture[7] = 0;
+    empty_gesture[8] = empty_gesture[9] = empty_gesture[10] = empty_gesture[11] = 0;
+    rejects(empty_gesture, "gesture without a delta is rejected");
+    std::vector<uint8_t> pan_too_far = pan_body;
+    pan_too_far[4] = static_cast<uint8_t>(chast::kMaxGestureDelta + 1);
+    pan_too_far[5] = static_cast<uint8_t>((chast::kMaxGestureDelta + 1) >> 8);
+    pan_too_far[6] = 0;
+    pan_too_far[7] = 0;
+    rejects(pan_too_far, "gesture delta past the limit is rejected");
+    const std::vector<uint8_t> zoom_body = payload_of(chast::make_input_event(zoom));
+    std::vector<uint8_t> zoom_horizontal = zoom_body;
+    zoom_horizontal[4] = 120;
+    rejects(zoom_horizontal, "zoom gesture with a horizontal delta is rejected");
+    std::vector<uint8_t> gesture_buttons = pan_body;
+    gesture_buttons[2] = 1;
+    rejects(gesture_buttons, "gesture carrying mouse buttons is rejected");
+    std::vector<uint8_t> gesture_pressure = pan_body;
+    gesture_pressure[16] = 1;
+    rejects(gesture_pressure, "gesture carrying touch pressure is rejected");
 
     chast::ClientStats stats;
     stats.received = 10;
@@ -3327,6 +3452,40 @@ void test_injector_dry_run() {
             fixture.injector->stop();
             check(fixture.injector->stats().lock_toggles == 0,
                   "an already matching lock state is left alone");
+        }
+    }
+
+    // A pinch becomes one Ctrl+wheel chord and leaves no Ctrl behind: the
+    // trailing release is part of the three injections, not a stop() extra.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            chast::InputEvent gesture;
+            gesture.kind = chast::InputKind::Gesture;
+            gesture.gesture.action = chast::GestureAction::Zoom;
+            gesture.gesture.y = 240;
+            fixture.injector->submit(gesture);
+            fixture.injector->stop();
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 3 && stats.rejected == 0 && stats.failed == 0,
+                  "a pinch is a Ctrl press, one wheel step and a Ctrl release");
+        }
+    }
+
+    // A two-finger pan is two wheel steps on the axes it moved.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            chast::InputEvent gesture;
+            gesture.kind = chast::InputKind::Gesture;
+            gesture.gesture.action = chast::GestureAction::Pan;
+            gesture.gesture.x = -120;
+            gesture.gesture.y = 240;
+            fixture.injector->submit(gesture);
+            fixture.injector->stop();
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 2 && stats.rejected == 0 && stats.failed == 0,
+                  "a pan is one horizontal and one vertical wheel step");
         }
     }
 
@@ -4216,6 +4375,7 @@ int main(int argc, char** argv) {
     test_display_switch();
     test_display_follow();
     test_display_modes();
+    test_display_control();
     test_file_transfer();
     test_file_browser();
     test_clipboard_container();

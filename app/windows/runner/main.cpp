@@ -2,8 +2,23 @@
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
 
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "flutter_window.h"
 #include "utils.h"
+
+namespace {
+
+// Keep these in sync with the Dart-side request encoder.
+constexpr size_t kMaxSessionWindows = 16;
+constexpr size_t kMaxSessionRequestBytes = 1024 * 1024;
+
+}  // namespace
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
@@ -24,19 +39,57 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
 
-  FlutterWindow window(project);
+  std::vector<std::unique_ptr<FlutterWindow>> windows;
+
+  // Session windows receive their connection request through an in-process
+  // Dart entrypoint argument, so credentials never reach the process command
+  // line or a temporary file.
+  std::function<bool(const std::string&)> open_window;
+  open_window = [&windows, &open_window](const std::string& request) {
+    if (windows.size() >= kMaxSessionWindows ||
+        request.size() > kMaxSessionRequestBytes) {
+      return false;
+    }
+    flutter::DartProject session_project(L"data");
+    session_project.set_dart_entrypoint_arguments({"--session-window", request});
+    auto window = std::make_unique<FlutterWindow>(session_project, open_window);
+    const unsigned int offset =
+        static_cast<unsigned int>(windows.size() % 8) * 28;
+    Win32Window::Point origin(100 + offset, 80 + offset);
+    Win32Window::Size size(1120, 720);
+    if (!window->Create(L"Chast", origin, size)) {
+      return false;
+    }
+    window->SetQuitOnClose(false);
+    windows.push_back(std::move(window));
+    return true;
+  };
+
+  auto window = std::make_unique<FlutterWindow>(project, open_window);
   Win32Window::Point origin(80, 60);
   Win32Window::Size size(1120, 720);
-  if (!window.Create(L"Chast", origin, size)) {
+  if (!window->Create(L"Chast", origin, size)) {
     return EXIT_FAILURE;
   }
-  window.SetQuitOnClose(true);
+  window->SetQuitOnClose(false);
+  windows.push_back(std::move(window));
 
   ::MSG msg;
   while (::GetMessage(&msg, nullptr, 0, 0)) {
     ::TranslateMessage(&msg);
     ::DispatchMessage(&msg);
+    windows.erase(
+        std::remove_if(windows.begin(), windows.end(),
+                       [](const std::unique_ptr<FlutterWindow>& window) {
+                         return window->GetHandle() == nullptr;
+                       }),
+        windows.end());
+    if (windows.empty()) {
+      break;
+    }
   }
+
+  windows.clear();
 
   ::CoUninitialize();
   return EXIT_SUCCESS;

@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'store_lock.dart';
+
 /// Returns the canonical 64 uppercase hex digits of a SHA-256 fingerprint, or
 /// an empty string when [text] is not one. Colons, whitespace and lower case
 /// are accepted so fingerprints copied from a log or a server banner work.
@@ -39,29 +41,31 @@ class TrustStore {
   }
 
   Future<Map<String, String>> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return <String, String>{};
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map) {
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
         return <String, String>{};
       }
-      final Map<String, String> entries = <String, String>{};
-      decoded.forEach((Object? key, Object? value) {
-        if (key is! String || value is! String) {
-          return;
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is! Map) {
+          return <String, String>{};
         }
-        final String fingerprint = normalizeFingerprint(value);
-        if (key.isNotEmpty && fingerprint.isNotEmpty) {
-          entries[key] = fingerprint;
-        }
-      });
-      return entries;
-    } catch (_) {
-      return <String, String>{};
-    }
+        final Map<String, String> entries = <String, String>{};
+        decoded.forEach((Object? key, Object? value) {
+          if (key is! String || value is! String) {
+            return;
+          }
+          final String fingerprint = normalizeFingerprint(value);
+          if (key.isNotEmpty && fingerprint.isNotEmpty) {
+            entries[key] = fingerprint;
+          }
+        });
+        return entries;
+      } catch (_) {
+        return <String, String>{};
+      }
+    });
   }
 
   Future<String> fingerprintFor(String target) async {
@@ -73,20 +77,24 @@ class TrustStore {
   /// the store could not be written; callers must not treat the value as
   /// pinned in that case.
   Future<String> trust(String target, String fingerprint) async {
-    final String canonical = normalizeFingerprint(fingerprint);
-    if (target.isEmpty || canonical.isEmpty) {
-      return '';
-    }
-    final Map<String, String> entries = await load();
-    entries[target] = canonical;
-    return await _save(entries) ? canonical : '';
+    return withStoreLock(_file(), () async {
+      final String canonical = normalizeFingerprint(fingerprint);
+      if (target.isEmpty || canonical.isEmpty) {
+        return '';
+      }
+      final Map<String, String> entries = await load();
+      entries[target] = canonical;
+      return await _save(entries) ? canonical : '';
+    });
   }
 
   Future<void> forget(String target) async {
-    final Map<String, String> entries = await load();
-    if (entries.remove(target) != null) {
-      await _save(entries);
-    }
+    return withStoreLock(_file(), () async {
+      final Map<String, String> entries = await load();
+      if (entries.remove(target) != null) {
+        await _save(entries);
+      }
+    });
   }
 
   /// Writes through a temp file and an atomic rename so a crash or a full disk

@@ -14,6 +14,10 @@ enum ViewFit { adaptive, original }
 typedef FramePointerHandler = void Function(Offset position, int buttons);
 typedef FrameButtonHandler = void Function(Offset position, int button, bool down);
 typedef FrameScrollHandler = void Function(Offset position, Offset delta);
+/// Precision-touchpad pan or pinch. Deltas are WHEEL_DELTA units (120 per
+/// notch); zoom uses only [deltaY] and is a complete Ctrl+wheel chord.
+typedef FrameGestureHandler =
+    void Function(Offset position, bool zoom, int deltaX, int deltaY);
 /// Touch and stylus events, which carry pressure and tilt the mouse path does
 /// not model.
 typedef FrameDeviceHandler = void Function(PointerEvent event, Offset position);
@@ -69,6 +73,7 @@ class RemoteView extends StatefulWidget {
     this.onMove,
     this.onButton,
     this.onScroll,
+    this.onGesture,
     this.onDevicePointer,
     this.onDeviceCancel,
     this.onFocusRequested,
@@ -106,6 +111,7 @@ class RemoteView extends StatefulWidget {
   final FramePointerHandler? onMove;
   final FrameButtonHandler? onButton;
   final FrameScrollHandler? onScroll;
+  final FrameGestureHandler? onGesture;
 
   /// Receives every touch or stylus down/move/up; [onDeviceCancel] receives a
   /// cancelled contact. Hover events are not forwarded because a floating pen
@@ -128,6 +134,12 @@ class _RemoteViewState extends State<RemoteView> {
   int _buttons = 0;
   Offset _lastFrame = Offset.zero;
   double? _reportedScale;
+  int? _panZoomPointer;
+  double _panZoomScale = 1;
+  double _gestureX = 0;
+  double _gestureY = 0;
+  double _gestureZoom = 0;
+  bool _zooming = false;
 
   @override
   void dispose() {
@@ -163,6 +175,8 @@ class _RemoteViewState extends State<RemoteView> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.captureInput && !widget.captureInput) {
       _releaseButtons();
+      _panZoomPointer = null;
+      _resetGesture();
     }
   }
 
@@ -215,6 +229,46 @@ class _RemoteViewState extends State<RemoteView> {
     return event.kind == PointerDeviceKind.touch ||
         event.kind == PointerDeviceKind.stylus ||
         event.kind == PointerDeviceKind.invertedStylus;
+  }
+
+  void _resetGesture() {
+    _gestureX = _gestureY = _gestureZoom = 0;
+    _panZoomScale = 1;
+    _zooming = false;
+  }
+
+  void _gesture(Offset position, Offset pan, double scale) {
+    if (!pan.dx.isFinite || !pan.dy.isFinite || !scale.isFinite || scale <= 0) {
+      return;
+    }
+    _gestureZoom += math.log(scale.clamp(0.25, 4)) / math.log(1.1) * 120;
+    // Ignore small span noise during a two-finger pan.
+    if (_gestureZoom.abs() >= 60) _zooming = true;
+    if (_zooming) {
+      // Accumulate small pinch updates: roughly ten percent is one zoom step.
+      // Once a gesture becomes a pinch, centroid drift must not also scroll.
+      final int steps = (_gestureZoom / 120).truncate();
+      if (steps != 0) {
+        _gestureZoom -= steps * 120;
+        widget.onGesture?.call(position, true, 0, steps.clamp(-10, 10) * 120);
+      }
+      return;
+    }
+    // Direct manipulation follows the fingers, the opposite of scrollDelta.
+    _gestureX -= pan.dx * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
+    _gestureY += pan.dy * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
+    final int x = _gestureX.truncate();
+    final int y = _gestureY.truncate();
+    _gestureX -= x;
+    _gestureY -= y;
+    if (x != 0 || y != 0) {
+      widget.onGesture?.call(
+        position,
+        false,
+        x.clamp(-1200, 1200),
+        y.clamp(-1200, 1200),
+      );
+    }
   }
 
   Widget _layer(Size box) {
@@ -274,6 +328,30 @@ class _RemoteViewState extends State<RemoteView> {
             return;
           }
           _syncButtons(0, position);
+        },
+        onPointerPanZoomStart: (PointerPanZoomStartEvent event) {
+          widget.onFocusRequested?.call();
+          _releaseButtons();
+          _panZoomPointer = event.pointer;
+          _resetGesture();
+        },
+        onPointerPanZoomUpdate: (PointerPanZoomUpdateEvent event) {
+          if (_panZoomPointer != event.pointer ||
+              !event.scale.isFinite ||
+              event.scale <= 0) {
+            return;
+          }
+          _gesture(
+            _toFrame(event.localPosition, box),
+            event.localPanDelta,
+            event.scale / _panZoomScale,
+          );
+          _panZoomScale = event.scale;
+        },
+        onPointerPanZoomEnd: (PointerPanZoomEndEvent event) {
+          if (_panZoomPointer != event.pointer) return;
+          _panZoomPointer = null;
+          _resetGesture();
         },
         onPointerSignal: (PointerSignalEvent event) {
           if (event is PointerScrollEvent) {

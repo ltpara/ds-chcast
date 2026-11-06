@@ -27,7 +27,9 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 	"github.com/ltpara/ds-chcast/server/internal/updater"
 	"github.com/ltpara/ds-chcast/server/internal/upnp"
+	"github.com/ltpara/ds-chcast/server/internal/wake"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
+	"github.com/ltpara/ds-chcast/server/internal/wol"
 )
 
 type HostConfig struct {
@@ -84,6 +86,14 @@ type HostConfig struct {
 	// UpdateDir is where the installer is staged. Empty uses an "updates"
 	// directory beside the agent executable, which inherits its ACL.
 	UpdateDir string
+	// WakeRelay makes this agent a cross-subnet Wake-on-LAN proxy: jobs queued
+	// by the server for any target are broadcast on this machine's link. It is
+	// opt-in because it sends packets to addresses outside this host.
+	WakeRelay bool
+	// WakeTargets overrides the broadcast destinations for diagnostics (for
+	// example 127.0.0.1:9 to observe the packet locally). Empty uses the
+	// limited broadcast plus each interface's directed broadcast.
+	WakeTargets []string
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
 	// goroutine, so it must not block.
@@ -113,7 +123,8 @@ type HostInfo struct {
 }
 
 type HostAgent struct {
-	cfg HostConfig
+	routes localRoutes
+	cfg    HostConfig
 	// conn carries rendezvous, relay and viewer traffic; localOut exists only
 	// when the local control address needs the other address family.
 	conn         *net.UDPConn
@@ -160,6 +171,9 @@ type HostAgent struct {
 	// updatesTried keeps the versions this process already staged or
 	// rejected, so a flapping server cannot loop the download.
 	updatesTried map[string]bool
+	// wakeSeen remembers relayed wake job ids so a duplicate delivery from a
+	// restarted or failed-over server does not broadcast twice.
+	wakeSeen map[string]bool
 	// observedPunch and observedRelay are this host's public mappings as seen
 	// by the rendezvous port and by its relay port. Comparing them classifies
 	// the NAT without a second server.
@@ -381,6 +395,7 @@ func (h *HostAgent) reportInfo() {
 }
 
 func (h *HostAgent) Close() {
+	h.routes.close()
 	h.cancel()
 	h.conn.Close()
 	if h.localOut != nil {
@@ -541,6 +556,7 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.softwareSeen = ""
 	}
 	h.mu.Unlock()
+	h.relayWakeJobs(reg.Wake)
 	if notice != nil {
 		h.log.Info("software update available",
 			"version", notice.Version, "current", Version, "url", notice.URL)
@@ -613,6 +629,42 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 		}
 		h.log.Info("software update installer started", "version", notice.Version, "path", path)
 	}()
+}
+
+// relayWakeJobs broadcasts queued Wake-on-LAN jobs on this machine's link. The
+// server already delivers each job once per agent, so the local set of seen ids
+// only guards against a duplicate after a server failover or restart. A relay
+// failure is logged and the job dropped: the request already returned 202 and
+// the target's MAC does not change, so the caller can simply retry later.
+func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
+	if !h.cfg.WakeRelay || len(jobs) == 0 {
+		return
+	}
+	targets := h.cfg.WakeTargets
+	if len(targets) == 0 {
+		targets = wol.Targets(wol.Port)
+	}
+	for _, job := range jobs {
+		h.mu.Lock()
+		seen := h.wakeSeen[job.ID]
+		if !seen {
+			if h.wakeSeen == nil || len(h.wakeSeen) >= 512 {
+				h.wakeSeen = make(map[string]bool)
+			}
+			h.wakeSeen[job.ID] = true
+		}
+		h.mu.Unlock()
+		if seen {
+			continue
+		}
+		sent, err := wol.SendTo(job.MAC, targets)
+		if err != nil {
+			h.log.Warn("wake relay failed", "target", job.Target, "mac", job.MAC, "error", err)
+			continue
+		}
+		h.log.Info("wake relayed", "target", job.Target, "mac", job.MAC,
+			"packets", sent, "job", job.ID)
+	}
 }
 
 func (h *HostAgent) getPunch() *net.UDPAddr {
@@ -805,11 +857,26 @@ func (h *HostAgent) readLoop() {
 			continue
 		}
 		h.noteViewer(src)
-		if h.localOut != nil {
-			h.localOut.WriteToUDP(data, h.local)
-		} else {
-			h.conn.WriteToUDP(data, h.local)
+		route := src.String()
+		id, payload, multiplex := carrier.DecodeMux(data)
+		if multiplex {
+			if !h.relayAllowed(src) {
+				continue
+			}
+			route += "/" + strconv.FormatUint(id, 10)
+			data = payload
 		}
+		peer := cloneAddr(src)
+		_ = h.routes.forward(route, h.local, data, func(reply []byte) error {
+			if multiplex {
+				reply = carrier.EncodeMux(id, reply)
+			}
+			if len(reply) == 0 {
+				return nil
+			}
+			_, err := h.conn.WriteToUDP(reply, peer)
+			return err
+		})
 	}
 }
 
@@ -940,10 +1007,15 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 			msg.Candidate == "" || msg.Nonce == "" {
 			return
 		}
-		signature := identity.Sign(h.priv, identity.RelayMessage(h.cfg.ID, src.Port, msg.Candidate, msg.Nonce))
+		candidate := msg.Candidate
+		if msg.Multiplex {
+			candidate += "\nMUX1"
+		}
+		signature := identity.Sign(h.priv, identity.RelayMessage(h.cfg.ID, src.Port, candidate, msg.Nonce))
 		h.noteObserved(false, msg.Candidate)
 		h.conn.WriteToUDP(wire.Encode(wire.Message{
 			Type:      wire.TypeRelayAuth,
+			Multiplex: msg.Multiplex,
 			HostID:    h.cfg.ID,
 			Nonce:     msg.Nonce,
 			Candidate: msg.Candidate,
@@ -1011,7 +1083,7 @@ func (h *HostAgent) relayHelloLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	send := func() {
-		raw := wire.Encode(wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID})
+		raw := wire.Encode(wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID, Multiplex: true})
 		// Every advertised endpoint is a way into the same lease. A dual-stack
 		// host authenticates on each family so a viewer can pick either one.
 		for _, relay := range h.relayEndpoints() {
@@ -1146,7 +1218,7 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	hello, err := json.Marshal(carrier.HostHello{HostID: h.cfg.ID})
+	hello, err := json.Marshal(carrier.HostHello{HostID: h.cfg.ID, Multiplex: true})
 	if err != nil {
 		return false, err
 	}
@@ -1166,10 +1238,15 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	if err := json.Unmarshal([]byte(challengeText), &challenge); err != nil || challenge.Nonce == "" {
 		return false, fmt.Errorf("relay carrier sent a malformed challenge")
 	}
+	capability := ""
+	if challenge.Multiplex {
+		capability = "MUX1"
+	}
 	auth, err := json.Marshal(carrier.HostAuth{
+		Multiplex: challenge.Multiplex,
 		HostID:    h.cfg.ID,
 		Nonce:     challenge.Nonce,
-		Signature: identity.Sign(h.priv, identity.CarrierHostMessage(h.cfg.ID, "", challenge.Nonce)),
+		Signature: identity.Sign(h.priv, identity.CarrierHostMessage(h.cfg.ID, capability, challenge.Nonce)),
 	})
 	if err != nil {
 		return false, err
@@ -1193,6 +1270,10 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	relaySend := carrier.NewFrameWriter(conn)
 
 	h.carrierOnce.Do(func() { close(h.carrierReady) })
+	if challenge.Multiplex {
+		local.Close()
+		return true, h.runMuxCarrier(conn, relayFrames, relaySend, relayAddr)
+	}
 	h.log.Info("carrier link established", "relay", relayAddr, "local", h.carrier.String())
 	defer h.log.Info("carrier link closed", "relay", relayAddr)
 

@@ -151,6 +151,9 @@ struct HostServerStats {
     uint64_t host_actions = 0;
     uint64_t host_action_failures = 0;
     bool block_input_active = false;
+    // Sessions the host closed itself after the configured idle timeout ran
+    // out. Zero while auto-disconnect is off or the viewer keeps interacting.
+    uint64_t idle_disconnects = 0;
     // OS login (protocol v39): passwords typed at the host's logon or lock
     // screen. `os_login_requests` counts every request, `os_login_failures`
     // the ones not answered Ok. The password itself is never kept here.
@@ -314,6 +317,10 @@ struct HostServerConfig {
     // waits are unlimited.
     uint32_t first_client_timeout_ms = 0;
     uint32_t finish_timeout_ms = 15000;
+    // Test hook: overrides settings.auto_disconnect_minutes when non-zero.
+    // A loopback check cannot wait whole minutes, and the session logic must
+    // still be the same one a configured host runs.
+    uint32_t auto_disconnect_ms = 0;
     // Consecutive open/session failures before the run gives up. 0 retries
     // forever: the service worker must survive a locked desktop, where
     // capture fails until the user unlocks.
@@ -561,6 +568,12 @@ private:
     void remember_local_clipboard();
     void apply_peer_clipboard(ClipboardContent content, HostServerStats& stats);
     void drain_peer(HostServerStats& stats);
+    // The configured idle timeout; zero disables auto-disconnect. The test
+    // hook wins over the persisted setting.
+    std::chrono::steady_clock::duration idle_disconnect_timeout() const;
+    long long idle_disconnect_seconds() const;
+    // A viewer request that counts as activity resets the idle clock.
+    void touch_viewer_activity();
     void poll_clipboard(std::chrono::steady_clock::time_point now, HostServerStats& stats);
     void stop_microphone(HostServerStats& stats, const std::string& reason);
     void drain_microphone(HostServerStats& stats);
@@ -677,6 +690,8 @@ private:
     std::unique_ptr<CarrierServer> carrier_;
     bool run_clock_started_ = false;
     std::chrono::steady_clock::time_point run_start_;
+    std::chrono::steady_clock::time_point last_viewer_activity_ =
+        std::chrono::steady_clock::now();
 
     // The operator download. Queued by the UI, hashed off the frame loop,
     // then offered and streamed from the host thread.

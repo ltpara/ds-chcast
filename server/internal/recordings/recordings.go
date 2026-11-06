@@ -24,7 +24,7 @@ import (
 var (
 	ErrEmpty    = errors.New("recording is empty")
 	ErrTooLarge = errors.New("recording exceeds the upload limit")
-	ErrQuota    = errors.New("account recording quota is exhausted")
+	ErrQuota    = account.ErrRecordingQuota
 )
 
 const (
@@ -100,7 +100,7 @@ func (a *Archive) Save(userID, name, peerID string, startedAtMS, durationMS int6
 		if err != nil {
 			return account.Recording{}, err
 		}
-		if used+sizeHint > a.quota {
+		if sizeHint > a.quota || used > a.quota-sizeHint {
 			return account.Recording{}, ErrQuota
 		}
 	}
@@ -138,15 +138,6 @@ func (a *Archive) Save(userID, name, peerID string, startedAtMS, durationMS int6
 	if err := file.Close(); err != nil {
 		return account.Recording{}, fmt.Errorf("recording upload: %w", err)
 	}
-	if a.quota > 0 {
-		used, _, err := a.accounts.RecordingUsage(userID)
-		if err != nil {
-			return account.Recording{}, err
-		}
-		if used+written > a.quota {
-			return account.Recording{}, ErrQuota
-		}
-	}
 	id, err := newID()
 	if err != nil {
 		return account.Recording{}, err
@@ -156,7 +147,7 @@ func (a *Archive) Save(userID, name, peerID string, startedAtMS, durationMS int6
 		return account.Recording{}, fmt.Errorf("recording store: %w", err)
 	}
 	keep = true
-	rec, err := a.accounts.AddRecording(account.Recording{
+	rec, err := a.accounts.AddRecordingWithQuota(account.Recording{
 		ID:          id,
 		UserID:      userID,
 		Name:        cleanName(name),
@@ -165,7 +156,7 @@ func (a *Archive) Save(userID, name, peerID string, startedAtMS, durationMS int6
 		SHA256:      hex.EncodeToString(hasher.Sum(nil)),
 		DurationMS:  max64(durationMS, 0),
 		StartedAtMS: max64(startedAtMS, 0),
-	})
+	}, a.quota)
 	if err != nil {
 		os.Remove(finalPath)
 		return account.Recording{}, err

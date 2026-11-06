@@ -339,6 +339,61 @@ void main() {
     );
   });
 
+  test('wake posts the MAC with the account token and accepts 202', () async {
+    String? method;
+    Uri? requested;
+    String? authorization;
+    String? contentType;
+    Map<String, Object?>? body;
+    server.listen((HttpRequest request) async {
+      method = request.method;
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      contentType = request.headers.contentType?.mimeType;
+      body =
+          jsonDecode(await utf8.decoder.bind(request).join())
+              as Map<String, Object?>;
+      request.response.statusCode = HttpStatus.accepted;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        '{"queued":true,"job":"abc","expires_in_sec":60}',
+      );
+      await request.response.close();
+    });
+
+    await ServerApi.wake(
+      settings,
+      ' account-token ',
+      ' targetbox ',
+      'AA:BB:CC:DD:EE:FF',
+    );
+    expect(method, 'POST');
+    expect(requested?.path, '/v1/hosts/targetbox/wake');
+    expect(authorization, 'Bearer account-token');
+    expect(contentType, 'application/json');
+    expect(body?['mac'], 'AA:BB:CC:DD:EE:FF');
+  });
+
+  test('wake reports a target outside the address book', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.forbidden;
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.wake(settings, 'token', 'targetbox', 'AA:BB:CC:DD:EE:FF'),
+      throwsA(
+        isA<ServerApiException>()
+            .having((ServerApiException e) => e.statusCode, 'statusCode', 403)
+            .having(
+              (ServerApiException e) => e.message,
+              'message',
+              contains('地址簿'),
+            ),
+      ),
+    );
+  });
+
   test('check treats an authorized 404 as a healthy service', () async {
     Uri? requested;
     server.listen((HttpRequest request) async {

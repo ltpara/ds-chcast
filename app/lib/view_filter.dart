@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'store_lock.dart';
+
 /// Persists small pieces of address-book UI state so a viewer comes back the
 /// way it was left: the tag filter applied to "我的设备", the collapsed state
 /// of address-book groups, and the search text of each address-book view. The
@@ -15,6 +17,7 @@ class ViewFilter {
   static const String _collapsedKey = 'collapsed';
   static const String _deviceSearchKey = 'search_devices';
   static const String _sharedSearchKey = 'search_shared';
+  static const String _favoritesOnlyKey = 'favoritesOnly';
 
   /// Redirects the filter file away from the real user profile in tests.
   @visibleForTesting
@@ -63,6 +66,16 @@ class ViewFilter {
     };
   }
 
+  /// Whether "我的设备" shows favorites only. Off removes the key so the
+  /// default file stays minimal.
+  static bool loadFavoritesOnly() {
+    return _readMap()[_favoritesOnlyKey] == true;
+  }
+
+  static void saveFavoritesOnly(bool enabled) {
+    _writeValue(_favoritesOnlyKey, enabled ? true : null);
+  }
+
   static Set<String> _clean(Object? raw, {required bool dropEmpty}) {
     if (raw is! Iterable) {
       return <String>{};
@@ -79,18 +92,20 @@ class ViewFilter {
     if (file == null) {
       return <String, Object?>{};
     }
-    try {
-      if (!file.existsSync()) {
-        return <String, Object?>{};
+    return withStoreLockSync(file, () {
+      try {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
+      } catch (_) {
+        // A corrupt settings file must not stop the viewer from starting.
       }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
-    } catch (_) {
-      // A corrupt settings file must not stop the viewer from starting.
-    }
-    return <String, Object?>{};
+      return <String, Object?>{};
+    });
   }
 
   static void _writeList(String key, List<String> values) {
@@ -102,18 +117,20 @@ class ViewFilter {
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap();
-    if (value == null) {
-      payload.remove(key);
-    } else {
-      payload[key] = value;
-    }
-    try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // View preferences; failing to persist them is not fatal.
-    }
+    withStoreLockSync(file, () {
+      final Map<String, Object?> payload = _readMap();
+      if (value == null) {
+        payload.remove(key);
+      } else {
+        payload[key] = value;
+      }
+      try {
+        file.parent.createSync(recursive: true);
+        file.writeAsStringSync(jsonEncode(payload));
+      } catch (_) {
+        // View preferences; failing to persist them is not fatal.
+      }
+    });
   }
 
   static File? _file() {

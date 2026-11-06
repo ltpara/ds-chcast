@@ -3,14 +3,22 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
+import 'deep_link.dart';
 import 'l10n.dart';
 import 'pages/home_page.dart';
+import 'pages/session_page.dart';
+import 'session_window.dart';
 import 'theme.dart';
 
 void main(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
   AppLanguage.load();
-  runApp(ChastApp(connectTarget: _connectTarget(args)));
+  runApp(
+    ChastApp(
+      initialConnection: parseLaunchArguments(args),
+      sessionWindow: SessionWindowRequest.fromArguments(args),
+    ),
+  );
   _markUpdateHealthy();
 }
 
@@ -33,23 +41,14 @@ void _markUpdateHealthy() {
   });
 }
 
-String? _connectTarget(List<String> args) {
-  for (int i = 0; i < args.length; ++i) {
-    final String arg = args[i];
-    if (arg == '--connect' && i + 1 < args.length) {
-      return args[i + 1];
-    }
-    if (arg.startsWith('--connect=')) {
-      return arg.substring('--connect='.length);
-    }
-  }
-  return null;
-}
-
 class ChastApp extends StatelessWidget {
-  const ChastApp({super.key, this.connectTarget});
+  const ChastApp({super.key, this.initialConnection, this.sessionWindow});
 
-  final String? connectTarget;
+  final DeepLinkRequest? initialConnection;
+
+  /// Non-null when this engine was started for [SessionWindowRequest.open];
+  /// the window shows that one session instead of the device list.
+  final SessionWindowRequest? sessionWindow;
 
   @override
   Widget build(BuildContext context) {
@@ -70,7 +69,22 @@ class ChastApp extends StatelessWidget {
           theme: buildChastTheme(Brightness.light),
           darkTheme: buildChastTheme(Brightness.dark),
           themeMode: ThemeMode.system,
-          home: HomePage(initialTarget: connectTarget),
+          home: sessionWindow != null
+              ? SessionPage(
+                  target: sessionWindow!.target,
+                  account: sessionWindow!.account,
+                  settings: sessionWindow!.settings,
+                  fileTransferOnly: sessionWindow!.filesOnly,
+                  sessionMode: sessionWindow!.sessionMode,
+                  rdpPort: sessionWindow!.rdpPort,
+                  windowSession: true,
+                  initialDisplay: sessionWindow!.display,
+                )
+              : HomePage(
+                  initialTarget: initialConnection?.target,
+                  initialFileTransferOnly:
+                      initialConnection?.fileTransferOnly ?? false,
+                ),
         );
       },
     );

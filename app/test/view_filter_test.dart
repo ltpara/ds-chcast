@@ -93,4 +93,19 @@ void main() {
     expect(saved.containsKey('search_shared'), isFalse);
     expect(ViewFilter.loadSearch(SearchView.shared), isEmpty);
   });
+
+  test('the favorites-only filter round-trips and clears its key', () {
+    expect(ViewFilter.loadFavoritesOnly(), isFalse);
+    ViewFilter.saveFavoritesOnly(true);
+    expect(ViewFilter.loadFavoritesOnly(), isTrue);
+
+    ViewFilter.save(<String>{'lab'});
+    expect(ViewFilter.loadFavoritesOnly(), isTrue);
+
+    ViewFilter.saveFavoritesOnly(false);
+    expect(ViewFilter.loadFavoritesOnly(), isFalse);
+    expect(jsonDecode(File(path).readAsStringSync()), <String, Object?>{
+      'tags': <String>['lab'],
+    });
+  });
 }

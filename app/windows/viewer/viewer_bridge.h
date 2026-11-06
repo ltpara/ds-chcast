@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -39,6 +40,11 @@ public:
     // Must run on the platform thread before the Flutter controller is
     // destroyed.
     void Shutdown();
+
+    // Set by the runner: starts another engine window for an encoded
+    // SessionWindowRequest. False means the caller should fall back to an
+    // in-process page.
+    std::function<bool(const std::string&)> open_session_window;
 
 private:
     void HandleMethodCall(
@@ -121,6 +127,11 @@ private:
     LONG_PTR saved_style_ = 0;
     WINDOWPLACEMENT saved_placement_{};
     bool shutting_down_ = false;
+    // With a page-installed close handler the window's X asks Dart to shut the
+    // session down first; the second WM_CLOSE arrives after that and closes
+    // for real.
+    bool window_close_handler_ = false;
+    bool window_close_requested_ = false;
 };
 
 }  // namespace chast_viewer

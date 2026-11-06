@@ -534,6 +534,9 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     }
     {
         std::lock_guard<std::mutex> lock(privacy_mutex_);
+        // A reused viewer starts with a display query: the toolbar needs the
+        // output list before the operator can ask for a change.
+        pending_display_control_ = chast::DisplayControlRequest{};
         pending_privacy_.reset();
     }
     // A SAS request queued for a session that ended must not fire into the
@@ -572,15 +575,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         received_chat_.clear();
         pending_text_.clear();
     }
-    // A console belongs to one session too; neither its commands nor its
+    // Consoles belong to one session too; neither their commands nor their
     // unread output may leak into the next connection.
     {
         std::lock_guard<std::mutex> lock(terminal_mutex_);
         pending_terminal_.clear();
-        pending_terminal_bytes_ = 0;
-        terminal_output_.clear();
-        terminal_output_bytes_ = 0;
-        terminal_output_ended_ = true;
+        terminals_ = {};
     }
     // A camera request belongs to one session; the host's ids are only valid
     // for its own list.
@@ -1403,6 +1403,34 @@ bool ViewerEngine::SetPrivacyMode(bool enabled) {
     return true;
 }
 
+bool ViewerEngine::ControlDisplays(chast::DisplayControlAction action, uint8_t value,
+                                   uint32_t target) {
+    const chast::DisplayControlRequest request{action, value, target};
+    if (chast::make_display_control(request).empty() ||
+        !running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const uint16_t need =
+            (action == chast::DisplayControlAction::SetCount ||
+             action == chast::DisplayControlAction::ToggleOutput)
+                ? chast::kPermissionPrivacyMode | chast::kPermissionInput
+                : chast::kPermissionPrivacyMode;
+        if (status_.state != ViewerState::kStreaming || status_.files_only ||
+            status_.display_control_busy ||
+            (action != chast::DisplayControlAction::Query &&
+             action != chast::DisplayControlAction::Restore &&
+             (status_.permissions & need) != need)) {
+            return false;
+        }
+        status_.display_control_busy = true;
+    }
+    std::lock_guard<std::mutex> lock(privacy_mutex_);
+    pending_display_control_ = request;
+    return true;
+}
+
 bool ViewerEngine::SendSas() {
     if (!running_.load(std::memory_order_acquire)) {
         return false;
@@ -1578,21 +1606,13 @@ bool ViewerEngine::TakeChat(std::string& text) {
 }
 
 bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
-                                uint32_t service_id) {
-    if (!chast::valid_terminal_size(columns, rows)) {
+                                uint32_t terminal_id, uint32_t service_id) {
+    if (terminal_id == 0 || terminal_id > chast::kMaxTerminals ||
+        !chast::valid_terminal_size(columns, rows)) {
         return false;
     }
     if (!running_.load(std::memory_order_acquire)) {
         return false;
-    }
-    {
-        std::lock_guard<std::mutex> lock(terminal_mutex_);
-        // The previous console's bytes must be on the panel before its phase
-        // can mean anything for a new one. Checked before the phase moves so a
-        // rejected open cannot leave kRequesting behind and lock out retries.
-        if (!terminal_output_ended_) {
-            return false;
-        }
     }
     uint8_t flags = 0;
     {
@@ -1605,20 +1625,6 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
         if (service_id != 0 && !status_.terminal_persist_supported) {
             return false;
         }
-        if (status_.terminal_phase == TerminalPhase::kRequesting ||
-            status_.terminal_phase == TerminalPhase::kOpen) {
-            return false;
-        }
-        status_.terminal_phase = TerminalPhase::kRequesting;
-        status_.terminal_code = 0;
-        status_.terminal_reason.clear();
-        status_.terminal_error.clear();
-        status_.terminal_columns = columns;
-        status_.terminal_rows = rows;
-        // The previous id says nothing about the console being opened now; a
-        // fresh one arrives with the host's answer.
-        status_.terminal_service_id = 0;
-        ++status_.terminal_updates;
         if (service_id != 0) {
             flags = chast::kTerminalRequestAttach;
         } else if (status_.terminal_persist_supported) {
@@ -1626,13 +1632,28 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
         }
     }
     std::lock_guard<std::mutex> lock(terminal_mutex_);
-    // Leftovers from the previous console would be printed as if they
-    // belonged to this one.
-    terminal_output_.clear();
-    terminal_output_bytes_ = 0;
-    terminal_output_ended_ = false;
+    TerminalChannel& channel = terminals_[terminal_id - 1];
+    // The previous console's bytes must be on the panel before its phase can
+    // mean anything for a new one. Checked before the phase moves so a
+    // rejected open cannot leave kRequesting behind and lock out retries.
+    if (!channel.ended || channel.status.phase == TerminalPhase::kRequesting ||
+        channel.status.phase == TerminalPhase::kOpen) {
+        return false;
+    }
+    // A fresh generation retires every command and reply that belonged to the
+    // previous console in this slot.
+    const uint64_t generation = channel.generation + 1;
+    channel = {};
+    channel.generation = generation;
+    channel.ended = false;
+    channel.status.phase = TerminalPhase::kRequesting;
+    channel.status.columns = columns;
+    channel.status.rows = rows;
+    ++channel.status.updates;
     TerminalCommand command;
     command.kind = TerminalCommand::Kind::kOpen;
+    command.slot = terminal_id - 1;
+    command.generation = generation;
     command.columns = columns;
     command.rows = rows;
     command.flags = flags;
@@ -1641,46 +1662,46 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
     return true;
 }
 
-bool ViewerEngine::SendTerminalInput(const std::string& bytes) {
-    if (bytes.empty() || !running_.load(std::memory_order_acquire)) {
+bool ViewerEngine::SendTerminalInput(const std::string& bytes,
+                                     uint32_t terminal_id) {
+    if (terminal_id == 0 || terminal_id > chast::kMaxTerminals || bytes.empty() ||
+        !running_.load(std::memory_order_acquire)) {
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.terminal_phase != TerminalPhase::kOpen) {
-            return false;
-        }
-    }
     std::lock_guard<std::mutex> lock(terminal_mutex_);
-    if (pending_terminal_bytes_ + bytes.size() >
-        chast::kTerminalInputHighWaterBytes) {
+    TerminalChannel& channel = terminals_[terminal_id - 1];
+    if (channel.status.phase != TerminalPhase::kOpen ||
+        bytes.size() > chast::kTerminalInputHighWaterBytes - channel.pending_bytes) {
         return false;
     }
     TerminalCommand command;
     command.kind = TerminalCommand::Kind::kInput;
+    command.slot = terminal_id - 1;
+    command.generation = channel.generation;
     command.bytes = bytes;
-    pending_terminal_bytes_ += command.bytes.size();
+    channel.pending_bytes += bytes.size();
     pending_terminal_.push_back(std::move(command));
     return true;
 }
 
-bool ViewerEngine::ResizeTerminal(uint16_t columns, uint16_t rows) {
-    if (!chast::valid_terminal_size(columns, rows) ||
+bool ViewerEngine::ResizeTerminal(uint16_t columns, uint16_t rows,
+                                  uint32_t terminal_id) {
+    if (terminal_id == 0 || terminal_id > chast::kMaxTerminals ||
+        !chast::valid_terminal_size(columns, rows) ||
         !running_.load(std::memory_order_acquire)) {
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.terminal_phase != TerminalPhase::kOpen &&
-            status_.terminal_phase != TerminalPhase::kRequesting) {
-            return false;
-        }
-    }
     std::lock_guard<std::mutex> lock(terminal_mutex_);
+    const TerminalPhase phase = terminals_[terminal_id - 1].status.phase;
+    if (phase != TerminalPhase::kOpen && phase != TerminalPhase::kRequesting) {
+        return false;
+    }
     // A resize that has not been sent yet is replaced: the console only needs
-    // where the panel is now.
+    // where the panel is now. Only this slot's queued resize is affected.
     for (TerminalCommand& command : pending_terminal_) {
-        if (command.kind == TerminalCommand::Kind::kResize) {
+        if (command.slot == terminal_id - 1 &&
+            command.generation == terminals_[terminal_id - 1].generation &&
+            command.kind == TerminalCommand::Kind::kResize) {
             command.columns = columns;
             command.rows = rows;
             return true;
@@ -1688,35 +1709,40 @@ bool ViewerEngine::ResizeTerminal(uint16_t columns, uint16_t rows) {
     }
     TerminalCommand command;
     command.kind = TerminalCommand::Kind::kResize;
+    command.slot = terminal_id - 1;
+    command.generation = terminals_[terminal_id - 1].generation;
     command.columns = columns;
     command.rows = rows;
     pending_terminal_.push_back(std::move(command));
     return true;
 }
 
-void ViewerEngine::CloseTerminal() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.terminal_phase == TerminalPhase::kRequesting ||
-            status_.terminal_phase == TerminalPhase::kOpen) {
-            status_.terminal_phase = TerminalPhase::kClosed;
-            status_.terminal_code = 0;
-            status_.terminal_reason.clear();
-            status_.terminal_error.clear();
-            // The stop kills a persistent service too, so the id must not
-            // invite a later attach.
-            status_.terminal_service_id = 0;
-            ++status_.terminal_updates;
-        }
-    }
-    if (!running_.load(std::memory_order_acquire)) {
+void ViewerEngine::CloseTerminal(uint32_t terminal_id) {
+    if (terminal_id == 0 || terminal_id > chast::kMaxTerminals) {
         return;
     }
     std::lock_guard<std::mutex> lock(terminal_mutex_);
-    // Input queued after this close is pointless; the close itself stays.
+    TerminalChannel& channel = terminals_[terminal_id - 1];
+    channel.status.phase = TerminalPhase::kClosed;
+    channel.status.code = 0;
+    channel.status.reason.clear();
+    channel.status.error.clear();
+    // The stop kills a persistent service too, so the id must not invite a
+    // later attach.
+    channel.status.service_id = 0;
+    ++channel.status.updates;
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Only this tab's queued work is obsolete. A close for one console must
+    // not discard input or a pending open belonging to another console.
     for (auto it = pending_terminal_.begin(); it != pending_terminal_.end();) {
-        if (it->kind == TerminalCommand::Kind::kInput) {
-            pending_terminal_bytes_ -= std::min(pending_terminal_bytes_, it->bytes.size());
+        if (it->slot == terminal_id - 1 &&
+            it->kind != TerminalCommand::Kind::kOpen) {
+            if (it->kind == TerminalCommand::Kind::kInput) {
+                channel.pending_bytes -=
+                    std::min(channel.pending_bytes, it->bytes.size());
+            }
             it = pending_terminal_.erase(it);
         } else {
             ++it;
@@ -1724,20 +1750,27 @@ void ViewerEngine::CloseTerminal() {
     }
     TerminalCommand command;
     command.kind = TerminalCommand::Kind::kClose;
+    command.slot = terminal_id - 1;
+    command.generation = channel.generation;
     pending_terminal_.push_back(std::move(command));
 }
 
-bool ViewerEngine::TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended) {
+bool ViewerEngine::TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended,
+                                      uint32_t terminal_id) {
     std::lock_guard<std::mutex> lock(terminal_mutex_);
-    if (terminal_output_.empty()) {
-        ended = terminal_output_ended_;
+    if (terminal_id == 0 || terminal_id > chast::kMaxTerminals) {
+        ended = true;
         return false;
     }
-    data = std::move(terminal_output_.front());
-    terminal_output_.pop_front();
-    terminal_output_bytes_ -=
-        std::min(terminal_output_bytes_, data.size());
-    ended = terminal_output_ended_ && terminal_output_.empty();
+    TerminalChannel& channel = terminals_[terminal_id - 1];
+    if (channel.output.empty()) {
+        ended = channel.ended;
+        return false;
+    }
+    data = std::move(channel.output.front());
+    channel.output.pop_front();
+    channel.output_bytes -= std::min(channel.output_bytes, data.size());
+    ended = channel.ended && channel.output.empty();
     return true;
 }
 
@@ -1880,8 +1913,23 @@ void ViewerEngine::StopPortForward(uint32_t rule_id) {
 }
 
 ViewerStatus ViewerEngine::Snapshot() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_, terminal_mutex_);
     ViewerStatus status = status_;
+    for (size_t i = 0; i < terminals_.size(); ++i) {
+        status.terminals[i] = terminals_[i].status;
+    }
+    // The legacy scalars always describe slot 1, so a UI that predates the
+    // tabs keeps seeing its console.
+    const ViewerTerminalStatus& first = status.terminals.front();
+    status.terminal_phase = first.phase;
+    status.terminal_code = first.code;
+    status.terminal_reason = first.reason;
+    status.terminal_error = first.error;
+    status.terminal_columns = first.columns;
+    status.terminal_rows = first.rows;
+    status.terminal_bytes = first.bytes;
+    status.terminal_updates = first.updates;
+    status.terminal_service_id = first.service_id;
     if (status.state == ViewerState::kConnecting || status.state == ViewerState::kHandshaking ||
         status.state == ViewerState::kStreaming) {
         status.elapsed_ms = static_cast<uint64_t>(
@@ -2006,6 +2054,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     int privacy_code = 0;
     std::string privacy_error;
     uint64_t privacy_updates = 0;
+    chast::DisplayControlState display_control;
+    uint64_t display_control_updates = 0;
     chast::DesktopKind desktop = chast::DesktopKind::Default;
     uint64_t desktop_updates = 0;
     int sas_code = 0;
@@ -2317,6 +2367,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.privacy_code = privacy_code;
             status_.privacy_error = privacy_error;
             status_.privacy_updates = privacy_updates;
+            status_.display_control = display_control;
+            status_.display_control_updates = display_control_updates;
             status_.desktop = desktop;
             status_.desktop_updates = desktop_updates;
             status_.sas_code = sas_code;
@@ -5539,6 +5591,51 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // fails locally (permission revoked between the queue and the
                 // send) is reported like a refusal, so the switch returns to
                 // what the host actually has.
+                // Sends the newest display-management request and adopts every
+                // answer. A local send failure is reported like a host refusal,
+                // so the toolbar's busy state can never stick.
+                auto poll_display_control = [&] {
+                    std::optional<chast::DisplayControlRequest> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(privacy_mutex_);
+                        requested.swap(pending_display_control_);
+                    }
+                    if (files_only) {
+                        return;
+                    }
+                    bool updated = false;
+                    if (requested) {
+                        const chast::Error sent =
+                            session->request_display_control(*requested);
+                        if (!sent.ok()) {
+                            display_control.code = chast::DisplayControlCode::Failed;
+                            display_control.reason = sent.to_string();
+                            ++display_control_updates;
+                            updated = true;
+                            std::fprintf(stderr, "viewer: display control: %s\n",
+                                         sent.to_string().c_str());
+                        }
+                    }
+                    chast::DisplayControlState answer;
+                    while (session->take_display_control_state(answer)) {
+                        display_control = std::move(answer);
+                        ++display_control_updates;
+                        updated = true;
+                        std::fprintf(stderr, "viewer: display control %s%s%s\n",
+                                     display_control.code == chast::DisplayControlCode::Ok
+                                         ? "ok"
+                                         : "refused",
+                                     display_control.reason.empty() ? "" : ": ",
+                                     display_control.reason.c_str());
+                    }
+                    if (updated) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.display_control = display_control;
+                        status_.display_control_updates = display_control_updates;
+                        status_.display_control_busy = false;
+                    }
+                };
+
                 auto drain_privacy = [&] {
                     std::optional<bool> requested;
                     {
@@ -6141,39 +6238,58 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
-                // Remote terminal. The panel drives one console through the
-                // command queue; this thread owns the session, so request,
-                // input, resize and the stop all leave from here in order.
-                // `terminal_id` is allocated per open, so an attached service
-                // gets a fresh session-scoped id and stale answers for the
-                // previous console can no longer match. `terminal_active`
-                // means the session holds that entry; `terminal_closing` means
-                // a stop went out or came in and the remaining output is still
-                // draining.
-                uint32_t terminal_id = 0;
+                // Remote terminals. The panel drives up to kMaxTerminals
+                // consoles through the command queue; this thread owns the
+                // session, so request, input, resize and the stop all leave
+                // from here in order. Each slot gets a fresh wire id on every
+                // open, so an attached service starts under a new
+                // session-scoped id and stale answers for the previous console
+                // can no longer match. `requesting`/`closing` describe the
+                // wire console behind one slot; the slot's command generation
+                // retires everything that belonged to its previous console.
+                struct ActiveTerminal {
+                    uint32_t wire_id = 0;
+                    bool requesting = false;
+                    bool closing = false;
+                };
+                std::array<ActiveTerminal, chast::kMaxTerminals> active_terminals{};
                 uint32_t terminal_next_id = 1;
-                bool terminal_active = false;
-                bool terminal_closing = false;
-                uint64_t terminal_bytes = 0;
-
-                auto set_terminal_phase = [&](TerminalPhase phase, int code,
+                auto terminal_slot = [&](uint32_t wire_id) -> size_t {
+                    for (size_t i = 0; i < active_terminals.size(); ++i) {
+                        if (active_terminals[i].wire_id == wire_id) return i;
+                    }
+                    return active_terminals.size();
+                };
+                auto terminals_active = [&] {
+                    return std::any_of(active_terminals.begin(), active_terminals.end(),
+                                       [](const ActiveTerminal& terminal) {
+                                           return terminal.wire_id != 0;
+                                       });
+                };
+                auto set_terminal_phase = [&](size_t slot, TerminalPhase phase, int code,
                                               std::string reason, std::string error) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    status_.terminal_phase = phase;
-                    status_.terminal_code = code;
-                    status_.terminal_reason = std::move(reason);
-                    status_.terminal_error = std::move(error);
+                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                    ViewerTerminalStatus& status = terminals_[slot].status;
+                    // A host reply arriving after the panel closes must not
+                    // revive that panel or accept new keystrokes for it.
+                    if (status.phase == TerminalPhase::kClosed) {
+                        return;
+                    }
+                    status.phase = phase;
+                    status.code = code;
+                    status.reason = std::move(reason);
+                    status.error = std::move(error);
                     if (phase == TerminalPhase::kEnded ||
                         phase == TerminalPhase::kFailed) {
                         // Nothing is left to attach to once the console is
                         // over or its open was refused.
-                        status_.terminal_service_id = 0;
+                        status.service_id = 0;
                     }
-                    ++status_.terminal_updates;
+                    ++status.updates;
                 };
-                auto terminal_phase_is = [&](TerminalPhase phase) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    return status_.terminal_phase == phase;
+                auto terminal_phase = [&](size_t slot) {
+                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                    return terminals_[slot].status.phase;
                 };
 
                 // Forgets the session-side entry once its output is done. The
@@ -6181,154 +6297,192 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // sees next poll is the caller's. The service id goes with the
                 // entry: either the host removed the service or the next open
                 // names a different one.
-                auto finish_terminal = [&] {
-                    if (terminal_id != 0) {
-                        session->close_terminal(terminal_id);
-                    }
-                    terminal_id = 0;
-                    terminal_active = false;
-                    terminal_closing = false;
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.terminal_service_id = 0;
-                    }
+                auto finish_terminal = [&](size_t slot) {
+                    session->close_terminal(active_terminals[slot].wire_id);
+                    active_terminals[slot] = {};
                     std::lock_guard<std::mutex> lock(terminal_mutex_);
-                    terminal_output_ended_ = true;
+                    terminals_[slot].ended = true;
+                    terminals_[slot].status.service_id = 0;
                 };
 
                 auto drain_terminal = [&] {
-                    while (true) {
-                        TerminalCommand command;
+                    // Work on a bounded snapshot. Backpressure for one tab
+                    // defers only that tab; the other tab can still resize,
+                    // type and close during the same frame.
+                    std::deque<TerminalCommand> commands;
+                    {
+                        std::lock_guard<std::mutex> lock(terminal_mutex_);
+                        commands.swap(pending_terminal_);
+                    }
+                    std::deque<TerminalCommand> deferred;
+                    std::array<bool, chast::kMaxTerminals> stalled{};
+                    for (TerminalCommand& command : commands) {
+                        const size_t slot = command.slot;
                         {
                             std::lock_guard<std::mutex> lock(terminal_mutex_);
-                            if (pending_terminal_.empty()) {
-                                return;
+                            if (command.generation != terminals_[slot].generation) {
+                                continue;
                             }
-                            command = std::move(pending_terminal_.front());
-                            pending_terminal_.pop_front();
-                            if (command.kind == TerminalCommand::Kind::kInput) {
-                                pending_terminal_bytes_ -= std::min(
-                                    pending_terminal_bytes_, command.bytes.size());
-                            }
+                        }
+                        ActiveTerminal& active = active_terminals[slot];
+                        if (stalled[slot]) {
+                            deferred.push_back(std::move(command));
+                            continue;
                         }
                         switch (command.kind) {
                             case TerminalCommand::Kind::kOpen: {
-                                if ((session->permissions() & chast::kPermissionTerminal) ==
-                                    0) {
+                                if (terminal_phase(slot) == TerminalPhase::kClosed) {
+                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                    terminals_[slot].ended = true;
+                                    break;
+                                }
+                                if ((session->permissions() &
+                                     chast::kPermissionTerminal) == 0) {
                                     set_terminal_phase(
-                                        TerminalPhase::kFailed, 0, {},
+                                        slot, TerminalPhase::kFailed, 0, {},
                                         "the host did not grant remote terminals");
                                     std::lock_guard<std::mutex> lock(terminal_mutex_);
-                                    terminal_output_ended_ = true;
-                                    continue;
+                                    terminals_[slot].ended = true;
+                                    break;
                                 }
-                                if (terminal_active) {
+                                if (active.wire_id != 0) {
                                     // The previous console is still draining;
                                     // opening now would mix its bytes into the
                                     // new panel.
-                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
-                                    pending_terminal_.push_front(std::move(command));
-                                    return;
+                                    deferred.push_back(std::move(command));
+                                    stalled[slot] = true;
+                                    break;
                                 }
                                 // A fresh id per console, wrapping only past
                                 // ids no session could still be waiting on.
-                                terminal_id = terminal_next_id++;
+                                const uint32_t wire_id = terminal_next_id++;
                                 if (terminal_next_id == 0) {
                                     terminal_next_id = 1;
                                 }
                                 chast::Error requested = session->request_terminal(
-                                    terminal_id, command.columns, command.rows,
+                                    wire_id, command.columns, command.rows,
                                     command.flags, command.service_id);
                                 if (!requested.ok()) {
-                                    terminal_id = 0;
-                                    set_terminal_phase(TerminalPhase::kFailed, 0, {},
+                                    set_terminal_phase(slot, TerminalPhase::kFailed, 0, {},
                                                        "request: " +
                                                            requested.to_string());
                                     std::lock_guard<std::mutex> lock(terminal_mutex_);
-                                    terminal_output_ended_ = true;
-                                    continue;
+                                    terminals_[slot].ended = true;
+                                    break;
                                 }
-                                terminal_active = true;
-                                terminal_closing = false;
-                                {
-                                    std::lock_guard<std::mutex> lock(mutex_);
-                                    status_.terminal_columns = command.columns;
-                                    status_.terminal_rows = command.rows;
-                                }
+                                active.wire_id = wire_id;
+                                active.requesting = true;
+                                active.closing = false;
                                 std::fprintf(stderr,
-                                             "viewer: terminal requested %ux%u "
+                                             "viewer: terminal %zu requested %ux%u "
                                              "(id %u, flags 0x%02x, service %u)\n",
-                                             command.columns, command.rows, terminal_id,
-                                             command.flags, command.service_id);
-                                continue;
+                                             slot + 1, command.columns, command.rows,
+                                             wire_id, command.flags, command.service_id);
+                                break;
                             }
                             case TerminalCommand::Kind::kInput: {
-                                if (!terminal_active || terminal_closing) {
-                                    continue;
-                                }
+                                const size_t original_bytes = command.bytes.size();
                                 bool retry = false;
-                                while (!command.bytes.empty()) {
-                                    const size_t chunk = std::min(
-                                        command.bytes.size(), chast::kMaxTerminalChunkBytes);
-                                    chast::Error sent = session->send_terminal_input(
-                                        terminal_id,
-                                        reinterpret_cast<const uint8_t*>(
-                                            command.bytes.data()),
-                                        chunk, std::chrono::milliseconds(0));
-                                    if (sent.status() == chast::Status::WaitTimeout) {
-                                        retry = true;
-                                        break;
+                                if (active.wire_id != 0 && !active.closing &&
+                                    terminal_phase(slot) == TerminalPhase::kOpen) {
+                                    while (!command.bytes.empty()) {
+                                        const size_t chunk = std::min(
+                                            command.bytes.size(),
+                                            chast::kMaxTerminalChunkBytes);
+                                        chast::Error sent = session->send_terminal_input(
+                                            active.wire_id,
+                                            reinterpret_cast<const uint8_t*>(
+                                                command.bytes.data()),
+                                            chunk, std::chrono::milliseconds(0));
+                                        if (sent.status() == chast::Status::WaitTimeout) {
+                                            retry = true;
+                                            break;
+                                        }
+                                        if (!sent.ok()) {
+                                            set_terminal_phase(slot, TerminalPhase::kFailed,
+                                                               0, {},
+                                                               "send input: " +
+                                                                   sent.to_string());
+                                            session->send_terminal_stop(
+                                                active.wire_id,
+                                                chast::TerminalCode::Failed,
+                                                "input stream failed");
+                                            finish_terminal(slot);
+                                            break;
+                                        }
+                                        command.bytes.erase(0, chunk);
                                     }
-                                    if (!sent.ok()) {
-                                        set_terminal_phase(TerminalPhase::kFailed, 0, {},
-                                                           "send input: " +
-                                                               sent.to_string());
-                                        terminal_closing = true;
-                                        break;
-                                    }
-                                    command.bytes.erase(0, chunk);
                                 }
-                                if (retry && !command.bytes.empty()) {
+                                {
                                     std::lock_guard<std::mutex> lock(terminal_mutex_);
-                                    pending_terminal_bytes_ += command.bytes.size();
-                                    pending_terminal_.push_front(std::move(command));
-                                    return;
+                                    TerminalChannel& channel = terminals_[slot];
+                                    if (channel.generation == command.generation) {
+                                        channel.pending_bytes -= std::min(
+                                            channel.pending_bytes,
+                                            original_bytes -
+                                                (retry ? command.bytes.size() : 0));
+                                    }
                                 }
-                                continue;
+                                if (retry) {
+                                    deferred.push_back(std::move(command));
+                                    stalled[slot] = true;
+                                }
+                                break;
                             }
                             case TerminalCommand::Kind::kResize: {
-                                if (!terminal_active || terminal_closing) {
-                                    continue;
+                                if (active.wire_id == 0 || active.closing ||
+                                    terminal_phase(slot) == TerminalPhase::kClosed) {
+                                    break;
+                                }
+                                if (active.requesting) {
+                                    deferred.push_back(std::move(command));
+                                    stalled[slot] = true;
+                                    break;
                                 }
                                 chast::Error sent = session->send_terminal_resize(
-                                    terminal_id, command.columns, command.rows);
-                                if (!sent.ok()) {
+                                    active.wire_id, command.columns, command.rows);
+                                if (sent.ok()) {
+                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                    terminals_[slot].status.columns = command.columns;
+                                    terminals_[slot].status.rows = command.rows;
+                                } else {
                                     std::fprintf(stderr,
-                                                 "viewer: terminal resize %ux%u: %s\n",
-                                                 command.columns, command.rows,
+                                                 "viewer: terminal %zu resize %ux%u: %s\n",
+                                                 slot + 1, command.columns,
+                                                 command.rows,
                                                  sent.to_string().c_str());
-                                    continue;
                                 }
-                                std::lock_guard<std::mutex> lock(mutex_);
-                                status_.terminal_columns = command.columns;
-                                status_.terminal_rows = command.rows;
-                                continue;
+                                break;
                             }
                             case TerminalCommand::Kind::kClose: {
-                                if (terminal_active && !terminal_closing) {
+                                if (active.wire_id != 0) {
                                     chast::Error stopped = session->send_terminal_stop(
-                                        terminal_id,
-                                        chast::TerminalCode::Cancelled,
+                                        active.wire_id, chast::TerminalCode::Cancelled,
                                         "closed by the viewer");
-                                    terminal_closing = true;
                                     if (!stopped.ok()) {
-                                        std::lock_guard<std::mutex> lock(mutex_);
-                                        status_.terminal_error =
+                                        std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                        terminals_[slot].status.error =
                                             "close: " + stopped.to_string();
                                     }
+                                    finish_terminal(slot);
                                 }
-                                continue;
+                                break;
                             }
+                        }
+                    }
+                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                    // A close may have arrived while this batch was running.
+                    // Drop stalled input for closed tabs before restoring
+                    // order, so a stale byte can never precede the close.
+                    for (auto it = deferred.rbegin(); it != deferred.rend(); ++it) {
+                        if (it->generation != terminals_[it->slot].generation) continue;
+                        if (terminals_[it->slot].status.phase == TerminalPhase::kClosed) {
+                            if (it->kind == TerminalCommand::Kind::kInput) {
+                                size_t& pending = terminals_[it->slot].pending_bytes;
+                                pending -= std::min(pending, it->bytes.size());
+                            }
+                        } else {
+                            pending_terminal_.push_front(std::move(*it));
                         }
                     }
                 };
@@ -6336,138 +6490,143 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto poll_terminal = [&] {
                     chast::TerminalResult result;
                     while (session->take_terminal_result(result)) {
-                        if (terminal_id == 0 || result.terminal_id != terminal_id) {
+                        const size_t slot = terminal_slot(result.terminal_id);
+                        if (slot == active_terminals.size()) {
                             continue;
                         }
-                        if (terminal_phase_is(TerminalPhase::kClosed)) {
+                        ActiveTerminal& active = active_terminals[slot];
+                        active.requesting = false;
+                        if (terminal_phase(slot) == TerminalPhase::kClosed) {
                             // The panel closed while the answer was in
                             // flight; the host's console must not outlive it.
                             if (result.code == chast::TerminalCode::Ok) {
-                                session->close_terminal(terminal_id);
-                                terminal_id = 0;
-                                terminal_active = false;
-                                terminal_closing = false;
-                                std::lock_guard<std::mutex> lock(terminal_mutex_);
-                                terminal_output_ended_ = true;
+                                session->send_terminal_stop(
+                                    active.wire_id, chast::TerminalCode::Cancelled,
+                                    "closed by the viewer");
                             }
+                            finish_terminal(slot);
                             continue;
                         }
                         if (result.code != chast::TerminalCode::Ok) {
-                            terminal_id = 0;
-                            terminal_active = false;
-                            terminal_closing = false;
-                            set_terminal_phase(TerminalPhase::kFailed,
+                            set_terminal_phase(slot, TerminalPhase::kFailed,
                                                static_cast<int>(result.code),
                                                result.reason, {});
                             std::fprintf(stderr, "viewer: terminal refused: %s\n",
                                          result.reason.empty() ? "no reason given"
                                                                : result.reason.c_str());
-                            std::lock_guard<std::mutex> lock(terminal_mutex_);
-                            terminal_output_ended_ = true;
+                            finish_terminal(slot);
                             continue;
                         }
                         // Persistent consoles hand back the id a later session
                         // attaches with. A legacy console leaves it at 0.
                         {
-                            std::lock_guard<std::mutex> lock(mutex_);
-                            status_.terminal_service_id = result.service_id;
+                            std::lock_guard<std::mutex> lock(terminal_mutex_);
+                            terminals_[slot].status.service_id = result.service_id;
                         }
-                        chast::Error opened = session->open_terminal_input(terminal_id);
+                        chast::Error opened =
+                            session->open_terminal_input(active.wire_id);
                         if (!opened.ok()) {
-                            session->close_terminal(terminal_id);
-                            terminal_id = 0;
-                            terminal_active = false;
-                            terminal_closing = false;
                             set_terminal_phase(
-                                TerminalPhase::kFailed,
+                                slot, TerminalPhase::kFailed,
                                 static_cast<int>(chast::TerminalCode::Failed), {},
                                 "input stream: " + opened.to_string());
-                            std::lock_guard<std::mutex> lock(terminal_mutex_);
-                            terminal_output_ended_ = true;
+                            session->send_terminal_stop(
+                                active.wire_id, chast::TerminalCode::Failed,
+                                "input stream failed");
+                            finish_terminal(slot);
                             continue;
                         }
-                        set_terminal_phase(TerminalPhase::kOpen, 0, {}, {});
+                        set_terminal_phase(slot, TerminalPhase::kOpen, 0, {}, {});
                         if (result.service_id != 0) {
-                            std::fprintf(stderr, "viewer: terminal open (service #%u)\n",
-                                         result.service_id);
+                            std::fprintf(stderr,
+                                         "viewer: terminal %zu open (service #%u)\n",
+                                         slot + 1, result.service_id);
                         } else {
-                            std::fprintf(stderr, "viewer: terminal open\n");
+                            std::fprintf(stderr, "viewer: terminal %zu open\n",
+                                         slot + 1);
                         }
                     }
 
                     chast::TerminalStop stop;
                     while (session->take_terminal_stop(stop)) {
-                        if (terminal_id == 0 || stop.terminal_id != terminal_id ||
-                            !terminal_active) {
+                        const size_t slot = terminal_slot(stop.terminal_id);
+                        if (slot == active_terminals.size()) {
                             continue;
                         }
-                        terminal_closing = true;
+                        active_terminals[slot].closing = true;
                         // A local close already told the panel why it ended;
                         // a host stop is the answer for everything else.
-                        if (!terminal_phase_is(TerminalPhase::kClosed) &&
-                            !terminal_phase_is(TerminalPhase::kFailed)) {
-                            set_terminal_phase(TerminalPhase::kEnded,
-                                               static_cast<int>(stop.code), stop.reason,
-                                               {});
+                        if (terminal_phase(slot) != TerminalPhase::kClosed &&
+                            terminal_phase(slot) != TerminalPhase::kFailed) {
+                            set_terminal_phase(slot, TerminalPhase::kEnded,
+                                               static_cast<int>(stop.code),
+                                               stop.reason, {});
                         }
-                        std::fprintf(stderr, "viewer: terminal stopped: %s\n",
+                        std::fprintf(stderr, "viewer: terminal %zu stopped: %s\n",
+                                     slot + 1,
                                      stop.reason.empty() ? "no reason given"
                                                          : stop.reason.c_str());
                     }
 
-                    if (!terminal_active) {
-                        return;
-                    }
-                    if ((session->permissions() & chast::kPermissionTerminal) == 0) {
-                        // The transport aborted the streams and the session
-                        // forgot the entry; anything received before that stays
-                        // queued for the panel.
-                        finish_terminal();
-                        set_terminal_phase(TerminalPhase::kFailed, 0, {},
-                                           "the host revoked terminal access");
-                        return;
-                    }
-                    if (terminal_phase_is(TerminalPhase::kRequesting)) {
-                        // The host has not answered yet, so the session has no
-                        // entry to read. Asking now would report the console as
-                        // ended and cancel the open that is still in flight.
-                        return;
-                    }
-                    for (;;) {
-                        {
-                            std::lock_guard<std::mutex> lock(terminal_mutex_);
-                            if (terminal_output_bytes_ >=
-                                chast::kTerminalReceiveHighWaterBytes) {
-                                // The panel has not caught up. Stop pulling so
-                                // the session's receive window pauses the host
-                                // instead of truncating the picture.
+                    for (size_t slot = 0; slot < active_terminals.size(); ++slot) {
+                        const ActiveTerminal& active = active_terminals[slot];
+                        if (active.wire_id == 0) {
+                            continue;
+                        }
+                        if ((session->permissions() &
+                             chast::kPermissionTerminal) == 0) {
+                            // The transport aborted the streams and the
+                            // session forgot the entry; anything received
+                            // before that stays queued for the panel.
+                            finish_terminal(slot);
+                            set_terminal_phase(slot, TerminalPhase::kFailed, 0, {},
+                                               "the host revoked terminal access");
+                            continue;
+                        }
+                        if (active.requesting) {
+                            // The host has not answered yet, so the session has
+                            // no entry to read. Asking now would report the
+                            // console as ended and cancel the open that is
+                            // still in flight.
+                            continue;
+                        }
+                        for (;;) {
+                            {
+                                std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                if (terminals_[slot].output_bytes >=
+                                    chast::kTerminalReceiveHighWaterBytes) {
+                                    // The panel has not caught up. Stop pulling
+                                    // so the session's receive window pauses
+                                    // the host instead of truncating the
+                                    // picture.
+                                    break;
+                                }
+                            }
+                            std::vector<uint8_t> data;
+                            bool ended = false;
+                            if (!session->take_terminal_output(active.wire_id, data,
+                                                               ended)) {
+                                if (ended) {
+                                    // A host-initiated ending carries its own
+                                    // stop; a lost one is still an ending.
+                                    if (terminal_phase(slot) ==
+                                            TerminalPhase::kOpen ||
+                                        terminal_phase(slot) ==
+                                            TerminalPhase::kRequesting) {
+                                        set_terminal_phase(slot,
+                                                           TerminalPhase::kEnded, 0,
+                                                           {}, {});
+                                    }
+                                    finish_terminal(slot);
+                                }
                                 break;
                             }
-                        }
-                        std::vector<uint8_t> data;
-                        bool ended = false;
-                        if (!session->take_terminal_output(terminal_id, data,
-                                                           ended)) {
-                            if (ended) {
-                                // A host-initiated ending carries its own stop;
-                                // a lost one is still an ending.
-                                if (terminal_phase_is(TerminalPhase::kOpen) ||
-                                    terminal_phase_is(TerminalPhase::kRequesting)) {
-                                    set_terminal_phase(TerminalPhase::kEnded, 0, {},
-                                                       {});
-                                }
-                                finish_terminal();
-                            }
-                            break;
-                        }
-                        terminal_bytes += data.size();
-                        {
                             std::lock_guard<std::mutex> lock(terminal_mutex_);
-                            terminal_output_bytes_ += data.size();
-                            terminal_output_.push_back(std::move(data));
+                            TerminalChannel& channel = terminals_[slot];
+                            channel.status.bytes += data.size();
+                            channel.output_bytes += data.size();
+                            channel.output.push_back(std::move(data));
                         }
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.terminal_bytes = terminal_bytes;
                     }
                 };
 
@@ -7359,6 +7518,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         break;
                     }
                     receive_permissions();
+                    poll_display_control();
                     drain_privacy();
                     receive_privacy();
                     drain_sas();
@@ -7445,7 +7605,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         file_active || audio_announced || microphone_enabled ||
                         microphone_wanted_.load(std::memory_order_relaxed) ||
                         voice_wanted_.load(std::memory_order_relaxed) || voice_active ||
-                        voice_pending || !forwards.empty() || terminal_active ||
+                        voice_pending || !forwards.empty() || terminals_active() ||
                         camera_active;
                     if (keyframe_wanted_.exchange(false, std::memory_order_relaxed)) {
                         request_keyframe();
@@ -7474,6 +7634,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_voice();
                     receive_voice();
                     receive_permissions();
+                    poll_display_control();
                     drain_privacy();
                     receive_privacy();
                     drain_sas();

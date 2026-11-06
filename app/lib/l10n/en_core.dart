@@ -44,6 +44,9 @@ const Map<String, String> kEnglishCore = <String, String>{
   '请输入新密码': 'Enter a new password',
   '账号已被封禁': 'The account has been suspended',
   '账号未登录': 'Not signed in',
+  '账号未登录或已过期': 'Not signed in, or the session has expired',
+  '目标设备不在当前账号的地址簿中':
+      'The target is not in this account\'s address book',
   '账号登录已失效，请重新登录': 'The account login is no longer valid; please sign in again',
   '连接服务地址无效': 'Invalid connection service address',
   '连接服务密钥无效': 'Invalid connection service key',

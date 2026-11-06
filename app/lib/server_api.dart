@@ -1095,6 +1095,44 @@ class ServerApi {
     }
   }
 
+  /// Queues a cross-subnet Wake-on-LAN request with the connection service.
+  ///
+  /// The caller supplies [mac] because the service never stores link-layer
+  /// addresses. An opted-in host agent on the target's link broadcasts the
+  /// packet at its next registration refresh, so this works across subnets as
+  /// long as at least one relay-enabled agent shares the target's LAN.
+  static Future<void> wake(
+    ServerSettings settings,
+    String token,
+    String hostId,
+    String mac, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final String id = hostId.trim();
+    if (id.isEmpty) {
+      throw ServerApiException(tr('设备 ID 为空'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse(
+        '${settings.url}/v1/hosts/${Uri.encodeComponent(id)}/wake',
+      );
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'mac': mac},
+      success: const <int>{HttpStatus.accepted},
+      unauthorized: tr('账号未登录或已过期'),
+      forbidden: tr('目标设备不在当前账号的地址簿中'),
+    );
+  }
+
   /// Exchanges a viewer account name and password for a bearer token.
   ///
   /// The token belongs to the account API only; the operator server key is

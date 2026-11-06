@@ -4,8 +4,9 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
-FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+FlutterWindow::FlutterWindow(const flutter::DartProject& project,
+                             std::function<bool(const std::string&)> open_window)
+    : project_(project), open_window_(std::move(open_window)) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -29,6 +30,7 @@ bool FlutterWindow::OnCreate() {
 
   viewer_bridge_ = std::make_unique<chast_viewer::ViewerBridge>(
       flutter_controller_->engine(), GetHandle());
+  viewer_bridge_->open_session_window = open_window_;
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();

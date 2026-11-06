@@ -468,6 +468,23 @@ void InputInjector::apply(const InputEvent& event) {
         case InputKind::Pen:
             apply_pen(event.pen);
             break;
+        case InputKind::Gesture:
+            if (event.gesture.action == GestureAction::Zoom) {
+                const uint16_t control = (reported & (kModifierLeftCtrl | kModifierRightCtrl))
+                                             ? 0
+                                             : kModifierLeftCtrl;
+                sync_modifiers(static_cast<uint16_t>(reported | control));
+                apply_mouse({MouseAction::Wheel, 0, 0, event.gesture.y});
+                sync_modifiers(reported);
+            } else {
+                if (event.gesture.x) {
+                    apply_mouse({MouseAction::WheelHorizontal, 0, event.gesture.x, 0});
+                }
+                if (event.gesture.y) {
+                    apply_mouse({MouseAction::Wheel, 0, 0, event.gesture.y});
+                }
+            }
+            break;
     }
 }
 

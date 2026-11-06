@@ -25,12 +25,14 @@
 #include "chast/clipboard.h"
 #include "chast/desktop.h"
 #include "chast/display_mode.h"
+#include "chast/display_privacy.h"
 #include "chast/file_transfer.h"
 #include "chast/port_forward_relay.h"
 #include "chast/privacy.h"
 #include "chast/sas.h"
 #include "chast/security.h"
 #include "chast/terminal_relay.h"
+#include "chast/virtual_display.h"
 
 namespace chast {
 
@@ -1737,9 +1739,29 @@ void HostServer::run_single() {
     running_ = false;
 }
 
+Clock::duration HostServer::idle_disconnect_timeout() const {
+    if (config_.auto_disconnect_ms != 0) {
+        return std::chrono::duration_cast<Clock::duration>(
+            std::chrono::milliseconds(config_.auto_disconnect_ms));
+    }
+    return std::chrono::duration_cast<Clock::duration>(
+        std::chrono::minutes(settings_.auto_disconnect_minutes));
+}
+
+long long HostServer::idle_disconnect_seconds() const {
+    return (std::max)(1LL, config_.auto_disconnect_ms != 0
+                               ? static_cast<long long>(config_.auto_disconnect_ms) / 1000
+                               : static_cast<long long>(settings_.auto_disconnect_minutes) * 60);
+}
+
+void HostServer::touch_viewer_activity() { last_viewer_activity_ = Clock::now(); }
+
 bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token,
                                        std::string* error, bool* peer_left) {
     *peer_left = false;
+    // A new viewer starts with a fresh idle clock; the time it spent waiting
+    // for approval or a first frame is not idleness.
+    touch_viewer_activity();
     ++stats.sessions;
     stats.client_connected = true;
     const std::string peer = session_->client_address();
@@ -2467,6 +2489,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
 
     auto last_publish = Clock::now();
     const auto run_start = Clock::now();
+    const Clock::duration idle_timeout = idle_disconnect_timeout();
     while (!stopping_.load()) {
         const auto now = Clock::now();
         // A follower shares the listener's run budget the same way a
@@ -2475,9 +2498,18 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
             std::chrono::duration<double>(now - run_start).count() >= config_.run_seconds) {
             break;
         }
+        if (idle_timeout > Clock::duration::zero() &&
+            now - last_viewer_activity_ >= idle_timeout) {
+            ++stats.idle_disconnects;
+            log("idle: no viewer activity for " + std::to_string(idle_disconnect_seconds()) +
+                " s; closing the session");
+            drain_peer(stats);
+            return SharedFollowResult::Ended;
+        }
         apply_pending_permissions();
         uint16_t switch_index = kDisplayAuto;
         if (session_->take_display_switch_request(switch_index)) {
+            touch_viewer_activity();
             ++stats.display_switch_failures;
             if (!send_failed(
                     session_->send_display_switch_result(
@@ -2489,6 +2521,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         uint16_t modes_index = 0;
         if (session_->take_list_display_modes_request(modes_index)) {
+            touch_viewer_activity();
             DisplayModeList list;
             list.display = modes_index;
             list.code = DisplayModeCode::Busy;
@@ -2504,6 +2537,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         uint16_t mode_refresh = 0;
         if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
                                                     mode_refresh)) {
+            touch_viewer_activity();
             ++stats.display_mode_failures;
             if (!send_failed(
                     session_->send_display_mode_result(
@@ -2516,6 +2550,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         StreamOptions options;
         if (session_->take_stream_options_request(options)) {
+            touch_viewer_activity();
             ++stats.stream_option_requests;
             ++stats.stream_option_failures;
             StreamOptionsResult result;
@@ -2532,6 +2567,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         bool privacy_requested = false;
         if (session_->take_privacy_mode_request(privacy_requested)) {
+            touch_viewer_activity();
             ++stats.privacy_mode_changes;
             if (!send_failed(
                     session_->send_privacy_mode_state(
@@ -2541,13 +2577,27 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
                 return SharedFollowResult::Ended;
             }
         }
+        DisplayControlRequest display_request;
+        if (session_->take_display_control_request(display_request)) {
+            touch_viewer_activity();
+            DisplayControlState denied;
+            denied.code = DisplayControlCode::Denied;
+            denied.reason =
+                "display control is controlled by the viewer that owns the shared stream";
+            if (!send_failed(session_->send_display_control_state(denied),
+                             "display_control_state")) {
+                return SharedFollowResult::Ended;
+            }
+        }
         while (session_->take_sas_request()) {
+            touch_viewer_activity();
             if (!send_sas_result(stats, error, peer_left)) {
                 return SharedFollowResult::Ended;
             }
         }
         HostControlRequest host_action;
         while (session_->take_host_action_request(host_action)) {
+            touch_viewer_activity();
             ++stats.host_actions;
             ++stats.host_action_failures;
             HostControlResult denied;
@@ -2564,6 +2614,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         // policy, so only the viewer that owns the stream may write.
         RemoteConfigRequest config_request;
         while (session_->take_remote_config_request(config_request)) {
+            touch_viewer_activity();
             ++stats.remote_config_requests;
             RemoteConfigState state;
             if (config_request.keys != 0) {
@@ -2585,6 +2636,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
+            touch_viewer_activity();
             ++stats.chat_received;
             log("chat: received " + std::to_string(chat_text.size()) + " bytes");
             if (config_.chat_message) {
@@ -2593,6 +2645,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         std::string injected_text;
         while (session_->take_text_input(injected_text)) {
+            touch_viewer_activity();
             ++stats.text_received;
             log("text input: received " + std::to_string(injected_text.size()) +
                 " bytes");
@@ -2619,6 +2672,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         PortForwardRequest forward_request;
         while (session_->take_port_forward_request(forward_request)) {
+            touch_viewer_activity();
             const Error answered = session_->send_port_forward_result(
                 forward_request.forward_id, PortForwardCode::Ok);
             if (!answered.ok()) {
@@ -2631,6 +2685,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         PortForwardStop forward_stop;
         while (session_->take_port_forward_stop(forward_stop)) {
+            touch_viewer_activity();
             log("port forward: stopped with code " +
                 std::to_string(static_cast<int>(forward_stop.code)) +
                 (forward_stop.reason.empty() ? std::string() : ": " + forward_stop.reason));
@@ -2752,6 +2807,26 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return false;
     }
 
+    // Crash-safe recovery ownership for a topology this session changed.
+    // Declared before the mode guard and every capture object so a session
+    // exit restores the original layout after the mode is put back and after
+    // the local capturer released its GPU references. A failed restore leaves
+    // the independent guardian retrying.
+    struct ManagedDisplays {
+        std::unique_ptr<DisplayPrivacyBackend> backend;
+        std::function<void(const std::string&)> log;
+        ~ManagedDisplays() {
+            if (backend) {
+                std::string error;
+                if (!backend->restore(&error)) log("display recovery is pending: " + error);
+            }
+        }
+    } managed_displays{nullptr, [this](const std::string& message) { log(message); }};
+    std::wstring managed_original_device;
+    bool managed_original_merged = false;
+    std::string privacy_implementation = settings_.privacy_mode_impl;
+    std::unique_ptr<VirtualDisplayPrivacy> virtual_privacy;
+
     // A viewer-picked resolution is temporary: this object remembers the mode
     // the output ran before the session, and the guard puts it back on every
     // exit path. Declared before the capturer so the mode is restored even when
@@ -2828,10 +2903,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             log("merged view unavailable (" + merged_error + "); falling back to display " +
                 std::to_string(display_index));
-            capturer = create_capturer(display_index, capture, error);
+            capturer = create_shared_capturer(display_index, capture, error);
         }
     } else {
-        capturer = create_capturer(display_index, capture, error);
+        capturer = create_shared_capturer(display_index, capture, error);
     }
     if (!capturer) {
         *error = "capturer creation failed: " + *error;
@@ -2908,6 +2983,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // revoked mid-session, so both are checked before acting.
     std::unique_ptr<PrivacyOverlay> privacy_overlay;
     bool privacy_active = false;
+    // Assigned with the capture-rebuild helpers below: restoring a virtual
+    // display topology must wait for GPU capture to work again, and those
+    // helpers need the pointer state declared later in this function. The
+    // revocation path in apply_pending_permissions() only runs once the
+    // session loop starts, after the assignment.
+    std::function<bool(bool)> set_privacy_mode;
     auto send_privacy_state = [&](bool enabled, PrivacyModeCode code,
                                   const std::string& reason) -> bool {
         Error sent = session_->send_privacy_mode_state(enabled, code, reason);
@@ -2922,7 +3003,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         return false;
     };
-    auto set_privacy_mode = [&](bool wanted) -> bool {
+    auto set_overlay_privacy = [&](bool wanted) -> bool {
         if (!wanted) {
             if (privacy_active) {
                 privacy_overlay->disable();
@@ -3143,12 +3224,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         // A revoked permission must take the mask down with it: leaving the
         // operator's screen black after they turned the feature off would be
-        // a privacy mode they cannot cancel from the viewer.
+        // a privacy mode they cannot cancel from the viewer. The virtual
+        // display path also restores the physical topology and rebuilds the
+        // stream before it answers.
         if (privacy_active && (now_mask & kPermissionPrivacyMode) == 0) {
-            privacy_overlay->disable();
-            privacy_active = false;
-            stats.privacy_mode_active = false;
-            ++stats.privacy_mode_changes;
+            if (!set_privacy_mode(false)) {
+                return false;
+            }
             log("privacy mode is off: the permission was revoked");
             if (!send_privacy_state(false, PrivacyModeCode::Denied,
                                     "privacy mode was turned off by the host")) {
@@ -3429,6 +3511,494 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         broadcast_cursor(cursor_sent);
     };
 
+    // Physical display privacy and management. Both paths rebuild the stream
+    // through the same proof: the new output must produce an NV12 texture and
+    // a hardware-encoded key frame before anything is announced. There is no
+    // CPU or GDI fallback, and a virtual output that fails is rolled back to
+    // the original layout instead of being shown as a degraded stream.
+    std::wstring privacy_original_device;
+    bool privacy_original_merged = false;
+    // Set when the rebuilt stream could not be announced; retrying cannot
+    // help, so privacy_capture() stops instead of looping until its deadline.
+    bool privacy_publish_failed = false;
+    auto privacy_capture_once = [&](const std::wstring& monitor, bool commit,
+                                    std::string* failure) -> bool {
+        std::vector<DisplayInfo> fresh = enumerate_displays();
+        const std::wstring device =
+            monitor.empty() ? privacy_original_device : virtual_display_device_name(monitor);
+        const bool merged = monitor.empty() && privacy_original_merged;
+        size_t target = fresh.size();
+        for (size_t i = 0; i < fresh.size(); ++i) {
+            if (fresh[i].device_name == device) {
+                target = i;
+            }
+        }
+        // Only recovery may choose another surviving physical output after
+        // an unplug. Privacy activation never silently captures another one.
+        if (monitor.empty() && target == fresh.size() && !fresh.empty()) {
+            target = 0;
+            for (size_t i = 0; i < fresh.size(); ++i) {
+                if (fresh[i].primary) {
+                    target = i;
+                }
+            }
+        }
+        if (fresh.empty() || (!merged && target == fresh.size())) {
+            *failure = "the requested privacy output is not GPU-capturable";
+            return false;
+        }
+        std::unique_ptr<IDxgiCapturer> next =
+            merged ? create_merged_capturer(fresh, capture, failure)
+                   : create_shared_capturer(fresh[target], capture, failure);
+        if (!next) {
+            return false;
+        }
+        UINT next_scale_request = resolution_request;
+        if (resolution_request != 100) {
+            Error scaled = next->set_nv12_scale(resolution_request);
+            if (!scaled.ok()) {
+                log("privacy capture: cannot scale to " +
+                    std::to_string(resolution_request) +
+                    "%; using 100%: " + scaled.to_string());
+                next_scale_request = 100;
+            }
+        }
+        if (!wait_for_usable_frame(*next, true, stopping_, std::chrono::seconds(5),
+                                   failure)) {
+            return false;
+        }
+        const uint16_t next_effective_percent =
+            static_cast<uint16_t>(next->nv12_scale_percent());
+        const FrameInfo& frame = next->frame();
+        EncoderConfig next_config = encoder_config;
+        next_config.width = frame.nv12_width;
+        next_config.height = frame.nv12_height;
+        const AdapterDevice next_adapter = next->adapter_device();
+        std::unique_ptr<IVideoEncoder> next_encoder =
+            create_encoder(next_adapter.device, next_config, failure);
+        if (!next_encoder) {
+            return false;
+        }
+        if (next_encoder->codec() != encoder_config.codec) {
+            log(std::string("the encoder fell back: requested ") +
+                codec_name(encoder_config.codec) + ", producing " +
+                codec_name(next_encoder->codec()));
+        }
+        // The replacement starts at the configured bitrate, so the current
+        // stream rate and frame rate have to be applied before the proof.
+        const uint32_t next_fps =
+            stats.framerate != 0 ? stats.framerate : static_cast<uint32_t>(framerate);
+        if (next_encoder->bitrate() != stats.target_bitrate ||
+            (next_fps != 0 && next_encoder->framerate() != next_fps)) {
+            Error rated = next_encoder->set_rate(stats.target_bitrate, next_fps);
+            if (!rated.ok()) {
+                *failure = "cannot apply the current bitrate: " + rated.to_string();
+                return false;
+            }
+        }
+        std::vector<EncodedPacket> proof;
+        const Error encoded = next_encoder->encode(frame.nv12_texture, 0, true, proof);
+        if (!encoded.ok() || proof.empty()) {
+            *failure = "virtual display hardware encoding failed: " + encoded.to_string();
+            return false;
+        }
+        if (!commit) {
+            return true;
+        }
+        // The proof frame is discarded. The first transmitted frame is a new
+        // IDR at the normal stream timestamp and follows the new StreamInfo.
+        // `frame` points into the capturer the move below hands to `capturer`.
+        capturer = std::move(next);
+        encoder = std::move(next_encoder);
+        attached = std::move(fresh);
+        have_input = false;
+        force_keyframe = true;
+        extra_idrs = 1;
+        frames_without_nv12 = 0;
+        cursor_sent_once = false;
+        cursor_sent = CursorUpdate{};
+        resolution_request = static_cast<uint16_t>(next_scale_request);
+        if (next_effective_percent != stats.resolution_percent) {
+            stats.resolution_percent = next_effective_percent;
+            ++stats.resolution_changes;
+        }
+        stream_info = describe_stream(attached, *capturer, *encoder, frame.width, frame.height,
+                                      static_cast<uint16_t>(framerate),
+                                      session_->permissions(), audio_info,
+                                      settings_.allow_terminal_persist);
+        publish_current(stream_info);
+        if (config_.stream_announced) {
+            config_.stream_announced(stream_info);
+        }
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            privacy_publish_failed = true;
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            }
+            *failure = refreshed.to_string();
+            return false;
+        }
+        ++stats.stream_updates;
+        return true;
+    };
+    auto privacy_capture = [&](const std::wstring& monitor, bool commit,
+                               std::string* failure) -> bool {
+        // CCD can report the restored topology before DXGI/DWM is ready to
+        // duplicate it (including transient E_ACCESSDENIED). Re-enumerate
+        // and recreate GPU resources for a bounded interval after switching.
+        // The guardian remains armed throughout activation and its rollback.
+        privacy_publish_failed = false;
+        const Clock::time_point deadline = Clock::now() + std::chrono::seconds(8);
+        do {
+            if (privacy_capture_once(monitor, commit, failure)) {
+                return true;
+            }
+            if (privacy_publish_failed || stopping_.load() || !session_->peer_alive()) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } while (Clock::now() < deadline);
+        return false;
+    };
+    // Discard GPU references to the detached output before restoring CCD. A
+    // failed restore leaves the guardian armed and ends the session: retrying
+    // from here would race the guardian and the operator's own changes.
+    auto stop_virtual_privacy = [&](std::string* failure) -> bool {
+        if (!virtual_privacy || !virtual_privacy->recovery_pending()) {
+            return true;
+        }
+        encoder.reset();
+        capturer.reset();
+        if (!virtual_privacy->disable(failure)) {
+            return false;
+        }
+        privacy_active = false;
+        stats.privacy_mode_active = false;
+        return privacy_capture({}, true, failure);
+    };
+    set_privacy_mode = [&](bool wanted) -> bool {
+        if (wanted && managed_displays.backend) {
+            return send_privacy_state(privacy_active, PrivacyModeCode::Denied,
+                "restore the managed display layout before enabling privacy");
+        }
+        if (privacy_implementation == "overlay") {
+            return set_overlay_privacy(wanted);
+        }
+        if (privacy_implementation != "virtual_display") {
+            return send_privacy_state(false, PrivacyModeCode::Unsupported,
+                                      "invalid privacy mode implementation");
+        }
+        if (!wanted) {
+            if (virtual_privacy && virtual_privacy->recovery_pending()) {
+                std::string failure;
+                if (!stop_virtual_privacy(&failure)) {
+                    send_privacy_state(false, PrivacyModeCode::Failed, failure);
+                    *error = failure;
+                    return false;  // the guardian keeps retrying
+                }
+                ++stats.privacy_mode_changes;
+                log("virtual display privacy is off; physical outputs are back");
+            }
+            return send_privacy_state(false, PrivacyModeCode::Ok, {});
+        }
+        if ((session_->permissions() & kPermissionPrivacyMode) == 0 ||
+            (registry_ && !registry_->may_change_host_state(this))) {
+            ++stats.privacy_mode_changes;
+            return send_privacy_state(
+                false, PrivacyModeCode::Denied,
+                "virtual display privacy requires permission and a single desktop viewer");
+        }
+        if (privacy_active) {
+            return send_privacy_state(true, PrivacyModeCode::Ok, {});
+        }
+        if (settings_.virtual_display_provider == "vdd") {
+            ++stats.privacy_mode_changes;
+            return send_privacy_state(false, PrivacyModeCode::Unsupported,
+                                      "the vdd provider is not implemented");
+        }
+        std::string failure;
+        const bool mode_was_active = mode_change->active();
+        if (mode_was_active && mode_change->restore(&failure) == ModeRestore::Failed) {
+            ++stats.privacy_mode_changes;
+            return send_privacy_state(false, PrivacyModeCode::Failed, failure);
+        }
+        privacy_original_device = capturer->display().device_name;
+        privacy_original_merged = capturer->merged();
+        if (!virtual_privacy) {
+            virtual_privacy = std::make_unique<VirtualDisplayPrivacy>(
+                make_display_privacy_backend(settings_.virtual_display_resolution,
+                                             default_virtual_display_package_dir()));
+        }
+        if (!virtual_privacy->enable(privacy_capture, &failure)) {
+            ++stats.privacy_mode_changes;
+            log("virtual display privacy failed: " + failure);
+            if (virtual_privacy->recovery_pending()) {
+                send_privacy_state(false, PrivacyModeCode::Failed, failure);
+                *error = failure;
+                return false;
+            }
+            if (!virtual_privacy->topology_may_have_changed() && !mode_was_active) {
+                return send_privacy_state(false, PrivacyModeCode::Failed, failure);
+            }
+            // Even a failed activation can invalidate the old duplication.
+            encoder.reset();
+            capturer.reset();
+            std::string stream_error;
+            if (!privacy_capture({}, true, &stream_error)) {
+                *error = failure + "; stream recovery: " + stream_error;
+                return false;
+            }
+            return send_privacy_state(false, PrivacyModeCode::Failed, failure);
+        }
+        privacy_active = true;
+        stats.privacy_mode_active = true;
+        ++stats.privacy_mode_changes;
+        log("virtual display privacy is on; physical outputs are disabled");
+        return send_privacy_state(true, PrivacyModeCode::Ok, {});
+    };
+
+    // IDs survive output reordering during this connection, but are never
+    // recycled after an identity disappears. No display-list index is trusted.
+    std::vector<std::pair<uint32_t, std::wstring>> display_identities;
+    uint32_t next_display_identity = 1;
+    auto refresh_display_identities = [&](DisplayControlState* state,
+                                          std::string* failure) -> bool {
+        std::vector<VirtualDisplayOutput> outputs;
+        if (!enumerate_virtual_display_outputs(outputs, failure)) {
+            return false;
+        }
+        std::erase_if(display_identities, [&](const auto& item) {
+            return std::none_of(outputs.begin(), outputs.end(), [&](const auto& output) {
+                return _wcsicmp(item.second.c_str(), output.identity.c_str()) == 0;
+            });
+        });
+        for (const VirtualDisplayOutput& output : outputs) {
+            auto item = std::find_if(
+                display_identities.begin(), display_identities.end(),
+                [&](const auto& candidate) {
+                    return _wcsicmp(candidate.second.c_str(), output.identity.c_str()) == 0;
+                });
+            if (item == display_identities.end()) {
+                if (!next_display_identity) {
+                    *failure = "virtual display identity limit reached";
+                    return false;
+                }
+                display_identities.emplace_back(next_display_identity++, output.identity);
+                item = std::prev(display_identities.end());
+            }
+            if (state) {
+                state->outputs.push_back({item->first, output.active});
+            }
+        }
+        return true;
+    };
+    auto send_display_control = [&](DisplayControlCode code,
+                                    const std::string& reason) -> bool {
+        DisplayControlState state;
+        const VirtualDisplayStatus driver =
+            classify_virtual_display_probe(probe_virtual_display());
+        state.supported = settings_.virtual_display_provider != "vdd" &&
+                          (driver.state == VirtualDisplayState::Installed ||
+                           driver.state == VirtualDisplayState::Active);
+        state.managed = managed_displays.backend != nullptr;
+        state.count = static_cast<uint8_t>(
+            std::min(attached_virtual_display_count(), kMaxVirtualDisplayMonitors));
+        state.privacy = privacy_implementation == "virtual_display"
+                            ? PrivacyImplementation::VirtualDisplay
+                            : PrivacyImplementation::Overlay;
+        state.code = code;
+        state.reason = reason;
+        std::string scan_error;
+        if (!refresh_display_identities(&state, &scan_error)) {
+            state.code = DisplayControlCode::Failed;
+            state.reason += (state.reason.empty() ? "" : "; ") + scan_error;
+        } else {
+            state.count = static_cast<uint8_t>(
+                std::count_if(state.outputs.begin(), state.outputs.end(),
+                              [](const auto& output) { return output.active; }));
+        }
+        const Error sent = session_->send_display_control_state(state);
+        if (!sent.ok()) {
+            *error = "display control: " + sent.to_string();
+        }
+        return sent.ok();
+    };
+    // Release capture before recovering the CCD topology; the independent
+    // guardian retains ownership when recovery cannot finish.
+    auto restore_managed_displays = [&](std::string* failure) -> bool {
+        if (!managed_displays.backend) {
+            return true;
+        }
+        encoder.reset();
+        capturer.reset();
+        if (mode_change->active() &&
+            mode_change->restore(failure) == ModeRestore::Failed) {
+            return false;
+        }
+        if (!managed_displays.backend->restore(failure)) {
+            return false;
+        }
+        managed_displays.backend.reset();
+        privacy_original_device = managed_original_device;
+        privacy_original_merged = managed_original_merged;
+        return privacy_capture({}, true, failure);
+    };
+    auto control_displays = [&](const DisplayControlRequest& request) -> bool {
+        if (request.action == DisplayControlAction::Query) {
+            return send_display_control(DisplayControlCode::Ok, {});
+        }
+        std::string failure;
+        if (request.action == DisplayControlAction::Restore) {
+            if (!restore_managed_displays(&failure)) {
+                send_display_control(DisplayControlCode::Failed, failure);
+                *error = "display recovery failed: " + failure;
+                return false;
+            }
+            return send_display_control(DisplayControlCode::Ok, {});
+        }
+        const uint16_t need =
+            (request.action == DisplayControlAction::SetCount ||
+             request.action == DisplayControlAction::ToggleOutput)
+                ? kPermissionPrivacyMode | kPermissionInput
+                : kPermissionPrivacyMode;
+        if ((session_->permissions() & need) != need) {
+            return send_display_control(DisplayControlCode::Denied,
+                                        "display control is not permitted");
+        }
+        if (privacy_active ||
+            (virtual_privacy && virtual_privacy->recovery_pending())) {
+            return send_display_control(
+                DisplayControlCode::Busy,
+                "turn off privacy before changing display settings");
+        }
+        if (request.action == DisplayControlAction::SelectPrivacy) {
+            if (managed_displays.backend) {
+                return send_display_control(
+                    DisplayControlCode::Busy,
+                    "restore the managed layout before selecting privacy");
+            }
+            if (request.value ==
+                static_cast<uint8_t>(PrivacyImplementation::VirtualDisplay)) {
+                const VirtualDisplayStatus driver =
+                    classify_virtual_display_probe(probe_virtual_display());
+                if (settings_.virtual_display_provider == "vdd" ||
+                    (driver.state != VirtualDisplayState::Installed &&
+                     driver.state != VirtualDisplayState::Active)) {
+                    return send_display_control(DisplayControlCode::Unsupported,
+                                                driver.detail);
+                }
+            }
+            privacy_implementation =
+                request.value == static_cast<uint8_t>(PrivacyImplementation::VirtualDisplay)
+                    ? "virtual_display"
+                    : "overlay";
+            return send_display_control(DisplayControlCode::Ok, {});
+        }
+        if (registry_ && !registry_->may_change_host_state(this)) {
+            return send_display_control(
+                DisplayControlCode::Busy,
+                "display topology changes require a single desktop viewer");
+        }
+        if (settings_.virtual_display_provider == "vdd") {
+            return send_display_control(DisplayControlCode::Unsupported,
+                                        "the vdd provider is not implemented");
+        }
+        std::wstring target_monitor;
+        if (request.action == DisplayControlAction::ToggleOutput) {
+            if (!refresh_display_identities(nullptr, &failure)) {
+                return send_display_control(DisplayControlCode::Failed, failure);
+            }
+            const auto target = std::find_if(
+                display_identities.begin(), display_identities.end(),
+                [&](const auto& item) { return item.first == request.target; });
+            if (target == display_identities.end()) {
+                return send_display_control(
+                    DisplayControlCode::Denied,
+                    "unknown or stale virtual display identity; refresh the list");
+            }
+            target_monitor = target->second;
+        }
+        if (!managed_displays.backend) {
+            std::unique_ptr<DisplayPrivacyBackend> backend =
+                make_display_management_backend(default_virtual_display_package_dir());
+            if (!backend->arm(&failure)) {
+                return send_display_control(DisplayControlCode::Failed, failure);
+            }
+            managed_original_device = capturer->display().device_name;
+            managed_original_merged = capturer->merged();
+            managed_displays.backend = std::move(backend);
+        }
+        privacy_original_device = capturer->display().device_name;
+        privacy_original_merged = capturer->merged();
+        std::wstring streamed_virtual_identity;
+        if (!capturer->merged()) {
+            for (const auto& item : display_identities) {
+                if (virtual_display_device_name(item.second) == privacy_original_device) {
+                    streamed_virtual_identity = item.second;
+                    break;
+                }
+            }
+        }
+        // A newly constructed reader would otherwise reuse the old shared
+        // duplication and its cached frame after CCD invalidates the output.
+        // Release the encoder and every reader before changing the layout.
+        encoder.reset();
+        capturer.reset();
+        bool changed = !mode_change->active() ||
+                       mode_change->restore(&failure) != ModeRestore::Failed;
+        std::vector<std::wstring> monitors;
+        if (changed) {
+            changed = request.action == DisplayControlAction::ToggleOutput
+                          ? managed_displays.backend->toggle(target_monitor,
+                                                             request.value != 0, &monitors,
+                                                             &failure)
+                          : managed_displays.backend->configure(request.value, &monitors,
+                                                                &failure);
+        }
+        // Prove capture/conversion/hardware encoding for each active virtual
+        // output before reporting success; never substitute CPU frames.
+        if (changed) {
+            for (const std::wstring& monitor : monitors) {
+                if (!privacy_capture(monitor, false, &failure)) {
+                    changed = false;
+                    break;
+                }
+            }
+        }
+        if (changed) {
+            const bool survives =
+                !streamed_virtual_identity.empty() &&
+                std::any_of(monitors.begin(), monitors.end(),
+                            [&](const std::wstring& monitor) {
+                                return _wcsicmp(monitor.c_str(),
+                                                streamed_virtual_identity.c_str()) == 0;
+                            });
+            if (!streamed_virtual_identity.empty() && !survives) {
+                // DISPLAYn can be reused after removal. Choose the surviving
+                // primary explicitly instead of accidentally capturing that
+                // name again.
+                privacy_original_device.clear();
+                privacy_original_merged = false;
+            }
+            changed = privacy_capture(survives ? streamed_virtual_identity : std::wstring{},
+                                      true, &failure);
+        }
+        if (!changed) {
+            const std::string cause = failure;
+            if (!restore_managed_displays(&failure)) {
+                send_display_control(DisplayControlCode::Failed,
+                                     cause + "; recovery: " + failure);
+                *error = "display recovery failed: " + failure;
+                return false;
+            }
+            return send_display_control(DisplayControlCode::Failed,
+                                        cause + "; original layout restored");
+        }
+        return send_display_control(DisplayControlCode::Ok, {});
+    };
+
     auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
         const FrameInfo& frame = capturer->frame();
         if (!frame.nv12_texture) {
@@ -3548,6 +4118,14 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if ((session_->permissions() & kPermissionInput) == 0) {
             return refuse(DisplaySwitchCode::Failed, "input control is disabled");
         }
+        // Overlay privacy masks the local screen but leaves capture running,
+        // so it never blocks a switch. Virtual display privacy does: the
+        // session is capturing the privacy output until the guardian restores
+        // the physical topology.
+        if (virtual_privacy && virtual_privacy->recovery_pending()) {
+            return refuse(DisplaySwitchCode::Busy,
+                          "turn off virtual display privacy before switching displays");
+        }
         if (switched_once && now - last_switch_at < std::chrono::seconds(1)) {
             return answer(DisplaySwitchCode::Busy, "a display switch just happened");
         }
@@ -3620,7 +4198,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                                   " displays: " + switch_error);
             }
         } else {
-            next = create_capturer(target, capture, &switch_error);
+            next = create_shared_capturer(target, capture, &switch_error);
             if (!next) {
                 return refuse(DisplaySwitchCode::Failed,
                               "cannot capture display " + std::to_string(target) + ": " +
@@ -3918,6 +4496,15 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
 
         if ((session_->permissions() & kPermissionInput) == 0) {
             return refuse(DisplayModeCode::Failed, "input control is disabled");
+        }
+        if (privacy_active ||
+            (virtual_privacy && virtual_privacy->recovery_pending())) {
+            return refuse(DisplayModeCode::Busy,
+                          "turn off privacy before changing display modes");
+        }
+        if (managed_displays.backend) {
+            return refuse(DisplayModeCode::Busy,
+                          "restore the managed display layout before changing modes");
         }
         if (mode_changed_once && now - last_mode_change_at < std::chrono::seconds(1)) {
             return answer(DisplayModeCode::Busy, "a display mode change just happened");
@@ -4571,6 +5158,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         CameraRelayConfig{settings_.codec, settings_.quality, config_.encoder_backend,
                           settings_.framerate > 0 ? settings_.framerate : 30u});
 
+    const Clock::duration idle_timeout = idle_disconnect_timeout();
     while (!stopping_.load()) {
         const auto now = Clock::now();
         if (config_.run_seconds > 0.0 &&
@@ -4588,33 +5176,50 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (session_->viewer_finished()) {
             break;
         }
-        uint16_t switch_index = kDisplayAuto;
-        if (session_->take_display_switch_request(switch_index) &&
-            !switch_display(switch_index)) {
-            const bool clean = error->empty();
+        // Frames, audio and local input keep flowing on their own; only an
+        // explicit viewer request proves somebody is still watching.
+        if (idle_timeout > Clock::duration::zero() &&
+            now - last_viewer_activity_ >= idle_timeout) {
+            ++stats.idle_disconnects;
+            log("idle: no viewer activity for " + std::to_string(idle_disconnect_seconds()) +
+                " s; closing the session");
             drain_peer(stats);
-            return clean;
+            return error->empty();
+        }
+        uint16_t switch_index = kDisplayAuto;
+        if (session_->take_display_switch_request(switch_index)) {
+            touch_viewer_activity();
+            if (!switch_display(switch_index)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
         }
         uint16_t modes_index = 0;
-        if (session_->take_list_display_modes_request(modes_index) &&
-            !send_mode_list(modes_index)) {
-            const bool clean = error->empty();
-            drain_peer(stats);
-            return clean;
+        if (session_->take_list_display_modes_request(modes_index)) {
+            touch_viewer_activity();
+            if (!send_mode_list(modes_index)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
         }
         uint16_t mode_index = 0;
         uint16_t mode_width = 0;
         uint16_t mode_height = 0;
         uint16_t mode_refresh = 0;
         if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
-                                                    mode_refresh) &&
-            !change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
-            const bool clean = error->empty();
-            drain_peer(stats);
-            return clean;
+                                                    mode_refresh)) {
+            touch_viewer_activity();
+            if (!change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
         }
         uint8_t follow_request = 0;
         if (session_->take_display_follow_request(follow_request)) {
+            touch_viewer_activity();
             uint8_t applied = follow_request & kDisplayFollowAll;
             DisplayFollowCode code = DisplayFollowCode::Ok;
             std::string reason;
@@ -4687,25 +5292,79 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
         }
         StreamOptions options;
-        if (session_->take_stream_options_request(options) &&
-            !apply_stream_options(options)) {
-            const bool clean = error->empty();
-            drain_peer(stats);
-            return clean;
+        if (session_->take_stream_options_request(options)) {
+            touch_viewer_activity();
+            if (!apply_stream_options(options)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
         }
         if (!apply_pending_permissions()) {
             const bool clean = error->empty();
             drain_peer(stats);
             return clean;
         }
+        DisplayControlRequest display_request;
+        if (session_->take_display_control_request(display_request)) {
+            touch_viewer_activity();
+            if (!control_displays(display_request)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
+        }
+        // A revoked permission or a layout another application changed must
+        // return this host's original topology before the session keeps using
+        // it. The independent guardian retries when the restore fails here.
+        if (managed_displays.backend) {
+            std::string recovery_reason;
+            const uint16_t management_need = kPermissionInput | kPermissionPrivacyMode;
+            const bool permitted =
+                (session_->permissions() & management_need) == management_need &&
+                (!registry_ || registry_->may_change_host_state(this));
+            if (!permitted || !managed_displays.backend->intact(&recovery_reason)) {
+                if (!restore_managed_displays(&recovery_reason)) {
+                    *error = recovery_reason;
+                    drain_peer(stats);
+                    return false;
+                }
+                if (!send_display_control(
+                        permitted ? DisplayControlCode::Failed
+                                  : DisplayControlCode::Denied,
+                        permitted
+                            ? "display management interrupted; original layout restored"
+                            : "display permission revoked; original layout restored")) {
+                    const bool clean = error->empty();
+                    drain_peer(stats);
+                    return clean;
+                }
+            }
+        }
         bool privacy_requested = false;
-        if (session_->take_privacy_mode_request(privacy_requested) &&
-            !set_privacy_mode(privacy_requested)) {
-            const bool clean = error->empty();
-            drain_peer(stats);
-            return clean;
+        if (session_->take_privacy_mode_request(privacy_requested)) {
+            touch_viewer_activity();
+            if (!set_privacy_mode(privacy_requested)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
+        }
+        if (virtual_privacy && privacy_active) {
+            std::string integrity_error;
+            if (!virtual_privacy->intact(&integrity_error)) {
+                log("virtual display privacy interrupted: " + integrity_error);
+                // A monitor hotplug or a dead guardian invalidates privacy.
+                // Restore immediately and terminate instead of transmitting
+                // a desktop that may now be visible on a physical panel.
+                virtual_privacy->disable(error);
+                send_privacy_state(false, PrivacyModeCode::Failed, integrity_error);
+                *error = integrity_error;
+                return false;
+            }
         }
         while (session_->take_sas_request()) {
+            touch_viewer_activity();
             if (!send_sas()) {
                 const bool clean = error->empty();
                 drain_peer(stats);
@@ -4734,6 +5393,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
+            touch_viewer_activity();
             ++stats.chat_received;
             log("chat: received " + std::to_string(chat_text.size()) + " bytes");
             if (config_.chat_message) {
@@ -4742,6 +5402,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         std::string injected_text;
         while (session_->take_text_input(injected_text)) {
+            touch_viewer_activity();
             ++stats.text_received;
             log("text input: received " + std::to_string(injected_text.size()) +
                 " bytes");
@@ -4780,6 +5441,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         drain_voice_call(stats);
         PortForwardRequest forward_request;
         while (session_->take_port_forward_request(forward_request)) {
+            touch_viewer_activity();
             // The transport already checked the session grant; reaching here
             // means the operator enabled port forwarding for this host.
             const Error answered = session_->send_port_forward_result(
@@ -4794,6 +5456,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         PortForwardStop forward_stop;
         while (session_->take_port_forward_stop(forward_stop)) {
+            touch_viewer_activity();
             log("port forward: stopped with code " +
                 std::to_string(static_cast<int>(forward_stop.code)) +
                 (forward_stop.reason.empty() ? std::string() : ": " + forward_stop.reason));
@@ -6392,8 +7055,28 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     };
     apply_pending_permissions();
 
+    // A file-only session counts only completed or progressed transfers as
+    // activity: browsing folders and refused desktop controls do not keep a
+    // forgotten viewer alive. `run_single` reuses `stats`, so the baseline is
+    // taken per session rather than assumed zero.
+    const Clock::duration idle_timeout = idle_disconnect_timeout();
+    const auto file_activity = [&stats] {
+        return stats.files_received + stats.files_sent + stats.file_bytes_received +
+               stats.file_bytes_sent + stats.file_failures + stats.file_send_failures +
+               stats.file_send_cancels;
+    };
+    auto last_activity = Clock::now();
+    auto last_file_activity = file_activity();
+
     while (!stopping_.load()) {
         apply_pending_permissions();
+        if (idle_timeout > Clock::duration::zero() &&
+            Clock::now() - last_activity >= idle_timeout) {
+            ++stats.idle_disconnects;
+            log("idle: no file activity for " + std::to_string(idle_disconnect_seconds()) +
+                " s; closing the file session");
+            return true;
+        }
         HostControlRequest host_action;
         while (session_->take_host_action_request(host_action)) {
             ++stats.host_actions;
@@ -6435,6 +7118,24 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
                 return false;
             }
             log("remote configuration refused: file-transfer sessions cannot change host settings");
+        }
+        DisplayControlRequest display_request;
+        while (session_->take_display_control_request(display_request)) {
+            DisplayControlState denied;
+            denied.code = DisplayControlCode::Denied;
+            denied.reason = "display control requires a desktop session";
+            const Error sent = session_->send_display_control_state(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "display_control_state: " + sent.to_string();
+                return false;
+            }
+            log("display control refused: a file-transfer session has no desktop");
         }
         std::string login_password;
         while (session_->take_os_login_request(login_password)) {
@@ -6496,6 +7197,11 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
             log("session select refused: file-transfer sessions cannot switch sessions");
         }
         poll_files(stats);
+        const uint64_t activity = file_activity();
+        if (activity != last_file_activity) {
+            last_file_activity = activity;
+            last_activity = Clock::now();
+        }
         if (session_->viewer_finished()) {
             return true;
         }
@@ -6628,6 +7334,24 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
                 return false;
             }
             log("remote configuration refused: a control-only session cannot change host settings");
+        }
+        DisplayControlRequest display_request;
+        while (session_->take_display_control_request(display_request)) {
+            DisplayControlState denied;
+            denied.code = DisplayControlCode::Denied;
+            denied.reason = "display control requires a desktop session";
+            const Error sent = session_->send_display_control_state(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "display_control_state: " + sent.to_string();
+                return false;
+            }
+            log("display control refused: a control-only session has no desktop");
         }
         std::string login_password;
         while (session_->take_os_login_request(login_password)) {
@@ -6947,6 +7671,7 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
 
 void HostServer::drain_peer(HostServerStats& stats) {
     for (const InputEvent& event : session_->take_input_events()) {
+        touch_viewer_activity();
         ++stats.input_events;
         if (config_.input_event) {
             config_.input_event(event);
@@ -6959,12 +7684,14 @@ void HostServer::drain_peer(HostServerStats& stats) {
     }
     ClipboardContent content;
     while (session_->take_clipboard_content(content)) {
+        touch_viewer_activity();
         apply_peer_clipboard(std::move(content), stats);
     }
     // A viewer that only speaks the v15 text message still works: treat its
     // ClipboardUpdate as a text-only item.
     ClipboardUpdate update;
     while (session_->take_clipboard_update(update)) {
+        touch_viewer_activity();
         ClipboardContent legacy;
         legacy.seq = update.seq;
         ClipboardFormatData text;
@@ -7386,6 +8113,7 @@ bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,
                                      bool* peer_left) {
     HostControlRequest request;
     while (session_->take_host_action_request(request)) {
+        touch_viewer_activity();
         ++stats.host_actions;
         HostActionCode code = HostActionCode::Ok;
         std::string reason;
@@ -7503,6 +8231,7 @@ bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::stri
                                                bool* peer_left) {
     RemoteConfigRequest request;
     while (session_->take_remote_config_request(request)) {
+        touch_viewer_activity();
         ++stats.remote_config_requests;
         const uint16_t permissions = session_->permissions();
         // keys = 0 is a read; any key bit asks to write that switch.
@@ -7624,6 +8353,7 @@ bool HostServer::handle_os_login_requests(HostServerStats& stats, std::string* e
                                           bool* peer_left) {
     std::string password;
     while (session_->take_os_login_request(password)) {
+        touch_viewer_activity();
         ++stats.os_login_requests;
         OsLoginCode code = OsLoginCode::Ok;
         std::string reason;
@@ -7706,6 +8436,7 @@ bool HostServer::handle_os_login_requests(HostServerStats& stats, std::string* e
 bool HostServer::handle_session_requests(HostServerStats& stats, std::string* error,
                                          bool* peer_left) {
     while (session_->take_session_list_request()) {
+        touch_viewer_activity();
         ++stats.session_list_requests;
         SessionListResult result;
         const uint16_t permissions = session_->permissions();

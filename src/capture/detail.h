@@ -280,6 +280,12 @@ std::unique_ptr<IDxgiCapturer> create_capturer_on_device(const DisplayInfo& disp
                                                          ID3D11DeviceContext* context,
                                                          UINT vendor_id, std::string* error);
 
+// A reader of the output's shared duplication, running on `device`/`context`
+// (the merged compositor's) or on its own device when both are null.
+std::unique_ptr<IDxgiCapturer> create_shared_capturer_on_device(const DisplayInfo& display,
+    const CaptureConfig& config, ID3D11Device* device, ID3D11DeviceContext* context,
+    UINT vendor_id, std::string* error);
+
 // Decides what the capturer must do after a stage failed. Status::Unsupported
 // and InvalidCall are permanent: the same pass will fail on every frame, so
 // retrying is pointless. Everything else may be transient (device removed,

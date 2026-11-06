@@ -511,9 +511,14 @@
     `carrier`/`relay`，载体与 UDP 中继均完成数据报往返，`direct` 明确失败；
     `--offline-after 1s` + 5 s keepalive 时 `last_seen_ms` 已过期但查询仍经
     载体返回在线，往返成功。
-  - 已知限制：载体仍为单查看者，不承载多路复用；主机关闭后要等载体读超时
-    （90 s）或 UDP 判定过期才转为离线；真实弱网重连与双机 UDP 封锁需人工
-    验收。
+  - 多路复用（能力协商，不改 QUIC 协议版本）：主机在 hello/challenge/auth 中声明
+    `multiplex` 并签名能力串 `MUX1`，中继校验后启用；UDP 数据报与载体帧均
+    以 `CHASTM1\n` + u64 大端路由号封装，中继按路由号隔离查看者（各自独立
+    策略会话与有界发送队列，慢查看者关闭）；上限 64 路，未知路由号丢弃，
+    查看者经多路复用通道注入的控制报文同样丢弃。旧主机或旧中继不声明能力
+    时自动退回单查看者模式。
+  - 已知限制：主机关闭后要等载体读超时（90 s）或 UDP 判定过期才转为离线；
+    多路复用目前仅单机回环验证，真实弱网重连与双机 UDP 封锁需人工验收。
 
 ## M10.4 — 管理通道、打洞审计与注册防滥用（已完成）
 
@@ -3379,6 +3384,136 @@
      串行 `ctest` 47/47（654.19 s），`flutter analyze` 无问题、
      `flutter test` 603 项、Windows release 构建通过；边界：C++ 依赖
      （vcpkg/oneVPL/FFmpeg）仍由人工跟进版本，Dependabot 不覆盖。
+155. **P1 · 移植显示管理与隐私（2026-11-06 完成）**：从归档并行分支
+     `feat/windows-session-display-20261105` 按模块移植，而不是整体合并，
+     协议升到 v47 并新增控制消息 `DisplayControl(67)` /
+     `DisplayControlState(68)`（归档分支的 58/59 已被 `OsLoginRequest` /
+     `OsLoginResult` 占用，改为顺延编号）。查看器可查询本会话的 0～4 个
+     “桌面输出”：每项带会话内稳定 id 与 active 状态，列表下标从不作为
+     线上身份；`SetCount` 增删虚拟屏、`ToggleOutput` 按 id 开关单块、
+     `Restore` 恢复原拓扑、`SelectPrivacy` 在遮罩与虚拟屏两种隐私实现间
+     切换。`SetCount`/`ToggleOutput` 需要隐私模式与输入权限，其余需要隐私
+     权限，但 `Restore` 在权限被撤销后仍可执行，便于查看者撤销自己的改动。
+     主机侧把归档分支的 `display_mode` 拓扑快照/恢复、`display_privacy`
+     后端与独立 `chast-display-guard.exe` 恢复守卫接进主线的单线程发布会话：
+     所有拓扑改动先在备用采集器上完成 GPU 采集、NV12 与硬件编码证明，
+     成功后才原子换入；失败、撤权、断线或热插拔由守卫恢复原拓扑；隐私
+     期间拒绝并发显示控制并返回 Busy，服务/跟随/仅文件会话按权限拒绝。
+     设置页新增“隐私方式”（遮罩默认 / 虚拟屏），托盘安全设置与 `host.ini`
+     的 `privacy_mode_impl` 持久化，非法值保留并告警。查看器工具栏新增
+     “虚拟显示器与隐私设置”菜单（数量 0～4、逐输出开关、恢复布局、隐私
+     方式、刷新状态），桥接发布 `displayControl*` 状态与错误提示，文案中英
+     双语。验证：C++ Release 全量构建通过，`protocol`、`display_privacy`、
+     `host_settings`、`host_i18n` 定向 ctest 通过（`virtual_display` 的 6 项
+     包签名校验当时因本机沙箱 `%TEMP%` ACL 被拒，后已改为显式私有 DACL
+     的测试夹具并在全量 ctest 中通过），
+     `flutter analyze` 无问题、`flutter test` 全量通过（新增稳定 id 开关与
+     撤权后恢复两项组件测试）、Windows release 构建通过。边界：本机未安装
+     usbmmidd/虚拟显示驱动，仅能验证 Query/Unsupported 与拒绝路径；真实
+     拓扑变更、守卫接管、双机端到端与虚拟屏定位（PLAT-01 G1）仍待专用
+     测试机验收。
+156. **P2 · 移植跨子网唤醒（2026-11-06 完成）**：从归档并行分支移植
+     DEV-10 超出 RustDesk 对齐面的增强。服务端新增内存唤醒队列（作业
+     60 s 有效、每目标 30 s 冷却、最多 64 个作业，按注册续期逐 agent
+     投递一次），`POST /v1/hosts/{id}/wake` 接受 MAC，server-key 或账号
+     令牌鉴权，管理员与地址簿/共享地址簿内的目标可唤醒，审计动作
+     `device_wake`。主机代理新增 `--wake-relay`，在注册续期时取走作业并
+     向受限广播与各网卡定向广播发送 102 字节魔法包，`--wake-targets`
+     供本机诊断；查看器“唤醒”对话框新增“通过连接服务转发”，与同网段
+     直发共存。该功能只增加 HTTP API 与代理参数，QUIC 协议仍为 v47。
+     验证：Go 全量测试与定向 wake API 测试、`flutter analyze` 与三个
+     定向测试文件通过；真实回环中 server-key 请求 202 后 2.3 s 内代理
+     记录 `wake relayed`，UDP 收到 102 字节，冷却窗口内重复请求返回
+     429 与 `Retry-After: 30`。真实跨子网链路、网卡唤醒与账号令牌
+     端到端仍需多网段/双机环境。
+157. **P2 · 移植精密触控板平移与捏合（2026-11-06 完成）**：从归档并行
+     分支移植 G11 的触控板手势，不移植其“触摸屏当鼠标”的模拟——主线
+     已有真实 Touch/Pen 注入，照搬会回退。协议升到 v48，新增
+     `InputKind::Gesture=5` 与 `GestureEvent{action,x,y}`：Pan 携带两轴
+     滚轮增量，Zoom 只允许纵向增量，单轴上限 ±1200，零增量、未知动作、
+     Zoom 带横向增量及携带按钮/触摸/笔字段的事件均拒绝。查看器监听
+     Flutter pointer pan/zoom：平移按 120/53 像素换算滚轮格并保留小数
+     累积，捏合按 `log(scale)/log(1.1)*120` 累积，达到 ±60 才算捏合、
+     按 ±10 格限幅发出，成为捏合后不再同时滚动，手势结束/失去焦点/撤权
+     时清空累积。主机把 Pan 注入横向/纵向滚轮，把 Zoom 合成为完整的
+     Ctrl+滚轮并在一步后恢复原修饰键状态；原生桥按 kind=5 校验动作、
+     按钮为零、增量范围与互斥字段。验证：`protocol` 通过（新增往返与
+     六类拒绝用例、注入器 dry-run 的 3 次/2 次注入计数），`flutter
+     analyze` 无问题、`flutter test` 630 项通过（新增四项手势组件/桥接
+     测试），QUIC 回环 `--input` 的“事件完整按序到达并全部注入”通过，
+     Windows release 构建通过。边界：本机无精密触控板，真机两指手势与
+     宿主应用缩放效果仍需实机验收；不改变触摸屏 Touch/Pen 语义，也不
+     转发触摸 hover。
+158. **P2 · 移植双终端标签（2026-11-06 完成）**：从归档并行分支移植
+     第二个远程控制台。协议自 v27 起已有 `kMaxTerminals=2` 与按
+     `terminal_id` 寻址的请求/结果/停止/流头，本次不加字段，协议仍为
+     v48。引擎把单个终端通道改成逐槽 `TerminalChannel`（代数、状态、
+     输出队列与字节计数）：命令携带槽位与代数，线上 id 每次打开重新
+     分配，输入/输出高水位按槽独立，延迟命令只阻塞本槽；`Snapshot()`
+     在双锁下把 1 号槽镜像回旧的标量字段。桥接状态新增 `terminals`
+     列表（id/phase/code/reason/error/columns/rows/bytes/updates/
+     serviceId），各方法接受可选 `terminalId`，旧调用形态保持原语义。
+     Flutter 新增 `TerminalTabs`：最多两个标签、逐标签焦点与
+     `resumeServiceId`、新建/关闭/关闭全部，断线重连只恢复仍在的持久
+     控制台，终端页同时跟踪各槽 service id 与打开的标签。验证：
+     `flutter analyze` 无问题、`flutter test` 632 项通过（新增双槽状态
+     解析与标签增删/输入路由/重连不误关两类测试）、Windows release
+     构建通过；`viewer_folder_download` 的真实 QUIC 回环通过（4.6 s），
+     探针在 1 号控制台 80x24→100x30 打开期间又开 2 号 90x28，分别回显
+     marker、各自缩放到 110x32 后独立关闭，1 号全程保持 100x30，共
+     969 字节。边界：主机传输并发上限为 2 个控制台，标签 UI 不再往上
+     扩展；终端专用会话仍不恢复持久控制台（沿用既有语义）；双标签
+     GUI 交互由组件测试覆盖，未做人工双桌面会话验收。
+159. **P2 · 移植多窗口与独立显示器窗口（2026-11-06 完成）**：从归档
+     并行分支移植查看器多窗口。只改查看器进程，协议仍为 v48，主机与
+     服务端无变化。每个会话窗口拥有独立的 Flutter engine、ViewerBridge
+     与 MethodChannel；首页连接时先请求原生开窗，桥接不可用或被拒绝时
+     回退到页内跳转。连接参数由 Dart 编码成 `SessionWindowRequest` JSON，
+     经 `set_dart_entrypoint_arguments` 直接交给新 engine，凭据不进入
+     进程命令行、临时文件或日志。runner 持有窗口向量（上限 16 个、
+     请求 1 MiB），新窗口按序号级联偏移摆放，统一
+     `SetQuitOnClose(false)`，消息循环回收已销毁窗口并在最后一个窗口
+     关闭时退出。窗口 X 走两阶段关闭：原生拦下 WM_CLOSE 并通知 Dart
+     `windowCloseRequested`，会话页停流、释放键鼠与录制后调用
+     `closeSessionWindow`，原生再投递真正的 WM_CLOSE，避免引擎先于会话
+     销毁。会话页新增窗口模式与初始显示器参数，显示器菜单新增逐屏
+     “在新窗口打开显示器 N”（菜单 id 以 -1000 为基址，避开跟随光标/
+     窗口的 -1/-2）。验证：`flutter analyze` 无问题、`flutter test`
+     640 项全部通过（新增 6 项窗口请求编解码/桥接调用/回退测试与 2 项
+     逐屏菜单测试）、Windows release 构建通过；进程级冒烟启动后主窗口
+     存活，关闭最后一个窗口以退出码 0 结束。边界：最多 16 个会话窗口
+     （含从会话窗口再开的逐屏窗口）；未做第二窗口的真实 GUI 人工验收，
+     窗口位置/大小不跨启动持久化；凭据只在进程内传递，不写入任何
+     持久化文件。
+160. **P2 · 移植共享 DXGI 采集与查看器存储锁（2026-11-06 完成）**：从
+     归档并行分支补齐两个并发基础。
+     共享采集：新增 `src/capture/shared_capturer.cc`，按
+     `DisplayInfo::device_name` 在进程内共享同一个桌面复制源（弱引用，
+     最后一个读者关闭即释放）。每个读者有独立的共享纹理与 NV12 pass，
+     可独立 `set_nv12_scale` 而不影响其他读者；跨设备时源纹理经 DXGI
+     共享句柄导入，并在拷贝前后插入 GPU fence（2 s 超时）；同一输出
+     出现不同 HDR 策略时拒绝创建；源重建会使其余读者在下一次
+     `capture()` 收到 `ReinitNeeded`。主机创建采集、隐私恢复/切屏的单屏
+     路径改用 `create_shared_capturer`，合并采集的成员改用
+     `detail::create_shared_capturer_on_device`，因此合并画布与单屏读者
+     共用一份复制，切屏与隐私过渡不再叠加第二个复制。线上协议仍为 v48。
+     存储锁：新增 `app/lib/store_lock.dart`，按文件路径在进程内串行，
+     并用同目录 `.lock` 旁路的 `FileLock.blockingExclusive` 跨进程串行；
+     Zone 记录已持有的文件集合，嵌套 `load()` 不会自锁；同步版本供
+     `ui.json`/`ui-filter.json` 的同步读改写使用。接入账号、设备、信任、
+     服务器身份、服务器设置、语言、画面偏好、视图偏好与地址簿筛选九个
+     存储，多窗口同时写同一 JSON 不再互相覆盖。验证：`flutter analyze`
+     无问题、`flutter test` 642 项全部通过（`store_lock_test` 用 3 个
+     isolate 各写 12 台宿主，最终 36 条 pin 与 36 台设备均保留；另覆盖
+     嵌套失败释放锁与同步重入）、Windows release 构建通过；C++ Release
+     全量构建通过，新增 ctest `shared_capture` 在本机真实桌面通过 6 项
+     断言（共享复制、独立纹理、独立缩放、重建检测、读者退出、合并画布
+     退出）；全量 ctest 51 项全部通过。首次全量跑暴露并修复两处回归：
+     overlay 隐私期间切屏被误拒（恢复归档语义，只有虚拟显示器隐私待恢复
+     才拒绝），以及 `virtual_display` 夹具继承沙箱 `%TEMP%` 的宽松 DACL
+     被包信任检查正确拒绝（夹具改为显式私有 DACL）。边界：共享采集仅
+     在本机单 GPU/单输出实测，跨适配器与多输出并发未单独验收；存储锁
+     只保证文件读改写原子，不提供跨文件事务。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

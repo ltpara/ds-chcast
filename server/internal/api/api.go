@@ -42,6 +42,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/relaypool"
 	"github.com/ltpara/ds-chcast/server/internal/software"
 	"github.com/ltpara/ds-chcast/server/internal/tracing"
+	"github.com/ltpara/ds-chcast/server/internal/wake"
 	"github.com/ltpara/ds-chcast/server/internal/webadmin"
 )
 
@@ -184,6 +185,8 @@ type server struct {
 
 	oidcMu      sync.Mutex
 	oidcPending map[string]*oidcLoginState
+
+	wake *wake.Broker
 }
 
 // httpDurationBuckets are the Prometheus histogram bounds in seconds. The
@@ -214,6 +217,7 @@ func New(cfg Config) http.Handler {
 		durationCount:   make(map[string]uint64),
 		durationBuckets: make(map[string][]uint64),
 		recoveryLast:    make(map[string]time.Time),
+		wake:            wake.New(wake.DefaultTTL, wake.DefaultCooldown, wake.DefaultMaxJobs),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/hosts", s.register)
@@ -297,6 +301,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/file-transfers/batch", s.recordAccountFileTransferBatch)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
+	mux.HandleFunc("POST /v1/hosts/{id}/wake", s.wakeHost)
 	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /v1/accounts", s.adminCreateAccount)
 	mux.HandleFunc("PATCH /v1/accounts/{username}", s.adminUpdateAccount)
@@ -368,6 +373,9 @@ type registerResponse struct {
 	// answering.
 	ConfigSerial      int64    `json:"config_serial,omitempty"`
 	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
+	// Wake carries cross-subnet Wake-on-LAN jobs for this agent to broadcast on
+	// its own link. Agents without the relay enabled ignore the field.
+	Wake []wake.Job `json:"wake,omitempty"`
 }
 
 // softwareInfo mirrors RustDesk's SoftwareUpdate reply: the newest version and
@@ -568,6 +576,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Software:        s.software(),
 	}
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
+	resp.Wake = s.wake.PendingFor(req.ID)
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
 	} else {
@@ -1031,6 +1040,10 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the server's response writer, so
+// upload handlers can extend their read and write deadlines.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (s *server) record(r *http.Request, status int, took time.Duration) {
 	endpoint := r.Pattern
 	if endpoint == "" {
@@ -1488,6 +1501,20 @@ func boolFloat(v bool) float64 {
 func (s *server) authorized(r *http.Request) bool {
 	if s.cfg.ServerKey == "" {
 		return true
+	}
+	header := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	got := strings.TrimSpace(header[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.ServerKey)) == 1
+}
+
+// Open registration does not grant operator privileges.
+func (s *server) serverKeyAuthorized(r *http.Request) bool {
+	if s.cfg.ServerKey == "" {
+		return false
 	}
 	header := r.Header.Get("Authorization")
 	const prefix = "Bearer "

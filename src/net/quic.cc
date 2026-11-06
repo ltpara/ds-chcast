@@ -679,6 +679,14 @@ struct QuicSession::Impl {
     bool remote_config_state_ready = false;
     RemoteConfigState remote_config_state;
     uint64_t remote_config_states_seen = 0;
+    // Server: the newest DisplayControl request. Client: the newest state the
+    // host answered, coalesced like the other one-shot control replies.
+    bool display_control_request_ready = false;
+    DisplayControlRequest display_control_request;
+    uint64_t display_control_requests_seen = 0;
+    bool display_control_state_ready = false;
+    DisplayControlState display_control_state;
+    uint64_t display_control_states_seen = 0;
     // Server: OS-login passwords waiting for the host loop. Short and bounded
     // like host actions; dropped, overflowed and reset entries are wiped.
     std::deque<std::string> os_login_requests;
@@ -3433,6 +3441,42 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::DisplayControl: {
+                if (role != Role::Server) {
+                    break;
+                }
+                DisplayControlRequest request;
+                if (!parse_display_control(payload, request, &error)) {
+                    control_protocol_failure("DisplayControl: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_control_request = request;
+                    display_control_request_ready = true;
+                    ++display_control_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayControlState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                DisplayControlState state;
+                if (!parse_display_control_state(payload, state, &error)) {
+                    control_protocol_failure("DisplayControlState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_control_state = std::move(state);
+                    display_control_state_ready = true;
+                    ++display_control_states_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::OsLoginRequest: {
                 if (role != Role::Server) {
                     break;
@@ -4788,6 +4832,12 @@ struct QuicSession::Impl {
             remote_config_state_ready = false;
             remote_config_state = RemoteConfigState{};
             remote_config_states_seen = 0;
+            display_control_request_ready = false;
+            display_control_request = DisplayControlRequest{};
+            display_control_requests_seen = 0;
+            display_control_state_ready = false;
+            display_control_state = DisplayControlState{};
+            display_control_states_seen = 0;
             for (std::string& password : os_login_requests) {
                 std::fill(password.begin(), password.end(), '\0');
             }
@@ -6235,6 +6285,78 @@ bool QuicSession::take_remote_config_state(RemoteConfigState& state) {
 uint64_t QuicSession::remote_config_states() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->remote_config_states_seen;
+}
+
+bool QuicSession::take_display_control_request(DisplayControlRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_control_request_ready) {
+        return false;
+    }
+    request = impl_->display_control_request;
+    impl_->display_control_request_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::display_control_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->display_control_requests_seen;
+}
+
+Error QuicSession::send_display_control_state(const DisplayControlState& state) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_display_control_state is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    const std::vector<uint8_t> payload = make_display_control_state(state);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "display control state is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_display_control(const DisplayControlRequest& request) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_display_control is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if (impl.requested_mode != SessionMode::Desktop) {
+            return Error(Status::PermissionDenied,
+                         "display control requires a desktop session");
+        }
+        const uint16_t needed =
+            (request.action == DisplayControlAction::SetCount ||
+             request.action == DisplayControlAction::ToggleOutput)
+                ? kPermissionPrivacyMode | kPermissionInput
+                : kPermissionPrivacyMode;
+        if (request.action != DisplayControlAction::Query &&
+            request.action != DisplayControlAction::Restore &&
+            (impl.session_permissions.load() & needed) != needed) {
+            return Error(Status::PermissionDenied, "display control is not permitted");
+        }
+    }
+    const std::vector<uint8_t> payload = make_display_control(request);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "display control request is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_control_state(DisplayControlState& state) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_control_state_ready) {
+        return false;
+    }
+    state = std::move(impl_->display_control_state);
+    impl_->display_control_state_ready = false;
+    return true;
 }
 
 Error QuicSession::send_host_action_result(const HostControlResult& result) {

@@ -27,6 +27,54 @@ enum ViewerTerminalPhase {
   }
 }
 
+/// Consoles the viewer and the protocol host both accept
+/// (chast::kMaxTerminals). Each slot is an independent shell.
+const int kViewerMaxTerminals = 2;
+
+/// One console slot, as the session loop and the panel see it. [serviceId] is
+/// non-zero while a persistent console is alive; it names what a later
+/// session can attach to and clears when the console ends or its open is
+/// refused. [bytes] counts what arrived and [updates] pairs a phase change
+/// with the poll that saw it.
+class ViewerTerminalStatus {
+  const ViewerTerminalStatus({
+    this.phase = ViewerTerminalPhase.closed,
+    this.code = 0,
+    this.reason = '',
+    this.error = '',
+    this.columns = 0,
+    this.rows = 0,
+    this.bytes = 0,
+    this.updates = 0,
+    this.serviceId = 0,
+  });
+
+  final ViewerTerminalPhase phase;
+  final int code;
+  final String reason;
+  final String error;
+  final int columns;
+  final int rows;
+  final int bytes;
+  final int updates;
+  final int serviceId;
+
+  factory ViewerTerminalStatus.fromMap(Map<Object?, Object?> map) {
+    int number(String name) => (map[name] as num?)?.toInt() ?? 0;
+    return ViewerTerminalStatus(
+      phase: ViewerTerminalPhase.fromCode(number('phase')),
+      code: number('code'),
+      reason: map['reason'] as String? ?? '',
+      error: map['error'] as String? ?? '',
+      columns: number('columns'),
+      rows: number('rows'),
+      bytes: number('bytes'),
+      updates: number('updates'),
+      serviceId: number('serviceId'),
+    );
+  }
+}
+
 /// One piece of console output. [ended] marks the last piece the console ever
 /// produced; the panel keeps the bytes and then shows the ending.
 class ViewerTerminalOutput {
@@ -430,6 +478,30 @@ class ViewerAudioOutput {
   }
 }
 
+/// One virtual desktop output the host can toggle. [id] is a session-stable
+/// identity, never a display-list index, so a reordered list cannot address
+/// the wrong output.
+class ViewerControlledDisplay {
+  const ViewerControlledDisplay({required this.id, required this.active});
+
+  final int id;
+  final bool active;
+
+  static List<ViewerControlledDisplay> fromList(Object? value) {
+    if (value is! List) {
+      return const <ViewerControlledDisplay>[];
+    }
+    return <ViewerControlledDisplay>[
+      for (final item in value)
+        if (item is Map && item['id'] is int && (item['id'] as int) > 0)
+          ViewerControlledDisplay(
+            id: item['id'] as int,
+            active: item['active'] == true,
+          ),
+    ];
+  }
+}
+
 class ViewerStatus {
   const ViewerStatus({
     this.state = ViewerState.idle,
@@ -587,6 +659,15 @@ class ViewerStatus {
     this.privacyCode = 0,
     this.privacyError = '',
     this.privacyUpdates = 0,
+    this.displayControlSupported = false,
+    this.displayControlManaged = false,
+    this.displayControlCount = 0,
+    this.displayControlPrivacy = 0,
+    this.displayControlCode = 0,
+    this.displayControlError = '',
+    this.displayControlUpdates = 0,
+    this.displayControlBusy = false,
+    this.displayControlOutputs = const <ViewerControlledDisplay>[],
     this.desktop = ViewerDesktopKind.defaultDesktop,
     this.desktopUpdates = 0,
     this.sasCode = 0,
@@ -653,6 +734,7 @@ class ViewerStatus {
     this.terminalRows = 0,
     this.terminalBytes = 0,
     this.terminalUpdates = 0,
+    this.terminals = const <ViewerTerminalStatus>[],
     this.cameraSupported = false,
     this.cameraPhase = ViewerCameraPhase.idle,
     this.cameraCode = 0,
@@ -1006,6 +1088,24 @@ class ViewerStatus {
   final String privacyError;
   final int privacyUpdates;
 
+  /// Virtual display management (protocol v47). [displayControlSupported] is
+  /// the host's driver probe, [displayControlManaged] means this session owns
+  /// a temporary layout, and [displayControlCount] is the number of attached
+  /// virtual outputs. [displayControlOutputs] carries the session-stable ids
+  /// the toolbar toggles; [displayControlPrivacy] is the selected privacy
+  /// implementation (0 overlay, 1 virtual display). [displayControlCode] is
+  /// the host's DisplayControlCode (0 = Ok), [displayControlError] its reason,
+  /// and [displayControlBusy] covers the request/answer round trip.
+  final bool displayControlSupported;
+  final bool displayControlManaged;
+  final int displayControlCount;
+  final int displayControlPrivacy;
+  final int displayControlCode;
+  final String displayControlError;
+  final int displayControlUpdates;
+  final bool displayControlBusy;
+  final List<ViewerControlledDisplay> displayControlOutputs;
+
   /// Which desktop the host's video is capturing: the user desktop, a secure
   /// desktop (lock screen, UAC, credential prompt) or none. The picture pauses
   /// while the host cannot follow it and resumes when the user desktop returns.
@@ -1158,18 +1258,19 @@ class ViewerStatus {
   final bool portForwardEnabled;
   final List<ViewerPortForwardRule> portForwardRules;
 
-  /// Remote terminal. [terminalSupported] mirrors the host's permission;
+  /// Remote terminals. [terminalSupported] mirrors the host's permission;
   /// [terminalPersistSupported] says the host keeps consoles across
-  /// disconnects (protocol v42) and [terminalServiceId] is the kept console's
-  /// id, 0 for a session console or before the host answers. [terminalPhase]
-  /// is the console's state, [terminalCode] and [terminalReason] carry the
-  /// host's TerminalCode and wording for a refusal or an ending, and
-  /// [terminalError] explains a local failure such as a send error or a
-  /// revoked permission. [terminalColumns]/[terminalRows] are the size the
-  /// host last acknowledged. Output never travels in this struct:
-  /// [ViewerBridge.takeTerminalOutput] hands it over and [terminalBytes]
-  /// counts what arrived. [terminalUpdates] counts phase transitions so the
-  /// panel pairs each ending with the poll that saw it.
+  /// disconnects (protocol v42) and each slot's service id is the kept
+  /// console's id, 0 for a session console or before the host answers.
+  /// [terminals] is the per-slot truth; the scalar fields below always
+  /// describe slot 1 for callers that predate the tabs. A slot's [phase] is
+  /// its console state, [code] and [reason] carry the host's TerminalCode and
+  /// wording for a refusal or an ending, and [error] explains a local failure
+  /// such as a send error or a revoked permission. [columns]/[rows] are the
+  /// size the host last acknowledged. Output never travels in this struct:
+  /// [ViewerBridge.takeTerminalOutput] hands it over and [bytes] counts what
+  /// arrived. [updates] counts phase transitions so the panel pairs each
+  /// ending with the poll that saw it.
   final bool terminalSupported;
   final bool terminalPersistSupported;
   final int terminalServiceId;
@@ -1181,6 +1282,30 @@ class ViewerStatus {
   final int terminalRows;
   final int terminalBytes;
   final int terminalUpdates;
+  final List<ViewerTerminalStatus> terminals;
+
+  /// The status of console slot [id] (1-based). Out-of-range ids read as a
+  /// closed console; slot 1 falls back to the legacy scalar fields when the
+  /// native side did not send a list.
+  ViewerTerminalStatus terminal(int id) {
+    if (id >= 1 && id <= terminals.length) {
+      return terminals[id - 1];
+    }
+    if (id != 1) {
+      return const ViewerTerminalStatus();
+    }
+    return ViewerTerminalStatus(
+      phase: terminalPhase,
+      code: terminalCode,
+      reason: terminalReason,
+      error: terminalError,
+      columns: terminalColumns,
+      rows: terminalRows,
+      bytes: terminalBytes,
+      updates: terminalUpdates,
+      serviceId: terminalServiceId,
+    );
+  }
 
   /// Camera sharing (protocol v29). [cameraSupported] mirrors the host's
   /// permission; the viewer watches at most one camera. [cameraPhase] is its
@@ -1560,6 +1685,16 @@ class ViewerStatus {
       privacyCode: asInt(map['privacyCode']),
       privacyError: asString(map['privacyError']),
       privacyUpdates: asInt(map['privacyUpdates']),
+      displayControlSupported: map['displayControlSupported'] == true,
+      displayControlManaged: map['displayControlManaged'] == true,
+      displayControlCount: asInt(map['displayControlCount']),
+      displayControlPrivacy: asInt(map['displayControlPrivacy']),
+      displayControlCode: asInt(map['displayControlCode']),
+      displayControlError: asString(map['displayControlError']),
+      displayControlUpdates: asInt(map['displayControlUpdates']),
+      displayControlBusy: map['displayControlBusy'] == true,
+      displayControlOutputs:
+          ViewerControlledDisplay.fromList(map['displayControlOutputs']),
       desktop: ViewerDesktopKind.fromCode(asInt(map['desktop'])),
       desktopUpdates: asInt(map['desktopUpdates']),
       sasCode: asInt(map['sasCode']),
@@ -1627,6 +1762,11 @@ class ViewerStatus {
       terminalRows: asInt(map['terminalRows']),
       terminalBytes: asInt(map['terminalBytes']),
       terminalUpdates: asInt(map['terminalUpdates']),
+      terminals: <ViewerTerminalStatus>[
+        for (final Object? item
+            in (map['terminals'] as List<Object?>? ?? const <Object?>[]))
+          if (item is Map<Object?, Object?>) ViewerTerminalStatus.fromMap(item),
+      ],
       cameraSupported: map['cameraSupported'] == true,
       cameraPhase: ViewerCameraPhase.fromCode(asInt(map['cameraPhase'])),
       cameraCode: asInt(map['cameraCode']),
@@ -1873,6 +2013,27 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// Sends a trackpad pan or a complete zoom chord, gated by remote input
+  /// permission. Pan deltas are wheel units (120 per notch) on both axes;
+  /// zoom uses only [y], and its sign matches the wheel (positive zooms in).
+  /// Each call is at most ten notches, which the native side enforces.
+  static Future<bool> sendGesture({
+    required bool zoom,
+    int x = 0,
+    int y = 0,
+    int modifiers = 0,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendInput', <String, Object>{
+      'kind': 5,
+      'action': zoom ? 1 : 0,
+      'buttons': 0,
+      'x': x,
+      'y': y,
+      'modifiers': modifiers,
+    });
+    return queued ?? false;
+  }
+
   /// Sends one pen transition. [tiltX]/[tiltY] are degrees from the surface
   /// normal (-90..90, positive right / toward the user), and [flags] is a
   /// combination of [ViewerPenFlag]. Pressure and tilt are stored by the host
@@ -2098,18 +2259,18 @@ class ViewerBridge {
     return _channel.invokeMethod<String>('takeChat');
   }
 
-  /// Opens the session's one remote console at [columns] x [rows] characters
-  /// (1..500 by 1..200). A non-zero [serviceId] reattaches to a console the
-  /// host kept after an earlier disconnect, which requires the host to have
-  /// announced terminal persistence. False means it was not queued: no
-  /// streaming session, the host did not grant [ViewerPermission.terminal], a
-  /// console is already open, or the previous one's output has not been
-  /// drained yet. The host's answer arrives through
-  /// [ViewerStatus.terminalPhase], [ViewerStatus.terminalCode],
-  /// [ViewerStatus.terminalReason] and [ViewerStatus.terminalServiceId].
+  /// Opens remote console slot [terminalId] (1..[kViewerMaxTerminals]) at
+  /// [columns] x [rows] characters (1..500 by 1..200). A non-zero [serviceId]
+  /// reattaches to a console the host kept after an earlier disconnect, which
+  /// requires the host to have announced terminal persistence. False means it
+  /// was not queued: no streaming session, the host did not grant
+  /// [ViewerPermission.terminal], that slot already has a console open, or the
+  /// previous one's output has not been drained yet. The host's answer arrives
+  /// through [ViewerStatus.terminal].
   static Future<bool> openTerminal({
     required int columns,
     required int rows,
+    int terminalId = 1,
     int serviceId = 0,
   }) async {
     final bool? opened = await _channel.invokeMethod<bool>(
@@ -2117,49 +2278,68 @@ class ViewerBridge {
       <String, Object>{
         'columns': columns,
         'rows': rows,
+        'terminalId': terminalId,
         'serviceId': serviceId,
       },
     );
     return opened ?? false;
   }
 
-  /// Queues raw console input. Printable text is UTF-8; control keys travel as
-  /// single bytes (for example `\x03` for Ctrl+C). False means no console is
-  /// open or the engine's 256 KiB input queue is full.
-  static Future<bool> sendTerminalInput(String input) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('sendTerminalInput', input);
-    return queued ?? false;
-  }
-
-  /// Asks the host to resize the open console. False means no console is open
-  /// or the size is out of range. The host applies it best effort; the
-  /// acknowledged size arrives in [ViewerStatus.terminalColumns] and
-  /// [ViewerStatus.terminalRows].
-  static Future<bool> resizeTerminal({
-    required int columns,
-    required int rows,
+  /// Queues raw console input for slot [terminalId]. Printable text is UTF-8;
+  /// control keys travel as single bytes (for example `\x03` for Ctrl+C).
+  /// False means that console is not open or its 256 KiB input queue is full.
+  static Future<bool> sendTerminalInput(
+    String input, {
+    int terminalId = 1,
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>(
-      'resizeTerminal',
-      <String, Object>{'columns': columns, 'rows': rows},
+      'sendTerminalInput',
+      <String, Object>{'text': input, 'terminalId': terminalId},
     );
     return queued ?? false;
   }
 
-  /// Ends the console. The host closes the shell; output already in flight is
-  /// still returned by [takeTerminalOutput] until it reports `ended`.
-  static Future<void> closeTerminal() {
-    return _channel.invokeMethod<void>('closeTerminal');
+  /// Asks the host to resize console slot [terminalId]. False means no console
+  /// is open or the size is out of range. The host applies it best effort; the
+  /// acknowledged size arrives in the slot's columns and rows.
+  static Future<bool> resizeTerminal({
+    required int columns,
+    required int rows,
+    int terminalId = 1,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'resizeTerminal',
+      <String, Object>{
+        'columns': columns,
+        'rows': rows,
+        'terminalId': terminalId,
+      },
+    );
+    return queued ?? false;
   }
 
-  /// Pops the oldest console output. Returns null when nothing is waiting and
-  /// the console has not ended; otherwise the bytes and whether that was the
-  /// last piece. A UTF-8 sequence may be split across pieces, so the panel
-  /// decodes only after it has reassembled them.
-  static Future<ViewerTerminalOutput?> takeTerminalOutput() async {
-    final Map<Object?, Object?>? reply =
-        await _channel.invokeMethod<Map<Object?, Object?>>('takeTerminalOutput');
+  /// Ends console slot [terminalId]. The host closes the shell; output already
+  /// in flight is still returned by [takeTerminalOutput] until it reports
+  /// `ended`.
+  static Future<void> closeTerminal({int terminalId = 1}) {
+    return _channel.invokeMethod<void>(
+      'closeTerminal',
+      <String, Object>{'terminalId': terminalId},
+    );
+  }
+
+  /// Pops the oldest output of console slot [terminalId]. Returns null when
+  /// nothing is waiting and the console has not ended; otherwise the bytes and
+  /// whether that was the last piece. A UTF-8 sequence may be split across
+  /// pieces, so the panel decodes only after it has reassembled them.
+  static Future<ViewerTerminalOutput?> takeTerminalOutput({
+    int terminalId = 1,
+  }) async {
+    final Map<Object?, Object?>? reply = await _channel
+        .invokeMethod<Map<Object?, Object?>>(
+          'takeTerminalOutput',
+          <String, Object>{'terminalId': terminalId},
+        );
     if (reply == null) {
       return null;
     }
@@ -2491,11 +2671,37 @@ class ViewerBridge {
   /// page listens at a time; passing null detaches it.
   static void setDropHandler(void Function(List<String> paths)? handler) {
     _dropHandler = handler;
-    if (handler == null) {
+    _installMethodHandler();
+  }
+
+  /// Routes the native window's close button through [handler] so a session
+  /// window can shut its session down before the window disappears. Passing
+  /// null restores the default close behavior.
+  static Future<void> setWindowCloseHandler(
+    Future<void> Function()? handler,
+  ) async {
+    _windowCloseHandler = handler;
+    _installMethodHandler();
+    try {
+      await _channel.invokeMethod<void>(
+        'setWindowCloseHandler',
+        handler != null,
+      );
+    } on MissingPluginException {
+      // Widget tests and non-Windows embedders do not have native windows.
+    }
+  }
+
+  static void _installMethodHandler() {
+    if (_dropHandler == null && _windowCloseHandler == null) {
       _channel.setMethodCallHandler(null);
       return;
     }
     _channel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'windowCloseRequested') {
+        await _windowCloseHandler?.call();
+        return;
+      }
       if (call.method == 'droppedFiles' && call.arguments is List) {
         final List<String> paths = (call.arguments as List)
             .whereType<String>()
@@ -2509,6 +2715,7 @@ class ViewerBridge {
   }
 
   static void Function(List<String> paths)? _dropHandler;
+  static Future<void> Function()? _windowCloseHandler;
 
   /// Picks up whatever pointer state the host sent and installs it as this
   /// window's cursor while [enabled]. [scale] is the size the video is drawn
@@ -2572,6 +2779,24 @@ class ViewerBridge {
     final bool? applied =
         await _channel.invokeMethod<bool>('setPrivacyMode', enabled);
     return applied ?? false;
+  }
+
+  /// Sends one display-management request (protocol v47). [action] is a
+  /// [ViewerDisplayControlAction] value, [value] the count, toggle state or
+  /// privacy implementation, and [target] the host-issued output id for a
+  /// toggle. The answer arrives in [ViewerStatus.displayControl].
+  static Future<bool> controlDisplays(
+    int action,
+    int value, {
+    int target = 0,
+  }) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('controlDisplays', <String, int>{
+      'action': action,
+      'value': value,
+      if (target != 0) 'target': target,
+    });
+    return queued ?? false;
   }
 
   /// Pins the capture endpoint; an empty id follows the default
@@ -2866,6 +3091,31 @@ enum ViewerHostActionCode {
   failed(4);
 
   const ViewerHostActionCode(this.code);
+  final int code;
+}
+
+/// Why a display-management request was not applied
+/// (chast::DisplayControlCode in chast/protocol.h).
+enum ViewerDisplayControlCode {
+  ok(0),
+  denied(1),
+  unsupported(2),
+  busy(3),
+  failed(4);
+
+  const ViewerDisplayControlCode(this.code);
+  final int code;
+}
+
+/// One display-management request kind (chast::DisplayControlAction).
+enum ViewerDisplayControlAction {
+  query(0),
+  setCount(1),
+  restore(2),
+  selectPrivacy(3),
+  toggleOutput(4);
+
+  const ViewerDisplayControlAction(this.code);
   final int code;
 }
 

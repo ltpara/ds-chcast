@@ -370,6 +370,60 @@ void main() {
     expect(loaded.map((Device device) => device.id), isNot(contains('host-0')));
   });
 
+  test(
+    'a favorite survives reload, touch and save, and can be toggled',
+    () async {
+      const String server = 'http://127.0.0.1:8443';
+      await store.save(
+        Device(
+          id: 'devbox',
+          server: server,
+          favorite: true,
+          addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+        ),
+      );
+      expect((await store.load()).single.favorite, isTrue);
+
+      await store.touch(
+        Device(
+          id: 'devbox',
+          server: server,
+          addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+        ),
+      );
+      expect((await store.load()).single.favorite, isTrue);
+
+      await store.save(
+        Device(
+          id: 'devbox',
+          server: server,
+          addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+        ),
+      );
+      expect((await store.load()).single.favorite, isTrue);
+
+      await store.setFavorite('$server|devbox', false);
+      expect((await store.load()).single.favorite, isFalse);
+    },
+  );
+
+  test('a favorite entry is not pruned by the recent cap', () async {
+    await store.touch(
+      Device(id: 'starred', addedAt: DateTime.fromMillisecondsSinceEpoch(0)),
+    );
+    await store.setFavorite('direct|starred', true);
+    for (int i = 0; i < DeviceStore.maxRecent + 1; ++i) {
+      await store.touch(
+        Device(id: 'host-$i', addedAt: DateTime.fromMillisecondsSinceEpoch(0)),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+
+    final List<Device> loaded = await store.load();
+    expect(loaded.map((Device device) => device.id), contains('starred'));
+    expect(loaded, hasLength(DeviceStore.maxRecent + 1));
+  });
+
   test('clearRecent keeps the address book', () async {
     await store.save(
       Device(

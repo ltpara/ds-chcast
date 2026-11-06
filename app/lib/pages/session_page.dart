@@ -11,6 +11,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
+import '../session_window.dart';
 import '../stream_prefs.dart';
 import '../target.dart';
 import '../theme.dart';
@@ -29,7 +30,7 @@ import '../widgets/remote_toolbar.dart';
 import '../widgets/send_text_dialog.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
-import '../widgets/terminal_panel.dart';
+import '../widgets/terminal_tabs.dart';
 import 'package:chast_viewer/l10n.dart';
 
 class SessionPage extends StatefulWidget {
@@ -42,6 +43,8 @@ class SessionPage extends StatefulWidget {
     this.fileTransferOnly = false,
     this.sessionMode = 'desktop',
     this.rdpPort = 0,
+    this.windowSession = false,
+    this.initialDisplay = 65535,
   });
 
   final ConnectTarget target;
@@ -62,6 +65,16 @@ class SessionPage extends StatefulWidget {
   /// session and, once the viewer listener is up, forwards the host's
   /// 127.0.0.1:[rdpPort] and opens the system RDP client against it.
   final int rdpPort;
+
+  /// True when this page owns its native window (started through
+  /// [SessionWindowRequest.open]). Leaving then closes the window instead of
+  /// popping a route, and the window's close button asks the page to shut the
+  /// session down first.
+  final bool windowSession;
+
+  /// The output this window should show from the start; [kViewerDisplayAuto]
+  /// follows the host's choice.
+  final int initialDisplay;
 
   /// The signed-in account, if any. It is used to report a finished remote
   /// session and, when enabled, to upload finished recordings.
@@ -124,11 +137,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   final FocusNode _terminalFocus = FocusNode(debugLabel: 'remote-terminal');
   bool _terminalOpen = false;
   bool _terminalTyping = false;
-  // Protocol v42: the host keeps the console across a disconnect. The id is
-  // remembered here (the engine's status restarts at 0 with the new session)
-  // and handed back to a rebuilt panel so it attaches instead of starting a
-  // fresh shell. Only a persistent console has one.
-  int _terminalServiceId = 0;
+  // Protocol v42: the host keeps a console across a disconnect. Service ids
+  // are remembered per slot here (the engine's status restarts at 0 with the
+  // new session) and handed back to a rebuilt tab so it attaches instead of
+  // starting a fresh shell. Only a persistent console has one.
+  final List<int> _terminalServiceIds = List<int>.filled(
+    kViewerMaxTerminals,
+    0,
+  );
+  // Console slots the open panel shows. The tabs widget owns the choices; the
+  // page keeps the list so a reconnect can restore exactly those consoles
+  // that outlived the session and close-all can stop every one of them.
+  List<int> _terminalTabIds = <int>[1];
   // Host camera preview. The native side decodes into a second plugin
   // texture, so the panel only owns that texture's life; opening registers
   // it and attaches the output, closing detaches and unregisters. The panel
@@ -293,10 +313,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _display = widget.initialDisplay;
     WidgetsBinding.instance.addObserver(this);
     _chatInputFocus.addListener(_onChatFocusChanged);
     _terminalFocus.addListener(_onTerminalFocusChanged);
     ViewerBridge.setDropHandler(_sendDroppedFiles);
+    if (widget.windowSession) {
+      unawaited(ViewerBridge.setWindowCloseHandler(_closeNativeWindow));
+    }
     final StreamPreferences prefs = StreamPreferences.load();
     _streamCodec = _streamCodecFor(prefs.codec);
     _streamQuality = _streamQualityFor(prefs.quality);
@@ -322,6 +346,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
     ViewerBridge.setDropHandler(null);
+    if (widget.windowSession) {
+      unawaited(ViewerBridge.setWindowCloseHandler(null));
+    }
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     _autoTimer?.cancel();
@@ -933,14 +960,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     _trackRecording(status);
     _syncPortForwardRules(status.portForwardRules);
-    // Track a persistent console's service id while it is alive. An ending or
-    // refusal leaves nothing to attach to, and a poll from a fresh engine
+    // Track each persistent console's service id while it is alive. An ending
+    // or refusal leaves nothing to attach to, and a poll from a fresh engine
     // (id still 0) must not erase what the page remembers for a reconnect.
-    if (status.terminalPhase == ViewerTerminalPhase.ended ||
-        status.terminalPhase == ViewerTerminalPhase.failed) {
-      _terminalServiceId = 0;
-    } else if (status.terminalServiceId != 0) {
-      _terminalServiceId = status.terminalServiceId;
+    for (int slot = 0; slot < kViewerMaxTerminals; slot++) {
+      final ViewerTerminalStatus terminal = status.terminal(slot + 1);
+      if (terminal.phase == ViewerTerminalPhase.ended ||
+          terminal.phase == ViewerTerminalPhase.failed) {
+        _terminalServiceIds[slot] = 0;
+      } else if (terminal.serviceId != 0) {
+        _terminalServiceIds[slot] = terminal.serviceId;
+      }
     }
     final int previousPermissions = _status.permissions;
     final int previousPermissionUpdates = _status.permissionUpdates;
@@ -1264,6 +1294,25 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
+    }
+    // Display-management answers only interrupt the operator when something
+    // was refused; a success is visible in the menu itself.
+    if (!nowOver &&
+        status.displayControlUpdates > previous.displayControlUpdates &&
+        status.displayControlCode != ViewerDisplayControlCode.ok.code) {
+      final String reason = status.displayControlError;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('显示设置未应用')
+                : tr('显示设置未应用：{reason}', <String, Object?>{
+                    'reason': reason,
+                  }),
+          ),
+          duration: const Duration(seconds: 4),
+        ),
       );
     }
     // Every Ctrl+Alt+Del request gets one answer. A refusal or unsupported
@@ -1829,6 +1878,33 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法切换隐私模式'))));
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  Future<void> _controlDisplays(
+    int action,
+    int value, {
+    int target = 0,
+  }) async {
+    try {
+      final bool queued = await ViewerBridge.controlDisplays(
+        action,
+        value,
+        target: target,
+      );
+      if (mounted && !queued) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(tr('显示设置未应用'))));
+      }
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message ?? tr('显示设置未应用'))));
+      }
     } on MissingPluginException {
       // The native viewer is going away.
     }
@@ -2725,6 +2801,31 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _reconnect();
   }
 
+  /// Starts a second session in its own window, fixed to one output. The new
+  /// window gets the same target and credentials through
+  /// [SessionWindowRequest], so it never touches a command line or a file.
+  Future<void> _openDisplayWindow(int display) async {
+    try {
+      final bool opened = await SessionWindowRequest(
+        target: widget.target,
+        account: widget.account,
+        settings: widget.settings,
+        sessionMode: 'desktop',
+        display: display,
+      ).open();
+      if (opened || !mounted) {
+        return;
+      }
+    } on PlatformException {
+      if (!mounted) {
+        return;
+      }
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(tr('无法打开会话窗口'))),
+    );
+  }
+
   /// Fetches the mode list for the streamed output once the session is live.
   /// One query is in flight at a time; a list already covering the displayed
   /// output is reused until an accepted change makes its current marker stale.
@@ -3125,10 +3226,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!automatic) {
       _cancelAutoReconnect();
     }
-    // A persistent console outlives the widgets below; keep the panel open so
-    // it attaches again once the new session is streaming. A session console
-    // dies with the old session, so its panel closes as before.
-    final bool resumeTerminal = _terminalOpen && _terminalServiceId != 0;
+    // A persistent console outlives the widgets below; keep its tab open so it
+    // attaches again once the new session is streaming. A session console dies
+    // with the old session, so only slots with a service id come back.
+    final List<int> resumeTabs = <int>[
+      for (int slot = 0; slot < kViewerMaxTerminals; slot++)
+        if (_terminalServiceIds[slot] != 0) slot + 1,
+    ];
+    final bool resumeTerminal = _terminalOpen && resumeTabs.isNotEmpty;
     setState(() {
       _reconnecting = true;
       _startError = null;
@@ -3176,8 +3281,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _chatTyping = false;
       _terminalOpen = resumeTerminal;
       _terminalTyping = false;
+      _terminalTabIds = resumeTerminal ? resumeTabs : <int>[1];
       if (!resumeTerminal) {
-        _terminalServiceId = 0;
+        _terminalServiceIds.fillRange(0, kViewerMaxTerminals, 0);
       }
       _cameraOpen = false;
       _fileBrowserOpen = false;
@@ -3209,6 +3315,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _tunnelStarting = null;
   }
 
+  /// The native window's close button. The session has to wind down before the
+  /// window (and with it the engine) disappears; once that is done the native
+  /// side is asked to close the window for real.
+  Future<void> _closeNativeWindow() async {
+    _autoTimer?.cancel();
+    _pollTimer?.cancel();
+    _hideTimer?.cancel();
+    _setKeyCapture(false);
+    _clearCursor();
+    try {
+      await _shutdown();
+    } finally {
+      await SessionWindowRequest.close();
+    }
+  }
+
   Future<void> _leave() async {
     if (_closing) {
       return;
@@ -3227,7 +3349,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!mounted) {
       return;
     }
-    Navigator.of(context).pop();
+    if (widget.windowSession) {
+      await SessionWindowRequest.close();
+    } else {
+      Navigator.of(context).pop();
+    }
   }
 
   void _cleanupAfterPop() {
@@ -3584,12 +3710,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_terminalFocus.hasFocus) {
       _terminalFocus.unfocus();
     }
-    // Closing the overlay ends the console. The panel no longer closes it on
-    // dispose (a reconnect disposes the widgets but keeps the service), so
-    // this is the one place a user-initiated close sends the stop, and a
-    // persistent service dies with it.
-    unawaited(ViewerBridge.closeTerminal());
-    _terminalServiceId = 0;
+    // Closing the overlay ends every console it shows. The panel no longer
+    // closes its console on dispose (a reconnect disposes the widgets but
+    // keeps the service), so this is the one place a user-initiated close
+    // sends the stop, and a persistent service dies with it.
+    for (final int id in _terminalTabIds) {
+      unawaited(ViewerBridge.closeTerminal(terminalId: id));
+    }
+    _terminalTabIds = <int>[1];
+    _terminalServiceIds.fillRange(0, kViewerMaxTerminals, 0);
     setState(() => _terminalOpen = false);
     _setKeyCapture(_inputActive && !_chatTyping);
     if (_inputActive) {
@@ -3598,6 +3727,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           _focus.requestFocus();
         }
       });
+    }
+  }
+
+  void _onTerminalTabsChanged(List<int> ids) {
+    _terminalTabIds = List<int>.of(ids);
+    // A tab that is no longer open must not be resumed: its console was
+    // stopped when the tab closed, even if the poll has not caught up yet.
+    for (int slot = 0; slot < kViewerMaxTerminals; slot++) {
+      if (!_terminalTabIds.contains(slot + 1)) {
+        _terminalServiceIds[slot] = 0;
+      }
     }
   }
 
@@ -4211,6 +4351,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  void _onGesture(Offset frame, bool zoom, int deltaX, int deltaY) {
+    unawaited(
+      _guardSend(
+        ViewerBridge.sendGesture(
+          zoom: zoom,
+          x: deltaX,
+          y: deltaY,
+          modifiers: _inputState(),
+        ),
+      ),
+    );
+  }
+
   void _onDevicePointer(PointerEvent event, Offset frame) {
     final (int x, int y) = _desktopPoint(frame);
     if (event.kind == PointerDeviceKind.touch) {
@@ -4458,6 +4611,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onMove: _inputActive ? _onPointerMove : null,
                       onButton: _inputActive ? _onPointerButton : null,
                       onScroll: _inputActive ? _onPointerScroll : null,
+                      onGesture: _inputActive ? _onGesture : null,
                       onDevicePointer: _inputActive ? _onDevicePointer : null,
                       onDeviceCancel: _inputActive ? _onDeviceCancel : null,
                       onFocusRequested: _focus.requestFocus,
@@ -4535,6 +4689,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onToggleFollowWindow: _toggleFollowWindow,
                         onSelectDisplay: (int index) =>
                             unawaited(_switchDisplay(index)),
+                        onOpenDisplayWindow: _status.isLive
+                            ? (int index) =>
+                                  unawaited(_openDisplayWindow(index))
+                            : null,
                         modes:
                             _status.displayModesDisplay ==
                                     _status.streamedDisplayIndex &&
@@ -4583,6 +4741,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
                         onToggleMicrophone: () =>
                             unawaited(_toggleMicrophone()),
+                        displayControlAvailable:
+                            _status.isLive && !_status.filesOnly,
+                        displayControlSupported:
+                            _status.displayControlSupported,
+                        displayControlManaged: _status.displayControlManaged,
+                        displayControlBusy: _status.displayControlBusy,
+                        displayControlCount: _status.displayControlCount,
+                        displayControlPrivacy: _status.displayControlPrivacy,
+                        onControlDisplays: _controlDisplays,
+                        displayControlOutputs:
+                            _status.displayControlOutputs,
+                        onToggleVirtualDisplay: (int target, bool enabled) =>
+                            unawaited(
+                              _controlDisplays(4, enabled ? 1 : 0, target: target),
+                            ),
                         onTogglePrivacy: () => unawaited(_togglePrivacy()),
                         recordingAvailable:
                             _status.acceptsRecording || _status.recording,
@@ -4811,23 +4984,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         child: FractionallySizedBox(
                           widthFactor: 0.7,
                           heightFactor: 0.7,
-                          child: TerminalPanel(
+                          child: TerminalTabs(
                             status: _status,
                             focusNode: _terminalFocus,
-                            resumeServiceId: _terminalServiceId,
-                            onOpen: (int columns, int rows, int serviceId) =>
-                                ViewerBridge.openTerminal(
-                                  columns: columns,
-                                  rows: rows,
-                                  serviceId: serviceId,
-                                ),
-                            onTakeOutput: ViewerBridge.takeTerminalOutput,
-                            onSendInput: ViewerBridge.sendTerminalInput,
-                            onResize: (int columns, int rows) =>
-                                ViewerBridge.resizeTerminal(
-                                  columns: columns,
-                                  rows: rows,
-                                ),
+                            initialTabs: _terminalTabIds,
+                            resumeServiceIds: _terminalServiceIds,
+                            onTabsChanged: _onTerminalTabsChanged,
                             onDismiss: _closeTerminalPanel,
                             initialFontSize: _terminalFontSize,
                             onFontSizeChanged: _rememberTerminalFontSize,
@@ -5136,26 +5298,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       case 'terminal':
         return Padding(
           padding: const EdgeInsets.all(12),
-          child: TerminalPanel(
+          child: TerminalTabs(
             status: _status,
             focusNode: _terminalFocus,
-            resumeServiceId: _terminalServiceId,
-            onOpen: (int columns, int rows, int serviceId) =>
-                ViewerBridge.openTerminal(
-                  columns: columns,
-                  rows: rows,
-                  serviceId: serviceId,
-                ),
-            onTakeOutput: ViewerBridge.takeTerminalOutput,
-            onSendInput: ViewerBridge.sendTerminalInput,
-            onResize: (int columns, int rows) =>
-                ViewerBridge.resizeTerminal(columns: columns, rows: rows),
+            initialTabs: _terminalTabIds,
+            resumeServiceIds: _terminalServiceIds,
+            onTabsChanged: _onTerminalTabsChanged,
             onDismiss: () {
-              // The X ends the console before the standalone session goes;
+              // The X ends every console before the standalone session goes;
               // otherwise a persistent service would outlive the panel the
               // operator just dismissed.
-              unawaited(ViewerBridge.closeTerminal());
-              _terminalServiceId = 0;
+              for (final int id in _terminalTabIds) {
+                unawaited(ViewerBridge.closeTerminal(terminalId: id));
+              }
+              _terminalTabIds = <int>[1];
+              _terminalServiceIds.fillRange(0, kViewerMaxTerminals, 0);
               unawaited(_leave());
             },
             initialFontSize: _terminalFontSize,

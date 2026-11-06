@@ -64,6 +64,7 @@ add_library(chast.dxgi STATIC
     src/capture/nv12_pass.cc
     src/capture/cursor.cc
     src/capture/dxgi_capturer.cc
+    src/capture/shared_capturer.cc
     src/capture/merged_capturer.cc)
 
 target_include_directories(chast.dxgi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -240,12 +241,14 @@ add_library(chast.host STATIC
     src/host/audit_spool.cc
     src/host/bitrate_controller.cc
     src/host/camera_relay.cc
+    src/host/display_privacy.cc
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
     src/host/virtual_display.cc
+    src/win/display_privacy.cc
     src/win/privacy.cc
     src/win/sas.cc)
 
@@ -276,6 +279,17 @@ target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi3
 # when the test tools are switched off.
 add_executable(chast-host WIN32 host/main.cc)
 target_link_libraries(chast-host PRIVATE chast.host.tray comctl32 comdlg32)
+
+# Crash-safe physical-display restoration helper. It receives only inherited
+# kernel handles from the host and has no network or user configuration path.
+add_executable(chast-display-guard host/display_guard_main.cc)
+target_include_directories(chast-display-guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(chast-display-guard PRIVATE chast.host)
+add_custom_command(TARGET chast-display-guard POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:chast-display-guard> $<TARGET_FILE_DIR:chast-host>
+    VERBATIM)
 add_custom_command(TARGET chast-host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-host>
@@ -379,6 +393,13 @@ if(CHAST_BUILD_TESTS)
     target_include_directories(chast-cursor-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(chast-cursor-test PRIVATE chast.dxgi)
 
+    # Shared duplication readers on one output: independent GPU textures and
+    # NV12 scales, detection of a shared rebuild, and survival while the
+    # merged compositor or another reader comes and goes. Skips without a
+    # capturable desktop.
+    add_executable(chast-shared-capturer-test tests/shared_capturer_test.cc)
+    target_link_libraries(chast-shared-capturer-test PRIVATE chast.dxgi)
+
     # PNG writing for screenshots: signature, decoded pixels and alpha forcing
     # through WIC. No GPU, no network.
     add_executable(chast-png-writer-test tests/png_writer_test.cc)
@@ -450,10 +471,47 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-login-test tests/host_login_test.cc)
     target_link_libraries(chast-host-login-test PRIVATE chast.host)
 
+    # Block input over the v38 host-action channel: the handshake consent, the
+    # idempotent toggle and the automatic release when the input or block-input
+    # permission is revoked. A synthetic backend stands in for BlockInput.
+    # Needs a desktop session, so it skips itself when none exists.
+    add_executable(chast-block-input-test tests/block_input_test.cc)
+    target_link_libraries(chast-block-input-test PRIVATE chast.host)
+
+    # Workstation lock after the last session: the settings switch, live
+    # cancellation, a failing platform call and the shutdown exemption, in both
+    # the single-viewer and the shared host. A synthetic backend stands in for
+    # LockWorkStation. Needs a desktop session, so it skips itself when none
+    # exists.
+    add_executable(chast-lock-after-session-test tests/lock_after_session_test.cc)
+    target_link_libraries(chast-lock-after-session-test PRIVATE chast.host)
+
+    # Two desktop viewers on one shared host: view-only admission, the
+    # follower's privacy and host-action refusals, focused chat and gesture
+    # gating, and the remaining viewer continuing after the publisher leaves.
+    # Needs a desktop session, so it skips itself when none exists.
+    add_executable(chast-multi-session-test tests/multi_session_test.cc)
+    target_link_libraries(chast-multi-session-test PRIVATE chast.host)
+
+    # Explicit opt-in hardware acceptance for virtual display privacy and
+    # management. Never registered with CTest: it disconnects physical outputs
+    # temporarily and needs an installed driver.
+    add_executable(chast-display-privacy-live tests/display_privacy_live.cc)
+    target_include_directories(chast-display-privacy-live PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-display-privacy-live PRIVATE chast.host)
+    add_dependencies(chast-display-privacy-live chast-display-guard)
+
     # Virtual display detection, classification and mode choice. The live
     # probe is read-only and runs without a driver.
     add_executable(chast-virtual-display-test tests/virtual_display_test.cc)
     target_link_libraries(chast-virtual-display-test PRIVATE chast.host)
+
+    # Display-privacy lifecycle boundaries and synthetic CCD topology, plus
+    # the recovery lease the guard and the host share. No driver or network.
+    add_executable(chast-display-privacy-test tests/display_privacy_test.cc)
+    target_include_directories(chast-display-privacy-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-display-privacy-test PRIVATE chast.host)
 
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
@@ -522,6 +580,7 @@ if(CHAST_BUILD_TESTS)
 
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
+    add_test(NAME shared_capture COMMAND chast-shared-capturer-test)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
@@ -539,7 +598,14 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_control PROPERTIES TIMEOUT 180)
     add_test(NAME host_login COMMAND chast-host-login-test)
     set_tests_properties(host_login PROPERTIES TIMEOUT 180)
+    add_test(NAME block_input COMMAND chast-block-input-test)
+    set_tests_properties(block_input PROPERTIES TIMEOUT 180)
+    add_test(NAME lock_after_session COMMAND chast-lock-after-session-test)
+    set_tests_properties(lock_after_session PROPERTIES TIMEOUT 240)
+    add_test(NAME multi_session COMMAND chast-multi-session-test)
+    set_tests_properties(multi_session PROPERTIES TIMEOUT 180)
     add_test(NAME virtual_display COMMAND chast-virtual-display-test)
+    add_test(NAME display_privacy COMMAND chast-display-privacy-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)
@@ -595,6 +661,13 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_stream_options
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
+    # Idle auto-disconnect: viewer input must keep the session alive across two
+    # timeout windows, a quiet session must be closed by the host itself, and a
+    # host with the timeout off must leave it open. The probe overrides the
+    # persisted minutes with a millisecond test value.
+    add_test(NAME quic_idle_disconnect
+        COMMAND chast-quic verify --port 45522 --idle-disconnect --quiet)
+    set_tests_properties(quic_idle_disconnect PROPERTIES TIMEOUT 180)
     # Shared-folder browsing: the viewer lists the host's receive directory and
     # one subfolder, the sandbox refuses escapes, and a viewer-requested
     # download crosses CFIL and is compared with the seeded payload.

@@ -127,6 +127,11 @@ struct HostSettings {
     // monitor, so a person sitting at the machine cannot see the desktop until
     // the session ends or the operator revokes the permission.
     bool allow_privacy_mode = false;
+    // How privacy mode hides the local screen: "overlay" draws a mask over
+    // every physical output, "virtual_display" moves capture to a temporary
+    // virtual output and disables the physical ones. Any other value is kept
+    // as "invalid" so a typo cannot silently select a different policy.
+    std::string privacy_mode_impl = "overlay";
     // Let the viewer reboot this machine. Off by default: a restart drops
     // every local session and unsaved work, so it is an explicit grant in the
     // same spirit as port forwarding and the camera.
@@ -174,6 +179,11 @@ struct HostSettings {
     // host-state change, like a restart. The lock runs after the session has
     // already ended, so it never interrupts the viewer.
     bool lock_after_session_end = false;
+    // Close the session after this many minutes without viewer activity
+    // (input, chat, clipboard and other viewer requests). 0 keeps it open until
+    // one side leaves and is the default: a forgotten viewer should not hold
+    // the screen forever, but long unattended transfers must not be cut.
+    uint32_t auto_disconnect_minutes = 0;
     // DPAPI-protected TOTP secret (base64); empty means 2FA is off. Use
     // protect_totp_secret()/unprotect_totp_secret() for the clear text.
     std::string totp_secret;

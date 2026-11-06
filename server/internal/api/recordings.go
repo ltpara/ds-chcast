@@ -49,9 +49,20 @@ func (s *server) uploadRecording(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// The HTTP server bounds reads to 15s, which a large upload over a slow
-	// link exceeds. The archive enforces its own byte limit while copying.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	// Match the viewer's ten-minute upload budget, including time spent
+	// reading the body before the server can write its response.
+	controller := http.NewResponseController(w)
+	deadline := time.Now().Add(10 * time.Minute)
+	if err := controller.SetReadDeadline(deadline); err != nil {
+		s.cfg.Logger.Error("recording read deadline", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not configure recording upload")
+		return
+	}
+	if err := controller.SetWriteDeadline(deadline.Add(30 * time.Second)); err != nil {
+		s.cfg.Logger.Error("recording write deadline", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not configure recording upload")
+		return
+	}
 	query := r.URL.Query()
 	startedAt, _ := strconv.ParseInt(query.Get("started_ms"), 10, 64)
 	duration, _ := strconv.ParseInt(query.Get("duration_ms"), 10, 64)

@@ -87,6 +87,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_session_select == b.allow_session_select && a.auth_mode == b.auth_mode &&
            a.allow_remote_config == b.allow_remote_config &&
            a.lock_after_session_end == b.lock_after_session_end &&
+           a.auto_disconnect_minutes == b.auto_disconnect_minutes &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
            a.allow_permission_change == b.allow_permission_change &&
@@ -131,6 +132,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_session_select = true;
     settings.allow_remote_config = true;
     settings.lock_after_session_end = true;
+    settings.auto_disconnect_minutes = 30;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
     settings.password_hash =
@@ -219,6 +221,8 @@ void test_missing_file(const std::filesystem::path& dir) {
           "a fresh host does not let viewers change its switches");
     check(!loaded.settings.lock_after_session_end,
           "a fresh host does not lock the console after a session");
+    check(loaded.settings.auto_disconnect_minutes == 0,
+          "a fresh host keeps an idle session open");
     check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
     check(loaded.settings.virtual_display == chast::VirtualDisplayPolicy::Off,
           "a fresh host never creates a virtual display on its own");
@@ -260,6 +264,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "audio_silence_gate_ms=99999\n"
                "microphone=perhaps\n"
                "privacy_mode=perhaps\n"
+               "auto_disconnect_minutes=20000\n"
                "record=perhaps\n"
                "approve=off\n"
                "token_mode=forever\n"
@@ -300,6 +305,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "an unparsable microphone toggle keeps the private default");
     check(!settings.allow_privacy_mode,
           "an unparsable privacy toggle keeps the private default");
+    check(settings.auto_disconnect_minutes == 0,
+          "an out-of-range idle timeout stays off");
     check(settings.allow_record, "an unparsable record toggle keeps the consent default");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
@@ -327,6 +334,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
                             "audio_device", "audio_aec", "audio_silence_gate_ms",
                             "microphone", "privacy_mode",
+                            "auto_disconnect_minutes",
                             "record", "token_mode", "token", "codec",
                             "bitrate_kbps",
                             "framerate",
@@ -736,6 +744,33 @@ void test_audit_spool(const std::filesystem::path& dir) {
           "a record without a viewer reference is refused");
 }
 
+void test_idle_timeout_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "idle.ini";
+    write_text(path, "auto_disconnect_minutes=10080\n");
+    const chast::HostSettingsLoad max = chast::load_host_settings(path.string());
+    check(max.warning.empty() && max.settings.auto_disconnect_minutes == 10080,
+          "a week is accepted as an idle timeout");
+
+    write_text(path, "auto_disconnect_minutes=30\n");
+    const chast::HostSettingsLoad thirty = chast::load_host_settings(path.string());
+    check(thirty.warning.empty() && thirty.settings.auto_disconnect_minutes == 30,
+          "a half-hour idle timeout is read back");
+
+    write_text(path, "auto_disconnect_minutes=soon\n");
+    const chast::HostSettingsLoad bad = chast::load_host_settings(path.string());
+    check(bad.settings.auto_disconnect_minutes == 0 &&
+              bad.warning.find("auto_disconnect_minutes") != std::string::npos,
+          "a non-numeric idle timeout is reported and stays off");
+
+    chast::HostSettings settings;
+    settings.auto_disconnect_minutes = 45;
+    std::string error;
+    check(chast::save_host_settings(path.string(), settings, &error),
+          "an idle timeout saves");
+    check(chast::load_host_settings(path.string()).settings.auto_disconnect_minutes == 45,
+          "a saved idle timeout survives a reload");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -762,6 +797,7 @@ int main() {
     test_missing_file(dir);
     test_invalid_values(dir);
     test_audio_settings(dir);
+    test_idle_timeout_settings(dir);
     test_virtual_display_settings(dir);
     test_tokens();
     test_security_migration(dir);
