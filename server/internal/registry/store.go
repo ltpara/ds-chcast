@@ -131,7 +131,7 @@ func ensurePeerColumns(db *sql.DB) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, column := range []string{"alias", "tags", "metadata_signature"} {
+	for _, column := range []string{"alias", "tags", "metadata_signature", "wake_targets"} {
 		if columns[column] {
 			continue
 		}
@@ -154,7 +154,7 @@ func (s *Store) Load() ([]Identity, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT id, public_key, fingerprint, hostname, platform, version,
-		metadata_signature, alias, tags, created_at, last_seen FROM peers ORDER BY id`)
+		metadata_signature, alias, tags, wake_targets, created_at, last_seen FROM peers ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("state %s: load peers: %w", s.path, err)
 	}
@@ -163,12 +163,12 @@ func (s *Store) Load() ([]Identity, error) {
 	for rows.Next() {
 		var (
 			record              Identity
-			tags                string
+			tags, wakeTargets   string
 			createdAt, lastSeen int64
 		)
 		if err := rows.Scan(&record.ID, &record.PublicKey, &record.Fingerprint,
 			&record.Hostname, &record.Platform, &record.Version, &record.MetadataSignature,
-			&record.Alias, &tags, &createdAt, &lastSeen); err != nil {
+			&record.Alias, &tags, &wakeTargets, &createdAt, &lastSeen); err != nil {
 			return nil, fmt.Errorf("state %s: read peer: %w", s.path, err)
 		}
 		if !ValidID(record.ID) {
@@ -183,6 +183,7 @@ func (s *Store) Load() ([]Identity, error) {
 		record.CreatedAt = timeFromMillis(createdAt)
 		record.LastSeen = timeFromMillis(lastSeen)
 		record.Tags = decodeTags(tags)
+		record.WakeTargets = decodeList(wakeTargets)
 		out = append(out, record)
 	}
 	if err := rows.Err(); err != nil {
@@ -205,8 +206,8 @@ func (s *Store) Save(record Identity) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO peers
 		(id, public_key, fingerprint, hostname, platform, version, metadata_signature,
-		 alias, tags, created_at, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 alias, tags, wake_targets, created_at, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			public_key = excluded.public_key,
 			fingerprint = excluded.fingerprint,
@@ -216,10 +217,12 @@ func (s *Store) Save(record Identity) error {
 			metadata_signature = excluded.metadata_signature,
 			alias = excluded.alias,
 			tags = excluded.tags,
+			wake_targets = excluded.wake_targets,
 			last_seen = excluded.last_seen`,
 		record.ID, record.PublicKey, record.Fingerprint, record.Hostname,
 		record.Platform, record.Version, record.MetadataSignature, record.Alias,
-		encodeTags(record.Tags), unixMillis(record.CreatedAt), unixMillis(record.LastSeen))
+		encodeTags(record.Tags), encodeList(record.WakeTargets),
+		unixMillis(record.CreatedAt), unixMillis(record.LastSeen))
 	if err != nil {
 		return fmt.Errorf("state %s: save peer %s: %w", s.path, record.ID, err)
 	}
@@ -243,25 +246,33 @@ func unixMillis(t time.Time) int64 {
 }
 
 func encodeTags(tags []string) string {
-	if len(tags) == 0 {
+	return encodeList(tags)
+}
+
+func decodeTags(raw string) []string {
+	return decodeList(raw)
+}
+
+func encodeList(values []string) string {
+	if len(values) == 0 {
 		return ""
 	}
-	raw, err := json.Marshal(tags)
+	raw, err := json.Marshal(values)
 	if err != nil {
 		return ""
 	}
 	return string(raw)
 }
 
-func decodeTags(raw string) []string {
+func decodeList(raw string) []string {
 	if raw == "" {
 		return nil
 	}
-	var tags []string
-	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
 		return nil
 	}
-	return tags
+	return values
 }
 
 func timeFromMillis(ms int64) time.Time {

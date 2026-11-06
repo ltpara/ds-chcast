@@ -44,6 +44,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/tracing"
 	"github.com/ltpara/ds-chcast/server/internal/wake"
 	"github.com/ltpara/ds-chcast/server/internal/webadmin"
+	"github.com/ltpara/ds-chcast/server/internal/wol"
 )
 
 const (
@@ -347,6 +348,12 @@ type registerRequest struct {
 	// ids, which proves the caller owns the old record.
 	OldID            string `json:"old_id,omitempty"`
 	MigrateSignature string `json:"migrate_signature,omitempty"`
+	// WakeRelay marks an agent that is willing to broadcast magic packets for
+	// other hosts. WakeTargets is the directed broadcast list the agent can
+	// reach; the server only hands a wake job to relay agents that share an
+	// endpoint with the target's own last report.
+	WakeRelay   bool     `json:"wake_relay,omitempty"`
+	WakeTargets []string `json:"wake_targets,omitempty"`
 }
 
 type registerResponse struct {
@@ -374,7 +381,7 @@ type registerResponse struct {
 	ConfigSerial      int64    `json:"config_serial,omitempty"`
 	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
 	// Wake carries cross-subnet Wake-on-LAN jobs for this agent to broadcast on
-	// its own link. Agents without the relay enabled ignore the field.
+	// its own link. Agents without the relay enabled never receive one.
 	Wake []wake.Job `json:"wake,omitempty"`
 }
 
@@ -523,6 +530,14 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		previous, hadPrevious = s.cfg.Registry.Lookup(req.OldID)
 	}
 
+	// WakeTargets is nil when the field was absent, which keeps the previous
+	// report across a renewal; a present list is normalized and may be empty,
+	// clearing links the agent no longer has.
+	var wakeTargets []string
+	if req.WakeTargets != nil {
+		wakeTargets = wol.NormalizeTargets(req.WakeTargets)
+	}
+
 	host, err := s.cfg.Registry.Register(registry.RegisterRequest{
 		ID:                req.ID,
 		PublicKey:         req.PublicKey,
@@ -533,6 +548,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		MetadataSignature: req.MetadataSignature,
 		TTL:               s.cfg.TTL,
 		OldID:             req.OldID,
+		WakeTargets:       wakeTargets,
 	})
 	if err != nil {
 		if errors.Is(err, registry.ErrKeyMismatch) {
@@ -576,7 +592,13 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Software:        s.software(),
 	}
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
-	resp.Wake = s.wake.PendingFor(req.ID)
+	// Match jobs against the persisted report so a relay agent that omits the
+	// field on a renewal still uses the link it registered earlier.
+	effectiveTargets := wakeTargets
+	if record, ok := s.cfg.Registry.Identity(req.ID); ok {
+		effectiveTargets = record.WakeTargets
+	}
+	resp.Wake = s.wake.PendingFor(req.ID, req.WakeRelay, effectiveTargets)
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
 	} else {

@@ -63,6 +63,10 @@ type Identity struct {
 	Tags              []string  `json:"tags,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	LastSeen          time.Time `json:"last_seen,omitempty"`
+	// WakeTargets are the directed broadcast endpoints on the host's LAN as
+	// last reported by the agent. They are internal routing hints for wake
+	// relays, not public metadata: never marshal them into lookup responses.
+	WakeTargets []string `json:"-"`
 }
 
 type Host struct {
@@ -125,6 +129,11 @@ type RegisterRequest struct {
 	// old id is accepted so a retry after a successful migration is
 	// idempotent.
 	OldID string
+	// WakeTargets is the set of directed broadcast endpoints the agent can
+	// relay wake packets to. A nil slice keeps the previous report; a non-nil
+	// slice replaces it, so an empty slice clears stale links when the agent
+	// loses its network.
+	WakeTargets []string
 }
 
 type Registry struct {
@@ -294,6 +303,7 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 			MetadataSignature: signedMetadata(req),
 			CreatedAt:         now,
 			LastSeen:          now,
+			WakeTargets:       slices.Clone(req.WakeTargets),
 		}
 		if err := r.storeIdentityLocked(record); err != nil {
 			return Host{}, err
@@ -339,6 +349,9 @@ func applyRegistrationMetadata(record Identity, req RegisterRequest) Identity {
 		// A later unsigned registration invalidates an older signature rather
 		// than leaving one attached to metadata it did not cover.
 		record.MetadataSignature = signedMetadata(req)
+	}
+	if req.WakeTargets != nil {
+		record.WakeTargets = slices.Clone(req.WakeTargets)
 	}
 	return record
 }
@@ -869,6 +882,7 @@ func identityChanged(a, b Identity) bool {
 		a.MetadataSignature != b.MetadataSignature ||
 		a.Alias != b.Alias ||
 		!slices.Equal(a.Tags, b.Tags) ||
+		!slices.Equal(a.WakeTargets, b.WakeTargets) ||
 		!a.CreatedAt.Equal(b.CreatedAt) ||
 		!a.LastSeen.Equal(b.LastSeen)
 }

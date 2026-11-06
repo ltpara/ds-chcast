@@ -74,28 +74,21 @@ func MagicPacket(mac string) ([]byte, error) {
 	return packet, nil
 }
 
-// Targets returns the limited broadcast address plus every up interface's
-// directed broadcast. A magic packet only matters on the target's own link, so
-// loopback and interface addresses are intentionally absent.
-func Targets(port int) []string {
+// maxTargets bounds a reported wake list so one registration cannot grow a
+// peer record without limit.
+const maxTargets = 16
+
+// DirectedTargets returns the directed broadcast endpoint of every up,
+// non-loopback IPv4 interface. The limited broadcast is intentionally absent:
+// it always means "the link of whoever sends it", so it cannot identify the
+// target's link and every host would report the same value.
+func DirectedTargets(port int) []string {
 	if port <= 0 || port > 65535 {
 		port = Port
 	}
 	portText := strconv.Itoa(port)
 	seen := make(map[string]bool)
 	var targets []string
-	add := func(ip net.IP) {
-		if ip == nil || ip.IsUnspecified() {
-			return
-		}
-		addr := net.JoinHostPort(ip.String(), portText)
-		if seen[addr] {
-			return
-		}
-		seen[addr] = true
-		targets = append(targets, addr)
-	}
-	add(net.IPv4bcast)
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return targets
@@ -124,7 +117,50 @@ func Targets(port int) []string {
 			if broadcast.Equal(ip4) {
 				continue
 			}
-			add(broadcast)
+			target := net.JoinHostPort(broadcast.String(), portText)
+			if seen[target] {
+				continue
+			}
+			seen[target] = true
+			targets = append(targets, target)
+		}
+	}
+	return targets
+}
+
+// NormalizeTargets canonicalizes host:port wake destinations. It keeps IPv4
+// unicast and directed-broadcast endpoints (diagnostics may use loopback) and
+// drops values that cannot identify a link: the limited broadcast, multicast,
+// unspecified addresses, non-IPv4 hosts and invalid ports. The result is
+// deduplicated and capped at maxTargets.
+func NormalizeTargets(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	targets := make([]string, 0, len(values))
+	for _, value := range values {
+		host, portText, err := net.SplitHostPort(strings.TrimSpace(value))
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			continue
+		}
+		ip4 := ip.To4()
+		if ip4 == nil || ip4.IsUnspecified() || ip4.IsMulticast() || ip4.Equal(net.IPv4bcast) {
+			continue
+		}
+		target := net.JoinHostPort(ip4.String(), strconv.Itoa(port))
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		targets = append(targets, target)
+		if len(targets) >= maxTargets {
+			break
 		}
 	}
 	return targets

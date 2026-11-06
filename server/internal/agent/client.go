@@ -136,7 +136,7 @@ type apiError struct {
 	Error string `json:"error"`
 }
 
-func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
+func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey ed25519.PrivateKey, fingerprint string, wakeRelay bool, wakeTargets []string) (registerResult, error) {
 	timestamp := time.Now().Unix()
 	hostname, _ := os.Hostname()
 	hostname = strings.TrimSpace(hostname)
@@ -152,6 +152,8 @@ func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey e
 		"signature":   identity.Sign(privateKey, identity.RegisterMessage(id, fingerprint, timestamp)),
 		"metadata_signature": identity.Sign(privateKey,
 			identity.HostMetadataMessage(id, hostname, platform, Version)),
+		"wake_relay":   wakeRelay,
+		"wake_targets": wakeTargets,
 	}
 	if oldID != "" {
 		body["old_id"] = oldID

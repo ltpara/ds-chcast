@@ -86,13 +86,15 @@ type HostConfig struct {
 	// UpdateDir is where the installer is staged. Empty uses an "updates"
 	// directory beside the agent executable, which inherits its ACL.
 	UpdateDir string
-	// WakeRelay makes this agent a cross-subnet Wake-on-LAN proxy: jobs queued
-	// by the server for any target are broadcast on this machine's link. It is
-	// opt-in because it sends packets to addresses outside this host.
+	// WakeRelay makes this agent a cross-subnet Wake-on-LAN proxy: the server
+	// may hand it jobs for targets whose last reported link shares an endpoint
+	// with this machine's link. It is opt-in because it sends packets to
+	// addresses outside this host.
 	WakeRelay bool
 	// WakeTargets overrides the broadcast destinations for diagnostics (for
 	// example 127.0.0.1:9 to observe the packet locally). Empty uses the
-	// limited broadcast plus each interface's directed broadcast.
+	// directed broadcast of each IPv4 interface, which is also what the agent
+	// reports to the server as its link.
 	WakeTargets []string
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
@@ -438,7 +440,8 @@ func (h *HostAgent) registerWithFailover(ctx context.Context) (registerResult, e
 	var lastErr error
 	for attempt := 0; attempt < h.servers.Len(); attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		reg, err := h.api.register(attemptCtx, h.cfg.ID, h.cfg.OldID, h.priv, h.cfg.Fingerprint)
+		reg, err := h.api.register(attemptCtx, h.cfg.ID, h.cfg.OldID, h.priv, h.cfg.Fingerprint,
+			h.cfg.WakeRelay, h.wakeTargets())
 		cancel()
 		if err == nil {
 			return reg, nil
@@ -631,20 +634,31 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 	}()
 }
 
-// relayWakeJobs broadcasts queued Wake-on-LAN jobs on this machine's link. The
-// server already delivers each job once per agent, so the local set of seen ids
-// only guards against a duplicate after a server failover or restart. A relay
-// failure is logged and the job dropped: the request already returned 202 and
-// the target's MAC does not change, so the caller can simply retry later.
+// relayWakeJobs broadcasts queued Wake-on-LAN jobs on the target's link. The
+// server already scopes delivery to relay agents whose reported link matches
+// the target's, but the agent re-checks against its current interfaces so a
+// delivery queued before a DHCP change is dropped instead of leaking a packet
+// onto a different LAN. An explicit --wake-targets override is used as-is for
+// diagnostics. The server marks a job delivered per agent, so the local set of
+// seen ids only guards against a duplicate after a server restart or failover.
+// A relay failure is logged and the job dropped: the request already returned
+// 202 and the target's MAC does not change, so the caller can simply retry.
 func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
 	if !h.cfg.WakeRelay || len(jobs) == 0 {
 		return
 	}
-	targets := h.cfg.WakeTargets
-	if len(targets) == 0 {
-		targets = wol.Targets(wol.Port)
-	}
+	override := len(h.cfg.WakeTargets) > 0
+	local := h.wakeTargets()
 	for _, job := range jobs {
+		targets := local
+		if !override {
+			targets = sharedTargets(job.Broadcasts, local)
+		}
+		if len(targets) == 0 {
+			h.log.Warn("wake relay skipped: no link shared with the target",
+				"target", job.Target, "job", job.ID)
+			continue
+		}
 		h.mu.Lock()
 		seen := h.wakeSeen[job.ID]
 		if !seen {
@@ -665,6 +679,37 @@ func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
 		h.log.Info("wake relayed", "target", job.Target, "mac", job.MAC,
 			"packets", sent, "job", job.ID)
 	}
+}
+
+// wakeTargets reports the directed broadcast endpoints this agent can reach.
+// An explicit override wins; otherwise every up, non-loopback IPv4 interface
+// contributes its directed broadcast. The limited broadcast is never reported
+// because every host would report the same value, so it cannot identify a
+// link.
+func (h *HostAgent) wakeTargets() []string {
+	if len(h.cfg.WakeTargets) > 0 {
+		return wol.NormalizeTargets(h.cfg.WakeTargets)
+	}
+	return append([]string{}, wol.DirectedTargets(wol.Port)...)
+}
+
+// sharedTargets returns the endpoints present in both lists, preserving order
+// and duplicates from a. An empty result means the job must not be sent.
+func sharedTargets(a, b []string) []string {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(b))
+	for _, value := range b {
+		set[value] = struct{}{}
+	}
+	var out []string
+	for _, value := range a {
+		if _, ok := set[value]; ok {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func (h *HostAgent) getPunch() *net.UDPAddr {
@@ -1345,7 +1390,8 @@ func (h *HostAgent) refreshLoop() {
 		case <-time.After(every):
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
-		reg, err := h.api.register(ctx, h.cfg.ID, h.cfg.OldID, h.priv, h.cfg.Fingerprint)
+		reg, err := h.api.register(ctx, h.cfg.ID, h.cfg.OldID, h.priv, h.cfg.Fingerprint,
+			h.cfg.WakeRelay, h.wakeTargets())
 		cancel()
 		if err != nil {
 			h.log.Warn("registration refresh failed", "error", err)

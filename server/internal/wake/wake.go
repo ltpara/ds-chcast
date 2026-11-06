@@ -29,12 +29,15 @@ const (
 
 // Job is one wake request delivered to a host agent. The job id lets an agent
 // recognise a repeated delivery; ExpiresInSec is filled in by the server when
-// the job is serialized.
+// the job is serialized. Broadcasts are the target's last-reported directed
+// broadcast endpoints: a relay only receives the job when one matches its own
+// report and sends to the matching subset.
 type Job struct {
-	ID           string `json:"job"`
-	Target       string `json:"target"`
-	MAC          string `json:"mac"`
-	ExpiresInSec int64  `json:"expires_in_sec"`
+	ID           string   `json:"job"`
+	Target       string   `json:"target"`
+	MAC          string   `json:"mac"`
+	Broadcasts   []string `json:"broadcasts,omitempty"`
+	ExpiresInSec int64    `json:"expires_in_sec"`
 }
 
 type entry struct {
@@ -81,9 +84,11 @@ func (b *Broker) SetClock(now func() time.Time) {
 	b.now = now
 }
 
-// Request queues a wake for target. It returns the cooldown remaining when the
-// target was woken too recently and ErrQueueFull when the queue is saturated.
-func (b *Broker) Request(target, mac string) (Job, time.Duration, error) {
+// Request queues a wake for target. Broadcasts are the target's last-reported
+// directed broadcast endpoints; a job without them is never handed to a relay.
+// It returns the cooldown remaining when the target was woken too recently and
+// ErrQueueFull when the queue is saturated.
+func (b *Broker) Request(target, mac string, broadcasts []string) (Job, time.Duration, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
@@ -100,6 +105,7 @@ func (b *Broker) Request(target, mac string) (Job, time.Duration, error) {
 		ID:           newID(),
 		Target:       target,
 		MAC:          mac,
+		Broadcasts:   append([]string(nil), broadcasts...),
 		ExpiresInSec: int64(b.ttl / time.Second),
 	}
 	b.jobs = append(b.jobs, &entry{
@@ -111,23 +117,46 @@ func (b *Broker) Request(target, mac string) (Job, time.Duration, error) {
 	return job, 0, nil
 }
 
-// PendingFor returns every unexpired job the agent has not received yet,
-// excluding jobs for the agent itself. Delivery is marked before the response
-// leaves the server so a refresh loop does not repeat the packet.
-func (b *Broker) PendingFor(agentID string) []Job {
+// PendingFor returns every unexpired job the agent may relay and has not
+// received yet. An agent only sees jobs when it registered as a relay and its
+// own directed broadcast endpoints intersect the target's report, which keeps
+// both the job metadata and the magic packet on the target's link. Delivery is
+// marked before the response leaves the server so a refresh loop does not
+// repeat the packet.
+func (b *Broker) PendingFor(agentID string, relay bool, broadcasts []string) []Job {
+	if !relay {
+		return nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
 	b.pruneLocked(now)
 	var out []Job
 	for _, item := range b.jobs {
-		if item.job.Target == agentID || item.delivered[agentID] {
+		if item.job.Target == agentID || item.delivered[agentID] ||
+			!sharedEndpoint(item.job.Broadcasts, broadcasts) {
 			continue
 		}
 		item.delivered[agentID] = true
 		out = append(out, item.job)
 	}
 	return out
+}
+
+func sharedEndpoint(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(b))
+	for _, value := range b {
+		set[value] = struct{}{}
+	}
+	for _, value := range a {
+		if _, ok := set[value]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Len reports the number of unexpired jobs.

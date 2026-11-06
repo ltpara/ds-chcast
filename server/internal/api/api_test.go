@@ -64,6 +64,18 @@ func registerBody(t *testing.T, id, secret, fingerprint string, timestamp int64)
 
 func registerBodyWithInfo(t *testing.T, id, secret, fingerprint, hostname, platform, version string, timestamp int64) string {
 	t.Helper()
+	return registerBodyFields(t, id, secret, fingerprint, hostname, platform, version, timestamp, false, nil)
+}
+
+// registerBodyWithLink reports the wake relay flag and link the way an agent
+// does. A nil targets list omits the field, which keeps a previous report.
+func registerBodyWithLink(t *testing.T, id, secret, fingerprint string, timestamp int64, relay bool, targets []string) string {
+	t.Helper()
+	return registerBodyFields(t, id, secret, fingerprint, "", "", "", timestamp, relay, targets)
+}
+
+func registerBodyFields(t *testing.T, id, secret, fingerprint, hostname, platform, version string, timestamp int64, relay bool, targets []string) string {
+	t.Helper()
 	priv, pub := hostKey(secret)
 	fields := map[string]any{
 		"id":          id,
@@ -78,6 +90,10 @@ func registerBodyWithInfo(t *testing.T, id, secret, fingerprint, hostname, platf
 	if hostname != "" || platform != "" || version != "" {
 		fields["metadata_signature"] = identity.Sign(priv,
 			identity.HostMetadataMessage(id, hostname, platform, version))
+	}
+	if relay || targets != nil {
+		fields["wake_relay"] = relay
+		fields["wake_targets"] = targets
 	}
 	body, err := json.Marshal(fields)
 	if err != nil {

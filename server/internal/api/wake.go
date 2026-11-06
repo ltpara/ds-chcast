@@ -32,7 +32,8 @@ func (s *server) wakeHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host is not known")
 		return
 	}
-	if _, ok := s.cfg.Registry.Identity(id); !ok {
+	record, ok := s.cfg.Registry.Identity(id)
+	if !ok {
 		writeError(w, http.StatusNotFound, "host is not known")
 		return
 	}
@@ -50,7 +51,15 @@ func (s *server) wakeHost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	job, wait, err := s.wake.Request(id, mac)
+	if len(record.WakeTargets) == 0 {
+		// Without a link the target never reported, a relay agent would only
+		// guess where to broadcast. Refuse instead of fanning the packet out
+		// to every relay's own network.
+		writeError(w, http.StatusConflict, "target has not reported a wake link")
+		s.recordAudit(r, actor, account.AuditDeviceWake, "wake "+id+" refused: no wake link", false)
+		return
+	}
+	job, wait, err := s.wake.Request(id, mac, record.WakeTargets)
 	switch {
 	case err == nil:
 	case errors.Is(err, wake.ErrCooldown):

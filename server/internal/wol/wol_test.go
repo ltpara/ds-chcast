@@ -3,6 +3,7 @@ package wol
 import (
 	"bytes"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,22 +52,53 @@ func TestMagicPacket(t *testing.T) {
 	}
 }
 
-func TestTargetsIncludeLimitedBroadcast(t *testing.T) {
-	targets := Targets(9)
-	found := false
+func TestDirectedTargetsExcludeLimitedBroadcast(t *testing.T) {
+	targets := DirectedTargets(9)
 	for _, target := range targets {
 		if target == "255.255.255.255:9" {
-			found = true
+			t.Fatalf("limited broadcast in directed targets %v", targets)
 		}
 		if strings.HasPrefix(target, "127.") {
 			t.Fatalf("loopback target %q", target)
 		}
 	}
-	if !found {
-		t.Fatalf("limited broadcast missing from %v", targets)
+	if got := DirectedTargets(0); len(got) != 0 {
+		for _, target := range got {
+			if !strings.HasSuffix(target, ":9") {
+				t.Fatalf("default port target = %q", target)
+			}
+		}
 	}
-	if got := Targets(0); len(got) == 0 || got[0] != "255.255.255.255:9" {
-		t.Fatalf("default port targets = %v", got)
+}
+
+func TestNormalizeTargets(t *testing.T) {
+	got := NormalizeTargets([]string{
+		"192.168.1.255:9",
+		" 192.168.1.255:9 ",
+		"10.0.0.255:9",
+		"255.255.255.255:9",
+		"0.0.0.0:9",
+		"224.0.0.1:9",
+		"[fe80::1]:9",
+		"relay.example:9",
+		"192.168.1.255:0",
+		"192.168.1.255:70000",
+	})
+	want := []string{"192.168.1.255:9", "10.0.0.255:9"}
+	if len(got) != len(want) {
+		t.Fatalf("NormalizeTargets = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("NormalizeTargets[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	many := make([]string, 0, maxTargets+4)
+	for i := 0; i < maxTargets+4; i++ {
+		many = append(many, "10.0."+strconv.Itoa(i)+".255:9")
+	}
+	if got := NormalizeTargets(many); len(got) != maxTargets {
+		t.Fatalf("NormalizeTargets cap = %d, want %d", len(got), maxTargets)
 	}
 }
 

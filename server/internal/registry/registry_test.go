@@ -558,6 +558,69 @@ func TestPeerMetadataPersists(t *testing.T) {
 	}
 }
 
+func TestWakeTargetsMergeAndPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pub := hostKey("host-secret")
+	register := func(targets []string) {
+		t.Helper()
+		if _, err := reg.Register(RegisterRequest{
+			ID:          "devbox",
+			PublicKey:   pub,
+			Fingerprint: "AB12",
+			TTL:         time.Minute,
+			WakeTargets: targets,
+		}); err != nil {
+			t.Fatalf("register %v: %v", targets, err)
+		}
+	}
+	targets := func() []string {
+		t.Helper()
+		record, ok := reg.Identity("devbox")
+		if !ok {
+			t.Fatal("peer record missing")
+		}
+		return record.WakeTargets
+	}
+
+	register([]string{"192.168.1.255:9"})
+	if got := targets(); len(got) != 1 || got[0] != "192.168.1.255:9" {
+		t.Fatalf("wake targets = %v", got)
+	}
+	register(nil)
+	if got := targets(); len(got) != 1 || got[0] != "192.168.1.255:9" {
+		t.Fatalf("wake targets after an omitted report = %v", got)
+	}
+	register([]string{})
+	if got := targets(); len(got) != 0 {
+		t.Fatalf("wake targets after an empty report = %v", got)
+	}
+	register([]string{"10.0.0.255:9", "10.0.1.255:9"})
+	if got := targets(); len(got) != 2 || got[1] != "10.0.1.255:9" {
+		t.Fatalf("wake targets = %v", got)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reloaded, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	record, ok := reloaded.Identity("devbox")
+	if !ok {
+		t.Fatal("peer record did not survive a restart")
+	}
+	if len(record.WakeTargets) != 2 || record.WakeTargets[0] != "10.0.0.255:9" ||
+		record.WakeTargets[1] != "10.0.1.255:9" {
+		t.Fatalf("reloaded wake targets = %v", record.WakeTargets)
+	}
+}
+
 func TestPeerMetadataSanitizedAndMerged(t *testing.T) {
 	reg := New(time.Minute)
 	now := time.Unix(7100, 0)

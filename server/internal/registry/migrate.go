@@ -10,10 +10,11 @@ import (
 // registrySchemaVersion is the schema generation this binary writes. Databases
 // created before registry_schema_migrations existed are upgraded by the
 // idempotent baseline migration.
-const registrySchemaVersion = 1
+const registrySchemaVersion = 2
 
 var registryMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyRegistryBaseline},
+	{Version: 2, Name: "wake targets", Apply: ensurePeerColumns},
 }
 
 func applyRegistryBaseline(db *sql.DB) error {
@@ -27,6 +28,7 @@ func applyRegistryBaseline(db *sql.DB) error {
 		metadata_signature TEXT NOT NULL DEFAULT '',
 		alias       TEXT NOT NULL DEFAULT '',
 		tags        TEXT NOT NULL DEFAULT '',
+		wake_targets TEXT NOT NULL DEFAULT '',
 		created_at  INTEGER NOT NULL,
 		last_seen   INTEGER NOT NULL DEFAULT 0
 	)`

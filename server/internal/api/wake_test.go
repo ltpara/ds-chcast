@@ -20,11 +20,17 @@ type wakeReply struct {
 }
 
 type wakeJobReply struct {
-	Job          string `json:"job"`
-	Target       string `json:"target"`
-	MAC          string `json:"mac"`
-	ExpiresInSec int64  `json:"expires_in_sec"`
+	Job          string   `json:"job"`
+	Target       string   `json:"target"`
+	MAC          string   `json:"mac"`
+	Broadcasts   []string `json:"broadcasts"`
+	ExpiresInSec int64    `json:"expires_in_sec"`
 }
+
+// wakeLink is the directed broadcast a test agent reports for its LAN. The
+// server never derives a link from the limited broadcast, so tests use an
+// explicit value.
+const wakeLink = "192.168.50.255:9"
 
 func postWake(t *testing.T, base, id, mac, key string) (int, http.Header, []byte) {
 	t.Helper()
@@ -51,8 +57,15 @@ func postWake(t *testing.T, base, id, mac, key string) (int, http.Header, []byte
 
 func registerWakeAgent(t *testing.T, base, id string, timestamp int64) []wakeJobReply {
 	t.Helper()
+	return registerWakeAgentLink(t, base, id, timestamp, false, []string{wakeLink})
+}
+
+// registerWakeAgentLink registers an agent with an explicit relay flag and
+// link. The returned jobs are those the registration delivered.
+func registerWakeAgentLink(t *testing.T, base, id string, timestamp int64, relay bool, targets []string) []wakeJobReply {
+	t.Helper()
 	status, body := request(t, http.MethodPost, base+"/v1/hosts",
-		registerBody(t, id, "secret "+id, "FP-"+id, timestamp), testutil.ServerKey)
+		registerBodyWithLink(t, id, "secret "+id, "FP-"+id, timestamp, relay, targets), testutil.ServerKey)
 	if status != http.StatusOK {
 		t.Fatalf("register %s: %d %s", id, status, body)
 	}
@@ -69,7 +82,7 @@ func TestWakeQueuesForProxyAgent(t *testing.T) {
 	s := testutil.Start(t)
 	now := time.Now().Unix()
 	registerWakeAgent(t, s.URL, "targetbox", now)
-	registerWakeAgent(t, s.URL, "proxy", now+1)
+	registerWakeAgentLink(t, s.URL, "proxy", now+1, true, []string{wakeLink})
 
 	status, _, body := postWake(t, s.URL, "targetbox", "aa-bb-cc-dd-ee-ff", testutil.ServerKey)
 	if status != http.StatusAccepted {
@@ -83,7 +96,7 @@ func TestWakeQueuesForProxyAgent(t *testing.T) {
 		t.Fatalf("unexpected wake reply: %+v", queued)
 	}
 
-	jobs := registerWakeAgent(t, s.URL, "proxy", now+2)
+	jobs := registerWakeAgentLink(t, s.URL, "proxy", now+2, true, []string{wakeLink})
 	if len(jobs) != 1 {
 		t.Fatalf("proxy got %d jobs, want 1: %+v", len(jobs), jobs)
 	}
@@ -92,8 +105,11 @@ func TestWakeQueuesForProxyAgent(t *testing.T) {
 		job.MAC != "AA:BB:CC:DD:EE:FF" || job.ExpiresInSec != 60 {
 		t.Fatalf("delivered job = %+v, want job %s", job, queued.Job)
 	}
+	if len(job.Broadcasts) != 1 || job.Broadcasts[0] != wakeLink {
+		t.Fatalf("delivered job broadcasts = %v, want [%s]", job.Broadcasts, wakeLink)
+	}
 
-	if jobs := registerWakeAgent(t, s.URL, "proxy", now+3); len(jobs) != 0 {
+	if jobs := registerWakeAgentLink(t, s.URL, "proxy", now+3, true, []string{wakeLink}); len(jobs) != 0 {
 		t.Fatalf("proxy got a job twice: %+v", jobs)
 	}
 	if jobs := registerWakeAgent(t, s.URL, "targetbox", now+4); len(jobs) != 0 {
@@ -186,7 +202,7 @@ func TestWakeSharedAddressBookPermission(t *testing.T) {
 		}
 	}
 	registerWakeAgent(t, s.URL, "targetbox", now)
-	registerWakeAgent(t, s.URL, "otherbox", now+1)
+	registerWakeAgentLink(t, s.URL, "otherbox", now+1, true, []string{wakeLink})
 
 	alice := login(t, s.URL, "alice", "correct horse")
 	bob := login(t, s.URL, "bob", "correct horse")
@@ -213,7 +229,7 @@ func TestWakeSharedAddressBookPermission(t *testing.T) {
 	if status, _, body := postWake(t, s.URL, "otherbox", "AA:BB:CC:DD:EE:FF", bob.Token); status != http.StatusForbidden {
 		t.Fatalf("wake outside shared book: %d %s", status, body)
 	}
-	jobs := registerWakeAgent(t, s.URL, "otherbox", now+2)
+	jobs := registerWakeAgentLink(t, s.URL, "otherbox", now+2, true, []string{wakeLink})
 	if len(jobs) != 1 || jobs[0].Job != queued.Job || jobs[0].Target != "targetbox" {
 		t.Fatalf("otherbox jobs = %+v, want job %s for targetbox", jobs, queued.Job)
 	}
@@ -224,5 +240,70 @@ func TestWakeSharedAddressBookPermission(t *testing.T) {
 	}
 	if status, _, body := postWake(t, s.URL, "targetbox", "AA:BB:CC:DD:EE:FF", bob.Token); status != http.StatusForbidden {
 		t.Fatalf("wake after revoke: %d %s", status, body)
+	}
+}
+
+func TestWakeDeliveryScopedToTargetLink(t *testing.T) {
+	node := newStubNode(t, "203.0.113.10", "203.0.113.10:21116")
+	s := testutil.StartWith(t, testutil.Options{RelayNodes: []string{node.url}})
+	now := time.Now().Unix()
+	const foreignLink = "192.168.60.255:9"
+
+	registerWakeAgentLink(t, s.URL, "targetbox", now, false, []string{wakeLink})
+	registerWakeAgentLink(t, s.URL, "peerrelay", now+1, true, []string{wakeLink})
+	registerWakeAgentLink(t, s.URL, "foreignrelay", now+2, true, []string{foreignLink})
+	registerWakeAgentLink(t, s.URL, "plainpeer", now+3, false, []string{wakeLink})
+
+	status, _, body := postWake(t, s.URL, "targetbox", "AA:BB:CC:DD:EE:FF", testutil.ServerKey)
+	if status != http.StatusAccepted {
+		t.Fatalf("wake: %d %s", status, body)
+	}
+	var queued wakeReply
+	if err := json.Unmarshal(body, &queued); err != nil {
+		t.Fatalf("wake reply: %v", err)
+	}
+
+	if jobs := registerWakeAgentLink(t, s.URL, "foreignrelay", now+4, true, []string{foreignLink}); len(jobs) != 0 {
+		t.Fatalf("relay on another link got a job: %+v", jobs)
+	}
+	if jobs := registerWakeAgentLink(t, s.URL, "plainpeer", now+5, false, []string{wakeLink}); len(jobs) != 0 {
+		t.Fatalf("non-relay agent got a job: %+v", jobs)
+	}
+	if jobs := registerWakeAgentLink(t, s.URL, "peerrelay", now+6, true, []string{foreignLink}); len(jobs) != 0 {
+		t.Fatalf("relay got a job after its link changed: %+v", jobs)
+	}
+
+	jobs := registerWakeAgentLink(t, s.URL, "peerrelay", now+7, true, []string{wakeLink})
+	if len(jobs) != 1 || jobs[0].Job != queued.Job || jobs[0].Target != "targetbox" {
+		t.Fatalf("peer relay jobs = %+v, want job %s for targetbox", jobs, queued.Job)
+	}
+	if len(jobs[0].Broadcasts) != 1 || jobs[0].Broadcasts[0] != wakeLink {
+		t.Fatalf("peer relay job broadcasts = %v, want [%s]", jobs[0].Broadcasts, wakeLink)
+	}
+}
+
+func TestWakeTargetWithoutLinkIsRejected(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "nolink", "secret nolink", "FP-nolink", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+
+	status, _, body = postWake(t, s.URL, "nolink", "AA:BB:CC:DD:EE:FF", testutil.ServerKey)
+	if status != http.StatusConflict {
+		t.Fatalf("wake without a link: %d %s", status, body)
+	}
+	if !strings.Contains(string(body), "wake link") {
+		t.Fatalf("wake error = %s, want a wake link message", body)
+	}
+
+	events, err := s.Accounts.AuditEventsFor(account.AuditDeviceWake, 10)
+	if err != nil {
+		t.Fatalf("list wake audit: %v", err)
+	}
+	if len(events) != 1 || events[0].Success || !strings.Contains(events[0].Detail, "no wake link") {
+		t.Fatalf("wake audit = %+v, want one failed no-link event", events)
 	}
 }
