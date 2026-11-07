@@ -22,6 +22,7 @@
 
 #include "chast/audio.h"
 #include "chast/host_server.h"
+#include "clipboard_stub.h"
 #include "chast/security.h"
 
 namespace {
@@ -166,6 +167,8 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
                                               std::shared_ptr<MicState> mic,
                                               std::string* error) {
     chast::HostServerConfig config;
+    use_empty_clipboard(config);
+    config.dry_run_input = true;
     config.settings.bind_address = "127.0.0.1";
     config.settings.port = port;
     config.settings.carrier = false;

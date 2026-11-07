@@ -270,6 +270,7 @@ void test_hello_ack() {
     sent.record_enabled = true;
     sent.camera_enabled = true;
     sent.session_select_enabled = true;
+    sent.remote_config_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -318,6 +319,7 @@ void test_hello_ack() {
     check(got.record_enabled, "HelloAck keeps the record flag");
     check(got.camera_enabled, "HelloAck keeps the camera flag");
     check(got.session_select_enabled, "HelloAck keeps the session select flag");
+    check(got.remote_config_enabled, "HelloAck keeps the remote configuration flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
               got.file_transfer_enabled && got.microphone_enabled &&
               got.privacy_mode_enabled && got.port_forward_enabled &&

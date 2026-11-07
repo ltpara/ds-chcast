@@ -157,6 +157,12 @@ PermissionMask permission_mask_from_info(const ServerInfo& info) {
     if (info.os_login_enabled) {
         mask |= kPermissionOsLogin;
     }
+    if (info.session_select_enabled) {
+        mask |= kPermissionSessionSelect;
+    }
+    if (info.remote_config_enabled) {
+        mask |= kPermissionRemoteConfig;
+    }
     return mask;
 }
 
@@ -725,6 +731,7 @@ struct QuicSession::Impl {
     // Client: the mask the host last announced. Atomic because the transport
     // callbacks read it while the application thread updates it.
     std::atomic<PermissionMask> session_permissions{0};
+    PermissionMask pending_policy_revocations = 0;  // guarded by mutex
     PermissionMask permission_ceiling = 0;
     // Client: a PermissionUpdate arrived since take_permission_update().
     bool permission_update_ready = false;
@@ -1273,7 +1280,7 @@ struct QuicSession::Impl {
                         kPermissionClipboard | kPermissionFileTransfer |
                         kPermissionMicrophone | kPermissionPortForward | kPermissionTerminal;
                     if (role == Role::Server &&
-                        (session_permissions.load() & kViewerStreamPermissions) == 0) {
+                        (effective_permissions() & kViewerStreamPermissions) == 0) {
                         // None of the viewer-initiated stream types (clipboard,
                         // file, microphone, port forward, terminal) is granted
                         // for this session; the HelloAck said so already.
@@ -1483,7 +1490,7 @@ struct QuicSession::Impl {
                 // stream without the permission is refused quietly: the
                 // microphone is optional and never takes video down.
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionMicrophone) == 0) {
+                    (effective_permissions() & kPermissionMicrophone) == 0) {
                     // Taking the handle into the microphone list means its
                     // abort and completion are closed here like any other
                     // CMIC stream instead of being reported as fatal.
@@ -1536,7 +1543,7 @@ struct QuicSession::Impl {
             } else if (std::memcmp(pending->data(), kClipboardStreamMagic, 4) == 0) {
                 const bool allowed =
                     role != Role::Server ||
-                    (session_permissions.load() & kPermissionClipboard) != 0;
+                    (effective_permissions() & kPermissionClipboard) != 0;
                 if (!allowed) {
                     // A revoked permission is recoverable: refuse this push,
                     // keep the session.
@@ -1559,7 +1566,7 @@ struct QuicSession::Impl {
                 // Either side may send; the permission bit says whether the
                 // session carries file transfers at all.
                 const bool allowed =
-                    (session_permissions.load() & kPermissionFileTransfer) != 0;
+                    (effective_permissions() & kPermissionFileTransfer) != 0;
                 FileStreamHeader header;
                 std::string error;
                 const bool header_ready = pending->size() >= kFileStreamHeaderSize;
@@ -1615,7 +1622,7 @@ struct QuicSession::Impl {
                 // the viewer only accepts a downlink for a connection it
                 // opened. Anything else is refused quietly, like a stale
                 // clipboard stream.
-                if ((session_permissions.load() & kPermissionPortForward) == 0) {
+                if ((effective_permissions() & kPermissionPortForward) == 0) {
                     kind = Kind::Reject;
                 } else if (pending->size() < kPortForwardStreamHeaderSize) {
                     return;
@@ -1717,7 +1724,7 @@ struct QuicSession::Impl {
                 // exist once the host answered Ok, so either direction may
                 // arrive first: ConPTY can print its prompt before the viewer
                 // opens its input stream.
-                if ((session_permissions.load() & kPermissionTerminal) == 0) {
+                if ((effective_permissions() & kPermissionTerminal) == 0) {
                     kind = Kind::Reject;
                 } else if (pending->size() < kTerminalStreamHeaderSize) {
                     return;
@@ -1786,7 +1793,7 @@ struct QuicSession::Impl {
                 const bool expecting =
                     client_pending_camera != 0 || client_camera_id != 0;
                 if (role != Role::Client ||
-                    (session_permissions.load() & kPermissionCamera) == 0) {
+                    (effective_permissions() & kPermissionCamera) == 0) {
                     kind = Kind::Reject;
                 } else if (pending->size() < kCameraStreamHeaderSize) {
                     return;
@@ -2491,7 +2498,7 @@ struct QuicSession::Impl {
                             matched = true;
                             const bool allowed =
                                 role != Role::Server ||
-                                (session_permissions.load() & kPermissionClipboard) != 0;
+                                (effective_permissions() & kPermissionClipboard) != 0;
                             if (allowed) {
                                 ClipboardContent content;
                                 std::string error;
@@ -2906,7 +2913,7 @@ struct QuicSession::Impl {
             }
             case ControlType::InputEvent: {
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionInput) == 0) {
+                    (effective_permissions() & kPermissionInput) == 0) {
                     // The HelloAck already told the viewer input is off; a
                     // client that sends it anyway is dropped, not fatal. This
                     // also covers a mid-session revocation: the operator does
@@ -2937,7 +2944,7 @@ struct QuicSession::Impl {
             }
             case ControlType::TextInput: {
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionInput) == 0) {
+                    (effective_permissions() & kPermissionInput) == 0) {
                     // Composed text is typing, so it follows the same input
                     // permission as InputEvent, including mid-session
                     // revocation.
@@ -3091,7 +3098,7 @@ struct QuicSession::Impl {
             }
             case ControlType::SwitchDisplay: {
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionInput) == 0) {
+                    (effective_permissions() & kPermissionInput) == 0) {
                     // Switching outputs changes what the viewer sees, so it
                     // travels with input control; a viewer without it is
                     // dropped rather than allowed to move the host's view.
@@ -3169,7 +3176,7 @@ struct QuicSession::Impl {
             }
             case ControlType::SetDisplayMode: {
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionInput) == 0) {
+                    (effective_permissions() & kPermissionInput) == 0) {
                     // Changing the host's mode affects the operator's desktop,
                     // so it travels with input control like SwitchDisplay.
                     break;
@@ -3225,7 +3232,7 @@ struct QuicSession::Impl {
             }
             case ControlType::SetDisplayFollow: {
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionInput) == 0) {
+                    (effective_permissions() & kPermissionInput) == 0) {
                     // Following moves the host's capture like SwitchDisplay, so
                     // it needs the same grant; without it the request is
                     // dropped rather than allowed to move the host's view.
@@ -3264,7 +3271,7 @@ struct QuicSession::Impl {
             }
             case ControlType::SetPrivacyMode: {
                 if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionPrivacyMode) == 0) {
+                    (effective_permissions() & kPermissionPrivacyMode) == 0) {
                     // The HelloAck already told the viewer whether privacy mode
                     // is available; a request without the permission is
                     // dropped, not fatal.
@@ -3631,7 +3638,7 @@ struct QuicSession::Impl {
             }
             case ControlType::ClipboardUpdate: {
                 if (role == Role::Server &&
-                    (session_permissions.load() & kPermissionClipboard) == 0) {
+                    (effective_permissions() & kPermissionClipboard) == 0) {
                     // The HelloAck already reported clipboard off; a client
                     // that sends it anyway is dropped, not fatal.
                     break;
@@ -3707,7 +3714,7 @@ struct QuicSession::Impl {
                                 voice_requests.pop_front();
                             }
                             voice_requests.push_back(request);
-                        } else if ((session_permissions.load() & kPermissionMicrophone) ==
+                        } else if ((effective_permissions() & kPermissionMicrophone) ==
                                    0) {
                             refusal.code = VoiceCallCode::Refused;
                             refusal.reason = "microphone access is not granted";
@@ -3791,7 +3798,7 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (!client_voice_active ||
-                        (session_permissions.load() & kPermissionMicrophone) == 0) {
+                        (effective_permissions() & kPermissionMicrophone) == 0) {
                         break;
                     }
                     while (!voice_audio.empty() &&
@@ -3828,7 +3835,7 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::FileOffer: {
-                if ((session_permissions.load() & kPermissionFileTransfer) == 0) {
+                if ((effective_permissions() & kPermissionFileTransfer) == 0) {
                     break;
                 }
                 FileOffer offer;
@@ -4063,7 +4070,7 @@ struct QuicSession::Impl {
                 bool queued = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if ((session_permissions.load() & kPermissionPortForward) == 0) {
+                    if ((effective_permissions() & kPermissionPortForward) == 0) {
                         refusal.code = PortForwardCode::Refused;
                         refusal.reason = "port forwarding is disabled on this host";
                     } else if (pending_forward_targets.count(request.forward_id) != 0 ||
@@ -4154,7 +4161,7 @@ struct QuicSession::Impl {
                 bool queued = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if ((session_permissions.load() & kPermissionTerminal) == 0) {
+                    if ((effective_permissions() & kPermissionTerminal) == 0) {
                         refusal.code = TerminalCode::Refused;
                         refusal.reason = "terminals are disabled on this host";
                     } else if (pending_terminal_targets.count(request.terminal_id) != 0 ||
@@ -4301,7 +4308,7 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if ((session_permissions.load() & kPermissionCamera) != 0) {
+                    if ((effective_permissions() & kPermissionCamera) != 0) {
                         camera_list_request_ready = true;
                     }
                 }
@@ -4344,7 +4351,7 @@ struct QuicSession::Impl {
                 bool queued = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if ((session_permissions.load() & kPermissionCamera) == 0) {
+                    if ((effective_permissions() & kPermissionCamera) == 0) {
                         refusal.code = CameraCode::Refused;
                         refusal.reason = "cameras are disabled on this host";
                     } else if ((camera.load() != nullptr && !camera_finished) ||
@@ -4865,6 +4872,7 @@ struct QuicSession::Impl {
             stream_options_result = StreamOptionsResult{};
             stream_options_results_seen = 0;
             session_permissions = 0;
+            pending_policy_revocations = 0;
             permission_ceiling = 0;
             permission_update_ready = false;
             permission_updates = 0;
@@ -4937,6 +4945,9 @@ struct QuicSession::Impl {
     // The hard gates from QuicServerConfig. Authentication and approval may
     // only reduce this; the transport never grants beyond it.
     PermissionMask config_permissions() const {
+        if (server_config.permission_policy) {
+            return server_config.permission_policy->load() & kPermissionAll;
+        }
         PermissionMask mask = 0;
         if (server_config.allow_input) {
             mask |= kPermissionInput;
@@ -4984,6 +4995,11 @@ struct QuicSession::Impl {
             mask |= kPermissionRemoteConfig;
         }
         return mask;
+    }
+
+    PermissionMask effective_permissions() const {
+        const PermissionMask granted = session_permissions.load();
+        return role == Role::Server ? granted & config_permissions() : granted;
     }
 
     // Spends a one-time token once a client was accepted.
@@ -5474,14 +5490,17 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             }
 
             if (refusal.empty()) {
-                const PermissionMask granted = auth.permissions & ceiling;
-                impl.session_permissions = granted;
-                impl.permission_ceiling = granted;
                 if (!impl.server_config.authenticate) {
                     impl.consume_token();
                 }
                 {
                     std::lock_guard<std::mutex> guard(impl.mutex);
+                    // Approval may have waited while another session reduced
+                    // policy. Reopening it must not revive that pending grant.
+                    const PermissionMask granted = auth.permissions & ceiling &
+                        impl.config_permissions() & ~impl.pending_policy_revocations;
+                    impl.session_permissions = granted;
+                    impl.permission_ceiling = granted;
                     impl.client_accepted = true;
                 }
                 return Error::success();
@@ -5559,10 +5578,28 @@ std::string QuicSession::client_address() const {
 }
 
 PermissionMask QuicSession::permissions() const {
-    return impl_->session_permissions.load();
+    return impl_->effective_permissions();
 }
 
 Error QuicSession::set_permissions(PermissionMask permissions) {
+    return set_permissions_impl(permissions, false);
+}
+
+void QuicSession::revoke_policy_permissions(PermissionMask permissions) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server || permissions == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.pending_policy_revocations |= permissions;
+    impl.session_permissions.fetch_and(~permissions);
+}
+
+Error QuicSession::apply_permission_policy() {
+    return set_permissions_impl(0, true);
+}
+
+Error QuicSession::set_permissions_impl(PermissionMask permissions, bool policy_change) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "set_permissions is a server operation");
@@ -5570,16 +5607,19 @@ Error QuicSession::set_permissions(PermissionMask permissions) {
     if (!impl.announced) {
         return Error(Status::InvalidCall, "the stream was not announced yet");
     }
-    if (!impl.server_config.allow_permission_change) {
+    if (!policy_change && !impl.server_config.allow_permission_change) {
         return Error(Status::InvalidCall, "permission changes are disabled on this host");
     }
     PermissionMask next = 0;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        next = permissions & impl.permission_ceiling & impl.config_permissions();
-        if (next == impl.session_permissions.load()) {
+        const PermissionMask revoked = impl.pending_policy_revocations;
+        next = (policy_change ? impl.session_permissions.load() : permissions) &
+            impl.permission_ceiling & impl.config_permissions() & ~revoked;
+        if (next == impl.session_permissions.load() && revoked == 0) {
             return Error::success();
         }
+        impl.pending_policy_revocations = 0;
         // The local gate changes before the message goes out: if telling the
         // viewer fails, the host is still the one enforcing the reduction.
         impl.session_permissions = next;
@@ -5735,7 +5775,7 @@ bool QuicSession::take_permission_update(PermissionMask& permissions) {
     if (!impl_->permission_update_ready) {
         return false;
     }
-    permissions = impl_->session_permissions.load();
+    permissions = impl_->effective_permissions();
     impl_->permission_update_ready = false;
     return true;
 }
@@ -5773,7 +5813,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     // session will not inject or audio the host disabled. The accepted mask
     // is already clamped to these gates, so it is the single source of truth
     // and includes any reduction the operator made at approval time.
-    const PermissionMask granted = impl.session_permissions.load();
+    const PermissionMask granted = impl.effective_permissions();
     ack.input_enabled = (granted & kPermissionInput) != 0;
     ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
@@ -5788,6 +5828,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     ack.os_login_enabled = (granted & kPermissionOsLogin) != 0;
     ack.session_select_enabled = (granted & kPermissionSessionSelect) != 0;
+    ack.remote_config_enabled = (granted & kPermissionRemoteConfig) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -5906,7 +5947,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
         return Error(Status::InvalidCall, "the stream was not announced yet");
     }
     ServerInfo update = info;
-    const PermissionMask granted = impl.session_permissions.load();
+    const PermissionMask granted = impl.effective_permissions();
     update.input_enabled = (granted & kPermissionInput) != 0;
     update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
@@ -5921,10 +5962,30 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     update.os_login_enabled = (granted & kPermissionOsLogin) != 0;
     update.session_select_enabled = (granted & kPermissionSessionSelect) != 0;
+    update.remote_config_enabled = (granted & kPermissionRemoteConfig) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         audio_stream_open = impl.audio.load() != nullptr && !impl.audio_stopped;
+    }
+    if (update.audio.enabled && (granted & kPermissionAudio) != 0 &&
+        !info.files_only && !info.control_only && !impl.audio.load()) {
+        // Audio may first become available after admission (for example when
+        // a follower takes over capture or the host enables system sound).
+        // The transport decision remains the one latched by announce().
+        HQUIC audio = nullptr;
+        QUIC_STATUS status = impl.api->StreamOpen(
+            impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+            &Impl::stream_callback, &impl, &audio);
+        if (QUIC_SUCCEEDED(status)) {
+            status = impl.api->StreamStart(audio, QUIC_STREAM_START_FLAG_NONE);
+        }
+        if (QUIC_FAILED(status)) {
+            if (audio) impl.api->StreamClose(audio);
+        } else {
+            impl.audio = audio;
+            audio_stream_open = true;
+        }
     }
     update.audio.enabled =
         update.audio.enabled && (granted & kPermissionAudio) != 0 && audio_stream_open;
@@ -5961,7 +6022,7 @@ Error QuicSession::request_display_switch(uint16_t display_index) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+        if ((impl.effective_permissions() & kPermissionInput) == 0) {
             return Error(Status::PermissionDenied, "input is disabled by the host");
         }
     }
@@ -6028,7 +6089,7 @@ Error QuicSession::request_set_display_mode(uint16_t display_index, uint16_t wid
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+        if ((impl.effective_permissions() & kPermissionInput) == 0) {
             return Error(Status::PermissionDenied, "input is disabled by the host");
         }
     }
@@ -6065,7 +6126,7 @@ bool QuicSession::take_privacy_mode_request(bool& enabled) {
         return false;
     }
     impl_->privacy_mode_request_ready = false;
-    if ((impl_->session_permissions.load() & kPermissionPrivacyMode) == 0) {
+    if ((impl_->effective_permissions() & kPermissionPrivacyMode) == 0) {
         // The permission was revoked between the request and this drain; the
         // host must not act on a request it can no longer honor.
         return false;
@@ -6112,7 +6173,7 @@ Error QuicSession::set_privacy_mode(bool enabled) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionPrivacyMode) == 0) {
+        if ((impl.effective_permissions() & kPermissionPrivacyMode) == 0) {
             return Error(Status::PermissionDenied, "privacy mode is disabled by the host");
         }
     }
@@ -6179,7 +6240,7 @@ Error QuicSession::request_sas() {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+        if ((impl.effective_permissions() & kPermissionInput) == 0) {
             return Error(Status::PermissionDenied, "input control is disabled by the host");
         }
     }
@@ -6257,7 +6318,7 @@ Error QuicSession::request_remote_config(uint32_t keys, uint32_t values) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionRemoteConfig) == 0) {
+        if ((impl.effective_permissions() & kPermissionRemoteConfig) == 0) {
             return Error(Status::PermissionDenied,
                          "remote configuration is disabled by the host");
         }
@@ -6338,7 +6399,7 @@ Error QuicSession::request_display_control(const DisplayControlRequest& request)
                 : kPermissionPrivacyMode;
         if (request.action != DisplayControlAction::Query &&
             request.action != DisplayControlAction::Restore &&
-            (impl.session_permissions.load() & needed) != needed) {
+            (impl.effective_permissions() & needed) != needed) {
             return Error(Status::PermissionDenied, "display control is not permitted");
         }
     }
@@ -6391,7 +6452,7 @@ Error QuicSession::request_host_action(HostAction action, bool block_input) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        const PermissionMask permissions = impl.session_permissions.load();
+        const PermissionMask permissions = impl.effective_permissions();
         if (action == HostAction::Restart) {
             if ((permissions & kPermissionRestart) == 0) {
                 return Error(Status::PermissionDenied,
@@ -6490,7 +6551,7 @@ Error QuicSession::request_os_login(const std::string& password) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        const PermissionMask permissions = impl.session_permissions.load();
+        const PermissionMask permissions = impl.effective_permissions();
         if ((permissions & (kPermissionInput | kPermissionOsLogin)) !=
             (kPermissionInput | kPermissionOsLogin)) {
             return Error(Status::PermissionDenied, "OS login is disabled by the host");
@@ -6584,7 +6645,7 @@ Error QuicSession::request_session_list() {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionSessionSelect) == 0) {
+        if ((impl.effective_permissions() & kPermissionSessionSelect) == 0) {
             return Error(Status::PermissionDenied, "session select is disabled by the host");
         }
     }
@@ -6621,7 +6682,7 @@ Error QuicSession::request_session_select(uint32_t session_id) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionSessionSelect) == 0) {
+        if ((impl.effective_permissions() & kPermissionSessionSelect) == 0) {
             return Error(Status::PermissionDenied, "session select is disabled by the host");
         }
     }
@@ -6836,7 +6897,7 @@ Error QuicSession::request_display_follow(uint8_t flags) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+        if ((impl.effective_permissions() & kPermissionInput) == 0) {
             return Error(Status::PermissionDenied, "input is disabled by the host");
         }
     }
@@ -6873,12 +6934,12 @@ Error QuicSession::send_audio(AudioHeader header, const uint8_t* payload, size_t
     }
     // A closed gate is a caller mistake, not a lost stream; keep the two
     // cases distinguishable for the host and the loopback check.
-    if (!impl.server_config.allow_audio) {
+    if ((impl.config_permissions() & kPermissionAudio) == 0) {
         return Error(Status::InvalidCall, "audio is disabled on this server");
     }
     // The operator may revoke audio mid-session. The stream stays open so a
     // restore resumes immediately, but nothing leaves the host in between.
-    if ((impl.session_permissions.load() & kPermissionAudio) == 0) {
+    if ((impl.effective_permissions() & kPermissionAudio) == 0) {
         return Error(Status::PermissionDenied, "audio is disabled for this session");
     }
     if (!impl.announced) {
@@ -7301,7 +7362,7 @@ Error QuicSession::start_microphone(const AudioInfo& info) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+        if ((impl.effective_permissions() & kPermissionMicrophone) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant the microphone");
         }
         if (impl.microphone.load() != nullptr) {
@@ -7354,7 +7415,7 @@ Error QuicSession::send_microphone(AudioHeader header, const uint8_t* payload, s
     }
     // The host may revoke the microphone mid-session and abort the stream.
     // Report that as a permission failure so the viewer UI can explain it.
-    if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+    if ((impl.effective_permissions() & kPermissionMicrophone) == 0) {
         return Error(Status::PermissionDenied, "the host revoked the microphone");
     }
     HQUIC microphone = impl.microphone.load();
@@ -7489,7 +7550,7 @@ Error QuicSession::send_input(const InputEvent& event) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
     }
-    if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+    if ((impl.effective_permissions() & kPermissionInput) == 0) {
         return Error(Status::PermissionDenied, "input is disabled by the host");
     }
     return impl.send_bytes(impl.control.load(), make_input_event(event), QUIC_SEND_FLAG_NONE);
@@ -7507,7 +7568,7 @@ Error QuicSession::release_input() {
 Error QuicSession::send_clipboard(uint64_t seq, const std::string& text) {
     Impl& impl = *impl_;
     if (impl.role == Impl::Role::Server) {
-        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
             return Error(Status::PermissionDenied, "clipboard is disabled for this session");
         }
     } else {
@@ -7515,7 +7576,7 @@ Error QuicSession::send_clipboard(uint64_t seq, const std::string& text) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
             return Error(Status::PermissionDenied, "clipboard is disabled by the host");
         }
     }
@@ -7552,7 +7613,7 @@ Error QuicSession::send_clipboard_content(ClipboardContent content) {
 Error QuicSession::send_clipboard_blob(std::vector<uint8_t> blob) {
     Impl& impl = *impl_;
     if (impl.role == Impl::Role::Server) {
-        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
             return Error(Status::PermissionDenied, "clipboard is disabled for this session");
         }
     } else {
@@ -7560,7 +7621,7 @@ Error QuicSession::send_clipboard_blob(std::vector<uint8_t> blob) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
             return Error(Status::PermissionDenied, "clipboard is disabled by the host");
         }
     }
@@ -7665,7 +7726,7 @@ Error QuicSession::send_voice_call_response(const VoiceCallResponse& response) {
         }
         impl.server_voice_pending = 0;
         if (answer.code == VoiceCallCode::Ok) {
-            if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+            if ((impl.effective_permissions() & kPermissionMicrophone) == 0) {
                 answer.code = VoiceCallCode::Refused;
                 answer.reason = "microphone access was revoked";
                 answer.audio = AudioInfo{};
@@ -7699,7 +7760,7 @@ Error QuicSession::send_voice_audio(const AudioHeader& header, const uint8_t* pa
         if (!impl.announced) {
             return Error(Status::InvalidCall, "the stream is not open");
         }
-        if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+        if ((impl.effective_permissions() & kPermissionMicrophone) == 0) {
             return Error(Status::PermissionDenied, "microphone access was revoked");
         }
         if (!impl.server_voice_active) {
@@ -7756,7 +7817,7 @@ Error QuicSession::request_voice_call() {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+        if ((impl.effective_permissions() & kPermissionMicrophone) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant the microphone");
         }
         if (impl.client_voice_active || impl.client_voice_requested) {
@@ -7852,7 +7913,7 @@ Error QuicSession::send_text_input(const std::string& text) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
     }
-    if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+    if ((impl.effective_permissions() & kPermissionInput) == 0) {
         return Error(Status::PermissionDenied, "input is disabled by the host");
     }
     std::vector<uint8_t> message = make_text_input(text);
@@ -8017,7 +8078,7 @@ Error QuicSession::offer_file(const FileOffer& offer) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             return Error(Status::PermissionDenied, "file transfer is disabled by the host");
         }
         if (impl.outgoing_uploads.count(offer.transfer_id) != 0) {
@@ -8068,7 +8129,7 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
     }
     // Checked per chunk: a revocation between two chunks ends the transfer
     // before another byte leaves the host.
-    if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+    if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
         return Error(Status::PermissionDenied, "file transfer was disabled");
     }
     HQUIC stream = nullptr;
@@ -8138,7 +8199,7 @@ Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data,
 
 Error QuicSession::finish_file_upload(uint32_t transfer_id) {
     Impl& impl = *impl_;
-    if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+    if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
         return Error(Status::PermissionDenied, "file transfer was disabled");
     }
     HQUIC stream = nullptr;
@@ -8268,7 +8329,7 @@ Error QuicSession::send_file_list_result(const FileListResult& result) {
         if (!impl.announced) {
             return Error(Status::InvalidCall, "the stream is not open");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             answer.entries.clear();
             answer.truncated = false;
             answer.code = FileCode::Refused;
@@ -8304,7 +8365,7 @@ Error QuicSession::send_file_download_result(const FileDownloadResult& result) {
         if (!impl.announced) {
             return Error(Status::InvalidCall, "the stream is not open");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             answer.transfer_id = 0;
             answer.code = FileCode::Refused;
             answer.reason = "file transfer was revoked";
@@ -8331,7 +8392,7 @@ Error QuicSession::request_file_list(uint32_t request_id, const std::string& dir
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             return Error(Status::PermissionDenied,
                          "the host did not grant file transfer");
         }
@@ -8363,7 +8424,7 @@ Error QuicSession::request_file_download(uint32_t request_id, const std::string&
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             return Error(Status::PermissionDenied,
                          "the host did not grant file transfer");
         }
@@ -8409,7 +8470,7 @@ Error QuicSession::send_file_op_result(const FileOpResult& result) {
         if (!impl.announced) {
             return Error(Status::InvalidCall, "the stream is not open");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             answer.code = FileCode::Refused;
             answer.reason = "file transfer was revoked";
         }
@@ -8437,7 +8498,7 @@ Error QuicSession::request_file_op(uint32_t request_id, FileOperation op,
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             return Error(Status::PermissionDenied,
                          "the host did not grant file transfer");
         }
@@ -8488,7 +8549,7 @@ Error QuicSession::send_port_forward_result(uint32_t forward_id, PortForwardCode
             return Error(Status::InvalidCall, "no port forward request is waiting");
         }
         if (code == PortForwardCode::Ok) {
-            if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+            if ((impl.effective_permissions() & kPermissionPortForward) == 0) {
                 result.code = PortForwardCode::Refused;
                 result.reason = "port forwarding was revoked";
             } else if (impl.active_forward_targets.size() >= kMaxPortForwardTargets) {
@@ -8535,7 +8596,7 @@ Error QuicSession::accept_port_forward_connection(PortForwardHandle handle) {
         if (entry->failed) {
             return Error(Status::Unavailable, entry->error);
         }
-        if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+        if ((impl.effective_permissions() & kPermissionPortForward) == 0) {
             return Error(Status::PermissionDenied, "port forwarding was revoked");
         }
         forward_id = entry->forward_id;
@@ -8646,7 +8707,7 @@ Error QuicSession::request_port_forward(uint32_t forward_id, const std::string& 
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+        if ((impl.effective_permissions() & kPermissionPortForward) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant port forwarding");
         }
         if (impl.client_pending_forwards.count(forward_id) != 0 ||
@@ -8698,7 +8759,7 @@ Error QuicSession::open_port_forward_connection(uint32_t forward_id,
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+        if ((impl.effective_permissions() & kPermissionPortForward) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant port forwarding");
         }
         if (impl.client_forward_targets.count(forward_id) == 0) {
@@ -9037,7 +9098,7 @@ Error QuicSession::send_terminal_result(const TerminalResult& result) {
             return Error(Status::InvalidCall, "no terminal request is waiting");
         }
         if (answer.code == TerminalCode::Ok) {
-            if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+            if ((impl.effective_permissions() & kPermissionTerminal) == 0) {
                 answer.code = TerminalCode::Refused;
                 answer.reason = "terminal access was revoked";
                 answer.service_id = 0;
@@ -9082,7 +9143,7 @@ Error QuicSession::request_terminal(uint32_t terminal_id, uint16_t columns, uint
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+        if ((impl.effective_permissions() & kPermissionTerminal) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant terminals");
         }
         if (impl.client_pending_terminals.count(terminal_id) != 0 ||
@@ -9139,7 +9200,7 @@ Error QuicSession::open_terminal_input(uint32_t terminal_id) {
         if (entry.uplink) {
             return Error(Status::InvalidCall, "the terminal input stream is already open");
         }
-        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+        if ((impl.effective_permissions() & kPermissionTerminal) == 0) {
             return Error(Status::PermissionDenied, "terminal access was revoked");
         }
     }
@@ -9267,7 +9328,7 @@ Error QuicSession::send_terminal_resize(uint32_t terminal_id, uint16_t columns,
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+        if ((impl.effective_permissions() & kPermissionTerminal) == 0) {
             return Error(Status::PermissionDenied, "terminal access was revoked");
         }
     }
@@ -9383,7 +9444,7 @@ Error QuicSession::send_terminal_output(uint32_t terminal_id, const uint8_t* dat
         if (entry.send_finished) {
             return Error(Status::Unavailable, "the output direction is closed");
         }
-        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+        if ((impl.effective_permissions() & kPermissionTerminal) == 0) {
             return Error(Status::PermissionDenied, "terminal access was revoked");
         }
         stream = entry.downlink;
@@ -9583,7 +9644,7 @@ Error QuicSession::send_camera_result(const CameraResult& result) {
             return Error(Status::InvalidCall, "no camera request is waiting");
         }
         impl.server_pending_camera = 0;
-        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+        if ((impl.effective_permissions() & kPermissionCamera) == 0) {
             answer.code = CameraCode::Refused;
             answer.reason = "camera access was revoked";
         } else if (answer.code == CameraCode::Ok && impl.camera.load() != nullptr &&
@@ -9647,7 +9708,7 @@ Error QuicSession::send_camera_frame(FrameHeader header, const uint8_t* payload,
         if (!impl.announced) {
             return Error(Status::InvalidCall, "the camera stream is not open");
         }
-        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+        if ((impl.effective_permissions() & kPermissionCamera) == 0) {
             return Error(Status::PermissionDenied, "camera access was revoked");
         }
         if (impl.camera_finished) {
@@ -9719,7 +9780,7 @@ Error QuicSession::request_camera_list() {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+        if ((impl.effective_permissions() & kPermissionCamera) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant cameras");
         }
     }
@@ -9757,7 +9818,7 @@ Error QuicSession::request_camera_start(uint16_t camera_id) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+        if ((impl.effective_permissions() & kPermissionCamera) == 0) {
             return Error(Status::PermissionDenied, "the host did not grant cameras");
         }
         if (impl.camera_finished) {

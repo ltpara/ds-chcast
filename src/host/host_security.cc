@@ -158,6 +158,11 @@ HostSecurity::HostSecurity() { set_config(Config{}); }
 
 HostSecurity::HostSecurity(Config config) { set_config(std::move(config)); }
 
+void HostSecurity::set_default_permissions(PermissionMask permissions) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_.default_permissions = permissions & kPermissionAll;
+}
+
 void HostSecurity::set_config(Config config) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (config.service_mode) {

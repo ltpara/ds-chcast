@@ -1255,6 +1255,8 @@ struct ServerInfo {
     // running in service mode sets it, and the host re-enumerates the sessions
     // when a request arrives.
     bool session_select_enabled = false;
+    // v46: decoded from the existing remote-configuration permission bit.
+    bool remote_config_enabled = false;
     // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
     // audio stream. Set only alongside audio.enabled.
     bool audio_datagram = false;

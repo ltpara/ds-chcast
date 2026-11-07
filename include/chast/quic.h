@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 
 // Minimal QUIC session built on MsQuic, carrying the chast protocol.
 //
@@ -205,6 +206,9 @@ struct QuicServerConfig {
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
+    // Optional process-wide policy. A reduction gates transport operations
+    // immediately, independently of a session's approval and UI permission lock.
+    std::shared_ptr<std::atomic<PermissionMask>> permission_policy;
     // Walk the injection path without calling SendInput. Only for the
     // loopback check, which must not move the real pointer.
     bool dry_run_input = false;
@@ -419,6 +423,10 @@ public:
     // also lifts anything the injector still holds. Requires an announced
     // stream.
     Error set_permissions(PermissionMask permissions);
+    // Thread-safe policy revocation: closes the gate now; the serving thread
+    // calls apply_permission_policy() to abort streams and notify the peer.
+    void revoke_policy_permissions(PermissionMask permissions);
+    Error apply_permission_policy();
     // Server: raises or lowers what a later set_permissions() may grant,
     // without changing the mask in force. The new ceiling is clamped to what
     // the configuration allows and never exceeds the mask the operator
@@ -1288,6 +1296,7 @@ private:
     QuicSession() = default;
 
     Error send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size, bool wait);
+    Error set_permissions_impl(PermissionMask permissions, bool policy_change);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

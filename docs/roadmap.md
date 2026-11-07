@@ -4,6 +4,8 @@
 
 ## 已完成
 
+- **发射端首批稳定性修复（2026-11-07，F01–F04）**：静止桌面按需关键帧、跟随会话请求结果、跨会话全局撤权、逐接收者系统音频；补全 SessionSelect/RemoteConfig 描述权限及晚开音频流。新增可控媒体的真实 QUIC 集成回归，串行六项测试通过，主机/服务/原生查看器探针构建通过。详见 `docs/rustdesk-host-parity-2026-11-07.md` 第七节；F05–F08 及真实双机效果对测仍待完成。
+
 - **采集与编码**（提交 fc57d78）：DXGI 桌面复制、旋转、HDR/高级色归一化、光标解码、GPU NV12；Intel oneVPL H.264/HEVC，零拷贝入编码器。
 - **传输与显示**（提交 e289d01）：MsQuic 会话、控制流/视频流、FFmpeg D3D11VA 解码、Flutter GPU 纹理显示、断线重连界面。
 - **输入 P1**（提交 8416e92）：协议 v2 的 `InputEvent`、`HelloAck` 的 origin 与输入闸门、服务端 `InputInjector`（HID→扫描码、串行注入、卡键释放、dry-run）。

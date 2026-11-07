@@ -483,6 +483,12 @@ void test_lockout() {
     uint32_t retry = 0;
     check(security.locked_out("127.0.0.1:7001", 1006, &retry) && retry == 29,
           "the sixth failure in a minute starts a 30 s backoff");
+    const auto temporary = security.temporary_password();
+    security.set_default_permissions(chast::kPermissionClipboard);
+    check(security.locked_out("127.0.0.1:7001", 1006, &retry) && retry == 29 &&
+              security.temporary_password() == temporary &&
+              security.config().default_permissions == chast::kPermissionClipboard,
+          "live capability defaults preserve lockout and temporary credentials");
     auto result = security.evaluate(wrong, "127.0.0.1:7000", 1006);
     check(result.decision == Decision::Deny && result.denial == AccessDenial::LockedOut,
           "a locked address is refused even before the password is checked");

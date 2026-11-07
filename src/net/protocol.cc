@@ -909,6 +909,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.session_select_enabled) {
         permissions |= kPermissionSessionSelect;
     }
+    if (info.remote_config_enabled) {
+        permissions |= kPermissionRemoteConfig;
+    }
     put_u32(cursor, permissions);
     put_u8(cursor, static_cast<uint8_t>(info.mode));
     return payload;
@@ -1151,7 +1154,8 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     if (permissions !=
         ((flags & kServerInfoPermissionFlags) |
          (permissions & (kPermissionRestart | kPermissionBlockInput |
-                         kPermissionOsLogin | kPermissionSessionSelect)))) {
+                         kPermissionOsLogin | kPermissionSessionSelect |
+                         kPermissionRemoteConfig)))) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
         return false;
     }
@@ -1160,7 +1164,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         return false;
     }
     if (control_mode) {
-        const uint16_t mode_permission =
+        const PermissionMask mode_permission =
             info.mode == SessionMode::Terminal
                 ? kPermissionTerminal
                 : info.mode == SessionMode::Camera ? kPermissionCamera
@@ -1211,6 +1215,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.block_input_enabled = (permissions & kPermissionBlockInput) != 0;
     info.os_login_enabled = (permissions & kPermissionOsLogin) != 0;
     info.session_select_enabled = (permissions & kPermissionSessionSelect) != 0;
+    info.remote_config_enabled = (permissions & kPermissionRemoteConfig) != 0;
     if (info.terminal_persist && !info.terminal_enabled) {
         set_error(error, "HelloAck announces terminal persistence without terminals");
         return false;

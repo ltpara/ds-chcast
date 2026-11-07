@@ -140,6 +140,7 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
                                               const std::shared_ptr<LoginState>& login,
                                               std::string* error) {
     chast::HostServerConfig config;
+    config.dry_run_input = true;
     use_empty_clipboard(config);
     config.settings.bind_address = "127.0.0.1";
     config.settings.port = port;

@@ -455,6 +455,8 @@ if(CHAST_BUILD_TESTS)
     # lease case skips itself when no interactive desktop exists.
     add_executable(chast-host-multi-test tests/host_multi_test.cc)
     target_link_libraries(chast-host-multi-test PRIVATE chast.host)
+    add_executable(chast-host-parity-test tests/host_parity_test.cc)
+    target_link_libraries(chast-host-parity-test PRIVATE chast.host)
 
     # Host voice call: request/accept, Opus uplink and permission revocation
     # against a synthetic capture. Needs a desktop session, so it skips itself
@@ -609,6 +611,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME service_log COMMAND chast-service-log-test)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
+    add_test(NAME host_parity COMMAND chast-host-parity-test)
+    set_tests_properties(host_parity PROPERTIES TIMEOUT 120)
     add_test(NAME host_voice COMMAND chast-host-voice-test)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)
     add_test(NAME host_control COMMAND chast-host-control-test)

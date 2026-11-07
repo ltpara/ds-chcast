@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "chast/carrier.h"
+#include "chast/capture.h"
 #include "chast/clipboard.h"
 #include "chast/clipboard_worker.h"
 #include "chast/encoder.h"
@@ -277,6 +278,18 @@ struct HostStatus {
 
 struct HostServerConfig {
     HostSettings settings;
+    // Injectable platform boundaries for deterministic host integration tests.
+    // Defaults retain DXGI capture, GPU conversion and hardware-only encoding.
+    std::function<std::vector<DisplayInfo>()> displays = enumerate_displays;
+    std::function<std::unique_ptr<IDxgiCapturer>(const DisplayInfo&, const CaptureConfig&,
+                                               std::string*)> capture_factory =
+        [](const DisplayInfo& display, const CaptureConfig& config, std::string* error) {
+            return create_shared_capturer(display, config, error);
+        };
+    std::function<std::unique_ptr<IVideoEncoder>(ID3D11Device*, const EncoderConfig&,
+                                                std::string*)> encoder_factory = create_encoder;
+    std::function<InputDesktopStatus()> desktop_status = input_desktop_status;
+    std::function<bool(std::string*, bool*)> follow_desktop = follow_input_desktop;
     // The tray keeps its identity in the user's store; the Windows service
     // worker uses the machine store so the fingerprint survives logins.
     IdentityScope identity_scope = IdentityScope::CurrentUser;
@@ -643,6 +656,9 @@ private:
     void commit_security();
     HostSecurity::Config security_config(const std::string& fingerprint);
     void refresh_security_config();
+    PermissionMask policy_permissions() const;
+    bool sync_remote_policy();
+    bool reject_desktop_requests(std::string* error);
     void publish_trusted_devices();
 
     HostServerConfig config_;
@@ -651,6 +667,8 @@ private:
     // password survive a reconnect; a new HostServer replaces it. Viewer
     // workers share their parent's policy, which is thread-safe.
     std::shared_ptr<HostSecurity> security_;
+    std::shared_ptr<std::atomic<PermissionMask>> permission_policy_;
+    uint64_t remote_settings_version_ = 0;
     // The Result of the Hello currently being admitted. authenticate_client
     // and approve_client run on the same host thread, so committing after the
     // operator's decision cannot race another handshake.

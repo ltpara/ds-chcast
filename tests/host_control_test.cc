@@ -188,6 +188,7 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
                                               std::shared_ptr<ClipboardState> clipboard,
                                               std::string* error) {
     chast::HostServerConfig config;
+    config.dry_run_input = true;
     use_empty_clipboard(config);
     config.clipboard_read = [clipboard](chast::ClipboardContent& content) {
         return clipboard->read(content);

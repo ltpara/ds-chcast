@@ -118,6 +118,8 @@ public:
     // Replaces the policy. The temporary password, failure counters and nonce
     // cache survive, so an operator edit cannot be used to clear a lockout.
     void set_config(Config config);
+    // Updates only capability defaults; preserves credentials and replay state.
+    void set_default_permissions(PermissionMask permissions);
     Config config() const;
 
     // Decides one parsed Hello. `peer_address` is the transport's "ip:port";

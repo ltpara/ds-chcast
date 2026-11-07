@@ -23,6 +23,7 @@
 #include "chast/capture.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
+#include "chast/com_ptr.h"
 #include "chast/desktop.h"
 #include "chast/display_mode.h"
 #include "chast/display_privacy.h"
@@ -49,6 +50,7 @@ HostServer::HostServer(HostServerConfig config)
 struct ViewerRegistry {
     mutable std::mutex mutex;
     std::weak_ptr<HostServer> focused;
+    std::vector<std::weak_ptr<HostServer>> workers;
     size_t active = 0;
     // Accepted connections still in their handshake. They already hold the
     // token they were accepted with, so rotation has to wait for them too.
@@ -996,6 +998,8 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
             server->config_.token_changed(server->settings_.access_token);
         }
     }
+    server->permission_policy_ = std::make_shared<std::atomic<PermissionMask>>(
+        server->policy_permissions());
     if (!server->open_session(error)) {
         return nullptr;
     }
@@ -1141,6 +1145,7 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
     quic.allow_permission_change = settings_.allow_permission_change;
     quic.allow_remote_config = settings_.allow_remote_config;
+    quic.permission_policy = permission_policy_;
     quic.dry_run_input = config_.dry_run_input;
     // The one-shot tool reports a refused password instead of waiting for the
     // next viewer; the interactive host keeps listening.
@@ -1233,7 +1238,10 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
             }
         }
     }
-    config.default_permissions = settings_permissions(settings_);
+    // The listener's settings copy can predate a worker's remote change.
+    // Credential/token refreshes must not roll back the shared capability policy.
+    config.default_permissions = permission_policy_ ? permission_policy_->load()
+                                                     : settings_permissions(settings_);
     // A viewer must not be told about a switch this process cannot perform.
     if (!config_.service_mode || !config_.list_sessions || !config_.select_session) {
         config.default_permissions &=
@@ -2031,6 +2039,7 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
     }
     viewer->session_ = std::move(connection);
     viewer->security_ = security_;
+    viewer->permission_policy_ = permission_policy_;
     viewer->denial_audit_ = denial_audit_;
     viewer->registry_ = registry_;
     viewer->adopted_ = true;
@@ -2047,6 +2056,8 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
     {
         std::lock_guard<std::mutex> lock(registry_->mutex);
         ++registry_->pending;
+        std::erase_if(registry_->workers, [](const auto& worker) { return worker.expired(); });
+        registry_->workers.push_back(viewer);
     }
     viewers_.push_back(viewer);
     viewer->start();
@@ -2379,7 +2390,8 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
             }
             stats.target_bitrate = next.bitrate;
             stats.framerate = next.framerate;
-            stats.audio_active = next.audio.enabled && shared_audio_ready_.load();
+            stats.audio_active = next.audio.enabled && shared_audio_ready_.load() &&
+                                 (session_->permissions() & kPermissionAudio) != 0;
             if (next.source_width != 0) {
                 stats.resolution_percent = static_cast<uint16_t>(
                     static_cast<uint64_t>(next.width) * 100 / next.source_width);
@@ -2419,16 +2431,17 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
     // publisher.
     auto apply_pending_permissions = [&]() {
         bool pending = false;
-        uint16_t requested = 0;
+        PermissionMask requested = 0;
         {
             std::lock_guard<std::mutex> lock(permission_mutex_);
             pending = permission_update_pending_.exchange(false);
             requested = pending_permissions_.load();
         }
-        if (!pending) {
+        const bool policy_changed = sync_remote_policy();
+        if (!pending && !policy_changed) {
             return;
         }
-        Error applied = session_->set_permissions(requested);
+        Error applied = pending ? session_->set_permissions(requested) : Error::success();
         if (!applied.ok()) {
             if (applied.status() != Status::InvalidCall) {
                 log("permission update failed: " + applied.to_string());
@@ -2443,6 +2456,10 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         if ((now_mask & kPermissionInput) == 0) {
             registry_->release_control(this);
         }
+        const Error refreshed = session_->refresh_stream(info);
+        if (!refreshed.ok()) {
+            shared_send_failed_.store(true);
+        }
         log("the session permissions are now " + permission_names(now_mask));
     };
     auto fold_shared = [&] {
@@ -2452,7 +2469,8 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         stats.audio_packets = shared_audio_packets_.load();
         stats.audio_bytes = shared_audio_bytes_.load();
         stats.audio_dropped = shared_audio_drops_.load();
-        stats.audio_active = info.audio.enabled && shared_audio_ready_.load();
+        stats.audio_active = info.audio.enabled && shared_audio_ready_.load() &&
+                             (session_->permissions() & kPermissionAudio) != 0;
         stats.cursor_sent = shared_cursor_sent_.load();
         stats.cursor_dropped = shared_cursor_drops_.load();
     };
@@ -2488,6 +2506,20 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         }
         apply_pending_permissions();
         uint16_t switch_index = kDisplayAuto;
+        uint8_t follow_request = 0;
+        if (session_->take_display_follow_request(follow_request)) {
+            touch_viewer_activity();
+            if (!send_failed(session_->send_display_follow_state({
+                    0, follow_request == 0 ? DisplayFollowCode::Ok : DisplayFollowCode::Unsupported,
+                    follow_request == 0 ? "" : "display follow requires the shared stream owner"}),
+                    "display_follow_state")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        if (!handle_os_login_requests(stats, error, peer_left) ||
+            !handle_session_requests(stats, error, peer_left) || stopping_.load()) {
+            return SharedFollowResult::Ended;
+        }
         if (session_->take_display_switch_request(switch_index)) {
             touch_viewer_activity();
             ++stats.display_switch_failures;
@@ -2590,14 +2622,19 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
                 return SharedFollowResult::Ended;
             }
         }
-        // Reads are harmless; a change would race the publisher's copy of the
-        // policy, so only the viewer that owns the stream may write.
+        // Followers can read the shared policy with the corresponding grant.
+        // Writes still belong to the publisher until host-wide control is
+        // separated from ownership of the shared media source.
         RemoteConfigRequest config_request;
         while (session_->take_remote_config_request(config_request)) {
             touch_viewer_activity();
             ++stats.remote_config_requests;
             RemoteConfigState state;
-            if (config_request.keys != 0) {
+            if ((session_->permissions() & kPermissionRemoteConfig) == 0) {
+                ++stats.remote_config_failures;
+                state.code = RemoteConfigCode::Denied;
+                state.reason = "remote configuration is not permitted by the host";
+            } else if (config_request.keys != 0) {
                 ++stats.remote_config_failures;
                 state.code = RemoteConfigCode::Busy;
                 state.reason =
@@ -2703,7 +2740,8 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
             publish_stream(next, index, name);
             stats.target_bitrate = next.bitrate;
             stats.framerate = next.framerate;
-            stats.audio_active = next.audio.enabled && shared_audio_ready_.load();
+            stats.audio_active = next.audio.enabled && shared_audio_ready_.load() &&
+                                 (session_->permissions() & kPermissionAudio) != 0;
             if (next.source_width != 0) {
                 stats.resolution_percent = static_cast<uint16_t>(
                     static_cast<uint64_t>(next.width) * 100 / next.source_width);
@@ -2781,7 +2819,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // The last scale the ladder asked for. A merged canvas may cap it lower,
     // and stats.resolution_percent reports what is actually encoded.
     uint16_t resolution_request = 100;
-    std::vector<DisplayInfo> attached = enumerate_displays();
+    std::vector<DisplayInfo> attached = config_.displays();
     if (attached.empty()) {
         *error = "no displays are attached";
         return false;
@@ -2821,7 +2859,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // tray host stays on Default and capture creation fails below.
     {
         std::string follow_error;
-        if (!follow_input_desktop(&follow_error)) {
+        if (!config_.follow_desktop(&follow_error, nullptr)) {
             log("cannot follow the input desktop: " + follow_error);
         }
     }
@@ -2883,10 +2921,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             log("merged view unavailable (" + merged_error + "); falling back to display " +
                 std::to_string(display_index));
-            capturer = create_shared_capturer(display_index, capture, error);
+            capturer = config_.capture_factory(attached[display_index], capture, error);
         }
     } else {
-        capturer = create_shared_capturer(display_index, capture, error);
+        capturer = config_.capture_factory(attached[display_index], capture, error);
     }
     if (!capturer) {
         *error = "capturer creation failed: " + *error;
@@ -2935,7 +2973,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     encoder_config.backend = config_.encoder_backend;
     const AdapterDevice adapter = capturer->adapter_device();
     std::unique_ptr<IVideoEncoder> encoder =
-        create_encoder(adapter.device, encoder_config, error);
+        config_.encoder_factory(adapter.device, encoder_config, error);
     if (!encoder) {
         *error = "encoder creation failed: " + *error;
         return false;
@@ -3046,8 +3084,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // mid-session would cost a fresh announcement for no benefit. The same
     // endpoint plays the viewer's microphone, so its playback feeds the echo
     // canceller the audio that actually comes out of this machine.
-    const bool audio_aec = settings_.allow_audio && settings_.audio_aec;
-    if (settings_.allow_audio) {
+    bool audio_started = false;
+    bool audio_policy_enabled = settings_.allow_audio;
+    auto open_system_audio = [&] {
+        if (!settings_.allow_audio || audio_capture) return;
+        const bool audio_aec = settings_.audio_aec;
         if (audio_aec) {
             audio_reference_ = std::make_shared<AudioReference>();
         }
@@ -3072,7 +3113,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             ++stats.audio_errors;
             log("audio unavailable: " + audio_error);
         }
-    }
+    };
+    open_system_audio();
     stats.audio_active =
         audio_info.enabled && (granted_permissions & kPermissionAudio) != 0;
 
@@ -3163,16 +3205,29 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     PermissionMask announced_permissions = granted_permissions;
     auto apply_pending_permissions = [&]() -> bool {
         bool pending = false;
-        uint16_t requested = 0;
+        PermissionMask requested = 0;
         {
             std::lock_guard<std::mutex> lock(permission_mutex_);
             pending = permission_update_pending_.exchange(false);
             requested = pending_permissions_.load();
         }
-        if (!pending) {
+        const bool policy_changed = sync_remote_policy();
+        bool source_changed = false;
+        const bool enable_audio_source = !audio_policy_enabled && settings_.allow_audio;
+        audio_policy_enabled = settings_.allow_audio;
+        if (enable_audio_source && !audio_capture) {
+            open_system_audio();
+            if (audio_capture) {
+                audio_capture->start();
+                audio_started = true;
+                source_changed = true;
+                stream_info.audio = audio_info;
+            }
+        }
+        if (!pending && !policy_changed && !source_changed) {
             return true;
         }
-        Error applied = session_->set_permissions(requested);
+        Error applied = pending ? session_->set_permissions(requested) : Error::success();
         if (!applied.ok()) {
             if (applied.status() != Status::InvalidCall) {
                 log("permission update failed: " + applied.to_string());
@@ -3180,7 +3235,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return true;
         }
         const PermissionMask now_mask = session_->permissions();
-        if (now_mask == announced_permissions) {
+        if (now_mask == announced_permissions && !source_changed) {
             return true;
         }
         announced_permissions = now_mask;
@@ -3235,8 +3290,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             (now_mask & kPermissionSessionSelect) != 0;
         // A viewer that was denied audio at approval has no AAC config yet,
         // so a fresh description is what makes a restore usable.
-        stream_info.audio.enabled =
-            audio_info.enabled && (now_mask & kPermissionAudio) != 0;
+        stream_info.audio.enabled = audio_info.enabled;
         publish_current(stream_info);
         Error refreshed = session_->refresh_stream(stream_info);
         if (!refreshed.ok()) {
@@ -3257,8 +3311,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     if (!apply_pending_permissions()) {
         return error->empty();
     }
-    if (audio_capture) {
+    if (audio_capture && !audio_started) {
         audio_capture->start();
+        audio_started = true;
     }
     if (!run_clock_started_) {
         run_clock_started_ = true;
@@ -3288,6 +3343,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // The second IDR is decodable once the announcement has landed.
     uint32_t extra_idrs = 0;
     bool have_input = false;
+    // Keep the last valid GPU surface alive across an idle capture call.
+    // A forced IDR must not depend on the desktop changing again.
+    ComPtr<ID3D11Texture2D> cached_nv12;
+    FrameInfo cached_frame;
     // Set when the GPU refused a scale: the captured NV12 size then stays put
     // for the rest of the session instead of retrying on every sample.
     bool resolution_fixed = false;
@@ -3318,7 +3377,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     } file_session_end{this};
 
 
-    // Audio degrades on its own: a failed endpoint, encoder or send turns the
+    // Audio degrades on its own: a failed endpoint or encoder turns the
     // stream off with a StreamInfo and leaves video running.
     auto disable_audio = [&](const std::string& reason) {
         audio_capture->stop();
@@ -3348,14 +3407,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (!audio_capture) {
             return;
         }
-        if ((session_->permissions() & kPermissionAudio) == 0) {
-            // Keep the endpoint warm so a restore resumes immediately, but
-            // encode nothing the viewer may not receive.
-            EncodedAudio dropped;
-            while (audio_capture->take_packet(dropped)) {
-            }
-            return;
-        }
         EncodedAudio packet;
         while (audio_capture->take_packet(packet)) {
             const uint64_t host_ms = packet.capture_ms & 0xFFFFFFFFFFFFull;
@@ -3366,6 +3417,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             header.frame_samples = audio_info.frame_samples;
             header.channels = audio_info.channels;
             header.codec = audio_info.codec;
+            broadcast_audio(header, packet.data.data(), packet.data.size());
+            if ((session_->permissions() & kPermissionAudio) == 0) {
+                continue;
+            }
             Error sent = session_->send_audio(header, packet.data.data(), packet.data.size());
             if (!sent.ok()) {
                 if (sent.status() == Status::PermissionDenied) {
@@ -3383,12 +3438,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 }
                 ++stats.audio_errors;
                 log("audio send failed: " + sent.to_string());
-                disable_audio("send failed");
-                return;
+                // Other viewers still own independent audio streams.
+                continue;
             }
             ++stats.audio_packets;
             stats.audio_bytes += packet.data.size();
-            broadcast_audio(header, packet.data.data(), packet.data.size());
         }
         const AudioCaptureStats captured = audio_capture->stats();
         stats.audio_dropped = audio_send_drops + captured.dropped;
@@ -3503,7 +3557,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     bool privacy_publish_failed = false;
     auto privacy_capture_once = [&](const std::wstring& monitor, bool commit,
                                     std::string* failure) -> bool {
-        std::vector<DisplayInfo> fresh = enumerate_displays();
+        std::vector<DisplayInfo> fresh = config_.displays();
         const std::wstring device =
             monitor.empty() ? privacy_original_device : virtual_display_device_name(monitor);
         const bool merged = monitor.empty() && privacy_original_merged;
@@ -3529,7 +3583,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         std::unique_ptr<IDxgiCapturer> next =
             merged ? create_merged_capturer(fresh, capture, failure)
-                   : create_shared_capturer(fresh[target], capture, failure);
+                   : config_.capture_factory(fresh[target], capture, failure);
         if (!next) {
             return false;
         }
@@ -3555,7 +3609,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         next_config.height = frame.nv12_height;
         const AdapterDevice next_adapter = next->adapter_device();
         std::unique_ptr<IVideoEncoder> next_encoder =
-            create_encoder(next_adapter.device, next_config, failure);
+            config_.encoder_factory(next_adapter.device, next_config, failure);
         if (!next_encoder) {
             return false;
         }
@@ -3592,6 +3646,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         encoder = std::move(next_encoder);
         attached = std::move(fresh);
         have_input = false;
+        cached_nv12.reset();
         force_keyframe = true;
         extra_idrs = 1;
         frames_without_nv12 = 0;
@@ -3979,9 +4034,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return send_display_control(DisplayControlCode::Ok, {});
     };
 
-    auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
-        const FrameInfo& frame = capturer->frame();
+    auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms, bool idle = false) -> bool {
+        const FrameInfo& frame = idle ? cached_frame : capturer->frame();
         if (!frame.nv12_texture) {
+            have_input = false;
+            cached_nv12.reset();
             // A conversion can fail for one frame and recover; a pass that was
             // torn down cannot. Give it a few frames, then end the session
             // instead of stalling silently.
@@ -4002,7 +4059,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         packets.clear();
         Error err = Error::success();
-        if (!frame.nv12_updated && have_input) {
+        if ((idle || !frame.nv12_updated) && have_input) {
             err = encoder->encode_repeat(pts_ms, force_keyframe, packets);
             if (err.ok()) {
                 ++stats.repeats;
@@ -4022,6 +4079,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return false;
         }
         have_input = true;
+        if (!idle) {
+            frame.nv12_texture->AddRef();
+            cached_nv12 = ComPtr<ID3D11Texture2D>(frame.nv12_texture);
+            cached_frame = frame;
+        }
 
         for (const EncodedPacket& packet : packets) {
             if (packet.data.empty()) {
@@ -4111,7 +4173,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
 
         // Re-enumerate: a hotplug can renumber the outputs since HelloAck.
-        std::vector<DisplayInfo> fresh = enumerate_displays();
+        std::vector<DisplayInfo> fresh = config_.displays();
         if (fresh.empty()) {
             return refuse(DisplaySwitchCode::NotFound, "no displays are attached");
         }
@@ -4178,7 +4240,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                                   " displays: " + switch_error);
             }
         } else {
-            next = create_shared_capturer(target, capture, &switch_error);
+            next = config_.capture_factory(fresh[target], capture, &switch_error);
             if (!next) {
                 return refuse(DisplaySwitchCode::Failed,
                               "cannot capture display " + std::to_string(target) + ": " +
@@ -4212,7 +4274,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         next_config.height = next_frame.nv12_height;
         const AdapterDevice next_adapter = next->adapter_device();
         std::unique_ptr<IVideoEncoder> next_encoder =
-            create_encoder(next_adapter.device, next_config, &switch_error);
+            config_.encoder_factory(next_adapter.device, next_config, &switch_error);
         if (!next_encoder) {
             return refuse(DisplaySwitchCode::Failed,
                           "encoder creation failed: " + switch_error);
@@ -4263,6 +4325,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         encoder = std::move(next_encoder);
         attached = std::move(fresh);
         have_input = false;
+        cached_nv12.reset();
         force_keyframe = true;
         extra_idrs = 1;
         // The new capture is live; commit its request and effective scale
@@ -4358,7 +4421,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     auto send_mode_list = [&](uint16_t requested_index) -> bool {
         DisplayModeList answer_list;
         answer_list.display = requested_index;
-        std::vector<DisplayInfo> fresh = enumerate_displays();
+        std::vector<DisplayInfo> fresh = config_.displays();
         std::string list_error;
         if (capturer->merged()) {
             answer_list.code = DisplayModeCode::Failed;
@@ -4495,7 +4558,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
 
         // Re-enumerate like the switch path: a hotplug can renumber outputs.
-        std::vector<DisplayInfo> fresh = enumerate_displays();
+        std::vector<DisplayInfo> fresh = config_.displays();
         if (fresh.empty()) {
             return refuse(DisplayModeCode::NotFound, "no displays are attached");
         }
@@ -4581,8 +4644,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             // publishes; the frame loop builds one and re-announces.
             encoder.reset();
             have_input = false;
+            cached_nv12.reset();
             force_keyframe = true;
-            attached = enumerate_displays();
+            attached = config_.displays();
             return refuse(DisplayModeCode::Failed, why);
         };
 
@@ -4595,7 +4659,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         mode_config.height = mode_frame.nv12_height;
         const AdapterDevice mode_adapter = capturer->adapter_device();
         std::unique_ptr<IVideoEncoder> mode_encoder =
-            create_encoder(mode_adapter.device, mode_config, &mode_error);
+            config_.encoder_factory(mode_adapter.device, mode_config, &mode_error);
         if (!mode_encoder) {
             return rollback("encoder creation failed: " + mode_error);
         }
@@ -4620,6 +4684,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // valid across the move below.
         encoder = std::move(mode_encoder);
         have_input = false;
+        cached_nv12.reset();
         force_keyframe = true;
         extra_idrs = 1;
         // The output was re-created: its pointer position and sprite are new.
@@ -4627,7 +4692,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         cursor_sent = CursorUpdate{};
         // `fresh` was read before ChangeDisplaySettingsExW, so its rects
         // describe the old mode. Announce the list as it is now.
-        attached = enumerate_displays();
+        attached = config_.displays();
         stream_info = describe_stream(attached, *capturer, *encoder, mode_frame.width,
                                       mode_frame.height, static_cast<uint16_t>(framerate),
                                       session_->permissions(), audio_info,
@@ -4752,7 +4817,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             const AdapterDevice codec_adapter = capturer->adapter_device();
             std::string codec_error;
-            replacement = create_encoder(codec_adapter.device, next_config, &codec_error);
+            replacement = config_.encoder_factory(codec_adapter.device, next_config, &codec_error);
             if (!replacement) {
                 const bool unsupported =
                     options.codec == StreamCodecPreference::Hevc ||
@@ -4799,6 +4864,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             // the viewer decode once it applied the StreamInfo announcing the
             // codec change.
             have_input = false;
+            cached_nv12.reset();
             extra_idrs = 1;
             applied = true;
         } else if (rate_change) {
@@ -5060,7 +5126,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (force_report) {
             reported_desktop = static_cast<DesktopKind>(0xFF);
         }
-        const InputDesktopStatus status = input_desktop_status();
+        const InputDesktopStatus status = config_.desktop_status();
         const DesktopKind kind =
             status.kind == InputDesktopKind::Default
                 ? DesktopKind::Default
@@ -5071,7 +5137,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         std::string follow_error;
         bool switched = false;
-        if (!follow_input_desktop(&follow_error, &switched)) {
+        if (!config_.follow_desktop(&follow_error, &switched)) {
             if (!desktop_paused) {
                 desktop_paused = true;
                 log("capture paused: cannot follow the input desktop: " + follow_error);
@@ -5102,6 +5168,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         desktop_reinitialized = true;
         encoder.reset();
         have_input = false;
+        cached_nv12.reset();
         force_keyframe = true;
         next_frame_due = Clock::now();
         return true;
@@ -5114,17 +5181,19 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     auto next_desktop_check = Clock::now() + std::chrono::seconds(1);
 
     // The frame captured before the handshake is the first one on the wire.
-    ++stats.frames;
-    if (initial_pointer_only) {
-        ++stats.pointer_only;
+    if (!desktop_paused && !desktop_reinitialized) {
+        ++stats.frames;
+        if (initial_pointer_only) {
+            ++stats.pointer_only;
+        }
+        if (!process_frame(0, capture_clock_ms(Clock::now()))) {
+            // A vanished viewer is a normal end, not a failure.
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
+        }
+        publish_cursor();
     }
-    if (!process_frame(0, capture_clock_ms(Clock::now()))) {
-        // A vanished viewer is a normal end, not a failure.
-        const bool clean = error->empty();
-        drain_peer(stats);
-        return clean;
-    }
-    publish_cursor();
     // Lives exactly as long as the session: its sockets close on every exit
     // path, before the caller resets the transport for the next viewer.
     PortForwardRelay port_forward(*session_);
@@ -5362,7 +5431,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             drain_peer(stats);
             return clean;
         }
-        if (!handle_session_requests(stats, error, peer_left)) {
+        if (!handle_session_requests(stats, error, peer_left) || stopping_.load()) {
             const bool clean = error->empty();
             drain_peer(stats);
             return clean;
@@ -5593,6 +5662,16 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                     drain_peer(stats);
                     return false;
                 }
+                if (force_keyframe && have_input && encoder && cached_nv12) {
+                    const auto repeated_at = Clock::now();
+                    const uint64_t pts_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            repeated_at - start).count());
+                    if (!process_frame(pts_ms, capture_clock_ms(repeated_at), true)) {
+                        drain_peer(stats);
+                        return error->empty();
+                    }
+                }
                 continue;
             case CaptureResult::ReinitNeeded: {
                 log("reinitializing: " + capturer->last_error().to_string());
@@ -5614,6 +5693,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 }
                 encoder.reset();
                 have_input = false;
+                cached_nv12.reset();
                 force_keyframe = true;
                 // The rebuilt duplication has no frame yet; a quiet desktop is
                 // not the same as a broken NV12 conversion.
@@ -5650,7 +5730,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             encoder_config.width = frame.nv12_width;
             encoder_config.height = frame.nv12_height;
             const AdapterDevice rebuilt_adapter = capturer->adapter_device();
-            encoder = create_encoder(rebuilt_adapter.device, encoder_config, error);
+            encoder = config_.encoder_factory(rebuilt_adapter.device, encoder_config, error);
             if (!encoder) {
                 *error = "encoder recreation failed: " + *error;
                 drain_peer(stats);
@@ -5686,7 +5766,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             stats.target_bitrate = encoder->bitrate();
             stats.framerate = static_cast<uint16_t>(framerate);
-            const std::vector<DisplayInfo> refreshed = enumerate_displays();
+            const std::vector<DisplayInfo> refreshed = config_.displays();
             // The output may have moved or been renumbered while capture was
             // down; StreamInfo and the pointer origin must describe the list
             // the viewer is about to receive.
@@ -5733,7 +5813,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             const AdapterDevice resize_adapter = capturer->adapter_device();
             std::string resize_error;
             std::unique_ptr<IVideoEncoder> next =
-                create_encoder(resize_adapter.device, resized, &resize_error);
+                config_.encoder_factory(resize_adapter.device, resized, &resize_error);
             if (!next) {
                 // Keep the stream that is running: put the capture back on the
                 // size the current encoder was built for and stop resizing.
@@ -5771,6 +5851,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             encoder = std::move(next);
             have_input = false;
+            cached_nv12.reset();
             force_keyframe = true;
             extra_idrs = 1;
             stats.target_bitrate = encoder->bitrate();
@@ -7024,6 +7105,62 @@ void HostServer::poll_files(HostServerStats& stats) {
     drive_file_download(stats);
 }
 
+bool HostServer::reject_desktop_requests(std::string* error) {
+    const std::string reason = "this operation requires a desktop session";
+    auto answered = [error](const Error& sent) {
+        if (!sent.ok()) {
+            *error = "desktop request result: " + sent.to_string();
+        }
+        return sent.ok();
+    };
+    uint16_t display = 0, width = 0, height = 0, refresh = 0;
+    if (session_->take_display_switch_request(display) &&
+        !answered(session_->send_display_switch_result(
+            display, DisplaySwitchCode::Failed, reason))) {
+        return false;
+    }
+    if (session_->take_list_display_modes_request(display)) {
+        DisplayModeList result;
+        result.display = display;
+        result.code = DisplayModeCode::Failed;
+        result.reason = reason;
+        if (!answered(session_->send_display_modes(result))) {
+            return false;
+        }
+    }
+    if (session_->take_set_display_mode_request(display, width, height, refresh) &&
+        !answered(session_->send_display_mode_result(display, width, height, refresh,
+                                                     DisplayModeCode::Failed, reason))) {
+        return false;
+    }
+    uint8_t follow = 0;
+    if (session_->take_display_follow_request(follow) &&
+        !answered(session_->send_display_follow_state(
+            {0, DisplayFollowCode::Unsupported, reason}))) {
+        return false;
+    }
+    StreamOptions options;
+    if (session_->take_stream_options_request(options)) {
+        StreamOptionsResult result;
+        result.code = StreamOptionsCode::Unsupported;
+        result.reason = reason;
+        if (!answered(session_->send_stream_options_result(result))) {
+            return false;
+        }
+    }
+    bool privacy = false;
+    if (session_->take_privacy_mode_request(privacy) &&
+        !answered(session_->send_privacy_mode_state(false, PrivacyModeCode::Unsupported, reason))) {
+        return false;
+    }
+    while (session_->take_sas_request()) {
+        if (!answered(session_->send_sas_result(SasCode::Unsupported, reason))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
     // The policy only lets a files-only Hello through with the file-transfer
@@ -7055,16 +7192,17 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     // read session_->permissions() on every poll.
     auto apply_pending_permissions = [&]() {
         bool pending = false;
-        uint16_t requested = 0;
+        PermissionMask requested = 0;
         {
             std::lock_guard<std::mutex> lock(permission_mutex_);
             pending = permission_update_pending_.exchange(false);
             requested = pending_permissions_.load();
         }
-        if (!pending) {
+        const bool policy_changed = sync_remote_policy();
+        if (!pending && !policy_changed) {
             return;
         }
-        Error applied = session_->set_permissions(requested);
+        Error applied = pending ? session_->set_permissions(requested) : Error::success();
         if (!applied.ok()) {
             if (applied.status() != Status::InvalidCall) {
                 log("permission update failed: " + applied.to_string());
@@ -7095,6 +7233,10 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
 
     while (!stopping_.load()) {
         apply_pending_permissions();
+        if (!reject_desktop_requests(error)) {
+            return false;
+        }
+
         if (idle_timeout > Clock::duration::zero() &&
             Clock::now() - last_activity >= idle_timeout) {
             ++stats.idle_disconnects;
@@ -7277,16 +7419,17 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
     // serving new requests.
     auto apply_pending_permissions = [&]() {
         bool pending = false;
-        uint16_t requested = 0;
+        PermissionMask requested = 0;
         {
             std::lock_guard<std::mutex> lock(permission_mutex_);
             pending = permission_update_pending_.exchange(false);
             requested = pending_permissions_.load();
         }
-        if (!pending) {
+        const bool policy_changed = sync_remote_policy();
+        if (!pending && !policy_changed) {
             return;
         }
-        Error applied = session_->set_permissions(requested);
+        Error applied = pending ? session_->set_permissions(requested) : Error::success();
         if (!applied.ok()) {
             if (applied.status() != Status::InvalidCall) {
                 log("permission update failed: " + applied.to_string());
@@ -7316,6 +7459,10 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
 
     while (!stopping_.load()) {
         apply_pending_permissions();
+        if (!reject_desktop_requests(error)) {
+            return false;
+        }
+
         // Desktop-only controls have no surface here. Answering keeps a viewer
         // that races a permission change from waiting for a reply that will
         // never come.
@@ -8330,6 +8477,31 @@ bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,
     return true;
 }
 
+PermissionMask HostServer::policy_permissions() const {
+    PermissionMask mask = settings_permissions(settings_);
+    if (!config_.service_mode || !config_.list_sessions || !config_.select_session) {
+        mask &= ~kPermissionSessionSelect;
+    }
+    return mask;
+}
+
+bool HostServer::sync_remote_policy() {
+    bool changed = false;
+    if (registry_ && remote_settings_version_ != registry_->remote_settings_version.load()) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        copy_remote_config_fields(registry_->remote_settings, settings_);
+        settings_.lock_after_session_end = registry_->lock_after_session_end.load();
+        remote_settings_version_ = registry_->remote_settings_version.load();
+        changed = true;
+    }
+    const Error applied = session_->apply_permission_policy();
+    if (!applied.ok()) {
+        log("policy cleanup failed: " + applied.to_string());
+    }
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return changed || status_.session_permissions != session_->permissions();
+}
+
 bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::string* error,
                                                bool* peer_left) {
     RemoteConfigRequest request;
@@ -8377,25 +8549,31 @@ bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::stri
             assign(kRemoteConfigCamera, settings_.allow_camera);
             assign(kRemoteConfigRecord, settings_.allow_record);
             if (changed != 0) {
-                // A gate that just closed loses its grant now; a gate that
-                // opened only affects the next connection, because the
-                // transport's ceiling was fixed at this session's handshake.
                 const PermissionMask revoke = remote_config_revocations(settings_, changed);
-                if ((revoke & permissions) != 0) {
-                    if (settings_.allow_permission_change) {
-                        set_permissions(permissions & ~revoke);
-                    } else {
-                        log("the disabled switches stay effective for the rest of "
-                            "this session; permission changes are off");
-                    }
-                }
+                // Publish the transport gate before any resource cleanup or
+                // persistence callback can block. Revocation also removes the
+                // raw grant so a quick off/on cannot revive existing sessions.
+                permission_policy_->store(policy_permissions());
+                security_->set_default_permissions(policy_permissions());
+                session_->revoke_policy_permissions(revoke);
+                std::vector<std::shared_ptr<HostServer>> workers;
                 if (registry_) {
                     std::lock_guard<std::mutex> lock(registry_->mutex);
                     copy_remote_config_fields(settings_, registry_->remote_settings);
                     registry_->remote_settings_valid = true;
-                    registry_->lock_after_session_end.store(
-                        settings_.lock_after_session_end);
+                    registry_->lock_after_session_end.store(settings_.lock_after_session_end);
                     ++registry_->remote_settings_version;
+                    for (const auto& weak : registry_->workers) {
+                        if (auto worker = weak.lock()) {
+                            workers.push_back(std::move(worker));
+                        }
+                    }
+                }
+                for (const auto& worker : workers) {
+                    std::lock_guard<std::mutex> lock(worker->session_mutex_);
+                    if (worker->session_) {
+                        worker->session_->revoke_policy_permissions(revoke);
+                    }
                 }
                 if (config_.settings_changed) {
                     if (registry_) {
