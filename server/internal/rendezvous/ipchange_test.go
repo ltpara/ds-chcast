@@ -92,3 +92,26 @@ func TestKeepaliveUsesAssignedRelayHost(t *testing.T) {
 		t.Fatalf("relay = %q, want relay-b.example:41000", ack.Relay)
 	}
 }
+
+// A standalone relay node's host must also reach the punch reply: the viewer
+// overwrites the relay it looked up with the one carried by this message.
+func TestPunchReplyUsesAssignedRelayHost(t *testing.T) {
+	_, reg, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	if ack := keepalive(t, host, meetAddr, priv); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+	reg.SetRelay("devbox", 41000, "relay-b.example")
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	reply := recv(t, viewer)
+	if !reply.OK || reply.Type != wire.TypePunchPeer {
+		t.Fatalf("punch reply: %+v", reply)
+	}
+	if reply.Relay != "relay-b.example:41000" {
+		t.Fatalf("punch reply relay = %q, want relay-b.example:41000", reply.Relay)
+	}
+}

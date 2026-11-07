@@ -1038,7 +1038,7 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 	var control *wire.Message
 	if msg, err := wire.Decode(data); err == nil {
 		switch msg.Type {
-		case wire.TypeRelayHello, wire.TypeRelayAuth, wire.TypeRelayViewer:
+		case wire.TypeRelayHello, wire.TypeRelayAuth, wire.TypeRelayViewer, wire.TypeNatProbe:
 			control = &msg
 		}
 	}
@@ -1066,6 +1066,9 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 			return
 		case wire.TypeRelayViewer:
 			p.handleViewerAuth(conn, *control, src, hostID)
+			return
+		case wire.TypeNatProbe:
+			p.handleNatProbe(conn, *control, src)
 			return
 		}
 	}
@@ -1159,6 +1162,20 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 		return
 	}
 	p.toHost += uint64(len(data))
+}
+
+// handleNatProbe is the second observation point of the NAT type test: the
+// rendezvous port observes the same socket from another destination, so a port
+// that changes here belongs to a symmetric NAT. It keeps no session state.
+func (p *port) handleNatProbe(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr) {
+	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
+		return
+	}
+	p.reply(conn, src, wire.Message{
+		Type:      wire.TypeNatProbeAck,
+		Nonce:     msg.Nonce,
+		Candidate: src.String(),
+	})
 }
 
 func (p *port) handleHello(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, now time.Time, hostID string) {

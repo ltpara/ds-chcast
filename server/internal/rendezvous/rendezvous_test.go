@@ -415,6 +415,179 @@ func TestKeepaliveIsRateLimited(t *testing.T) {
 	}
 }
 
+// A viewer that reaches the rendezvous port over IPv4 reports its own global
+// IPv6 endpoint; the host must receive it as the candidate to punch.
+func TestPunchForwardsViewerReportedIPv6(t *testing.T) {
+	_, _, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	if ack := keepalive(t, host, meetAddr, priv); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+		SelfV6: "[2001:db8::77]:4000",
+	}), meetAddr)
+	if reply := recv(t, viewer); !reply.OK {
+		t.Fatalf("punch reply: %+v", reply)
+	}
+	notify := recv(t, host)
+	if notify.Candidate != viewer.LocalAddr().String() {
+		t.Fatalf("observed IPv4 candidate: %+v", notify)
+	}
+	if notify.CandidateV6 != "[2001:db8::77]:4000" {
+		t.Fatalf("reported IPv6 candidate was not forwarded: %+v", notify)
+	}
+
+	// An address outside 2000::/3 is not reachable from the host and must not
+	// be forwarded as a punch target.
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+		SelfV6: "[fd00::77]:4000",
+	}), meetAddr)
+	_ = recv(t, viewer)
+	if again := recv(t, host); again.CandidateV6 != "" {
+		t.Fatalf("non-global IPv6 candidate was forwarded: %+v", again)
+	}
+}
+
+// The host's own IPv6 endpoint travels in keepalive auth: an IPv4-only
+// rendezvous port can never observe the v6 mapping itself.
+func TestKeepaliveStoresHostReportedIPv6(t *testing.T) {
+	_, reg, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	send := func(selfV6 string) wire.Message {
+		host.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeKeepalive, HostID: "devbox"}), meetAddr)
+		challenge := recv(t, host)
+		message := identity.KeepaliveMessage("devbox", challenge.Candidate, challenge.Nonce)
+		host.WriteToUDP(wire.Encode(wire.Message{
+			Type:      wire.TypeKeepaliveAuth,
+			HostID:    "devbox",
+			Nonce:     challenge.Nonce,
+			Candidate: challenge.Candidate,
+			Signature: identity.Sign(priv, message),
+			SelfV6:    selfV6,
+		}), meetAddr)
+		return recv(t, host)
+	}
+	if ack := send("[2001:db8::9]:14434"); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+	stored, _ := reg.Lookup("devbox")
+	if stored.CandidateV6 != "[2001:db8::9]:14434" {
+		t.Fatalf("host IPv6 endpoint was not stored: %+v", stored)
+	}
+	// A non-global report is discarded and does not erase the last good one.
+	if ack := send("[::1]:14434"); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+	stored, _ = reg.Lookup("devbox")
+	if stored.CandidateV6 != "[2001:db8::9]:14434" {
+		t.Fatalf("unreachable IPv6 report replaced the stored endpoint: %+v", stored)
+	}
+}
+
+func TestValidSelfV6(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"[2001:db8::7]:4000", "[2001:db8::7]:4000"},
+		{"[2606:4700::1111]:443", "[2606:4700::1111]:443"},
+		{"[fd00::7]:4000", ""},
+		{"[fe80::7]:4000", ""},
+		{"[::1]:4000", ""},
+		{"[::ffff:192.0.2.1]:4000", ""},
+		{"198.51.100.7:4000", ""},
+		{"[2001:db8::7]", ""},
+		{"[2001:db8::7]:0", ""},
+		{"[2001:db8::7]:70000", ""},
+	}
+	for _, tc := range cases {
+		if got := validSelfV6(tc.in); got != tc.want {
+			t.Errorf("validSelfV6(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A viewer's LAN candidates reach the host only when the service observed both
+// peers behind the same public address. Otherwise the host would probe a
+// stranger's private network and could never reach the viewer there anyway.
+func TestPunchForwardsViewerLocalAddrsOnSameNetwork(t *testing.T) {
+	_, _, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	keepalive(t, host, meetAddr, priv)
+
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+		LocalAddrs: []string{
+			"192.168.1.20:55000", "not-an-endpoint", "0.0.0.0:55000", "127.0.0.1:55000",
+		},
+		LocalAddrsV6: []string{"[fd00::20]:55000", "192.168.1.21:55000"},
+	}), meetAddr)
+	if reply := recv(t, viewer); !reply.OK {
+		t.Fatalf("punch reply: %+v", reply)
+	}
+	notify := recv(t, host)
+	if notify.Type != wire.TypePunchPeer {
+		t.Fatalf("host notification: %+v", notify)
+	}
+	if len(notify.LocalAddrs) != 1 || notify.LocalAddrs[0] != "192.168.1.20:55000" {
+		t.Fatalf("viewer LAN candidates = %v", notify.LocalAddrs)
+	}
+	if len(notify.LocalAddrsV6) != 1 || notify.LocalAddrsV6[0] != "[fd00::20]:55000" {
+		t.Fatalf("viewer LAN v6 candidates = %v", notify.LocalAddrsV6)
+	}
+}
+
+// The mismatch case cannot be exercised through the server without moving the
+// host's observed address away from its socket, so it is checked directly.
+func TestViewerLocalAddrsRequireSamePublicAddress(t *testing.T) {
+	host := registry.Host{Candidate: "198.51.100.7:5000"}
+	same := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 40000}
+	other := &net.UDPAddr{IP: net.ParseIP("198.51.100.8"), Port: 40000}
+	v4, v6 := viewerLocalAddrs(host, same,
+		[]string{"192.168.1.20:55000"},
+		[]string{"[fd00::20]:55000"})
+	if len(v4) != 1 || len(v6) != 1 {
+		t.Fatalf("same address was not forwarded: %v %v", v4, v6)
+	}
+	if v4, v6 := viewerLocalAddrs(host, other,
+		[]string{"192.168.1.20:55000"},
+		[]string{"[fd00::20]:55000"}); len(v4) != 0 || len(v6) != 0 {
+		t.Fatalf("candidates crossed networks: %v %v", v4, v6)
+	}
+	if v4, v6 := viewerLocalAddrs(registry.Host{}, same,
+		[]string{"192.168.1.20:55000"}, nil); len(v4) != 0 || len(v6) != 0 {
+		t.Fatalf("candidates forwarded without an observed host address: %v %v", v4, v6)
+	}
+}
+
+func TestValidLocalAddrs(t *testing.T) {
+	cases := []struct {
+		in     []string
+		wantV6 bool
+		want   []string
+	}{
+		{[]string{"192.168.1.20:55000", "10.0.0.1:080", "0.0.0.0:55000", "127.0.0.1:55000",
+			"[fd00::20]:55000", "example.com:55000", "192.168.1.20"}, false,
+			[]string{"192.168.1.20:55000", "10.0.0.1:80"}},
+		{[]string{"[fd00::20]:55000", "192.168.1.20:55000", "[fe80::1]:55000"}, true,
+			[]string{"[fd00::20]:55000"}},
+	}
+	for _, tc := range cases {
+		got := validLocalAddrs(tc.in, tc.wantV6)
+		if len(got) != len(tc.want) {
+			t.Fatalf("validLocalAddrs(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("validLocalAddrs(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		}
+	}
+}
+
 func TestKeepaliveOverIPv6(t *testing.T) {
 	priv := identity.PrivateKeyFromSecret("host-secret")
 	pub := identity.PublicKeyText(priv.Public().(ed25519.PublicKey))

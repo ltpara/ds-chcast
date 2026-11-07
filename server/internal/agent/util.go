@@ -139,6 +139,65 @@ func familyAllowed(local, remote net.IP) bool {
 	return (local.To4() != nil) == (remote.To4() != nil)
 }
 
+// ipv6RouteProbe is a global address the kernel can pick a route for; nothing
+// is ever sent to it. RustDesk's test_bind_ipv6 asks for the same route.
+const ipv6RouteProbe = "2001:4860:4860::8888"
+
+// globalV6 reports whether ip is in 2000::/3, the only prefix RustDesk accepts
+// for its IPv6 punch socket. Link-local and unique-local addresses cannot be
+// reached by a peer, so they are rejected rather than advertised.
+func globalV6(ip net.IP) bool {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return false
+	}
+	return v6[0]&0xe0 == 0x20
+}
+
+// localV6Endpoint asks the kernel which source address a route towards dst
+// would use, without sending a packet, and joins it with port. It mirrors
+// RustDesk's test_bind_ipv6 and returns "" when this host has no global IPv6
+// route.
+func localV6Endpoint(dst net.IP, port int) string {
+	if port <= 0 || port > 65535 {
+		return ""
+	}
+	for _, target := range []net.IP{dst, net.ParseIP(ipv6RouteProbe)} {
+		if !globalV6(target) {
+			continue
+		}
+		conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: target, Port: 53})
+		if err != nil {
+			continue
+		}
+		local, _ := conn.LocalAddr().(*net.UDPAddr)
+		conn.Close()
+		if local == nil || !globalV6(local.IP) {
+			continue
+		}
+		return net.JoinHostPort(local.IP.String(), strconv.Itoa(port))
+	}
+	return ""
+}
+
+// selfV6Endpoint reports the IPv6 endpoint this agent can be reached on. A
+// socket bound to IPv4 has none; a specific IPv6 bind advertises only that
+// address; a wildcard socket asks the kernel for the route's source address.
+// peer is the address the endpoint will be used towards, which may select a
+// different source address than the default route on a multi-homed host.
+func selfV6Endpoint(bind *net.UDPAddr, peer net.IP) string {
+	if bind == nil || bind.IP.To4() != nil {
+		return ""
+	}
+	if !bind.IP.IsUnspecified() {
+		if globalV6(bind.IP) {
+			return net.JoinHostPort(bind.IP.String(), strconv.Itoa(bind.Port))
+		}
+		return ""
+	}
+	return localV6Endpoint(peer, bind.Port)
+}
+
 // mergeCandidates resolves, family-filters, deduplicates and ranks candidate
 // addresses collected from registration and punch replies.
 func mergeCandidates(local *net.UDPAddr, lists ...[]string) []*net.UDPAddr {
@@ -280,12 +339,16 @@ func resolveUDP(text string) (*net.UDPAddr, error) {
 
 // selectRelayAddr picks the first advertised relay endpoint this socket can
 // reach. Names are expanded to every address they publish, so one host name
-// can carry both the IPv4 and IPv6 listener of the same relay.
+// can carry both the IPv4 and IPv6 listener of the same relay. IPv4 is
+// preferred: a dual-stack agent would otherwise pick an IPv6 relay merely
+// because the resolver listed it first, changing the path from the IPv4 one
+// the server advertised.
 func selectRelayAddr(local *net.UDPAddr, endpoints []string) *net.UDPAddr {
 	var localIP net.IP
 	if local != nil {
 		localIP = local.IP
 	}
+	var firstV6 *net.UDPAddr
 	for _, text := range endpoints {
 		text = strings.TrimSpace(text)
 		if text == "" {
@@ -318,12 +381,19 @@ func selectRelayAddr(local *net.UDPAddr, endpoints []string) *net.UDPAddr {
 			if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
 				continue
 			}
-			if familyAllowed(localIP, ip) {
-				return &net.UDPAddr{IP: ip, Port: port}
+			if !familyAllowed(localIP, ip) {
+				continue
+			}
+			addr := &net.UDPAddr{IP: ip, Port: port}
+			if ip.To4() != nil {
+				return addr
+			}
+			if firstV6 == nil {
+				firstV6 = addr
 			}
 		}
 	}
-	return nil
+	return firstV6
 }
 
 // resolveUDPAll expands every endpoint to all addresses its host name

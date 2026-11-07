@@ -243,7 +243,7 @@ func TestRegisterLookupAndDelete(t *testing.T) {
 	}
 	message := identity.KeepaliveMessage("devbox", "198.51.100.9:5000", nonce)
 	if err := s.Registry.TouchChallenge("devbox", nonce, "198.51.100.9:5000",
-		identity.Sign(priv, message), string(message), nil, "", 50000); err != nil {
+		identity.Sign(priv, message), string(message), nil, "", 50000, ""); err != nil {
 		t.Fatal(err)
 	}
 	_, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)

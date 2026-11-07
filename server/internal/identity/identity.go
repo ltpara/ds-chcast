@@ -42,6 +42,13 @@ const (
 	DomainHostBinding = "chast-host-binding-v1"
 	// DomainPunch covers the viewer's server-key proof in a punch request.
 	DomainPunch = "chast-punch-v1"
+	// DomainTCPPunch covers the host's announce on the server's TCP punch port.
+	// A host signature is what lets the server relay an observed endpoint
+	// without trusting an unauthenticated announce.
+	DomainTCPPunch = "chast-tcp-punch-v1"
+	// DomainTCPDirect covers the host hello on a punched TCP link, so a viewer
+	// can prove the peer holding the socket really owns the host id.
+	DomainTCPDirect = "chast-tcp-direct-v1"
 	// DomainHostAudit covers a host reporting an inbound session or finished
 	// file. The host key that owns the id signs the canonical fields, so a
 	// leaked server key alone cannot fabricate host-side records.
@@ -235,6 +242,18 @@ func CarrierHostMessage(id, candidate, nonce string) []byte {
 
 func PunchMessage(id, nonce string, unix int64) []byte {
 	return fieldsMessage(DomainPunch, id, nonce, strconv.FormatInt(unix, 10))
+}
+
+// TCPPunchMessage binds one half of a TCP punch announce. role keeps a host
+// signature from being replayable as a viewer proof.
+func TCPPunchMessage(id, nonce, role string, unix int64) []byte {
+	return fieldsMessage(DomainTCPPunch, id, nonce, role, strconv.FormatInt(unix, 10))
+}
+
+// TCPDirectMessage binds the host hello a viewer checks on a punched TCP
+// socket. The nonce ties the socket to the punch that produced it.
+func TCPDirectMessage(id, nonce string, unix int64) []byte {
+	return fieldsMessage(DomainTCPDirect, id, nonce, strconv.FormatInt(unix, 10))
 }
 
 // PunchAuth proves knowledge of the server key without putting the key itself

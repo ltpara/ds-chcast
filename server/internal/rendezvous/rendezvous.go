@@ -33,7 +33,10 @@ const (
 	// second per source IP: far above the host's own interval while still
 	// capping a flood.
 	DefaultKeepaliveRateMax = 120
-	defaultRateSpan         = 10 * time.Second
+	// DefaultNatProbeRateMax caps unauthenticated NAT probes per source IP per
+	// ten seconds. Two endpoints are probed per measurement, retried on failure.
+	DefaultNatProbeRateMax = 60
+	defaultRateSpan        = 10 * time.Second
 )
 
 type options struct {
@@ -42,6 +45,11 @@ type options struct {
 	keepaliveRateMax int
 	serverKey        string
 	tracer           *tracing.Tracer
+	// tcpPunchListenSet distinguishes "derive from the UDP bind" from an
+	// explicit value; an explicitly empty value disables the listener.
+	tcpPunchListenSet bool
+	tcpPunchListen    string
+	relayOnly         func() bool
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -79,6 +87,23 @@ func WithTracer(tracer *tracing.Tracer) Option {
 	return func(o *options) { o.tracer = tracer }
 }
 
+// WithTCPPunchListen sets the address of the TCP punch coordination listener.
+// An empty addr disables it; without this option the listener is derived from
+// the bound UDP address and uses the same port.
+func WithTCPPunchListen(addr string) Option {
+	return func(o *options) {
+		o.tcpPunchListen = addr
+		o.tcpPunchListenSet = true
+	}
+}
+
+// WithRelayOnly makes the TCP punch listener refuse coordination while
+// relay-only mode is active, matching the API, which stops advertising the
+// endpoint in the same state.
+func WithRelayOnly(relayOnly func() bool) Option {
+	return func(o *options) { o.relayOnly = relayOnly }
+}
+
 type Server struct {
 	conn      *net.UDPConn
 	reg       *registry.Registry
@@ -92,11 +117,18 @@ type Server struct {
 	// it an unauthenticated flood could mint challenges as fast as the
 	// registry can sign them.
 	keepaliveLimiter *limiter
-	serverKey        string
-	tracer           *tracing.Tracer
-	readBuffer       int
-	done             chan struct{}
-	closeOnce        sync.Once
+	// natProbeLimiter throttles stateless NAT observation replies so the punch
+	// port cannot be used as a reflector.
+	natProbeLimiter *limiter
+	serverKey       string
+	tracer          *tracing.Tracer
+	readBuffer      int
+	relayOnly       func() bool
+	// tcpPunch is nil when the coordination listener is disabled or could not
+	// bind; punching then stays on UDP.
+	tcpPunch  *tcpPuncher
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // New binds the meeting port. bind is an IP:port; port 0 lets the kernel pick.
@@ -121,18 +153,37 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		log.Warn("punch UDP receive buffer was not applied",
 			"requested", cfg.readBuffer, "error", err)
 	}
-	return &Server{
+	server := &Server{
 		conn:             conn,
 		reg:              reg,
 		relayAddr:        relayAddr,
 		log:              log,
 		limiter:          newLimiter(cfg.rateMax, defaultRateSpan),
 		keepaliveLimiter: newLimiter(cfg.keepaliveRateMax, defaultRateSpan),
+		natProbeLimiter:  newLimiter(DefaultNatProbeRateMax, defaultRateSpan),
 		serverKey:        cfg.serverKey,
 		tracer:           cfg.tracer,
 		readBuffer:       readBuffer,
+		relayOnly:        cfg.relayOnly,
 		done:             make(chan struct{}),
-	}, nil
+	}
+	server.startTCPPunch(cfg)
+	return server, nil
+}
+
+// startTCPPunch binds the TCP punch listener, deriving its address from the
+// bound UDP address unless one was configured explicitly.
+func (s *Server) startTCPPunch(cfg options) {
+	bind := ""
+	if cfg.tcpPunchListenSet {
+		bind = cfg.tcpPunchListen
+	} else if udp, ok := s.conn.LocalAddr().(*net.UDPAddr); ok {
+		bind = deriveTCPPunchListen(udp)
+	}
+	if bind == "" {
+		return
+	}
+	s.enableTCPPunch(bind)
 }
 
 // ReadBuffer is the SO_RCVBUF value reported by the kernel, or zero when the
@@ -154,6 +205,9 @@ func (s *Server) Close() {
 	s.closeOnce.Do(func() {
 		close(s.done)
 		s.conn.Close()
+		if s.tcpPunch != nil {
+			s.tcpPunch.close()
+		}
 	})
 }
 
@@ -191,7 +245,43 @@ func (s *Server) handle(msg wire.Message, src *net.UDPAddr) {
 		s.handleKeepaliveAuth(msg, src)
 	case wire.TypePunchRequest:
 		s.handlePunchRequest(msg, src)
+	case wire.TypeNatProbe:
+		s.handleNatProbe(msg, src)
 	}
+}
+
+// normalizeNATType keeps only the classifications the agents exchange. An
+// arbitrary string from a viewer must not reach a host's logging or decisions.
+func normalizeNATType(nat string) string {
+	switch nat {
+	case "unknown", "asymmetric", "symmetric":
+		return nat
+	default:
+		return ""
+	}
+}
+
+// handleNatProbe echoes the source address a probe arrived from. Two server
+// ports observe the same client socket: a cone NAT keeps the public port while
+// a symmetric NAT allocates one per destination, which is how the agent tells
+// them apart. It is stateless and rate-limited because the reply can be sent
+// to a spoofed source.
+func (s *Server) handleNatProbe(msg wire.Message, src *net.UDPAddr) {
+	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
+		return
+	}
+	if !s.natProbeLimiter.allow(src.IP.String()) {
+		return
+	}
+	candidate, candidateV6 := observedCandidate(src)
+	if candidate == "" {
+		candidate = candidateV6
+	}
+	s.reply(src, wire.Message{
+		Type:      wire.TypeNatProbeAck,
+		Nonce:     msg.Nonce,
+		Candidate: candidate,
+	})
 }
 
 // handleKeepalive only starts the exchange. The host must prove its key over a
@@ -246,7 +336,7 @@ func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	message := identity.KeepaliveMessage(msg.HostID, observed, msg.Nonce)
 	localAddrs := append(append([]string{}, msg.LocalAddrs...), msg.LocalAddrsV6...)
 	if err := s.reg.TouchChallenge(msg.HostID, msg.Nonce, observed, msg.Signature,
-		string(message), localAddrs, msg.NATType, msg.UpnpPort); err != nil {
+		string(message), localAddrs, msg.NATType, msg.UpnpPort, validSelfV6(msg.SelfV6)); err != nil {
 		ack.Error = err.Error()
 		s.reply(src, ack)
 		return
@@ -354,6 +444,13 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	}
 	result = "ok"
 	viewer4, viewer6 := observedCandidate(src)
+	if viewer6 == "" {
+		// This port only sees the family the request arrived on. A viewer that
+		// reached it over IPv4 reports its own global IPv6 endpoint, which is
+		// what RustDesk carries as socket_addr_v6; without it a host could
+		// never punch back over IPv6.
+		viewer6 = validSelfV6(msg.SelfV6)
+	}
 	// Record only requests that can actually be coordinated, matching hbbs's
 	// record point after the target's online check. A dual-stack host gets one
 	// entry per family.
@@ -363,15 +460,22 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		}
 	}
 	// Tell the host to punch towards the viewer. Best effort: the viewer is
-	// also told the host candidate and will probe first.
+	// also told the host candidate and will probe first. The viewer's NAT type
+	// lets the host skip a v4 punch that a symmetric mapping cannot complete;
+	// a v6 punch is unaffected because it does not traverse the NAT.
+	viewerNAT := normalizeNATType(msg.NATType)
+	viewerLocal4, viewerLocal6 := viewerLocalAddrs(host, src, msg.LocalAddrs, msg.LocalAddrsV6)
 	for _, hostAddr := range hostAddrs {
 		s.reply(hostAddr, wire.Message{
-			Type:        wire.TypePunchPeer,
-			Nonce:       msg.Nonce,
-			Candidate:   viewer4,
-			CandidateV6: viewer6,
-			UpnpPort:    msg.UpnpPort,
-			ExpiresMS:   punchTTL.Milliseconds(),
+			Type:         wire.TypePunchPeer,
+			Nonce:        msg.Nonce,
+			Candidate:    viewer4,
+			CandidateV6:  viewer6,
+			LocalAddrs:   viewerLocal4,
+			LocalAddrsV6: viewerLocal6,
+			UpnpPort:     msg.UpnpPort,
+			NATType:      viewerNAT,
+			ExpiresMS:    punchTTL.Milliseconds(),
 		})
 	}
 	reply.OK = true
@@ -391,7 +495,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		}
 	}
 	if host.RelayPort != 0 {
-		reply.Relay = s.relayAddr(host.RelayPort)
+		reply.Relay = s.relayFor(host)
 		relayOffered = true
 	}
 	reply.ExpiresMS = punchTTL.Milliseconds()
@@ -472,4 +576,78 @@ func observedCandidate(src *net.UDPAddr) (v4, v6 string) {
 		return src.String(), ""
 	}
 	return "", src.String()
+}
+
+// validSelfV6 accepts a self-reported IPv6 endpoint only in 2000::/3, the
+// range RustDesk uses for its v6 punch socket. Loopback, link-local, ULA and
+// multicast addresses cannot be reached by a peer, so one agent must not be
+// able to point another at them.
+func validSelfV6(text string) string {
+	host, portText, err := net.SplitHostPort(text)
+	if err != nil {
+		return ""
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() != nil {
+		return ""
+	}
+	v6 := ip.To16()
+	if v6 == nil || v6[0]&0xe0 != 0x20 {
+		return ""
+	}
+	return net.JoinHostPort(ip.String(), portText)
+}
+
+// maxViewerLocalAddrs caps the LAN endpoints forwarded from a viewer so a
+// single punch request cannot inflate the control datagram handed to the host.
+const maxViewerLocalAddrs = 8
+
+// viewerLocalAddrs hands a viewer's LAN candidates to the host only when the
+// service observed both peers behind the same public IPv4 address. On any other
+// path those addresses describe a different network: punching them would probe
+// a stranger's LAN, and only on the same network can a host reach them at all.
+// RustDesk draws the same line with is_local and its FetchLocalAddr exchange.
+func viewerLocalAddrs(host registry.Host, src *net.UDPAddr, local4, local6 []string) ([]string, []string) {
+	if src == nil || host.Candidate == "" {
+		return nil, nil
+	}
+	observed, err := net.ResolveUDPAddr("udp", host.Candidate)
+	if err != nil || observed == nil || !observed.IP.Equal(src.IP) {
+		return nil, nil
+	}
+	return validLocalAddrs(local4, false), validLocalAddrs(local6, true)
+}
+
+// validLocalAddrs keeps unicast host:port endpoints of the requested family.
+// The values are only routing hints from an authenticated viewer, so they are
+// normalized before they reach a host as punch targets.
+func validLocalAddrs(texts []string, wantV6 bool) []string {
+	var out []string
+	for _, text := range texts {
+		if len(out) >= maxViewerLocalAddrs {
+			break
+		}
+		host, portText, err := net.SplitHostPort(text)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || ip.IsUnspecified() || ip.IsMulticast() ||
+			ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+			continue
+		}
+		if wantV6 != (ip.To4() == nil) {
+			continue
+		}
+		out = append(out, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	}
+	return out
 }

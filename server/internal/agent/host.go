@@ -113,6 +113,9 @@ type HostInfo struct {
 	Relay  string `json:"relay,omitempty"`
 	Viewer string `json:"viewer,omitempty"`
 	Path   string `json:"path,omitempty"`
+	// Transport is "tcp" while a punched TCP link carries the viewer and
+	// "udp" for the direct and relay datagram paths.
+	Transport string `json:"transport,omitempty"`
 	// NAT is the classification derived from the mappings seen by the
 	// rendezvous and relay ports: asymmetric, symmetric or unknown.
 	NAT string `json:"nat,omitempty"`
@@ -140,6 +143,11 @@ type HostAgent struct {
 	publicKey    string
 	localAddrs   []string
 	localAddrsV6 []string
+	// selfV6 is this host's own IPv6 UDP endpoint for the punch socket. It is
+	// reported with every keepalive so the rendezvous service can hand it to
+	// viewers even when its own punch port is IPv4-only. Empty means no global
+	// IPv6 route, in which case no viewer should be pointed here.
+	selfV6 string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -163,7 +171,12 @@ type HostAgent struct {
 	// forwarding.
 	viewer     *net.UDPAddr
 	viewerPath string
-	lastInfo   string
+	// viewerTransport is "udp" for the datagram paths and "tcp" while a
+	// punched link is live. tcpViewer is that link's peer address; a UDP
+	// report received meanwhile must not hide the transport actually in use.
+	viewerTransport string
+	tcpViewer       string
+	lastInfo        string
 	// migratedFrom is set once at start, when the registration moved an old
 	// identity. It is never updated by renewals.
 	migratedFrom string
@@ -192,6 +205,15 @@ type HostAgent struct {
 	// endpoints may become the forwarding target, so one stray datagram
 	// cannot steal the return path.
 	punchPeers map[string]time.Time
+	// punchSessions holds the running probe round per viewer address. A round
+	// ends on the viewer's first real packet, matching RustDesk's listener.
+	punchSessions map[string]chan struct{}
+	// tcpPunch is the rendezvous service's TCP punch coordination endpoint.
+	// tcpPunches bounds the host-side punch goroutines by nonce; tcpLinks are
+	// the live punched viewers, closed on shutdown so their routes end too.
+	tcpPunch   *net.TCPAddr
+	tcpPunches map[string]time.Time
+	tcpLinks   map[net.Conn]struct{}
 
 	keepaliveOnce  sync.Once
 	relayOnce      sync.Once
@@ -245,6 +267,13 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		return nil, fmt.Errorf("listen address %q: %w", cfg.ListenAddr, err)
 	}
 	conn, err := net.ListenUDP("udp", listen)
+	if err != nil && listen.IP != nil && listen.IP.To4() == nil && listen.IP.IsUnspecified() {
+		// The default listen address is the IPv6 wildcard so one socket can
+		// carry both families. A host without IPv6 still needs to serve IPv4.
+		cfg.Logger.Warn("IPv6 listen unavailable; falling back to IPv4 only",
+			"address", cfg.ListenAddr, "error", err)
+		conn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: listen.Port})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", cfg.ListenAddr, err)
 	}
@@ -264,6 +293,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 
 	ctx, cancel := context.WithCancel(parent)
 	localAddrs, localAddrsV6 := splitByFamily(localCandidates(conn.LocalAddr().(*net.UDPAddr)))
+	selfV6 := selfV6Endpoint(conn.LocalAddr().(*net.UDPAddr), nil)
 	h := &HostAgent{
 		cfg:            cfg,
 		conn:           conn,
@@ -277,6 +307,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		publicKey:      publicKey,
 		localAddrs:     localAddrs,
 		localAddrsV6:   localAddrsV6,
+		selfV6:         selfV6,
 		ctx:            ctx,
 		cancel:         cancel,
 		refresh:        20 * time.Second,
@@ -371,13 +402,22 @@ func (h *HostAgent) Info() HostInfo {
 }
 
 func (h *HostAgent) infoLocked() HostInfo {
+	viewer := addrValue(h.viewer)
+	path := h.viewerPath
+	transport := h.viewerTransport
+	if h.tcpViewer != "" {
+		viewer = h.tcpViewer
+		path = "direct"
+		transport = "tcp"
+	}
 	return HostInfo{
 		ID:           h.cfg.ID,
 		Listen:       h.conn.LocalAddr().String(),
 		Punch:        addrValue(h.punch),
 		Relay:        addrValue(h.relay),
-		Viewer:       addrValue(h.viewer),
-		Path:         h.viewerPath,
+		Viewer:       viewer,
+		Path:         path,
+		Transport:    transport,
 		NAT:          h.natType,
 		UPnPPort:     h.upnpPort,
 		MigratedFrom: h.migratedFrom,
@@ -387,7 +427,8 @@ func (h *HostAgent) infoLocked() HostInfo {
 func (h *HostAgent) reportInfo() {
 	h.mu.Lock()
 	info := h.infoLocked()
-	key := info.Relay + "|" + info.Viewer + "|" + info.Path + "|" + info.NAT + "|" + info.MigratedFrom
+	key := info.Relay + "|" + info.Viewer + "|" + info.Path + "|" + info.Transport + "|" +
+		info.NAT + "|" + info.MigratedFrom
 	changed := key != h.lastInfo
 	h.lastInfo = key
 	h.mu.Unlock()
@@ -399,6 +440,11 @@ func (h *HostAgent) reportInfo() {
 func (h *HostAgent) Close() {
 	h.routes.close()
 	h.cancel()
+	h.mu.Lock()
+	for conn := range h.tcpLinks {
+		conn.Close()
+	}
+	h.mu.Unlock()
 	h.conn.Close()
 	if h.localOut != nil {
 		h.localOut.Close()
@@ -503,6 +549,7 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	if err != nil {
 		h.log.Warn("registration returned an unusable IPv6 punch address", "punch_v6", reg.PunchV6, "error", err)
 	}
+	tcpPunch := resolveTCP(reg.TCPPunch)
 	relay, err := resolveUDP(reg.Relay)
 	if err != nil {
 		h.log.Warn("registration returned an unusable relay address", "relay", reg.Relay, "error", err)
@@ -521,6 +568,10 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 			h.log.Info("IPv6 rendezvous endpoint updated", "punch_v6", punch6.String())
 		}
 		h.punch6 = punch6
+	}
+	if tcpPunch != nil && (h.tcpPunch == nil || h.tcpPunch.String() != tcpPunch.String()) {
+		h.tcpPunch = tcpPunch
+		h.log.Info("TCP punch endpoint updated", "tcp_punch", tcpPunch.String())
 	}
 	if relay != nil && !sameAddr(h.relay, relay) {
 		h.relay = relay
@@ -871,7 +922,11 @@ func (h *HostAgent) readLoop() {
 		h.mu.Unlock()
 
 		if wire.IsControl(data) {
-			if h.acceptsControl(src, punch, punch6) {
+			msg, decodeErr := wire.Decode(data)
+			switch {
+			case decodeErr == nil && msg.Type == wire.TypePunchProbe:
+				h.handlePunchProbe(msg, src)
+			case h.acceptsControl(src, punch, punch6):
 				h.handleControl(data, src)
 			}
 
@@ -901,6 +956,7 @@ func (h *HostAgent) readLoop() {
 			continue
 		}
 		h.noteViewer(src)
+		h.confirmPunchPeer(src.String())
 		route := src.String()
 		id, payload, multiplex := carrier.DecodeMux(data)
 		if multiplex {
@@ -962,12 +1018,19 @@ func (h *HostAgent) noteViewer(src *net.UDPAddr) {
 		}
 	}
 	h.mu.Lock()
+	if h.tcpViewer != "" {
+		// A live punched link is the reported path: the UDP datagram seen here
+		// is the relay or a stale punch, not what the local client receives.
+		h.mu.Unlock()
+		return
+	}
 	first := h.viewer == nil
 	changed := !sameAddr(h.viewer, src) || h.viewerPath != path
 	if changed {
 		h.viewer = cloneAddr(src)
 		h.viewerPath = path
 	}
+	h.viewerTransport = "udp"
 	h.mu.Unlock()
 	if !changed {
 		return
@@ -1011,6 +1074,7 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 			LocalAddrsV6: h.localAddrsV6,
 			NATType:      h.getNATType(),
 			UpnpPort:     h.upnpPort,
+			SelfV6:       h.selfV6,
 		}), src)
 	case wire.TypeKeepaliveAck:
 		if !fromPunch {
@@ -1028,24 +1092,71 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 		if !fromPunch {
 			return
 		}
-		peer, err := resolveUDP(msg.Candidate)
-		if err != nil || peer == nil {
-			peer, err = resolveUDP(msg.CandidateV6)
-			if err != nil || peer == nil {
-				return
+		conn := h.conn.LocalAddr().(*net.UDPAddr)
+		connIP := conn.IP
+		var v4Peer, v6Peer *net.UDPAddr
+		if addr, err := resolveUDP(msg.Candidate); err == nil && addr != nil &&
+			familyAllowed(connIP, addr.IP) {
+			v4Peer = addr
+		}
+		if addr, err := resolveUDP(msg.CandidateV6); err == nil && addr != nil &&
+			familyAllowed(connIP, addr.IP) {
+			v6Peer = addr
+		}
+		// The rendezvous service includes these only when it observed this host
+		// and the viewer behind the same public address. A LAN path never
+		// traverses the NAT, so a symmetric mapping that makes the public v4
+		// punch hopeless does not apply; RustDesk's intranet path is likewise
+		// taken independently of its relay_v4 decision.
+		locals := mergeCandidates(conn, msg.LocalAddrs, msg.LocalAddrsV6)
+		if v4Peer == nil && v6Peer == nil && len(locals) == 0 {
+			return
+		}
+		// A symmetric NAT on either side allocates a new public port per
+		// destination, so punching the observed v4 candidate cannot complete.
+		// Skip only v4 and let the viewer fall back to the relay for it. IPv6
+		// does not traverse the NAT, so it is punched in parallel regardless,
+		// exactly like RustDesk's punch_v6, which starts before the v4 relay
+		// branch.
+		h.mu.Lock()
+		symmetric := h.natType == NATSymmetric
+		h.mu.Unlock()
+		if v4Peer != nil {
+			h.rememberPunchPeer(v4Peer)
+			if symmetric || msg.NATType == NATSymmetric {
+				h.log.Info("symmetric NAT; skipping the v4 punch", "candidate", v4Peer.String())
+			} else {
+				h.log.Info("punch request from viewer", "candidate", v4Peer.String())
+				go h.sendPunches(v4Peer, msg.Nonce)
+			}
+			// The viewer's gateway mapping stays reachable even when its
+			// observed source port differs per destination (symmetric NAT).
+			if mapped, err := resolveUDP(candidateWithUpnpPort(msg.Candidate, msg.UpnpPort)); err == nil &&
+				mapped != nil && !sameAddr(mapped, v4Peer) && familyAllowed(connIP, mapped.IP) {
+				h.rememberPunchPeer(mapped)
+				h.log.Info("punching the viewer's UPnP mapping", "candidate", mapped.String())
+				go h.sendPunches(mapped, msg.Nonce)
 			}
 		}
-		h.rememberPunchPeer(peer)
-		h.log.Info("punch request from viewer", "candidate", peer.String())
-		go h.sendPunches(peer, msg.Nonce)
-		// The viewer's gateway mapping stays reachable even when its observed
-		// source port differs per destination (symmetric NAT).
-		if mapped, err := resolveUDP(candidateWithUpnpPort(msg.Candidate, msg.UpnpPort)); err == nil &&
-			mapped != nil && !sameAddr(mapped, peer) {
-			h.rememberPunchPeer(mapped)
-			h.log.Info("punching the viewer's UPnP mapping", "candidate", mapped.String())
-			go h.sendPunches(mapped, msg.Nonce)
+		if v6Peer != nil {
+			h.rememberPunchPeer(v6Peer)
+			h.log.Info("punching the viewer over IPv6", "candidate", v6Peer.String())
+			go h.sendPunches(v6Peer, msg.Nonce)
 		}
+		for _, peer := range locals {
+			if sameAddr(peer, v4Peer) || sameAddr(peer, v6Peer) {
+				continue
+			}
+			h.rememberPunchPeer(peer)
+			h.log.Info("punching the viewer on the local network", "candidate", peer.String())
+			go h.sendPunches(peer, msg.Nonce)
+		}
+	case wire.TypeTCPPunch:
+		if !fromPunch || msg.HostID != h.cfg.ID || len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
+			return
+		}
+		h.log.Debug("TCP punch trigger received", "nonce", msg.Nonce)
+		h.startTCPPunch(msg.Nonce)
 	case wire.TypeRelayChallenge:
 		if !fromRelay || msg.HostID != h.cfg.ID ||
 			msg.Candidate == "" || msg.Nonce == "" {
@@ -1078,17 +1189,81 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 }
 
 func (h *HostAgent) sendPunches(peer *net.UDPAddr, nonce string) {
-	punch := wire.Encode(wire.Message{Type: wire.TypePunch, Nonce: nonce})
-	for i := 0; i < 3; i++ {
-		if _, err := h.conn.WriteToUDP(punch, peer); err != nil {
+	// The listener side of RustDesk's punch_udp: probe with a transaction id
+	// and stop on the viewer's first real packet, because an acknowledgement
+	// only proves our probe survived, not that the peer is ready to talk.
+	stop := h.beginPunchSession(peer)
+	defer h.endPunchSession(peer.String(), stop)
+	probe := wire.Encode(wire.Message{Type: wire.TypePunchProbe, Nonce: nonce, TID: newNonce()})
+	deadline := time.Now().Add(punchProbeWindow)
+	gap := punchProbeMinGap
+	for time.Now().Before(deadline) {
+		if _, err := h.conn.WriteToUDP(probe, peer); err != nil {
 			return
 		}
 		select {
 		case <-h.ctx.Done():
 			return
-		case <-time.After(200 * time.Millisecond):
+		case <-stop:
+			return
+		case <-time.After(gap):
 		}
+		gap = nextPunchGap(gap)
 	}
+}
+
+// beginPunchSession starts one probe round; a newer round for the same address
+// replaces and stops the old one.
+func (h *HostAgent) beginPunchSession(peer *net.UDPAddr) chan struct{} {
+	key := peer.String()
+	h.mu.Lock()
+	if h.punchSessions == nil {
+		h.punchSessions = make(map[string]chan struct{})
+	}
+	if old, ok := h.punchSessions[key]; ok {
+		close(old)
+	}
+	stop := make(chan struct{})
+	h.punchSessions[key] = stop
+	h.mu.Unlock()
+	return stop
+}
+
+func (h *HostAgent) endPunchSession(peer string, stop chan struct{}) {
+	h.mu.Lock()
+	if h.punchSessions[peer] == stop {
+		delete(h.punchSessions, peer)
+		close(stop)
+	}
+	h.mu.Unlock()
+}
+
+// confirmPunchPeer stops probing once the viewer sends real data, which is
+// exactly when RustDesk's listener ends its punch.
+func (h *HostAgent) confirmPunchPeer(peer string) {
+	h.mu.Lock()
+	if stop, ok := h.punchSessions[peer]; ok {
+		delete(h.punchSessions, peer)
+		close(stop)
+	}
+	h.mu.Unlock()
+}
+
+// handlePunchProbe acknowledges a viewer's probe. The echoed transaction id is
+// the proof the viewer waits for before it treats the path as usable; only an
+// address the rendezvous service announced may open a path through this host.
+func (h *HostAgent) handlePunchProbe(msg wire.Message, src *net.UDPAddr) {
+	if len(msg.TID) != punchTIDLen {
+		return
+	}
+	h.mu.Lock()
+	allowed := h.acceptViewerSourceLocked(src)
+	h.mu.Unlock()
+	if !allowed {
+		return
+	}
+	ack := wire.Encode(wire.Message{Type: wire.TypePunchAck, TID: msg.TID})
+	h.conn.WriteToUDP(ack, src)
 }
 
 func (h *HostAgent) sendKeepalive() {

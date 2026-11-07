@@ -86,6 +86,7 @@ type registerResult struct {
 	Relays            []string      `json:"relays"`
 	Punch             string        `json:"punch"`
 	PunchV6           string        `json:"punch_v6"`
+	TCPPunch          string        `json:"tcp_punch"`
 	Carrier           string        `json:"carrier"`
 	CarrierV6         string        `json:"carrier_v6"`
 	CarrierToken      string        `json:"carrier_token"`
@@ -112,6 +113,7 @@ type lookupResult struct {
 	Relays            []string      `json:"relays"`
 	Punch             string        `json:"punch"`
 	PunchV6           string        `json:"punch_v6"`
+	TCPPunch          string        `json:"tcp_punch"`
 	Carrier           string        `json:"carrier"`
 	CarrierV6         string        `json:"carrier_v6"`
 	CarrierToken      string        `json:"carrier_token"`

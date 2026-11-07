@@ -190,6 +190,116 @@ func TestAutoPathThroughAgents(t *testing.T) {
 	testRoundTrip(t, ctx, s, ModeAuto)
 }
 
+// TestViewerDetectsOwnNATType runs the same two-port observation the host
+// uses. On loopback the observed port does not change per destination, so the
+// classification must be asymmetric.
+func TestViewerDetectsOwnNATType(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := testutil.Start(t)
+	echo := startEcho(t)
+	startHostAgent(t, ctx, s.URL, echo.LocalAddr().String())
+
+	viewer, err := StartViewer(ctx, ViewerConfig{
+		ServerURL:     s.URL,
+		ServerKey:     testutil.ServerKey,
+		HostID:        "devbox",
+		ListenAddr:    "127.0.0.1:0",
+		Mode:          ModeAuto,
+		DirectTimeout: time.Second,
+		Logger:        quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start viewer agent: %v", err)
+	}
+	t.Cleanup(viewer.Close)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info := viewer.PathInfo()
+		if info.OwnNAT == NATAsymmetric {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("viewer NAT type = %q, want %q", info.OwnNAT, NATAsymmetric)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A symmetric NAT makes the v4 punch useless, but RustDesk still gives the
+// direct race its MIN window (one second) instead of latching the relay at
+// once, so an IPv6 path can still complete inside that window.
+func TestViewerSymmetricNATShortensDirectWait(t *testing.T) {
+	direct := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+	relay := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002}
+	v6 := &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 40003}
+	newAgent := func(mode string, candidates ...*net.UDPAddr) *ViewerAgent {
+		v := &ViewerAgent{
+			cfg:        ViewerConfig{Mode: mode},
+			ctx:        context.Background(),
+			direct:     direct,
+			remote:     direct,
+			relay:      relay,
+			candidates: candidates,
+			log:        quietLogger(),
+			directWait: 30 * time.Second,
+			timerArmed: true,
+		}
+		v.timer = time.AfterFunc(time.Hour, v.onDirectTimeout)
+		t.Cleanup(func() { v.timer.Stop() })
+		return v
+	}
+	fellBack := func(v *ViewerAgent) bool {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		return v.fellBack
+	}
+	waitFallback := func(v *ViewerAgent) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for !fellBack(v) {
+			if time.Now().After(deadline) {
+				t.Fatal("symmetric NAT never fell back to the relay")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !sameAddr(v.relay, relay) {
+			t.Fatalf("fallback left the relay at %v", v.remote)
+		}
+	}
+
+	v := newAgent(ModeAuto, direct)
+	start := time.Now()
+	v.setOwnNAT(NATSymmetric)
+	if fellBack(v) {
+		t.Fatal("relay latched before the direct window elapsed")
+	}
+	waitFallback(v)
+	if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
+		t.Fatalf("direct window was only %v, want about %v", elapsed, symmetricDirectWait)
+	}
+
+	// An IPv6 candidate does not extend the window: RustDesk races it in
+	// parallel and falls back when neither path answers.
+	v6Agent := newAgent(ModeAuto, v6, direct)
+	v6Agent.setOwnNAT(NATSymmetric)
+	waitFallback(v6Agent)
+
+	// An explicit direct mode keeps its own window whatever the NAT says.
+	v3 := newAgent(ModeDirect, direct)
+	v3.setOwnNAT(NATSymmetric)
+	time.Sleep(100 * time.Millisecond)
+	if fellBack(v3) {
+		t.Fatal("direct mode abandoned the direct path")
+	}
+	v3.mu.Lock()
+	wait := v3.directWait
+	v3.mu.Unlock()
+	if wait != 30*time.Second {
+		t.Fatalf("direct mode wait shortened to %v", wait)
+	}
+}
+
 func TestHostDetectsNATType(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

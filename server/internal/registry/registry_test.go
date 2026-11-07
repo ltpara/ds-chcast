@@ -459,7 +459,7 @@ func TestChallengeSurvivesInterleavedIssues(t *testing.T) {
 	}
 	msg := identity.KeepaliveMessage("devbox", candidate, first)
 	if err := reg.TouchChallenge("devbox", first, candidate,
-		identity.Sign(priv, msg), string(msg), nil, "", 0); err != nil {
+		identity.Sign(priv, msg), string(msg), nil, "", 0, ""); err != nil {
 		t.Fatalf("outstanding challenge was displaced: %v", err)
 	}
 }
@@ -483,7 +483,7 @@ func TestKeepaliveChallengesPerFamily(t *testing.T) {
 	// A nonce minted for one family cannot be spent on the other.
 	wrong := identity.KeepaliveMessage("devbox", v6, nonce4)
 	if err := reg.TouchChallenge("devbox", nonce4, v6,
-		identity.Sign(priv, wrong), string(wrong), nil, "", 0); !errors.Is(err, ErrChallenge) {
+		identity.Sign(priv, wrong), string(wrong), nil, "", 0, ""); !errors.Is(err, ErrChallenge) {
 		t.Fatalf("v4 challenge accepted for v6: %v", err)
 	}
 	for _, step := range []struct{ nonce, candidate string }{
@@ -492,13 +492,53 @@ func TestKeepaliveChallengesPerFamily(t *testing.T) {
 	} {
 		msg := identity.KeepaliveMessage("devbox", step.candidate, step.nonce)
 		if err := reg.TouchChallenge("devbox", step.nonce, step.candidate,
-			identity.Sign(priv, msg), string(msg), nil, "", 0); err != nil {
+			identity.Sign(priv, msg), string(msg), nil, "", 0, ""); err != nil {
 			t.Fatalf("touch %s: %v", step.candidate, err)
 		}
 	}
 	host, ok := reg.Lookup("devbox")
 	if !ok || host.Candidate != v4 || host.CandidateV6 != v6 {
 		t.Fatalf("one family erased the other: %+v", host)
+	}
+}
+
+func TestKeepaliveStoresReportedSelfV6(t *testing.T) {
+	reg := New(time.Minute)
+	priv, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	v4 := "198.51.100.7:51234"
+	self := "[2001:db8::7]:14434"
+	nonce, err := reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := identity.KeepaliveMessage("devbox", v4, nonce)
+	if err := reg.TouchChallenge("devbox", nonce, v4,
+		identity.Sign(priv, msg), string(msg), nil, "", 0, self); err != nil {
+		t.Fatal(err)
+	}
+	host, _ := reg.Lookup("devbox")
+	if host.Candidate != v4 || host.CandidateV6 != self {
+		t.Fatalf("reported IPv6 endpoint was not stored: %+v", host)
+	}
+
+	// A real IPv6 observation is authoritative: the self report cannot point
+	// the host anywhere else once the rendezvous port has seen its mapping.
+	v6 := "[2001:db8::8]:4000"
+	nonce, err = reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg = identity.KeepaliveMessage("devbox", v6, nonce)
+	if err := reg.TouchChallenge("devbox", nonce, v6,
+		identity.Sign(priv, msg), string(msg), nil, "", 0, self); err != nil {
+		t.Fatal(err)
+	}
+	host, _ = reg.Lookup("devbox")
+	if host.CandidateV6 != v6 {
+		t.Fatalf("observed IPv6 address was overwritten by the report: %+v", host)
 	}
 }
 

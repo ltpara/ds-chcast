@@ -55,7 +55,8 @@ func run(args []string) error {
 func runHost(args []string) error {
 	fs := flag.NewFlagSet("host", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
-	serverKey := fs.String("server-key", "", "server key required by the API")
+	serverKey := fs.String("server-key", "", "server key required by the API (visible in the process command line; prefer --server-key-stdin)")
+	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the server key from the first line of stdin; overrides --server-key")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id registered with the service")
@@ -65,7 +66,7 @@ func runHost(args []string) error {
 	local := fs.String("local", "127.0.0.1:4433", "chast-host QUIC listener")
 	carrierAddr := fs.String("carrier", "", "chast-host TCP carrier listener (127.0.0.1:P+1); empty disables the relay's TCP fallback")
 	auditSpool := fs.String("audit-spool", "", "chast-host JSONL audit spool; the agent signs and forwards it")
-	listen := fs.String("listen", "0.0.0.0:14434", "public-facing UDP address of this agent")
+	listen := fs.String("listen", "[::]:14434", "public-facing UDP address of this agent (dual-stack where available)")
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	autoUpdate := fs.Bool("auto-update", false, "stage and launch the installer advertised by the server; needs --server-pubkey")
@@ -83,6 +84,17 @@ func runHost(args []string) error {
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
+	if *serverKeyStdin {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		key := strings.TrimRight(line, "\r\n")
+		if key == "" {
+			if err != nil {
+				return fmt.Errorf("read server key from stdin: %w", err)
+			}
+			return fmt.Errorf("read server key from stdin: empty key")
+		}
+		*serverKey = key
+	}
 	proxy, err := resolveProxy(*proxyURL)
 	if err != nil {
 		return err
@@ -152,6 +164,7 @@ func runHost(args []string) error {
 				Listen:       info.Listen,
 				Host:         info.ID,
 				Path:         info.Path,
+				Transport:    info.Transport,
 				Remote:       info.Viewer,
 				Punch:        info.Punch,
 				Relay:        info.Relay,
@@ -182,6 +195,7 @@ func runHost(args []string) error {
 		Listen:       info.Listen,
 		Host:         info.ID,
 		Path:         info.Path,
+		Transport:    info.Transport,
 		Remote:       info.Viewer,
 		Punch:        info.Punch,
 		Relay:        info.Relay,
@@ -213,8 +227,8 @@ func runViewer(args []string) error {
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id to reach")
 	listen := fs.String("listen", "127.0.0.1:24434", "local UDP address for the QUIC client")
-	mode := fs.String("mode", agent.ModeAuto, "auto: direct, relay or carrier; direct; relay; carrier")
-	directTimeout := fs.Duration("direct-timeout", 2*time.Second, "how long auto waits for the direct path")
+	mode := fs.String("mode", agent.ModeAuto, "auto: direct, relay or carrier; direct; relay; carrier; tcp: punched TCP link only")
+	directTimeout := fs.Duration("direct-timeout", 3*time.Second, "how long auto waits for the direct path")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
@@ -292,6 +306,7 @@ func runViewer(args []string) error {
 			emit(agentEvent{
 				Event:        "path",
 				Path:         info.Path,
+				Transport:    info.Transport,
 				Remote:       info.Remote,
 				Direct:       info.Direct,
 				Relay:        info.Relay,
@@ -312,6 +327,7 @@ func runViewer(args []string) error {
 		Listen:       v.LocalAddr().String(),
 		Host:         *id,
 		Path:         info.Path,
+		Transport:    info.Transport,
 		Remote:       info.Remote,
 		Direct:       info.Direct,
 		Relay:        info.Relay,
@@ -486,6 +502,7 @@ type agentEvent struct {
 	Listen       string `json:"listen,omitempty"`
 	Host         string `json:"host,omitempty"`
 	Path         string `json:"path,omitempty"`
+	Transport    string `json:"transport,omitempty"`
 	Remote       string `json:"remote,omitempty"`
 	Punch        string `json:"punch,omitempty"`
 	Direct       string `json:"direct,omitempty"`

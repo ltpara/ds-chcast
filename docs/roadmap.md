@@ -3521,10 +3521,32 @@
      被包信任检查正确拒绝（夹具改为显式私有 DACL）。边界：共享采集仅
      在本机单 GPU/单输出实测，跨适配器与多输出并发未单独验收；存储锁
      只保证文件读改写原子，不提供跨文件事务。
+161. **P1 · 打洞与 RustDesk 功能对齐（2026-11-07 完成）**：按“1:1 复刻
+     RustDesk 已验证打洞行为”的要求补齐六项。NAT 测试：主机继续用会合/中继
+     两个观察点分类，查看者新增 `nat_probe`/`nat_probe_ack` 并随
+     `punch_request` 上报；任一方 `symmetric` 时主机跳过公网 v4 打洞，
+     UPnP/IPv6/局域网候选照常探测，查看者 v4 直连预算缩到 1 s。请求与探测：
+     `punch_request` 发三次、等待窗口 3/6/9 s；每轮探测带新事务号
+     `punch_probe`/`punch_ack`，间隔 20 ms→200 ms、窗口 3 s，只有 ACK 或
+     真实主机数据才锁定直连。IPv6：代理上报 `self_v6`、`local_addrs_v6`，
+     双栈 v4/v6 并行打洞，跨族候选随 `punch_peer` 交换，没有全局 v6 源时
+     不发布 v6 候选。同网段：查看者局域网候选只在双方观察公网一致时转发，
+     主机并行探测且不受对称 NAT 短路。TCP 打洞：`--tcp-punch-listen`
+     （默认与 UDP 会合同端口号）配对两侧报到，查看者 HMAC、主机 Ed25519
+     （`chast-tcp-punch-v1`），服务器只回对方观察地址；主机从协调连接的本地
+     端口预打洞 30 ms 后监听并反拨，18 s 窗口、0.15 s 起 1.5× 退避；链路
+     首条报文为签名 `tcp_direct`，数据按载体帧承载，主机为每条链路建
+     `tcp:<远端>` 独立路由；查看者新增 `--mode tcp`，`auto`/`direct` 与 UDP
+     并行竞争。查看者上游套接字同时拆成“回环本地 + 可路由上游”，避免打洞
+     数据报污染本地 QUIC 客户端。验证：`go test ./...` 全部通过，新增
+     `TestTCPPunchPathThroughAgents` 用真实 TCP 打洞链路完成 QUIC 数据报
+     回环（`path=direct`、`transport=tcp`），另有 NAT 分类、对称跳过、
+     双栈并行、事务号、TCP 协调鉴权等用例。文档见
+     `docs/nat-traversal-2026-11-07.md`。边界：单机无真实 NAT，跨网锥形/
+     对称 NAT、IPv6 与 TCP 打洞的成功率仍需双机验收，清单已随文档给出。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
-
 ## M6 后续（进行中）
 
 - 音频质量调优：唇音同步已按 RustDesk 对齐为“到达即播”（查看者系统

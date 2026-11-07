@@ -84,6 +84,41 @@ func TestFamilyAllowed(t *testing.T) {
 	}
 }
 
+func TestGlobalV6Prefix(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{"2001:db8::1", true},
+		{"2606:4700::1111", true},
+		{"3fff::1", true},
+		{"4000::1", false},
+		{"fd00::1", false},
+		{"fe80::1", false},
+		{"fe80::1%eth0", false},
+		{"::1", false},
+		{"::", false},
+		{"::ffff:192.0.2.1", false},
+		{"192.0.2.1", false},
+	}
+	for _, tc := range cases {
+		if got := globalV6(net.ParseIP(tc.addr)); got != tc.want {
+			t.Errorf("globalV6(%s) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}
+
+func TestSelfV6EndpointNeedsIPv6Bind(t *testing.T) {
+	v4 := &net.UDPAddr{IP: net.IPv4zero, Port: 14434}
+	if got := selfV6Endpoint(v4, nil); got != "" {
+		t.Fatalf("an IPv4-bound socket advertised %q", got)
+	}
+	loopback := &net.UDPAddr{IP: net.IPv6loopback, Port: 14434}
+	if got := selfV6Endpoint(loopback, nil); got != "" {
+		t.Fatalf("an IPv6 socket bound to loopback advertised %q", got)
+	}
+}
+
 func TestSplitByFamily(t *testing.T) {
 	v4, v6 := splitByFamily([]string{
 		"10.0.0.9:4000", "[fd00::9]:4000", "192.0.2.9:4000", "[2001:db8::9]:4000",

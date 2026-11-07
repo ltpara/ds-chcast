@@ -95,6 +95,26 @@ func relayHandshake(t *testing.T, conn *net.UDPConn, relayAddr *net.UDPAddr, id 
 	return ack
 }
 
+// The relay is the second observation point of the NAT type test. A probe
+// must be answered without a reservation: the viewer measures its NAT before
+// it knows whether this session will use the relay.
+func TestRelayNatProbeReportsObservedSource(t *testing.T) {
+	_, _, relayAddr, _ := startRelay(t, "devbox", "host-secret")
+	probe := listenUDP(t)
+	const nonce = "nat-probe-nonce-2"
+	probe.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeNatProbe, Nonce: nonce}), relayAddr)
+	ack, err := wire.Decode(recv(t, probe, 2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Type != wire.TypeNatProbeAck || ack.Nonce != nonce {
+		t.Fatalf("nat probe ack: %+v", ack)
+	}
+	if ack.Candidate != probe.LocalAddr().String() {
+		t.Fatalf("observed = %q, want %q", ack.Candidate, probe.LocalAddr())
+	}
+}
+
 func TestRelayForwardsBothWays(t *testing.T) {
 	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(false))
 	host := listenUDP(t)

@@ -72,6 +72,16 @@ func (r *localRoutes) forward(key string, target *net.UDPAddr, data []byte, repl
 	return err
 }
 
+func (r *localRoutes) remove(key string) {
+	r.mu.Lock()
+	conn := r.peers[key]
+	delete(r.peers, key)
+	r.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+}
+
 func (r *localRoutes) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()

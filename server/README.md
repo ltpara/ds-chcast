@@ -30,8 +30,11 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | Wake-on-LAN | 查看器本地广播 + 跨子网中继 | 设备菜单可为已保存或最近设备填写 MAC：默认向 `255.255.255.255:9` 发送 102 字节魔法包；勾选“通过连接服务转发”时改为 `POST /v1/hosts/{id}/wake`，作业只投递给允许名单（`--wake-relay-policy`）内、与目标最后上报链路有交集且带 `--wake-relay` 的主机代理；目标未上报链路或运营者未授权代理时返回 409。MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
 | `PeerDiscovery` 局域网发现 | `chast-tunnel host --lan-discovery` + `chast-tunnel discover` | 主机在 UDP 21129 应答 `CHASTL1` ping，返回 ID/主机名/用户名/平台/版本/MAC；`discover` 向受限广播、各网卡定向广播与回环探测，并按 ID 合并同一主机的多个来源地址。无认证、只暴露展示元数据、不授权连接；主机侧默认开启，可 `--lan-discovery=false` 关闭 |
 | `SoftwareUpdate` | `--software-version`/`--software-url`（+ 可选 `--software-dir`）+ `chast-tunnel host --auto-update` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；设置 `--software-dir` 时由服务端在 `/software/{name}` 只读托管发布文件，并在通告中附 SHA-256、大小与服务器 Ed25519 签名；主机代理可固定服务器公钥后自动校验、暂存并启动安装器，未开启时只记提示；查看器固定服务器身份后可“下载并安装”，由随包 `chast-tunnel apply-update` 在查看器退出后换入并重启 |
-| `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 交换观察到的公网地址并让双方互发探针 |
+| `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 请求按 RustDesk 的节奏发三次，等待窗口 3 s/6 s/9 s；交换观察地址后双方用带事务号的 `punch_probe`/`punch_ack` 确认回程（20→200 ms 退避，3 s 窗口），只收到单向来包不算成功 |
+| NAT 类型测试 | `nat_probe`（会合与中继两个观察点） | 查看者用同一套接字向两个服务器端口取公网端口：一致为 `asymmetric`，不同为 `symmetric`；对称 NAT 把 v4 直连窗口缩到 1 s，但 IPv6 与同网段候选仍照常并行探测 |
+| IPv6 打洞 | `self_v6` + `candidate_v6`/`local_addrs_v6` | 双栈代理分别保活与探测 v4/v6，跨族候选随 `punch_peer` 一起交换；只上报本机确有全局 IPv6 源地址的候选 |
 | `FetchLocalAddr` | `local_addrs` + `nat_type` | 主机上报局域网候选与 NAT 分类 |
+| TCP 打洞（RustDesk `PunchHole` 的 TCP 通道） | `--tcp-punch-listen` + `tcp_punch` + `--mode tcp` | 双方在同一 TCP 端口报到，服务器只把对方观察地址回给各自；主机从同一本地端口预打洞后监听，链路用载体帧承载数据报。UDP 被封或对称 NAT 下仍可直连，`auto` 里与 UDP 并行竞争 |
 | UPnP 端口映射 | `--upnp` + `upnp_port`（keepalive、punch、查询） | 代理向本地 IGD 申请 UDP 端口映射并每 15 min 续租，服务端把映射外部端口随双方候选转发；缺省关闭，只有 IPv4 |
 | `RequestRelay`（uuid 配对） | 按主机分配 UDP 中继端口 | 查看者直接连该端口，主机侧代理回连中继 |
 | 共享中继端口按 UUID 复用 | `--carrier-listen` TCP/WebSocket 共享载体 | 一个端口承载所有主机链路，查看者凭随机令牌选择主机 |
@@ -81,12 +84,13 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   chast-tunnel host  ───────────────────────────┐
         │  UDP 保活（签名挑战）                  │
         │  UDP 8444 会合                         │   chast-server
+        │  TCP 8444 打洞协调（可选）             │
         │  UDP HELLO + 数据 ↔ 41000..41099 中继  │
         │  TCP/WS 8445 共享载体（可选）          │
         ▼                                        │
   chast-host :4433 (QUIC)                        │
         ▲                                        │
-        │ 直连（打洞成功后，同一数据套接字）     │
+        │ 直连（UDP/TCP 打洞成功后，同一数据套接字/链路）
         │ 或经中继/载体（主机的出站映射）        │
   chast-tunnel viewer ───────────────────────────┘
         ▲ 127.0.0.1:24434 (UDP)
@@ -119,8 +123,14 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 - 注册响应包含 `carrier` 时，优先向共享载体建立 `CHASTT-HOST2` 链路；同时
   下发 `carrier_v6` 时按本机可达的地址族排序，首选端点建链失败自动回退到
   另一个；没有共享载体则回退到中继端口的 TCP 载体；
-- 收到 `punch_peer` 后向查看者候选地址发探针（含查看者上报的 `upnp_port`
-  拼出的外部端点），打开本侧 NAT；
+- 收到 `punch_peer` 后向查看者候选地址发 `punch_probe`（含查看者上报的
+  `upnp_port` 拼出的外部端点），查看者回 `punch_ack` 才算回程可用；与主机
+  处于同一公网地址的查看者还会带来其局域网候选，这些地址与公网候选并行
+  探测，且不受对称 NAT 短路影响——局域网路径不经过 NAT；
+- 服务器经 UDP 会合端口下发 `tcp_punch`（带查看者 nonce）时，主机代理用同一
+  数据套接字向协调端口报到并留下 Ed25519 签名，再从这个协调连接的本地端口
+  向查看者预打洞 30 ms，随后在该端口监听并反拨查看者；认证通过的链路按
+  `tcp:<远端>` 单独路由转发，与 UDP 直连或中继互不干扰；
 - 收到的查看者数据报（直连来源、中继来源或载体帧）转发给 `--local` 指定的
   `chast-host`；`chast-host` 的回包发回最后一个远端来源。由于两侧代理都只有
   一个数据套接字，直连切中继时 QUIC 看到的五元组不变。
@@ -128,22 +138,33 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 查看者代理：
 
 - 用 `GET /v1/hosts/{id}` 查询在线状态、主机候选/局域网地址、NAT 类型、
-  中继地址、会合地址、身份绑定、主机名/平台/版本、`upnp_port` 与
-  `transport`（`direct`/`relay`/`carrier`）；离线主机仍返回持久记录与
+  中继地址、会合地址、TCP 打洞协调地址（`tcp_punch`）、身份绑定、
+  主机名/平台/版本、`upnp_port` 与 `transport`
+  （`direct`/`relay`/`carrier`）；离线主机仍返回持久记录与
   `last_seen_ms`，但不返回候选或令牌；
   查询返回的 `relay` 是该租约的主中继地址，续约不变，查看者无需在多个
   地址间自行选择；主机在线时还会得到共享载体地址（`carrier`，双栈时另有
   `carrier_v6`）与 `carrier_token`；
 - `relay_only` 为真时服务器不返回任何直连候选，`nat_type` 固定为
   `symmetric`；此时 `direct` 模式直接报错，`auto` 只会选择载体或中继；
-- `auto` 模式在有候选时先向主机候选地址发真实 QUIC 数据报并打洞，
-  `--direct-timeout` 内收到主机回包就锁定直连，否则切到中继端口并保持；
+- `auto` 模式先做本机 NAT 测试，并按 RustDesk 的 3 s/6 s/9 s 等待窗口发三次
+  打洞请求交换候选；每个候选轮次用新事务号发 `punch_probe`，只有 `punch_ack` 或
+  真实主机数据才锁定直连，`--direct-timeout` 内没有结果就切到中继并保持；
   `transport=carrier` 时直接使用共享载体；
+- 本机 NAT 被测为 `symmetric` 时 v4 直连窗口缩到 1 s，但 IPv6 与同网段候选
+  不受影响；查询带 `tcp_punch` 时，`auto`/`direct` 还会并行发起 TCP 打洞，
+  TCP 链路先建立就先锁定，之后不再接受 UDP 直连，避免两条路同时回包；
+- `punch_request` 同时上报本机局域网候选（`local_addrs`/`local_addrs_v6`）。
+  服务器只在查看者与主机的观察公网地址一致时把它们转给主机，因此同网段的
+  双方即使路由器不支持 hairpin 也能建立直连；跨网段时这些地址不会离开服务器，
+  主机也不会去探测陌生内网；
 - `relay` 优先 UDP 中继，主机只报告 `transport=carrier` 时改用载体；
   `carrier` 模式强制 `CHASTT-V2` 共享载体，链路断开按 0.5 s→5 s 退避重连，
   空闲每 30 s 发空帧保活；有 `carrier_v6` 时两个端点按本地地址族排序、
   拨号失败自动回退，路径事件报告实际使用的端点；
-- `direct` / `relay` / `carrier` 模式用于强制验证各条路径。
+- `direct` / `relay` / `carrier` / `tcp` 模式用于强制验证各条路径；`tcp`
+  只走打洞后的 TCP 链路（18 s 窗口内反复重拨），没有协调地址或主机公钥时
+  启动即报错。
 
 局域网内查看者也可以不经过代理，直接用查询到的候选地址连接 `chast-host`；
 代理主要解决跨网直连和中继回退。
@@ -160,9 +181,13 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | `keepalive_challenge` | 会合 → 主机 | `nonce`, `candidate` | 一次性 nonce 与服务器观察地址 |
 | `keepalive_auth` | 主机 → 会合 | `host_id`, `nonce`, `candidate`, `local_addrs`, `nat_type`, `upnp_port`, `signature` | 签名应答并上报候选 |
 | `keepalive_ack` | 会合 → 主机 | `ok`, `candidate`, `relay`, `local_addrs`, `nat_type`, `error` | 认证结果与中继地址 |
-| `punch_request` | 查看者 → 会合 | `host_id`, `nonce`, `upnp_port`（可选） | 请求与主机交换候选地址 |
-| `punch_peer` | 会合 → 双方 | `nonce`, `candidate`, `relay`, `public_key`, `binding`, `upnp_port`（可选） | 对方地址、身份绑定与 UPnP 映射端口 |
-| `punch` | 代理 ↔ 代理 | `nonce` | 打开 NAT 映射的探针，收到即说明路径可用 |
+| `punch_request` | 查看者 → 会合 | `host_id`, `nonce`, `nat_type`, `self_v6`, `local_addrs`, `local_addrs_v6`, `upnp_port`（可选） | 请求与主机交换候选地址；局域网地址只在与主机同一观察公网时转发 |
+| `punch_peer` | 会合 → 双方 | `nonce`, `candidate`, `candidate_v6`, `local_addrs`, `local_addrs_v6`, `relay`, `public_key`, `binding`, `nat_type`, `upnp_port`（可选） | 对方地址（含同网段局域网候选）、身份绑定与 UPnP 映射端口 |
+| `punch` | 代理 ↔ 代理 | `nonce` | 旧式打洞探针；收到即说明路径可用 |
+| `punch_probe` | 代理 ↔ 代理 | `nonce`, `tid` | 带事务号的打洞探针；主机只对已通知的查看者来源应答 |
+| `punch_ack` | 代理 → 代理 | `tid` | 回显事务号，证明回程可达；只有本轮 `tid` 才确认直连 |
+| `nat_probe` | 查看者 → 会合/中继 | `nonce` | 用同一套接字向两个服务器端口取公网映射 |
+| `nat_probe_ack` | 会合/中继 → 查看者 | `nonce`, `candidate` | 该端口观察到的源地址 |
 | `relay_hello` | 主机 → 中继 | `host_id` | 请求中继挑战 |
 | `relay_challenge` | 中继 → 主机 | `nonce` | 一次性 nonce |
 | `relay_auth` | 主机 → 中继 | `host_id`, `nonce`, `signature` | 绑定中继端口与主机侧地址 |
@@ -178,6 +203,20 @@ relay     : domain | host_id | relay_port | candidate | nonce
 carrier   : domain | host_id | candidate | nonce
 register  : domain | host_id | fingerprint | unix_timestamp
 ```
+
+TCP 打洞协调走独立 TCP 监听（默认取 `--punch-listen` 的端口号；`off` 关闭，
+其他值可显式指定）。协调连接上的每条报文是一个**载体帧**（`u32le length |
+payload`，payload 是完整控制报文），不是 UDP 数据报：
+
+1. 双方各发一条 `tcp_punch` 报到；查看者用 `auth` 证明 server-key
+   （`chast-punch-v1` HMAC），主机用 `signature` 证明注册私钥
+   （`chast-tcp-punch-v1`，覆盖 id、nonce、role 与时间戳）。
+2. 服务器按 `host_id + nonce` 配对两半，把对方的 TCP 观察地址作为
+   `candidate` 分别回给两侧；查看者先到时，服务器还会经 UDP 会合端口向主机
+   连发三次触发（250 ms 间隔），因为 NAT 后的主机无法被直接拨入。
+3. 两侧保留协调连接的本地端口，用它向对方 `candidate` 拨号；主机随后在同一
+   端口监听并反拨。链路首条报文是签名 `tcp_direct`，查看者校验主机公钥与
+   nonce 后才开始承载数据报。
 
 ### 共享载体（TCP 8445 / WebSocket）
 
@@ -216,8 +255,8 @@ wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）�
 
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
-| `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、`transport`、`relay_only` 与可选的 `software`；共享载体（`carrier`/`carrier_v6`）与令牌只在该主机在线时返回 |
+| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`tcp_punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
+| `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、TCP 打洞协调地址 `tcp_punch`、`transport`、`relay_only` 与可选的 `software`；共享载体（`carrier`/`carrier_v6`）与令牌只在该主机在线时返回 |
 | `GET` | `/v1/hosts?ids=<id,...>` | 配置了 server-key 时需要 Bearer server-key | 批量查询，逗号分隔、最多 200 个 ID；返回 `hosts` 数组（字段同单机查询）、`missing` 未知 ID 列表与顶层 `software` |
 | `PATCH` | `/v1/identities/{id}` | Bearer server-key | 设置或清除运营者别名/标签；省略字段保持不变，`""`/`[]` 表示清除 |
 | `GET` | `/v1/identities?q=&online=&limit=&offset=` | Bearer server-key | 全量持久身份（含离线）：`identities`（注册表字段 + `online`、在线时的 `relay`/`candidate`、`last_seen_ms`）、过滤后的 `total` 与 `online`；`q` 对 ID/指纹/主机名/平台/版本/别名/标签做大小写不敏感子串匹配，`online=1`（或 `true`）只返回在线；`limit` 1–1000 默认 200、`offset` 0–1000000 |
@@ -279,7 +318,7 @@ wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）�
 | `DELETE` | `/v1/hosts/{id}` | Bearer server-key | 主机主动下线并释放中继端口，保留永久身份 |
 | `DELETE` | `/v1/identities/{id}` | Bearer server-key | 管理员重置丢失密钥的主机身份 |
 | `POST` | `/v1/hosts/{id}/audit` | 主机 Ed25519 签名（按 `audit_ref`） | 主机上报一条入站审计：`kind`（`session`/`file`）、`audit_ref`、时间/方向/文件名/大小/结果/说明，以及 `signature`。签名覆盖域分隔的规范消息 `chast-host-audit-v1`；未知主机 404、签名无效 401、时间偏差超过 2 分钟或字段非法 400。会话与查看器记录按引用合并，文件保存为主机逐文件行；返回 201 与规范化后的记录 |
-| `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体（`carrier`/`carrier_v6`）、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
+| `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、TCP 打洞协调地址（`tcp_punch`）、共享载体（`carrier`/`carrier_v6`）、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
 | `GET` | `/v1/audit?limit=N&action=<action>&before_id=<id>&format=json\|csv` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤，`before_id` 取上一页返回的 `next_before_id` 续页；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数），未启用账号存储返回 503 |
 | `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail` 与 `direction`；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大或方向非法返回 400 |
@@ -773,20 +812,44 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
 - 公网地址由服务器在 UDP 会合端口观察得到，不信任客户端自报；主机的候选地址
   是其数据套接字到会合端口的映射。主机随后把同一套接字在中继端口上的映射与
   它会合映射比较：端口一致记为 `asymmetric`（锥形 NAT），不一致记为
-  `symmetric`，尚无法判断时为 `unknown`。
+  `symmetric`，尚无法判断时为 `unknown`。查看者在首次打洞前用
+  `nat_probe`/`nat_probe_ack` 对会合与中继两个端口做同样的测试，结果随
+  `punch_request` 上报；它在自己的 v4 直连预算上直接生效（对称时 1 s）。
+- 任一方为 `symmetric` 时主机跳过公网 v4 打洞——对称 NAT 每个目的地分配新
+  端口，观察到的候选必然打不通——但 UPnP 映射端点、IPv6 候选和同网段候选
+  照常探测：它们不依赖那个逐目的地映射。这与 RustDesk 在对称 NAT 下仍尝试
+  v6 与 intranet 路径的行为一致。
 - 主机代理从绑定套接字枚举本机单播地址，作为 `local_addrs` 随 keepalive 上报；
   查询的 `candidates` 会把公网观察地址与局域网地址去重合并。局域网地址仅为
   提示，服务端不会用它替代观察地址。
-- 双方从**同一个**数据套接字向对方候选地址发探针，打洞对锥形 NAT
-  （全锥/受限/端口受限）有效。对称 NAT 下不同目的地的映射端口不同，直连会
-  失败，查看者代理在 `--direct-timeout` 后自动切中继；这是有意保留的回退，
-  不伪装成"总能直连"。
+- 同网段直达：查看者在 `punch_request` 里上报自己的局域网候选，服务器**仅在
+  观察到的公网 IPv4 地址与主机一致时**把它们转给主机。主机把局域网候选与
+  公网候选并行探测，且不看对称 NAT 结论——局域网路径不经过 NAT，这正是
+  路由器不支持 hairpin 时唯一可行的直连。跨公网地址上报的局域网候选不会
+  转发，避免让主机探测陌生内网；这对应 RustDesk 的 `FetchLocalAddr` 同网段
+  路径。
+- 双方从**同一个**数据套接字向对方候选地址发 `punch_probe`，每轮使用一个新
+  事务号；只有该事务号以 `punch_ack` 回来（或真实主机数据到达）才算直连
+  成功，单向来包不锁定。探测间隔从 20 ms 按 1.5× 退避到 200 ms，窗口 3 s，
+  对应 RustDesk `punch_udp` 的 `MAX_TIME`；请求本身发三次，等待窗口 3/6/9 s。
+  该路径对锥形 NAT（全锥/受限/端口受限）有效。对称 NAT 下不同目的地的映射
+  端口不同，公网 v4 直连会失败，查看者代理在 `--direct-timeout` 后自动切
+  中继；这是有意保留的回退，不伪装成"总能直连"。
 - `--upnp` 是这种回退之外的可选补救：代理向本地 IGD 申请固定外部端口后，
   对方可以用“观察到的公网 IP + 映射外部端口”直接发探针，不必依赖对称 NAT
   的逐目的地映射。该端口由代理自报、经签名 keepalive 传给服务器，属于
   **提示而非可信地址**；服务器仍以 UDP 观察值为准，映射失败或路由器不响应
   SSDP 时行为与未启用时一致。目前只处理 IPv4 与 WANIPConnection/
   WANPPPConnection，不覆盖 IPv6 防火墙规则。
+- TCP 打洞是对称 NAT 与“UDP 被防火墙拦截”的补充（`--tcp-punch-listen`，
+  默认与 UDP 会合同端口号，关闭用 `off`）。协调服务器只配对两半并回给对方
+  观察地址，不转发任何会话数据；真正的链路由两端直接建立，按载体帧承载同一
+  批不透明数据报。`auto`/`direct` 下 TCP 与 UDP 并行尝试，TCP 先建成即接管，
+  UDP 数据随后被忽略；`--mode tcp` 只走 TCP 且在 18 s 内按 0.15 s 起、
+  1.5× 退避、上限 2 s 的间隔反复重拨。防火墙需同时放行该端口的 TCP 与 UDP，
+  否则 `auto` 仍会按上述预算回退中继。
+- TCP 链路与 UDP 直连一样按查看者隔离：主机为每条链路建一个 `tcp:<远端>`
+  本地路由，链路关闭即撤销；一条链路的失败或超时不会影响其他查看者。
 - 中继端口按主机分配，服务器重启后重新分配；主机代理会在续约时更新地址。
   `--state` 是 SQLite 对等数据库（默认 `chast-server-state.db`），重启后恢复
   ID 绑定与最近一次元数据（租约与中继端口不持久化，主机重新注册时再分配）。
@@ -840,6 +903,13 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   数据报直接丢弃；TCP/WS 载体同样在首条 hello 校验该令牌。主机侧仍只有用注册
   公钥通过 `relay_hello`/载体挑战的链路才能占用槽位；查看者令牌只在该主机在线
   时由查询返回，租约失效后轮换。
+- **TCP 打洞认证**：`tcp_punch-listen` 的协调端口单独验签：查看者出示
+  server-key HMAC，主机出示 `chast-tcp-punch-v1` Ed25519 签名，nonce 一次性
+  配对、±60 s 时间窗、按源 IP 限速；未通过验证的报到只收到 `error`，不会
+  交换任何地址或触发主机。打洞出的 TCP 链路由主机签名
+  （`chast-tcp-direct-v1`，覆盖 host id 与协调 nonce）作首条报文，查看者
+  用查询得到的 host 公钥复核，随后还要在 `tcp_direct` 握手中回显同一 nonce；
+  协调服务器既不能冒充主机，也不能把两个不同会话接在一起。
 - **查询隐私**：离线主机仍返回身份与绑定（供查看者预校验），但不返回候选、
   共享载体与令牌；配置 server-key 后查询本身也需要 Bearer，`/v1/stats` 与
   `/metrics` 同样需要认证。
@@ -1455,8 +1525,10 @@ chast-tunnel viewer --server http://127.0.0.1:8443 --server-key dev-secret \
 chast-quic connect --host 127.0.0.1 --port 24434 --token <token>
 ```
 
-`--mode relay` 强制中继，`--mode direct` 只走打洞直连，`--mode carrier` 强制
-共享载体，用于分别验证各条路径。`--upnp` 让主机或查看者尝试在本地网关上
+`--mode relay` 强制中继，`--mode direct` 只走打洞直连（UDP 或 TCP），
+`--mode carrier` 强制共享载体，`--mode tcp` 只走打洞后的 TCP 链路，用于分别
+验证各条路径。默认 TCP 打洞协调与 `--punch-listen` 同端口号；`--tcp-punch-listen
+off` 关闭，显式地址可单独监听。`--upnp` 让主机或查看者尝试在本地网关上
 映射自己的 UDP 端口并随查询/打洞交换（缺省关闭；没有 IGD 时只记警告）。服务器加 `--relay-only` 后不再下发直连候选，
 效果类似 RustDesk 的 `ALWAYS_USE_RELAY`；`--state ""` 与 `--identity ""` 用于
 一次性测试；`--host-ttl` 和 `--offline-after` 控制租约与在线判定；
@@ -1465,7 +1537,11 @@ chast-quic connect --host 127.0.0.1 --port 24434 --token <token>
 127.0.0.1,127.0.0.2`，再用管理通道 `rs`/`tg` 查看分配。IP 变更审计默认
 启用（180 s 窗口、360 s 保留，上限 65536 个 ID）。
 `chast-tunnel host --help` / `viewer --help` / `discover --help` /
-`apply-update --help` 列出全部参数。
+`apply-update --help` 列出全部参数。`host` 与 `viewer` 都支持
+`--server-key-stdin`：解析参数后从 stdin 第一行读取并去掉 CRLF，空密钥或
+读取失败直接退出；`--server-key` 仅保留给手工调试，它会出现在进程命令行。
+嵌入调用应使用 stdin 传递密钥（Flutter 查看器已这样做）；托盘主机目前仍从
+`host.ini` 读取后经 `--server-key` 传递。
 
 ## 查看者集成（Flutter）
 
@@ -1564,7 +1640,7 @@ server_key=...
 tunnel_id=devbox
 tunnel_key=...
 tunnel_old_id=
-tunnel_listen=0.0.0.0:14434
+tunnel_listen=[::]:14434
 carrier=1
 ```
 
@@ -1576,7 +1652,8 @@ carrier=1
   自动填入旧值，代理以 `--old-id` 提交并回显 `migrated_from`，确认后自动清空；
   正常情况下为空。
 - `tunnel_listen` 必须与主机 QUIC 的 `port` 不同（两者都是 UDP 监听），默认
-  `0.0.0.0:14434`。`carrier=1`（默认）让 HostServer 在 `port+1` 上监听 TCP/WS
+  `[::]:14434`（双栈，IPv4 与 IPv6 打洞共用；没有 IPv6 的系统自动回退到
+  `0.0.0.0:14434`）。`carrier=1`（默认）让 HostServer 在 `port+1` 上监听 TCP/WS
   载体；托盘“允许防火墙”为主机端口与隧道端口各建一条按程序限定的 UDP 入站
   规则，并加一条载体 TCP 规则和一条 `chast-tunnel.exe` 的 21129/UDP 局域网
   发现规则；禁用隧道服务时会删除这些规则。
@@ -2612,6 +2689,24 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   且没有“账号”页签。
 - 边界：浏览器验收使用单机回环与临时数据；未做真实跨网大文件下载或并发
   运营者操作。
+
+2026-11-07，打洞与 RustDesk 对齐（NAT 类型、probe/ACK、IPv6、同网段、TCP
+打洞）在单机回环上验证：
+
+- 自动化：`go test ./...` 全部通过。`internal/rendezvous` 覆盖 NAT 观察点
+  （`TestNatProbeReportsObservedSource`、短 nonce 丢弃）、TCP 打洞配对
+  （双方拿到对方套接字的观察地址）、错误主机签名、查看者缺 HMAC 被拒绝；
+  `internal/agent` 覆盖查看者自己的 NAT 分类与 1 s 短路、对称 NAT 下主机跳过
+  v4 但继续探测 UPnP/IPv6/局域网、双栈并行、probe/ACK 事务号、
+  `TestTCPPunchPathThroughAgents`（进程内服务器 + 真实 TCP 打洞链路完成
+  QUIC 数据报回环，路径报告 `direct/tcp`）与 relay-only 拒绝 TCP 模式。
+- 回环观察（集成测试日志）：TCP 打洞协调监听与 UDP 会合同端口；
+  `--mode tcp` 的查看者在约 0.1 s 内建立链路，路径事件为
+  `direct`/`transport=tcp`；查看者退出后主机记录 “TCP viewer path closed”
+  并撤销该路由。
+- 边界：本机只有一张网卡且无真实 NAT，对称 NAT 分类、跨网锥形 NAT 打洞、
+  IPv6 打洞与 TCP 打洞在真实家庭/公司网络下的成功率仍需双机复核；验收步骤
+  见 `docs/nat-traversal-2026-11-07.md`。
 
 环境边界：单机回环只有一张网卡，`symmetric` NAT 分类、局域网候选与跨网行为需要
 双机复核。IPv6 会合、打洞与中继已在单机双栈回环验证（服务端

@@ -62,6 +62,7 @@ func run() error {
 	var (
 		httpListen       = flag.String("http-listen", "0.0.0.0:8443", "HTTP registration and lookup address")
 		punchListen      = flag.String("punch-listen", "0.0.0.0:8444", "UDP rendezvous and punch address")
+		tcpPunchListen   = flag.String("tcp-punch-listen", "", "TCP punch coordination address; empty uses the same port as --punch-listen, off disables it")
 		relayListen      = flag.String("relay-listen", "0.0.0.0", "IP address for relay UDP ports")
 		relayV6          = flag.String("relay-listen-v6", "", "optional IPv6 address for relay UDP ports, same port numbers as --relay-listen")
 		portRange        = flag.String("relay-ports", "41000-41099", "relay UDP ports, e.g. 41000-41099")
@@ -733,13 +734,23 @@ func run() error {
 		log.Info("relay nodes configured", "nodes", pool.NodeURLs(), "health_interval", *relayHealth)
 	}
 
-	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log,
+	meetOpts := []rendezvous.Option{
 		rendezvous.WithReadBuffer(*rmem),
 		rendezvous.WithPunchRateMax(*punchRateMax),
 		rendezvous.WithKeepaliveRateMax(*keepaliveRate),
 		rendezvous.WithServerKey(*serverKey),
 		rendezvous.WithTracer(tracer),
-	)
+		rendezvous.WithRelayOnly(func() bool { return relayOnlyFlag.Load() }),
+	}
+	switch *tcpPunchListen {
+	case "":
+		// Derived from the bound UDP address, which shares the port.
+	case "off":
+		meetOpts = append(meetOpts, rendezvous.WithTCPPunchListen(""))
+	default:
+		meetOpts = append(meetOpts, rendezvous.WithTCPPunchListen(*tcpPunchListen))
+	}
+	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log, meetOpts...)
 	if err != nil {
 		return err
 	}
@@ -752,6 +763,15 @@ func run() error {
 		return err
 	}
 	punchAddr := net.JoinHostPort(advertised, punchPortText)
+	tcpPunchAddr := ""
+	if tcpAddr := meet.TCPAddr(); tcpAddr != "" {
+		_, tcpPort, err := net.SplitHostPort(tcpAddr)
+		if err != nil {
+			return err
+		}
+		tcpPunchAddr = net.JoinHostPort(advertised, tcpPort)
+		log.Info("TCP punch advertised", "addr", tcpPunchAddr)
+	}
 	punchAddrV6 := ""
 	if *advertiseV6 != "" {
 		punchAddrV6 = net.JoinHostPort(strings.Trim(*advertiseV6, "[]"), punchPortText)
@@ -999,6 +1019,7 @@ func run() error {
 		Identity:      serverIdentity,
 		PunchAddr:     punchAddr,
 		PunchAddrV6:   punchAddrV6,
+		TCPPunchAddr:  tcpPunchAddr,
 		RelayHost:     advertised,
 		ServerKey:     *serverKey,
 		WakeRelays:    wakeRelays,

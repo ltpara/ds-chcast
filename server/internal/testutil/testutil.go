@@ -119,6 +119,7 @@ type Server struct {
 	HTTP       *httptest.Server
 	URL        string
 	Punch      string
+	TCPPunch   string
 	RelayHost  string
 	Carrier    string
 	RelayOnly  *atomic.Bool
@@ -201,8 +202,11 @@ func StartWith(t testing.TB, opts Options) *Server {
 	relayAddr := func(port int) string {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	}
+	relayOnly := &atomic.Bool{}
+	relayOnly.Store(opts.RelayOnly)
 	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log,
 		rendezvous.WithServerKey(ServerKey),
+		rendezvous.WithRelayOnly(relayOnly.Load),
 	)
 	if err != nil {
 		rm.Close()
@@ -214,8 +218,6 @@ func StartWith(t testing.TB, opts Options) *Server {
 	ipChanges := ipchange.New(0)
 	meet.SetIPChanges(ipChanges)
 	go meet.Serve()
-	relayOnly := &atomic.Bool{}
-	relayOnly.Store(opts.RelayOnly)
 	relayServers := opts.RelayServers
 	if len(relayServers) == 0 {
 		relayServers = []string{"127.0.0.1"}
@@ -284,6 +286,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		Relay:                      rm,
 		Identity:                   serverIdentity,
 		PunchAddr:                  meet.Addr(),
+		TCPPunchAddr:               meet.TCPAddr(),
 		RelayHost:                  "127.0.0.1",
 		ServerKey:                  ServerKey,
 		WakeRelays:                 opts.WakeRelays,
@@ -335,6 +338,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		HTTP:       hs,
 		URL:        hs.URL,
 		Punch:      meet.Addr(),
+		TCPPunch:   meet.TCPAddr(),
 		RelayHost:  "127.0.0.1",
 		Carrier:    rm.CarrierAddr(),
 		RelayOnly:  relayOnly,

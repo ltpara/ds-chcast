@@ -65,6 +65,10 @@ type Config struct {
 	// server derives one from the address a registration arrived on, which is
 	// correct for a directly reachable dual-stack server.
 	PunchAddrV6 string
+	// TCPPunchAddr is the advertised TCP punch coordination endpoint. Empty
+	// leaves the TCP fallback unavailable; looking up a host through a
+	// relay-only server also omits it.
+	TCPPunchAddr string
 	// Hostname or IP advertised for relay ports.
 	RelayHost string
 	ServerKey string
@@ -365,6 +369,7 @@ type registerResponse struct {
 	Relays          []string `json:"relays,omitempty"`
 	Punch           string   `json:"punch"`
 	PunchV6         string   `json:"punch_v6,omitempty"`
+	TCPPunch        string   `json:"tcp_punch,omitempty"`
 	ExpiresInSec    int64    `json:"expires_in_sec"`
 	PublicKey       string   `json:"public_key,omitempty"`
 	ServerPublicKey string   `json:"server_public_key,omitempty"`
@@ -417,6 +422,7 @@ type lookupResponse struct {
 	Relays          []string `json:"relays,omitempty"`
 	Punch           string   `json:"punch"`
 	PunchV6         string   `json:"punch_v6,omitempty"`
+	TCPPunch        string   `json:"tcp_punch,omitempty"`
 	Fingerprint     string   `json:"fingerprint,omitempty"`
 	PublicKey       string   `json:"public_key,omitempty"`
 	ServerPublicKey string   `json:"server_public_key,omitempty"`
@@ -585,6 +591,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Relays:          relays,
 		Punch:           s.cfg.PunchAddr,
 		PunchV6:         s.punchV6(r),
+		TCPPunch:        s.cfg.TCPPunchAddr,
 		ExpiresInSec:    int64(s.cfg.TTL / time.Second),
 		PublicKey:       host.PublicKey,
 		ServerPublicKey: s.cfg.Identity.PublicKeyText(),
@@ -770,6 +777,10 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 		resp.LocalAddrsV6 = host.LocalAddrsV6
 		resp.NATType = host.NATType
 		resp.UpnpPort = host.UpnpPort
+		// TCP punching is a direct path too, and the listener refuses while
+		// relay-only, so a viewer is never told about an endpoint that would
+		// turn it down.
+		resp.TCPPunch = s.cfg.TCPPunchAddr
 	}
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
@@ -924,6 +935,7 @@ func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 		"public_key":            s.cfg.Identity.PublicKeyText(),
 		"punch":                 s.cfg.PunchAddr,
 		"punch_v6":              s.cfg.PunchAddrV6,
+		"tcp_punch":             s.cfg.TCPPunchAddr,
 		"carrier":               carrier,
 		"carrier_v6":            s.localCarrierV6(),
 		"tls":                   s.cfg.TLS,

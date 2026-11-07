@@ -440,10 +440,10 @@ func (r *Registry) Online(host Host) bool {
 func (r *Registry) Touch(id, candidate string, localAddrs []string, natType string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.touchLocked(id, candidate, localAddrs, natType, 0)
+	return r.touchLocked(id, candidate, localAddrs, natType, 0, "")
 }
 
-func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natType string, upnpPort int) error {
+func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natType string, upnpPort int, selfV6 string) error {
 	host, ok := r.hosts[id]
 	if !ok {
 		return ErrUnknownHost
@@ -461,6 +461,12 @@ func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natTyp
 			host.CandidateV6 = candidate
 		} else {
 			host.Candidate = candidate
+			// The rendezvous port was reached over IPv4, so it can never see the
+			// host's IPv6 mapping. Trust the authenticated host's reported
+			// endpoint instead, which is what RustDesk's local_addr_v6 does.
+			if selfV6 != "" && isIPv6Text(selfV6) {
+				host.CandidateV6 = selfV6
+			}
 		}
 	}
 	if localAddrs != nil {
@@ -785,8 +791,10 @@ func (r *Registry) CheckChallenge(id, purpose, nonce, message, signature string)
 
 // TouchChallenge verifies and records a keepalive in one step. The observed
 // candidate is part of the signed message, so a replay from another address
-// cannot move the host's mapping.
-func (r *Registry) TouchChallenge(id, nonce, candidate, signature, message string, localAddrs []string, natType string, upnpPort int) error {
+// cannot move the host's mapping. selfV6 is the host's own IPv6 endpoint: it
+// is only used when the keepalive itself arrived over IPv4, because then the
+// rendezvous port can never observe the IPv6 mapping.
+func (r *Registry) TouchChallenge(id, nonce, candidate, signature, message string, localAddrs []string, natType string, upnpPort int, selfV6 string) error {
 	_, err := r.verifyChallenge(id, identity.DomainKeepalive, challengeScope(candidate),
 		nonce, message, signature)
 	if err != nil {
@@ -794,7 +802,7 @@ func (r *Registry) TouchChallenge(id, nonce, candidate, signature, message strin
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.touchLocked(id, candidate, localAddrs, natType, upnpPort)
+	return r.touchLocked(id, candidate, localAddrs, natType, upnpPort, selfV6)
 }
 
 // challengeScope matches the family used by IssueChallengeScoped for a
