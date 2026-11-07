@@ -3,6 +3,8 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -343,6 +345,100 @@ void test_ipv4() {
     check(!chast::ipv4_in_ranges(address, {}), "an empty list matches nothing");
 }
 
+void test_ipv6() {
+    std::array<uint8_t, 16> address{};
+    check(chast::parse_ipv6("2001:db8::1", address) && address[0] == 0x20 &&
+              address[1] == 0x01 && address[2] == 0x0d && address[3] == 0xb8 &&
+              address[14] == 0 && address[15] == 1,
+          "IPv6 parses a compressed address");
+    check(chast::parse_ipv6("::1", address) && address[15] == 1, "IPv6 parses the loopback");
+    check(chast::parse_ipv6("::", address) && address == std::array<uint8_t, 16>{},
+          "IPv6 parses the unspecified address");
+    check(chast::parse_ipv6("2001:DB8:0:0:0:0:0:1", address) && address[15] == 1,
+          "IPv6 accepts uppercase hex and full groups");
+    check(chast::parse_ipv6("fe80::1%eth0", address) && address[15] == 1,
+          "IPv6 ignores a zone suffix");
+    check(chast::parse_ipv6("::ffff:192.168.1.10", address) && address[12] == 192 &&
+              address[15] == 10,
+          "IPv6 accepts a dotted-quad tail");
+
+    check(!chast::parse_ipv6("1:2:3:4:5:6:7", address), "IPv6 rejects seven groups");
+    check(!chast::parse_ipv6("1:2:3:4:5:6:7:8:9", address), "IPv6 rejects nine groups");
+    check(!chast::parse_ipv6("1::2::3", address), "IPv6 rejects two gaps");
+    check(!chast::parse_ipv6("2001:db8::1:", address),
+          "IPv6 rejects a single trailing colon after compression");
+    check(!chast::parse_ipv6("1:2:3:4:5:6:7:8:", address),
+          "IPv6 rejects a single trailing colon after eight groups");
+    check(chast::parse_ipv6("2001:db8::", address),
+          "IPv6 still accepts trailing zero compression");
+    check(!chast::parse_ipv6("12345::", address), "IPv6 rejects a five-digit group");
+    check(!chast::parse_ipv6("::1.2.3.4:5", address), "IPv6 rejects a tail that is not last");
+    check(!chast::parse_ipv6("", address), "IPv6 rejects an empty string");
+    check(!chast::parse_ipv6("2001:db8::zz", address), "IPv6 rejects a non-hex group");
+
+    chast::Ipv6Range range;
+    chast::parse_ipv6_cidr("2001:db8::/32", range);
+    chast::parse_ipv6("2001:db8:ffff::1", address);
+    check(range.prefix == 32 && chast::ipv6_in_range(address, range),
+          "an IPv6 CIDR contains a later subnet");
+    chast::parse_ipv6("2001:db9::1", address);
+    check(!chast::ipv6_in_range(address, range), "an IPv6 CIDR excludes a neighbour");
+
+    check(chast::parse_ipv6_cidr("::/0", range) && range.prefix == 0, "IPv6 accepts /0");
+    chast::parse_ipv6("2001:4860::8888", address);
+    check(chast::ipv6_in_range(address, range), "IPv6 /0 matches everything");
+
+    check(chast::parse_ipv6_cidr("2001:db8::5/128", range) && range.prefix == 128,
+          "IPv6 accepts /128");
+    chast::parse_ipv6("2001:db8::5", address);
+    check(chast::ipv6_in_range(address, range), "IPv6 /128 matches exactly");
+    chast::parse_ipv6("2001:db8::6", address);
+    check(!chast::ipv6_in_range(address, range), "IPv6 /128 rejects a neighbour");
+    check(!chast::parse_ipv6_cidr("2001:db8::/129", range), "IPv6 rejects /129");
+
+    chast::parse_ipv6("2001:db8:1:2:3:4:5:6", address);
+    check(chast::format_ipv6_prefix(address, 64) == "2001:db8:1:2::/64",
+          "an IPv6 prefix formats with the compressed zero run");
+    chast::parse_ipv6("2001:0db8:0000:0000:0000:0000:0000:0001", address);
+    check(chast::format_ipv6_prefix(address, 48) == "2001:db8::/48",
+          "prefix formatting is canonical");
+    chast::parse_ipv6("::", address);
+    check(chast::format_ipv6_prefix(address, 0) == "::/0", "the all-zero prefix formats");
+
+    chast::IpAddress single;
+    check(chast::parse_ip_address("192.168.1.1", single) && !single.ipv6 &&
+              single.bytes[0] == 192,
+          "a plain address parses as IPv4");
+    check(chast::parse_ip_address("[2001:db8::1]", single) && single.ipv6,
+          "a bracketed literal parses as IPv6");
+    check(chast::parse_ip_address("::ffff:10.0.0.1", single) && !single.ipv6 &&
+              single.bytes[0] == 10 && single.bytes[3] == 1,
+          "a mapped literal folds to IPv4");
+    check(!chast::parse_ip_address("not-an-address", single),
+          "a non-address does not parse");
+
+    chast::IpRange list_entry;
+    check(chast::parse_ip_cidr("::ffff:192.168.0.0/112", list_entry) && !list_entry.ipv6 &&
+              list_entry.prefix == 16,
+          "a mapped CIDR becomes the equivalent IPv4 range");
+    check(!chast::parse_ip_cidr("::ffff:192.168.0.0/64", list_entry),
+          "a mapped CIDR wider than the IPv4 block is rejected");
+
+    chast::IpRange v4_entry;
+    chast::IpRange v6_entry;
+    chast::parse_ip_cidr("10.0.0.0/8", v4_entry);
+    chast::parse_ip_cidr("2001:db8::/32", v6_entry);
+    const std::vector<chast::IpRange> mixed = {v4_entry, v6_entry};
+    chast::parse_ip_address("10.1.2.3", single);
+    check(chast::ip_in_ranges(single, mixed), "a mixed list matches its IPv4 entry");
+    chast::parse_ip_address("2001:db8::9", single);
+    check(chast::ip_in_ranges(single, mixed), "a mixed list matches its IPv6 entry");
+    chast::parse_ip_address("172.16.0.1", single);
+    check(!chast::ip_in_ranges(single, mixed), "a mixed list rejects an outsider");
+    chast::parse_ip_address("2001:db9::9", single);
+    check(!chast::ip_in_ranges(single, mixed), "family and prefix both have to match");
+}
+
 }  // namespace
 
 int main() {
@@ -353,6 +449,7 @@ int main() {
     test_dpapi();
     test_device_identity();
     test_ipv4();
+    test_ipv6();
     if (failures != 0) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

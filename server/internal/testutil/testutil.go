@@ -48,6 +48,7 @@ type Options struct {
 	// RequireHostMetadata mirrors --require-host-metadata-signature.
 	RequireHostMetadata bool
 	RelayOnly           bool
+	WakeRelays          map[string][]string
 	Registration        *abuse.Blocker
 	RelayServers        []string
 	// RelayNodes are standalone relay node base URLs. RelayNodeKey is their
@@ -285,6 +286,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		PunchAddr:                  meet.Addr(),
 		RelayHost:                  "127.0.0.1",
 		ServerKey:                  ServerKey,
+		WakeRelays:                 opts.WakeRelays,
 		TTL:                        60 * time.Second,
 		Logger:                     log,
 		Limiter:                    ratelimit.New(opts.RateLimit, opts.RateBurst),

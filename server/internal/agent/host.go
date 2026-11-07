@@ -766,11 +766,11 @@ func (h *HostAgent) acceptsControl(src, punch, punch6 *net.UDPAddr) bool {
 }
 
 // acceptViewerSourceLocked reports whether data from src may become the
-// forwarding target. The current remote, a relay endpoint and a recently
-// punched viewer address qualify; anything else would let a single stray
-// datagram steal the return path.
+// forwarding target. A live local route, a relay endpoint and a recently
+// punched viewer address qualify. Each admitted viewer keeps its own route;
+// the most recently received viewer must not revoke the others after punch TTL.
 func (h *HostAgent) acceptViewerSourceLocked(src *net.UDPAddr) bool {
-	if h.remote != nil && sameAddr(h.remote, src) {
+	if h.routes.contains(src.String()) {
 		return true
 	}
 	for _, relay := range h.relayEndpointsLocked() {

@@ -15,6 +15,7 @@ type auditEventView struct {
 	Action      string `json:"action"`
 	Detail      string `json:"detail"`
 	ClientIP    string `json:"client_ip"`
+	HostID      string `json:"host_id,omitempty"`
 	Success     bool   `json:"success"`
 }
 
@@ -83,6 +84,7 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 			Action:      event.Action,
 			Detail:      event.Detail,
 			ClientIP:    event.ClientIP,
+			HostID:      event.HostID,
 			Success:     event.Success,
 		})
 	}

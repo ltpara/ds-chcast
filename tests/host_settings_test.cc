@@ -88,6 +88,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_remote_config == b.allow_remote_config &&
            a.lock_after_session_end == b.lock_after_session_end &&
            a.auto_disconnect_minutes == b.auto_disconnect_minutes &&
+           a.trusted_device_days == b.trusted_device_days &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
            a.allow_permission_change == b.allow_permission_change &&
@@ -133,6 +134,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_remote_config = true;
     settings.lock_after_session_end = true;
     settings.auto_disconnect_minutes = 30;
+    settings.trusted_device_days = 30;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
     settings.password_hash =
@@ -710,17 +712,29 @@ void test_audit_spool(const std::filesystem::path& dir) {
     file.occurred_at_ms = 1700000004000;
     check(chast::append_audit_file(spool, file, &error), "a file record is appended");
 
+    chast::AuditDenialRecord denial;
+    denial.address = "203.0.113.9:5000";
+    denial.code = 9;
+    denial.occurred_at_ms = 1700000006000;
+    denial.detail = "this address is not on the host's allow list";
+    check(chast::append_audit_denial(spool, denial, &error), "a denial record is appended");
+
     std::ifstream in(folder / L"events.jsonl", std::ios::binary);
     std::string first;
     std::string second;
-    check(static_cast<bool>(std::getline(in, first)) && static_cast<bool>(std::getline(in, second)),
-          "both spool lines are readable");
+    std::string third;
+    check(static_cast<bool>(std::getline(in, first)) && static_cast<bool>(std::getline(in, second)) &&
+              static_cast<bool>(std::getline(in, third)),
+          "all three spool lines are readable");
     check(first ==
               R"({"kind":"session","audit_ref":"00112233aabbccdd","viewer_ref_absent":false,"started_at_ms":1700000000000,"ended_at_ms":1700000005000,"success":false,"detail":"the \"viewer\" left"})",
           "the session line matches the agent's JSON shape");
     check(second ==
               R"({"kind":"file","audit_ref":"00112233aabbccdd","viewer_ref_absent":false,"direction":"upload","name":"报告\nb.txt","size":42,"occurred_at_ms":1700000004000,"success":true,"detail":""})",
           "the file line escapes the name and carries the size");
+    check(third ==
+              R"({"kind":"denial","address":"203.0.113.9:5000","denial":9,"occurred_at_ms":1700000006000,"detail":"this address is not on the host's allow list"})",
+          "the denial line carries the address, code and reason");
 
     // A spool nobody consumes must stay bounded: an append past the cap
     // rotates the full file to .1 and starts a fresh active file.
@@ -771,6 +785,42 @@ void test_idle_timeout_settings(const std::filesystem::path& dir) {
           "a saved idle timeout survives a reload");
 }
 
+void test_trusted_device_lifetime_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "trust-days.ini";
+    check(chast::HostSettings{}.trusted_device_days == 90,
+          "a trusted device lasts 90 days by default");
+
+    write_text(path, "trusted_device_days=0\n");
+    const chast::HostSettingsLoad never = chast::load_host_settings(path.string());
+    check(never.warning.empty() && never.settings.trusted_device_days == 0,
+          "zero days keeps trusted devices forever");
+
+    write_text(path, "trusted_device_days=7\n");
+    const chast::HostSettingsLoad week = chast::load_host_settings(path.string());
+    check(week.warning.empty() && week.settings.trusted_device_days == 7,
+          "a short trusted-device lifetime is read back");
+
+    write_text(path, "trusted_device_days=3651\n");
+    const chast::HostSettingsLoad too_long = chast::load_host_settings(path.string());
+    check(too_long.settings.trusted_device_days == 90 &&
+              too_long.warning.find("trusted_device_days") != std::string::npos,
+          "a lifetime beyond ten years is reported and the default kept");
+
+    write_text(path, "trusted_device_days=soon\n");
+    const chast::HostSettingsLoad bad = chast::load_host_settings(path.string());
+    check(bad.settings.trusted_device_days == 90 &&
+              bad.warning.find("trusted_device_days") != std::string::npos,
+          "a non-numeric lifetime is reported and the default kept");
+
+    chast::HostSettings settings;
+    settings.trusted_device_days = 0;
+    std::string error;
+    check(chast::save_host_settings(path.string(), settings, &error),
+          "a trusted-device lifetime saves");
+    check(chast::load_host_settings(path.string()).settings.trusted_device_days == 0,
+          "a saved trusted-device lifetime survives a reload");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -798,6 +848,7 @@ int main() {
     test_invalid_values(dir);
     test_audio_settings(dir);
     test_idle_timeout_settings(dir);
+    test_trusted_device_lifetime_settings(dir);
     test_virtual_display_settings(dir);
     test_tokens();
     test_security_migration(dir);

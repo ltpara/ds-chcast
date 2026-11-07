@@ -64,7 +64,7 @@ class AppLanguage {
       } catch (_) {
         // A corrupt settings file must not stop the viewer from starting.
       }
-    });
+    }, onFileError: () {});
   }
 
   static void _save(String code) {
@@ -82,7 +82,7 @@ class AppLanguage {
       } catch (_) {
         // Language is a preference; failing to persist it is not fatal.
       }
-    });
+    }, onFileError: () {});
   }
 
   static Map<String, Object?> _readMap() {
@@ -103,7 +103,7 @@ class AppLanguage {
         // A corrupt settings file must not stop the viewer from starting.
       }
       return <String, Object?>{};
-    });
+    }, onFileError: () => <String, Object?>{});
   }
 
   static File? _file() {

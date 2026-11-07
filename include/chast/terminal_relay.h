@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,7 +29,9 @@ struct TerminalConsole;
 
 class TerminalRelay {
 public:
-    explicit TerminalRelay(QuicSession& session, bool allow_persist = false);
+    // Called for viewer requests and nonempty input, never for shell output.
+    explicit TerminalRelay(QuicSession& session, bool allow_persist = false,
+                           std::function<void()> viewer_activity = {});
     ~TerminalRelay();
     TerminalRelay(const TerminalRelay&) = delete;
     TerminalRelay& operator=(const TerminalRelay&) = delete;
@@ -58,6 +61,7 @@ private:
 
     QuicSession& session_;
     bool allow_persist_ = false;
+    std::function<void()> viewer_activity_;
     std::vector<std::shared_ptr<TerminalConsole>> live_;
     uint64_t started_ = 0;
     uint64_t failures_ = 0;

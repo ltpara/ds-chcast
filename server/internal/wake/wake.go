@@ -43,6 +43,7 @@ type Job struct {
 type entry struct {
 	job     Job
 	expires time.Time
+	relays  map[string]bool
 }
 
 // Broker owns the in-memory queue. It is safe for concurrent use.
@@ -84,10 +85,12 @@ func (b *Broker) SetClock(now func() time.Time) {
 }
 
 // Request queues a wake for target. Broadcasts are the target's last-reported
-// directed broadcast endpoints; a job without them is never handed to a relay.
+// directed broadcast endpoints. Relays must be explicitly authorized by the
+// server operator; matching private broadcast addresses alone prove no trust.
+// A job without broadcasts or authorized relays is never handed to an agent.
 // It returns the cooldown remaining when the target was woken too recently and
 // ErrQueueFull when the queue is saturated.
-func (b *Broker) Request(target, mac string, broadcasts []string) (Job, time.Duration, error) {
+func (b *Broker) Request(target, mac string, broadcasts, relays []string) (Job, time.Duration, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
@@ -107,15 +110,20 @@ func (b *Broker) Request(target, mac string, broadcasts []string) (Job, time.Dur
 		Broadcasts:   append([]string(nil), broadcasts...),
 		ExpiresInSec: int64(b.ttl / time.Second),
 	}
-	b.jobs = append(b.jobs, &entry{job: job, expires: now.Add(b.ttl)})
+	allowed := make(map[string]bool, len(relays))
+	for _, id := range relays {
+		allowed[id] = true
+	}
+	b.jobs = append(b.jobs, &entry{job: job, expires: now.Add(b.ttl), relays: allowed})
 	b.last[target] = now
 	return job, 0, nil
 }
 
 // PendingFor returns every unexpired job the agent may relay. An agent only
-// sees jobs when it registered as a relay and its own directed broadcast
-// endpoints intersect the target's report, which keeps both the job metadata
-// and the magic packet on the target's link. Jobs remain eligible until expiry
+// sees jobs when the operator authorized its ID for the target, it registered
+// as a relay, and its directed broadcast endpoints intersect the target's
+// report. The address intersection is routing, not authorization: unrelated
+// sites commonly reuse the same private subnet. Jobs remain eligible until expiry
 // because the server cannot know whether a registration response reached the
 // agent; agents use the job id to suppress a successfully relayed duplicate.
 func (b *Broker) PendingFor(agentID string, relay bool, broadcasts []string) []Job {
@@ -128,7 +136,7 @@ func (b *Broker) PendingFor(agentID string, relay bool, broadcasts []string) []J
 	b.pruneLocked(now)
 	var out []Job
 	for _, item := range b.jobs {
-		if item.job.Target == agentID || !sharedEndpoint(item.job.Broadcasts, broadcasts) {
+		if !item.relays[agentID] || item.job.Target == agentID || !sharedEndpoint(item.job.Broadcasts, broadcasts) {
 			continue
 		}
 		out = append(out, item.job)

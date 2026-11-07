@@ -3,6 +3,12 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:chast_viewer/remote_key_sequence.dart';
 
 void main() {
+  test('toolbar chords preserve physically held modifiers', () {
+    final events = buildRemoteChord(<int>[0xE0, 0xE1], 0x29, 0x01);
+    expect(events.map((e) => e.usage), <int>[0xE1, 0x29, 0x29, 0xE1]);
+    expect(events.last.modifiers, 0x01);
+    expect(buildRemoteWinTap(0x08, 0x08), isEmpty);
+  });
   test('a chord presses modifiers first and releases them last', () {
     final List<RemoteKeyEvent> events =
         buildRemoteChord(<int>[0xE2], 0x2B, 0);

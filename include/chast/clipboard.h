@@ -131,10 +131,16 @@ bool decode_clipboard_stream(const uint8_t* data, size_t size, ClipboardContent&
 
 // ----- Win32 clipboard -----
 
+// Empty is a successful observation; Failed must never establish a baseline.
+enum class ClipboardReadState { Failed, Empty, Content };
+ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* error);
+ClipboardReadState read_clipboard_files_state(std::vector<std::string>& paths,
+                                             std::string* error);
+
 // Reads the formats above that the clipboard currently offers into `content`
 // (hash left 0). Returns false with `error` when the clipboard cannot be
-// opened or holds none of the supported formats; a form with no supported
-// format is not an error for the caller, it just yields an empty content.
+// opened or holds none of the supported formats. Use read_clipboard_state
+// when Empty and Failed need to be distinguished (for example, a baseline).
 bool read_clipboard(ClipboardContent& content, std::string* error);
 
 // Replaces the clipboard with `content` in one ownership change. Formats the

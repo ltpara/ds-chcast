@@ -68,6 +68,7 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 		if err := store.AppendAudit(account.AuditEvent{
 			Username: "alice", Action: account.AuditLogin, Detail: detail,
 			ClientIP: "203.0.113.9", Location: "Testland", CreatedAt: start, Success: true,
+			HostID: "archive-host",
 		}); err != nil {
 			t.Fatalf("append audit: %v", err)
 		}
@@ -107,7 +108,7 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 		t.Fatalf("audit lines = %d, want 2", len(auditLines))
 	}
 	if auditLines[0]["stream"] != "audit" || auditLines[0]["detail"] != "first" ||
-		auditLines[1]["detail"] != "second" {
+		auditLines[1]["detail"] != "second" || auditLines[0]["host_id"] != "archive-host" {
 		t.Fatalf("audit lines = %v", auditLines)
 	}
 	if got := auditLines[0]["created_at"]; got != "2026-10-28T09:30:00Z" {

@@ -377,7 +377,7 @@ std::vector<Target> make_targets() {
     targets.push_back(message_target(
         "permission_update", chast::make_permission_update(1),
         [](const std::vector<uint8_t>& payload) {
-            uint16_t permissions = 0;
+            chast::PermissionMask permissions = 0;
             return chast::parse_permission_update(payload, permissions, &parse_error);
         }));
     targets.push_back(message_target(

@@ -40,6 +40,19 @@ struct AuditFileRecord {
     std::string detail;
 };
 
+// A Hello the host refused. No session exists and the viewer may not have
+// sent an audit reference, so the record is identified by the source address
+// and the refusal instead.
+struct AuditDenialRecord {
+    // The transport's "ip:port", or empty when it reported none.
+    std::string address;
+    // The AccessDenial value, kept numeric so the service need not mirror the
+    // enum. The agent signs it with the other fields.
+    int code = 0;
+    int64_t occurred_at_ms = 0;
+    std::string detail;
+};
+
 // Appends one line. Opens and closes the file per record so the agent can
 // delete it between writes; missing directories are the caller's problem (the
 // default spool sits next to host.ini, which already exists). The spool
@@ -49,5 +62,7 @@ bool append_audit_session(const std::string& spool_path, const AuditSessionRecor
                           std::string* error = nullptr);
 bool append_audit_file(const std::string& spool_path, const AuditFileRecord& record,
                        std::string* error = nullptr);
+bool append_audit_denial(const std::string& spool_path, const AuditDenialRecord& record,
+                         std::string* error = nullptr);
 
 }  // namespace chast

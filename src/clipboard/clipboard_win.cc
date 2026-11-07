@@ -107,7 +107,7 @@ bool read_text(std::vector<uint8_t>& out) {
         ++length;
     }
     std::string text;
-    const bool converted = length > 0 && wide_to_utf8(data, length, text);
+    const bool converted = length == 0 || wide_to_utf8(data, length, text);
     GlobalUnlock(handle);
     // accepts() re-validates against the stream limits; the legacy control
     // message's 256 KiB text cap does not apply to a rich item.
@@ -199,43 +199,57 @@ HGLOBAL make_text(const std::vector<uint8_t>& data) {
 
 }  // namespace
 
-bool read_clipboard(ClipboardContent& content, std::string* error) {
+ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* error) {
     content = ClipboardContent{};
+    if (error) error->clear();
     if (!open_clipboard()) {
         if (error) {
             *error = "the clipboard is held by another process";
         }
-        return false;
+        return ClipboardReadState::Failed;
     }
     struct Closer {
         ~Closer() { CloseClipboard(); }
     } closer;
 
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) &&
+        !IsClipboardFormatAvailable(html_format()) &&
+        !IsClipboardFormatAvailable(rtf_format()) &&
+        !IsClipboardFormatAvailable(CF_DIB)) {
+        return ClipboardReadState::Empty;
+    }
+
     std::vector<uint8_t> data;
-    if (read_text(data)) {
-        accepts(content, ClipboardFormat::Text, std::move(data));
+    bool failed = false;
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        if (!read_text(data)) failed = true;
+        else if (!data.empty() && !accepts(content, ClipboardFormat::Text, std::move(data))) failed = true;
     }
-    if (read_bytes(html_format(), kMaxClipboardMarkupBytes, true, data)) {
-        accepts(content, ClipboardFormat::Html, std::move(data));
+    const UINT formats[] = {html_format(), rtf_format(), CF_DIB};
+    const ClipboardFormat kinds[] = {ClipboardFormat::Html, ClipboardFormat::Rtf, ClipboardFormat::Dib};
+    for (size_t i = 0; i < 3; ++i) {
+        if (!IsClipboardFormatAvailable(formats[i])) continue;
+        if (!read_bytes(formats[i], i == 2 ? kMaxClipboardImageBytes : kMaxClipboardMarkupBytes,
+                        i != 2, data) || !accepts(content, kinds[i], std::move(data))) failed = true;
     }
-    if (read_bytes(rtf_format(), kMaxClipboardMarkupBytes, true, data)) {
-        accepts(content, ClipboardFormat::Rtf, std::move(data));
+    // A partially rendered item is not a valid baseline either: otherwise a
+    // format that becomes readable later would look like a new local copy.
+    if (failed) {
+        content = {};
+        if (error) *error = "a clipboard format could not be read";
+        return ClipboardReadState::Failed;
     }
-    if (read_bytes(CF_DIB, kMaxClipboardImageBytes, false, data)) {
-        accepts(content, ClipboardFormat::Dib, std::move(data));
-    }
-    if (content.formats.empty()) {
-        if (error) {
-            *error = "the clipboard holds no supported format";
-        }
-        return false;
-    }
+    if (content.formats.empty()) return ClipboardReadState::Empty;
     if (!valid_clipboard_content(content, error)) {
         content = ClipboardContent{};
-        return false;
+        return ClipboardReadState::Failed;
     }
     content.hash = clipboard_content_hash(content);
-    return true;
+    return ClipboardReadState::Content;
+}
+
+bool read_clipboard(ClipboardContent& content, std::string* error) {
+    return read_clipboard_state(content, error) == ClipboardReadState::Content;
 }
 
 bool write_clipboard(const ClipboardContent& content, std::string* error) {
@@ -312,23 +326,26 @@ bool write_clipboard(const ClipboardContent& content, std::string* error) {
     return true;
 }
 
-bool read_clipboard_files(std::vector<std::string>& paths, std::string* error) {
+ClipboardReadState read_clipboard_files_state(std::vector<std::string>& paths,
+                                             std::string* error) {
     paths.clear();
+    if (error) error->clear();
     if (!open_clipboard()) {
         if (error) {
             *error = "the clipboard is held by another process";
         }
-        return false;
+        return ClipboardReadState::Failed;
     }
     struct Closer {
         ~Closer() { CloseClipboard(); }
     } closer;
+    if (!IsClipboardFormatAvailable(CF_HDROP)) return ClipboardReadState::Empty;
     const HANDLE handle = GetClipboardData(CF_HDROP);
     if (!handle) {
         if (error) {
             *error = "the clipboard holds no files";
         }
-        return false;
+        return ClipboardReadState::Failed;
     }
     const HDROP drop = static_cast<HDROP>(handle);
     const UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0);
@@ -336,13 +353,13 @@ bool read_clipboard_files(std::vector<std::string>& paths, std::string* error) {
         if (error) {
             *error = "the clipboard file list is empty";
         }
-        return false;
+        return ClipboardReadState::Empty;
     }
     if (count > kMaxClipboardFileEntries) {
         if (error) {
             *error = "the clipboard holds more files than a copy can carry";
         }
-        return false;
+        return ClipboardReadState::Failed;
     }
     for (UINT index = 0; index < count; ++index) {
         const UINT length = DragQueryFileW(drop, index, nullptr, 0);
@@ -366,9 +383,13 @@ bool read_clipboard_files(std::vector<std::string>& paths, std::string* error) {
         if (error) {
             *error = "the clipboard holds no files or folders";
         }
-        return false;
+        return ClipboardReadState::Failed;
     }
-    return true;
+    return ClipboardReadState::Content;
+}
+
+bool read_clipboard_files(std::vector<std::string>& paths, std::string* error) {
+    return read_clipboard_files_state(paths, error) == ClipboardReadState::Content;
 }
 
 bool write_clipboard_files(const std::vector<std::string>& paths, std::string* error) {

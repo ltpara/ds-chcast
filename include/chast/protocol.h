@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 48.
+// The chast wire protocol, version 49.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 48;
+inline constexpr uint16_t kProtocolVersion = 49;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -990,7 +990,8 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoTerminalPersist;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
-// after the source size, PermissionUpdate replaces it mid-session, and the
+// after the source size (a u32 since v49), PermissionUpdate replaces it
+// mid-session, and the
 // ServerInfo booleans are its decoded form. Input covers pointer and
 // keyboard injection; clipboard governs clipboard streams in both directions;
 // audio is present only while an audio stream is open; microphone allows the
@@ -1008,17 +1009,21 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // SessionSelectRequest and needs the host's serving backend: the viewer moves
 // the stream between Windows sessions, so the grant is refused when the service
 // that owns the worker is not present.
-enum PermissionBit : uint16_t {
+// The permission mask travels as a u32 on the wire (v49). Every mask field in
+// the API uses this alias, so widening the set again is a one-line change.
+using PermissionMask = uint32_t;
+
+enum PermissionBit : PermissionMask {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
     kPermissionAudio = 0x0004,
     kPermissionFileTransfer = 0x0008,
     kPermissionMicrophone = 0x0010,
     kPermissionPrivacyMode = 0x0020,
-    // Bit 0x0040 stays unused: on the HelloAck flag word that bit is the
-    // merged-layout marker, which is not a permission. Aligning the next
-    // permission with 0x0080 keeps the mask and the flag word comparable
-    // field by field, as every earlier permission bit already is.
+    // 0x0040 stays unused. It was left out on the u16 wire so the mask lined
+    // up field by field with the HelloAck flag word, where that bit is the
+    // merged-layout marker. v49 widened the mask to u32, so this gap is now
+    // only a historical reservation: new permissions start at 0x10000.
     kPermissionPortForward = 0x0080,
     kPermissionTerminal = 0x0100,
     kPermissionRecord = 0x0200,
@@ -1038,14 +1043,14 @@ enum PermissionBit : uint16_t {
     // is on; it travels in the mask alone.
     kPermissionRemoteConfig = 0x8000,
 };
-inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
-                                           kPermissionAudio | kPermissionFileTransfer |
-                                           kPermissionMicrophone | kPermissionPrivacyMode |
-                                           kPermissionPortForward | kPermissionTerminal |
-                                           kPermissionRecord | kPermissionCamera |
-                                           kPermissionRestart | kPermissionBlockInput |
-                                           kPermissionOsLogin | kPermissionSessionSelect |
-                                           kPermissionRemoteConfig;
+inline constexpr PermissionMask kPermissionAll = kPermissionInput | kPermissionClipboard |
+                                                 kPermissionAudio | kPermissionFileTransfer |
+                                                 kPermissionMicrophone | kPermissionPrivacyMode |
+                                                 kPermissionPortForward | kPermissionTerminal |
+                                                 kPermissionRecord | kPermissionCamera |
+                                                 kPermissionRestart | kPermissionBlockInput |
+                                                 kPermissionOsLogin | kPermissionSessionSelect |
+                                                 kPermissionRemoteConfig;
 
 // What the viewer wants to do on this connection. Desktop is the full remote
 // desktop. The other modes ask for a control-only session that never starts a
@@ -1332,7 +1337,7 @@ struct ClientHello {
     std::string password;
     // Bits from PermissionBit. The host intersects this with its defaults and
     // with what the operator approves.
-    uint16_t requested_permissions = kPermissionAll;
+    PermissionMask requested_permissions = kPermissionAll;
     // ECDSA P-256 public key blob. Empty when the client has no identity (the
     // CLI tools); a signed flag requires it.
     std::vector<uint8_t> device_key;
@@ -1918,9 +1923,9 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
                          std::string* error);
 // Host -> viewer permission change. Unknown bits are rejected so a newer
 // sender cannot silently grant something this build does not understand.
-std::vector<uint8_t> make_permission_update(uint16_t permissions);
+std::vector<uint8_t> make_permission_update(PermissionMask permissions);
 bool parse_permission_update(const std::vector<uint8_t>& payload,
-                             uint16_t& permissions, std::string* error);
+                             PermissionMask& permissions, std::string* error);
 
 // ----- privacy mode and desktop state -----
 //

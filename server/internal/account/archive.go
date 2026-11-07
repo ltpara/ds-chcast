@@ -73,7 +73,7 @@ func (s *Store) AuditEventsAfter(afterID int64, limit int) ([]AuditEvent, error)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT id, created_at, username, action, detail, client_ip, location, success
+		`SELECT id, created_at, username, action, detail, client_ip, location, success, host_id, event_key
 		 FROM audit_events WHERE id > ? ORDER BY id ASC LIMIT ?`, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("account store %s: archive audit: %w", s.path, err)
@@ -86,7 +86,8 @@ func (s *Store) AuditEventsAfter(afterID int64, limit int) ([]AuditEvent, error)
 			created int64
 		)
 		if err := rows.Scan(&event.ID, &created, &event.Username, &event.Action,
-			&event.Detail, &event.ClientIP, &event.Location, &event.Success); err != nil {
+			&event.Detail, &event.ClientIP, &event.Location, &event.Success,
+			&event.HostID, &event.EventKey); err != nil {
 			return nil, fmt.Errorf("account store %s: archive audit: %w", s.path, err)
 		}
 		event.CreatedAt = timeFromMillis(created)

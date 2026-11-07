@@ -443,8 +443,9 @@ P2 = 平台扩展。
   不含 `255.255.255.255`），服务端持久化目标最后一次上报值（`wake_targets`
   列，registry schema v2）；作业只投递给 `wake_relay` 为真且与目标链路有
   交集的代理，作业携带 `broadcasts`，代理发送前再与当前网卡求交集，无交集
-  跳过。目标无链路记录时唤醒返回 409，不再盲目 fanout。匹配基于广播端点，
-  不引入主机-账号归属，不同租户使用相同私网网段时仍会匹配。
+  跳过。目标无链路记录时唤醒返回 409，不再盲目 fanout。广播端点只用于选路，
+  授权仍由运营者的 `--wake-relay-policy` 目标到代理允许名单决定，因此不同租户
+  使用相同私网网段时也不会自动收到对方作业。
 - 验收：跨子网可唤醒；未授权请求被拒；与现有同网段直发共存。
 - 验证（2026-11-06，main 真实回环）：全量 `go test ./...` 通过。服务端 +
   四个 `chast-tunnel host` 代理（目标链路 `127.0.0.1:41001`、同链路 relay、
@@ -1227,8 +1228,9 @@ RustDesk 的“远程配置”允许已连接的查看者读取并修改主机�
   应答携带结果码（Ok/Denied/Unsupported/Busy/Failed）、错误原因与仅 Ok
   才出现的开关快照；非 Ok 携带快照会被判为格式错误。共 14 项开关，
   `kRemoteConfigAll = 0x3FFF` 恰好用满 32 位中的 14 位。
-- **权限**：新增 `kPermissionRemoteConfig = 0x8000`（最后一个空闲位；
-  0x0040 属于 HelloAck 合并布局标记，仍保留不用）。主机仅在
+- **权限**：新增 `kPermissionRemoteConfig = 0x8000`。当时它是 u16 掩码里的
+  最后一个空闲位（0x0040 属于 HelloAck 合并布局标记，保留不用）；协议升到
+  v49 把掩码放宽到 u32 后，新权限从 0x10000 起编号。主机仅在
   `allow_remote_config` 打开时把该位放入 HelloAck，查看器据此启停工具栏
   的“修改主机设置”按钮。
 - **主机**：`handle_remote_config_requests` 校验位图、软件模拟开关与
@@ -1442,6 +1444,31 @@ Windows release 构建通过。
 实机验收；只处理 Flutter 上报的 precision-trackpad pan/zoom，不改变触摸
 屏的 Touch/Pen 语义，也不转发触摸 hover。协议升到 v48，旧版对端需同步
 升级。
+
+## 权限掩码扩宽与可信设备有效期（2026-11-07，协议 v49）
+
+u16 权限掩码在 `kPermissionRemoteConfig = 0x8000` 之后已经没有空闲位，
+0x0040 又因 HelloAck 合并布局标记长期保留，任何新权限都无处安放。同时
+可信设备有效期写死 90 天，运营者既不能缩短也不能关闭。
+
+- **协议（v49）**：Hello、HelloAck/StreamInfo 与 `PermissionUpdate` 的掩码
+  字段从 u16 变为小端 u32；HelloAck 自身的标志字仍是 u16，
+  `kServerInfoMergedLayout = 0x0040` 语义不变。所有掩码在 API 上统一用
+  `using PermissionMask = uint32_t;`，后续再扩宽只需改这一行。解析仍然拒绝
+  掩码里协议未定义的位（0x0040 与 0x10000 以上）。截断在掩码内部的 Hello
+  必须被拒绝，不能被当成更短的掩码读入。
+- **可信设备有效期**：新增 host.ini `trusted_device_days`（默认 90，
+  0 表示永不过期，上限 3650 天）。`HostServer::security_config()` 把它换算成
+  秒传入 `HostSecurity::Config::trusted_device_lifetime_seconds`，
+  `device_expired()` 对 0 直接返回未过期。安全页“访问控制”新增输入框与
+  校验（0..3650），原“设备 90 天未使用自动失效”静态文字改为说明该设置。
+- **边界**：主机与查看器需同步升级；旧版对端读到 v49 会按原有版本拒绝。
+  有效期改变会立即作用于列表内已有设备，因为比较基准是每个设备自己的
+  `last_seen`。
+
+验证：`protocol`、`protocol_fuzz`（69 个解析入口）、`host_settings`、
+`host_security` 与全量串行 `ctest`（54/54）通过；`go test ./...` 与
+`go vet ./...` 通过。
 
 ## 完成定义
 

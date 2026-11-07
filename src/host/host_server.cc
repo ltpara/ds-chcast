@@ -438,8 +438,8 @@ const char* session_select_code_name(SessionSelectCode code) {
     return "unknown";
 }
 
-uint16_t settings_permissions(const HostSettings& settings) {
-    uint16_t mask = 0;
+PermissionMask settings_permissions(const HostSettings& settings) {
+    PermissionMask mask = 0;
     if (settings.allow_input) {
         mask |= kPermissionInput;
     }
@@ -537,10 +537,10 @@ void copy_remote_config_fields(const HostSettings& from, HostSettings& to) {
 // Permissions the current session loses when a switch it just watched turn
 // off. Only fields that actually changed are revoked; a switch that was
 // already off has no grant to take back.
-uint16_t remote_config_revocations(const HostSettings& settings, uint32_t changed) {
-    uint16_t revoke = 0;
+PermissionMask remote_config_revocations(const HostSettings& settings, uint32_t changed) {
+    PermissionMask revoke = 0;
     auto take = [&revoke, &settings, changed](uint32_t bit, bool enabled,
-                                              uint16_t permission) {
+                                              PermissionMask permission) {
         if ((changed & bit) != 0 && !enabled) {
             revoke |= permission;
         }
@@ -638,7 +638,7 @@ std::string streamed_display_name(const IDxgiCapturer& capturer) {
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
                            const IDxgiCapturer& capturer, const IVideoEncoder& encoder,
                            UINT source_width, UINT source_height, uint16_t framerate,
-                           uint16_t permissions, const AudioInfo& audio,
+                           PermissionMask permissions, const AudioInfo& audio,
                            bool terminal_persist) {
     const DisplayInfo& display = capturer.display();
     ServerInfo info;
@@ -763,7 +763,7 @@ std::string auth_method_suffix(const HostSecurity::Result& result) {
     return " with a password";
 }
 
-std::string permission_names(uint16_t mask) {
+std::string permission_names(PermissionMask mask) {
     std::string text;
     auto add = [&text](const char* name) {
         if (!text.empty()) {
@@ -989,38 +989,7 @@ private:
 }  // namespace
 
 std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::string* error) {
-    if (!config.clipboard_read) {
-        config.clipboard_read = [](ClipboardContent& content) {
-            std::string ignored;
-            return read_clipboard(content, &ignored);
-        };
-    }
-    if (!config.clipboard_read_files) {
-        config.clipboard_read_files = [](std::vector<std::string>& paths) {
-            std::string ignored;
-            return read_clipboard_files(paths, &ignored);
-        };
-    }
-    if (!config.clipboard_write_files) {
-        config.clipboard_write_files = [](const std::vector<std::string>& paths) {
-            std::string ignored;
-            return write_clipboard_files(paths, &ignored);
-        };
-    }
     std::unique_ptr<HostServer> server(new HostServer(std::move(config)));
-    if (!server->config_.clipboard_write) {
-        // The default writer reports why the viewer's item was refused; the
-        // clipboard backend now leaves the previous content in place on failure.
-        HostServer* self = server.get();
-        server->config_.clipboard_write = [self](const ClipboardContent& content) {
-            std::string write_error;
-            if (write_clipboard(content, &write_error)) {
-                return true;
-            }
-            self->log("clipboard: cannot apply the viewer's content: " + write_error);
-            return false;
-        };
-    }
     if (server->settings_.access_token.empty()) {
         server->settings_.access_token = generate_access_token();
         if (server->config_.token_changed) {
@@ -1074,6 +1043,7 @@ void HostServer::stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+    if (clipboard_worker_) clipboard_worker_->Cancel();
     if (carrier_) {
         carrier_->stop();
     }
@@ -1267,7 +1237,7 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
     // A viewer must not be told about a switch this process cannot perform.
     if (!config_.service_mode || !config_.list_sessions || !config_.select_session) {
         config.default_permissions &=
-            ~static_cast<uint16_t>(kPermissionSessionSelect);
+            ~kPermissionSessionSelect;
     }
     config.allow_permission_change = settings_.allow_permission_change;
     config.ip_whitelist = settings_.ip_whitelist;
@@ -1279,6 +1249,10 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
     // revoked a device since the settings were loaded.
     config.trusted_devices = security_ ? security_->config().trusted_devices
                                        : settings_.trusted_devices;
+    config.trusted_device_lifetime_seconds =
+        settings_.trusted_device_days == 0
+            ? 0
+            : static_cast<int64_t>(settings_.trusted_device_days) * 24 * 60 * 60;
     return config;
 }
 
@@ -1302,12 +1276,11 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
             // A files-only connection has no input surface and its worker
             // refuses host actions, so drop those grants here instead of
             // advertising controls that would only be denied.
-            auth.permissions &= ~static_cast<uint16_t>(
-                kPermissionInput | kPermissionRestart | kPermissionBlockInput |
-                kPermissionSessionSelect);
+            auth.permissions &= ~(kPermissionInput | kPermissionRestart |
+                                  kPermissionBlockInput | kPermissionSessionSelect);
         } else if (settings_.allow_input && (auth.permissions & kPermissionInput) != 0) {
             if (!registry_->acquire_control(this)) {
-                auth.permissions &= ~static_cast<uint16_t>(kPermissionInput);
+                auth.permissions &= ~kPermissionInput;
                 lease_stripped_input_ = true;
                 log("another viewer already holds control; this viewer joins view-only");
             }
@@ -1335,6 +1308,8 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
             auth.denial = pending_security_.denial;
             auth.reason = pending_security_.reason;
             log("refused " + from + ": " + pending_security_.reason);
+            audit_denial(request.peer_address, pending_security_.denial,
+                         pending_security_.reason);
             break;
     }
     return auth;
@@ -1359,6 +1334,8 @@ ClientApproval HostServer::approve_client(const ClientRequest& request) {
             log("the viewer from " + from + " left while waiting for approval");
         } else {
             log("the operator declined the viewer from " + from);
+            audit_denial(request.peer_address, AccessDenial::Declined,
+                         "the operator declined the connection");
         }
         return approval;
     }
@@ -1480,7 +1457,7 @@ std::shared_ptr<HostServer> HostServer::focused_viewer() const {
     return registry_->focused.lock();
 }
 
-void HostServer::set_permissions(uint16_t permissions) {
+void HostServer::set_permissions(PermissionMask permissions) {
     if (registry_ && !adopted_) {
         std::shared_ptr<HostServer> target = focused_viewer();
         if (!target) {
@@ -1490,13 +1467,13 @@ void HostServer::set_permissions(uint16_t permissions) {
         return;
     }
     std::lock_guard<std::mutex> lock(permission_mutex_);
-    uint16_t mask = permissions & kPermissionAll;
+    PermissionMask mask = permissions & kPermissionAll;
     // Input injection has one owner. Granting input to a viewer that does not
     // hold the lease would put two keyboards on one desktop, so the grant
     // keeps that viewer view-only until control is free.
     if (registry_ && adopted_ && (mask & kPermissionInput) != 0 &&
         !registry_->acquire_control(this)) {
-        mask &= ~static_cast<uint16_t>(kPermissionInput);
+        mask &= ~kPermissionInput;
         log("another viewer controls input; this viewer stays view-only");
     }
     pending_permissions_.store(mask);
@@ -2054,6 +2031,7 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
     }
     viewer->session_ = std::move(connection);
     viewer->security_ = security_;
+    viewer->denial_audit_ = denial_audit_;
     viewer->registry_ = registry_;
     viewer->adopted_ = true;
     viewer->self_ = viewer;
@@ -2245,6 +2223,7 @@ void HostServer::run_adopted() {
         std::lock_guard<std::mutex> lock(session_mutex_);
         session_.reset();
     }
+    if (clipboard_worker_) clipboard_worker_->Cancel();
     finished_ = true;
     running_ = false;
 }
@@ -2456,7 +2435,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
             }
             return;
         }
-        const uint16_t now_mask = session_->permissions();
+        const PermissionMask now_mask = session_->permissions();
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.session_permissions = now_mask;
@@ -2479,7 +2458,8 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
     };
 
     PortForwardRelay port_forward(*session_);
-    TerminalRelay terminal(*session_, settings_.allow_terminal_persist);
+    TerminalRelay terminal(*session_, settings_.allow_terminal_persist,
+                           [this] { touch_viewer_activity(); });
     // A follower has no capturer to borrow an adapter from; the camera relay
     // opens its own device instead.
     CameraRelay camera(*session_, [] { return LUID{}; },
@@ -2974,7 +2954,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // encoded, and a machine without a usable endpoint simply streams video.
     std::unique_ptr<ILoopbackCapture> audio_capture;
     AudioInfo audio_info;
-    const uint16_t granted_permissions = session_->permissions();
+    const PermissionMask granted_permissions = session_->permissions();
 
     // Privacy mode is per session and the overlay is owned here: every return
     // path destroys it, which is what puts the operator's screen back when the
@@ -3180,7 +3160,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     }
     // A UI request made between sessions is applied once the stream exists:
     // set_permissions() is only valid after the announcement.
-    uint16_t announced_permissions = granted_permissions;
+    PermissionMask announced_permissions = granted_permissions;
     auto apply_pending_permissions = [&]() -> bool {
         bool pending = false;
         uint16_t requested = 0;
@@ -3199,7 +3179,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             return true;
         }
-        const uint16_t now_mask = session_->permissions();
+        const PermissionMask now_mask = session_->permissions();
         if (now_mask == announced_permissions) {
             return true;
         }
@@ -5149,7 +5129,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // path, before the caller resets the transport for the next viewer.
     PortForwardRelay port_forward(*session_);
     // Same lifetime rule: its destructor terminates every shell still running.
-    TerminalRelay terminal(*session_, settings_.allow_terminal_persist);
+    TerminalRelay terminal(*session_, settings_.allow_terminal_persist,
+                           [this] { touch_viewer_activity(); });
     // The camera opens only when the viewer asks, and only if the host allows
     // cameras; it encodes on the capture adapter with its own device so it
     // never shares the capturer's immediate context.
@@ -5319,7 +5300,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // it. The independent guardian retries when the restore fails here.
         if (managed_displays.backend) {
             std::string recovery_reason;
-            const uint16_t management_need = kPermissionInput | kPermissionPrivacyMode;
+            const PermissionMask management_need = kPermissionInput | kPermissionPrivacyMode;
             const bool permitted =
                 (session_->permissions() & management_need) == management_need &&
                 (!registry_ || registry_->may_change_host_state(this));
@@ -5871,6 +5852,9 @@ void HostServer::begin_file_session() {
 }
 
 void HostServer::end_file_session() {
+    // A read started by this viewer must never be published to the next one.
+    cancel_clipboard_work();
+    clipboard_was_allowed_ = false;
     {
         // Nothing may apply this mask after the session it belonged to ended;
         // the next connection starts from its own approved mask.
@@ -5937,6 +5921,7 @@ bool HostServer::clipboard_transfer_allowed() const {
 }
 
 void HostServer::reset_clipboard_incoming(bool remove_directory) {
+    if (clipboard_write_pending_ && clipboard_write_is_files_) cancel_clipboard_work();
     if (remove_directory && !clipboard_incoming_.directory.empty()) {
         std::error_code ec;
         std::filesystem::remove_all(path_from_utf8(clipboard_incoming_.directory), ec);
@@ -6044,21 +6029,15 @@ void HostServer::finish_clipboard_incoming(HostServerStats& stats) {
             tops.push_back(item);
         }
     }
-    if (!config_.clipboard_write_files || !config_.clipboard_write_files(tops)) {
-        log("clipboard: cannot put the viewer's file(s) on the host clipboard");
-        reset_clipboard_incoming(true);
-        return;
-    }
-    last_file_identity_ = clipboard_incoming_.identity;
-    last_file_entries_ = clipboard_incoming_.entries;
-    last_file_paths_ = tops;
-    ++stats.clipboard_received;
-    log("clipboard: the viewer's file(s) are on the host clipboard (" +
-        std::to_string(tops.size()) + " top-level item(s), " +
-        std::to_string(clipboard_incoming_.entries.size()) + " file(s))");
-    // The staging directory stays: the host's CF_HDROP points into it until
-    // the next list replaces it or the session ends.
-    clipboard_incoming_.active = false;
+    // Staged files use the same serialized, retryable writer as rich content.
+    cancel_clipboard_work();
+    pending_clipboard_paths_ = std::move(tops);
+    clipboard_write_pending_ = true;
+    clipboard_write_is_files_ = true;
+    clipboard_write_attempts_ = 0;
+    clipboard_write_retry_ = Clock::now();
+    (void)stats;
+
 }
 
 void HostServer::audit_upload(const std::string& name, uint64_t bytes, bool success,
@@ -6077,6 +6056,52 @@ void HostServer::audit_upload(const std::string& name, uint64_t bytes, bool succ
     record.detail = detail;
     std::string audit_error;
     if (!append_audit_file(settings_.audit_spool, record, &audit_error)) {
+        log("audit: " + audit_error);
+    }
+}
+
+// A blocked address can retry dozens of times a second; repeating the same
+// refusal would push real events out of the service's bounded audit table.
+bool HostServer::should_audit_denial(const std::string& key, int64_t now_unix) {
+    constexpr int64_t kRepeatIntervalSeconds = 30;
+    constexpr size_t kMaxTrackedDenials = 512;
+    std::lock_guard<std::mutex> lock(denial_audit_->mutex);
+    auto& records = denial_audit_->records;
+    const auto it = records.find(key);
+    if (it != records.end() && now_unix - it->second < kRepeatIntervalSeconds) {
+        return false;
+    }
+    if (records.size() >= kMaxTrackedDenials) {
+        // The map only suppresses repeats; dropping it costs duplicates, not
+        // records, so a wholesale clear is enough to keep it bounded.
+        records.clear();
+    }
+    records[key] = now_unix;
+    return true;
+}
+
+void HostServer::audit_denial(const std::string& address, AccessDenial denial,
+                              const std::string& reason) {
+    if (settings_.audit_spool.empty()) {
+        return;
+    }
+    const int64_t now = unix_now();
+    // The transport picks a fresh source port per attempt, so the throttle
+    // keys on the address only.
+    const std::string host = peer_ip_text(address);
+    const std::string key =
+        (host.empty() ? std::string("unknown") : host) + "|" +
+        std::to_string(static_cast<int>(denial));
+    if (!should_audit_denial(key, now)) {
+        return;
+    }
+    AuditDenialRecord record;
+    record.address = address;
+    record.code = static_cast<int>(denial);
+    record.occurred_at_ms = unix_now_ms();
+    record.detail = reason;
+    std::string audit_error;
+    if (!append_audit_denial(settings_.audit_spool, record, &audit_error)) {
         log("audit: " + audit_error);
     }
 }
@@ -7046,7 +7071,7 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
             }
             return;
         }
-        const uint16_t now_mask = session_->permissions();
+        const PermissionMask now_mask = session_->permissions();
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.session_permissions = now_mask;
@@ -7268,7 +7293,7 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
             }
             return;
         }
-        const uint16_t now_mask = session_->permissions();
+        const PermissionMask now_mask = session_->permissions();
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.session_permissions = now_mask;
@@ -7280,7 +7305,8 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
     // The relays own every socket and shell they open; their destructors run
     // on every exit path below.
     PortForwardRelay port_forward(*session_);
-    TerminalRelay terminal(*session_, settings_.allow_terminal_persist);
+    TerminalRelay terminal(*session_, settings_.allow_terminal_persist,
+                           [this] { touch_viewer_activity(); });
     // A control-only session has no capturer to borrow an adapter from; the
     // camera relay opens its own device instead.
     CameraRelay camera(*session_, [] { return LUID{}; },
@@ -7599,35 +7625,45 @@ bool HostServer::clipboard_allowed() const {
            (session_->permissions() & kPermissionClipboard) != 0;
 }
 
-bool HostServer::read_local_clipboard_files(std::vector<ClipboardFileEntry>& entries,
-                                            std::vector<std::string>& paths) {
-    entries.clear();
-    paths.clear();
-    std::vector<std::string> found;
-    if (!config_.clipboard_read_files(found)) {
-        return false;
-    }
-    std::string collect_error;
-    if (!collect_clipboard_files(found, entries, paths, &collect_error)) {
-        if (!collect_error.empty()) {
-            log("clipboard: " + collect_error);
+void HostServer::request_local_clipboard() {
+    if (!clipboard_worker_) {
+        ClipboardBackend backend;
+        if (config_.clipboard_read) {
+            backend.read = [read = config_.clipboard_read](ClipboardContent& content) {
+                if (!read(content)) return ClipboardReadState::Failed;
+                return content.empty() ? ClipboardReadState::Empty : ClipboardReadState::Content;
+            };
         }
-        return false;
+        if (config_.clipboard_read_files) {
+            backend.read_files = [read = config_.clipboard_read_files](std::vector<std::string>& paths) {
+                return read(paths) && !paths.empty() ? ClipboardReadState::Content : ClipboardReadState::Empty;
+            };
+        }
+        backend.write = config_.clipboard_write;
+        backend.write_files = config_.clipboard_write_files;
+        clipboard_worker_ = std::make_unique<ClipboardWorker>(std::move(backend));
     }
-    return true;
+    clipboard_worker_->Read(clipboard_epoch_);
+}
+
+void HostServer::cancel_clipboard_work() {
+    ++clipboard_epoch_;
+    if (clipboard_worker_) clipboard_worker_->Cancel();
+    clipboard_write_pending_ = false;
+    clipboard_write_inflight_ = false;
+    pending_clipboard_content_ = {};
+    pending_clipboard_paths_.clear();
 }
 
 void HostServer::remember_local_clipboard() {
-    ClipboardContent current;
-    if (config_.clipboard_read(current)) {
-        last_clipboard_hash_ = clipboard_content_hash(current);
-        last_clipboard_ = std::move(current);
-    }
+    cancel_clipboard_work();
+    clipboard_baseline_pending_ = true;
+    last_clipboard_hash_ = 0;
+    last_clipboard_ = {};
     last_file_entries_.clear();
     last_file_paths_.clear();
-    last_file_identity_ = read_local_clipboard_files(last_file_entries_, last_file_paths_)
-                              ? clipboard_file_identity_hash(last_file_entries_)
-                              : 0;
+    last_file_identity_ = 0;
+    request_local_clipboard();
 }
 
 void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats& stats) {
@@ -7641,6 +7677,7 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
             log("clipboard: the viewer sent an unusable file list: " + list_error);
             return;
         }
+        cancel_clipboard_work();
         last_clipboard_hash_ = clipboard_content_hash(content);
         last_clipboard_ = ClipboardContent{};
         std::string begin_error;
@@ -7650,7 +7687,7 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
         return;
     }
     const uint64_t hash = clipboard_content_hash(content);
-    if (hash == last_clipboard_hash_) {
+    if (hash == last_clipboard_hash_ && !clipboard_write_pending_) {
         return;
     }
     std::string content_error;
@@ -7658,15 +7695,17 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
         log("clipboard: the viewer sent unusable content: " + content_error);
         return;
     }
-    if (!config_.clipboard_write(content)) {
-        ++stats.clipboard_write_failures;
-        return;
+    // New peer content supersedes a queued retry and invalidates older reads.
+    cancel_clipboard_work();
+    if (upload_ && upload_->offer.clipboard) {
+        end_upload(FileCode::Cancelled, "the viewer replaced its clipboard list", true, true, stats);
     }
-    // Remembering what was applied stops the next poll from sending it
-    // straight back to the viewer.
-    last_clipboard_hash_ = hash;
-    last_clipboard_ = std::move(content);
-    ++stats.clipboard_received;
+    if (clipboard_incoming_.active) reset_clipboard_incoming(true);
+    pending_clipboard_content_ = std::move(content);
+    clipboard_write_pending_ = true;
+    clipboard_write_is_files_ = false;
+    clipboard_write_attempts_ = 0;
+    clipboard_write_retry_ = Clock::now();
 }
 
 void HostServer::drain_peer(HostServerStats& stats) {
@@ -7681,6 +7720,13 @@ void HostServer::drain_peer(HostServerStats& stats) {
     stats.input_releases = session_->input_release_requests();
     if (!clipboard_allowed()) {
         return;
+    }
+    // Establish the new epoch before accepting peer content on a restored
+    // grant, otherwise the following poll would cancel that new write.
+    if (!clipboard_was_allowed_) {
+        clipboard_was_allowed_ = true;
+        remember_local_clipboard();
+        next_clipboard_poll_ = Clock::now() + std::chrono::milliseconds(500);
     }
     ClipboardContent content;
     while (session_->take_clipboard_content(content)) {
@@ -7704,8 +7750,8 @@ void HostServer::drain_peer(HostServerStats& stats) {
 
 void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
                                 HostServerStats& stats) {
-    const bool allowed = clipboard_allowed();
-    if (!allowed) {
+    if (!clipboard_allowed()) {
+        if (clipboard_was_allowed_) cancel_clipboard_work();
         clipboard_was_allowed_ = false;
         return;
     }
@@ -7715,13 +7761,70 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         next_clipboard_poll_ = now + std::chrono::milliseconds(500);
         return;
     }
-    if (now < next_clipboard_poll_) {
+    ClipboardWorker::Result result;
+    bool have_read = false;
+    if (clipboard_worker_ && clipboard_worker_->Take(result) && result.epoch == clipboard_epoch_) {
+        if (result.operation == ClipboardWorker::Operation::Read) {
+            have_read = !clipboard_write_pending_;
+        } else {
+            clipboard_write_inflight_ = false;
+            if (result.written) {
+                clipboard_write_pending_ = false;
+                clipboard_baseline_pending_ = false;
+                if (clipboard_write_is_files_) {
+                    last_file_identity_ = clipboard_incoming_.identity;
+                    last_file_entries_ = clipboard_incoming_.entries;
+                    last_file_paths_ = pending_clipboard_paths_;
+                    clipboard_incoming_.active = false;
+                } else {
+                    last_clipboard_hash_ = clipboard_content_hash(pending_clipboard_content_);
+                    last_clipboard_ = std::move(pending_clipboard_content_);
+                    last_file_identity_ = 0;
+                    last_file_entries_.clear();
+                    last_file_paths_.clear();
+                }
+                ++stats.clipboard_received;
+            } else {
+                ++stats.clipboard_write_failures;
+                if (++clipboard_write_attempts_ >= 10) {
+                    clipboard_write_pending_ = false;
+                    log("clipboard: write failed after 10 attempts");
+                    if (clipboard_write_is_files_) reset_clipboard_incoming(true);
+                }
+                clipboard_write_retry_ = now + std::chrono::milliseconds(250);
+            }
+        }
+    }
+    if (clipboard_write_pending_) {
+        if (!clipboard_write_inflight_ && now >= clipboard_write_retry_ && clipboard_worker_) {
+            clipboard_write_inflight_ = clipboard_write_is_files_
+                ? clipboard_worker_->WriteFiles(clipboard_epoch_, pending_clipboard_paths_)
+                : clipboard_worker_->Write(clipboard_epoch_, pending_clipboard_content_);
+        }
         return;
     }
+    if (!have_read) {
+        if (now >= next_clipboard_poll_) request_local_clipboard();
+        return;
+    }
+    ClipboardSnapshot snapshot = std::move(result.snapshot);
     next_clipboard_poll_ = now + std::chrono::milliseconds(500);
-    std::vector<ClipboardFileEntry> current_files;
-    std::vector<std::string> current_paths;
-    if (read_local_clipboard_files(current_files, current_paths)) {
+    if (snapshot.state == ClipboardReadState::Failed) return;
+    const bool has_content = snapshot.state == ClipboardReadState::Content && !snapshot.has_files;
+    if (clipboard_baseline_pending_) {
+        clipboard_baseline_pending_ = false;
+        last_clipboard_hash_ = has_content
+                                   ? clipboard_content_hash(snapshot.content) : 0;
+        last_clipboard_ = std::move(snapshot.content);
+        last_file_identity_ = snapshot.has_files
+                                  ? clipboard_file_identity_hash(snapshot.entries) : 0;
+        last_file_entries_ = std::move(snapshot.entries);
+        last_file_paths_ = std::move(snapshot.paths);
+        return;
+    }
+    auto& current_files = snapshot.entries;
+    auto& current_paths = snapshot.paths;
+    if (snapshot.has_files) {
         const uint64_t identity = clipboard_file_identity_hash(current_files);
         last_clipboard_ = ClipboardContent{};
         last_clipboard_hash_ = 0;
@@ -7763,10 +7866,10 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     last_file_identity_ = 0;
     last_file_entries_.clear();
     last_file_paths_.clear();
-    ClipboardContent current;
-    if (!config_.clipboard_read(current)) {
+    if (!has_content) {
         return;
     }
+    ClipboardContent current = std::move(snapshot.content);
     const uint64_t hash = clipboard_content_hash(current);
     if (hash == last_clipboard_hash_) {
         return;
@@ -8121,7 +8224,7 @@ bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,
             code = next;
             reason = std::move(why);
         };
-        const uint16_t permissions = session_->permissions();
+        const PermissionMask permissions = session_->permissions();
         if (request.action == HostAction::Restart) {
             if ((permissions & kPermissionRestart) == 0) {
                 refuse(HostActionCode::Denied, "restart is not permitted by the host");
@@ -8233,7 +8336,7 @@ bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::stri
     while (session_->take_remote_config_request(request)) {
         touch_viewer_activity();
         ++stats.remote_config_requests;
-        const uint16_t permissions = session_->permissions();
+        const PermissionMask permissions = session_->permissions();
         // keys = 0 is a read; any key bit asks to write that switch.
         const bool changing = request.keys != 0;
         RemoteConfigState state;
@@ -8277,7 +8380,7 @@ bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::stri
                 // A gate that just closed loses its grant now; a gate that
                 // opened only affects the next connection, because the
                 // transport's ceiling was fixed at this session's handshake.
-                const uint16_t revoke = remote_config_revocations(settings_, changed);
+                const PermissionMask revoke = remote_config_revocations(settings_, changed);
                 if ((revoke & permissions) != 0) {
                     if (settings_.allow_permission_change) {
                         set_permissions(permissions & ~revoke);
@@ -8362,7 +8465,7 @@ bool HostServer::handle_os_login_requests(HostServerStats& stats, std::string* e
             code = next;
             reason = std::move(why);
         };
-        const uint16_t permissions = session_->permissions();
+        const PermissionMask permissions = session_->permissions();
         if ((permissions & (kPermissionInput | kPermissionOsLogin)) !=
             (kPermissionInput | kPermissionOsLogin)) {
             refuse(OsLoginCode::Denied, "OS login is not permitted by the host");
@@ -8439,7 +8542,7 @@ bool HostServer::handle_session_requests(HostServerStats& stats, std::string* er
         touch_viewer_activity();
         ++stats.session_list_requests;
         SessionListResult result;
-        const uint16_t permissions = session_->permissions();
+        const PermissionMask permissions = session_->permissions();
         if ((permissions & kPermissionSessionSelect) == 0) {
             result.code = SessionListCode::Denied;
             result.reason = "session select is not permitted by the host";
@@ -8490,7 +8593,7 @@ bool HostServer::handle_session_requests(HostServerStats& stats, std::string* er
             result.code = code;
             result.reason = std::move(why);
         };
-        const uint16_t permissions = session_->permissions();
+        const PermissionMask permissions = session_->permissions();
         if ((permissions & kPermissionSessionSelect) == 0) {
             refuse(SessionSelectCode::Denied, "session select is not permitted by the host");
         } else if (!settings_.allow_session_select) {

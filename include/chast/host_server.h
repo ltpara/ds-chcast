@@ -30,6 +30,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,6 +39,7 @@
 
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
+#include "chast/clipboard_worker.h"
 #include "chast/encoder.h"
 #include "chast/file_transfer.h"
 #include "chast/host_security.h"
@@ -243,7 +245,7 @@ struct HostStatus {
     std::string temporary_password;  // empty in click and service modes
     // Permissions granted to the current (or last) viewer after approval and
     // any live reduction. 0 when no viewer was admitted yet.
-    uint16_t session_permissions = 0;
+    PermissionMask session_permissions = 0;
     std::string peer_address;  // "ip:port" of the current or last viewer
     uint16_t requested_display = kDisplayAuto;
     size_t display_index = 0;
@@ -359,11 +361,16 @@ struct HostServerConfig {
     std::function<void(const InputEvent&)> input_event;
     // Rich clipboard access. Empty means the real Win32 backend (text, HTML,
     // RTF and DIB); the loopback check substitutes an in-memory pair so it
-    // never touches the operator's clipboard.
+    // never touches the operator's clipboard. Reads run on a background
+    // thread together with writes. Callbacks must own captured state because
+    // an in-flight OS call can finish after stop() and destruction.
+    // Legacy bool sources: true with empty output means Empty; false Failed.
     std::function<bool(ClipboardContent&)> clipboard_read;
     std::function<bool(const ClipboardContent&)> clipboard_write;
     // CF_HDROP access. Empty reads the real clipboard; the loopback check
     // substitutes a list so it never touches the operator's clipboard.
+    // This legacy test hook returns false for no file list; the real backend
+    // distinguishes failed access from an observed empty list.
     std::function<bool(std::vector<std::string>&)> clipboard_read_files;
     // CF_HDROP write used when a viewer's clipboard file copy has been staged
     // (protocol v34). Empty writes the real clipboard; the loopback check
@@ -469,7 +476,7 @@ public:
     // permissions. The mask is clamped to what was granted at approval time
     // and to the settings gates; the viewer is told through PermissionUpdate.
     // Ignored while no session is streaming.
-    void set_permissions(uint16_t permissions);
+    void set_permissions(PermissionMask permissions);
 
     // Applies a lock-after-session-end choice made in the operator UI. The
     // listener also shares it with its workers, so the last viewer of a
@@ -563,8 +570,8 @@ private:
     // Clipboard and microphone plumbing shared by the publisher and follower
     // paths; each worker owns its viewer's state.
     bool clipboard_allowed() const;
-    bool read_local_clipboard_files(std::vector<ClipboardFileEntry>& entries,
-                                    std::vector<std::string>& paths);
+    void request_local_clipboard();
+    void cancel_clipboard_work();
     void remember_local_clipboard();
     void apply_peer_clipboard(ClipboardContent content, HostServerStats& stats);
     void drain_peer(HostServerStats& stats);
@@ -653,14 +660,14 @@ private:
     // is announced, so a later lease transfer can grant input without ever
     // widening what was approved. `lease_stripped_input_` marks the temporal
     // strip (another viewer held control) as opposed to a policy exclusion.
-    uint16_t approved_permissions_ = 0;
+    PermissionMask approved_permissions_ = 0;
     bool lease_stripped_input_ = false;
     // A UI request is queued instead of touching the session from that
     // thread; the frame loop applies it. The pair is only meaningful together,
     // so both fields are read and written under permission_mutex_.
     std::mutex permission_mutex_;
     std::atomic<bool> permission_update_pending_{false};
-    std::atomic<uint16_t> pending_permissions_{0};
+    std::atomic<PermissionMask> pending_permissions_{0};
     std::thread thread_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> running_{false};
@@ -806,6 +813,12 @@ private:
                               HostServerStats& stats);
     void audit_upload(const std::string& name, uint64_t bytes, bool success,
                       const std::string& detail);
+    // Records a refused Hello in the audit spool. A blocked peer retries in a
+    // loop, so repeats of the same address and refusal are suppressed for a
+    // short interval instead of flooding the spool.
+    void audit_denial(const std::string& address, AccessDenial denial,
+                      const std::string& reason);
+    bool should_audit_denial(const std::string& key, int64_t now_unix);
 
     // The viewer's incoming upload. One transfer at a time: the receiver owns
     // the .part file and the answer goes out only after the name, free space
@@ -829,6 +842,13 @@ private:
     bool session_audit_ref_absent_ = false;
     std::string file_audit_ref_;
     bool file_audit_ref_absent_ = false;
+    // Shared by the listener and every accepted worker, so reconnects cannot
+    // reset the refusal throttle. Also used by the single-viewer listener.
+    struct DenialAuditState {
+        std::mutex mutex;
+        std::map<std::string, int64_t> records;
+    };
+    std::shared_ptr<DenialAuditState> denial_audit_ = std::make_shared<DenialAuditState>();
     std::ifstream download_stream_;
     double download_tokens_ = 0.0;
     std::chrono::steady_clock::time_point download_token_time_;
@@ -864,6 +884,19 @@ private:
     // They live here instead of in stream_desktop() because the follower path
     // serves the same per-viewer features without owning capture.
     bool clipboard_was_allowed_ = false;
+    // A delayed clipboard owner or a slow copied folder must not stall
+    // capture, control requests or permission revocation. Only the session
+    // thread consumes results; callbacks own their lifetime independently.
+    std::unique_ptr<ClipboardWorker> clipboard_worker_;
+    uint64_t clipboard_epoch_ = 0;
+    bool clipboard_baseline_pending_ = true;
+    bool clipboard_write_pending_ = false;
+    bool clipboard_write_inflight_ = false;
+    bool clipboard_write_is_files_ = false;
+    unsigned clipboard_write_attempts_ = 0;
+    ClipboardContent pending_clipboard_content_;
+    std::vector<std::string> pending_clipboard_paths_;
+    std::chrono::steady_clock::time_point clipboard_write_retry_{};
     ClipboardContent last_clipboard_;
     uint64_t last_clipboard_hash_ = 0;
     uint64_t clipboard_seq_ = 1;

@@ -188,8 +188,14 @@ struct HostSettings {
     // protect_totp_secret()/unprotect_totp_secret() for the clear text.
     std::string totp_secret;
     std::vector<TrustedDevice> trusted_devices;
-    // Comma-separated IPv4 CIDR list; empty means no restriction. Entries that
-    // do not parse make the list fail closed rather than disappear.
+    // How long a remembered device may skip two-factor authentication after
+    // its last successful use. 0 means it never expires; the default is 90
+    // days. Changing it applies to devices already on the list, because the
+    // comparison is against each device's last_seen timestamp.
+    uint32_t trusted_device_days = 90;
+    // Comma-separated IPv4 and/or IPv6 CIDR list; empty means no restriction.
+    // Entries that do not parse make the list fail closed rather than
+    // disappear.
     std::string ip_whitelist;
     HostTokenMode token_mode = HostTokenMode::OneTime;
     // Empty means "generate one on first start".

@@ -11,6 +11,7 @@ add_library(chast_viewer_core STATIC
   "${VIEWER_DIR}/viewer_engine.cc"
   "${VIEWER_DIR}/remote_cursor.cc"
   "${VIEWER_DIR}/security_key.cc"
+  "${VIEWER_DIR}/keyboard_capture.cc"
 )
 target_include_directories(chast_viewer_core PUBLIC "${VIEWER_DIR}")
 # The viewer records with the same muxer the command-line tool uses, so the

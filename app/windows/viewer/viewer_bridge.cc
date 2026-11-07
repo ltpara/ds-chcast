@@ -37,6 +37,7 @@ constexpr UINT_PTR kWindowSubclassId = 2;
 // Posted by a security-key worker thread once Windows Hello returns. The
 // LPARAM owns a SecurityKeyCompletion that only the platform thread may answer.
 constexpr UINT kSecurityKeyDoneMessage = WM_APP + 0x51;
+constexpr UINT kKeyboardEscapeMessage = WM_APP + 0x52;
 // The Dart side uses a server URL or host:port as the password-store key.
 constexpr size_t kMaxTrustKeyLength = 512;
 // Binds account-token ciphertext to its purpose, so a blob lifted from another
@@ -262,6 +263,12 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
     texture_sink_ = std::make_unique<GpuFrameSink>();
     camera_sink_ = std::make_unique<GpuFrameSink>();
     viewer_ = std::make_unique<ViewerEngine>(texture_sink_.get(), camera_sink_.get());
+    keyboard_capture_ = std::make_unique<KeyboardCapture>(window_,
+        [this](const chast::InputEvent& event) {
+            return viewer_ != nullptr && viewer_->SendInput(event);
+        },
+        [this] { if (viewer_ != nullptr) viewer_->ReleaseInput(); },
+        [this] { PostMessageW(window_, kKeyboardEscapeMessage, 0, 0); });
     channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
         engine_->messenger(), "chast/viewer", &flutter::StandardMethodCodec::GetInstance());
     channel_->SetMethodCallHandler(
@@ -296,6 +303,7 @@ void ViewerBridge::Shutdown() {
     // the flag itself; clearing it here covers the window already being gone.
     security_key_busy_->store(false);
     SetKeyCapture(false);
+    keyboard_capture_.reset();
     SetRelativeMouse(false, 1.0);
     ClearCursor();
     if (view_ != nullptr) {
@@ -586,7 +594,7 @@ void ViewerBridge::HandleMethodCall(
         map[key("fullscreen")] = flutter::EncodableValue(fullscreen_);
         map[key("inputEnabled")] = flutter::EncodableValue(status.input_enabled);
         map[key("permissions")] =
-            flutter::EncodableValue(static_cast<int32_t>(status.permissions));
+            flutter::EncodableValue(static_cast<int64_t>(status.permissions));
         map[key("permissionUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.permission_updates));
         map[key("originX")] = flutter::EncodableValue(static_cast<int32_t>(status.origin_x));
@@ -1066,7 +1074,7 @@ void ViewerBridge::HandleMethodCall(
         }
         SetKeyCapture(*enable);
         result->Success(
-            flutter::EncodableValue(key_capture_.load(std::memory_order_relaxed)));
+            flutter::EncodableValue(keyboard_capture_ && keyboard_capture_->enabled()));
         return;
     }
 
@@ -1090,6 +1098,16 @@ void ViewerBridge::HandleMethodCall(
     if (method == "releaseInput") {
         const bool queued = viewer_ != nullptr && viewer_->ReleaseInput();
         result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "keyboardState") {
+        if (!keyboard_capture_ || !keyboard_capture_->available()) {
+            result->Error("unavailable", "native keyboard capture is unavailable");
+            return;
+        }
+        result->Success(flutter::EncodableValue(static_cast<int32_t>(
+            keyboard_capture_->InputState())));
         return;
     }
 
@@ -2307,6 +2325,15 @@ LRESULT CALLBACK ViewerBridge::WindowSubclassProc(HWND window, UINT message, WPA
                                                   LPARAM lparam, UINT_PTR id,
                                                   DWORD_PTR ref_data) {
     auto* bridge = reinterpret_cast<ViewerBridge*>(ref_data);
+    if (message == kKeyboardEscapeMessage && bridge != nullptr && !bridge->shutting_down_) {
+        bridge->SetRelativeMouse(false, 1.0);
+        bridge->channel_->InvokeMethod("keyboardEscape", nullptr);
+        return 0;
+    }
+    if (message == WM_ACTIVATE && LOWORD(wparam) == WA_INACTIVE && bridge != nullptr &&
+        bridge->keyboard_capture_ && bridge->keyboard_capture_->enabled()) {
+        bridge->keyboard_capture_->Release();
+    }
     if (message == WM_CLOSE && bridge != nullptr && bridge->window_close_handler_ &&
         !bridge->shutting_down_) {
         // The session window must wind its session down before the engine
@@ -2358,7 +2385,6 @@ void ViewerBridge::SendInput(
 
     chast::InputEvent event;
     event.modifiers = static_cast<uint16_t>(modifiers);
-    last_modifiers_ = event.modifiers;
     if (kind == 1) {
         event.kind = chast::InputKind::Mouse;
         if (action < 0 || action > 5 || buttons < 0 || buttons > 0x1F ||
@@ -2391,6 +2417,14 @@ void ViewerBridge::SendInput(
                 break;
         }
     } else if (kind == 2) {
+        bool physical = false;
+        map_bool(args, "physical", &physical);
+        if (physical && keyboard_capture_ && keyboard_capture_->enabled()) {
+            // Native ownership can begin before the asynchronous Dart reply.
+            // Do not double-forward the remaining Flutter key notifications.
+            result->Success(flutter::EncodableValue(true));
+            return;
+        }
         event.kind = chast::InputKind::Key;
         if (!map_int(args, "hidUsage", &usage) || usage <= 0 || usage > 0xFFFF ||
             action < 0 || action > 1) {
@@ -2453,11 +2487,19 @@ void ViewerBridge::SendInput(
         return;
     }
 
+    // The hook consumes physical modifiers before Flutter sees them. Pointer
+    // events must use that same bitmap; synthetic toolbar chords keep theirs.
+    if (event.kind != chast::InputKind::Key && keyboard_capture_ &&
+        keyboard_capture_->enabled()) {
+        event.modifiers = keyboard_capture_->InputState();
+    }
+    last_modifiers_ = event.modifiers;
     const bool queued = viewer_ != nullptr && viewer_->SendInput(event);
     result->Success(flutter::EncodableValue(queued));
 }
 
 void ViewerBridge::SetKeyCapture(bool enable) {
+    if (keyboard_capture_) keyboard_capture_->Enable(enable);
     const bool was = key_capture_.exchange(enable, std::memory_order_relaxed);
     if (was == enable || view_ == nullptr || !IsWindow(view_)) {
         return;
@@ -2471,6 +2513,7 @@ void ViewerBridge::SetKeyCapture(bool enable) {
 }
 
 void ViewerBridge::SetRelativeMouse(bool enable, double scale) {
+    if (keyboard_capture_) keyboard_capture_->set_relative(enable);
     relative_scale_ = scale > 0.0 ? scale : 1.0;
     relative_mouse_.store(enable, std::memory_order_relaxed);
     if (view_ == nullptr || !IsWindow(view_)) {
@@ -2549,7 +2592,10 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                         if (move_x != 0 || move_y != 0) {
                             chast::InputEvent event;
                             event.kind = chast::InputKind::Mouse;
-                            event.modifiers = self->last_modifiers_;
+                            event.modifiers = self->keyboard_capture_ &&
+                                                      self->keyboard_capture_->enabled()
+                                                  ? self->keyboard_capture_->InputState()
+                                                  : self->last_modifiers_;
                             event.mouse.action = chast::MouseAction::MoveRelative;
                             event.mouse.buttons = 0;
                             event.mouse.x = move_x;

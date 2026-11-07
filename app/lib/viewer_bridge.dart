@@ -1974,6 +1974,7 @@ class ViewerBridge {
     required int usage,
     required bool down,
     int modifiers = 0,
+    bool physical = false,
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>('sendInput', <String, Object>{
       'kind': 2,
@@ -1982,6 +1983,7 @@ class ViewerBridge {
       'x': 0,
       'y': 0,
       'hidUsage': usage,
+      'physical': physical,
       'modifiers': modifiers,
     });
     return queued ?? false;
@@ -2423,12 +2425,22 @@ class ViewerBridge {
     });
   }
 
-  /// While remote control is on, an active local IME must not turn physical
-  /// keys into VK_PROCESSKEY (the engine drops those before Dart sees them).
+  /// Enables the native physical keyboard hook and detaches the local IME.
+  /// Returns whether the hook owns input; false keeps Flutter's fallback.
   /// Turning this off restores the IME for local text fields.
   static Future<bool> setKeyCapture(bool enable) async {
     final bool? active = await _channel.invokeMethod<bool>('setKeyCapture', enable);
     return active ?? false;
+  }
+
+  static Future<int> keyboardState({int fallback = 0}) async {
+    try {
+      return await _channel.invokeMethod<int>('keyboardState') ?? fallback;
+    } on PlatformException {
+      return fallback;
+    } on MissingPluginException {
+      return fallback;
+    }
   }
 
   /// Pins the local pointer to the viewer window and turns motion into
@@ -2674,6 +2686,11 @@ class ViewerBridge {
     _installMethodHandler();
   }
 
+  static void setKeyboardEscapeHandler(void Function()? handler) {
+    _keyboardEscapeHandler = handler;
+    _installMethodHandler();
+  }
+
   /// Routes the native window's close button through [handler] so a session
   /// window can shut its session down before the window disappears. Passing
   /// null restores the default close behavior.
@@ -2693,11 +2710,16 @@ class ViewerBridge {
   }
 
   static void _installMethodHandler() {
-    if (_dropHandler == null && _windowCloseHandler == null) {
+    if (_dropHandler == null && _windowCloseHandler == null &&
+        _keyboardEscapeHandler == null) {
       _channel.setMethodCallHandler(null);
       return;
     }
     _channel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'keyboardEscape') {
+        _keyboardEscapeHandler?.call();
+        return;
+      }
       if (call.method == 'windowCloseRequested') {
         await _windowCloseHandler?.call();
         return;
@@ -2716,6 +2738,7 @@ class ViewerBridge {
 
   static void Function(List<String> paths)? _dropHandler;
   static Future<void> Function()? _windowCloseHandler;
+  static void Function()? _keyboardEscapeHandler;
 
   /// Picks up whatever pointer state the host sent and installs it as this
   /// window's cursor while [enabled]. [scale] is the size the video is drawn
@@ -2930,8 +2953,8 @@ abstract final class ViewerLock {
 /// eight modifier usages is ignored. [PhysicalKeyboardKey.usbHidUsage] carries
 /// the usage page in its upper half (0x000700E0 for left Ctrl), so only page
 /// 0x07 keys qualify. Windows reports AltGr as a synthetic left Ctrl plus
-/// Right Alt, so the bitmap stays physical and the host folds the pair into
-/// Right Alt.
+/// Right Alt. The native hook removes the synthetic Ctrl using its scan code;
+/// this Flutter fallback preserves the keys it actually receives.
 int modifierBitsFor(Iterable<PhysicalKeyboardKey> keys) {
   int bits = 0;
   for (final PhysicalKeyboardKey key in keys) {

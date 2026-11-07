@@ -148,8 +148,13 @@ void test_hello() {
 
     chast::ClientHello plain;
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(plain));
-    unknown_permissions[8] = 0x40;  // bit 6: the one slot outside every permission
+    // Version, display and the empty token/password lengths fill the first
+    // eight bytes; the mask is the little-endian u32 that follows. Bit 6 is
+    // still reserved, so it is a bit the protocol does not define.
+    unknown_permissions[8] = 0x40;
     unknown_permissions[9] = 0x00;
+    unknown_permissions[10] = 0x00;
+    unknown_permissions[11] = 0x00;
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
     std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
@@ -465,13 +470,19 @@ void test_hello_ack() {
     rejects_ack(std::move(empty_source), "a HelloAck with an empty source picture is rejected");
 
     std::vector<uint8_t> mask_mismatch = ack_payload();
-    mask_mismatch[mask_mismatch.size() - 2] = 0x03;  // flags still say audio too
-    mask_mismatch[mask_mismatch.size() - 1] = 0;
+    mask_mismatch[mask_mismatch.size() - 5] = 0x03;  // flags still say audio too
+    mask_mismatch[mask_mismatch.size() - 4] = 0;
+    mask_mismatch[mask_mismatch.size() - 3] = 0;
+    mask_mismatch[mask_mismatch.size() - 2] = 0;
     rejects_ack(std::move(mask_mismatch),
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
+    // The mask is the last four bytes before the mode byte; bit 15 is the
+    // highest permission the protocol defines, so bit 16 is unknown.
+    unknown_permissions[unknown_permissions.size() - 5] = 0x00;
+    unknown_permissions[unknown_permissions.size() - 4] = 0x00;
+    unknown_permissions[unknown_permissions.size() - 3] = 0x01;
     unknown_permissions[unknown_permissions.size() - 2] = 0x00;
-    unknown_permissions[unknown_permissions.size() - 1] = 0x80;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
 
@@ -694,7 +705,7 @@ void test_merged_hello_ack() {
 }
 
 void test_permission_update() {
-    uint16_t permissions = chast::kPermissionAll;
+    chast::PermissionMask permissions = chast::kPermissionAll;
     std::string error;
     check((chast::kPermissionAll & chast::kPermissionFileTransfer) != 0 &&
               (chast::kPermissionAll & chast::kPermissionClipboard) != 0,
@@ -3405,8 +3416,8 @@ void test_injector_dry_run() {
         }
     }
 
-    // AltGr arrives as Windows' synthetic left Ctrl plus Right Alt; the pair is
-    // folded into Right Alt, including the Ctrl release at the end.
+    // Synthetic AltGr Ctrl is removed by the native viewer; a real Ctrl plus
+    // RightAlt must reach the host unchanged.
     {
         InjectorFixture fixture{chast::InputInjector::create(true, &error)};
         if (fixture.injector) {
@@ -3419,15 +3430,14 @@ void test_injector_dry_run() {
             fixture.injector->submit(key(0xE0, chast::KeyAction::Up, 0));
             fixture.injector->stop();
             const chast::InputStats stats = fixture.injector->stats();
-            check(stats.applied == 4, "AltGr's synthetic Ctrl is folded away");
+            check(stats.applied == 4, "real Ctrl+RightAlt injects four transitions");
             check(stats.rejected == 0 && stats.failed == 0 && stats.dropped == 0,
-                  "AltGr has no rejects, failures or drops");
+                  "Ctrl+RightAlt has no rejects, failures or drops");
         }
     }
 
-    // Lock keys are states, not held keys: the first event reports Caps on
-    // and the injector taps Caps once; later events carrying the same state
-    // do nothing, and switching back taps it again.
+    // Lock state is borrowed for each affected event, then restored so a
+    // remote session does not change the host's own typing state.
     {
         InjectorFixture fixture{chast::InputInjector::create(true, &error)};
         if (fixture.injector) {
@@ -3437,8 +3447,8 @@ void test_injector_dry_run() {
             fixture.injector->submit(key(0x04, chast::KeyAction::Up, 0));
             fixture.injector->stop();
             const chast::InputStats stats = fixture.injector->stats();
-            check(stats.lock_toggles == 2, "a lock-state change taps the lock key once");
-            check(stats.applied == 8, "each lock tap is a press and a release");
+            check(stats.lock_toggles == 4, "Caps is adjusted and restored for both events");
+            check(stats.applied == 12, "four lock taps plus four original events");
             check(stats.rejected == 0 && stats.failed == 0,
                   "lock synchronization injects cleanly");
         }
@@ -3452,6 +3462,27 @@ void test_injector_dry_run() {
             fixture.injector->stop();
             check(fixture.injector->stats().lock_toggles == 0,
                   "an already matching lock state is left alone");
+        }
+    }
+
+    for (const uint16_t usage : {uint16_t{0x39}, uint16_t{0x53}, uint16_t{0x47}}) {
+        auto injector = chast::InputInjector::create(true, &error);
+        if (!injector) continue;
+        injector->submit(key(usage, chast::KeyAction::Down, chast::kLockStateMask));
+        injector->submit(key(usage, chast::KeyAction::Up, chast::kLockStateMask));
+        injector->stop();
+        check(injector->stats().applied == 2 && injector->stats().lock_toggles == 0,
+              "a physical lock key is never synchronized with itself");
+    }
+    {
+        auto injector = chast::InputInjector::create(true, &error);
+        if (injector) {
+            for (int i = 0; i < 5; ++i) injector->submit(key(0x04, chast::KeyAction::Down, 0));
+            injector->submit(key(0x04, chast::KeyAction::Up, 0));
+            injector->submit(key(0x48, chast::KeyAction::Down, 0));
+            injector->stop();
+            check(injector->stats().applied == 8 && injector->stats().rejected == 0,
+                  "repeats inject every down and Pause is released on teardown");
         }
     }
 
@@ -3552,7 +3583,7 @@ void test_injector_dry_run() {
 
     chast::InputEvent unknown;
     unknown.kind = chast::InputKind::Key;
-    unknown.key.hid_usage = 0x48;  // Pause: no set 1 scan code
+    unknown.key.hid_usage = 0xFFFF;
     fixture.injector->submit(unknown);
 
     fixture.injector->stop();

@@ -23,6 +23,7 @@
 
 #include "chast/host_server.h"
 #include "chast/security.h"
+#include "clipboard_stub.h"
 
 namespace {
 
@@ -139,6 +140,7 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
                                               const std::shared_ptr<LoginState>& login,
                                               std::string* error) {
     chast::HostServerConfig config;
+    use_empty_clipboard(config);
     config.settings.bind_address = "127.0.0.1";
     config.settings.port = port;
     config.settings.carrier = false;
@@ -251,7 +253,7 @@ int main() {
             if (host->status().state != chast::HostState::Streaming) {
                 skip("the OS-login check needs a desktop stream");
             } else {
-                const uint16_t permissions = viewer->permissions();
+                const chast::PermissionMask permissions = viewer->permissions();
                 check((permissions & chast::kPermissionInput) != 0,
                       "the host offers the input permission");
                 check((permissions & chast::kPermissionOsLogin) != 0,

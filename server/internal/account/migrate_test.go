@@ -18,6 +18,16 @@ func TestSchemaVersionMatchesMigrations(t *testing.T) {
 func seedAuditEventTables(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`CREATE TABLE audit_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at INTEGER NOT NULL,
+			username TEXT NOT NULL,
+			action TEXT NOT NULL,
+			detail TEXT NOT NULL DEFAULT '',
+			client_ip TEXT NOT NULL DEFAULT '',
+			location TEXT NOT NULL DEFAULT '',
+			success INTEGER NOT NULL DEFAULT 0
+		)`,
 		`CREATE TABLE connection_events (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id    TEXT NOT NULL,

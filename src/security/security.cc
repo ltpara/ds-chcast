@@ -1166,4 +1166,375 @@ bool ipv4_in_ranges(uint32_t address, const std::vector<Ipv4Range>& ranges) {
     return false;
 }
 
+std::string format_ipv4(uint32_t address) {
+    std::string text;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (!text.empty()) {
+            text.push_back('.');
+        }
+        text += std::to_string((address >> shift) & 0xFFu);
+    }
+    return text;
+}
+
+// ----- IPv6 CIDR -----
+
+namespace {
+
+std::string strip_zone(const std::string& text) {
+    const size_t zone = text.find('%');
+    return zone == std::string::npos ? text : text.substr(0, zone);
+}
+
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+bool is_mapped_v4(const std::array<uint8_t, 16>& address) {
+    for (size_t i = 0; i < 10; ++i) {
+        if (address[i] != 0) {
+            return false;
+        }
+    }
+    return address[10] == 0xFF && address[11] == 0xFF;
+}
+
+void store_ipv4(uint32_t address, std::array<uint8_t, 16>& bytes) {
+    bytes = {};
+    bytes[0] = static_cast<uint8_t>(address >> 24);
+    bytes[1] = static_cast<uint8_t>(address >> 16);
+    bytes[2] = static_cast<uint8_t>(address >> 8);
+    bytes[3] = static_cast<uint8_t>(address);
+}
+
+uint32_t load_ipv4(const std::array<uint8_t, 16>& bytes) {
+    return (static_cast<uint32_t>(bytes[0]) << 24) |
+           (static_cast<uint32_t>(bytes[1]) << 16) |
+           (static_cast<uint32_t>(bytes[2]) << 8) | static_cast<uint32_t>(bytes[3]);
+}
+
+bool parse_prefix(const std::string& text, uint32_t limit, uint8_t& prefix) {
+    if (text.empty() || text.size() > 3) {
+        return false;
+    }
+    uint32_t parsed = 0;
+    for (char c : text) {
+        const int digit = hex_digit(c);
+        if (digit < 0 || digit > 9) {
+            return false;
+        }
+        parsed = parsed * 10 + static_cast<uint32_t>(digit);
+    }
+    if (parsed > limit) {
+        return false;
+    }
+    prefix = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+}  // namespace
+
+bool parse_ipv6(const std::string& text, std::array<uint8_t, 16>& address) {
+    const std::string value = trim(strip_zone(trim(text)));
+    if (value.empty()) {
+        return false;
+    }
+    // Sixteen-bit groups as written; a "::" leaves a hole that the zero fill
+    // below closes.
+    uint16_t groups[8] = {};
+    int count = 0;
+    int gap = -1;
+    size_t position = 0;
+    if (value.size() >= 2 && value.compare(0, 2, "::") == 0) {
+        gap = 0;
+        position = 2;
+        if (position == value.size()) {
+            address = {};
+            return true;
+        }
+    }
+    while (position < value.size()) {
+        if (count >= 8) {
+            return false;
+        }
+        const size_t colon = value.find(':', position);
+        const size_t stop = colon == std::string::npos ? value.size() : colon;
+        const std::string piece = value.substr(position, stop - position);
+        if (piece.empty()) {
+            return false;
+        }
+        if (piece.find('.') != std::string::npos) {
+            // The dotted-quad tail stands for the last two groups and must end
+            // the literal.
+            uint32_t embedded = 0;
+            if (colon != std::string::npos || count > 6 || !parse_ipv4(piece, embedded)) {
+                return false;
+            }
+            groups[count++] = static_cast<uint16_t>(embedded >> 16);
+            groups[count++] = static_cast<uint16_t>(embedded & 0xFFFFu);
+            break;
+        }
+        if (piece.size() > 4) {
+            return false;
+        }
+        uint16_t group = 0;
+        for (char c : piece) {
+            const int digit = hex_digit(c);
+            if (digit < 0) {
+                return false;
+            }
+            group = static_cast<uint16_t>((group << 4) | static_cast<uint16_t>(digit));
+        }
+        groups[count++] = group;
+        if (colon == std::string::npos) {
+            break;
+        }
+        position = colon + 1;
+        if (position == value.size()) {
+            return false;  // a single trailing ':' cannot terminate a group
+        }
+        if (position < value.size() && value[position] == ':') {
+            if (gap >= 0) {
+                return false;  // a second "::"
+            }
+            gap = count;
+            ++position;
+            if (position == value.size()) {
+                break;
+            }
+        }
+    }
+    if (gap >= 0) {
+        if (count > 7) {
+            return false;
+        }
+        const int tail = count - gap;
+        uint16_t filled[8] = {};
+        for (int i = 0; i < gap; ++i) {
+            filled[i] = groups[i];
+        }
+        for (int i = 0; i < tail; ++i) {
+            filled[8 - tail + i] = groups[gap + i];
+        }
+        std::memcpy(groups, filled, sizeof(groups));
+        count = 8;
+    }
+    if (count != 8) {
+        return false;
+    }
+    for (int i = 0; i < 8; ++i) {
+        address[static_cast<size_t>(2 * i)] = static_cast<uint8_t>(groups[i] >> 8);
+        address[static_cast<size_t>(2 * i + 1)] = static_cast<uint8_t>(groups[i] & 0xFFu);
+    }
+    return true;
+}
+
+bool parse_ipv6_cidr(const std::string& text, Ipv6Range& range) {
+    const std::string value = trim(text);
+    const size_t slash = value.find('/');
+    const std::string address_text =
+        slash == std::string::npos ? value : value.substr(0, slash);
+    std::array<uint8_t, 16> address{};
+    if (!parse_ipv6(address_text, address)) {
+        return false;
+    }
+    uint8_t prefix = 128;
+    if (slash != std::string::npos && !parse_prefix(trim(value.substr(slash + 1)), 128, prefix)) {
+        return false;
+    }
+    range.address = address;
+    range.prefix = prefix;
+    return true;
+}
+
+bool ipv6_in_range(const std::array<uint8_t, 16>& address, const Ipv6Range& range) {
+    if (range.prefix > 128) {
+        return false;
+    }
+    const size_t full = range.prefix / 8;
+    const uint8_t rest = static_cast<uint8_t>(range.prefix % 8);
+    for (size_t i = 0; i < full; ++i) {
+        if (address[i] != range.address[i]) {
+            return false;
+        }
+    }
+    if (rest != 0) {
+        const uint8_t mask = static_cast<uint8_t>(0xFFu << (8 - rest));
+        if ((address[full] & mask) != (range.address[full] & mask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ipv6_in_ranges(const std::array<uint8_t, 16>& address,
+                    const std::vector<Ipv6Range>& ranges) {
+    for (const Ipv6Range& range : ranges) {
+        if (ipv6_in_range(address, range)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string format_ipv6_prefix(const std::array<uint8_t, 16>& address, uint8_t prefix) {
+    std::array<uint8_t, 16> bytes = address;
+    if (prefix < 128) {
+        const size_t full = prefix / 8;
+        const uint8_t rest = static_cast<uint8_t>(prefix % 8);
+        if (rest != 0) {
+            bytes[full] &= static_cast<uint8_t>(0xFFu << (8 - rest));
+        }
+        for (size_t i = full + (rest != 0 ? 1 : 0); i < bytes.size(); ++i) {
+            bytes[i] = 0;
+        }
+    }
+    uint16_t groups[8] = {};
+    for (size_t i = 0; i < 8; ++i) {
+        groups[i] = static_cast<uint16_t>((bytes[2 * i] << 8) | bytes[2 * i + 1]);
+    }
+    int best_start = -1;
+    int best_length = 0;
+    for (int i = 0; i < 8;) {
+        if (groups[i] != 0) {
+            ++i;
+            continue;
+        }
+        int end = i;
+        while (end < 8 && groups[end] == 0) {
+            ++end;
+        }
+        if (end - i > best_length) {
+            best_start = i;
+            best_length = end - i;
+        }
+        i = end;
+    }
+    if (best_length < 2) {
+        best_start = -1;  // RFC 5952 compresses only runs of two or more
+    }
+    std::string text;
+    for (int i = 0; i < 8; ++i) {
+        if (best_start == i) {
+            text += "::";
+            i += best_length - 1;
+            continue;
+        }
+        if (!text.empty() && text.back() != ':') {
+            text.push_back(':');
+        }
+        char group_text[5] = {};
+        std::snprintf(group_text, sizeof(group_text), "%x", groups[i]);
+        text += group_text;
+    }
+    text.push_back('/');
+    text += std::to_string(static_cast<int>(prefix));
+    return text;
+}
+
+bool parse_ip_address(const std::string& text, IpAddress& address) {
+    address = IpAddress{};
+    std::string value = trim(strip_zone(trim(text)));
+    if (value.size() >= 2 && value.front() == '[' && value.back() == ']') {
+        value = value.substr(1, value.size() - 2);
+    }
+    if (value.empty()) {
+        return false;
+    }
+    uint32_t ipv4 = 0;
+    if (parse_ipv4(value, ipv4)) {
+        store_ipv4(ipv4, address.bytes);
+        return true;
+    }
+    std::array<uint8_t, 16> ipv6{};
+    if (!parse_ipv6(value, ipv6)) {
+        return false;
+    }
+    if (is_mapped_v4(ipv6)) {
+        const uint32_t embedded = (static_cast<uint32_t>(ipv6[12]) << 24) |
+                                  (static_cast<uint32_t>(ipv6[13]) << 16) |
+                                  (static_cast<uint32_t>(ipv6[14]) << 8) |
+                                  static_cast<uint32_t>(ipv6[15]);
+        store_ipv4(embedded, address.bytes);
+        return true;
+    }
+    address.ipv6 = true;
+    address.bytes = ipv6;
+    return true;
+}
+
+bool parse_ip_cidr(const std::string& text, IpRange& range) {
+    const std::string value = trim(text);
+    const size_t slash = value.find('/');
+    const std::string address_text =
+        slash == std::string::npos ? value : value.substr(0, slash);
+    IpAddress address;
+    if (!parse_ip_address(address_text, address)) {
+        return false;
+    }
+    // A mapped literal is written with a full 128-bit prefix even though it
+    // names an IPv4 range.
+    const bool mapped = !address.ipv6 && address_text.find(':') != std::string::npos;
+    uint32_t limit = address.ipv6 || mapped ? 128 : 32;
+    uint8_t prefix = static_cast<uint8_t>(limit);
+    if (slash != std::string::npos &&
+        !parse_prefix(trim(value.substr(slash + 1)), limit, prefix)) {
+        return false;
+    }
+    if (mapped) {
+        if (prefix < 96) {
+            return false;  // wider than the IPv4 block; not an IPv4 rule
+        }
+        prefix = static_cast<uint8_t>(prefix - 96);
+    }
+    range.ipv6 = address.ipv6;
+    range.address = address.bytes;
+    range.prefix = prefix;
+    return true;
+}
+
+bool ip_in_range(const IpAddress& address, const IpRange& range) {
+    if (address.ipv6 != range.ipv6) {
+        return false;
+    }
+    if (range.ipv6) {
+        Ipv6Range ipv6;
+        ipv6.address = range.address;
+        ipv6.prefix = range.prefix;
+        return ipv6_in_range(address.bytes, ipv6);
+    }
+    Ipv4Range ipv4;
+    ipv4.address = load_ipv4(range.address);
+    ipv4.prefix = range.prefix;
+    return ipv4_in_range(load_ipv4(address.bytes), ipv4);
+}
+
+bool ip_in_ranges(const IpAddress& address, const std::vector<IpRange>& ranges) {
+    for (const IpRange& range : ranges) {
+        if (ip_in_range(address, range)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string format_ip_range(const IpRange& range) {
+    if (range.ipv6) {
+        return format_ipv6_prefix(range.address, range.prefix);
+    }
+    std::string text = format_ipv4(load_ipv4(range.address));
+    text.push_back('/');
+    text += std::to_string(static_cast<int>(range.prefix));
+    return text;
+}
+
 }  // namespace chast

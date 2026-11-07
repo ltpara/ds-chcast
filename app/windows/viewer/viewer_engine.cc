@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include "chast/audio.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
+#include "chast/clipboard_worker.h"
 #include "chast/decoder.h"
 #include "chast/file_transfer.h"
 #include "chast/identity.h"
@@ -646,9 +648,10 @@ bool ViewerEngine::ReleaseInput() {
         return false;
     }
     std::lock_guard<std::mutex> lock(input_mutex_);
-    if (!input_enabled_ || pending_input_.size() >= kMaxPendingInput) {
+    if (!input_enabled_) {
         return false;
     }
+    if (pending_input_.size() >= kMaxPendingInput) pending_input_.clear();
     PendingInput pending;
     pending.release = true;
     pending_input_.push_back(pending);
@@ -772,7 +775,21 @@ bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t
 }
 
 void ViewerEngine::SetClipboardSync(bool enabled) {
-    clipboard_sync_.store(enabled, std::memory_order_release);
+    if (clipboard_sync_.exchange(enabled, std::memory_order_acq_rel) != enabled) {
+        clipboard_sync_version_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void ViewerEngine::SetClipboardSource(
+    std::function<bool(chast::ClipboardContent&)> source) {
+    std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
+    clipboard_source_ = std::move(source);
+}
+
+void ViewerEngine::SetClipboardSink(
+    std::function<bool(const chast::ClipboardContent&)> sink) {
+    std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
+    clipboard_sink_ = std::move(sink);
 }
 
 void ViewerEngine::SetClipboardFileSink(
@@ -2011,7 +2028,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool audio_broken = false;
     bool audio_enabled = false;
     bool audio_muted_applied = false;
-    uint16_t permissions = 0;
+    chast::PermissionMask permissions = 0;
     uint64_t permission_updates = 0;
     uint32_t audio_sample_rate = 0;
     uint32_t audio_channels = 0;
@@ -2802,7 +2819,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             // the UI's queue gates, the flags it polls, and the counters it
             // watches for a live change. Queued events that the host no
             // longer accepts are dropped here rather than sent and refused.
-            auto apply_permissions = [&](uint16_t mask) {
+            auto apply_permissions = [&](chast::PermissionMask mask) {
                 if (permission_updates != 0 && mask == permissions) {
                     return;
                 }
@@ -3044,33 +3061,63 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // uploaded, and anything the host sends is written locally
                 // and remembered so the next poll cannot echo it back.
                 bool clipboard_was_allowed = false;
+                bool clipboard_baseline_pending = true;
+                uint64_t clipboard_sync_version = clipboard_sync_version_.load();
+                uint64_t clipboard_epoch = 0;
                 uint64_t clipboard_hash = 0;
-                // Hash of the host's latest FileList; unlike clipboard_hash it
-                // is not touched by outbound polls, so a local copy on the
-                // viewer cannot make a downloading list look stale.
                 uint64_t clipboard_peer_file_list = 0;
-                // Viewer -> host clipboard files (protocol v34): identity of the
-                // list last announced or baselined, whether the local clipboard
-                // currently owns files (the rich poll then stays out of the
-                // way), and one log line per distinct collection refusal.
                 uint64_t clipboard_out_identity = 0;
                 bool clipboard_has_files = false;
-                bool clipboard_out_was_allowed = false;
-                auto next_clipboard_file_poll = Clock::now();
-                std::string last_clipboard_file_error;
+                auto next_clipboard_poll = Clock::now();
+                std::optional<chast::ClipboardSnapshot> clipboard_snapshot;
+                struct PendingClipboard {
+                    bool active = false;
+                    bool inflight = false;
+                    bool files = false;
+                    unsigned attempts = 0;
+                    chast::ClipboardContent content;
+                    std::vector<std::string> paths;
+                    Clock::time_point retry{};
+                } pending_clipboard;
+                {
+                    chast::ClipboardBackend backend;
+                    std::lock_guard lock(clipboard_sink_mutex_);
+                    if (clipboard_source_) {
+                        backend.read = [source = clipboard_source_](chast::ClipboardContent& content) {
+                            if (!source(content)) return chast::ClipboardReadState::Failed;
+                            return content.empty() ? chast::ClipboardReadState::Empty
+                                                   : chast::ClipboardReadState::Content;
+                        };
+                    }
+                    if (clipboard_file_source_) {
+                        backend.read_files = [source = clipboard_file_source_](std::vector<std::string>& paths) {
+                            return source(paths) && !paths.empty() ? chast::ClipboardReadState::Content
+                                                                  : chast::ClipboardReadState::Empty;
+                        };
+                    }
+                    backend.write = clipboard_sink_;
+                    backend.write_files = clipboard_file_sink_;
+                    if (!clipboard_worker_) {
+                        clipboard_worker_ = std::make_unique<chast::ClipboardWorker>(std::move(backend));
+                    } else {
+                        clipboard_worker_->SetBackend(std::move(backend));
+                    }
+                }
+                struct ClipboardCancel {
+                    chast::ClipboardWorker* worker;
+                    ~ClipboardCancel() { worker->Cancel(); }
+                } clipboard_cancel{clipboard_worker_.get()};
                 auto clipboard_allowed = [&] {
                     return clipboard_enabled &&
                            (permissions & chast::kPermissionClipboard) != 0 &&
                            clipboard_sync_.load(std::memory_order_relaxed);
                 };
-                auto remember_local_clipboard = [&] {
-                    chast::ClipboardContent current;
-                    std::string ignored;
-                    if (chast::read_clipboard(current, &ignored)) {
-                        clipboard_hash = chast::clipboard_content_hash(current);
-                    }
+                auto cancel_clipboard_work = [&] {
+                    ++clipboard_epoch;
+                    clipboard_worker_->Cancel();
+                    pending_clipboard = {};
+                    clipboard_snapshot.reset();
                 };
-                auto next_clipboard_poll = Clock::now();
 
                 // Clipboard file copy (protocol v33). The host announces the
                 // files on its clipboard as a FileList; the viewer pulls each
@@ -3203,42 +3250,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             discard_clipboard_files();
                             return;
                         }
-                        std::function<bool(const std::vector<std::string>&)> sink;
-                        {
-                            std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
-                            sink = clipboard_file_sink_;
+                        if (!pending_clipboard.active) {
+                            cancel_clipboard_work();
+                            pending_clipboard.active = true;
+                            pending_clipboard.files = true;
+                            pending_clipboard.paths = clipboard_files.paths;
+                            pending_clipboard.retry = now;
                         }
-                        std::string write_error;
-                        const bool written =
-                            sink ? sink(clipboard_files.paths)
-                                 : chast::write_clipboard_files(clipboard_files.paths,
-                                                                &write_error);
-                        if (!written) {
-                            if (write_error.empty()) {
-                                write_error = "the clipboard sink rejected the list";
-                            }
-                            ++clipboard_failed;
-                            std::fprintf(stderr,
-                                         "viewer: clipboard files: cannot write the "
-                                         "clipboard: %s\n",
-                                         write_error.c_str());
-                            discard_clipboard_files();
-                            return;
-                        }
-                        ++clipboard_received;
-                        clipboard_received_formats =
-                            1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
-                        // These files are on the local clipboard now: the
-                        // reverse poll must see its own write as the baseline
-                        // instead of copying the list back to the host.
-                        clipboard_out_identity = chast::clipboard_file_identity_hash(
-                            clipboard_files.entries);
-                        std::fprintf(stderr,
-                                     "viewer: clipboard files written (%zu top-level "
-                                     "item(s), formats 0x%x)\n",
-                                     clipboard_files.paths.size(),
-                                     clipboard_received_formats);
-                        clipboard_files = ClipboardFiles{};
                         return;
                     }
                     const size_t index = clipboard_files.next;
@@ -3254,35 +3272,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
 
                 auto poll_clipboard = [&] {
-                    const auto now = Clock::now();
-                    if (!clipboard_allowed()) {
-                        clipboard_was_allowed = false;
-                        return;
-                    }
-                    if (!clipboard_was_allowed) {
-                        // Re-enabling starts from a fresh baseline instead of
-                        // flushing everything that changed while paused.
-                        clipboard_was_allowed = true;
-                        remember_local_clipboard();
-                        next_clipboard_poll = now + kClipboardPollInterval;
-                        return;
-                    }
-                    if (now < next_clipboard_poll) {
-                        return;
-                    }
-                    next_clipboard_poll = now + kClipboardPollInterval;
-                    // A file copy owns the clipboard; a stale text hash would
-                    // otherwise announce a rich item beside it. The next rich
-                    // read after the files are gone is a fresh change again.
-                    if (clipboard_has_files) {
-                        clipboard_hash = 0;
-                        return;
-                    }
-                    chast::ClipboardContent current;
-                    std::string read_error;
-                    if (!chast::read_clipboard(current, &read_error)) {
-                        return;
-                    }
+                    if (!clipboard_snapshot || clipboard_snapshot->has_files ||
+                        clipboard_snapshot->state != chast::ClipboardReadState::Content) return;
+                    chast::ClipboardContent current = std::move(clipboard_snapshot->content);
+                    clipboard_snapshot.reset();
                     const uint64_t hash = chast::clipboard_content_hash(current);
                     if (hash == clipboard_hash) {
                         return;
@@ -3317,7 +3310,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
 
                 auto apply_peer_clipboard = [&](chast::ClipboardContent content) {
                     const uint64_t hash = chast::clipboard_content_hash(content);
-                    if (hash == clipboard_hash) {
+                    if (hash == clipboard_hash && !pending_clipboard.active) {
                         return;
                     }
                     std::string content_error;
@@ -3350,26 +3343,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                          file_error.c_str());
                             return;
                         }
+                        cancel_clipboard_work();
                         clipboard_hash = hash;
                         clipboard_peer_file_list = hash;
                         start_clipboard_files(std::move(entries), hash);
                         return;
                     }
-                    std::string write_error;
-                    if (!chast::write_clipboard(content, &write_error)) {
-                        ++clipboard_failed;
-                        if (clipboard_failed <= 3) {
-                            std::fprintf(stderr, "viewer: write clipboard: %s\n",
-                                         write_error.c_str());
-                        }
-                        return;
-                    }
-                    clipboard_hash = hash;
+                    cancel_clipboard_work();
                     clipboard_peer_file_list = 0;
-                    clipboard_received_formats = formats_mask(content);
-                    ++clipboard_received;
-                    std::fprintf(stderr, "viewer: clipboard written (formats 0x%x)\n",
-                                 clipboard_received_formats);
+                    pending_clipboard.active = true;
+                    pending_clipboard.content = std::move(content);
+                    pending_clipboard.retry = Clock::now();
                 };
 
                 auto receive_clipboard = [&] {
@@ -3548,72 +3532,90 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // host stages it for its own clipboard instead of its receive
                 // directory. A baseline is taken when sync opens: whatever was
                 // on the clipboard before the session is never flushed.
-                auto read_local_clipboard_files =
-                    [&](std::vector<chast::ClipboardFileEntry>& entries,
-                        std::vector<std::string>& paths) {
-                        entries.clear();
-                        paths.clear();
-                        std::vector<std::string> found;
-                        std::function<bool(std::vector<std::string>&)> source;
-                        {
-                            std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
-                            source = clipboard_file_source_;
-                        }
-                        if (source) {
-                            if (!source(found)) {
-                                return false;
-                            }
-                        } else {
-                            std::string read_error;
-                            if (!chast::read_clipboard_files(found, &read_error)) {
-                                return false;
-                            }
-                        }
-                        std::string collect_error;
-                        if (!chast::collect_clipboard_files(found, entries, paths,
-                                                            &collect_error)) {
-                            // One line per distinct refusal: the operator can
-                            // copy again, but an unchanged unsendable list must
-                            // not repaint the log twice a second.
-                            if (collect_error != last_clipboard_file_error) {
-                                last_clipboard_file_error = collect_error;
-                                std::fprintf(stderr, "viewer: clipboard files: %s\n",
-                                             collect_error.c_str());
-                            }
-                            return false;
-                        }
-                        last_clipboard_file_error.clear();
-                        return true;
-                    };
-                auto poll_local_clipboard_files = [&] {
+                auto pump_clipboard = [&] {
                     const auto now = Clock::now();
+                    clipboard_snapshot.reset();
+                    const uint64_t version = clipboard_sync_version_.load(std::memory_order_acquire);
+                    if (version != clipboard_sync_version) {
+                        cancel_clipboard_work();
+                        clipboard_was_allowed = false;
+                        clipboard_sync_version = version;
+                    }
                     if (!clipboard_allowed()) {
-                        clipboard_out_was_allowed = false;
-                        clipboard_out_identity = 0;
+                        if (clipboard_was_allowed) cancel_clipboard_work();
+                        clipboard_was_allowed = false;
                         clipboard_has_files = false;
                         return;
                     }
-                    std::vector<chast::ClipboardFileEntry> entries;
-                    std::vector<std::string> paths;
-                    if (!clipboard_out_was_allowed) {
-                        clipboard_out_was_allowed = true;
-                        clipboard_has_files = read_local_clipboard_files(entries, paths);
-                        clipboard_out_identity =
-                            clipboard_has_files
-                                ? chast::clipboard_file_identity_hash(entries)
-                                : 0;
-                        next_clipboard_file_poll = now + kClipboardPollInterval;
-                        return;
+                    if (!clipboard_was_allowed) {
+                        cancel_clipboard_work();
+                        clipboard_was_allowed = true;
+                        clipboard_baseline_pending = true;
+                        clipboard_hash = 0;
+                        clipboard_out_identity = 0;
+                        next_clipboard_poll = now;
                     }
-                    if (now < next_clipboard_file_poll) {
-                        return;
+                    chast::ClipboardWorker::Result result;
+                    if (clipboard_worker_->Take(result) && result.epoch == clipboard_epoch) {
+                        if (result.operation == chast::ClipboardWorker::Operation::Read) {
+                            if (!pending_clipboard.active && result.snapshot.state != chast::ClipboardReadState::Failed) {
+                                clipboard_has_files = result.snapshot.has_files;
+                                if (clipboard_baseline_pending) {
+                                    clipboard_baseline_pending = false;
+                                    clipboard_hash = result.snapshot.content.empty() ? 0
+                                        : chast::clipboard_content_hash(result.snapshot.content);
+                                    clipboard_out_identity = clipboard_has_files
+                                        ? chast::clipboard_file_identity_hash(result.snapshot.entries) : 0;
+                                } else {
+                                    clipboard_snapshot = std::move(result.snapshot);
+                                }
+                            }
+                            next_clipboard_poll = now + kClipboardPollInterval;
+                        } else if (pending_clipboard.active) {
+                            pending_clipboard.inflight = false;
+                            if (result.written) {
+                                clipboard_baseline_pending = false;
+                                ++clipboard_received;
+                                if (pending_clipboard.files) {
+                                    clipboard_received_formats = 1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
+                                    clipboard_out_identity = chast::clipboard_file_identity_hash(clipboard_files.entries);
+                                    clipboard_files = ClipboardFiles{};
+                                } else {
+                                    clipboard_hash = chast::clipboard_content_hash(pending_clipboard.content);
+                                    clipboard_out_identity = 0;
+                                    clipboard_received_formats = formats_mask(pending_clipboard.content);
+                                }
+                                pending_clipboard = {};
+                            } else {
+                                ++clipboard_failed;
+                                if (++pending_clipboard.attempts >= 10) {
+                                    if (pending_clipboard.files) discard_clipboard_files();
+                                    pending_clipboard = {};
+                                } else {
+                                    pending_clipboard.retry = now + std::chrono::milliseconds(250);
+                                }
+                            }
+                        }
                     }
-                    next_clipboard_file_poll = now + kClipboardPollInterval;
-                    clipboard_has_files = read_local_clipboard_files(entries, paths);
-                    if (!clipboard_has_files) {
+                    if (pending_clipboard.active) {
+                        if (!pending_clipboard.inflight && now >= pending_clipboard.retry) {
+                            pending_clipboard.inflight = pending_clipboard.files
+                                ? clipboard_worker_->WriteFiles(clipboard_epoch, pending_clipboard.paths)
+                                : clipboard_worker_->Write(clipboard_epoch, pending_clipboard.content);
+                        }
+                    } else if (now >= next_clipboard_poll) {
+                        clipboard_worker_->Read(clipboard_epoch);
+                    }
+                };
+                auto poll_local_clipboard_files = [&] {
+                    if (!clipboard_snapshot) return;
+                    if (!clipboard_snapshot->has_files) {
                         clipboard_out_identity = 0;
                         return;
                     }
+                    auto entries = std::move(clipboard_snapshot->entries);
+                    auto paths = std::move(clipboard_snapshot->paths);
+                    clipboard_snapshot.reset();
                     const uint64_t identity = chast::clipboard_file_identity_hash(entries);
                     if (identity == 0 || identity == clipboard_out_identity) {
                         return;
@@ -5579,10 +5581,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // enforces the same mask on its side; this keeps the UI's
                 // gates and the queues consistent with it immediately.
                 auto receive_permissions = [&] {
-                    uint16_t updated = 0;
+                    chast::PermissionMask updated = 0;
                     while (session->take_permission_update(updated)) {
                         apply_permissions(updated);
-                        std::fprintf(stderr, "viewer: permissions are now 0x%04x\n",
+                        std::fprintf(stderr, "viewer: permissions are now 0x%08x\n",
                                      updated);
                     }
                 };
@@ -7564,6 +7566,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                     }
                     drain_input();
+                    pump_clipboard();
                     poll_local_clipboard_files();
                     poll_clipboard();
                     receive_clipboard();

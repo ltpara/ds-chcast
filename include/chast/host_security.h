@@ -7,8 +7,10 @@
 // the Result as-is or shows the operator an approval dialog and then commits
 // it with note_connected(). Decisions are made in this order:
 //
-//   1. the IPv4 allow list, before any secret is examined;
-//   2. per-address lockout after repeated failures;
+//   1. the IP allow list, before any secret is examined;
+//   2. per-address lockout after repeated failures; an IPv6 peer is accounted
+//      by its /64, /56 and /48, so rotating the interface address inside its
+//      own block does not reset the counter;
 //   3. an explicitly enabled access token, for CLI and automation;
 //   4. the auth mode: a supplied password is checked, an empty one asks the
 //      operator in Both mode, while Click always asks;
@@ -40,6 +42,8 @@
 namespace chast {
 
 inline constexpr size_t kMinPermanentPasswordLength = 8;
+// The default lifetime of a remembered device, in seconds. A host may override
+// it with trusted_device_days; 0 there means "never expires".
 inline constexpr int64_t kTrustedDeviceLifetimeSeconds = 90ll * 24 * 60 * 60;
 // A signed Hello with a timestamp outside this window is stale. The viewer's
 // clock is not assumed to be exact, so two minutes in both directions.
@@ -66,12 +70,15 @@ public:
         // silently dropping the second factor.
         std::string totp_secret;
         // What the viewer may use before the operator narrows it further.
-        uint16_t default_permissions = kPermissionAll;
+        PermissionMask default_permissions = kPermissionAll;
         bool allow_permission_change = true;
-        // Comma-separated IPv4 CIDRs. Empty means no restriction. Any
-        // unparsable entry fails closed: every address is refused.
+        // Comma-separated IPv4 and/or IPv6 CIDRs. Empty means no restriction.
+        // Any unparsable entry fails closed: every address is refused.
         std::string ip_whitelist;
         std::vector<TrustedDevice> trusted_devices;
+        // How long a remembered device stays usable, in seconds. 0 disables
+        // expiry. The default mirrors kTrustedDeviceLifetimeSeconds.
+        int64_t trusted_device_lifetime_seconds = kTrustedDeviceLifetimeSeconds;
         // Service mode has no interactive operator: no approval, no temporary
         // password, and no connection at all without a permanent password.
         bool service_mode = false;
@@ -91,7 +98,7 @@ public:
         std::string reason;
         // Config defaults intersected with the Hello request. The operator may
         // narrow this further before allowing.
-        uint16_t permissions = 0;
+        PermissionMask permissions = 0;
         bool used_temporary_password = false;
         bool via_token = false;
         bool via_trusted_device = false;
@@ -176,17 +183,21 @@ private:
         uint32_t block_count = 0;  // drives the backoff ladder
     };
 
-    static std::string address_key(const std::string& peer_address, std::string& ip);
+    // Lockout accounting keys for one address: the address itself, or the
+    // /64, /56 and /48 networks a peer may rotate inside.
+    static std::vector<std::string> lockout_keys(const std::string& ip);
     static bool password_hash_usable(const std::string& hash);
 
-    void fail_locked(const std::string& key, int64_t now_unix);
+    void fail_locked(const std::vector<std::string>& keys, int64_t now_unix);
+    void prune_failures_locked(int64_t now_unix);
+    void evict_failure_locked();
     void prune_nonces_locked(int64_t now_unix);
 
     mutable std::mutex mutex_;
     Config config_;
     std::string temporary_password_;
     uint32_t temporary_failures_ = 0;
-    std::vector<Ipv4Range> whitelist_;
+    std::vector<IpRange> whitelist_;
     bool whitelist_configured_ = false;
     bool whitelist_valid_ = false;
     bool totp_valid_ = false;
@@ -197,10 +208,15 @@ private:
     std::vector<std::pair<std::array<uint8_t, kHelloNonceBytes>, int64_t>> nonces_;
 };
 
-// Parses one comma-separated IPv4 CIDR list. Empty or blank text is a valid
-// empty list. Returns false on the first bad entry and leaves the entries read
-// so far in `ranges`; callers that enforce a list must fail closed on false.
-bool parse_ip_whitelist(const std::string& text, std::vector<Ipv4Range>& ranges,
+// Parses one comma-separated CIDR list of either family. Empty or blank text
+// is a valid empty list. Returns false on the first bad entry and leaves the
+// entries read so far in `ranges`; callers that enforce a list must fail closed
+// on false.
+bool parse_ip_whitelist(const std::string& text, std::vector<IpRange>& ranges,
                         std::string* error);
+
+// The bare address of the transport's "ip:port": brackets and the port are
+// removed. A value that is already an address is returned unchanged.
+std::string peer_ip_text(const std::string& peer_address);
 
 }  // namespace chast

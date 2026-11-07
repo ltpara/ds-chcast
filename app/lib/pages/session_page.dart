@@ -202,6 +202,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _reconnecting = false;
   bool _closing = false;
   bool _controlEnabled = false;
+  bool _nativeKeyCapture = false;
+  int _keyCaptureGeneration = 0;
   // Relative mode pins the local pointer to the window and sends host motion
   // itself; it is session-only and starts off.
   bool _relativeMouse = false;
@@ -317,6 +319,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _chatInputFocus.addListener(_onChatFocusChanged);
     _terminalFocus.addListener(_onTerminalFocusChanged);
+    _focus.addListener(_onKeyboardFocusChanged);
+    ViewerBridge.setKeyboardEscapeHandler(() {
+      if (mounted && _relativeMouse) setState(_disableRelativeMouse);
+    });
     ViewerBridge.setDropHandler(_sendDroppedFiles);
     if (widget.windowSession) {
       unawaited(ViewerBridge.setWindowCloseHandler(_closeNativeWindow));
@@ -346,6 +352,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
     ViewerBridge.setDropHandler(null);
+    ViewerBridge.setKeyboardEscapeHandler(null);
     if (widget.windowSession) {
       unawaited(ViewerBridge.setWindowCloseHandler(null));
     }
@@ -356,9 +363,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _chatInputFocus.dispose();
     _terminalFocus.removeListener(_onTerminalFocusChanged);
     _terminalFocus.dispose();
+    _focus.removeListener(_onKeyboardFocusChanged);
+    _setKeyCapture(false);
     _focus.dispose();
     _portForwardRules.dispose();
-    _setKeyCapture(false);
     _clearCursor();
     final DateTime? auditStartedAt = _auditStartedAt;
     _auditStartedAt = null;
@@ -371,13 +379,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed || !_controlEnabled) {
+    if (state == AppLifecycleState.resumed) {
+      _onKeyboardFocusChanged();
+      return;
+    }
+    if (!_controlEnabled) {
       return;
     }
     // Switching away means the key-ups for anything still held will never
     // reach the page; lift them here and tell the host to drop whatever it
     // still holds. Control stays on for when the window comes back.
     _releaseRemoteInput();
+    _setKeyCapture(false);
   }
 
   Future<void> _reportFinishedSession(DateTime startedAt, String detail) async {
@@ -3370,23 +3383,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (_chatTyping) {
-      // The chat input has the keyboard: characters, Enter and IME belong to
-      // the text field, not the host.
+    if (_chatTyping || _terminalTyping || !_focus.hasPrimaryFocus) {
+      // Local controls own their characters, shortcuts and IME composition.
       return KeyEventResult.ignored;
     }
     if (_inputActive) {
-      if (event is KeyRepeatEvent) {
-        // The host generates its own auto-repeat; forwarding these would
-        // double the rate.
+      if (_nativeKeyCapture) {
+        // Native capture already enqueues keys. Caps/Num are deliberately
+        // left local so Windows maintains the lock state used by the hook.
         return KeyEventResult.handled;
       }
-      if (event is KeyUpEvent &&
-          _swallowEscapeChordUp &&
+      if (_swallowEscapeChordUp &&
           event.logicalKey == LogicalKeyboardKey.keyR) {
-        // The chord's key-down was consumed, so its key-up must not reach the
-        // host as a lone R release.
-        _swallowEscapeChordUp = false;
+        // Keep repeats and the matching release local after capture exits.
+        if (event is KeyUpEvent) _swallowEscapeChordUp = false;
         return KeyEventResult.handled;
       }
       if (event is KeyDownEvent &&
@@ -3395,22 +3405,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           HardwareKeyboard.instance.isControlPressed &&
           HardwareKeyboard.instance.isAltPressed &&
           HardwareKeyboard.instance.isShiftPressed) {
-        _swallowEscapeChordUp = true;
         setState(_disableRelativeMouse);
+        _swallowEscapeChordUp = true;
         return KeyEventResult.handled;
       }
-      if (event is KeyDownEvent || event is KeyUpEvent) {
+      if (event is KeyDownEvent || event is KeyRepeatEvent || event is KeyUpEvent) {
         // Flutter's usbHidUsage carries the usage page in the upper half
         // (0x00070004 for A); the protocol wants the page-0x07 id alone.
         final int raw = event.physicalKey.usbHidUsage;
         final int usage = raw & 0xFFFF;
         if ((raw >> 16) == 0x07 && usage > 0) {
-          if (event is KeyDownEvent) {
+          if (event is! KeyUpEvent) {
             _heldKeys.add(usage);
           } else {
             _heldKeys.remove(usage);
           }
-          unawaited(_sendKey(usage, event is KeyDownEvent));
+          unawaited(_sendKey(usage, event is! KeyUpEvent));
           return KeyEventResult.handled;
         }
       }
@@ -3494,6 +3504,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _releaseRemoteInput() {
+    _swallowEscapeChordUp = false;
     for (final int usage in _heldKeys.toList().reversed) {
       unawaited(_sendKey(usage, false));
     }
@@ -4011,10 +4022,35 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _setKeyCapture(bool enable) {
-    if (!enable) {
+    final AppLifecycleState? lifecycle = WidgetsBinding.instance.lifecycleState;
+    final bool wanted = enable && _focus.hasPrimaryFocus &&
+        !_chatTyping && !_terminalTyping &&
+        (lifecycle == null || lifecycle == AppLifecycleState.resumed);
+    if (!wanted) {
       _disableRelativeMouse();
     }
-    unawaited(_guardSend(ViewerBridge.setKeyCapture(enable)));
+    final int generation = ++_keyCaptureGeneration;
+    if (!wanted) _nativeKeyCapture = false;
+    unawaited(_updateKeyCapture(wanted, generation));
+  }
+
+  Future<void> _updateKeyCapture(bool enable, int generation) async {
+    bool captured = false;
+    try {
+      captured = await ViewerBridge.setKeyCapture(enable);
+    } on PlatformException {
+      // Keep the Flutter path when native capture is unavailable.
+    } on MissingPluginException {
+      // Widget tests and other embedders use the Flutter path.
+    }
+    if (mounted && generation == _keyCaptureGeneration) {
+      _nativeKeyCapture = enable && captured;
+    }
+  }
+
+  void _onKeyboardFocusChanged() {
+    if (!_focus.hasPrimaryFocus && _inputActive) _releaseRemoteInput();
+    _setKeyCapture(_inputActive && _focus.hasPrimaryFocus);
   }
 
   void _toggleRelativeMouse() {
@@ -4184,7 +4220,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _sendKey(int usage, bool down) {
     return _guardSend(
-      ViewerBridge.sendKey(usage: usage, down: down, modifiers: _inputState()),
+      ViewerBridge.sendKey(usage: usage, down: down, modifiers: _inputState(),
+          physical: true),
     );
   }
 
@@ -4201,10 +4238,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// down and up, then the modifiers up in reverse order. Every event carries
   /// the bitmap at that instant, matching a physical chord on the host.
   Future<void> _sendChord(List<int> modifierUsages, int keyUsage) async {
+    final int modifiers = await ViewerBridge.keyboardState(fallback: _inputState());
     for (final RemoteKeyEvent event in buildRemoteChord(
       modifierUsages,
       keyUsage,
-      _inputState(),
+      modifiers,
     )) {
       await _sendKeyWithBits(event.usage, event.down, event.modifiers);
     }
@@ -4213,8 +4251,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// Win is itself a modifier, so a tap clears its bit before the key-up event
   /// rather than sending a second, duplicate down.
   Future<void> _sendWinTap() async {
+    final int modifiers = await ViewerBridge.keyboardState(fallback: _inputState());
     for (final RemoteKeyEvent event in buildRemoteWinTap(
-      _inputState(),
+      modifiers,
       ViewerModifier.leftGui,
     )) {
       await _sendKeyWithBits(event.usage, event.down, event.modifiers);
@@ -4225,6 +4264,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!_inputActive) {
       return;
     }
+    // The menu may have taken primary focus. Return key ownership so real
+    // modifier releases following this shortcut still reach the host.
+    _focus.requestFocus();
     if (action == RemoteSpecialAction.sas) {
       bool queued = false;
       try {

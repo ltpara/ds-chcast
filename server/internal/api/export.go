@@ -139,7 +139,7 @@ func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 	group := strings.TrimSpace(r.URL.Query().Get("group"))
 	export := s.newCSVExport(w, "chast-audit", "audit", []string{
 		"id", "created_at", "username", "action", "detail",
-		"client_ip", "location", "success",
+		"client_ip", "location", "success", "host_id",
 	})
 	var before int64
 	for {
@@ -167,6 +167,7 @@ func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 				event.ClientIP,
 				event.Location,
 				strconv.FormatBool(event.Success),
+				event.HostID,
 			})
 		}
 		if !export.write(rows) {

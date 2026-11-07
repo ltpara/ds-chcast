@@ -446,7 +446,7 @@ HostSettingsLoad load_host_settings(const std::string& path) {
     bool auth_mode_seen = false;
     bool token_auth_seen = false;
     bool permissions_seen = false;
-    uint16_t permissions_mask = kPermissionAll;
+    PermissionMask permissions_mask = kPermissionAll;
     std::string line;
     while (std::getline(in, line)) {
         const std::string text = trim(line);
@@ -576,6 +576,15 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             } else {
                 settings.auto_disconnect_minutes = minutes;
             }
+        } else if (key == "trusted_device_days") {
+            uint32_t days = 0;
+            // Ten years is the practical ceiling; 0 keeps the list forever.
+            if (!parse_u32(value, days) || days > 3650) {
+                warn(result.warning, "trusted_device_days '" + value +
+                                         "' is not 0..3650; keeping 90 days");
+            } else {
+                settings.trusted_device_days = days;
+            }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
                 warn(result.warning, "audio_device is too long; using the default output");
@@ -634,7 +643,7 @@ HostSettingsLoad load_host_settings(const std::string& path) {
                                          std::to_string(kPermissionAll + 1));
             } else {
                 permissions_seen = true;
-                permissions_mask = static_cast<uint16_t>(mask);
+                permissions_mask = mask;
             }
         } else if (key == "allow_permission_change") {
             if (!parse_bool(value, settings.allow_permission_change)) {
@@ -660,10 +669,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             settings.ip_whitelist = trim(value);
             for (const std::string& entry : split(settings.ip_whitelist, ',')) {
                 const std::string item = trim(entry);
-                Ipv4Range range;
-                if (!item.empty() && !parse_ipv4_cidr(item, range)) {
+                IpRange range;
+                if (!item.empty() && !parse_ip_cidr(item, range)) {
                     warn(result.warning, "ip_whitelist entry '" + item +
-                                             "' is not an IPv4 address or CIDR; the list will "
+                                             "' is not an IP address or CIDR; the list will "
                                              "refuse every address");
                 }
             }
@@ -881,7 +890,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
             return false;
         }
     }
-    const uint16_t permissions =
+    const PermissionMask permissions =
         (settings.allow_input ? kPermissionInput : 0) |
         (settings.allow_clipboard ? kPermissionClipboard : 0) |
         (settings.allow_audio ? kPermissionAudio : 0) |
@@ -936,6 +945,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "lock_after_session_end=" << (settings.lock_after_session_end ? 1 : 0)
          << "\n"
          << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
+         << "trusted_device_days=" << settings.trusted_device_days << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

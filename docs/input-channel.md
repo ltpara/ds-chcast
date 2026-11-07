@@ -2,6 +2,27 @@
 
 本文记录 chast 远程控制输入通道的设计与实现进度，按阶段（P1/P2/P3）更新。
 
+## 当前实现：Windows 默认 Map 路径（2026-11-07）
+
+本节描述当前行为；后面的 P1/P2/P3 和 m4 章节保留为历史记录，其中关于忽略重复按键、AltGr 位图折叠、锁键读取及不设按键超时的描述已被本节取代。
+
+对齐参考为 RustDesk 官方仓库提交 `3513c9751db598567b2d1ac7e0637f8ecc5a5fc0`。`src/client.rs` 在读取对端信息后，把未配置且对端支持的键盘模式设为 **Map**；Flutter 字段的 Legacy 初始值不代表现代 Windows 连接的实际默认模式。本次采用 Windows Map 物理键路径，没有增加 Legacy/Translate 模式选择，也不自动把本地输入法组合结果转为文字发送。
+
+- **采集与焦点**：Windows 独立消息线程安装 `WH_KEYBOARD_LL`，仅前台会话窗口且远程画面拥有主焦点时转发按键。进入聊天、终端、工具栏或对话框时交还本地键盘，回到画面时重新启用。按下事件在本地拦截，松开事件继续交给 Windows，避免捕获前按下的本地修饰键残留；各会话窗口的钩子均能观察物理状态。控制期间继续摘除本地 IME 上下文，输入法组词由远端布局和 IME 处理。
+- **物理映射**：钩子扫描码转换为现有协议的 HID usage，远端再映射成 Windows 扫描码。普通键的重复 Down 逐次发送，修饰键的重复 Down 被过滤。原生钩子不可用时保留 Flutter 的物理键回退，并转发 `KeyRepeatEvent`；桥接层区分物理转发和工具栏合成按键，防止捕获切换期间重复发送。
+- **AltGr**：在采集端依据 Windows 的特殊扫描码 `0x021D` 丢弃合成 Ctrl。被控端不再把“左 Ctrl + 右 Alt”位图推断成 AltGr，因此真正按住这两个键的组合可以保留。鼠标事件和工具栏快捷键也读取原生修饰键状态。
+- **锁键**：Caps Lock / Num Lock 按键留在本地，锁定状态随后续事件发送。被控端通过前台输入队列的 `GetKeyState` 低位读取锁定状态；注入线程临时使用 `AttachThreadInput` 访问该队列，读取失败时跳过同步。影响字符的按键临时对齐 Caps，数字键盘再对齐 Num，注入后恢复原锁定状态；修饰键、Tab、主 Enter、指针和锁键自身不触发同步。不会把 `GetAsyncKeyState` 的“最近按过”位当成锁定状态。
+- **特殊键**：修正数字键盘 `*` 与 PrintScreen 的扩展位混淆，增加 F13–F24、数字键盘逗号及部分日文物理键映射；Pause 使用 `VK_PAUSE` 回退注入。工具栏组合键不会重复按下或释放原本已按住的修饰键。
+- **释放与恢复**：失焦、停用控制、断线和退出都会释放远端输入；释放请求在发送或注入队列已满时仍保留，必要时丢弃未执行的旧事件。被控端每十秒检查一次，释放六分钟没有再次 Down 的按键。相对鼠标退出组合键的重复与松开保持本地处理。所有本进程注入的键盘事件（包括 Unicode 文本）都携带标记，防止同机回环重新进入采集。
+
+当前协议仍使用原有 `InputEvent` / `InputRelease`，此处未新增键盘模式字段。`tests/keyboard_test.cc` 覆盖扫描码、重复键、AltGr 来源、真实 Ctrl+右 Alt 注入顺序、锁键临时调整、文本注入标记与满队列释放；`tests/protocol_test.cc` 和 Flutter 输入测试覆盖状态位与组合键。自动化验证包括 dry-run 注入，不等同于双机物理键盘实测；中文 IME、不同布局、Win/Alt+Tab 和长按体验仍需实际连接确认。
+
+官方参考位置：RustDesk `src/client.rs`（默认模式）、`src/keyboard.rs`（采集和 Map）、`src/server/input_service.rs`（锁键和超时），以及其 rdev 依赖提交 `0904f23ce496e255461a98848b85c11fa5a62eab` 的 `src/windows/grab.rs`、`src/keycodes/windows.rs`。
+
+本轮验证：Flutter 静态分析、55 项 Flutter 测试、`keyboard` / `protocol` / `protocol_fuzz` 和查看器/主机 Release 构建通过。扩展的 `host_control` / `host_login` / `block_input` 超时已定位为真实剪贴板读取阻塞主机循环约 10 秒；主机改为后台读取并隔离测试剪贴板后，三个测试及相关回归共 9/9 通过。新增回归覆盖读取阻塞期间的控制、撤权、断线释放和迟到快照处理。排查说明见 `docs/host-integration-timeouts-2026-11-07.md`，原键盘验证记录位于 `build/review/keyboard-validation-2026-11-07.md`。
+
+后续剪贴板修复：主机和查看器都使用常驻后台执行器串行读写，慢读不再阻塞查看器输入发送与画面处理；读取失败保留待建立基线状态，写入失败有界重试，退出不等待阻塞的剪贴板读。实现及回归边界见 `docs/clipboard-async-fix-2026-11-07.md`。
+
 ## 目标与分工
 
 - 协议层与平台无关：坐标用**远端虚拟桌面像素**，按键用 **USB HID usage**。

@@ -116,8 +116,8 @@ std::string truncate_utf8(const std::string& text, size_t limit) {
     return text.substr(0, cut);
 }
 
-uint16_t permission_mask_from_info(const ServerInfo& info) {
-    uint16_t mask = 0;
+PermissionMask permission_mask_from_info(const ServerInfo& info) {
+    PermissionMask mask = 0;
     if (info.input_enabled) {
         mask |= kPermissionInput;
     }
@@ -724,8 +724,8 @@ struct QuicSession::Impl {
     // established. Mid-session changes may only stay inside the ceiling.
     // Client: the mask the host last announced. Atomic because the transport
     // callbacks read it while the application thread updates it.
-    std::atomic<uint16_t> session_permissions{0};
-    uint16_t permission_ceiling = 0;
+    std::atomic<PermissionMask> session_permissions{0};
+    PermissionMask permission_ceiling = 0;
     // Client: a PermissionUpdate arrived since take_permission_update().
     bool permission_update_ready = false;
     uint64_t permission_updates = 0;
@@ -3040,7 +3040,7 @@ struct QuicSession::Impl {
                 if (role != Role::Client) {
                     break;
                 }
-                uint16_t permissions = 0;
+                PermissionMask permissions = 0;
                 if (!parse_permission_update(payload, permissions, &error)) {
                     control_protocol_failure("PermissionUpdate: " + error);
                     break;
@@ -4936,8 +4936,8 @@ struct QuicSession::Impl {
 
     // The hard gates from QuicServerConfig. Authentication and approval may
     // only reduce this; the transport never grants beyond it.
-    uint16_t config_permissions() const {
-        uint16_t mask = 0;
+    PermissionMask config_permissions() const {
+        PermissionMask mask = 0;
         if (server_config.allow_input) {
             mask |= kPermissionInput;
         }
@@ -5357,7 +5357,7 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
 Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    const uint16_t ceiling = impl.config_permissions();
+    const PermissionMask ceiling = impl.config_permissions();
     for (;;) {
         std::unique_lock<std::mutex> lock(impl.mutex);
         auto until = deadline;
@@ -5474,7 +5474,7 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             }
 
             if (refusal.empty()) {
-                const uint16_t granted = auth.permissions & ceiling;
+                const PermissionMask granted = auth.permissions & ceiling;
                 impl.session_permissions = granted;
                 impl.permission_ceiling = granted;
                 if (!impl.server_config.authenticate) {
@@ -5558,11 +5558,11 @@ std::string QuicSession::client_address() const {
     return impl_->requested_peer;
 }
 
-uint16_t QuicSession::permissions() const {
+PermissionMask QuicSession::permissions() const {
     return impl_->session_permissions.load();
 }
 
-Error QuicSession::set_permissions(uint16_t permissions) {
+Error QuicSession::set_permissions(PermissionMask permissions) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "set_permissions is a server operation");
@@ -5573,7 +5573,7 @@ Error QuicSession::set_permissions(uint16_t permissions) {
     if (!impl.server_config.allow_permission_change) {
         return Error(Status::InvalidCall, "permission changes are disabled on this host");
     }
-    uint16_t next = 0;
+    PermissionMask next = 0;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         next = permissions & impl.permission_ceiling & impl.config_permissions();
@@ -5717,7 +5717,7 @@ Error QuicSession::set_permissions(uint16_t permissions) {
                            QUIC_SEND_FLAG_NONE);
 }
 
-Error QuicSession::set_permission_ceiling(uint16_t permissions) {
+Error QuicSession::set_permission_ceiling(PermissionMask permissions) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "set_permission_ceiling is a server operation");
@@ -5730,7 +5730,7 @@ Error QuicSession::set_permission_ceiling(uint16_t permissions) {
     return Error::success();
 }
 
-bool QuicSession::take_permission_update(uint16_t& permissions) {
+bool QuicSession::take_permission_update(PermissionMask& permissions) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (!impl_->permission_update_ready) {
         return false;
@@ -5773,7 +5773,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     // session will not inject or audio the host disabled. The accepted mask
     // is already clamped to these gates, so it is the single source of truth
     // and includes any reduction the operator made at approval time.
-    const uint16_t granted = impl.session_permissions.load();
+    const PermissionMask granted = impl.session_permissions.load();
     ack.input_enabled = (granted & kPermissionInput) != 0;
     ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
@@ -5906,7 +5906,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
         return Error(Status::InvalidCall, "the stream was not announced yet");
     }
     ServerInfo update = info;
-    const uint16_t granted = impl.session_permissions.load();
+    const PermissionMask granted = impl.session_permissions.load();
     update.input_enabled = (granted & kPermissionInput) != 0;
     update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
@@ -6391,7 +6391,7 @@ Error QuicSession::request_host_action(HostAction action, bool block_input) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        const uint16_t permissions = impl.session_permissions.load();
+        const PermissionMask permissions = impl.session_permissions.load();
         if (action == HostAction::Restart) {
             if ((permissions & kPermissionRestart) == 0) {
                 return Error(Status::PermissionDenied,
@@ -6490,7 +6490,7 @@ Error QuicSession::request_os_login(const std::string& password) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        const uint16_t permissions = impl.session_permissions.load();
+        const PermissionMask permissions = impl.session_permissions.load();
         if ((permissions & (kPermissionInput | kPermissionOsLogin)) !=
             (kPermissionInput | kPermissionOsLogin)) {
             return Error(Status::PermissionDenied, "OS login is disabled by the host");

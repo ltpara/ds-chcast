@@ -385,7 +385,7 @@ struct ApprovalDialogState {
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
     const ClientRequest* request = nullptr;
-    uint16_t result = 0;
+    PermissionMask result = 0;
     bool allowed = false;
     bool peer_gone = false;
     bool done = false;
@@ -401,7 +401,7 @@ bool approval_peer_alive(const ApprovalDialogState& dialog) {
 void finish_approval(ApprovalDialogState& dialog, bool allowed) {
     dialog.allowed = allowed;
     if (allowed) {
-        uint16_t mask = 0;
+        PermissionMask mask = 0;
         if (SendMessageW(dialog.input, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionInput;
         }
@@ -597,7 +597,7 @@ ClientApproval server_approve(const ClientRequest& request) {
     add(L"STATIC", tr(L"允许的权限（可以取消勾选）："), SS_LEFT, 20, 164, full_width, 20, 0,
         nullptr);
 
-    const auto permission_check = [&](const wchar_t* text, uint16_t bit, int left, int width,
+    const auto permission_check = [&](const wchar_t* text, PermissionMask bit, int left, int width,
                                       int top, int id) {
         HWND control = add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, left, top, width, 24,
                            id, nullptr);
@@ -659,7 +659,7 @@ ClientApproval server_approve(const ClientRequest& request) {
     }
     const bool allowed = dialog.allowed;
     const bool peer_gone = dialog.peer_gone;
-    const uint16_t mask = dialog.result;
+    const PermissionMask mask = dialog.result;
     if (IsWindow(window)) {
         DestroyWindow(window);
     }
@@ -913,7 +913,7 @@ std::wstring auth_mode_label(HostAuthMode mode) {
     return L"—";
 }
 
-std::wstring permission_label(uint16_t mask) {
+std::wstring permission_label(PermissionMask mask) {
     std::wstring text;
     auto add = [&text](const wchar_t* name) {
         if (!text.empty()) {
@@ -969,8 +969,8 @@ std::wstring permission_label(uint16_t mask) {
     return text.empty() ? tr(L"只看") : text;
 }
 
-uint16_t current_gate_mask() {
-    return static_cast<uint16_t>((g_app->settings.allow_input ? kPermissionInput : 0) |
+PermissionMask current_gate_mask() {
+    return ((g_app->settings.allow_input ? kPermissionInput : 0) |
                                  (g_app->settings.allow_clipboard ? kPermissionClipboard : 0) |
                                  (g_app->settings.allow_audio ? kPermissionAudio : 0) |
                                  (g_app->settings.allow_microphone ? kPermissionMicrophone : 0) |
@@ -1857,6 +1857,7 @@ enum SecurityDialogId {
     kSecTotpConfirm,
     kSecTrustedList,
     kSecRevoke,
+    kSecTrustedDays,
     kSecWhitelist,
     kSecAllowInput,
     kSecAllowClipboard,
@@ -1912,6 +1913,7 @@ struct SecurityDialogState {
     HWND totp_code = nullptr;
     HWND totp_confirm = nullptr;
     HWND trusted_list = nullptr;
+    HWND trusted_days = nullptr;
     HWND whitelist = nullptr;
     HWND allow_input = nullptr;
     HWND allow_clipboard = nullptr;
@@ -1982,15 +1984,6 @@ std::wstring unix_date(int64_t seconds) {
     swprintf_s(buffer, std::size(buffer), L"%04d-%02d-%02d", local.tm_year + 1900,
                local.tm_mon + 1, local.tm_mday);
     return buffer;
-}
-
-std::string format_ipv4_range(const Ipv4Range& range) {
-    std::string text = std::to_string((range.address >> 24) & 0xFF) + "." +
-                       std::to_string((range.address >> 16) & 0xFF) + "." +
-                       std::to_string((range.address >> 8) & 0xFF) + "." +
-                       std::to_string(range.address & 0xFF);
-    text += "/" + std::to_string(range.prefix);
-    return text;
 }
 
 void refresh_trusted_list(SecurityDialogState& dialog) {
@@ -2183,6 +2176,18 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
         }
         updated.auto_disconnect_minutes = static_cast<uint32_t>(minutes);
     }
+    if (dialog.trusted_days != nullptr) {
+        const std::string days_text = trim_ascii(narrow(control_text(dialog.trusted_days)));
+        unsigned long days = 0;
+        const bool digits =
+            !days_text.empty() && days_text.size() <= 4 &&
+            std::all_of(days_text.begin(), days_text.end(),
+                        [](char c) { return c >= '0' && c <= '9'; });
+        if (!digits || (days = std::strtoul(days_text.c_str(), nullptr, 10)) > 3650) {
+            return complain(tr(L"可信设备有效期必须是 0 到 3650 之间的整数天。"));
+        }
+        updated.trusted_device_days = static_cast<uint32_t>(days);
+    }
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2192,17 +2197,17 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     std::string whitelist = narrow(control_text(dialog.whitelist));
     std::replace(whitelist.begin(), whitelist.end(), '\r', ',');
     std::replace(whitelist.begin(), whitelist.end(), '\n', ',');
-    std::vector<Ipv4Range> ranges;
+    std::vector<IpRange> ranges;
     std::string whitelist_error;
     if (!parse_ip_whitelist(whitelist, ranges, &whitelist_error)) {
         return complain(tr(L"IP 白名单无效：") + widen(whitelist_error));
     }
     std::string normalized;
-    for (const Ipv4Range& range : ranges) {
+    for (const IpRange& range : ranges) {
         if (!normalized.empty()) {
             normalized += ",";
         }
-        normalized += format_ipv4_range(range);
+        normalized += format_ip_range(range);
     }
     updated.ip_whitelist = normalized;
 
@@ -2640,6 +2645,7 @@ bool edit_security_settings(HostSettings& result) {
         nullptr, &dialog.auth_page);
 
     // ----- access-control page -----
+    const int page_right = dialog_width - 36;
     add(L"STATIC", tr(L"可信设备（通过两步验证后可以记住这台查看器）"), SS_LEFT, 0, 32, 56, 500,
         20, 0, nullptr, &dialog.access_page);
     dialog.trusted_list =
@@ -2647,8 +2653,18 @@ bool edit_security_settings(HostSettings& result) {
             440, 110, kSecTrustedList, nullptr, &dialog.access_page);
     add(L"BUTTON", tr(L"撤销信任"), BS_PUSHBUTTON | WS_TABSTOP, 0, 484, 78, 92, 30, kSecRevoke,
         nullptr, &dialog.access_page);
-    add(L"STATIC", tr(L"设备 90 天未使用自动失效；修改永久密码会清空列表。"), SS_LEFT, 0, 32,
-        196, page_text_width, 20, 0, nullptr, &dialog.access_page);
+    const wchar_t* trusted_days_label = tr(L"可信设备有效期（天，0 表示永不过期）");
+    const int trusted_days_label_width = text_px(trusted_days_label) + 8;
+    add(L"STATIC", trusted_days_label, SS_LEFT, 0, 32, 196, trusted_days_label_width, 20, 0,
+        nullptr, &dialog.access_page);
+    dialog.trusted_days =
+        add(L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+            32 + trusted_days_label_width + 12, 192, 80, 26, kSecTrustedDays, nullptr,
+            &dialog.access_page);
+    const int trusted_note_left = 32 + trusted_days_label_width + 12 + 80 + 16;
+    add(L"STATIC", tr(L"超过未使用时长后需要重新两步验证；修改永久密码会清空列表。"),
+        SS_LEFT | SS_ENDELLIPSIS, 0, trusted_note_left, 196, page_right - trusted_note_left, 20,
+        0, nullptr, &dialog.access_page);
     add(L"STATIC", tr(L"IP 白名单（IPv4 或 CIDR，逗号或换行分隔，留空不限制）"), SS_LEFT, 0,
         32, 224, page_text_width, 20, 0, nullptr, &dialog.access_page);
     dialog.whitelist =
@@ -2659,7 +2675,6 @@ bool edit_security_settings(HostSettings& result) {
         page_text_width, 20, 0, nullptr, &dialog.access_page);
     add(L"STATIC", tr(L"新连接的默认权限"), SS_LEFT, 0, 32, 344, 300, 20, 0, nullptr,
         &dialog.access_page);
-    const int page_right = dialog_width - 36;
     const auto page_check = [&](const wchar_t* text, int left, int top, int id) {
         return add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, left, top, check_px(text), 24,
                    id, nullptr, &dialog.access_page);
@@ -2906,6 +2921,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_remote_config, settings.allow_remote_config);
     set_check(dialog.lock_after_end, settings.lock_after_session_end);
     set_text(dialog.idle_minutes, widen(std::to_string(settings.auto_disconnect_minutes)));
+    set_text(dialog.trusted_days, widen(std::to_string(settings.trusted_device_days)));
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);

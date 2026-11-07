@@ -142,6 +142,17 @@ func HostAuditFileMessage(hostID, auditRef, direction, name string, size, occurr
 		boolText(success), detail)
 }
 
+// HostAuditDenialMessage binds one refused Hello. A refusal has no audit
+// reference, so the address, the denial code and the text the viewer was told
+// identify it. The request timestamp is signed separately from the occurrence
+// time so an old report cannot be made fresh by editing its envelope.
+func HostAuditDenialMessage(hostID, address string, denial, occurredAt int64,
+	detail string, timestamp int64) []byte {
+	return fieldsMessage(DomainHostAudit, "denial", hostID, address,
+		strconv.FormatInt(denial, 10), strconv.FormatInt(occurredAt, 10), detail,
+		strconv.FormatInt(timestamp, 10))
+}
+
 // SoftwareMessage binds the update notice fields a client verifies before
 // trusting a downloaded binary.
 func SoftwareMessage(version, downloadURL, digest string, size int64) []byte {

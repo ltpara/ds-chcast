@@ -7255,10 +7255,10 @@ bool auth_and_permissions_work(uint16_t port, std::string* detail) {
         chast::ServerInfo info;
         bool client_ok = client && client->connect(std::chrono::seconds(5)).ok() &&
                          client->handshake(info, std::chrono::seconds(5)).ok();
-        auto wait_for_mask = [&](uint16_t expected) {
+        auto wait_for_mask = [&](chast::PermissionMask expected) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (std::chrono::steady_clock::now() < deadline) {
-                uint16_t mask = 0;
+                chast::PermissionMask mask = 0;
                 if (client && client->take_permission_update(mask) && mask == expected) {
                     return true;
                 }
@@ -8310,7 +8310,10 @@ bool idle_disconnect_works(uint16_t port, std::string* detail) {
     constexpr uint32_t kIdleMs = 2000;
     std::string error;
     std::unique_ptr<chast::HostServer> host = start_probe_host(
-        port, [](chast::HostSettings& settings) { settings.allow_input = true; }, &error,
+        port, [](chast::HostSettings& settings) {
+            settings.allow_input = true;
+            settings.allow_terminal = true;
+        }, &error,
         kIdleMs);
     if (!host) {
         *detail = "idle host: " + error;
@@ -8343,7 +8346,7 @@ bool idle_disconnect_works(uint16_t port, std::string* detail) {
     }
     // Keep interacting across two full timeout windows: each mouse move must
     // reset the timer, or the host would close the session at kIdleMs.
-    for (int step = 0; step < 5; ++step) {
+    for (int step = 0; step < 8; ++step) {
         chast::InputEvent event;
         event.kind = chast::InputKind::Mouse;
         event.mouse.action = chast::MouseAction::Move;
@@ -8364,10 +8367,78 @@ bool idle_disconnect_works(uint16_t port, std::string* detail) {
         host->stop();
         return false;
     }
-    // Quiet again: one more timeout window must end the session by itself.
+    auto fail_terminal = [&](const std::string& reason) {
+        *detail = reason;
+        client.reset();
+        host->stop();
+        return false;
+    };
+    // Terminal interaction uses CTTY, not the desktop InputEvent queue. Keep
+    // typing for two timeout windows without sending any mouse/key events.
+    constexpr uint32_t terminal_id = 91;
+    if (const chast::Error requested = client->request_terminal(terminal_id, 80, 24);
+        !requested.ok()) {
+        return fail_terminal("idle terminal request: " + requested.to_string());
+    }
+    bool terminal_ready = false;
+    const auto terminal_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!terminal_ready && std::chrono::steady_clock::now() < terminal_deadline) {
+        chast::TerminalResult result;
+        while (client->take_terminal_result(result)) {
+            if (result.terminal_id != terminal_id) continue;
+            if (result.code != chast::TerminalCode::Ok) {
+                return fail_terminal("idle terminal refused: " + result.reason);
+            }
+            terminal_ready = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!terminal_ready) return fail_terminal("idle terminal did not open");
+    if (const chast::Error opened = client->open_terminal_input(terminal_id); !opened.ok()) {
+        return fail_terminal("idle terminal input: " + opened.to_string());
+    }
+    auto type_terminal = [&](const std::string& command) {
+        return client->send_terminal_input(
+            terminal_id, reinterpret_cast<const uint8_t*>(command.data()), command.size(),
+            std::chrono::seconds(1));
+    };
+    auto drain_terminal = [&]() {
+        size_t bytes = 0;
+        std::vector<uint8_t> data;
+        bool ended = false;
+        while (client->take_terminal_output(terminal_id, data, ended)) {
+            bytes += data.size();
+        }
+        return bytes;
+    };
+    for (int step = 0; step < 8; ++step) {
+        const chast::Error sent = type_terminal("echo CHAST_IDLE_INPUT\r");
+        if (!sent.ok()) {
+            return fail_terminal("the host closed an active terminal: " + sent.to_string());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        drain_terminal();
+    }
+    if (host->status().state != chast::HostState::Streaming) {
+        return fail_terminal("terminal typing did not keep the session active");
+    }
+    // A child producing output without viewer input must NOT keep the host
+    // alive. Ping only loopback; session teardown closes the pseudo console.
+    if (const chast::Error sent = type_terminal("ping -t 127.0.0.1\r"); !sent.ok()) {
+        return fail_terminal("idle output command: " + sent.to_string());
+    }
+    const auto quiet_started = std::chrono::steady_clock::now();
+    bool background_output = false;
+    // Quiet again: one more timeout window must end the session by itself,
+    // even while the terminal is still producing output.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     while (std::chrono::steady_clock::now() < deadline &&
            host->status().state == chast::HostState::Streaming) {
+        const size_t bytes = drain_terminal();
+        if (bytes != 0 && std::chrono::steady_clock::now() - quiet_started >
+                              std::chrono::milliseconds(750)) {
+            background_output = true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     const bool stopped = host->status().state != chast::HostState::Streaming;
@@ -8384,6 +8455,10 @@ bool idle_disconnect_works(uint16_t port, std::string* detail) {
     }
     client.reset();
     host->stop();
+    if (!background_output) {
+        *detail = "the terminal did not produce background output during idle detection";
+        return false;
+    }
     if (!stopped) {
         *detail = "the host kept an idle session open past the timeout";
         return false;

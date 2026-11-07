@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +41,12 @@ namespace chast {
 // code).
 bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended);
 
+// Reverse mapping for the native viewer hook. Zero means unsupported. Pause
+// is identified by virtual key because its E1 sequence is not a set-1 key.
+uint16_t windows_key_to_hid(uint32_t virtual_key, uint32_t scan_code, bool extended);
+bool make_keyboard_input(uint16_t usage, bool down, INPUT& input);
+inline constexpr ULONG_PTR kInputInjectionTag = 0x43484153u;
+
 // Modifier bit (see chast/protocol.h) for a HID usage, or 0 when the usage is
 // not one of the eight modifier keys.
 uint16_t modifier_bit_for_usage(uint16_t hid_usage);
@@ -48,8 +55,8 @@ struct InputStats {
     uint64_t applied = 0;
     uint64_t rejected = 0;  // unknown key or malformed event
     uint64_t failed = 0;    // SendInput reported zero inserted events
-    uint64_t dropped = 0;   // queue was full
-    uint64_t lock_toggles = 0;  // Caps/Num/Scroll taps that matched the client
+    uint64_t dropped = 0;   // queue overflow, including work discarded for release
+    uint64_t lock_toggles = 0;  // temporary lock adjustments and restoration
 };
 
 class InputInjector {
@@ -59,7 +66,10 @@ public:
     // held-key bookkeeping, counters) but SendInput is not called, so a
     // loopback test can exercise it without moving the real pointer or typing
     // into the focused window.
-    static std::unique_ptr<InputInjector> create(bool dry_run, std::string* error);
+    // An optional dry-run observer receives each OS input in injection order
+    // on the worker thread; it must outlive stop(). Ignored for live input.
+    static std::unique_ptr<InputInjector> create(bool dry_run, std::string* error,
+        std::function<void(const INPUT&)> dry_run_observer = {});
 
     ~InputInjector();
     InputInjector(const InputInjector&) = delete;
@@ -79,7 +89,8 @@ public:
 
     // Queues a release of everything held so far. It lands behind the events
     // already submitted and ahead of anything later, so a burst of pointer
-    // moves cannot be applied after the viewer has given up control.
+    // moves cannot be applied after the viewer has given up control. A full
+    // queue is discarded to reserve space for this release.
     void release_held();
 
     // Releases every key and button this injector is holding down, then stops
@@ -100,12 +111,10 @@ private:
     void apply_text(const std::string& text);
     // Brings held modifiers in line with the bitmap the peer reported.
     void sync_modifiers(uint16_t reported);
-    // Taps Caps/Num/Scroll once when the peer's lock state differs from this
-    // machine's. `reported` only carries kLockStateMask bits.
-    void sync_locks(uint16_t reported);
+    // Temporarily reconciles the selected lock bits. Returns bits changed,
+    // so apply() can restore the host's state after the key was injected.
+    uint16_t sync_locks(uint16_t reported, uint16_t mask);
     bool lock_state(uint16_t bit);
-    // Folds Windows' synthetic Ctrl+Right Alt (AltGr) into Right Alt alone.
-    uint16_t normalize_modifiers(uint16_t reported);
     void apply_mouse(const MouseEvent& event);
     void apply_key(const KeyEvent& event);
     // Touch goes through Windows' touch injection, which takes a frame
@@ -140,6 +149,7 @@ private:
     void follow_input_desktop_if_due();
 
     bool dry_run_ = false;
+    std::function<void(const INPUT&)> dry_run_observer_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     struct Pending {
@@ -155,13 +165,11 @@ private:
     // Owned by the injection thread.
     uint16_t held_buttons_ = 0;
     struct HeldKey {
-        uint16_t scan = 0;
-        bool extended = false;
         uint16_t usage = 0;
+        std::chrono::steady_clock::time_point last_down;
     };
     // Keys currently down, in press order, so release_all lifts them in
-    // reverse. Scan code alone is ambiguous (0x1D is both Ctrl keys), so the
-    // extended flag is kept with it.
+    // reverse. HID usage distinguishes left/right keys and Pause's fallback.
     std::deque<HeldKey> held_keys_;
 
     enum class DeviceState : uint8_t { Unknown, Ready, Unavailable };
@@ -196,14 +204,8 @@ private:
     DestroyPointerDeviceFn destroy_pointer_device_ = nullptr;
     void* pen_device_ = nullptr;
 
-    // Set while a reported left Ctrl is the synthetic one Windows emits for
-    // AltGr; kept until the peer stops reporting it.
-    bool altgr_synthetic_ctrl_ = false;
-    // This injector's view of the host lock keys. Seeded from the OS on first
-    // use and toggled whenever a lock key is injected (including the taps
-    // sync_locks() makes and a lock key the peer presses itself), so a tap
-    // is never applied twice. A dry run seeds it at zero, since no tap ever
-    // changes the real desktop.
+    // Refreshed from the foreground input queue before affected keys, then
+    // updated only on successful injection. Dry runs start at zero.
     bool locks_seeded_ = false;
     uint16_t host_locks_ = 0;
     // Started due so the first event checks the desktop before injecting.

@@ -16,6 +16,10 @@ constexpr size_t kLongWindowLimit = 30;
 constexpr int64_t kBackoffBaseSeconds = 30;
 constexpr int64_t kBackoffMaxSeconds = 300;
 constexpr uint32_t kTempPasswordFailureLimit = 10;
+// Upper bound on the address lockout table. A blocked peer retries, but an
+// attacker rotating across a large address space must not grow the map without
+// limit; idle entries are pruned and the oldest active one gives way.
+constexpr size_t kMaxFailureEntries = 4096;
 
 std::string trim(std::string_view text) {
     size_t begin = 0;
@@ -72,7 +76,7 @@ bool has_prefix(const std::string& text, std::string_view prefix) {
 
 // A control-only session may request nothing beyond the one permission its
 // mode serves: the host announces no picture, input or other control for it.
-uint16_t mode_permissions(SessionMode mode) {
+PermissionMask mode_permissions(SessionMode mode) {
     switch (mode) {
         case SessionMode::FileTransfer:
             return kPermissionFileTransfer;
@@ -104,21 +108,25 @@ std::string mode_disabled_reason(SessionMode mode) {
     return {};
 }
 
-bool device_expired(const TrustedDevice& device, int64_t now_unix) {
+bool device_expired(const TrustedDevice& device, int64_t now_unix,
+                    int64_t lifetime_seconds) {
     const int64_t last = device.last_seen_unix_seconds != 0 ? device.last_seen_unix_seconds
                                                             : device.added_unix_seconds;
     if (last <= 0) {
         return true;
     }
+    if (lifetime_seconds <= 0) {
+        return false;
+    }
     if (now_unix <= last) {
         return false;
     }
-    return now_unix - last > kTrustedDeviceLifetimeSeconds;
+    return now_unix - last > lifetime_seconds;
 }
 
 }  // namespace
 
-bool parse_ip_whitelist(const std::string& text, std::vector<Ipv4Range>& ranges,
+bool parse_ip_whitelist(const std::string& text, std::vector<IpRange>& ranges,
                         std::string* error) {
     ranges.clear();
     size_t begin = 0;
@@ -129,10 +137,10 @@ bool parse_ip_whitelist(const std::string& text, std::vector<Ipv4Range>& ranges,
                                                          ? std::string::npos
                                                          : comma - begin));
         if (!entry.empty()) {
-            Ipv4Range range;
-            if (!parse_ipv4_cidr(entry, range)) {
+            IpRange range;
+            if (!parse_ip_cidr(entry, range)) {
                 if (error != nullptr) {
-                    *error = "'" + entry + "' is not an IPv4 address or CIDR";
+                    *error = "'" + entry + "' is not an IP address or CIDR";
                 }
                 return false;
             }
@@ -196,55 +204,108 @@ HostSecurity::Config HostSecurity::config() const {
     return config_;
 }
 
-std::string HostSecurity::address_key(const std::string& peer_address, std::string& ip) {
-    ip.clear();
+std::string peer_ip_text(const std::string& peer_address) {
     if (peer_address.empty()) {
-        return "unknown";
+        return {};
     }
     std::string host = peer_address;
     if (host.front() == '[') {
         const size_t close = host.find(']');
         if (close != std::string::npos) {
-            host = host.substr(1, close - 1);
-        }
-    } else {
-        const size_t colon = host.rfind(':');
-        if (colon != std::string::npos && host.find(':') == colon) {
-            host = host.substr(0, colon);
+            return host.substr(1, close - 1);
         }
     }
-    if (host.empty()) {
-        return "unknown";
+    // A bare IPv6 literal has several colons and no port to strip.
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos && host.find(':') == colon) {
+        return host.substr(0, colon);
     }
-    ip = host;
     return host;
+}
+
+std::vector<std::string> HostSecurity::lockout_keys(const std::string& ip) {
+    IpAddress address;
+    if (ip.empty() || !parse_ip_address(ip, address)) {
+        return {ip.empty() ? "unknown" : ip};
+    }
+    if (!address.ipv6) {
+        // A mapped IPv4 form folds here too, so both spellings share a bucket.
+        return {format_ipv4((static_cast<uint32_t>(address.bytes[0]) << 24) |
+                            (static_cast<uint32_t>(address.bytes[1]) << 16) |
+                            (static_cast<uint32_t>(address.bytes[2]) << 8) |
+                            static_cast<uint32_t>(address.bytes[3]))};
+    }
+    // A client picks its interface address inside the /64 its provider
+    // delegates, so per-address accounting alone would never lock it out.
+    return {format_ipv6_prefix(address.bytes, 64), format_ipv6_prefix(address.bytes, 56),
+            format_ipv6_prefix(address.bytes, 48)};
 }
 
 bool HostSecurity::password_hash_usable(const std::string& hash) {
     return !hash.empty() && hash.size() <= 512 && has_prefix(hash, "pbkdf2-sha256$");
 }
 
-void HostSecurity::fail_locked(const std::string& key, int64_t now_unix) {
-    AddressFailures& state = failures_[key];
-    const int64_t long_cutoff = now_unix - static_cast<int64_t>(kLongWindowSeconds);
-    state.failures.erase(
-        std::remove_if(state.failures.begin(), state.failures.end(),
-                       [long_cutoff](int64_t stamp) { return stamp < long_cutoff; }),
-        state.failures.end());
-    state.failures.push_back(now_unix);
+void HostSecurity::fail_locked(const std::vector<std::string>& keys, int64_t now_unix) {
+    for (const std::string& key : keys) {
+        if (failures_.find(key) == failures_.end() && failures_.size() >= kMaxFailureEntries) {
+            prune_failures_locked(now_unix);
+            while (failures_.size() >= kMaxFailureEntries) {
+                evict_failure_locked();
+            }
+        }
+        AddressFailures& state = failures_[key];
+        const int64_t long_cutoff = now_unix - static_cast<int64_t>(kLongWindowSeconds);
+        state.failures.erase(
+            std::remove_if(state.failures.begin(), state.failures.end(),
+                           [long_cutoff](int64_t stamp) { return stamp < long_cutoff; }),
+            state.failures.end());
+        state.failures.push_back(now_unix);
 
-    const int64_t short_cutoff = now_unix - static_cast<int64_t>(kShortWindowSeconds);
-    size_t recent = 0;
-    for (auto it = state.failures.rbegin(); it != state.failures.rend() && *it >= short_cutoff;
-         ++it) {
-        ++recent;
+        const int64_t short_cutoff = now_unix - static_cast<int64_t>(kShortWindowSeconds);
+        size_t recent = 0;
+        for (auto it = state.failures.rbegin();
+             it != state.failures.rend() && *it >= short_cutoff; ++it) {
+            ++recent;
+        }
+        if (recent >= kShortWindowLimit || state.failures.size() >= kLongWindowLimit) {
+            const uint32_t shift = std::min<uint32_t>(state.block_count, 4);
+            int64_t backoff = kBackoffBaseSeconds << shift;
+            backoff = (std::min)(backoff, kBackoffMaxSeconds);
+            state.blocked_until = now_unix + backoff;
+            ++state.block_count;
+        }
     }
-    if (recent >= kShortWindowLimit || state.failures.size() >= kLongWindowLimit) {
-        const uint32_t shift = std::min<uint32_t>(state.block_count, 4);
-        int64_t backoff = kBackoffBaseSeconds << shift;
-        backoff = (std::min)(backoff, kBackoffMaxSeconds);
-        state.blocked_until = now_unix + backoff;
-        ++state.block_count;
+}
+
+void HostSecurity::prune_failures_locked(int64_t now_unix) {
+    const int64_t cutoff = now_unix - static_cast<int64_t>(kLongWindowSeconds);
+    for (auto it = failures_.begin(); it != failures_.end();) {
+        AddressFailures& state = it->second;
+        state.failures.erase(
+            std::remove_if(state.failures.begin(), state.failures.end(),
+                           [cutoff](int64_t stamp) { return stamp < cutoff; }),
+            state.failures.end());
+        if (state.failures.empty() && state.blocked_until <= now_unix) {
+            it = failures_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void HostSecurity::evict_failure_locked() {
+    auto last_stamp = [](const AddressFailures& state) {
+        return state.failures.empty() ? int64_t{0} : state.failures.back();
+    };
+    auto oldest = failures_.end();
+    for (auto it = failures_.begin(); it != failures_.end(); ++it) {
+        if (oldest == failures_.end() ||
+            last_stamp(it->second) < last_stamp(oldest->second)) {
+            oldest = it;
+        }
+    }
+    if (oldest != failures_.end()) {
+        failures_.erase(oldest);
     }
 }
 
@@ -261,7 +322,9 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     std::lock_guard<std::mutex> lock(mutex_);
     Result result;
     result.peer_address = peer_address;
-    const std::string key = address_key(peer_address, result.peer_ip);
+    result.peer_ip = peer_ip_text(peer_address);
+    const std::string& ip = result.peer_ip;
+    const std::vector<std::string> keys = lockout_keys(ip);
     result.device_name = hello.device_name;
     result.device_platform = hello.device_platform;
     result.device_key = hello.device_key;
@@ -269,18 +332,17 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     // serves: the host will announce no picture, input or other control for
     // it. Clamping the request here keeps every later decision and the
     // approval window on the same mask.
-    const uint16_t requested =
+    const PermissionMask requested =
         hello.requested_permissions & mode_permissions(hello.mode);
     result.permissions = config_.default_permissions & requested;
 
     if (whitelist_configured_) {
-        uint32_t address = 0;
-        if (!whitelist_valid_ ||
-            !parse_ipv4(result.peer_ip, address) ||
-            !ipv4_in_ranges(address, whitelist_)) {
+        IpAddress address;
+        if (!whitelist_valid_ || !parse_ip_address(ip, address) ||
+            !ip_in_ranges(address, whitelist_)) {
             result = deny(AccessDenial::NotWhitelisted);
             result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
+            result.peer_ip = ip;
             return result;
         }
     }
@@ -291,19 +353,25 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         result = deny(AccessDenial::PasswordRequired,
                       "the service has no permanent password; set one before connecting");
         result.peer_address = peer_address;
-        result.peer_ip = address_key(peer_address, result.peer_ip);
+        result.peer_ip = ip;
         return result;
     }
 
     {
-        const auto it = failures_.find(key);
-        if (it != failures_.end() && it->second.blocked_until > now_unix) {
-            const int64_t remaining = it->second.blocked_until - now_unix;
+        int64_t blocked_until = 0;
+        for (const std::string& lock_key : keys) {
+            const auto it = failures_.find(lock_key);
+            if (it != failures_.end()) {
+                blocked_until = (std::max)(blocked_until, it->second.blocked_until);
+            }
+        }
+        if (blocked_until > now_unix) {
+            const int64_t remaining = blocked_until - now_unix;
             result = deny(AccessDenial::LockedOut,
                           "too many failed attempts; try again in " +
                               std::to_string(remaining) + " s");
             result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
+            result.peer_ip = ip;
             return result;
         }
     }
@@ -315,7 +383,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         (config_.default_permissions & mode_permissions(hello.mode)) == 0) {
         result = deny(AccessDenial::Declined, mode_disabled_reason(hello.mode));
         result.peer_address = peer_address;
-        result.peer_ip = address_key(peer_address, result.peer_ip);
+        result.peer_ip = ip;
         return result;
     }
 
@@ -332,10 +400,10 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result.via_token = true;
             return result;
         }
-        fail_locked(key, now_unix);
+        fail_locked(keys, now_unix);
         result = deny(AccessDenial::InvalidToken);
         result.peer_address = peer_address;
-        result.peer_ip = address_key(peer_address, result.peer_ip);
+        result.peer_ip = ip;
         result.permissions =
             config_.default_permissions & requested;
         return result;
@@ -389,13 +457,14 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     }
     const bool trusted_active =
         trusted_index < config_.trusted_devices.size() &&
-        !device_expired(config_.trusted_devices[trusted_index], now_unix);
+        !device_expired(config_.trusted_devices[trusted_index], now_unix,
+                        config_.trusted_device_lifetime_seconds);
     if (signature_flag && !signature_valid && (trusted_active || trust_request)) {
         result = deny(AccessDenial::Declined,
                       trusted_active ? "the trusted device proof is not valid"
                                      : "the device proof could not be verified");
         result.peer_address = peer_address;
-        result.peer_ip = address_key(peer_address, result.peer_ip);
+        result.peer_ip = ip;
         result.permissions =
             config_.default_permissions & requested;
         result.device_key = hello.device_key;
@@ -414,7 +483,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         if (config_.mode == HostAuthMode::Password) {
             result = deny(AccessDenial::PasswordRequired);
             result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
+            result.peer_ip = ip;
             result.permissions =
                 config_.default_permissions & requested;
             return result;
@@ -449,19 +518,19 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     if (!permanent_ok && !temporary_ok) {
         result = deny(AccessDenial::WrongPassword);
         result.peer_address = peer_address;
-        result.peer_ip = address_key(peer_address, result.peer_ip);
+        result.peer_ip = ip;
         result.permissions =
             config_.default_permissions & requested;
         if (hash_present && !hash_usable) {
             result = deny(AccessDenial::Declined,
                           "the host's password configuration is invalid");
             result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
+            result.peer_ip = ip;
             result.permissions =
                 config_.default_permissions & requested;
             return result;
         }
-        fail_locked(key, now_unix);
+        fail_locked(keys, now_unix);
         if (!config_.service_mode && !temporary_password_.empty()) {
             ++temporary_failures_;
             if (temporary_failures_ >= kTempPasswordFailureLimit) {
@@ -478,7 +547,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result = deny(AccessDenial::Declined,
                           "the host's two-factor configuration is invalid");
             result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
+            result.peer_ip = ip;
             result.permissions =
                 config_.default_permissions & requested;
             return result;
@@ -489,7 +558,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         } else if (hello.totp.empty()) {
             result = deny(AccessDenial::TwoFactorRequired);
             result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
+            result.peer_ip = ip;
             result.permissions =
                 config_.default_permissions & requested;
             return result;
@@ -503,10 +572,10 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             if (!fresh) {
                 result = deny(AccessDenial::WrongTwoFactor);
                 result.peer_address = peer_address;
-                result.peer_ip = address_key(peer_address, result.peer_ip);
+                result.peer_ip = ip;
                 result.permissions =
                     config_.default_permissions & requested;
-                fail_locked(key, now_unix);
+                fail_locked(keys, now_unix);
                 if (!config_.service_mode && !temporary_password_.empty()) {
                     ++temporary_failures_;
                     if (temporary_failures_ >= kTempPasswordFailureLimit) {
@@ -531,8 +600,9 @@ void HostSecurity::note_connected(const Result& result, int64_t now_unix) {
         return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    std::string ip;
-    failures_.erase(address_key(result.peer_address, ip));
+    for (const std::string& key : lockout_keys(peer_ip_text(result.peer_address))) {
+        failures_.erase(key);
+    }
     temporary_failures_ = 0;
     if (result.used_temporary_password) {
         temporary_password_ = random_digits(6);
@@ -687,7 +757,7 @@ std::vector<TrustedDevice> HostSecurity::trusted_devices(int64_t now_unix) const
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<TrustedDevice> devices;
     for (const TrustedDevice& device : config_.trusted_devices) {
-        if (!device_expired(device, now_unix)) {
+        if (!device_expired(device, now_unix, config_.trusted_device_lifetime_seconds)) {
             devices.push_back(device);
         }
     }
@@ -718,15 +788,18 @@ void HostSecurity::clear_trusted_devices() {
 bool HostSecurity::locked_out(const std::string& peer_address, int64_t now_unix,
                               uint32_t* retry_after_seconds) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::string ip;
-    const std::string key = address_key(peer_address, ip);
-    const auto it = failures_.find(key);
-    if (it == failures_.end() || it->second.blocked_until <= now_unix) {
+    int64_t blocked_until = 0;
+    for (const std::string& key : lockout_keys(peer_ip_text(peer_address))) {
+        const auto it = failures_.find(key);
+        if (it != failures_.end()) {
+            blocked_until = (std::max)(blocked_until, it->second.blocked_until);
+        }
+    }
+    if (blocked_until <= now_unix) {
         return false;
     }
     if (retry_after_seconds != nullptr) {
-        *retry_after_seconds =
-            static_cast<uint32_t>(it->second.blocked_until - now_unix);
+        *retry_after_seconds = static_cast<uint32_t>(blocked_until - now_unix);
     }
     return true;
 }

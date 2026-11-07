@@ -72,7 +72,7 @@ struct ClientRequest {
     // Authentication's permission ceiling: the host's defaults intersected
     // with what the viewer requested. The approval callback starts from this
     // mask and may only reduce it.
-    uint16_t permissions = 0;
+    PermissionMask permissions = 0;
     // Set by HostServer before it calls approve_client; Unknown for the raw
     // transport request.
     ClientApprovalMethod method = ClientApprovalMethod::Unknown;
@@ -99,14 +99,14 @@ struct ClientAuthResult {
     std::string reason;
     // Used for Allow and as the ceiling for RequireApproval. Bits outside the
     // server's allow_* gates are dropped by the transport.
-    uint16_t permissions = 0;
+    PermissionMask permissions = 0;
 };
 
 struct ClientApproval {
     bool allow = false;
     // The operator's grant for this session. Bits outside the authentication
     // ceiling are dropped, so approval can only reduce.
-    uint16_t permissions = 0;
+    PermissionMask permissions = 0;
 };
 
 // Where the server keeps its key and certificate. The tray is per-user; the
@@ -315,7 +315,7 @@ struct QuicClientConfig {
     std::string audit_ref;
     // The permissions the viewer asks for; the host intersects them with its
     // defaults and the operator's approval.
-    uint16_t requested_permissions = kPermissionAll;
+    PermissionMask requested_permissions = kPermissionAll;
     // What this connection is for. Desktop captures the remote desktop;
     // FileTransfer asks for a control-only session that browses the shared
     // directories and moves files. The host may refuse the mode.
@@ -412,20 +412,20 @@ public:
     std::string client_address() const;
     // The permission mask in force: what the accepted viewer was granted on
     // the server, or what the host last announced on the client.
-    uint16_t permissions() const;
+    PermissionMask permissions() const;
     // Server: replaces the mask mid-session and tells the viewer. The new
     // mask is clamped to the grant approved at connect time, so a permission
     // the operator did not allow cannot be restored later. Revoking input
     // also lifts anything the injector still holds. Requires an announced
     // stream.
-    Error set_permissions(uint16_t permissions);
+    Error set_permissions(PermissionMask permissions);
     // Server: raises or lowers what a later set_permissions() may grant,
     // without changing the mask in force. The new ceiling is clamped to what
     // the configuration allows and never exceeds the mask the operator
     // approved; the multi-viewer host uses it so a viewer that joined
     // view-only can receive input once the control lease frees. Requires an
     // announced stream.
-    Error set_permission_ceiling(uint16_t permissions);
+    Error set_permission_ceiling(PermissionMask permissions);
     // Replaces the token the next client has to send. Call between sessions:
     // a token spent by the previous one becomes valid again under its new
     // value, which is how a host rotates a one-time token without rebinding.
@@ -677,7 +677,7 @@ public:
     // Pops the newest permission mask the host sent with PermissionUpdate.
     // permissions() already reflects it, so this is the "something changed"
     // edge for a UI that wants to explain the revocation.
-    bool take_permission_update(uint16_t& permissions);
+    bool take_permission_update(PermissionMask& permissions);
     uint64_t permission_updates() const;
     // Waits for one complete access unit. Returns WaitTimeout when nothing
     // arrived in time, or Unavailable once the peer finished the video stream.

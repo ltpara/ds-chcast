@@ -31,7 +31,7 @@ const std::string& test_password_hash() {
     return hash;
 }
 
-uint16_t permissions(bool input, bool clipboard, bool audio) {
+chast::PermissionMask permissions(bool input, bool clipboard, bool audio) {
     return (input ? chast::kPermissionInput : 0) |
            (clipboard ? chast::kPermissionClipboard : 0) |
            (audio ? chast::kPermissionAudio : 0);
@@ -315,6 +315,35 @@ void test_trusted_devices() {
           "an expired trusted device has to pass 2FA again");
     check(security.trusted_devices(now).empty(),
           "the expired device is not listed for the operator");
+
+    // The lifetime comes from the host settings, so a short one expires a
+    // device that the default 90 days would still accept.
+    chast::TrustedDevice recent_device = trusted;
+    recent_device.last_seen_unix_seconds = static_cast<int64_t>(now) - 10;
+    config.trusted_device_lifetime_seconds = 60;
+    config.trusted_devices = {recent_device};
+    security.set_config(config);
+    chast::ClientHello recent = hello_with(test_password());
+    device.sign(recent, static_cast<int64_t>(now), chast::kAuthFlagSigned);
+    result = security.evaluate(recent, "127.0.0.1:4000", now);
+    check(result.decision == Decision::Allow && result.via_trusted_device,
+          "a device inside a shortened lifetime still skips 2FA");
+    chast::ClientHello after = hello_with(test_password());
+    device.sign(after, static_cast<int64_t>(now + 61), chast::kAuthFlagSigned);
+    result = security.evaluate(after, "127.0.0.1:4000", now + 61);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::TwoFactorRequired,
+          "a device older than the configured lifetime has to pass 2FA again");
+
+    // Zero disables expiry entirely: even a device last seen years ago stays.
+    config.trusted_device_lifetime_seconds = 0;
+    config.trusted_devices = {recent_device};
+    security.set_config(config);
+    const uint64_t much_later = now + static_cast<uint64_t>(10 * 365 * 24 * 60 * 60);
+    chast::ClientHello ancient = hello_with(test_password());
+    device.sign(ancient, static_cast<int64_t>(much_later), chast::kAuthFlagSigned);
+    result = security.evaluate(ancient, "127.0.0.1:4000", much_later);
+    check(result.decision == Decision::Allow && result.via_trusted_device,
+          "a zero lifetime never expires a trusted device");
 }
 
 void test_trust_request() {
@@ -378,17 +407,66 @@ void test_allow_list() {
     check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
           "an IPv6 address cannot match an IPv4 list");
 
+    config.ip_whitelist = "10.0.0.0/8, 192.168.5.5, 2001:db8:1::/48";
+    security.set_config(config);
+    result = security.evaluate(hello, "[2001:db8:1:7::5]:6000", 1004);
+    check(result.decision == Decision::RequireApproval, "an IPv6 entry admits its subnet");
+    result = security.evaluate(hello, "[2001:db8:2::5]:6000", 1005);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
+          "an IPv6 address outside every entry is refused");
+    result = security.evaluate(hello, "10.3.4.5:6000", 1006);
+    check(result.decision == Decision::RequireApproval,
+          "a mixed list still admits its IPv4 entries");
+
+    // A dual-stack listener may report an IPv4 peer in its mapped form.
+    result = security.evaluate(hello, "[::ffff:10.1.2.3]:6000", 1007);
+    check(result.decision == Decision::RequireApproval,
+          "a mapped IPv4 peer matches the IPv4 entry");
+
     config.ip_whitelist = "10.0.0.0/33";
     security.set_config(config);
-    result = security.evaluate(hello, "10.1.2.3:6000", 1004);
+    result = security.evaluate(hello, "10.1.2.3:6000", 1008);
     check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
           "a broken allow list fails closed");
+    config.ip_whitelist = "2001:db8::/129";
+    security.set_config(config);
+    result = security.evaluate(hello, "[2001:db8::1]:6000", 1009);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
+          "an IPv6 prefix past 128 fails closed");
+
+    config.ip_whitelist = "10.0.0.0/8, 2001:db8::1:";
+    security.set_config(config);
+    result = security.evaluate(hello, "[2001:db8::1]:6000", 1009);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
+          "a trailing-colon IPv6 whitelist entry fails closed");
+    result = security.evaluate(hello, "10.1.2.3:6000", 1009);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
+          "a malformed IPv6 entry also refuses otherwise allowed IPv4 peers");
+
+    config.ip_whitelist = "10.0.0.0/8, not-an-address";
+    security.set_config(config);
+    result = security.evaluate(hello, "10.1.2.3:6000", 1010);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::NotWhitelisted,
+          "one bad entry refuses even the addresses it does cover");
 
     config.ip_whitelist.clear();
     security.set_config(config);
-    result = security.evaluate(hello, "[::1]:6000", 1005);
+    result = security.evaluate(hello, "[::1]:6000", 1011);
     check(result.decision == Decision::RequireApproval,
           "an empty allow list accepts any address");
+
+    std::vector<chast::IpRange> ranges;
+    std::string error;
+    const bool parsed =
+        chast::parse_ip_whitelist("10.0.0.0/8, 2001:db8::/32, ::ffff:192.168.0.0/112",
+                                  ranges, &error);
+    check(parsed && ranges.size() == 3, "a mixed list parses three entries");
+    chast::IpAddress mapped;
+    chast::parse_ip_address("192.168.4.4", mapped);
+    check(parsed && chast::ip_in_ranges(mapped, ranges),
+          "a mapped IPv6 entry is stored as the IPv4 range it names");
+    check(chast::parse_ip_whitelist("", ranges, &error) && ranges.empty(),
+          "a blank list parses as empty");
 }
 
 void test_lockout() {
@@ -435,6 +513,46 @@ void test_lockout() {
     security.note_connected(accepted, 6000);
     check(!security.locked_out("10.9.8.7:7000", 6000),
           "a successful connection clears the lockout");
+}
+
+void test_ipv6_lockout() {
+    chast::HostSecurity::Config config;
+    config.mode = chast::HostAuthMode::Password;
+    chast::HostSecurity security(config);
+    chast::ClientHello wrong = hello_with("not-the-password");
+
+    // A client picks any interface address in its own /64, so six attempts
+    // spread over six addresses must still start the backoff.
+    for (int i = 0; i < 6; ++i) {
+        const std::string peer = "[2001:db8:1:2::" + std::to_string(i + 1) + "]:7000";
+        const auto result = security.evaluate(wrong, peer, 1000 + i);
+        check(result.denial == AccessDenial::WrongPassword,
+              "each early IPv6 failure is still a password refusal");
+    }
+    uint32_t retry = 0;
+    check(security.locked_out("[2001:db8:1:2::99]:7001", 1006, &retry),
+          "rotating the address inside the same /64 does not escape the lockout");
+    check(security.evaluate(wrong, "[2001:db8:1:2:ffff::1]:7000", 1006).denial ==
+              AccessDenial::LockedOut,
+          "a fresh address in the locked /64 is refused");
+    check(security.locked_out("[2001:db8:1:9::1]:7000", 1006),
+          "a neighbouring /64 in the same /48 is locked as well");
+    check(!security.locked_out("[2001:db8:2::1]:7000", 1006),
+          "another /48 keeps its own counter");
+
+    // An IPv4-mapped peer shares the IPv4 bucket with its plain spelling.
+    for (int i = 0; i < 6; ++i) {
+        security.evaluate(wrong, "203.0.113.9:8000", 3000 + i);
+    }
+    check(security.locked_out("[::ffff:203.0.113.9]:8001", 3006),
+          "the mapped form of a blocked IPv4 address is blocked too");
+
+    chast::HostSecurity::Result accepted;
+    accepted.decision = Decision::Allow;
+    accepted.peer_address = "[2001:db8:1:2::7]:7000";
+    security.note_connected(accepted, 4000);
+    check(!security.locked_out("[2001:db8:1:2::99]:7000", 4000),
+          "a successful connection clears every prefix bucket");
 }
 
 void test_service_mode() {
@@ -626,6 +744,7 @@ int main() {
     test_trust_request();
     test_allow_list();
     test_lockout();
+    test_ipv6_lockout();
     test_service_mode();
     test_password_and_permissions();
     test_password_rehash();

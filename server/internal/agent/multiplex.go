@@ -17,6 +17,14 @@ type localRoutes struct {
 	closed bool
 }
 
+// contains keeps an admitted source authorized only while its local route is
+// alive. The reader removes the route on timeout, socket error or close.
+func (r *localRoutes) contains(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.closed && r.peers[key] != nil
+}
+
 func (r *localRoutes) forward(key string, target *net.UDPAddr, data []byte, reply func([]byte) error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

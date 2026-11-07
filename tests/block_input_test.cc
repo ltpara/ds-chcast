@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "chast/host_server.h"
+#include "clipboard_stub.h"
 
 namespace {
 
@@ -110,6 +111,7 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, bool allow_block_in
                                               const std::shared_ptr<BlockBackend>& backend,
                                               std::string* error) {
     chast::HostServerConfig config;
+    use_empty_clipboard(config);
     config.settings.bind_address = "127.0.0.1";
     config.settings.port = port;
     config.settings.carrier = false;
@@ -189,7 +191,7 @@ bool take_action(chast::QuicSession& session, chast::HostControlResult& result,
         timeout);
 }
 
-bool wait_permissions(chast::QuicSession& session, uint16_t mask,
+bool wait_permissions(chast::QuicSession& session, chast::PermissionMask mask,
                       std::chrono::milliseconds timeout) {
     return wait_for([&] { return (session.permissions() & mask) == mask; }, timeout);
 }
@@ -220,7 +222,7 @@ void run_allowed(uint16_t port) {
         return;
     }
     check(info.block_input_enabled, "the handshake reports the host's consent");
-    const uint16_t both = chast::kPermissionInput | chast::kPermissionBlockInput;
+    const chast::PermissionMask both = chast::kPermissionInput | chast::kPermissionBlockInput;
     check(wait_permissions(*viewer, both, std::chrono::seconds(5)),
           "the viewer is granted input and block-input");
 

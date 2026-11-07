@@ -149,13 +149,14 @@ std::unique_ptr<chast::QuicSession> connect_viewer(uint16_t port,
                                                    chast::SessionMode mode,
                                                    const std::string& audit_ref,
                                                    chast::ServerInfo* info,
-                                                   std::string* error) {
+                                                   std::string* error,
+                                                   const std::string& password_text = password()) {
     chast::QuicClientConfig config;
     config.host = "127.0.0.1";
     config.port = port;
     config.idle_timeout_ms = 8000;
     config.pinned_fingerprint = fingerprint;
-    config.password = password();
+    config.password = password_text;
     config.session_mode = mode;
     config.audit_ref = audit_ref;
     std::unique_ptr<chast::QuicSession> session =
@@ -530,7 +531,7 @@ void test_input_lease(const std::filesystem::path& dir) {
     // that the viewer still has no input.
     host->set_permissions(chast::kPermissionAll);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    uint16_t second_mask = 0;
+    chast::PermissionMask second_mask = 0;
     while (second->take_permission_update(second_mask)) {
     }
     second_mask = second->permissions();
@@ -564,11 +565,11 @@ void test_input_lease(const std::filesystem::path& dir) {
     check(promoted_frames, "the remaining viewer takes over the shared capture");
 
     bool input_restored = false;
-    uint16_t restored_mask = 0;
+    chast::PermissionMask restored_mask = 0;
     wait_for(
         [&] {
             host->set_permissions(chast::kPermissionAll);
-            uint16_t mask = 0;
+            chast::PermissionMask mask = 0;
             if (second->take_permission_update(mask)) {
                 restored_mask = mask;
                 input_restored = (mask & chast::kPermissionInput) != 0;
@@ -587,6 +588,102 @@ void test_input_lease(const std::filesystem::path& dir) {
     stop_host(host);
 }
 
+void test_denied_audit(const std::filesystem::path& dir, uint32_t max_viewers) {
+    const std::filesystem::path spool =
+        dir / ("denied-" + std::to_string(max_viewers) + ".audit.jsonl");
+    const uint16_t port = free_udp_port();
+    check(port != 0, "a loopback port is available for the refusal check");
+    if (port == 0) {
+        return;
+    }
+    chast::HostServerConfig config;
+    config.settings.bind_address = "127.0.0.1";
+    config.settings.port = port;
+    config.settings.carrier = false;
+    config.settings.tunnel = false;
+    config.settings.max_viewers = max_viewers;
+    config.settings.allow_file_transfer = true;
+    config.settings.auth_mode = chast::HostAuthMode::Password;
+    config.settings.password_hash = chast::hash_password(password());
+    config.settings.audit_spool = spool.string();
+    config.settings.file_receive_directory = (dir / L"receive").string();
+    config.first_client_timeout_ms = 0;
+    config.serve_once = false;
+    config.max_consecutive_failures = 3;
+    std::string error;
+    std::unique_ptr<chast::HostServer> host =
+        chast::HostServer::create(std::move(config), &error);
+    if (!host) {
+        check(false, "the refusal host starts");
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+    host->start();
+    check(wait_for([&host] { return host->status().state == chast::HostState::Listening; },
+                   std::chrono::seconds(5)),
+          "the refusal host listens");
+    const std::string fingerprint = host->status().fingerprint;
+
+    // A wrong password is refused before any session exists, yet the refusal
+    // must reach the spool.
+    chast::ServerInfo info;
+    std::unique_ptr<chast::QuicSession> viewer =
+        connect_viewer(port, fingerprint, chast::SessionMode::FileTransfer,
+                       "c3c3c3c3c3c3c3c3", &info, &error, "not-the-password");
+    check(!viewer, "a wrong password is refused");
+    viewer.reset();
+
+    const bool recorded = wait_for(
+        [&spool] {
+            for (const std::string& line : read_lines(spool)) {
+                if (line.find("\"kind\":\"denial\"") != std::string::npos &&
+                    line.find("\"denial\":4") != std::string::npos &&
+                    line.find("incorrect password") != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        std::chrono::seconds(5));
+    check(recorded, "the refused Hello leaves a denial record with its address");
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto repeat = connect_viewer(port, fingerprint, chast::SessionMode::FileTransfer,
+                                     "eeeeeeeeeeeeeeee", &info, &error, "not-the-password");
+        check(!repeat && error.find("incorrect password") != std::string::npos,
+              "a new connection reaches the same password refusal");
+    }
+    size_t password_denials = 0;
+    for (const auto& line : read_lines(spool)) {
+        if (line.find("\"denial\":4") != std::string::npos) {
+            ++password_denials;
+        }
+    }
+    check(password_denials == 1, "same-IP refusal throttling survives reconnects");
+
+    // A missing password in password mode is a different refusal, recorded
+    // with its own code.
+    std::unique_ptr<chast::QuicSession> empty =
+        connect_viewer(port, fingerprint, chast::SessionMode::FileTransfer,
+                       "d4d4d4d4d4d4d4d4", &info, &error, "");
+    check(!empty, "an empty password is refused in password mode");
+    empty.reset();
+    check(wait_for(
+              [&spool] {
+                  for (const std::string& line : read_lines(spool)) {
+                      if (line.find("\"kind\":\"denial\"") != std::string::npos &&
+                          line.find("\"denial\":5") != std::string::npos) {
+                          return true;
+                      }
+                  }
+                  return false;
+              },
+              std::chrono::seconds(5)),
+          "the second refusal is recorded under its own code");
+
+    stop_host(host);
+}
+
 }  // namespace
 
 int main() {
@@ -601,6 +698,8 @@ int main() {
     test_connection_cap(dir);
     test_duplicate_audit_ref(dir);
     test_input_lease(dir);
+    test_denied_audit(dir, 1);
+    test_denied_audit(dir, 2);
     WSACleanup();
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

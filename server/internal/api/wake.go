@@ -59,7 +59,13 @@ func (s *server) wakeHost(w http.ResponseWriter, r *http.Request) {
 		s.recordAudit(r, actor, account.AuditDeviceWake, "wake "+id+" refused: no wake link", false)
 		return
 	}
-	job, wait, err := s.wake.Request(id, mac, record.WakeTargets)
+	relays := s.cfg.WakeRelays[id]
+	if len(relays) == 0 {
+		writeError(w, http.StatusConflict, "target has no authorized wake relay")
+		s.recordAudit(r, actor, account.AuditDeviceWake, "wake "+id+" refused: no authorized wake relay", false)
+		return
+	}
+	job, wait, err := s.wake.Request(id, mac, record.WakeTargets, relays)
 	switch {
 	case err == nil:
 	case errors.Is(err, wake.ErrCooldown):

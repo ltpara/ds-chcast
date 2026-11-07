@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,6 +38,10 @@ type auditSpoolEvent struct {
 	OccurredAtMS int64  `json:"occurred_at_ms,omitempty"`
 	Success      *bool  `json:"success,omitempty"`
 	Detail       string `json:"detail,omitempty"`
+	// A refused Hello has no audit reference; it carries the source address
+	// and the AccessDenial value instead.
+	Address string `json:"address,omitempty"`
+	Denial  int64  `json:"denial,omitempty"`
 }
 
 // auditSpool tails the host spool in order. Lines are consumed only after the
@@ -144,7 +149,7 @@ func (sp *auditSpool) forward(ctx context.Context, line string) error {
 		sp.log.Warn("audit spool line is not JSON; dropping", "line", line)
 		return nil
 	}
-	if event.Kind != "session" && event.Kind != "file" {
+	if event.Kind != "session" && event.Kind != "file" && event.Kind != "denial" {
 		sp.log.Warn("audit spool line has an unknown kind; dropping", "kind", event.Kind)
 		return nil
 	}
@@ -162,31 +167,48 @@ func (sp *auditSpool) report(err error) {
 }
 
 func (c *apiClient) audit(ctx context.Context, hostID string, priv ed25519.PrivateKey, event auditSpoolEvent) error {
-	success := true
-	if event.Success != nil {
-		success = *event.Success
-	}
 	timestamp := time.Now().Unix()
 	body := map[string]any{
 		"kind":      event.Kind,
-		"audit_ref": event.AuditRef,
-		"success":   success,
-		"detail":    event.Detail,
 		"timestamp": timestamp,
 	}
 	var msg []byte
-	if event.Kind == "session" {
+	switch event.Kind {
+	case "session":
+		success := true
+		if event.Success != nil {
+			success = *event.Success
+		}
+		body["audit_ref"] = event.AuditRef
+		body["success"] = success
+		body["detail"] = event.Detail
 		body["started_at_ms"] = event.StartedAtMS
 		body["ended_at_ms"] = event.EndedAtMS
 		msg = identity.HostAuditSessionMessage(hostID, event.AuditRef,
 			event.StartedAtMS, event.EndedAtMS, success, event.Detail)
-	} else {
+	case "file":
+		success := true
+		if event.Success != nil {
+			success = *event.Success
+		}
+		body["audit_ref"] = event.AuditRef
+		body["success"] = success
+		body["detail"] = event.Detail
 		body["direction"] = event.Direction
 		body["name"] = event.Name
 		body["size"] = event.Size
 		body["occurred_at_ms"] = event.OccurredAtMS
 		msg = identity.HostAuditFileMessage(hostID, event.AuditRef, event.Direction,
 			event.Name, event.Size, event.OccurredAtMS, success, event.Detail)
+	case "denial":
+		body["address"] = event.Address
+		body["denial"] = event.Denial
+		body["occurred_at_ms"] = event.OccurredAtMS
+		body["detail"] = event.Detail
+		msg = identity.HostAuditDenialMessage(hostID, event.Address, event.Denial,
+			event.OccurredAtMS, event.Detail, timestamp)
+	default:
+		return fmt.Errorf("audit event kind %q is not forwardable", event.Kind)
 	}
 	body["signature"] = identity.Sign(priv, msg)
 	data, err := json.Marshal(body)

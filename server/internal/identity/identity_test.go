@@ -43,6 +43,19 @@ func TestMessageSignatureRejectsTamper(t *testing.T) {
 	}
 }
 
+func TestHostDenialSignatureBindsTimestamp(t *testing.T) {
+	priv := PrivateKeyFromSecret("host-secret")
+	pub := priv.Public().(ed25519.PublicKey)
+	message := HostAuditDenialMessage("devbox", "203.0.113.9:5000", 9, 1700000000000, "refused", 1700000010)
+	signature := Sign(priv, message)
+	if !Verify(pub, message, signature) {
+		t.Fatal("valid denial signature rejected")
+	}
+	if Verify(pub, HostAuditDenialMessage("devbox", "203.0.113.9:5000", 9, 1700000000000, "refused", 1700000020), signature) {
+		t.Fatal("denial signature accepted after changing the request timestamp")
+	}
+}
+
 func TestMigrateSignatureBindsBothIDs(t *testing.T) {
 	priv := PrivateKeyFromSecret("host-secret")
 	pub := priv.Public().(ed25519.PublicKey)

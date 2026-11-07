@@ -135,6 +135,29 @@ func TestPostgresStore(t *testing.T) {
 	if !audited {
 		t.Fatalf("audit event for %s is missing: %+v", username, events)
 	}
+	denial := AuditEvent{Username: username, Action: AuditHostDenied, HostID: username,
+		EventKey: "pg-denial-" + username, Detail: "refused", ClientIP: "192.0.2.10"}
+	for i := 0; i < 3; i++ {
+		if err := store.AppendAudit(denial); err != nil {
+			t.Fatalf("denial retry: %v", err)
+		}
+	}
+	denials, err := store.AuditEventsFor(AuditHostDenied, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching := 0
+	for _, event := range denials {
+		if event.EventKey == denial.EventKey {
+			matching++
+			if event.HostID != denial.HostID {
+				t.Fatalf("denial host identity: %+v", event)
+			}
+		}
+	}
+	if matching != 1 {
+		t.Fatalf("denial retries stored %d rows, want 1", matching)
+	}
 
 	firstID := fmt.Sprintf("%032x", time.Now().UnixNano())
 	secondID := fmt.Sprintf("%032x", time.Now().UnixNano()+1)

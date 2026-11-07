@@ -201,6 +201,7 @@ endif()
 # capture or network.
 add_library(chast.clipboard STATIC
     src/clipboard/clipboard.cc
+    src/clipboard/clipboard_worker.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32)
@@ -417,6 +418,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
+    add_executable(chast-keyboard-test tests/keyboard_test.cc
+        app/windows/viewer/keyboard_capture.cc)
+    target_include_directories(chast-keyboard-test PRIVATE app/windows/viewer)
+    target_link_libraries(chast-keyboard-test PRIVATE chast.net)
+
     # Deterministic mutation coverage for every control parser, the stream
     # header decoders and the three reassembly parsers. Seeds are real maker
     # output; truncation, bit flips, insertions and random 1 MiB payloads must
@@ -463,6 +469,16 @@ if(CHAST_BUILD_TESTS)
     # session, so it skips itself when no interactive desktop exists.
     add_executable(chast-host-control-test tests/host_control_test.cc)
     target_link_libraries(chast-host-control-test PRIVATE chast.host)
+
+    add_executable(chast-clipboard-async-test tests/clipboard_async_test.cc
+        app/windows/viewer/viewer_engine.cc)
+    target_include_directories(chast-clipboard-async-test PRIVATE app/windows/viewer tools)
+    target_compile_definitions(chast-clipboard-async-test PRIVATE NOMINMAX)
+    target_link_libraries(chast-clipboard-async-test PRIVATE chast.host d3d11 dxgi
+        "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
+    add_custom_command(TARGET chast-clipboard-async-test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-clipboard-async-test>)
 
     # OS login: the password request over loopback QUIC, the permission and
     # logon-state gates, the exact text handed to a synthetic injector, and the
@@ -584,6 +600,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME keyboard COMMAND chast-keyboard-test)
     add_test(NAME protocol_fuzz COMMAND chast-protocol-fuzz-test)
     set_tests_properties(protocol_fuzz PROPERTIES TIMEOUT 300)
     add_test(NAME desktop COMMAND chast-desktop-test)
@@ -596,6 +613,8 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)
     add_test(NAME host_control COMMAND chast-host-control-test)
     set_tests_properties(host_control PROPERTIES TIMEOUT 180)
+    add_test(NAME clipboard_async COMMAND chast-clipboard-async-test)
+    set_tests_properties(clipboard_async PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME host_login COMMAND chast-host-login-test)
     set_tests_properties(host_login PROPERTIES TIMEOUT 180)
     add_test(NAME block_input COMMAND chast-block-input-test)
@@ -662,7 +681,8 @@ if(CHAST_BUILD_TESTS)
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
     # Idle auto-disconnect: viewer input must keep the session alive across two
-    # timeout windows, a quiet session must be closed by the host itself, and a
+    # timeout windows (desktop and terminal input); shell output alone must
+    # not reset the timer. A quiet session must be closed by the host, and a
     # host with the timeout off must leave it open. The probe overrides the
     # persisted minutes with a millisecond test value.
     add_test(NAME quic_idle_disconnect

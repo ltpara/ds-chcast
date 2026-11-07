@@ -4,6 +4,32 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:chast_viewer/viewer_bridge.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  const MethodChannel channel = MethodChannel('chast/viewer');
+  final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+  tearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+  test('toolbar reads native modifiers even after capture is disabled', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'setKeyCapture') return false;
+      if (call.method == 'keyboardState') return ViewerModifier.rightAlt;
+      return null;
+    });
+    expect(await ViewerBridge.setKeyCapture(false), isFalse);
+    expect(await ViewerBridge.keyboardState(fallback: ViewerModifier.leftCtrl),
+        ViewerModifier.rightAlt);
+  });
+
+  test('native keyboard state failure keeps Flutter fallback', () async {
+    expect(await ViewerBridge.keyboardState(fallback: ViewerModifier.leftShift),
+        ViewerModifier.leftShift);
+    messenger.setMockMethodCallHandler(channel, (_) async {
+      throw PlatformException(code: 'unavailable');
+    });
+    expect(await ViewerBridge.keyboardState(fallback: ViewerModifier.leftShift),
+        ViewerModifier.leftShift);
+  });
+
   test('maps every modifier usage to its bit', () {
     expect(modifierBitsFor(const <PhysicalKeyboardKey>[]), 0);
     final Map<PhysicalKeyboardKey, int> expected = <PhysicalKeyboardKey, int>{

@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
@@ -67,6 +69,200 @@ func viewerConnectionBody(t *testing.T, peerID, ref string, startedAt, endedAt i
 		t.Fatal(err)
 	}
 	return string(body)
+}
+
+func hostAuditDenialBody(t *testing.T, secret, hostID, address string, denial int64, detail string, occurredAt, timestamp int64) string {
+	t.Helper()
+	priv, _ := hostKey(secret)
+	body, err := json.Marshal(map[string]any{
+		"kind":           "denial",
+		"address":        address,
+		"denial":         denial,
+		"detail":         detail,
+		"occurred_at_ms": occurredAt,
+		"timestamp":      timestamp,
+		"signature":      identity.Sign(priv, identity.HostAuditDenialMessage(hostID, address, denial, occurredAt, detail, timestamp)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestHostAuditDeniedConnections(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "devbox", "host secret", "AB12", now), testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	occurred := time.Now().UnixMilli()
+	for _, tc := range []struct {
+		name    string
+		address string
+		denial  int64
+		detail  string
+		want    string
+	}{
+		{"whitelist", "203.0.113.9:5555", 9, "this address is not on the host's allow list",
+			"not_whitelisted: this address is not on the host's allow list"},
+		{"lockout", "[2001:db8::1]:6000", 8, "too many failed attempts", "locked_out: too many failed attempts"},
+		{"declined", "198.51.100.4:7000", 3, "", "declined"},
+	} {
+		status, body := request(t, http.MethodPost, s.URL+"/v1/hosts/devbox/audit",
+			hostAuditDenialBody(t, "host secret", "devbox", tc.address, tc.denial, tc.detail,
+				occurred, time.Now().Unix()), testutil.ServerKey)
+		if status != http.StatusCreated {
+			t.Fatalf("%s: %d %s", tc.name, status, body)
+		}
+		events, err := s.Accounts.AuditEventsFor(account.AuditHostDenied, 10)
+		if err != nil {
+			t.Fatalf("%s: read audit: %v", tc.name, err)
+		}
+		if len(events) == 0 || events[0].Detail != "devbox: "+tc.want || events[0].Success ||
+			events[0].Username != "-" || events[0].HostID != "devbox" {
+			t.Fatalf("%s: audit row = %+v", tc.name, events)
+		}
+	}
+	// The address column keeps only the host part, in both families.
+	events, err := s.Accounts.AuditEventsFor(account.AuditHostDenied, 10)
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("denial rows = %d, want 3", len(events))
+	}
+	ips := []string{events[0].ClientIP, events[1].ClientIP, events[2].ClientIP}
+	wantIPs := []string{"198.51.100.4", "2001:db8::1", "203.0.113.9"}
+	for i := range ips {
+		if ips[i] != wantIPs[i] {
+			t.Fatalf("client ips = %v, want %v", ips, wantIPs)
+		}
+	}
+
+	// The security trail lists them for the operator.
+	status, body := request(t, http.MethodGet,
+		s.URL+"/v1/audit?action="+account.AuditHostDenied+"&limit=10", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("console audit: %d %s", status, body)
+	}
+	var reply struct {
+		Events []struct {
+			Username string `json:"username"`
+			Action   string `json:"action"`
+			Detail   string `json:"detail"`
+			ClientIP string `json:"client_ip"`
+			HostID   string `json:"host_id"`
+			Success  bool   `json:"success"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatalf("audit reply: %v", err)
+	}
+	if len(reply.Events) != 3 {
+		t.Fatalf("console audit rows = %+v", reply.Events)
+	}
+	if reply.Events[0].Action != account.AuditHostDenied || reply.Events[0].Success ||
+		reply.Events[0].HostID != "devbox" {
+		t.Fatalf("console audit row = %+v", reply.Events[0])
+	}
+
+	for _, tc := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{
+			"bad signature",
+			hostAuditDenialBody(t, "other secret", "devbox", "203.0.113.9:5555", 9,
+				"", occurred, time.Now().Unix()),
+			http.StatusUnauthorized,
+		},
+		{
+			"stale timestamp",
+			hostAuditDenialBody(t, "host secret", "devbox", "203.0.113.9:5555", 9,
+				"", occurred, time.Now().Add(-time.Hour).Unix()),
+			http.StatusUnauthorized,
+		},
+		{
+			"address too long",
+			hostAuditDenialBody(t, "host secret", "devbox",
+				strings.Repeat("a", 200), 9, "", occurred, time.Now().Unix()),
+			http.StatusBadRequest,
+		},
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts/devbox/audit",
+			tc.body, testutil.ServerKey); status != tc.status {
+			t.Fatalf("%s: %d %s, want %d", tc.name, status, body, tc.status)
+		}
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts/ghost/audit",
+		hostAuditDenialBody(t, "host secret", "ghost", "203.0.113.9:5555", 9, "",
+			occurred, time.Now().Unix()), testutil.ServerKey); status != http.StatusNotFound {
+		t.Fatalf("unknown host: %d %s", status, body)
+	}
+}
+
+func TestHostDenialRetriesAndHostIdentity(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	for _, host := range []string{"host-a", "host-b"} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+			registerBody(t, host, host+" secret", "AB12", now), testutil.ServerKey); status != http.StatusOK {
+			t.Fatalf("register %s: %d %s", host, status, body)
+		}
+	}
+	// An old occurrence can be forwarded after an offline interval. Only the
+	// signed request time must be fresh; retries may carry a new signature.
+	occurred := time.Now().Add(-24 * time.Hour).UnixMilli()
+	for _, timestamp := range []int64{now, now, now + 1} {
+		body := hostAuditDenialBody(t, "host-a secret", "host-a", "203.0.113.9:5000",
+			9, "refused", occurred, timestamp)
+		if status, reply := request(t, http.MethodPost, s.URL+"/v1/hosts/host-a/audit",
+			body, testutil.ServerKey); status != http.StatusCreated {
+			t.Fatalf("retry: %d %s", status, reply)
+		}
+	}
+	if status, reply := request(t, http.MethodPost, s.URL+"/v1/hosts/host-b/audit",
+		hostAuditDenialBody(t, "host-b secret", "host-b", "203.0.113.9:5000", 9,
+			"refused", occurred, now), testutil.ServerKey); status != http.StatusCreated {
+		t.Fatalf("other host: %d %s", status, reply)
+	}
+	events, err := s.Accounts.AuditEventsFor(account.AuditHostDenied, 10)
+	if err != nil || len(events) != 2 || events[0].HostID != "host-b" || events[1].HostID != "host-a" ||
+		events[0].EventKey == events[1].EventKey || events[0].Detail == events[1].Detail {
+		t.Fatalf("retry and host attribution: %+v, %v", events, err)
+	}
+	status, body := request(t, http.MethodGet, s.URL+"/v1/audit?action=host_denied", "", testutil.ServerKey)
+	var page struct {
+		Events []struct {
+			HostID string `json:"host_id"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(body, &page); status != http.StatusOK || err != nil ||
+		len(page.Events) != 2 || page.Events[0].HostID != "host-b" || page.Events[1].HostID != "host-a" {
+		t.Fatalf("host identity in API: %d %s, %v", status, body, err)
+	}
+	rows := exportCSV(t, s.URL+"/v1/audit?format=csv&action=host_denied")
+	if len(rows) != 3 || rows[0][8] != "host_id" || rows[1][8] != "host-b" || rows[2][8] != "host-a" {
+		t.Fatalf("host identity in CSV: %v", rows)
+	}
+	// Merely changing an expired envelope to now must not revive its proof.
+	stale := hostAuditDenialBody(t, "host-a secret", "host-a", "203.0.113.9:5000",
+		9, "tampered", occurred, now-3600)
+	var tampered map[string]any
+	if err := json.Unmarshal([]byte(stale), &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered["timestamp"] = now
+	encoded, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, reply := request(t, http.MethodPost, s.URL+"/v1/hosts/host-a/audit",
+		string(encoded), testutil.ServerKey); status != http.StatusUnauthorized {
+		t.Fatalf("modified timestamp accepted: %d %s", status, reply)
+	}
 }
 
 func listConnections(t *testing.T, url, token string) connectionsReply {

@@ -561,7 +561,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     const size_t audit_size = hello.audit_ref.size() > kMaxAuditRefLength
                                   ? kMaxAuditRefLength
                                   : hello.audit_ref.size();
-    std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 2 + 2 + key_size +
+    std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 4 + 2 + key_size +
                                  1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
                                  signature_size + 2 + totp_size + 2 + audit_size + 2);
     uint8_t* cursor = payload.data();
@@ -573,7 +573,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     put_u16(cursor, static_cast<uint16_t>(password_size));
     std::memcpy(cursor, hello.password.data(), password_size);
     cursor += password_size;
-    put_u16(cursor, hello.requested_permissions);
+    put_u32(cursor, hello.requested_permissions);
     put_u16(cursor, static_cast<uint16_t>(key_size));
     if (key_size > 0) {
         std::memcpy(cursor, hello.device_key.data(), key_size);
@@ -639,7 +639,7 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "Hello carries a malformed password");
         return false;
     }
-    if (!reader.u16(hello.requested_permissions)) {
+    if (!reader.u32(hello.requested_permissions)) {
         set_error(error, "Hello carries no permission request");
         return false;
     }
@@ -804,8 +804,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     // 24 fixed bytes, the encoder name, the display count, the displays, the
     // 16-byte audio description and its AudioSpecificConfig, the captured
     // desktop size (the encoded size in the fixed block may be scaled down),
-    // the v13 permission mask, then the v41 session mode.
-    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4 + 2 + 1;
+    // the v49 permission mask, then the v41 session mode.
+    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4 + 4 + 1;
     for (size_t i = 0; i < display_count; ++i) {
         size += kDisplayFixedSize + info.displays[i].name.size();
     }
@@ -866,7 +866,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     put_u16(cursor, info.source_width);
     put_u16(cursor, info.source_height);
-    uint16_t permissions = 0;
+    PermissionMask permissions = 0;
     if (info.input_enabled) {
         permissions |= kPermissionInput;
     }
@@ -909,7 +909,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.session_select_enabled) {
         permissions |= kPermissionSessionSelect;
     }
-    put_u16(cursor, permissions);
+    put_u32(cursor, permissions);
     put_u8(cursor, static_cast<uint8_t>(info.mode));
     return payload;
 }
@@ -1114,8 +1114,8 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck has a source picture in a control-only session");
         return false;
     }
-    uint16_t permissions = 0;
-    if (!reader.u16(permissions)) {
+    PermissionMask permissions = 0;
+    if (!reader.u32(permissions)) {
         set_error(error, "HelloAck carries no permissions");
         return false;
     }
@@ -3093,17 +3093,17 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
     return true;
 }
 
-std::vector<uint8_t> make_permission_update(uint16_t permissions) {
-    std::vector<uint8_t> payload(2);
+std::vector<uint8_t> make_permission_update(PermissionMask permissions) {
+    std::vector<uint8_t> payload(4);
     uint8_t* cursor = payload.data();
-    put_u16(cursor, permissions);
+    put_u32(cursor, permissions);
     return make_control(ControlType::PermissionUpdate, payload);
 }
 
 bool parse_permission_update(const std::vector<uint8_t>& payload,
-                             uint16_t& permissions, std::string* error) {
+                             PermissionMask& permissions, std::string* error) {
     Reader reader(payload.data(), payload.size());
-    if (!reader.u16(permissions) || !reader.at_end()) {
+    if (!reader.u32(permissions) || !reader.at_end()) {
         set_error(error, "malformed PermissionUpdate");
         return false;
     }

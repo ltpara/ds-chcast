@@ -203,4 +203,16 @@ bool append_audit_file(const std::string& spool_path, const AuditFileRecord& rec
     return append_line(spool_path, line, error);
 }
 
+bool append_audit_denial(const std::string& spool_path, const AuditDenialRecord& record,
+                         std::string* error) {
+    std::string line = "{\"kind\":\"denial\",\"address\":";
+    append_json_string(line, record.address);
+    line += ",\"denial\":" + std::to_string(record.code);
+    append_number(line, "occurred_at_ms", record.occurred_at_ms);
+    line += ",\"detail\":";
+    append_json_string(line, record.detail);
+    line += "}\n";
+    return append_line(spool_path, line, error);
+}
+
 }  // namespace chast

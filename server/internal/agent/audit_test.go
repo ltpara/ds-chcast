@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
 
@@ -97,6 +98,37 @@ func TestAuditSpoolForwardsHostEvents(t *testing.T) {
 		return row.HostID == "devbox" && row.Source == "host" && row.Direction == "upload" &&
 			row.Name == "a.txt" && row.Size == 10 && row.Files == 1 && row.Success
 	})
+
+	// A refusal carries no session reference: the agent forwards the address,
+	// the denial code and the text the viewer was told.
+	occurredRefusal := time.Now().UnixMilli()
+	appendSpool(t, spool, `{"kind":"denial","address":"203.0.113.9:5000","denial":9,`+
+		`"occurred_at_ms":`+itoa(occurredRefusal)+`,"detail":"this address is not on the host's allow list"}`+"\n")
+	waitFor(t, 10*time.Second, "host denial event", func() bool {
+		events, err := s.Accounts.AuditEventsFor(account.AuditHostDenied, 10)
+		if err != nil || len(events) != 1 {
+			return false
+		}
+		row := events[0]
+		return row.Username == "-" && row.ClientIP == "203.0.113.9" && !row.Success &&
+			row.HostID == "devbox" &&
+			row.Detail == "devbox: not_whitelisted: this address is not on the host's allow list"
+	})
+	waitFor(t, 5*time.Second, "denial spool removal", func() bool {
+		_, err := os.Stat(spool)
+		return os.IsNotExist(err)
+	})
+	// Simulate a spool replay after the acknowledgment was lost or the agent
+	// restarted. The request is signed again but the event stays identical.
+	appendSpool(t, spool, `{"kind":"denial","address":"203.0.113.9:5000","denial":9,`+
+		`"occurred_at_ms":`+itoa(occurredRefusal)+`,"detail":"this address is not on the host's allow list"}`+"\n")
+	waitFor(t, 5*time.Second, "replayed denial spool removal", func() bool {
+		_, err := os.Stat(spool)
+		return os.IsNotExist(err)
+	})
+	if events, err := s.Accounts.AuditEventsFor(account.AuditHostDenied, 10); err != nil || len(events) != 1 {
+		t.Fatalf("replayed denial duplicated: %+v, %v", events, err)
+	}
 
 	// Unknown kinds are dropped instead of blocking later events.
 	appendSpool(t, spool, `{"kind":"network","audit_ref":"00112233aabbccdd"}`+"\n")

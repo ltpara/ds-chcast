@@ -165,5 +165,53 @@ bool parse_ipv4(const std::string& text, uint32_t& address);
 bool parse_ipv4_cidr(const std::string& text, Ipv4Range& range);
 bool ipv4_in_range(uint32_t address, const Ipv4Range& range);
 bool ipv4_in_ranges(uint32_t address, const std::vector<Ipv4Range>& ranges);
+std::string format_ipv4(uint32_t address);
+
+// ----- IPv6 CIDR -----
+
+struct Ipv6Range {
+    std::array<uint8_t, 16> address{};  // network byte order
+    uint8_t prefix = 0;
+};
+
+// Accepts the RFC 4291 literal forms, including "::" compression and a
+// trailing dotted quad. A "%zone" suffix is ignored, because a scoped
+// link-local address still names one host.
+bool parse_ipv6(const std::string& text, std::array<uint8_t, 16>& address);
+bool parse_ipv6_cidr(const std::string& text, Ipv6Range& range);
+bool ipv6_in_range(const std::array<uint8_t, 16>& address, const Ipv6Range& range);
+bool ipv6_in_ranges(const std::array<uint8_t, 16>& address,
+                    const std::vector<Ipv6Range>& ranges);
+// RFC 5952 text of the masked network, e.g. "2001:db8::/64". Two prefixes of
+// the same network produce the same string, so it doubles as a map key.
+std::string format_ipv6_prefix(const std::array<uint8_t, 16>& address, uint8_t prefix);
+
+// ----- either family -----
+
+// One address in either family. An IPv4-mapped IPv6 form (::ffff:a.b.c.d) is
+// folded to plain IPv4, so a dual-stack listener matches IPv4 rules and a
+// mapped peer shares the IPv4 lockout bucket.
+struct IpAddress {
+    bool ipv6 = false;
+    std::array<uint8_t, 16> bytes{};  // IPv4 lives in bytes[0..3]
+};
+
+struct IpRange {
+    bool ipv6 = false;
+    std::array<uint8_t, 16> address{};  // IPv4 lives in address[0..3]
+    uint8_t prefix = 0;
+};
+
+// A bare literal; surrounding brackets and a "%zone" suffix are accepted.
+bool parse_ip_address(const std::string& text, IpAddress& address);
+// An entry of a mixed-family list. A mapped entry such as
+// "::ffff:10.0.0.0/104" becomes the IPv4 range 10.0.0.0/8; mapped forms
+// covering more than the IPv4 block are rejected.
+bool parse_ip_cidr(const std::string& text, IpRange& range);
+bool ip_in_range(const IpAddress& address, const IpRange& range);
+bool ip_in_ranges(const IpAddress& address, const std::vector<IpRange>& ranges);
+// Canonical text of one list entry, e.g. "10.0.0.0/8" or "2001:db8::/32". What
+// it prints parses back to the same range.
+std::string format_ip_range(const IpRange& range);
 
 }  // namespace chast

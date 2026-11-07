@@ -63,7 +63,7 @@ class StreamPreferences {
       } catch (_) {
         // A picture preference; failing to persist it is not fatal.
       }
-    });
+    }, onFileError: () {});
   }
 
   static int _choice(Object? raw, int max) {
@@ -98,7 +98,7 @@ class StreamPreferences {
         // A corrupt settings file must not stop the viewer from starting.
       }
       return <String, Object?>{};
-    });
+    }, onFileError: () => <String, Object?>{});
   }
 
   static File? _file() {

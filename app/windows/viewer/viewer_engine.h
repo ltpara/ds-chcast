@@ -33,6 +33,8 @@ struct ID3D11Device;
 struct ID3D11Texture2D;
 
 namespace chast {
+struct ClipboardContent;
+class ClipboardWorker;
 class DeviceIdentity;
 class FileReceiver;
 class PortForwardClient;
@@ -237,7 +239,7 @@ struct ViewerStatus {
     // The permission mask the host last announced (chast::PermissionBit) and
     // how many masks have been applied, including the one from HelloAck. The
     // UI compares the mask to explain a live revocation.
-    uint16_t permissions = 0;
+    chast::PermissionMask permissions = 0;
     uint64_t permission_updates = 0;
     // Input gate and coordinate origin from HelloAck. `origin_x`/`origin_y`
     // are the captured output's top-left in virtual-desktop pixels; the UI
@@ -248,7 +250,7 @@ struct ViewerStatus {
     uint64_t input_sent = 0;
     uint64_t input_failed = 0;
     // Clipboard gate from HelloAck. Changes are read from and written to the
-    // local Win32 clipboard by the session thread; the counters cover every
+    // local Win32 clipboard by a background worker; the counters cover every
     // rich item exchanged this session. `clipboard_*_formats` is a bitmask of
     // chast::ClipboardFormat (1 << id) for the most recent item each way.
     bool clipboard_enabled = false;
@@ -759,6 +761,12 @@ public:
     // baseline, so whatever changed in between is not flushed to the host.
     // The host's own clipboard permission is applied on top of this.
     void SetClipboardSync(bool enabled);
+    // Test hook for rich clipboard reads (text, HTML, RTF and images).
+    // Install before Start to keep file-copy probes off the real clipboard.
+    // Unset uses the Windows backend. False means failure; true with empty
+    // output means a confirmed empty clipboard. Callbacks own captured state.
+    void SetClipboardSource(std::function<bool(chast::ClipboardContent&)> source);
+    void SetClipboardSink(std::function<bool(const chast::ClipboardContent&)> sink);
     // Test hook: when set, a clipboard file list lands in this callback with
     // the staged absolute paths instead of the Windows clipboard. The loopback
     // probe uses it so an automated run never disturbs the operator's
@@ -1255,11 +1263,14 @@ private:
     std::deque<PendingInput> pending_input_;
     bool input_enabled_ = false;
 
-    // Native clipboard bridge. The session thread reads the local clipboard
-    // and writes what the host sends; the toggle only crosses as a flag, and
-    // the UI never moves clipboard bytes through Dart.
+    // Native clipboard I/O is serialized off the session thread. Callbacks
+    // must own captured state and be installed before Start().
     std::atomic<bool> clipboard_sync_{true};
+    std::atomic<uint64_t> clipboard_sync_version_{0};
+    std::unique_ptr<chast::ClipboardWorker> clipboard_worker_;
     mutable std::mutex clipboard_sink_mutex_;
+    std::function<bool(chast::ClipboardContent&)> clipboard_source_;
+    std::function<bool(const chast::ClipboardContent&)> clipboard_sink_;
     std::function<bool(const std::vector<std::string>&)> clipboard_file_sink_;
     std::function<bool(std::vector<std::string>&)> clipboard_file_source_;
 

@@ -105,7 +105,7 @@ class ViewFilter {
         // A corrupt settings file must not stop the viewer from starting.
       }
       return <String, Object?>{};
-    });
+    }, onFileError: () => <String, Object?>{});
   }
 
   static void _writeList(String key, List<String> values) {
@@ -130,7 +130,7 @@ class ViewFilter {
       } catch (_) {
         // View preferences; failing to persist them is not fatal.
       }
-    });
+    }, onFileError: () {});
   }
 
   static File? _file() {

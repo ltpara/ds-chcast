@@ -39,6 +39,10 @@ const (
 	AuditDeviceWake        = "device_wake"
 	AuditRecordingUpload   = "recording_upload"
 	AuditRecordingDelete   = "recording_delete"
+	// AuditHostDenied is a Hello the host policy refused. The username is
+	// unknown ("-"), the client IP is the refused address and the detail names
+	// the host and refusal.
+	AuditHostDenied = "host_denied"
 
 	AuditGroupCreate       = "group_create"
 	AuditGroupUpdate       = "group_update"
@@ -62,6 +66,10 @@ type AuditEvent struct {
 	Action    string
 	Detail    string
 	ClientIP  string
+	HostID    string
+	// EventKey identifies a host report across retries, independently of its
+	// request timestamp. Empty leaves ordinary account events append-only.
+	EventKey string
 	// Location is the operator-supplied label for ClientIP. It stays empty
 	// when no GeoIP table is configured or the address is not covered.
 	Location string
@@ -83,17 +91,31 @@ func (s *Store) AppendAudit(event AuditEvent) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(
-		`INSERT INTO audit_events (created_at, username, action, detail, client_ip, location, success)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	key := strings.TrimSpace(event.EventKey)
+	// The SELECT avoids advancing the sequence for routine retries; the
+	// unique index also handles simultaneous writers on different servers.
+	result, err := s.db.Exec(
+		`INSERT INTO audit_events (created_at, username, action, detail, client_ip, location, success, host_id, event_key)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		 WHERE ? = '' OR NOT EXISTS (SELECT 1 FROM audit_events WHERE event_key = ?)
+		 ON CONFLICT(event_key) WHERE event_key <> '' DO NOTHING`,
 		unixMillis(at), username, action, strings.TrimSpace(event.Detail),
 		strings.TrimSpace(event.ClientIP), strings.TrimSpace(event.Location), event.Success,
-	); err != nil {
+		strings.TrimSpace(event.HostID), key, key, key,
+	)
+	if err != nil {
 		return fmt.Errorf("account store %s: append audit: %w", s.path, err)
 	}
+	if inserted, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("account store %s: append audit result: %w", s.path, err)
+	} else if inserted == 0 {
+		return nil
+	}
+	// Conflict races can still leave sequence gaps, so retain actual rows.
 	if _, err := s.db.Exec(
-		`DELETE FROM audit_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - ? FROM audit_events)`,
-		auditRetention,
+		`DELETE FROM audit_events WHERE id <
+		 (SELECT id FROM audit_events ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+		auditRetention-1,
 	); err != nil {
 		return fmt.Errorf("account store %s: trim audit: %w", s.path, err)
 	}
@@ -163,7 +185,7 @@ func (s *Store) auditEvents(clauses []string, args []any, beforeID int64, limit 
 		where = " WHERE " + strings.Join(clauses, " AND ")
 	}
 	args = append(args, limit)
-	query := `SELECT id, created_at, username, action, detail, client_ip, location, success
+	query := `SELECT id, created_at, username, action, detail, client_ip, location, success, host_id, event_key
 		 FROM audit_events` + where + ` ORDER BY id DESC LIMIT ?`
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,7 +201,8 @@ func (s *Store) auditEvents(clauses []string, args []any, beforeID int64, limit 
 			created int64
 		)
 		if err := rows.Scan(&event.ID, &created, &event.Username, &event.Action,
-			&event.Detail, &event.ClientIP, &event.Location, &event.Success); err != nil {
+			&event.Detail, &event.ClientIP, &event.Location, &event.Success,
+			&event.HostID, &event.EventKey); err != nil {
 			return nil, fmt.Errorf("account store %s: scan audit: %w", s.path, err)
 		}
 		event.CreatedAt = timeFromMillis(created)

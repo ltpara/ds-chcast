@@ -13,6 +13,7 @@
 #include <string>
 
 #include "remote_cursor.h"
+#include "keyboard_capture.h"
 #include "viewer_engine.h"
 
 namespace flutter {
@@ -93,11 +94,10 @@ private:
     HWND window_ = nullptr;
     HWND view_ = nullptr;
     std::atomic<bool> key_capture_{false};
+    std::unique_ptr<KeyboardCapture> keyboard_capture_;
     std::atomic<bool> relative_mouse_{false};
-    // Physical pixels per captured pixel, and the modifier state carried by
-    // the last Dart input event. Relative moves bypass Dart, so the native
-    // path has to replay the modifiers or a held Ctrl would be lifted by the
-    // host's per-event reconciliation.
+    // Physical pixels per captured pixel. Relative moves use the native
+    // keyboard snapshot; the last Dart bitmap is the hook-failure fallback.
     double relative_scale_ = 1.0;
     uint16_t last_modifiers_ = 0;
     HIMC saved_himc_ = nullptr;

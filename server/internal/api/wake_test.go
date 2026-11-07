@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
 
@@ -79,7 +81,7 @@ func registerWakeAgentLink(t *testing.T, base, id string, timestamp int64, relay
 }
 
 func TestWakeQueuesForProxyAgent(t *testing.T) {
-	s := testutil.Start(t)
+	s := testutil.StartWith(t, testutil.Options{WakeRelays: map[string][]string{"targetbox": {"proxy"}}})
 	now := time.Now().Unix()
 	registerWakeAgent(t, s.URL, "targetbox", now)
 	registerWakeAgentLink(t, s.URL, "proxy", now+1, true, []string{wakeLink})
@@ -139,7 +141,7 @@ func TestWakeQueuesForProxyAgent(t *testing.T) {
 }
 
 func TestWakeAuthorizationAndValidation(t *testing.T) {
-	s := testutil.Start(t)
+	s := testutil.StartWith(t, testutil.Options{WakeRelays: map[string][]string{"targetbox": {"proxy"}, "otherbox": {"proxy"}}})
 	now := time.Now().Unix()
 	if _, err := s.Accounts.CreateUserWithRole("root", "battery staple", "", "", account.RoleAdmin); err != nil {
 		t.Fatalf("create admin: %v", err)
@@ -193,7 +195,7 @@ func TestWakeAuthorizationAndValidation(t *testing.T) {
 }
 
 func TestWakeSharedAddressBookPermission(t *testing.T) {
-	s := testutil.Start(t)
+	s := testutil.StartWith(t, testutil.Options{WakeRelays: map[string][]string{"targetbox": {"otherbox"}}})
 	now := time.Now().Unix()
 	if _, err := s.Accounts.CreateUserWithRole("root", "battery staple", "", "", account.RoleAdmin); err != nil {
 		t.Fatalf("create admin: %v", err)
@@ -247,7 +249,8 @@ func TestWakeSharedAddressBookPermission(t *testing.T) {
 
 func TestWakeDeliveryScopedToTargetLink(t *testing.T) {
 	node := newStubNode(t, "203.0.113.10", "203.0.113.10:21116")
-	s := testutil.StartWith(t, testutil.Options{RelayNodes: []string{node.url}})
+	s := testutil.StartWith(t, testutil.Options{RelayNodes: []string{node.url},
+		WakeRelays: map[string][]string{"targetbox": {"peerrelay", "foreignrelay", "plainpeer"}}})
 	now := time.Now().Unix()
 	const foreignLink = "192.168.60.255:9"
 
@@ -307,5 +310,63 @@ func TestWakeTargetWithoutLinkIsRejected(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Success || !strings.Contains(events[0].Detail, "no wake link") {
 		t.Fatalf("wake audit = %+v, want one failed no-link event", events)
+	}
+}
+
+func TestWakeTargetWithoutAuthorizedRelayIsRejected(t *testing.T) {
+	s := testutil.Start(t)
+	registerWakeAgent(t, s.URL, "targetbox", time.Now().Unix())
+	status, _, body := postWake(t, s.URL, "targetbox", "AA:BB:CC:DD:EE:FF", testutil.ServerKey)
+	if status != http.StatusConflict || !strings.Contains(string(body), "authorized wake relay") {
+		t.Fatalf("wake without policy: %d %s", status, body)
+	}
+	events, err := s.Accounts.AuditEventsFor(account.AuditDeviceWake, 10)
+	if err != nil || len(events) != 1 || events[0].Success || !strings.Contains(events[0].Detail, "no authorized wake relay") {
+		t.Fatalf("wake audit = %+v, error = %v", events, err)
+	}
+}
+
+func TestWakeSameSubnetDoesNotAuthorizeAnonymousRelay(t *testing.T) {
+	node := newStubNode(t, "203.0.113.10", "203.0.113.10:21116")
+	s := testutil.StartWith(t, testutil.Options{RelayNodes: []string{node.url}})
+	srv := httptest.NewServer(api.New(api.Config{
+		Registry: s.Registry, Relay: s.Relay, Identity: s.Identity,
+		RelayPool: s.Pool,
+		Accounts:  s.Accounts, PunchAddr: s.Punch, RelayHost: s.RelayHost,
+		TTL: time.Minute, WakeRelays: map[string][]string{"private-target": {"trusted-relay"}},
+	}))
+	defer srv.Close()
+	now := time.Now().Unix()
+	register := func(id string, relay bool) []wakeJobReply {
+		t.Helper()
+		status, body := request(t, http.MethodPost, srv.URL+"/v1/hosts",
+			registerBodyWithLink(t, id, "secret "+id, "FP-"+id, now, relay, []string{wakeLink}), "")
+		if status != http.StatusOK {
+			t.Fatalf("registration: %d %s", status, body)
+		}
+		var out struct {
+			Wake []wakeJobReply `json:"wake"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Wake
+	}
+	register("private-target", false)
+	register("trusted-relay", true)
+	if _, err := s.Accounts.CreateUser("root", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	root := login(t, srv.URL, "root", "correct horse")
+	status, _, body := postWake(t, srv.URL, "private-target", "AA:BB:CC:DD:EE:FF", root.Token)
+	if status != http.StatusAccepted {
+		t.Fatalf("wake: %d %s", status, body)
+	}
+	if jobs := register("unrelated-relay", true); len(jobs) != 0 {
+		t.Fatalf("anonymous unrelated host received wake: %+v", jobs)
+	}
+	now++
+	if jobs := register("trusted-relay", true); len(jobs) != 1 || jobs[0].Target != "private-target" {
+		t.Fatalf("authorized host did not receive wake: %+v", jobs)
 	}
 }

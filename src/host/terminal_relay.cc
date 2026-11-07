@@ -365,8 +365,10 @@ void assign_to_job(HANDLE process) {
 
 }  // namespace
 
-TerminalRelay::TerminalRelay(QuicSession& session, bool allow_persist)
-    : session_(session), allow_persist_(allow_persist) {}
+TerminalRelay::TerminalRelay(QuicSession& session, bool allow_persist,
+                             std::function<void()> viewer_activity)
+    : session_(session), allow_persist_(allow_persist),
+      viewer_activity_(std::move(viewer_activity)) {}
 
 TerminalRelay::~TerminalRelay() {
     for (const auto& console : live_) {
@@ -708,6 +710,7 @@ std::vector<std::string> TerminalRelay::pump() {
     std::vector<std::string> events;
     TerminalRequest request;
     while (session_.take_terminal_request(request)) {
+        if (viewer_activity_) viewer_activity_();
         if ((request.flags & kTerminalRequestAttach) != 0) {
             attach_console(request, events);
         } else {
@@ -716,6 +719,7 @@ std::vector<std::string> TerminalRelay::pump() {
     }
     TerminalSize resize;
     while (session_.take_terminal_resize(resize)) {
+        if (viewer_activity_) viewer_activity_();
         for (const auto& console : live_) {
             if (console->terminal_id == resize.terminal_id) {
                 apply_resize(*console, resize, events);
@@ -725,6 +729,7 @@ std::vector<std::string> TerminalRelay::pump() {
     }
     TerminalStop stop;
     while (session_.take_terminal_stop(stop)) {
+        if (viewer_activity_) viewer_activity_();
         for (size_t i = 0; i < live_.size(); ++i) {
             if (live_[i]->terminal_id != stop.terminal_id) {
                 continue;
@@ -774,6 +779,7 @@ TerminalRelay::Outcome TerminalRelay::drive(const std::shared_ptr<TerminalConsol
             }
             break;
         }
+        if (!data.empty() && viewer_activity_) viewer_activity_();
         std::lock_guard<std::mutex> lock(console->mutex);
         console->to_console_bytes += data.size();
         console->to_console.push_back(std::move(data));

@@ -125,7 +125,7 @@ class ViewPreferences {
       } catch (_) {
         // A view preference; failing to persist it is not fatal.
       }
-    });
+    }, onFileError: () {});
   }
 
   static Map<String, Object?> _readMap() {
@@ -146,7 +146,7 @@ class ViewPreferences {
         // A corrupt settings file must not stop the viewer from starting.
       }
       return <String, Object?>{};
-    });
+    }, onFileError: () => <String, Object?>{});
   }
 
   static File? _file() {

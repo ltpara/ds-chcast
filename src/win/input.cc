@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "chast/desktop.h"
@@ -101,12 +102,11 @@ bool lookup(uint16_t usage, uint16_t& scan, bool& extended) {
         case 0x43: scan = 0x44; return true;  // F10
         case 0x44: scan = 0x57; return true;  // F11
         case 0x45: scan = 0x58; return true;  // F12
-        // F13-F24 are not expressible with set 1 scan codes alone.
 
         case 0x46: scan = 0x37; extended = true; return true;  // Print Screen
         case 0x47: scan = 0x46; return true;                   // Scroll Lock
         // 0x48 Pause: needs the E1 prefix, which SendInput cannot emit as a
-        // scan code. Rejected rather than sent as a wrong key.
+        // scan code. make_keyboard_input() uses VK_PAUSE instead.
 
         // Navigation block (all extended).
         case 0x49: scan = 0x52; extended = true; return true;  // Insert
@@ -123,7 +123,7 @@ bool lookup(uint16_t usage, uint16_t& scan, bool& extended) {
         // Keypad.
         case 0x53: scan = 0x45; extended = true; return true;  // Num Lock
         case 0x54: scan = 0x35; extended = true; return true;  // KP /
-        case 0x55: scan = 0x37; extended = true; return true;  // KP *
+        case 0x55: scan = 0x37; return true;                   // KP *
         case 0x56: scan = 0x4A; return true;                   // KP -
         case 0x57: scan = 0x4E; return true;                   // KP +
         case 0x58: scan = 0x1C; extended = true; return true;  // KP Enter
@@ -141,7 +141,23 @@ bool lookup(uint16_t usage, uint16_t& scan, bool& extended) {
         case 0x64: scan = 0x56; return true;                   // Non-US backslash
         case 0x65: scan = 0x5D; extended = true; return true;  // Application
         case 0x67: scan = 0x59; return true;                   // KP =
-        // 0x68-0x73 F13-F24: no set 1 scan codes.
+        case 0x68: scan = 0x64; return true;  // F13
+        case 0x69: scan = 0x65; return true;
+        case 0x6A: scan = 0x66; return true;
+        case 0x6B: scan = 0x67; return true;
+        case 0x6C: scan = 0x68; return true;
+        case 0x6D: scan = 0x69; return true;
+        case 0x6E: scan = 0x6A; return true;
+        case 0x6F: scan = 0x6B; return true;
+        case 0x70: scan = 0x6C; return true;
+        case 0x71: scan = 0x6D; return true;
+        case 0x72: scan = 0x6E; return true;
+        case 0x73: scan = 0x76; return true;  // F24
+        case 0x85: scan = 0x7E; return true;  // Keypad comma
+        case 0x87: scan = 0x73; return true;  // International 1 (Ro)
+        case 0x89: scan = 0x7D; return true;  // International 3 (Yen)
+        case 0x8A: scan = 0x79; return true;  // Convert
+        case 0x8B: scan = 0x7B; return true;  // Non-convert
 
         // Modifiers.
         case 0xE0: scan = 0x1D; return true;                   // Left Ctrl
@@ -221,15 +237,31 @@ uint16_t lock_bit_for_usage(uint16_t usage) {
 }
 
 bool system_lock_state(uint16_t bit) {
-    // GetAsyncKeyState, not GetKeyState: the injection thread has no message
-    // loop, and the thread-local state GetKeyState reports only advances when
-    // messages are dispatched. The low bit is the lock's toggle state here.
+    // GetKeyState's low bit is the toggle state. GetAsyncKeyState's low bit
+    // means "pressed since a previous query", which is not a lock state.
     switch (bit) {
-        case kLockCaps: return (GetAsyncKeyState(VK_CAPITAL) & 0x0001) != 0;
-        case kLockNum: return (GetAsyncKeyState(VK_NUMLOCK) & 0x0001) != 0;
-        case kLockScroll: return (GetAsyncKeyState(VK_SCROLL) & 0x0001) != 0;
+        case kLockCaps: return (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+        case kLockNum: return (GetKeyState(VK_NUMLOCK) & 0x0001) != 0;
+        case kLockScroll: return (GetKeyState(VK_SCROLL) & 0x0001) != 0;
         default: return false;
     }
+}
+
+bool read_system_locks(uint16_t& locks) {
+    // This worker has no window receiving keyboard messages. Read the state
+    // of the foreground input queue rather than its stale thread snapshot.
+    const DWORD foreground = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    const DWORD current = GetCurrentThreadId();
+    if (foreground == 0) return false;
+    MSG message{};
+    PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    const bool attach = foreground != current;
+    if (attach && !AttachThreadInput(current, foreground, TRUE)) return false;
+    locks = (system_lock_state(kLockCaps) ? kLockCaps : 0) |
+            (system_lock_state(kLockNum) ? kLockNum : 0) |
+            (system_lock_state(kLockScroll) ? kLockScroll : 0);
+    if (attach) AttachThreadInput(current, foreground, FALSE);
+    return true;
 }
 
 // Touch contacts (and synthetic pointers for the pen) live in screen
@@ -249,6 +281,38 @@ bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended) {
     return lookup(hid_usage, scan_code, extended);
 }
 
+uint16_t windows_key_to_hid(uint32_t vk, uint32_t scan, bool extended) {
+    if (vk == VK_PAUSE) return 0x48;
+    if (vk == VK_NUMLOCK) return 0x53;
+    // Windows' AltGr companion is not a real left Ctrl.
+    if (scan == 0x021D) return 0;
+    for (uint16_t usage = 1; usage <= 0xE7; ++usage) {
+        uint16_t candidate = 0;
+        bool candidate_extended = false;
+        if (lookup(usage, candidate, candidate_extended) && candidate == scan &&
+            candidate_extended == extended) return usage;
+    }
+    return 0;
+}
+
+bool make_keyboard_input(uint16_t usage, bool down, INPUT& input) {
+    input = INPUT{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.dwExtraInfo = kInputInjectionTag;
+    if (usage == 0x48) {
+        input.ki.wVk = VK_PAUSE;
+    } else {
+        uint16_t scan = 0;
+        bool extended = false;
+        if (!lookup(usage, scan, extended)) return false;
+        input.ki.wScan = scan;
+        input.ki.dwFlags = KEYEVENTF_SCANCODE |
+                              (extended ? KEYEVENTF_EXTENDEDKEY : 0);
+    }
+    if (!down) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    return true;
+}
+
 uint16_t modifier_bit_for_usage(uint16_t hid_usage) {
     if (hid_usage >= 0xE0 && hid_usage <= 0xE7) {
         return static_cast<uint16_t>(1u << (hid_usage - 0xE0));
@@ -256,9 +320,11 @@ uint16_t modifier_bit_for_usage(uint16_t hid_usage) {
     return 0;
 }
 
-std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* error) {
+std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* error,
+    std::function<void(const INPUT&)> dry_run_observer) {
     std::unique_ptr<InputInjector> injector(new InputInjector());
     injector->dry_run_ = dry_run;
+    injector->dry_run_observer_ = std::move(dry_run_observer);
     try {
         injector->thread_ = std::thread(&InputInjector::run, injector.get());
     } catch (const std::exception& e) {
@@ -269,14 +335,17 @@ std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* 
 }
 
 UINT InputInjector::send(const INPUT& input) {
+    INPUT tagged = input;
+    if (tagged.type == INPUT_KEYBOARD) tagged.ki.dwExtraInfo = kInputInjectionTag;
     // A dry run stops at the OS boundary: everything above it (mapping,
     // coordinate conversion, held-key tracking) runs exactly as it does for a
     // real event, so a loopback check covers all of our code and none of the
     // desktop's.
     if (dry_run_) {
+        if (dry_run_observer_) dry_run_observer_(tagged);
         return 1u;
     }
-    const UINT inserted = SendInput(1, const_cast<INPUT*>(&input), sizeof(input));
+    const UINT inserted = SendInput(1, &tagged, sizeof(tagged));
     if (inserted == 0) {
         // The desktop can change between the check in run() and this call;
         // SendInput then drops the event. Look again before the next one.
@@ -370,8 +439,15 @@ void InputInjector::submit_text(const std::string& text) {
 void InputInjector::release_held() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_ || queue_.size() >= 1024) {
+        if (stopping_) {
             return;
+        }
+        // A release barrier must survive saturation; discard unsent work,
+        // then release everything that actually reached the desktop.
+        if (queue_.size() >= 1024) {
+            std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+            stats_.dropped += queue_.size();
+            queue_.clear();
         }
         Pending pending;
         pending.release = true;
@@ -405,7 +481,8 @@ InputStats InputInjector::stats() const {
 void InputInjector::run() {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
-        cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+        cv_.wait_for(lock, std::chrono::seconds(10),
+                     [this] { return stopping_ || !queue_.empty(); });
         std::deque<Pending> batch;
         batch.swap(queue_);
         if (!batch.empty()) {
@@ -424,6 +501,14 @@ void InputInjector::run() {
             }
             lock.lock();
         }
+        lock.unlock();
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<uint16_t> expired;
+        for (const HeldKey& held : held_keys_) {
+            if (now - held.last_down >= std::chrono::minutes(6)) expired.push_back(held.usage);
+        }
+        for (const uint16_t usage : expired) apply_key({KeyAction::Up, usage});
+        lock.lock();
         if (stopping_ && queue_.empty()) {
             break;
         }
@@ -433,15 +518,9 @@ void InputInjector::run() {
 }
 
 void InputInjector::apply(const InputEvent& event) {
-    uint16_t locks = static_cast<uint16_t>(event.modifiers & kLockStateMask);
-    if (event.kind == InputKind::Key) {
-        // A lock key toggles the host by itself; reconciling that same bit
-        // first would tap it twice.
-        locks = static_cast<uint16_t>(locks & ~lock_bit_for_usage(event.key.hid_usage));
-    }
-    sync_locks(locks);
-
-    const uint16_t reported = normalize_modifiers(event.modifiers);
+    // The native viewer filters AltGr's synthetic Ctrl by scan code. Folding
+    // a Ctrl+RightAlt bitmap here would also destroy a real two-key chord.
+    const uint16_t reported = event.modifiers & kModifierMask;
     if (event.kind == InputKind::Key) {
         const uint16_t own = modifier_bit_for_usage(event.key.hid_usage);
         if (own != 0) {
@@ -459,9 +538,31 @@ void InputInjector::apply(const InputEvent& event) {
         case InputKind::Mouse:
             apply_mouse(event.mouse);
             break;
-        case InputKind::Key:
+        case InputKind::Key: {
+            // Like RustDesk Map, reconcile LEDs only for affected keys, then
+            // restore the host's state. Never toggle locks during a Win/Alt
+            // chord or mouse drag, and never synchronize a lock with itself.
+            const uint16_t usage = event.key.hid_usage;
+            INPUT mapped{};
+            uint16_t mask = 0;
+            if (lock_bit_for_usage(usage) == 0 && usage != 0x28 && usage != 0x2B &&
+                make_keyboard_input(usage, true, mapped)) {
+                // Caps affects punctuation/digits on some layouts too.
+                mask = kLockCaps;
+                if ((usage >= 0x54 && usage <= 0x63) || usage == 0x67 || usage == 0x85) {
+                    mask |= kLockNum;
+                }
+            }
+            if (!dry_run_ && (mask != 0 || lock_bit_for_usage(usage) != 0)) {
+                // Refresh for every affected key, including changes made by
+                // someone at the host keyboard between remote events.
+                locks_seeded_ = read_system_locks(host_locks_);
+            }
+            const uint16_t changed = sync_locks(event.modifiers, mask);
             apply_key(event.key);
+            sync_locks(static_cast<uint16_t>(event.modifiers ^ changed), changed);
             break;
+        }
         case InputKind::Touch:
             apply_touch(event.touch);
             break;
@@ -488,47 +589,25 @@ void InputInjector::apply(const InputEvent& event) {
     }
 }
 
-uint16_t InputInjector::normalize_modifiers(uint16_t reported) {
-    reported &= kModifierMask;
-    if ((reported & kModifierRightAlt) != 0) {
-        if ((reported & kModifierLeftCtrl) != 0) {
-            // Windows turns AltGr into a synthetic left Ctrl plus Right Alt.
-            // Right Alt already means AltGr on the host, so fold the pair and
-            // remember the Ctrl was synthetic until the peer stops reporting
-            // it; otherwise releasing AltGr would press a stray Ctrl.
-            altgr_synthetic_ctrl_ = true;
-            reported &= static_cast<uint16_t>(~kModifierLeftCtrl);
-        }
-    } else if (altgr_synthetic_ctrl_) {
-        if ((reported & kModifierLeftCtrl) != 0) {
-            reported &= static_cast<uint16_t>(~kModifierLeftCtrl);
-        } else {
-            altgr_synthetic_ctrl_ = false;
-        }
-    }
-    return reported;
-}
-
 bool InputInjector::lock_state(uint16_t bit) {
     if (!locks_seeded_) {
         locks_seeded_ = true;
         if (!dry_run_) {
             // A dry run must not read the real desktop either: SendInput never
             // flips it, so a model seeded at zero stays deterministic.
-            host_locks_ = 0;
-            if (system_lock_state(kLockCaps)) host_locks_ |= kLockCaps;
-            if (system_lock_state(kLockNum)) host_locks_ |= kLockNum;
-            if (system_lock_state(kLockScroll)) host_locks_ |= kLockScroll;
+            locks_seeded_ = read_system_locks(host_locks_);
         }
     }
     return (host_locks_ & bit) != 0;
 }
 
-void InputInjector::sync_locks(uint16_t reported) {
+uint16_t InputInjector::sync_locks(uint16_t reported, uint16_t mask) {
     reported &= kLockStateMask;
+    uint16_t changed = 0;
     const uint16_t bits[] = {kLockCaps, kLockNum, kLockScroll};
     for (uint16_t bit : bits) {
-        if (((reported & bit) != 0) == lock_state(bit)) {
+        if ((mask & bit) == 0 || ((reported & bit) != 0) == lock_state(bit) ||
+            (!dry_run_ && !locks_seeded_)) {
             continue;
         }
         // A lock key is a toggle: one tap, with the release immediately after.
@@ -540,9 +619,11 @@ void InputInjector::sync_locks(uint16_t reported) {
         apply_key(tap);
         tap.action = KeyAction::Up;
         apply_key(tap);
+        if (((reported & bit) != 0) == lock_state(bit)) changed |= bit;
         std::lock_guard<std::mutex> lock(stats_mutex_);
         ++stats_.lock_toggles;
     }
+    return changed;
 }
 
 void InputInjector::sync_modifiers(uint16_t reported) {
@@ -1043,52 +1124,43 @@ void InputInjector::release_pen() {
 }
 
 void InputInjector::apply_key(const KeyEvent& event) {
-    uint16_t scan = 0;
-    bool extended = false;
-    if (!lookup(event.hid_usage, scan, extended)) {
+    INPUT input{};
+    const bool pressed = event.action == KeyAction::Down;
+    if (!make_keyboard_input(event.hid_usage, pressed, input)) {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         ++stats_.rejected;
         return;
     }
 
-    INPUT input{};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wScan = scan;
-    input.ki.dwFlags = KEYEVENTF_SCANCODE;
-    if (extended) {
-        input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-    }
-    if (event.action == KeyAction::Up) {
-        input.ki.dwFlags |= KEYEVENTF_KEYUP;
-    }
-
-    const bool pressed = event.action == KeyAction::Down;
-    const auto matches = [scan, extended](const HeldKey& held) {
-        return held.scan == scan && held.extended == extended;
+    const auto matches = [&event](const HeldKey& held) {
+        return held.usage == event.hid_usage;
     };
     const auto found = std::find_if(held_keys_.begin(), held_keys_.end(), matches);
+    const UINT inserted = send(input);
+    if (inserted != 1) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.failed;
+        return;
+    }
     if (pressed) {
         // Auto-repeat arrives as repeated Downs. Only the first press belongs
         // in the held set; otherwise a single Up would leave the key stuck.
         if (found == held_keys_.end()) {
-            held_keys_.push_back(HeldKey{scan, extended, event.hid_usage});
+            held_keys_.push_back(HeldKey{event.hid_usage, std::chrono::steady_clock::now()});
             // Whether the tap came from the peer or from sync_locks(), the
             // host's lock state just changed under us.
             if (const uint16_t lock = lock_bit_for_usage(event.hid_usage); lock != 0) {
                 host_locks_ ^= lock;
             }
+        } else {
+            found->last_down = std::chrono::steady_clock::now();
         }
     } else if (found != held_keys_.end()) {
         held_keys_.erase(found);
     }
 
-    const UINT inserted = send(input);
     std::lock_guard<std::mutex> lock(stats_mutex_);
-    if (inserted == 1) {
-        ++stats_.applied;
-    } else {
-        ++stats_.failed;
-    }
+    ++stats_.applied;
 }
 
 void InputInjector::apply_text(const std::string& text) {
@@ -1201,12 +1273,7 @@ void InputInjector::release_all() {
         const HeldKey held = held_keys_.back();
         held_keys_.pop_back();
         INPUT input{};
-        input.type = INPUT_KEYBOARD;
-        input.ki.wScan = held.scan;
-        input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-        if (held.extended) {
-            input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-        }
+        make_keyboard_input(held.usage, false, input);
         const UINT inserted = send(input);
         std::lock_guard<std::mutex> lock(stats_mutex_);
         if (inserted == 1) {

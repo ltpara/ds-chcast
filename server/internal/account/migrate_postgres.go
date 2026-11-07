@@ -8,9 +8,8 @@ import (
 )
 
 // accountPostgresMigrations keeps PostgreSQL version numbers aligned with the
-// SQLite list. PostgreSQL support starts at the current schema, so only the
-// last entry creates tables; earlier entries mark the versions that the
-// baseline already contains. New migrations must be appended to both lists.
+// SQLite list. PostgreSQL started at v8; keep that baseline at v8 so later
+// migrations also run when upgrading an existing PostgreSQL database.
 var accountPostgresMigrations = func() []schemamig.Migration {
 	list := make([]schemamig.Migration, len(accountMigrations))
 	for i, migration := range accountMigrations {
@@ -20,11 +19,25 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 			Apply:   func(*sql.DB) error { return nil },
 		}
 	}
-	list[len(list)-1].Apply = applyAccountPostgresBaseline
+	list[7].Apply = applyAccountPostgresBaseline
+	list[8].Apply = applyHostAuditIdentityPostgres
 	return list
 }()
 
-// applyAccountPostgresBaseline creates the current account schema in an empty
+func applyHostAuditIdentityPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS host_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS event_key TEXT NOT NULL DEFAULT ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS audit_events_key ON audit_events(event_key) WHERE event_key <> ''`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("migrate PostgreSQL host audit: %w", err)
+		}
+	}
+	return nil
+}
+
+// applyAccountPostgresBaseline creates the v8 account schema in an empty
 // PostgreSQL database. Case-insensitive columns use a non-deterministic ICU
 // collation so '=' and ORDER BY keep the SQLite NOCASE semantics without
 // rewriting every query.

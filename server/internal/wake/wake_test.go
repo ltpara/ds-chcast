@@ -12,22 +12,22 @@ func TestRequestCooldown(t *testing.T) {
 	now := time.Unix(1000, 0)
 	broker := New(time.Minute, 30*time.Second, 8)
 	broker.SetClock(func() time.Time { return now })
-	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}); err != nil {
+	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy"}); err != nil {
 		t.Fatal(err)
 	}
-	_, wait, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink})
+	_, wait, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy"})
 	if !errors.Is(err, ErrCooldown) || wait != 30*time.Second {
 		t.Fatalf("second request = %v after %v", err, wait)
 	}
 	now = now.Add(31 * time.Second)
-	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}); err != nil {
+	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy"}); err != nil {
 		t.Fatalf("request after cooldown: %v", err)
 	}
 }
 
 func TestPendingForRetriesUntilExpiry(t *testing.T) {
 	broker := New(time.Minute, 30*time.Second, 8)
-	job, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink})
+	job, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy-a", "proxy-b", "target"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestPendingForRetriesUntilExpiry(t *testing.T) {
 
 func TestPendingForRequiresRelayAndSharedLink(t *testing.T) {
 	broker := New(time.Minute, 30*time.Second, 8)
-	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}); err != nil {
+	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy", "plain", "far"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := broker.PendingFor("plain", false, []string{testLink}); len(got) != 0 {
@@ -74,7 +74,7 @@ func TestJobsExpire(t *testing.T) {
 	now := time.Unix(2000, 0)
 	broker := New(time.Minute, 30*time.Second, 8)
 	broker.SetClock(func() time.Time { return now })
-	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}); err != nil {
+	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy"}); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(61 * time.Second)
@@ -88,10 +88,32 @@ func TestJobsExpire(t *testing.T) {
 
 func TestQueueFull(t *testing.T) {
 	broker := New(time.Minute, time.Second, 1)
-	if _, _, err := broker.Request("one", "AA:BB:CC:DD:EE:FF", []string{testLink}); err != nil {
+	if _, _, err := broker.Request("one", "AA:BB:CC:DD:EE:FF", []string{testLink}, []string{"proxy"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := broker.Request("two", "AA:BB:CC:DD:EE:01", []string{testLink}); !errors.Is(err, ErrQueueFull) {
+	if _, _, err := broker.Request("two", "AA:BB:CC:DD:EE:01", []string{testLink}, []string{"proxy"}); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("second target error = %v", err)
+	}
+}
+
+func TestPendingForRequiresExplicitAuthorization(t *testing.T) {
+	broker := New(time.Minute, time.Second, 8)
+	relays := []string{"trusted"}
+	if _, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink}, relays); err != nil {
+		t.Fatal(err)
+	}
+	// Mutating the caller's policy slice must not change a queued job's scope.
+	relays[0] = "unrelated"
+	if got := broker.PendingFor("unrelated", true, []string{testLink}); len(got) != 0 {
+		t.Fatalf("unrelated relay on the same private subnet received %+v", got)
+	}
+	if got := broker.PendingFor("trusted", true, []string{testLink}); len(got) != 1 {
+		t.Fatalf("authorized relay received %+v", got)
+	}
+	if _, _, err := broker.Request("unconfigured", "AA:BB:CC:DD:EE:01", []string{testLink}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := broker.PendingFor("trusted", true, []string{testLink}); len(got) != 1 || got[0].Target != "target" {
+		t.Fatalf("a job without authorized relays was delivered: %+v", got)
 	}
 }

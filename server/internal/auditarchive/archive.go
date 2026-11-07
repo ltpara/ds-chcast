@@ -976,6 +976,7 @@ type auditLine struct {
 	ClientIP  string `json:"client_ip"`
 	Location  string `json:"location"`
 	Success   bool   `json:"success"`
+	HostID    string `json:"host_id,omitempty"`
 }
 
 type connectionLine struct {
@@ -1034,6 +1035,7 @@ func (a *Archiver) readAudit(afterID int64, limit int) ([]record, error) {
 			ClientIP:  event.ClientIP,
 			Location:  event.Location,
 			Success:   event.Success,
+			HostID:    event.HostID,
 		})
 		if err != nil {
 			return nil, err

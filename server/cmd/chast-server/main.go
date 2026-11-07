@@ -147,6 +147,7 @@ func run() error {
 		proxyHeader      = flag.String("proxy-header", "", "header carrying the client IP behind a trusted proxy, e.g. X-Forwarded-For")
 		geoIPFile        = flag.String("geoip-file", "", "CIDR-to-location table used to label login IPs; empty records IPs only")
 		relayOnly        = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
+		wakeRelayPolicy  = flag.String("wake-relay-policy", "", "JSON file mapping wake target IDs to authorized relay IDs; empty disables relayed wake")
 		adminListen      = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
 		adminToken       = flag.String("admin-token", "", "secret the admin console requires; empty generates and logs one at startup")
 
@@ -206,6 +207,10 @@ func run() error {
 		return err
 	}
 	*serverKey = key
+	wakeRelays, err := loadWakeRelayPolicy(*wakeRelayPolicy)
+	if err != nil {
+		return fmt.Errorf("--wake-relay-policy: %w", err)
+	}
 	softwareVersion := strings.TrimSpace(*softwareVer)
 	softwareDownload := strings.TrimSpace(*softwareURL)
 	if (softwareVersion == "") != (softwareDownload == "") {
@@ -322,6 +327,12 @@ func run() error {
 	defer logSink.Close()
 	if key == "" {
 		log.Warn("running without a server key: the HTTP API is loopback-only and the other listeners accept unauthenticated hosts", "http_listen", *httpListen)
+	}
+	if targets, relays := wakeRelayPolicyCounts(wakeRelays); targets == 0 {
+		log.Info("cross-subnet wake relay has no authorized targets; /v1/hosts/{id}/wake returns 409", "policy", *wakeRelayPolicy)
+	} else {
+		log.Info("cross-subnet wake relay targets authorized",
+			"targets", targets, "relays", relays, "policy", *wakeRelayPolicy)
 	}
 	if softwareName == "" && softwareDownload != "" {
 		if name, _ := software.HostedName(softwareDownload); name != "" {
@@ -990,6 +1001,7 @@ func run() error {
 		PunchAddrV6:   punchAddrV6,
 		RelayHost:     advertised,
 		ServerKey:     *serverKey,
+		WakeRelays:    wakeRelays,
 		TTL:           *hostTTL,
 		RelayOnly:     relayOnlyFlag,
 		Blocker:       blocker,

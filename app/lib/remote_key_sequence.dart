@@ -22,12 +22,14 @@ List<RemoteKeyEvent> buildRemoteChord(
   final List<RemoteKeyEvent> events = <RemoteKeyEvent>[];
   int bits = baseModifiers;
   for (final int usage in modifierUsages) {
+    if (baseModifiers & _modifierBit(usage) != 0) continue;
     bits |= _modifierBit(usage);
     events.add(RemoteKeyEvent(usage, true, bits));
   }
   events.add(RemoteKeyEvent(keyUsage, true, bits));
   events.add(RemoteKeyEvent(keyUsage, false, bits));
   for (final int usage in modifierUsages.reversed) {
+    if (baseModifiers & _modifierBit(usage) != 0) continue;
     bits &= ~_modifierBit(usage);
     events.add(RemoteKeyEvent(usage, false, bits));
   }
@@ -37,6 +39,7 @@ List<RemoteKeyEvent> buildRemoteChord(
 /// A Win tap. Win is a modifier itself, so the key-up clears its own bitmap
 /// bit instead of leaving a phantom gui-down behind.
 List<RemoteKeyEvent> buildRemoteWinTap(int baseModifiers, int guiBit) {
+  if (baseModifiers & guiBit != 0) return <RemoteKeyEvent>[];
   final int downBits = baseModifiers | guiBit;
   return <RemoteKeyEvent>[
     RemoteKeyEvent(kHidLeftGui, true, downBits),

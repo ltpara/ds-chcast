@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 8
+const accountSchemaVersion = 9
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -22,6 +22,18 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 6, Name: "oidc identities", Apply: applyOIDCIdentities},
 	{Version: 7, Name: "account groups", Apply: applyAccountGroups},
 	{Version: 8, Name: "audit location and route", Apply: applyAuditLocationRoute},
+	{Version: 9, Name: "host audit identity and deduplication", Apply: applyHostAuditIdentity},
+}
+
+func applyHostAuditIdentity(db *sql.DB) error {
+	for _, name := range []string{"host_id", "event_key"} {
+		if err := ensureColumn(db, "audit_events", name, name+" TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate audit_events.%s: %w", name, err)
+		}
+	}
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS audit_events_key
+		ON audit_events(event_key) WHERE event_key <> ''`)
+	return err
 }
 
 // applyAuditLocationRoute records where a session signed in and which path it

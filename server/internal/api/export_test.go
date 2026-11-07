@@ -250,7 +250,7 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 
 	rows := exportCSV(t, s.URL+"/v1/audit?format=csv&action=export_probe")
 	if want := []string{"id", "created_at", "username", "action", "detail",
-		"client_ip", "location", "success"}; !slices.Equal(rows[0], want) {
+		"client_ip", "location", "success", "host_id"}; !slices.Equal(rows[0], want) {
 		t.Fatalf("audit header = %v, want %v", rows[0], want)
 	}
 	if len(rows) != 3 {

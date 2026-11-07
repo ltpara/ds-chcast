@@ -74,6 +74,9 @@ type Config struct {
 	// the shared carrier, but never punch. The admin console flips it at
 	// runtime, so lookups read the current value instead of a startup copy.
 	RelayOnly *atomic.Bool
+	// WakeRelays maps target IDs to operator-approved relay IDs. Missing or
+	// empty entries disable server-relayed wake for that target.
+	WakeRelays map[string][]string
 	// Blocker throttles registration attempts per IP. Nil disables it.
 	Blocker *abuse.Blocker
 	// PunchLog backs the admin punch-request listing; nil disables exposure.

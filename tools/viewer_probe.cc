@@ -510,7 +510,7 @@ std::unique_ptr<chast::HostServer> start_host(
     config.serve_once = true;
     config.keyframe_interval_ms = 500;
     // Loopback acceptance must not read or write the operator's clipboard.
-    config.clipboard_read = [](chast::ClipboardContent&) { return false; };
+    config.clipboard_read = [](chast::ClipboardContent&) { return true; };
     config.clipboard_write = [](const chast::ClipboardContent&) { return true; };
     // A viewer's clipboard list must never reach the real CF_HDROP here; the
     // scenario captures it instead, and everything else acknowledges silently.
@@ -1617,6 +1617,8 @@ int main(int argc, char** argv) {
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
                 engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+                engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
                                    kPassword, {}, {}, false,
                                    chast_viewer::ViewerTransport::kAuto, {}, 0, {}, {},
@@ -1624,10 +1626,7 @@ int main(int argc, char** argv) {
                     error = "ViewerEngine::Start was refused";
                     engine.reset();
                 } else {
-                    // The probe never touches the operator's clipboard.
-                    engine->SetClipboardFileSource([](std::vector<std::string>&) {
-                        return false;
-                    });
+
                 }
             }
             if (engine && file_transfer_denied) {
@@ -1748,23 +1747,20 @@ int main(int argc, char** argv) {
                      utf8(clipboard_source / from_utf8(clip.folder_name))},
                     ready);
             }
-            ClipboardCapture capture;
+            auto capture = std::make_shared<ClipboardCapture>();
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
                 engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+                engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
+                engine->SetClipboardFileSink(
+                    [capture](const std::vector<std::string>& files) {
+                        return capture->sink(files);
+                    });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
                                    kPassword)) {
                     error = "ViewerEngine::Start was refused";
                     engine.reset();
-                } else {
-                    engine->SetClipboardFileSink(
-                        [&capture](const std::vector<std::string>& files) {
-                            return capture.sink(files);
-                        });
-                    // The probe never touches the operator's clipboard.
-                    engine->SetClipboardFileSource([](std::vector<std::string>&) {
-                        return false;
-                    });
                 }
             }
             if (engine && wait_streaming(*engine, 20s, &error)) {
@@ -1773,11 +1769,11 @@ int main(int argc, char** argv) {
                 } else {
                     // The copy happens now, after the session's empty baseline.
                     ready->store(true);
-                    if (!capture.wait(30s)) {
+                    if (!capture->wait(30s)) {
                         error = "the clipboard files never reached the viewer";
                     } else {
                         std::string staging;
-                        if (!check_clipboard_files(capture.paths, clip, &staging, &error)) {
+                        if (!check_clipboard_files(capture->paths, clip, &staging, &error)) {
                             // error already set
                         } else if (!wait_clipboard_received(*engine, 5s)) {
                             error = "the viewer did not count the clipboard item";
@@ -1840,7 +1836,7 @@ int main(int argc, char** argv) {
                 utf8(clipboard_source / from_utf8(clip.folder_name))};
             const uint16_t port = pick_free_port();
             ProbeSink sink;
-            ClipboardCapture host_clipboard;
+            auto host_clipboard = std::make_shared<ClipboardCapture>();
             std::unique_ptr<chast::HostServer> host;
             if (!seed_clipboard(clipboard_source, clip, &error)) {
                 // keep the error
@@ -1851,31 +1847,32 @@ int main(int argc, char** argv) {
             } else {
                 host = start_host(
                     utf8(share), port, &error, true, {}, nullptr,
-                    [&host_clipboard](const std::vector<std::string>& files) {
-                        return host_clipboard.sink(files);
+                    [host_clipboard](const std::vector<std::string>& files) {
+                        return host_clipboard->sink(files);
                     });
             }
-            ClipboardCapture viewer_clipboard;
+            auto viewer_clipboard = std::make_shared<ClipboardCapture>();
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
                 engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+                engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
+                engine->SetClipboardFileSource(
+                    [source_paths, ready](std::vector<std::string>& paths) {
+                        if (!ready->load()) {
+                            return false;
+                        }
+                        paths = source_paths;
+                        return true;
+                    });
+                engine->SetClipboardFileSink(
+                    [viewer_clipboard](const std::vector<std::string>& files) {
+                        return viewer_clipboard->sink(files);
+                    });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
                                    kPassword)) {
                     error = "ViewerEngine::Start was refused";
                     engine.reset();
-                } else {
-                    engine->SetClipboardFileSource(
-                        [source_paths, ready](std::vector<std::string>& paths) {
-                            if (!ready->load()) {
-                                return false;
-                            }
-                            paths = source_paths;
-                            return true;
-                        });
-                    engine->SetClipboardFileSink(
-                        [&viewer_clipboard](const std::vector<std::string>& files) {
-                            return viewer_clipboard.sink(files);
-                        });
                 }
             }
             std::string staging;
@@ -1888,9 +1885,9 @@ int main(int argc, char** argv) {
                     // copy appears.
                     std::this_thread::sleep_for(1000ms);
                     ready->store(true);
-                    if (!host_clipboard.wait(30s)) {
+                    if (!host_clipboard->wait(30s)) {
                         error = "the viewer's clipboard files never reached the host";
-                    } else if (!check_host_clipboard_files(host_clipboard.paths, clip, share,
+                    } else if (!check_host_clipboard_files(host_clipboard->paths, clip, share,
                                                            &staging, &error)) {
                         // error already set
                     } else {
@@ -1898,7 +1895,7 @@ int main(int argc, char** argv) {
                         // back to the viewer as a new clipboard item.
                         std::this_thread::sleep_for(1500ms);
                         const chast_viewer::ViewerStatus after = engine->Snapshot();
-                        if (viewer_clipboard.wait(0ms)) {
+                        if (viewer_clipboard->wait(0ms)) {
                             error = "the host's staged list was echoed back to the viewer";
                         } else if (after.clipboard_received != 0) {
                             error = "the viewer counted " +
@@ -1954,15 +1951,14 @@ int main(int argc, char** argv) {
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
                 engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+                engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
                                    kPassword)) {
                     error = "ViewerEngine::Start was refused";
                     engine.reset();
                 } else {
-                    // The probe never touches the operator's clipboard.
-                    engine->SetClipboardFileSource([](std::vector<std::string>&) {
-                        return false;
-                    });
+
                 }
             }
 

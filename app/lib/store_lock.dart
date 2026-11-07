@@ -39,7 +39,23 @@ Future<T> withStoreLock<T>(File? file, Future<T> Function() body) async {
   }
 }
 
-T withStoreLockSync<T>(File file, T Function() body) {
+/// [onFileError] is for optional UI preferences: loading can return defaults
+/// and saving can be skipped if the lock or file is unavailable. The body is
+/// never run without its lock. Other stores keep propagating failures.
+T withStoreLockSync<T>(
+  File file,
+  T Function() body, {
+  T Function()? onFileError,
+}) {
+  try {
+    return _withStoreLockSync(file, body);
+  } on FileSystemException {
+    if (onFileError != null) return onFileError();
+    rethrow;
+  }
+}
+
+T _withStoreLockSync<T>(File file, T Function() body) {
   final String key = file.absolute.path.toLowerCase();
   final Set<String> held =
       Zone.current[_heldStores] as Set<String>? ?? <String>{};
