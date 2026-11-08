@@ -7,6 +7,7 @@ import 'deep_link.dart';
 import 'l10n.dart';
 import 'pages/home_page.dart';
 import 'pages/session_page.dart';
+import 'pages/display_window_page.dart';
 import 'session_window.dart';
 import 'theme.dart';
 
@@ -17,6 +18,9 @@ void main(List<String> args) {
     ChastApp(
       initialConnection: parseLaunchArguments(args),
       sessionWindow: SessionWindowRequest.fromArguments(args),
+      displayWindow: args.length == 2 && args.first == '--display-window'
+          ? int.tryParse(args[1])
+          : null,
     ),
   );
   _markUpdateHealthy();
@@ -26,8 +30,8 @@ void main(List<String> args) {
 /// Writing it after the first frame means a release that crashes during startup
 /// is rolled back instead of leaving the viewer unusable.
 void _markUpdateHealthy() {
-  final String path =
-      (Platform.environment['CHAST_UPDATE_HEALTH_FILE'] ?? '').trim();
+  final String path = (Platform.environment['CHAST_UPDATE_HEALTH_FILE'] ?? '')
+      .trim();
   if (path.isEmpty) {
     return;
   }
@@ -42,7 +46,13 @@ void _markUpdateHealthy() {
 }
 
 class ChastApp extends StatelessWidget {
-  const ChastApp({super.key, this.initialConnection, this.sessionWindow});
+  const ChastApp({
+    super.key,
+    this.initialConnection,
+    this.sessionWindow,
+    this.displayWindow,
+  });
+  final int? displayWindow;
 
   final DeepLinkRequest? initialConnection;
 
@@ -60,16 +70,17 @@ class ChastApp extends StatelessWidget {
           debugShowCheckedModeBanner: false,
           locale: Locale(language),
           supportedLocales: const <Locale>[Locale('zh', 'CN'), Locale('en')],
-          localizationsDelegates:
-              const <LocalizationsDelegate<Object>>[
-                GlobalMaterialLocalizations.delegate,
-                GlobalWidgetsLocalizations.delegate,
-                GlobalCupertinoLocalizations.delegate,
-              ],
+          localizationsDelegates: const <LocalizationsDelegate<Object>>[
+            GlobalMaterialLocalizations.delegate,
+            GlobalWidgetsLocalizations.delegate,
+            GlobalCupertinoLocalizations.delegate,
+          ],
           theme: buildChastTheme(Brightness.light),
           darkTheme: buildChastTheme(Brightness.dark),
           themeMode: ThemeMode.system,
-          home: sessionWindow != null
+          home: displayWindow != null
+              ? DisplayWindowPage(streamId: displayWindow!)
+              : sessionWindow != null
               ? SessionPage(
                   target: sessionWindow!.target,
                   account: sessionWindow!.account,

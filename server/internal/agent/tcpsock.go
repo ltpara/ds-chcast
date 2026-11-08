@@ -27,10 +27,10 @@ func tcpListenReuse(addr *net.TCPAddr) (net.Listener, error) {
 	return lc.Listen(context.Background(), "tcp", addr.String())
 }
 
-func tcpDialReuse(local, remote *net.TCPAddr, timeout time.Duration) (net.Conn, error) {
+func tcpDialReuseContext(ctx context.Context, local, remote *net.TCPAddr, timeout time.Duration) (net.Conn, error) {
 	d := net.Dialer{Timeout: timeout, Control: tcpReuseControl}
 	if local != nil {
 		d.LocalAddr = local
 	}
-	return d.Dial("tcp", remote.String())
+	return d.DialContext(ctx, "tcp", remote.String())
 }

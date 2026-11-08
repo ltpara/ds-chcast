@@ -48,7 +48,8 @@ target_include_directories(chast.base PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 # supplies PBKDF2/HMAC/ECDSA, crypt32 the data-protection API; neither has a
 # dependency on the capture or network stacks.
 add_library(chast.security STATIC
-    src/security/security.cc)
+    src/security/security.cc
+    src/win/user_context.cc)
 target_include_directories(chast.security PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(chast.security PUBLIC chast.base bcrypt crypt32)
 
@@ -64,6 +65,7 @@ add_library(chast.dxgi STATIC
     src/capture/nv12_pass.cc
     src/capture/cursor.cc
     src/capture/dxgi_capturer.cc
+    src/capture/gdi_capturer.cc
     src/capture/shared_capturer.cc
     src/capture/merged_capturer.cc)
 
@@ -98,6 +100,39 @@ if(DEFINED OPUS_ROOT)
 endif()
 find_package(Opus CONFIG REQUIRED)
 
+# OpenH264 software fallback. Use the static-library/dynamic-CRT triplet so it
+# matches the MSVC runtime used by the application. The vcpkg port exports
+# pkg-config metadata but no CMake package, so import it from the prefix.
+if(NOT DEFINED OPENH264_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static-md/include/wels/codec_api.h")
+    set(OPENH264_ROOT "D:/vcpkg/installed/x64-windows-static-md" CACHE PATH "OpenH264 install prefix")
+endif()
+if(NOT DEFINED OPENH264_ROOT OR
+   NOT EXISTS "${OPENH264_ROOT}/include/wels/codec_api.h" OR
+   NOT EXISTS "${OPENH264_ROOT}/lib/openh264.lib")
+    message(FATAL_ERROR "OpenH264 not found; set OPENH264_ROOT to an install prefix with include/wels and lib/openh264.lib")
+endif()
+add_library(OpenH264::openh264 STATIC IMPORTED)
+set_target_properties(OpenH264::openh264 PROPERTIES
+    IMPORTED_CONFIGURATIONS "RELEASE;DEBUG"
+    IMPORTED_LOCATION "${OPENH264_ROOT}/lib/openh264.lib"
+    IMPORTED_LOCATION_RELEASE "${OPENH264_ROOT}/lib/openh264.lib"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${OPENH264_ROOT}/lib/openh264.lib"
+    IMPORTED_LOCATION_MINSIZEREL "${OPENH264_ROOT}/lib/openh264.lib"
+    IMPORTED_LOCATION_DEBUG "${OPENH264_ROOT}/debug/lib/openh264.lib"
+    MAP_IMPORTED_CONFIG_PROFILE Release
+    INTERFACE_INCLUDE_DIRECTORIES "${OPENH264_ROOT}/include")
+
+# VP9 software encoding/decoding and direct full-chroma pixel conversion.
+if(NOT DEFINED VPX_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static-md/include/vpx/vpx_codec.h")
+    set(VPX_ROOT "D:/vcpkg/installed/x64-windows-static-md" CACHE PATH "libvpx and libyuv install prefix")
+endif()
+if(DEFINED VPX_ROOT)
+    list(PREPEND CMAKE_PREFIX_PATH "${VPX_ROOT}")
+endif()
+find_package(unofficial-libvpx CONFIG REQUIRED)
+find_package(libyuv CONFIG REQUIRED)
+set_target_properties(unofficial::libvpx::libvpx yuv PROPERTIES MAP_IMPORTED_CONFIG_PROFILE Release)
+
 # FFmpeg static build for hardware decoding. D3D11VA lives in libavutil and
 # libavcodec supplies the H.264/HEVC decoders; vcpkg's x64-windows-static
 # triplet ships both, so the receiver needs no FFmpeg DLLs at run time.
@@ -127,13 +162,17 @@ target_link_libraries(chast.ffmpeg PUBLIC
 add_library(chast.codec STATIC
     src/codec/encoder_factory.cc
     src/codec/ffmpeg_encoder.cc
+    src/codec/openh264_encoder.cc
+    src/codec/vpx_encoder.cc
+    src/codec/vpx_decoder.cc
     src/codec/vpl_encoder.cc
     src/codec/ffmpeg_decoder.cc)
 
 target_include_directories(chast.codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(chast.codec PRIVATE ONEVPL_EXPERIMENTAL)
-target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg)
+target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg OpenH264::openh264
+    unofficial::libvpx::libvpx yuv)
 
 # Audio: Opus on the wire, WASAPI loopback capture and render (host) plus
 # microphone capture (viewer). AAC-LC stays for older recordings and tests.
@@ -202,9 +241,11 @@ endif()
 add_library(chast.clipboard STATIC
     src/clipboard/clipboard.cc
     src/clipboard/clipboard_worker.cc
+    src/clipboard/clipboard_virtual.cc
+    src/clipboard/clipboard_local.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32)
+target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32 ole32 uuid shlwapi)
 
 # Receive-side file handling: name sanitizing, resumable .part files, digest
 # verification. The receiver side only; the viewer hashes what it sends through
@@ -218,6 +259,7 @@ target_link_libraries(chast.transfer PUBLIC chast.base chast.security shell32)
 # DXGI or VPL dependency, so the receiver side links this without the capture
 # stack.
 add_library(chast.net STATIC
+    src/net/clipboard_channel.cc
     src/net/carrier.cc
     src/net/identity.cc
     src/net/port_forward_client.cc
@@ -239,10 +281,15 @@ target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard
 # the other.
 add_library(chast.host STATIC
     src/capture/camera.cc
+    src/capture/camera_capturer.cc
     src/host/audit_spool.cc
     src/host/bitrate_controller.cc
     src/host/camera_relay.cc
     src/host/display_privacy.cc
+    src/host/desktop_stream.cc
+    src/host/stream_recorder.cc
+    src/host/video_qos.cc
+    src/host/shared_loopback.cc
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc
@@ -251,10 +298,13 @@ add_library(chast.host STATIC
     src/host/virtual_display.cc
     src/win/display_privacy.cc
     src/win/privacy.cc
+    src/win/power_request.cc
     src/win/sas.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+target_link_libraries(chast.host PUBLIC "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
 # Media Foundation supplies camera enumeration and capture; mf holds the
 # device-source helpers and mfuuid the format GUIDs. SetupAPI and CfgMgr
 # identify virtual display adapters and their monitor children.
@@ -268,17 +318,22 @@ add_library(chast.host.tray STATIC
     host/i18n.cc
     host/i18n_en.cc
     host/platform.cc
+    host/elevation_handoff.cc
     host/tunnel.cc
     host/service.cc
+    host/service_control.cc
+    host/service_manager_startup.cc
+    host/windows_sessions.cc
+    host/service_settings.cc
     host/service_log.cc)
 target_include_directories(chast.host.tray PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/host)
-target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi32)
+target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi32 userenv)
 
 # Notification-area host application. It is product code, so it is built even
 # when the test tools are switched off.
-add_executable(chast-host WIN32 host/main.cc)
+add_executable(chast-host WIN32 host/main.cc host/connections.cc host/service_manager.cc)
 target_link_libraries(chast-host PRIVATE chast.host.tray comctl32 comdlg32)
 
 # Crash-safe physical-display restoration helper. It receives only inherited
@@ -334,8 +389,7 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-capture tools/capture.cc tools/crash_handler.cc)
     target_link_libraries(chast-capture PRIVATE chast.dxgi dbghelp)
 
-    # Capture -> NV12 -> oneVPL encode, writing an elementary stream: the
-    # end-to-end proof that no frame leaves the GPU on the way to the encoder.
+    # Capture -> NV12 -> hardware or software encode -> elementary stream.
     add_executable(chast-encode tools/encode.cc tools/crash_handler.cc)
     target_link_libraries(chast-encode PRIVATE chast.codec dbghelp)
 
@@ -371,7 +425,7 @@ if(CHAST_BUILD_TESTS)
     # ViewerStatus, so the real engine and a real HostServer run in one
     # process here to exercise the shared-folder walk over loopback QUIC.
     add_executable(chast-viewer-probe tools/viewer_probe.cc
-        app/windows/viewer/viewer_engine.cc)
+        app/windows/viewer/viewer_engine.cc app/windows/viewer/display_video_receiver.cc)
     target_include_directories(chast-viewer-probe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer
         ${CMAKE_CURRENT_SOURCE_DIR}/tools)
@@ -419,9 +473,9 @@ if(CHAST_BUILD_TESTS)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
     add_executable(chast-keyboard-test tests/keyboard_test.cc
-        app/windows/viewer/keyboard_capture.cc)
+        app/windows/viewer/keyboard_capture.cc app/windows/viewer/local_text_input.cc)
     target_include_directories(chast-keyboard-test PRIVATE app/windows/viewer)
-    target_link_libraries(chast-keyboard-test PRIVATE chast.net)
+    target_link_libraries(chast-keyboard-test PRIVATE chast.net imm32)
 
     # Deterministic mutation coverage for every control parser, the stream
     # header decoders and the three reassembly parsers. Seeds are real maker
@@ -442,7 +496,7 @@ if(CHAST_BUILD_TESTS)
 
     # Settings file round-trip: no GPU, no network, no certificate store.
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
-    target_link_libraries(chast-host-settings-test PRIVATE chast.host)
+    target_link_libraries(chast-host-settings-test PRIVATE chast.host.tray)
 
     # JSONL records for the service and worker: timestamp shape, escaping,
     # invalid-UTF-8 replacement, rotation and concurrent appends.
@@ -456,7 +510,19 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-multi-test tests/host_multi_test.cc)
     target_link_libraries(chast-host-multi-test PRIVATE chast.host)
     add_executable(chast-host-parity-test tests/host_parity_test.cc)
-    target_link_libraries(chast-host-parity-test PRIVATE chast.host)
+    target_link_libraries(chast-host-parity-test PRIVATE chast.host.tray)
+    add_executable(chast-desktop-stream-test tests/desktop_stream_test.cc)
+    target_link_libraries(chast-desktop-stream-test PRIVATE chast.host)
+    add_executable(chast-display-subscription-test tests/display_subscription_test.cc)
+    target_link_libraries(chast-display-subscription-test PRIVATE chast.net)
+    add_executable(chast-display-video-test tests/display_video_receiver_test.cc
+        app/windows/viewer/display_video_receiver.cc app/windows/viewer/viewer_engine.cc)
+    target_include_directories(chast-display-video-test PRIVATE tools)
+    target_compile_definitions(chast-display-video-test PRIVATE NOMINMAX)
+    target_link_libraries(chast-display-video-test PRIVATE chast.host d3d11 dxgi
+        "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
+    add_executable(chast-video-qos-test tests/video_qos_test.cc src/host/video_qos.cc)
+    target_include_directories(chast-video-qos-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
     # Host voice call: request/accept, Opus uplink and permission revocation
     # against a synthetic capture. Needs a desktop session, so it skips itself
@@ -473,7 +539,7 @@ if(CHAST_BUILD_TESTS)
     target_link_libraries(chast-host-control-test PRIVATE chast.host)
 
     add_executable(chast-clipboard-async-test tests/clipboard_async_test.cc
-        app/windows/viewer/viewer_engine.cc)
+        app/windows/viewer/viewer_engine.cc app/windows/viewer/display_video_receiver.cc)
     target_include_directories(chast-clipboard-async-test PRIVATE app/windows/viewer tools)
     target_compile_definitions(chast-clipboard-async-test PRIVATE NOMINMAX)
     target_link_libraries(chast-clipboard-async-test PRIVATE chast.host d3d11 dxgi
@@ -593,7 +659,7 @@ if(CHAST_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tools)
     # The static avformat object files pull its TLS, socket and RTSP helpers
     # even though this test only uses the MP4 demuxer.
-    target_link_libraries(chast-mp4-recorder-test PRIVATE chast.ffmpeg
+    target_link_libraries(chast-mp4-recorder-test PRIVATE chast.host
         "${FFMPEG_ROOT}/lib/avformat.lib" secur32 crypt32 ws2_32 bcrypt ncrypt)
 
     enable_testing()
@@ -612,6 +678,15 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_parity COMMAND chast-host-parity-test)
+    add_test(NAME desktop_stream COMMAND chast-desktop-stream-test)
+    add_test(NAME display_subscriptions COMMAND chast-display-subscription-test)
+    add_test(NAME display_video COMMAND chast-display-video-test)
+    add_test(NAME viewer_display_streams COMMAND chast-display-video-test --engine)
+    set_tests_properties(viewer_display_streams PROPERTIES TIMEOUT 60)
+    set_tests_properties(display_video PROPERTIES TIMEOUT 30)
+    set_tests_properties(display_subscriptions PROPERTIES TIMEOUT 30)
+    add_test(NAME video_qos COMMAND chast-video-qos-test)
+    set_tests_properties(desktop_stream PROPERTIES TIMEOUT 30)
     set_tests_properties(host_parity PROPERTIES TIMEOUT 120)
     add_test(NAME host_voice COMMAND chast-host-voice-test)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)

@@ -345,6 +345,14 @@ void test_partial_reparse(const std::filesystem::path& directory) {
     check(receiver == nullptr,
           "a reserved partial path that is a reparse point is refused");
     std::filesystem::remove(link, ignored);
+    const auto alias = root / "alias";
+    if (CreateSymbolicLinkW(alias.c_str(), target.c_str(),
+                           SYMBOLIC_LINK_FLAG_DIRECTORY | kAllowUnprivilegedCreate)) {
+        check(!chast::create_receive_directory(root.string(), "alias/clipboard-empty", &error) &&
+                  !std::filesystem::exists(target / "clipboard-empty"),
+              "empty clipboard directories do not follow a reparse point");
+        std::filesystem::remove(alias, ignored);
+    }
 }
 
 void test_browser(const std::filesystem::path& directory) {
@@ -471,6 +479,48 @@ void test_browser(const std::filesystem::path& directory) {
           "operations cannot leave the root and report missing paths");
 }
 
+void test_directory_pages(const std::filesystem::path& directory) {
+    const auto root = directory / "pages";
+    std::filesystem::create_directories(root);
+    std::vector<chast::FileListEntry> expected;
+    for (int i = 0; i < 2061; ++i) {
+        char name[24]{};
+        const bool folder = i < 1030;
+        std::snprintf(name, sizeof(name), "%c%04d", folder ? 'd' : 'f', i);
+        if (folder) std::filesystem::create_directory(root / name);
+        else std::ofstream(root / name, std::ios::binary).put('x');
+        expected.push_back({name, folder ? 0ull : 1ull, 0, folder});
+    }
+    chast::FileListResult page;
+    page.request_id = 17;
+    std::vector<chast::FileListEntry> received;
+    int pages = 0;
+    do {
+        chast::list_receive_directory(root.string(), "", page, page.next_cursor);
+        check(page.code == chast::FileCode::Ok && page.request_id == 17 &&
+                  page.entries.size() <= chast::kMaxFileListEntries,
+              "directory pagination returns bounded successful pages");
+        received.insert(received.end(), page.entries.begin(), page.entries.end());
+        if (++pages == 1 && !page.entries.empty()) {
+            // Removing the continuation entry and inserting before it must
+            // not shift the next page, as an offset would.
+            std::filesystem::remove(root / page.entries.back().name);
+            std::filesystem::create_directory(root / "before-the-cursor");
+        }
+        if (!page.truncated) break;
+        check(!page.next_cursor.empty() && page.next_cursor == chast::file_list_cursor(page.entries.back()),
+              "continued directory pages expose the final entry key");
+    } while (pages < 5);
+    bool same = received.size() == expected.size();
+    for (size_t i = 0; same && i < expected.size(); ++i)
+        same = received[i].name == expected[i].name && received[i].directory == expected[i].directory && received[i].size == expected[i].size;
+    check(same && pages == 3 && !page.truncated && page.next_cursor.empty(),
+          "three pages cross the directory/file boundary without omissions or duplicates after earlier entries change");
+    chast::list_receive_directory(root.string(), "", page, "f:../outside");
+    check(page.code == chast::FileCode::Refused && page.entries.empty() && page.next_cursor.empty(),
+          "invalid continuation keys cannot escape the share or expose an old page");
+}
+
 }  // namespace
 
 int main() {
@@ -491,9 +541,18 @@ int main() {
         test_sha256_file(directory);
         test_receiver(directory);
         test_nested_receiver(directory);
+        std::string directory_error;
+        check(chast::create_receive_directory(directory.string(), "empty-tree/leaf", &directory_error) &&
+                  std::filesystem::is_empty(directory / "empty-tree" / "leaf"),
+              "metadata-only clipboard directory is created without a data file");
+        check(!chast::create_receive_directory(directory.string(), "../escape", &directory_error) &&
+                  !chast::create_receive_directory(directory.string(), "CON", &directory_error) &&
+                  !chast::create_receive_directory(directory.string(), "trailing.", &directory_error),
+              "clipboard directory rejects escaping and silently renamed paths");
         test_part_isolation(directory);
         test_partial_reparse(directory);
         test_browser(directory);
+        test_directory_pages(directory);
     } else {
         std::printf("FAIL could not create a temp directory\n");
         ++failures;

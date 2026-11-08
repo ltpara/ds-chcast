@@ -18,6 +18,7 @@ struct Source {
     uint64_t generation = 1;
     bool lost = false;
     bool want_hdr = true;
+    CaptureBackend backend = CaptureBackend::Auto;
 };
 std::mutex sources_mutex;
 std::map<std::wstring, std::weak_ptr<Source>> sources;
@@ -158,6 +159,9 @@ public:
     const CursorInfo& cursor() const override { return cursor_; }
     const DisplayInfo& display() const override { return display_; }
     AdapterDevice adapter_device() const override { return {device_.get(), vendor_, display_.adapter_luid}; }
+    const char* implementation() const noexcept override {
+        return source_->capture->implementation();
+    }
     Error reinitialize() override {
         std::lock_guard<std::mutex> lock(source_->mutex);
         if (generation_ == source_->generation) {
@@ -226,6 +230,8 @@ std::unique_ptr<IDxgiCapturer> make_reader(const DisplayInfo& display, const Cap
         CaptureConfig raw;
         raw.want_hdr = config.want_hdr;
         source->want_hdr = config.want_hdr;
+        raw.backend = config.backend;
+        source->backend = config.backend;
         raw.capture_cursor = true;
         source->capture = create_capturer(display, raw, error);
         if (!source->capture) return nullptr;
@@ -233,6 +239,10 @@ std::unique_ptr<IDxgiCapturer> make_reader(const DisplayInfo& display, const Cap
     }
     if (source->want_hdr != config.want_hdr) {
         if (error) *error = "this output is already captured with a different HDR policy";
+        return nullptr;
+    }
+    if (source->backend != config.backend) {
+        if (error) *error = "this output is already captured with a different capture backend";
         return nullptr;
     }
     std::lock_guard<std::mutex> source_lock(source->mutex);

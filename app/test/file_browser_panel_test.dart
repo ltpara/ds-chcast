@@ -23,6 +23,8 @@ ViewerFileListing _listing(
   int code = 0,
   String reason = '',
   bool truncated = false,
+  String cursor = '',
+  String nextCursor = '',
 }) {
   return ViewerFileListing(
     directory: directory,
@@ -30,6 +32,8 @@ ViewerFileListing _listing(
     reason: reason,
     truncated: truncated,
     entries: entries,
+    cursor: cursor,
+    nextCursor: nextCursor,
   );
 }
 
@@ -69,6 +73,7 @@ typedef _OpenDownload = Future<void> Function(String path);
 Widget _host({
   required ViewerStatus status,
   required _ListRequest onRequestList,
+  Future<bool> Function(String directory, String cursor)? onRequestPage,
   _DownloadRequest? onRequestDownload,
   _TakeList? onTakeList,
   _UploadRequest? onUpload,
@@ -93,7 +98,9 @@ Widget _host({
       body: Center(
         child: FileBrowserPanel(
           status: status,
-          onRequestList: onRequestList,
+          onRequestList: (String directory, [String cursor = '']) =>
+              onRequestPage?.call(directory, cursor) ??
+              onRequestList(directory),
           onRequestDownload: onRequestDownload ?? (_) async => true,
           onTakeList: onTakeList ?? () async => null,
           onUpload: onUpload ?? (_) async => null,
@@ -118,6 +125,69 @@ Widget _host({
 }
 
 void main() {
+  testWidgets(
+    'loads subsequent pages, retries them and ignores a stale folder reply',
+    (WidgetTester tester) async {
+      final List<(String, String)> requests = <(String, String)>[];
+      ViewerFileListing answer = _listing(
+        '',
+        <ViewerFileEntry>[_folder('next'), _file('a.txt')],
+        truncated: true,
+        nextCursor: 'f:a.txt',
+      );
+      Widget build(int count) => _host(
+        status: ViewerStatus(fileListAnswers: count),
+        onRequestList: (_) async => true,
+        onRequestPage: (String path, String cursor) async {
+          requests.add((path, cursor));
+          return true;
+        },
+        onTakeList: () async => answer,
+      );
+      await tester.pumpWidget(build(0));
+      await tester.pump();
+      await tester.pumpWidget(build(1));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('加载更多（已显示 2 项）'));
+      await tester.pump();
+      expect(requests.last, ('', 'f:a.txt'));
+      answer = _listing(
+        '',
+        <ViewerFileEntry>[],
+        cursor: 'f:a.txt',
+        code: 5,
+        reason: 'temporary read failure',
+      );
+      await tester.pumpWidget(build(2));
+      await tester.pumpAndSettle();
+      expect(find.text('a.txt'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey<String>('file-retry')));
+      await tester.pump();
+      expect(requests.last, ('', 'f:a.txt'));
+      answer = _listing('', <ViewerFileEntry>[
+        _file('b.txt'),
+      ], cursor: 'f:a.txt');
+      await tester.pumpWidget(build(3));
+      await tester.pumpAndSettle();
+      expect(find.text('a.txt'), findsOneWidget);
+      expect(find.text('b.txt'), findsOneWidget);
+      expect(find.textContaining('加载更多'), findsNothing);
+      await tester.tap(find.text('next'));
+      await tester.pump();
+      answer = _listing('', <ViewerFileEntry>[
+        _file('stale.txt'),
+      ], cursor: 'f:a.txt');
+      await tester.pumpWidget(build(4));
+      await tester.pumpAndSettle();
+      expect(find.text('stale.txt'), findsNothing);
+      answer = _listing('next', <ViewerFileEntry>[_file('current.txt')]);
+      await tester.pumpWidget(build(5));
+      await tester.pumpAndSettle();
+      expect(find.text('current.txt'), findsOneWidget);
+      expect(find.text('a.txt'), findsNothing);
+    },
+  );
+
   testWidgets('asks for the shared root on mount and adopts the listing', (
     WidgetTester tester,
   ) async {
@@ -142,17 +212,19 @@ void main() {
     await tester.pump();
     expect(requests, <String>['']);
 
-    answer = _listing('', <ViewerFileEntry>[
-      _folder('photos'),
-      _file('notes.txt', size: 1536),
-    ], truncated: true);
+    answer = _listing(
+      '',
+      <ViewerFileEntry>[_folder('photos'), _file('notes.txt', size: 1536)],
+      truncated: true,
+      nextCursor: 'f:notes.txt',
+    );
     await tester.pumpWidget(build(const ViewerStatus(fileListAnswers: 1)));
     await tester.pumpAndSettle();
 
     expect(find.text('photos'), findsOneWidget);
     expect(find.text('notes.txt'), findsOneWidget);
     expect(find.text('1.5 KiB'), findsOneWidget);
-    expect(find.text('条目太多，主机只返回了前一部分'), findsOneWidget);
+    expect(find.text('加载更多（已显示 2 项）'), findsOneWidget);
 
     await tester.tap(find.byTooltip('下载到本机'));
     await tester.pump();
@@ -309,6 +381,7 @@ void main() {
     WidgetTester tester,
   ) async {
     ViewerFileListing? answer = _listing('', <ViewerFileEntry>[
+      _folder('private'),
       _file('notes.txt'),
     ]);
 
@@ -324,6 +397,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('notes.txt'), findsOneWidget);
 
+    await tester.tap(find.text('private'));
+    await tester.pump();
     answer = _listing(
       'private',
       <ViewerFileEntry>[],

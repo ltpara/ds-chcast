@@ -28,6 +28,8 @@
 #include <cwchar>
 #include <deque>
 #include <iterator>
+#include <future>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,9 +43,14 @@
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/virtual_display.h"
+#include "chast/user_context.h"
+#include "elevation_handoff.h"
 #include "i18n.h"
+#include "connections.h"
 #include "platform.h"
 #include "service.h"
+#include "service_manager.h"
+#include "service_settings.h"
 #include "tunnel.h"
 
 namespace {
@@ -123,10 +130,9 @@ enum ControlId {
     kLogEdit,
 };
 
-enum ChatDialogId {
-    kChatHistory = 5000,
-    kChatInput,
-    kChatSend,
+struct ViewerChatMessage {
+    uint64_t id;
+    std::string text;
 };
 
 struct HostApp {
@@ -165,6 +171,14 @@ struct HostApp {
     // Portable mode: settings live beside the executable and the host never
     // writes the login autostart entry, so the folder stays self-contained.
     bool portable = false;
+    bool machine_settings_editor = false;
+    bool service_handoff = false;
+    std::shared_ptr<chast::host::ElevationController> elevation = std::make_shared<chast::host::ElevationController>();
+    std::unique_ptr<chast::host::ElevatedChild> elevated_child;
+    std::shared_ptr<void> identity_user_token;
+    HANDLE instance_mutex = nullptr;
+    bool elevation_transferring = false;
+    std::shared_ptr<chast::host::ElevationHandoff> handled_elevation;
     HostSettings settings;
     // The listener's microphone gate is fixed at creation; the UI uses this to
     // tell an operator whether enabling it applies now or next session.
@@ -184,18 +198,17 @@ struct HostApp {
     std::string tunnel_viewer_remote;
     std::string tunnel_error;
     std::deque<std::wstring> log_lines;
-    // Chat is a modeless window so the operator can keep it open next to the
-    // main page. History is cleared when a new viewer starts streaming.
-    HWND chat_window = nullptr;
-    HWND chat_history = nullptr;
-    HWND chat_input = nullptr;
-    bool chat_live = false;
-    std::deque<std::wstring> chat_lines;
+    std::unique_ptr<chast::host::ConnectionsWindow> connections;
+
 };
 
 HostApp* g_app = nullptr;
 
-void append_chat_line(const std::wstring& text);
+chast::host::ConnectionsWindow& connection_window() {
+    if (!g_app->connections) g_app->connections = std::make_unique<chast::host::ConnectionsWindow>(
+        g_app->window, g_app->instance, g_app->font, g_app->dpi, [] { return g_app->server.get(); });
+    return *g_app->connections;
+}
 
 int px(int value) {
     return MulDiv(value, g_app->dpi, 96);
@@ -333,8 +346,8 @@ void server_settings_changed(const HostSettings& settings) {
     }
 }
 
-void server_chat(const std::string& text) {
-    auto* copy = new std::string(text);
+void server_chat(uint64_t id, const std::string& text) {
+    auto* copy = new ViewerChatMessage{id, text};
     if (!PostMessageW(g_app->window, kChatMessage, 0, reinterpret_cast<LPARAM>(copy))) {
         delete copy;
     }
@@ -677,7 +690,8 @@ ClientApproval server_approve(const ClientRequest& request) {
 
 bool save_settings() {
     std::string error;
-    if (!save_host_settings(g_app->config_path, g_app->settings, &error)) {
+    ScopedUserContext original(g_app->identity_user_token.get());
+    if (!original.ok() || !save_host_settings(g_app->config_path, g_app->settings, &error)) {
         post_log(tr(L"保存设置失败：") + widen(error));
         return false;
     }
@@ -743,8 +757,8 @@ void start_server() {
     if (g_app->server) {
         return;
     }
-    if (g_app->config_path == host_settings_path() && chast::host::service_running()) {
-        append_log_line(tr(L"chast 主机服务正在运行，托盘不能同时共享"));
+    if (!g_app->portable && g_app->config_path == host_settings_path() && chast::host::service_installed()) {
+        append_log_line(tr(L"已安装主机服务，请使用服务连接管理。"));
         return;
     }
     HostServerConfig config;
@@ -760,13 +774,23 @@ void start_server() {
     config.trusted_devices_changed = server_trusted_devices_changed;
     config.password_hash_changed = server_password_hash_changed;
     config.settings_changed = server_settings_changed;
-    config.chat_message = server_chat;
+    config.viewer_chat_message = server_chat;
+    config.identity_user_token = g_app->identity_user_token;
+    if (g_app->elevated_child) config.expected_identity_fingerprint = g_app->elevated_child->snapshot.fingerprint;
+    const auto elevation = g_app->elevation;
+    config.elevation_state = [elevation] { return elevation->state(); };
+    config.request_elevation = [elevation] { return elevation->request(); };
     std::string error;
     g_app->server = HostServer::create(std::move(config), &error);
     if (!g_app->server) {
         append_log_line(tr(L"启动失败：") + widen(error));
         const std::wstring message = tr(L"无法启动共享：\n") + widen(error);
-        MessageBoxW(g_app->window, message.c_str(), window_title(), MB_ICONERROR | MB_OK);
+        if (!g_app->elevated_child) MessageBoxW(g_app->window, message.c_str(), window_title(), MB_ICONERROR | MB_OK);
+        return;
+    }
+    if (g_app->elevated_child && g_app->server->status().fingerprint != g_app->elevated_child->snapshot.fingerprint) {
+        append_log_line(L"Elevation failed: the original device identity could not be retained.");
+        g_app->server.reset();
         return;
     }
     g_app->listener_microphone = g_app->settings.allow_microphone;
@@ -790,6 +814,56 @@ void restart_tunnel() {
     start_tunnel();
 }
 
+void poll_elevation() {
+    if (g_app->elevated_child && g_app->elevated_child->cancelled()) {
+        DestroyWindow(g_app->window);
+        return;
+    }
+    const auto task = g_app->elevation->current();
+    if (!task || !task->committed()) return;
+    if (g_app->handled_elevation != task) {
+        // Settings dialogs run their own message loop. Let their save/cancel
+        // finish before taking the final snapshot or destroying the owner.
+        if (!IsWindowEnabled(g_app->window)) return;
+        g_app->handled_elevation = task;
+        if (task->finished()) {
+            append_log_line(L"Elevation ended before transfer: " + widen(task->poll().reason));
+            return;
+        }
+        g_app->elevation_transferring = true;
+        EnableWindow(g_app->window, FALSE);
+        chast::host::ElevationSnapshot snapshot;
+        snapshot.fingerprint = g_app->server ? g_app->server->status().fingerprint : std::string();
+        snapshot.hidden = IsWindowVisible(g_app->window) == FALSE;
+        snapshot.portable = g_app->portable;
+        snapshot.instance_mutex = g_app->instance_mutex;
+        stop_server();
+        // stop() joins the callbacks. Apply every queued credential/policy
+        // update before serializing so an in-flight change cannot be lost.
+        for (const UINT id : {kTokenMessage, kSecurityMessage, kPasswordHashMessage, kSettingsMessage}) {
+            MSG message{};
+            while (PeekMessageW(&message, g_app->window, id, id, PM_REMOVE)) DispatchMessageW(&message);
+        }
+        snapshot.config_path = g_app->config_path;
+        snapshot.settings = g_app->settings;
+        std::string error;
+        if (!task->supply(snapshot, &error)) {
+            append_log_line(L"Elevation transfer failed: " + widen(error));
+            task->shutdown();
+        }
+    }
+    if (!g_app->elevation_transferring || !task->finished()) return;
+    const auto state = task->poll();
+    if (state.code == ElevationCode::Elevated) {
+        DestroyWindow(g_app->window);
+    } else {
+        g_app->elevation_transferring = false;
+        EnableWindow(g_app->window, TRUE);
+        append_log_line(L"Elevation failed; restoring the original host: " + widen(state.reason));
+        start_server();
+    }
+}
+
 void update_tray_tip(const std::wstring& tip) {
     if (!g_app->tray_added || tip == g_app->tray_tip) {
         return;
@@ -810,6 +884,8 @@ std::wstring codec_label(VideoCodec codec) {
             return L"H.264";
         case VideoCodec::Hevc:
             return L"HEVC";
+        case VideoCodec::Vp9:
+            return L"VP9";
         case VideoCodec::Av1:
             return L"AV1";
     }
@@ -1012,7 +1088,8 @@ std::wstring session_permission_text(const HostStatus& status) {
     if (status.state != HostState::Streaming) {
         return tr(L"本次会话权限：—");
     }
-    std::wstring text = tr(L"本次会话权限：") + permission_label(status.session_permissions);
+    std::wstring text = L"#" + std::to_wstring(status.connection_id) + L" · " +
+        permission_label(status.session_permissions);
     if (status.stats.privacy_mode_active) {
         text += tr(L" · 本地屏幕已遮挡（隐私模式）");
     }
@@ -1031,19 +1108,6 @@ void refresh_ui() {
         status = g_app->server->status();
     }
     const bool running = g_app->server && g_app->server->running();
-
-    // Chat history belongs to one viewer: clear it when a session starts so a
-    // later viewer never sees the previous conversation.
-    const bool streaming = g_app->server != nullptr && status.state == HostState::Streaming;
-    if (streaming != g_app->chat_live) {
-        g_app->chat_live = streaming;
-        if (streaming) {
-            g_app->chat_lines.clear();
-            append_chat_line(tr(L"—— 查看者已连接，可以开始聊天 ——"));
-        } else {
-            append_chat_line(tr(L"—— 查看者已断开 ——"));
-        }
-    }
 
     set_text(g_app->state_label, tr(L"状态：") + (g_app->server ? state_text(status.state, status)
                                                            : std::wstring(tr(L"已停止"))));
@@ -1186,6 +1250,11 @@ void process_tunnel_events() {
 }
 
 void load_settings() {
+    ScopedUserContext original(g_app->identity_user_token.get());
+    if (!original.ok()) {
+        g_app->startup_warning = "Cannot access the original user's settings.";
+        return;
+    }
     const HostSettingsLoad loaded = load_host_settings(g_app->config_path);
     g_app->settings = loaded.settings;
     if (g_app->portable) {
@@ -1307,7 +1376,7 @@ void create_controls() {
                                           20 + shift, kSecuritySummary, nullptr);
     g_app->session_label = add_control(L"STATIC", tr(L"本次会话权限：—"), SS_LEFT, 0, 24,
                                        352 + shift, 440, 20, kSessionLabel, nullptr);
-    add_control(L"BUTTON", tr(L"会话聊天…"), BS_PUSHBUTTON, 0, 476, 348 + shift, 120, 28,
+    add_control(L"BUTTON", tr(L"管理连接…"), BS_PUSHBUTTON, 0, 476, 348 + shift, 120, 28,
                 kChatButton, nullptr);
 
     int left = 24;
@@ -1406,180 +1475,6 @@ std::string trim_ascii(std::string text) {
     }
     const size_t last = text.find_last_not_of(" \t\r\n");
     return text.substr(first, last - first + 1);
-}
-
-constexpr wchar_t kChatWindowClass[] = L"ChastChatWindow";
-
-void chat_refresh_history() {
-    if (g_app->chat_history == nullptr) {
-        return;
-    }
-    std::wstring all;
-    for (const std::wstring& line : g_app->chat_lines) {
-        all += line;
-        all += L"\r\n";
-    }
-    SetWindowTextW(g_app->chat_history, all.c_str());
-    SendMessageW(g_app->chat_history, EM_SETSEL, static_cast<WPARAM>(all.size()),
-                 static_cast<LPARAM>(all.size()));
-    SendMessageW(g_app->chat_history, EM_SCROLLCARET, 0, 0);
-}
-
-void append_chat_line(const std::wstring& text) {
-    SYSTEMTIME now{};
-    GetLocalTime(&now);
-    wchar_t stamp[16]{};
-    swprintf_s(stamp, std::size(stamp), L"[%02u:%02u] ", now.wHour, now.wMinute);
-    g_app->chat_lines.push_back(std::wstring(stamp) + text);
-    while (g_app->chat_lines.size() > 300) {
-        g_app->chat_lines.pop_front();
-    }
-    chat_refresh_history();
-}
-
-void send_chat_from_input();
-
-LRESULT CALLBACK chat_input_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
-                                 UINT_PTR, DWORD_PTR) {
-    if (message == WM_KEYDOWN && wparam == VK_RETURN) {
-        send_chat_from_input();
-        return 0;
-    }
-    return DefSubclassProc(hwnd, message, wparam, lparam);
-}
-
-void send_chat_from_input() {
-    if (g_app->server == nullptr) {
-        append_chat_line(tr(L"系统：共享没有运行，消息未发送"));
-        return;
-    }
-    const std::string text = trim_ascii(narrow(control_text(g_app->chat_input)));
-    if (!valid_chat_text(text)) {
-        append_chat_line(tr(L"系统：消息不能为空，最长 4096 字节"));
-        return;
-    }
-    if (!g_app->server->send_chat(text)) {
-        append_chat_line(tr(L"系统：没有正在连接的查看者，或待发队列已满"));
-        return;
-    }
-    append_chat_line(tr(L"[主机] ") + widen(text));
-    SetWindowTextW(g_app->chat_input, L"");
-    SetFocus(g_app->chat_input);
-}
-
-LRESULT CALLBACK chat_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-    switch (message) {
-        case WM_COMMAND:
-            if (HIWORD(wparam) == 0 && LOWORD(wparam) == kChatSend) {
-                send_chat_from_input();
-            }
-            return 0;
-        case WM_CLOSE:
-            // Keep the window and its history; a new session clears both.
-            ShowWindow(hwnd, SW_HIDE);
-            return 0;
-        case WM_DESTROY:
-            g_app->chat_window = nullptr;
-            g_app->chat_history = nullptr;
-            g_app->chat_input = nullptr;
-            return 0;
-        default:
-            break;
-    }
-    return DefWindowProcW(hwnd, message, wparam, lparam);
-}
-
-void show_chat_window(bool focus) {
-    if (g_app->chat_window == nullptr) {
-        static bool class_ready = false;
-        if (!class_ready) {
-            WNDCLASSEXW window_class{};
-            window_class.cbSize = sizeof(window_class);
-            window_class.style = CS_HREDRAW | CS_VREDRAW;
-            window_class.lpfnWndProc = chat_dialog_proc;
-            window_class.hInstance = g_app->instance;
-            window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-            window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-            window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-            window_class.lpszClassName = kChatWindowClass;
-            if (RegisterClassExW(&window_class) == 0) {
-                append_log_line(tr(L"无法创建聊天窗口"));
-                return;
-            }
-            class_ready = true;
-        }
-        const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-        RECT frame{0, 0, px(520), px(440)};
-        AdjustWindowRectEx(&frame, style, FALSE, 0);
-        const int width = frame.right - frame.left;
-        const int height = frame.bottom - frame.top;
-        RECT work{};
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        // Ownerless so it still opens while the main window sits in the tray.
-        const HWND window = CreateWindowExW(0, kChatWindowClass, tr(L"chast 会话聊天"), style, 0, 0,
-                                            width, height, nullptr, nullptr, g_app->instance,
-                                            nullptr);
-        if (window == nullptr) {
-            append_log_line(tr(L"无法创建聊天窗口"));
-            return;
-        }
-        g_app->chat_window = window;
-        RECT main{};
-        if (g_app->window != nullptr) {
-            GetWindowRect(g_app->window, &main);
-        }
-        int x = main.right - width;
-        int y = main.top + px(80);
-        if (x < work.left) {
-            x = work.left + px(16);
-        }
-        if (x + width > work.right) {
-            x = work.right - width;
-        }
-        if (y + height > work.bottom) {
-            y = work.bottom - height;
-        }
-        if (y < work.top) {
-            y = work.top;
-        }
-        SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-
-        const auto add = [window](const wchar_t* cls, const wchar_t* text, DWORD control_style,
-                                  DWORD ex_style, int left, int top, int w, int h, int id) {
-            HWND control = CreateWindowExW(
-                ex_style, cls, text, WS_CHILD | WS_VISIBLE | control_style, px(left), px(top),
-                px(w), px(h), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                g_app->instance, nullptr);
-            if (control != nullptr) {
-                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->font), TRUE);
-            }
-            return control;
-        };
-        add(L"STATIC", tr(L"会话聊天 · 消息只在本会话中传输"), SS_LEFT, 0, 16, 12, 480, 20, 0);
-        g_app->chat_history =
-            add(L"EDIT", L"",
-                ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP,
-                WS_EX_CLIENTEDGE, 16, 38, 472, 310, kChatHistory);
-        g_app->chat_input =
-            add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 360, 372, 28,
-                kChatInput);
-        add(L"BUTTON", tr(L"发送"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 398, 358, 90, 32, kChatSend);
-        add(L"STATIC", tr(L"按 Enter 发送 · 最多 4096 字节"), SS_LEFT, 0, 16, 396, 360, 18, 0);
-        SetWindowSubclass(g_app->chat_input, chat_input_proc, 1, 0);
-        chat_refresh_history();
-    }
-    ShowWindow(g_app->chat_window, focus ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
-    if (focus) {
-        SetForegroundWindow(g_app->chat_window);
-        SetFocus(g_app->chat_input);
-    } else {
-        FLASHWINFO flash{};
-        flash.cbSize = sizeof(flash);
-        flash.hwnd = g_app->chat_window;
-        flash.dwFlags = FLASHW_TRAY;
-        flash.uCount = 2;
-        FlashWindowEx(&flash);
-    }
 }
 
 bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, std::string& error) {
@@ -1738,7 +1633,8 @@ bool edit_tunnel_settings(HostSettings& result) {
     const int height = frame.bottom - frame.top;
     const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
     const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kTunnelDialogClass, tr(L"连接服务设置"),
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kTunnelDialogClass,
+                                  tr(g_app->machine_settings_editor ? L"服务连接设置" : L"连接服务设置"),
                                   style, x, y, width, height, g_app->window, nullptr,
                                   g_app->instance, &dialog);
     if (window == nullptr) {
@@ -1793,8 +1689,9 @@ bool edit_tunnel_settings(HostSettings& result) {
     dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 414,
                          std::max(400, check_px(enable_text)), 24, kDialogEnabled, nullptr);
     const int tunnel_cancel_left = dialog_width - 20 - 100;
-    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left - 10 - 100,
-        456, 100, 32, IDOK, nullptr);
+    const int tunnel_save_width = g_app->machine_settings_editor ? 220 : 100;
+    add(L"BUTTON", tr(g_app->machine_settings_editor ? L"保存并重启服务" : L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0,
+        tunnel_cancel_left - 10 - tunnel_save_width, 456, tunnel_save_width, 32, IDOK, nullptr);
     add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 456, 100, 32,
         IDCANCEL, nullptr);
 
@@ -1870,6 +1767,9 @@ enum SecurityDialogId {
     kSecAllowTerminal,
     kSecAllowTerminalPersist,
     kSecAllowRecord,
+    kSecRecordIncoming,
+    kSecRecordDirectory,
+    kSecRecordPick,
     kSecAllowCamera,
     kSecAllowRestart,
     kSecAllowBlockInput,
@@ -1877,6 +1777,8 @@ enum SecurityDialogId {
     kSecAllowSessionSelect,
     kSecAllowRemoteConfig,
     kSecLockAfterEnd,
+    kSecKeepAwake,
+    kSecClipboardDirection,
     kSecIdleMinutes,
     kSecAllowChange,
     kSecTokenAuth,
@@ -1917,6 +1819,7 @@ struct SecurityDialogState {
     HWND whitelist = nullptr;
     HWND allow_input = nullptr;
     HWND allow_clipboard = nullptr;
+    HWND clipboard_direction = nullptr;
     HWND allow_file = nullptr;
     HWND receive_dir = nullptr;
     // Chosen receive/shared folder in UTF-8; empty keeps the default. It only
@@ -1926,6 +1829,8 @@ struct SecurityDialogState {
     HWND allow_terminal = nullptr;
     HWND allow_terminal_persist = nullptr;
     HWND allow_record = nullptr;
+    HWND record_incoming = nullptr;
+    HWND record_directory = nullptr;
     HWND allow_camera = nullptr;
     HWND allow_restart = nullptr;
     HWND allow_block_input = nullptr;
@@ -1933,6 +1838,7 @@ struct SecurityDialogState {
     HWND allow_session_select = nullptr;
     HWND allow_remote_config = nullptr;
     HWND lock_after_end = nullptr;
+    HWND keep_awake = nullptr;
     HWND idle_minutes = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
@@ -1954,6 +1860,7 @@ struct SecurityDialogState {
     std::vector<HWND> auth_page;
     std::vector<HWND> access_page;
     std::vector<HWND> advanced_page;
+    std::vector<HWND> recording_page;
     std::vector<TrustedDevice> devices;
     std::vector<std::vector<uint8_t>> revoked;
     // A generated but not yet protected secret; empty when 2FA is untouched.
@@ -2002,6 +1909,8 @@ void refresh_trusted_list(SecurityDialogState& dialog) {
 }
 
 std::wstring receive_directory_text(const std::string& directory) {
+    if (directory.empty() && g_app->machine_settings_editor)
+        return tr(L"接收目录：服务账户默认目录");
     const std::string effective =
         directory.empty() ? chast::default_receive_directory() : directory;
     return tr(L"接收目录：") +
@@ -2009,7 +1918,7 @@ std::wstring receive_directory_text(const std::string& directory) {
 }
 
 void show_security_page(SecurityDialogState& dialog, int page) {
-    if (page < 0 || page > 2) {
+    if (page < 0 || page > 3) {
         page = 0;
     }
     const auto show = [](const std::vector<HWND>& controls, bool visible) {
@@ -2020,6 +1929,7 @@ void show_security_page(SecurityDialogState& dialog, int page) {
     show(dialog.auth_page, page == 0);
     show(dialog.access_page, page == 1);
     show(dialog.advanced_page, page == 2);
+    show(dialog.recording_page, page == 3);
 }
 
 void refresh_audio_devices(SecurityDialogState& dialog) {
@@ -2150,11 +2060,21 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.require_approval = updated.auth_mode != HostAuthMode::Password;
     updated.allow_input = is_checked(dialog.allow_input);
     updated.allow_clipboard = is_checked(dialog.allow_clipboard);
+    const auto direction = SendMessageW(dialog.clipboard_direction, CB_GETCURSEL, 0, 0);
+    updated.clipboard_direction = direction == 0 ? ClipboardDirection::Both :
+        direction == 1 ? ClipboardDirection::HostToViewer :
+        direction == 2 ? ClipboardDirection::ViewerToHost : ClipboardDirection::Disabled;
     updated.allow_file_transfer = is_checked(dialog.allow_file);
     updated.allow_port_forward = is_checked(dialog.allow_port_forward);
     updated.allow_terminal = is_checked(dialog.allow_terminal);
     updated.allow_terminal_persist = is_checked(dialog.allow_terminal_persist);
     updated.allow_record = is_checked(dialog.allow_record);
+    updated.record_incoming = is_checked(dialog.record_incoming);
+    updated.record_directory = trim_ascii(narrow(control_text(dialog.record_directory)));
+    if (updated.record_incoming && (updated.record_directory.empty() ||
+        !std::filesystem::path(widen(updated.record_directory)).is_absolute())) {
+        return complain(tr(L"启用主机录屏前，请选择完整的本机保存目录。"));
+    }
     updated.allow_camera = is_checked(dialog.allow_camera);
     updated.allow_restart = is_checked(dialog.allow_restart);
     updated.allow_block_input = is_checked(dialog.allow_block_input);
@@ -2162,6 +2082,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_session_select = is_checked(dialog.allow_session_select);
     updated.allow_remote_config = is_checked(dialog.allow_remote_config);
     updated.lock_after_session_end = is_checked(dialog.lock_after_end);
+    updated.keep_awake = is_checked(dialog.keep_awake);
     if (dialog.idle_minutes != nullptr) {
         const std::string minutes_text =
             trim_ascii(narrow(control_text(dialog.idle_minutes)));
@@ -2242,12 +2163,15 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
         }
         std::string protected_secret;
         std::string error;
-        if (!protect_totp_secret(dialog.pending_totp, SecretScope::CurrentUser,
+        ScopedUserContext original(g_app->identity_user_token.get());
+        if (!original.ok() || !protect_totp_secret(dialog.pending_totp, g_app->machine_settings_editor ? SecretScope::LocalMachine : SecretScope::CurrentUser,
                                  protected_secret, &error)) {
             return complain(tr(L"无法保护两步验证密钥：") + widen(error));
         }
         updated.totp_secret = std::move(protected_secret);
     }
+    if (g_app->machine_settings_editor && updated.auth_mode == HostAuthMode::Password && updated.password_hash.empty())
+        return complain(tr(L"服务的密码模式需要设置永久密码。"));
 
     if (!dialog.revoked.empty()) {
         std::vector<TrustedDevice>& devices = updated.trusted_devices;
@@ -2388,12 +2312,25 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                     refresh_audio_devices(*dialog);
                     return 0;
                 }
+                case kSecRecordPick: {
+                    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                    BROWSEINFOW browse{};
+                    browse.hwndOwner = dialog->window;
+                    browse.lpszTitle = tr(L"选择主机录像保存目录");
+                    browse.ulFlags = BIF_RETURNONLYFSDIRS | (SUCCEEDED(com) ? BIF_NEWDIALOGSTYLE : 0);
+                    const auto item = SHBrowseForFolderW(&browse);
+                    wchar_t path[MAX_PATH]{};
+                    if (item && SHGetPathFromIDListW(item, path)) set_text(dialog->record_directory, path);
+                    if (item) CoTaskMemFree(item);
+                    if (SUCCEEDED(com)) CoUninitialize();
+                    return 0;
+                }
                 case kSecReceivePick: {
                     // BIF_NEWDIALOGSTYLE needs an initialized apartment; the
                     // classic dialog still works if COM is unavailable.
                     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                     PIDLIST_ABSOLUTE start = nullptr;
-                    const std::string current = dialog->receive_directory.empty()
+                    const std::string current = dialog->receive_directory.empty() && !g_app->machine_settings_editor
                                                     ? chast::default_receive_directory()
                                                     : dialog->receive_directory;
                     if (!current.empty() && SUCCEEDED(com)) {
@@ -2514,15 +2451,16 @@ bool edit_security_settings(HostSettings& result) {
     RECT owner_rect{};
     GetWindowRect(g_app->window, &owner_rect);
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    const int dialog_width = chast::host::english_ui() ? 700 : 620;
+    const int dialog_width = (chast::host::english_ui() ? 700 : 620) + (g_app->machine_settings_editor ? 80 : 0);
     const int page_text_width = dialog_width - 80;
-    RECT frame{0, 0, px(dialog_width), px(772)};
+    RECT frame{0, 0, px(dialog_width), px(784)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
     const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
     const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kSecurityDialogClass, tr(L"安全设置"),
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kSecurityDialogClass,
+                                  tr(g_app->machine_settings_editor ? L"服务安全设置" : L"安全设置"),
                                   style, x, y, width, height, g_app->window, nullptr,
                                   g_app->instance, &dialog);
     if (window == nullptr) {
@@ -2562,6 +2500,8 @@ bool edit_security_settings(HostSettings& result) {
         TabCtrl_InsertItem(dialog.tab, 1, &item);
         item.pszText = const_cast<wchar_t*>(tr(L"高级"));
         TabCtrl_InsertItem(dialog.tab, 2, &item);
+        item.pszText = const_cast<wchar_t*>(tr(L"主机录屏"));
+        TabCtrl_InsertItem(dialog.tab, 3, &item);
     }
 
     // ----- authentication page -----
@@ -2764,7 +2704,23 @@ bool edit_security_settings(HostSettings& result) {
                                             allow_block_input_width + 24,
                    544, kSecAllowOsLogin);
     add(L"STATIC", tr(L"阻止本地输入需要键盘与鼠标权限；系统登录需要键盘权限，且只在登录或锁屏界面生效。"),
-        SS_LEFT, 0, 32, 570, page_text_width, 20, 0, nullptr, &dialog.access_page);
+        SS_LEFT, 0, 32, 570, page_text_width, 36, 0, nullptr, &dialog.access_page);
+
+    const wchar_t* keep_awake_text = tr(L"远程连接期间防止自动休眠");
+    dialog.keep_awake = page_check(keep_awake_text, 32, 612, kSecKeepAwake);
+    add(L"STATIC", tr(L"桌面连接同时保持屏幕唤醒；文件、终端等连接仅防止系统休眠。"),
+        SS_LEFT, 0, 32, 640, page_text_width, 28, 0, nullptr, &dialog.access_page);
+
+    const wchar_t* direction_label = tr(L"剪贴板方向");
+    const int direction_left = 32 + text_px(direction_label) + 16;
+    add(L"STATIC", direction_label, SS_LEFT, 0, 32, 676, direction_left - 40, 20, 0,
+        nullptr, &dialog.access_page);
+    dialog.clipboard_direction = add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+        0, direction_left, 672, page_right - direction_left, 150, kSecClipboardDirection,
+        nullptr, &dialog.access_page);
+    for (const auto* label : {tr(L"双向同步"), tr(L"仅本机 → 查看端"), tr(L"仅查看端 → 本机"), tr(L"禁止同步")}) {
+        SendMessageW(dialog.clipboard_direction, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+    }
 
     // ----- advanced page -----
     add(L"STATIC", tr(L"访问令牌（仅供 CLI 与自动化，默认关闭）"), SS_LEFT, 0, 32, 56, 500, 20, 0,
@@ -2878,10 +2834,31 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", virtual_display_line.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, 32, 674,
         page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
+    // ----- local recording page -----
+    const wchar_t* recording_text = tr(L"自动保存远程会话视频到本机");
+    dialog.record_incoming = add(L"BUTTON", recording_text, BS_AUTOCHECKBOX | WS_TABSTOP,
+        0, 32, 60, page_text_width, 26, kSecRecordIncoming, nullptr, &dialog.recording_page);
+    add(L"STATIC", tr(L"录像保存目录"), SS_LEFT, 0, 32, 108, page_text_width, 22,
+        0, nullptr, &dialog.recording_page);
+    dialog.record_directory = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+        32, 138, page_text_width - 100, 28, kSecRecordDirectory, nullptr, &dialog.recording_page);
+    add(L"BUTTON", tr(L"浏览…"), BS_PUSHBUTTON | WS_TABSTOP, 0, 32 + page_text_width - 90,
+        138, 90, 28, kSecRecordPick, nullptr, &dialog.recording_page);
+    add(L"STATIC", tr(L"启用前请选择保存目录。服务模式下，服务账户必须有该目录的写入权限。"),
+        SS_LEFT, 0, 32, 184, page_text_width, 48, 0, nullptr, &dialog.recording_page);
+    add(L"STATIC", tr(L"录制当前被观看的屏幕、合并桌面和摄像头，仅保存视频，不包含声音。"),
+        SS_LEFT, 0, 32, 250, page_text_width, 48, 0, nullptr, &dialog.recording_page);
+    add(L"STATIC", tr(L"多人观看同一画面只保存一份。切换格式或每满 10 分钟会另存一段 MP4，最后一个观看者离开后保存完成。"),
+        SS_LEFT, 0, 32, 316, page_text_width, 64, 0, nullptr, &dialog.recording_page);
+    add(L"STATIC", tr(L"此设置只允许在本机修改，与允许查看者录制相互独立。录像不会自动删除；保存失败会显示在主机日志中。"),
+        SS_LEFT, 0, 32, 398, page_text_width, 64, 0, nullptr, &dialog.recording_page);
+
     const int sec_cancel_left = dialog_width - 20 - 90;
-    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 720,
-        90, 32, kSecSave, nullptr, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 720, 90, 32,
+    const int save_y = 720;
+    const int save_width = g_app->machine_settings_editor ? 220 : 90;
+    add(L"BUTTON", tr(g_app->machine_settings_editor ? L"保存并重启服务" : L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0,
+        sec_cancel_left - 10 - save_width, save_y, save_width, 32, kSecSave, nullptr, nullptr);
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, save_y, 90, 32,
         kSecCancel, nullptr, nullptr);
 
     // The advanced page has no free row left, so the idle timeout sits beside
@@ -2895,7 +2872,7 @@ bool edit_security_settings(HostSettings& result) {
         add(L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
             32 + idle_label_width + 12, 720, 80, 26, kSecIdleMinutes, nullptr, nullptr);
     add(L"STATIC", tr(L"无输入、聊天或剪贴板操作达到此时长即关闭会话。"), SS_LEFT, 0, 32,
-        748, sec_cancel_left - 10 - 90 - 32 - 12, 20, 0, nullptr, nullptr);
+        756, page_text_width, 20, 0, nullptr, nullptr);
 
     // ----- initial state -----
     const HostSettings& settings = g_app->settings;
@@ -2908,11 +2885,17 @@ bool edit_security_settings(HostSettings& result) {
     set_text(dialog.whitelist, widen(settings.ip_whitelist));
     set_check(dialog.allow_input, settings.allow_input);
     set_check(dialog.allow_clipboard, settings.allow_clipboard);
+    SendMessageW(dialog.clipboard_direction, CB_SETCURSEL,
+        settings.clipboard_direction == ClipboardDirection::Both ? 0 :
+        settings.clipboard_direction == ClipboardDirection::HostToViewer ? 1 :
+        settings.clipboard_direction == ClipboardDirection::ViewerToHost ? 2 : 3, 0);
     set_check(dialog.allow_file, settings.allow_file_transfer);
     set_check(dialog.allow_port_forward, settings.allow_port_forward);
     set_check(dialog.allow_terminal, settings.allow_terminal);
     set_check(dialog.allow_terminal_persist, settings.allow_terminal_persist);
     set_check(dialog.allow_record, settings.allow_record);
+    set_check(dialog.record_incoming, settings.record_incoming);
+    set_text(dialog.record_directory, widen(settings.record_directory));
     set_check(dialog.allow_camera, settings.allow_camera);
     set_check(dialog.allow_restart, settings.allow_restart);
     set_check(dialog.allow_block_input, settings.allow_block_input);
@@ -2920,6 +2903,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_session_select, settings.allow_session_select);
     set_check(dialog.allow_remote_config, settings.allow_remote_config);
     set_check(dialog.lock_after_end, settings.lock_after_session_end);
+    set_check(dialog.keep_awake, settings.keep_awake);
     set_text(dialog.idle_minutes, widen(std::to_string(settings.auto_disconnect_minutes)));
     set_text(dialog.trusted_days, widen(std::to_string(settings.trusted_device_days)));
     set_check(dialog.allow_audio, settings.allow_audio);
@@ -2931,7 +2915,7 @@ bool edit_security_settings(HostSettings& result) {
     set_text(dialog.token_edit, widen(settings.access_token));
     set_text(fingerprint,
              g_app->server ? widen(format_fingerprint(g_app->server->status().fingerprint))
-                           : std::wstring(tr(L"共享未启动")));
+                           : std::wstring(tr(g_app->machine_settings_editor ? L"请在服务连接管理中查看当前指纹" : L"共享未启动")));
     dialog.selected_audio_device = settings.audio_device;
     set_check(dialog.audio_aec, settings.audio_aec);
     set_check(dialog.audio_gate, settings.audio_silence_gate_ms != 0);
@@ -3093,13 +3077,15 @@ void show_tray_menu() {
                 kRecordCheck, tr(L"允许查看者录制会话"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_camera ? MF_CHECKED : 0),
                 kCameraCheck, tr(L"允许查看器串流本机摄像头"));
-    const bool can_send = running && status.state == HostState::Streaming &&
-                          (status.session_permissions & kPermissionFileTransfer) != 0;
+    const auto viewers = g_app->server ? g_app->server->viewers() : std::vector<HostViewer>{};
+    const bool can_send = std::any_of(viewers.begin(), viewers.end(), [](const auto& viewer) {
+        return (viewer.permissions & kPermissionFileTransfer) != 0;
+    });
     AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
                 tr(L"发送文件到查看器…"));
-    const bool can_chat = running && status.state == HostState::Streaming;
+    const bool can_chat = running;
     AppendMenuW(menu, MF_STRING | (can_chat ? 0 : MF_GRAYED), kChatButton,
-                tr(L"与查看者聊天…"));
+                tr(L"管理连接与聊天…"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
                 tr(L"共享系统声音"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_microphone ? MF_CHECKED : 0),
@@ -3195,6 +3181,7 @@ bool session_is_live() {
 }
 
 void handle_command(int id) {
+    if (g_app->elevation_transferring) return;
     switch (id) {
         case kMenuShow:
             show_window();
@@ -3264,34 +3251,11 @@ void handle_command(int id) {
                                                                 : tr(L"剪贴板同步已关闭"));
             }
             break;
-        case kSendFileButton: {
-            if (!session_is_live()) {
-                append_log_line(tr(L"没有正在连接的查看者，无法发送文件"));
-                break;
-            }
-            wchar_t path[32768]{};
-            OPENFILENAMEW dialog{};
-            dialog.lStructSize = sizeof(dialog);
-            dialog.hwndOwner = g_app->window;
-            const std::wstring filter =
-                std::wstring(tr(L"所有文件")) + L'\0' + L"*.*" + L'\0';
-            dialog.lpstrFilter = filter.c_str();
-            dialog.lpstrFile = path;
-            dialog.nMaxFile = static_cast<DWORD>(std::size(path));
-            dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-            if (!GetOpenFileNameW(&dialog)) {
-                break;
-            }
-            std::string error;
-            if (!g_app->server->start_file_download(narrow(path), &error)) {
-                append_log_line(tr(L"无法发送文件：") + widen(error));
-            } else {
-                append_log_line(tr(L"已排队发送：") + std::wstring(path));
-            }
+        case kSendFileButton:
+            connection_window().show();
             break;
-        }
         case kChatButton:
-            show_chat_window(true);
+            connection_window().show();
             break;
         case kFileTransferCheck:
             g_app->settings.allow_file_transfer = !g_app->settings.allow_file_transfer;
@@ -3581,7 +3545,8 @@ void handle_command(int id) {
         case kAutostartCheck: {
             const bool enabled = !g_app->settings.autostart;
             std::string error;
-            if (!chast::host::set_autostart(enabled, &error)) {
+            ScopedUserContext original(g_app->identity_user_token.get());
+            if (!original.ok() || !chast::host::set_autostart(enabled, &error)) {
                 append_log_line(tr(L"开机启动：") + widen(error));
                 const std::wstring message = tr(L"无法修改开机启动项：\n") + widen(error);
                 MessageBoxW(g_app->window, message.c_str(), window_title(),
@@ -3768,6 +3733,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         case WM_TIMER:
             if (wparam == kStatusTimer) {
+                poll_elevation();
+                if (!IsWindow(hwnd) || g_app->elevation_transferring) return 0;
+                // An already-open default tray yields after service install.
+                // Portable/custom profiles retain their explicitly chosen mode.
+                static ULONGLONG service_probe_at = 0;
+                const auto now = GetTickCount64();
+                if (now >= service_probe_at && !g_app->portable && g_app->config_path == host_settings_path()) {
+                    service_probe_at = now + 2000;
+                    if (chast::host::service_installed()) {
+                        g_app->service_handoff = true;
+                        DestroyWindow(hwnd);
+                        return 0;
+                    }
+                }
                 refresh_ui();
             }
             return 0;
@@ -3810,12 +3789,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         }
         case kChatMessage: {
-            auto* text = reinterpret_cast<std::string*>(lparam);
-            append_chat_line(tr(L"[查看器] ") + widen(*text));
-            delete text;
-            // Show it without taking focus away from whatever the operator is
-            // doing; the taskbar flash announces the message.
-            show_chat_window(false);
+            std::unique_ptr<ViewerChatMessage> chat(reinterpret_cast<ViewerChatMessage*>(lparam));
+            connection_window().receive_chat(chat->id, chat->text);
             return 0;
         }
         case kTunnelMessage:
@@ -3854,10 +3829,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kStatusTimer);
+            g_app->elevation->shutdown();
             g_app->quitting.store(true);
-            if (g_app->chat_window != nullptr) {
-                DestroyWindow(g_app->chat_window);
-            }
+            g_app->connections.reset();
             g_app->tunnel.stop();
             if (g_app->server) {
                 g_app->server_stopping.store(true);
@@ -3879,6 +3853,61 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             break;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+int run_machine_settings_editor(chast::host::ServiceSettingsPage page) {
+    const auto argument = page == chast::host::ServiceSettingsPage::Security ? L"--service-settings" : L"--service-network-settings";
+    if (!chast::host::service_settings_admin()) {
+        const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"runas",
+            chast::host::executable_path().c_str(), argument, nullptr, SW_SHOWNORMAL));
+        return result > 32 ? 0 : 1;
+    }
+    g_app->machine_settings_editor = true;
+    g_app->config_path = machine_settings_path();
+    const auto loaded = load_host_settings(g_app->config_path);
+    if (!loaded.existed || !loaded.warning.empty()) {
+        MessageBoxW(nullptr, tr(L"无法完整读取机器设置。请先安装主机服务，或修复配置文件中的错误。"),
+            tr(L"主机服务设置"), MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    g_app->settings = loaded.settings;
+    HDC screen = GetDC(nullptr); g_app->dpi = GetDeviceCaps(screen, LOGPIXELSX); ReleaseDC(nullptr, screen);
+    create_fonts();
+    g_app->window = CreateWindowExW(0, L"STATIC", tr(L"主机服务设置"), WS_OVERLAPPED | WS_CAPTION,
+        (GetSystemMetrics(SM_CXSCREEN) - px(640)) / 2, (GetSystemMetrics(SM_CYSCREEN) - px(220)) / 2,
+        px(640), px(220), nullptr, nullptr, g_app->instance, nullptr);
+    if (!g_app->window) { DeleteObject(g_app->font); DeleteObject(g_app->title_font); return 1; }
+    HostSettings edited;
+    const bool accepted = page == chast::host::ServiceSettingsPage::Security ? edit_security_settings(edited) : edit_tunnel_settings(edited);
+    int code = 0;
+    if (accepted) {
+        add_control(L"STATIC", tr(L"正在保存机器设置并重启主机服务…"), SS_LEFT, 0, 24, 40, 590, 55, 0, g_app->font);
+        ShowWindow(g_app->window, SW_SHOWNORMAL); UpdateWindow(g_app->window);
+        const auto original = loaded.settings;
+        auto saving = std::async(std::launch::async, [original, edited, page] {
+            return chast::host::save_service_settings(original, edited, page);
+        });
+        while (saving.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+        }
+        const auto result = saving.get();
+        if (!result.error.empty()) {
+            const auto message = std::wstring(result.saved ? tr(L"设置已保存，但服务启动未完成：\n") : tr(L"设置未保存：\n")) + widen(result.error);
+            MessageBoxW(g_app->window, message.c_str(), tr(L"主机服务设置"), MB_OK | MB_ICONERROR);
+            code = 1;
+        } else {
+            MessageBoxW(g_app->window, result.running ? tr(L"机器设置已保存，主机服务已重启。") :
+                tr(L"机器设置已保存，将在下次启动主机服务时生效。"), tr(L"主机服务设置"), MB_OK | MB_ICONINFORMATION);
+        }
+    }
+    DestroyWindow(g_app->window); g_app->window = nullptr;
+    DeleteObject(g_app->font); DeleteObject(g_app->title_font);
+    g_app->font = g_app->title_font = nullptr;
+    return code;
 }
 
 std::wstring absolute_path(const std::wstring& path) {
@@ -3906,15 +3935,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     bool config_overridden = false;
     bool start_hidden = false;
     bool portable = false;
+    bool service_settings = false, service_network_settings = false, service_manager = false;
+    std::wstring elevation_id;
+    DWORD elevation_parent = 0;
+    uint64_t elevation_birth = 0;
     for (int i = 1; argv != nullptr && i < argc; ++i) {
         const std::wstring arg = argv[i];
-        if (arg == L"--config" && i + 1 < argc) {
+        if (arg == L"--elevated-handoff") {
+            if (argc != 5 || i != 1) { LocalFree(argv); return 2; }
+            elevation_id = argv[++i];
+            wchar_t* end = nullptr;
+            elevation_parent = wcstoul(argv[++i], &end, 10);
+            if (!end || *end || !elevation_parent) { LocalFree(argv); return 2; }
+            elevation_birth = _wcstoui64(argv[++i], &end, 10);
+            if (!end || *end || !elevation_birth) { LocalFree(argv); return 2; }
+        } else if (arg == L"--config" && i + 1 < argc) {
             config_path = narrow(absolute_path(argv[++i]));
             config_overridden = true;
         } else if (arg == L"--portable") {
             portable = true;
         } else if (arg == L"--tray") {
             start_hidden = true;
+        } else if (arg == L"--service-manager") {
+            service_manager = true;
+        } else if (arg == L"--service-settings") {
+            service_settings = true;
+        } else if (arg == L"--service-network-settings") {
+            service_network_settings = true;
         } else if (arg == L"--firewall" && i + 1 < argc) {
             const unsigned long port = wcstoul(argv[++i], nullptr, 10);
             unsigned long tunnel_port = 0;
@@ -3948,7 +3995,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                         L"--config <路径>     使用其他设置文件\n"
                         L"--portable          便携模式：设置保存在程序目录下，不写开机启动\n"
                         L"--tray              启动后隐藏窗口\n"
+                        L"--service-manager   仅管理主机服务，不启动普通共享\n"
                         L"--autostart on|off  设置开机启动\n"
+                        L"--service-settings  编辑服务安全设置（需要管理员）\n"
+                        L"--service-network-settings  编辑服务连接设置（需要管理员）\n"
                         L"--vdisplay <命令>   虚拟显示器：install --package <目录> [--count 1-4]、uninstall、set-count <0-4>、status（安装/卸载需要管理员）\n"
                         L"--firewall <端口> [隧道端口]  添加防火墙规则（含局域网发现 21129/UDP，需要管理员）"),
                         window_title(), MB_OK | MB_ICONINFORMATION);
@@ -3957,6 +4007,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
     LocalFree(argv);
+    if (!elevation_id.empty()) {
+        std::string error;
+        app.elevated_child = chast::host::ElevatedChild::receive(elevation_id, elevation_parent, elevation_birth, &error);
+        if (!app.elevated_child) return 1;
+        const auto& snapshot = app.elevated_child->snapshot;
+        app.identity_user_token = app.elevated_child->identity_user_token;
+        app.settings = snapshot.settings;
+        app.instance_mutex = snapshot.instance_mutex;
+        portable = snapshot.portable;
+        start_hidden = snapshot.hidden;
+        config_path = snapshot.config_path;
+        config_overridden = true;
+    }
+    if (service_manager) {
+        if (config_overridden || portable || service_settings || service_network_settings) return 2;
+        return chast::host::run_service_manager(instance, start_hidden);
+    }
+    if (service_settings || service_network_settings) {
+        if (config_overridden || portable || (service_settings && service_network_settings)) return 2;
+        return run_machine_settings_editor(service_network_settings ? chast::host::ServiceSettingsPage::Connection :
+                                                                   chast::host::ServiceSettingsPage::Security);
+    }
     if (portable) {
         g_app->portable = true;
         if (!config_overridden) {
@@ -3968,17 +4040,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         MessageBoxW(nullptr, tr(L"无法确定设置文件的位置。"), window_title(), MB_ICONERROR | MB_OK);
         return 1;
     }
-    if (config_path == host_settings_path() && chast::host::service_running()) {
-        MessageBoxW(nullptr,
-                    tr(L"chast 主机服务正在运行，托盘主机已让位。\n"
-                    L"请使用 chast-service.exe --token 查看访问令牌。"),
-                    window_title(), MB_ICONINFORMATION | MB_OK);
-        return 0;
+    if (!app.elevated_child && !portable && config_path == host_settings_path() && chast::host::service_installed()) {
+        return chast::host::run_service_manager(instance, start_hidden);
     }
     app.config_path = config_path;
 
     HANDLE instance_mutex = nullptr;
-    if (config_path == host_settings_path()) {
+    if (!app.elevated_child && config_path == host_settings_path()) {
         instance_mutex = CreateMutexW(nullptr, FALSE, L"Local\\chast-host-tray");
         if (instance_mutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
             if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
@@ -3994,6 +4062,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             return 0;
         }
     }
+    if (instance_mutex) app.instance_mutex = instance_mutex;
 
     HDC screen = GetDC(nullptr);
     app.dpi = GetDeviceCaps(screen, LOGPIXELSX);
@@ -4002,7 +4071,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         app.dpi = 96;
     }
 
-    load_settings();
+    if (!app.elevated_child) load_settings();
 
     WNDCLASSEXW window_class{};
     window_class.cbSize = sizeof(window_class);
@@ -4040,13 +4109,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!g_app->startup_warning.empty()) {
         append_log_line(tr(L"设置文件有警告：") + widen(g_app->startup_warning));
     }
-    if (g_app->settings.autostart) {
+    if (g_app->settings.autostart && !app.elevated_child) {
         std::string error;
         if (!chast::host::set_autostart(true, &error)) {
             append_log_line(tr(L"开机启动：") + widen(error));
         }
     }
     start_server();
+    if (app.elevated_child) {
+        std::string error;
+        if (!app.server || !app.elevated_child->announce_ready(app.server->status().fingerprint, &error)) {
+            DestroyWindow(window);
+            return 1;
+        }
+    }
     if (g_app->server) {
         const HostStatus status = g_app->server->status();
         if (!status.fingerprint.empty()) {
@@ -4063,11 +4139,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (g_app->connections && g_app->connections->translate(message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
     if (instance_mutex != nullptr) {
         CloseHandle(instance_mutex);
     }
+    if (g_app->service_handoff) return chast::host::run_service_manager(instance, start_hidden);
     return static_cast<int>(message.wParam);
 }

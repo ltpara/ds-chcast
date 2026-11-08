@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -35,9 +36,15 @@ public:
     // call. The bridge clears it after the session thread has stopped and
     // before Dart unregisters the texture.
     void SetOutput(void* output);
+    // Each Flutter engine owns its output. Detach waits for in-flight copies;
+    // attaching replays the last frame even when the remote desktop is idle.
+    void SetOutputForOwner(const void* owner, void* output);
+    void ClearOutputs();
+    bool HasOutputs() const;
 
     bool ready() const noexcept { return ready_; }
     ID3D11Device* device() override;
+    chast::VideoCodecMask Decoding444Codecs() override { return chast::supported_decoder_444_codecs(device()); }
     // True once an error named the device itself (removed or reset). Frames
     // cannot be recovered on that device; the session rebuilds the decoder
     // after Reset().
@@ -97,9 +104,10 @@ private:
     bool has_adapter_luid_ = false;
 
     mutable std::mutex mutex_;
-    void* output_ = nullptr;
+    std::map<const void*, void*> outputs_;
+    std::mutex frame_mutex_;
 
-    // Slots are only touched by the session thread.
+    // frame_mutex_ also serializes replay from the window thread.
     std::array<Slot, kSlotCount> slots_;
     size_t next_slot_ = 0;
     // The slot holding the newest picture the plugin was handed, for the
@@ -110,6 +118,7 @@ private:
 
     UINT pipeline_input_width_ = 0;
     UINT pipeline_input_height_ = 0;
+    DXGI_FORMAT pipeline_input_format_ = DXGI_FORMAT_UNKNOWN;
     UINT pipeline_width_ = 0;
     UINT pipeline_height_ = 0;
     bool pipeline_ready_ = false;

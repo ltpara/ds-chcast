@@ -19,15 +19,20 @@ inline constexpr wchar_t kWorkerStopEvent[] = L"Global\\chast-service-worker-sto
 // Named by the worker after it wrote a session-switch request; the service
 // reads the request, stops the worker and relaunches it in the chosen session.
 // The request file is %ProgramData%\chast\session-switch and carries only a
-// session id: no credential ever travels over this channel.
+// versioned worker PID, session id and logon identity; no credential travels here.
 inline constexpr wchar_t kWorkerSwitchEvent[] = L"Global\\chast-service-worker-switch";
 
-// The single-id request file the worker writes before signalling
+// The request file the worker writes before signalling
 // kWorkerSwitchEvent. Defined here because both processes must derive the same
 // path from the machine settings location.
 std::wstring session_switch_path();
 
 bool service_installed();
+enum class ServicePresence { Missing, Installed, Unknown };
+// Distinguishes removal from a transient SCM/access error for manager teardown.
+ServicePresence service_presence();
+enum class ServiceState { Unknown, Stopped, Starting, Running, Stopping, Paused };
+ServiceState service_state();
 // True while the service is starting, running or stopping: the tray must not
 // bind the same ports.
 bool service_running();
@@ -42,6 +47,8 @@ bool load_machine_settings(HostSettings& settings, std::string* path,
 // Both require an elevated process. install() creates machine settings with a
 // fresh token/device identity when they are missing and starts the service;
 // uninstall() stops and deletes it but keeps the settings and logs.
+// The installed service starts the sibling chast-host.exe manager under the
+// interactive user's token; installation preserves per-user startup choices.
 int install_service(std::string* error);
 int uninstall_service(std::string* error);
 

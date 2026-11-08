@@ -15,9 +15,9 @@ import (
 
 const (
 	// tcpPunchWait bounds how long one side of a punch waits for the other. The
-	// viewer announces first and the host is triggered by UDP, so a host that
-	// never answers costs one wait per round.
-	tcpPunchWait = 5 * time.Second
+	// viewer retries on one connection at 3s and 9s; keep its session alive
+	// throughout all three response windows (18s total).
+	tcpPunchWait = 20 * time.Second
 	// tcpPunchSessionTTL reaps sessions whose sides never paired.
 	tcpPunchSessionTTL = 30 * time.Second
 	// tcpPunchMaxSessions caps memory and the number of open handshake sockets.
@@ -31,11 +31,13 @@ const (
 type tcpWait struct {
 	ch       chan tcpPair
 	observed string
+	local    string
 }
 
 type tcpPair struct {
-	peer string
-	err  string
+	peer  string
+	local bool
+	err   string
 }
 
 type tcpSession struct {
@@ -55,6 +57,7 @@ type tcpPuncher struct {
 
 	mu        sync.Mutex
 	sessions  map[string]*tcpSession
+	controls  map[string]*hostControl
 	lastSwept time.Time
 }
 
@@ -109,6 +112,11 @@ func (p *tcpPuncher) close() {
 	if p.ln != nil {
 		p.ln.Close()
 	}
+	p.mu.Lock()
+	for _, control := range p.controls {
+		control.conn.Close()
+	}
+	p.mu.Unlock()
 }
 
 func (p *tcpPuncher) handle(conn net.Conn) {
@@ -120,9 +128,13 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 	if !p.limiter.allow(remote.IP.String()) {
 		return
 	}
-	conn.SetDeadline(time.Now().Add(tcpPunchWait + 2*time.Second))
+	conn.SetDeadline(time.Now().Add(7 * time.Second))
 	msg, err := readAnnounce(conn)
 	if err != nil {
+		return
+	}
+	if msg.Type == wire.TypeRendezvousControl {
+		p.serveHostControl(conn, msg)
 		return
 	}
 	if err := p.checkAnnounce(msg); err != nil {
@@ -130,40 +142,71 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 		return
 	}
 	key := msg.HostID + "\x00" + msg.Nonce
-	own, err := p.join(key, msg.Role, remote.String())
+	if msg.Role == wire.RoleHost && msg.Error != "" {
+		p.mu.Lock()
+		if sess := p.sessions[key]; sess != nil && sess.viewer != nil {
+			tryNotify(sess.viewer, tcpPair{err: msg.Error})
+			delete(p.sessions, key)
+		}
+		p.mu.Unlock()
+		return
+	}
+	own, err := p.join(key, msg.Role, remote.String(), msg.Candidate)
 	if err != nil {
 		writeAnnounce(conn, wire.Message{Type: wire.TypeTCPPunch, Nonce: msg.Nonce, Error: err.Error()})
 		return
 	}
+	defer p.leave(key, msg.Role, own)
+	_ = conn.SetDeadline(time.Now().Add(tcpPunchWait))
+	// A single reader preserves partially received frames across retry windows.
+	requests := make(chan wire.Message)
+	disconnected := make(chan struct{})
+	finished := make(chan struct{})
+	defer close(finished)
 	if msg.Role == wire.RoleViewer {
-		// Best effort and off the request path: the host is asleep until this
-		// tells it which nonce to announce under.
-		go p.triggerHost(msg.HostID, msg.Nonce)
+		go func() {
+			defer close(disconnected)
+			for {
+				retry, err := readAnnounce(conn)
+				if err != nil {
+					return
+				}
+				select {
+				case requests <- retry:
+				case <-finished:
+					return
+				}
+			}
+		}()
+		go p.triggerHost(msg.HostID, msg.Nonce, remote.String(), msg.NATType)
 	}
-	select {
-	case result := <-own.ch:
-		if result.err != "" {
-			writeAnnounce(conn, wire.Message{Type: wire.TypeTCPPunch, Nonce: msg.Nonce, Error: result.err})
+	timer := time.NewTimer(tcpPunchWait)
+	defer timer.Stop()
+	for {
+		select {
+		case retry := <-requests:
+			if retry.Role != msg.Role || retry.HostID != msg.HostID || retry.Nonce != msg.Nonce ||
+				!p.limiter.allow(remote.IP.String()) || p.checkAnnounce(retry) != nil {
+				return
+			}
+			go p.triggerHost(msg.HostID, msg.Nonce, remote.String(), retry.NATType)
+		case <-disconnected:
+			return
+		case result := <-own.ch:
+			host, _ := p.srv.reg.Lookup(msg.HostID)
+			writeAnnounce(conn, wire.Message{
+				Type: wire.TypeTCPPunch, Nonce: msg.Nonce,
+				OK: result.err == "", Error: result.err,
+				Candidate: result.peer, NATType: host.NATType, IsLocal: result.local,
+			})
+			return
+		case <-timer.C:
+			writeAnnounce(conn, wire.Message{Type: wire.TypeTCPPunch, Nonce: msg.Nonce,
+				Error: "peer did not join the punch in time"})
+			return
+		case <-p.srv.done:
 			return
 		}
-		writeAnnounce(conn, wire.Message{
-			Type:  wire.TypeTCPPunch,
-			Nonce: msg.Nonce,
-			OK:    true,
-			// The address this side must punch. It is the peer's observed
-			// source, not its registration address: a TCP mapping is per
-			// socket, and this is the only one proven reachable.
-			Candidate: result.peer,
-		})
-	case <-time.After(tcpPunchWait):
-		p.leave(key, msg.Role, own)
-		writeAnnounce(conn, wire.Message{
-			Type:  wire.TypeTCPPunch,
-			Nonce: msg.Nonce,
-			Error: "peer did not join the punch in time",
-		})
-	case <-p.srv.done:
-		p.leave(key, msg.Role, own)
 	}
 }
 
@@ -180,10 +223,6 @@ func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
 	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
 		return errors.New("nonce must be 8..64 characters")
 	}
-	host, ok := p.srv.reg.Lookup(msg.HostID)
-	if !ok || !p.srv.reg.Online(host) {
-		return errors.New("host is offline")
-	}
 	now := time.Now()
 	delta := now.Unix() - msg.Timestamp
 	if delta < 0 {
@@ -192,20 +231,49 @@ func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
 	if delta > int64(punchAuthWindow/time.Second) {
 		return errors.New("announce is stale")
 	}
+	// Authenticate the caller before looking up the host. In particular, a
+	// viewer without the server key must not be able to use this port to probe
+	// whether an ID exists or is online.
 	if msg.Role == wire.RoleViewer {
 		if !identity.CheckPunchAuth(p.srv.serverKey, msg.HostID, msg.Nonce, msg.Auth,
 			msg.Timestamp, now, punchAuthWindow) {
 			return errors.New("punch authentication failed")
 		}
-		return nil
 	}
-	pub, err := identity.ParsePublicKey(host.PublicKey)
-	if err != nil {
-		return errors.New("host has no public key")
+	host, ok := p.srv.reg.Lookup(msg.HostID)
+	if !ok {
+		if msg.Role == wire.RoleHost {
+			return errors.New("punch authentication failed")
+		}
+		return errors.New("host is offline")
 	}
-	message := identity.TCPPunchMessage(msg.HostID, msg.Nonce, wire.RoleHost, msg.Timestamp)
-	if !identity.Verify(pub, message, msg.Signature) {
-		return errors.New("host signature does not match")
+	if msg.Role == wire.RoleHost {
+		// Until the signature verifies, unknown IDs and invalid keys/proofs
+		// must be indistinguishable, including when the host is offline.
+		pub, err := identity.ParsePublicKey(host.PublicKey)
+		if err != nil {
+			return errors.New("punch authentication failed")
+		}
+		message := identity.TCPPunchMessage(msg.HostID, msg.Nonce, wire.RoleHost, msg.Timestamp)
+		if msg.Candidate != "" {
+			message = identity.TCPPunchLocalMessage(msg.HostID, msg.Nonce, msg.Candidate, msg.Timestamp)
+		}
+		if msg.Error != "" {
+			message = identity.TCPPunchDeclineMessage(msg.HostID, msg.Nonce, msg.Error, msg.Timestamp)
+		}
+		if !identity.Verify(pub, message, msg.Signature) {
+			return errors.New("punch authentication failed")
+		}
+	}
+	online := p.srv.reg.Online(host)
+	if !online {
+		online = p.srv.HostControlLinked(msg.HostID)
+	}
+	if !online && p.srv.hostCarrierLinked != nil {
+		online = p.srv.hostCarrierLinked(msg.HostID)
+	}
+	if !online {
+		return errors.New("host is offline")
 	}
 	return nil
 }
@@ -214,7 +282,7 @@ func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
 // repeated announce for the same role replaces the older socket: a
 // retransmitted trigger or a retried round leaves the previous wait stale, and
 // letting it block the fresh announce would waste the whole window.
-func (p *tcpPuncher) join(key, role, observed string) (*tcpWait, error) {
+func (p *tcpPuncher) join(key, role, observed, local string) (*tcpWait, error) {
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -227,7 +295,7 @@ func (p *tcpPuncher) join(key, role, observed string) (*tcpWait, error) {
 		sess = &tcpSession{created: now}
 		p.sessions[key] = sess
 	}
-	own := &tcpWait{ch: make(chan tcpPair, 1), observed: observed}
+	own := &tcpWait{ch: make(chan tcpPair, 1), observed: observed, local: local}
 	var peer *tcpWait
 	if role == wire.RoleViewer {
 		if sess.viewer != nil {
@@ -244,8 +312,8 @@ func (p *tcpPuncher) join(key, role, observed string) (*tcpWait, error) {
 	}
 	if peer != nil {
 		delete(p.sessions, key)
-		tryNotify(peer, tcpPair{peer: observed})
-		tryNotify(own, tcpPair{peer: peer.observed})
+		tryNotify(peer, tcpPeerResult(own, peer))
+		tryNotify(own, tcpPeerResult(peer, own))
 	}
 	return own, nil
 }
@@ -296,12 +364,23 @@ func tryNotify(w *tcpWait, result tcpPair) {
 }
 
 // triggerHost tells the host to announce itself under this nonce. The host
-// keeps its UDP punch mapping open for keepalives, and this is the only
-// reliable place to reach it: a TCP punch listener alone cannot be discovered
-// through a NAT without an outbound packet first.
-func (p *tcpPuncher) triggerHost(hostID, nonce string) {
+// receives the server instruction over its authenticated control link, or
+// over UDP when that link is unavailable. Retries come from the viewer.
+func (p *tcpPuncher) triggerHost(hostID, nonce, candidate, nat string) {
 	host, ok := p.srv.reg.Lookup(hostID)
 	if !ok {
+		return
+	}
+	msg := wire.Message{Type: wire.TypeTCPPunch, HostID: hostID, Nonce: nonce, Candidate: candidate, NATType: nat}
+	p.mu.Lock()
+	link := p.controls[hostID]
+	p.mu.Unlock()
+	hostObserved := host.Candidate
+	if link != nil {
+		hostObserved = link.conn.RemoteAddr().String()
+	}
+	msg.IsLocal = sameObservedIP(hostObserved, candidate)
+	if p.triggerControl(msg) {
 		return
 	}
 	var targets []*net.UDPAddr
@@ -314,14 +393,8 @@ func (p *tcpPuncher) triggerHost(hostID, nonce string) {
 			targets = append(targets, addr)
 		}
 	}
-	msg := wire.Message{Type: wire.TypeTCPPunch, HostID: hostID, Nonce: nonce}
-	for i := 0; i < 3; i++ {
-		for _, addr := range targets {
-			p.srv.reply(addr, msg)
-		}
-		if i < 2 {
-			time.Sleep(250 * time.Millisecond)
-		}
+	for _, addr := range targets {
+		p.srv.reply(addr, msg)
 	}
 }
 
@@ -347,4 +420,23 @@ func deriveTCPPunchListen(udp *net.UDPAddr) string {
 		return ""
 	}
 	return net.JoinHostPort(udp.IP.String(), fmt.Sprint(udp.Port))
+}
+
+func sameObservedIP(a, b string) bool {
+	ah, _, ae := net.SplitHostPort(a)
+	bh, _, be := net.SplitHostPort(b)
+	ai, bi := net.ParseIP(ah), net.ParseIP(bh)
+	return ae == nil && be == nil && ai != nil && bi != nil && ai.Equal(bi)
+}
+
+func tcpPeerResult(peer, own *tcpWait) tcpPair {
+	result := tcpPair{peer: peer.observed}
+	if sameObservedIP(peer.observed, own.observed) && peer.local != "" {
+		host, port, err := net.SplitHostPort(peer.local)
+		ip := net.ParseIP(host)
+		if err == nil && port != "0" && ip != nil && !ip.IsUnspecified() && !ip.IsMulticast() {
+			result.peer, result.local = peer.local, true
+		}
+	}
+	return result
 }

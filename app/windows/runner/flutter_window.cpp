@@ -5,8 +5,12 @@
 #include "flutter/generated_plugin_registrant.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project,
-                             std::function<bool(const std::string&)> open_window)
-    : project_(project), open_window_(std::move(open_window)) {}
+                             std::function<bool(const std::string&)> open_window,
+                             OpenDisplayWindow open_display,
+                             std::shared_ptr<chast_viewer::SharedViewerSession> session,
+                             std::optional<uint32_t> stream)
+    : project_(project), open_window_(std::move(open_window)),
+      open_display_(std::move(open_display)), session_(std::move(session)), stream_(stream) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -29,8 +33,9 @@ bool FlutterWindow::OnCreate() {
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   viewer_bridge_ = std::make_unique<chast_viewer::ViewerBridge>(
-      flutter_controller_->engine(), GetHandle());
+      flutter_controller_->engine(), GetHandle(), session_, stream_);
   viewer_bridge_->open_session_window = open_window_;
+  viewer_bridge_->open_display_window = open_display_;
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();

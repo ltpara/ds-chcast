@@ -741,6 +741,16 @@ func run() error {
 		rendezvous.WithServerKey(*serverKey),
 		rendezvous.WithTracer(tracer),
 		rendezvous.WithRelayOnly(func() bool { return relayOnlyFlag.Load() }),
+		rendezvous.WithHostCarrierLinked(func(id string) bool {
+			host, ok := reg.Lookup(id)
+			if !ok {
+				return false
+			}
+			if host.RelayNode != "" {
+				return pool != nil && pool.HostLinked(host.RelayNode, id)
+			}
+			return relayManager.HostLinked(id)
+		}),
 	}
 	switch *tcpPunchListen {
 	case "":
@@ -1014,29 +1024,30 @@ func run() error {
 	}
 
 	handler := api.New(api.Config{
-		Registry:      reg,
-		Relay:         relayManager,
-		Identity:      serverIdentity,
-		PunchAddr:     punchAddr,
-		PunchAddrV6:   punchAddrV6,
-		TCPPunchAddr:  tcpPunchAddr,
-		RelayHost:     advertised,
-		ServerKey:     *serverKey,
-		WakeRelays:    wakeRelays,
-		TTL:           *hostTTL,
-		RelayOnly:     relayOnlyFlag,
-		Blocker:       blocker,
-		Accounts:      accounts,
-		Recordings:    recordingArchive,
-		GeoIP:         geoLocator,
-		PunchLog:      punchLog,
-		IPChanges:     ipChanges,
-		RelayAddrs:    relayAddrs,
-		RelayExtra:    relayExtra,
-		CarrierV6Host: carrierV6Host,
-		RelayPool:     pool,
-		Logger:        log,
-		Limiter:       ratelimit.New(*apiRate, float64(*apiBurst)),
+		Registry:          reg,
+		Relay:             relayManager,
+		Identity:          serverIdentity,
+		PunchAddr:         punchAddr,
+		PunchAddrV6:       punchAddrV6,
+		TCPPunchAddr:      tcpPunchAddr,
+		HostControlLinked: meet.HostControlLinked,
+		RelayHost:         advertised,
+		ServerKey:         *serverKey,
+		WakeRelays:        wakeRelays,
+		TTL:               *hostTTL,
+		RelayOnly:         relayOnlyFlag,
+		Blocker:           blocker,
+		Accounts:          accounts,
+		Recordings:        recordingArchive,
+		GeoIP:             geoLocator,
+		PunchLog:          punchLog,
+		IPChanges:         ipChanges,
+		RelayAddrs:        relayAddrs,
+		RelayExtra:        relayExtra,
+		CarrierV6Host:     carrierV6Host,
+		RelayPool:         pool,
+		Logger:            log,
+		Limiter:           ratelimit.New(*apiRate, float64(*apiBurst)),
 		LoginLimiter: newLoginLimiter(accounts, authlimit.Config{
 			Window:      *loginWindow,
 			MaxFailures: *loginFails,

@@ -1,144 +1,97 @@
-# 打洞与 RustDesk 对齐（2026-11-07）
+# 打洞与 RustDesk 对齐（2026-11-08 修订）
 
-状态：代码与单机回环验证完成；跨网双机验收待做。
-范围：NAT 类型测试、打洞请求/探测重试、IPv6 并行打洞、同网段直达、TCP 打洞。
-明确不做：WebRTC/ICE/STUN/TURN、直接 IP 访问入口。
-相关代码：`server/internal/agent/viewer.go`、`host.go`、`tcppunch.go`、
-`tcpsock*.go`、`server/internal/rendezvous/tcppunch.go`。
+范围：TCP 触发、预打洞顺序、连接预算、回退竞态，以及打洞后的保活和会话重连；保留现有 QUIC 数据报传输。
+参照本地 `D:/rustdesk-ref`（`7423dced37845c48093b6f71bd82e4a16cc8c79d`）和
+`D:/ref/rustdesk-server`（`873230e35a8805de7fd057e7eb763c46f7a174ef`）。
+本机测试验证流程、鉴权及数据往返；第 6 节真实跨网成功率尚未验收。
 
-## 1. 目标与判定口径
+## 1. 修复后的对照
 
-RustDesk 的打洞经过大量真实网络验证，本轮按“功能一比一”对齐，而不是
-另造一套策略。判定标准：
-
-- 每项行为的**触发条件、重试节奏、超时与回退顺序**与 RustDesk 一致；
-- 失败时显式回退（中继/载体），不把未确认的路径报告成直连；
-- 单机回环只能证明逻辑与数据面，不能证明 NAT 穿越成功率；成功率由
-  第 6 节的双机清单验收。
-
-## 2. 与 RustDesk 的对照
-
-| 能力 | RustDesk | chast 实现 |
+| 项目 | RustDesk 参考位置 | 当前行为 |
 | --- | --- | --- |
-| NAT 类型 | 主机比较会合/中继两个观察端口；连接方后台 `test_nat` | 主机保留原逻辑；查看者新增 `nat_probe`/`nat_probe_ack`，会合与中继两个观察点，3 次尝试、每次 750 ms |
-| 对称 NAT | 缩短直连等待（`MIN` 超时），v6 仍并行 | 查看者 v4 直连预算缩到 1 s；主机跳过公网 v4 探测，但继续探测 UPnP、IPv6、同网段 |
-| 打洞请求 | `PunchHoleRequest` 三次，等待窗口 3 s/6 s/9 s | `punch_request` 同样的节奏（首次随查询发出，3 s 与 9 s 各重发一次） |
-| 探测与确认 | `punch_udp`：随机事务号，20 ms 起 1.5× 退避到 200 ms，`MAX_TIME` 3 s | `punch_probe`/`punch_ack`，同样节奏；只有本轮事务号的 ACK 或真实主机数据才锁定 |
-| IPv6 | `punch_v6` 与 v4 并行；`local_addr_v6` 自报 | `self_v6` + `candidate_v6`/`local_addrs_v6`；双栈代理并行探测；没有全局 v6 源时不发布 v6 候选 |
-| 同网段 | `FetchLocalAddr` + intranet 路径，不受对称 NAT 结论影响 | 仅当双方观察公网一致时转发局域网候选；主机并行探测，不看对称 NAT |
-| UPnP | 映射外部端口随打洞交换 | 保留：`upnp_port` 随 keepalive/punch 交换，对称 NAT 下仍探测该端点 |
-| TCP 打洞 | 双方经 hbbs 的 TCP 通道交换地址；主机预打洞后带 `SO_REUSEADDR` 监听并反拨；18 s 窗口 | 独立协调监听（默认与 UDP 会合同端口号）；同样的预打洞 + 监听/反拨；18 s 窗口；数据用载体帧承载 |
-| 回退顺序 | 直连失败 → 中继 | `auto`：UDP/TCP 直连 → 中继；`carrier` 显式强制共享载体 |
+| 鉴权后通知 | 服务端 `rendezvous_server.rs:722`；客户端 `rendezvous_mediator.rs:418` | 主机主动建立独立 TCP 会合控制连接；服务端鉴权后通知；UDP 备用，无需查看者 carrier 令牌、会话或配额 |
+| 预打洞顺序 | `rendezvous_mediator.rs:701`；`server.rs:176` | 主机复用协调端口预拨，最长 30 ms；随后签名报到，服务器才释放查看者；关闭协调连接后复用端口监听 18 s，不并行反拨 |
+| 同网段 | `FetchLocalAddr` / intranet | 双方观察 IP 相同才返回主机签名的内网 TCP 端点，免公网预拨，连接预算 1 s；UDP 保留 LAN 候选 |
+| 请求重试 | `client.rs:449` | 同一 TCP 连接、同一 nonce，分别等待 3/6/9 s；重试只通知主机，不新建等待会话；断开清理；读取响应不因重试丢失半帧 |
+| 连接预算 | `client.rs:649` | 按下表实现分支顺序，协调时间不提前耗尽实际连接预算 |
+| 历史结果 | `client.rs:210`、`:2063` | CLI 按服务器/主机 ID/公钥保存上次直连失败，成功清零，回退置一 |
+| 路径竞速 | `client.rs:684` | TCP、UDP/IPv6 并行；选定后取消其他尝试；默认全部结束才回退；迟到链路和数据不能改变路径 |
+| NAT/代理/强制中继 | `rendezvous_mediator.rs:660` | 对称 NAT 跳过公网 IPv4 TCP；主机代理不绕行 TCP/UDP；IPv6/同网段按可用性尝试；强制中继隐藏直连入口 |
+| UDP 探测 | `punch_udp` | 事务号 ACK 确认；20 ms 起乘 1.5 退避到 200 ms，最多 3 s，并受连接预算限制 |
+| 连接失效 | `client/io_loop.rs:242`、`:282` | RustDesk 在 EOF/读错/30 s 无数据后结束连接；本项目直连数据路径 2 s 保活、8 s 未收到有效响应判失效（UDP 按周期检查，通常 8–10 s），auto 尝试中继，失败后由会话重连 |
+| 重新连接 | `ui_session_interface.rs:1278`；`flutter/lib/models/model.dart:1064` | 销毁旧隧道，重新查询主机地址/令牌并建立新连接；旧状态不得作用于新一轮；临时查询失败延续有限重试，身份/鉴权失败停止 |
 
-与 RustDesk 的实现差异（不影响功能等价）：
+## 2. 超时和模式
 
-- RustDesk 在 hbbs 的同一条复用 TCP 连接上协调 TCP 打洞；chast 用独立
-  TCP 监听和长度前缀帧，配对语义相同，且不依赖复用连接的生命周期。
-- chast 的链路承载的是不透明 QUIC 数据报，TCP 打洞只替换传输，不改变
-  QUIC 的端到端认证与加密。
-- RustDesk 的连接方 NAT 测试用于选择直连/中继；chast 把结果随
-  `punch_request` 交给主机，由主机决定是否跳过 v4。
+`--direct-timeout=0`（默认）使用自适应算法；显式正数是 `auto` 从发起尝试起的总上限，包含协调。
+默认算法中的 `punch` 为协调耗时，以下条件按顺序判断：
 
-## 3. 数据流
-
-### 3.1 UDP 打洞
-
-```
-viewer                         hbbs                          host
-  │ GET /v1/hosts/{id}           │                              │
-  │── punch_request ────────────>│                              │
-  │   (nat_type, self_v6,        │── punch_peer ───────────────>│
-  │    local_addrs*)             │<─ keepalive(punch) ──────────│
-  │<───────────── punch_peer ────│                              │
-  │                              │                              │
-  │── punch_probe(tid) ─────────────────────────────────────────>│
-  │<───────────────────────────────────────────── punch_ack(tid)│
-  │<════════════════ 真实 QUIC 数据报 ═════════════════════════>│
-```
-
-`local_addrs` 只有在双方的观察公网地址一致时才转发给主机。
-
-### 3.2 TCP 打洞
-
-```
-viewer                        hbbs TCP 端口                    host
-  │ TCP 连接 + tcp_punch(viewer, nonce, HMAC) ──>│               │
-  │                                              │── UDP tcp_punch(nonce) ×3 ──>│
-  │                                              │<── tcp_punch(host, nonce, 签名)
-  │<──────────── tcp_punch(candidate=host 观察地址)              │
-  │                                              │────── tcp_punch(candidate=viewer 观察地址) ──>│
-  │                                                              │
-  │  双方用各自协调连接的本地端口向对方 candidate 拨号            │
-  │  主机从该端口预打洞 30 ms，随后在该端口监听并反拨             │
-  │<════════════ tcp_direct（主机签名）→ 查看者校验 ════════════>│
-  │<════════════ 载体帧承载的 QUIC 数据报 ═════════════════════>│
-```
-
-关键点：
-
-- 协调服务器只配对地址，不转发会话数据。
-- 主机在协调连接关闭后，用它**自己的本地端口**重新监听；这个端口就是
-  先前向查看者预打洞的源端口，因此对称 NAT/防火墙已经放行回程 SYN。
-- 链路首条报文是签名 `tcp_direct`（`chast-tcp-direct-v1`，覆盖 host id、
-  nonce、时间戳）；查看者用查询得到的 host 公钥验证后才发送 viewer hello。
-- 链路空闲 60 s 断开；20 s 空帧保活；写入 5 s、握手 10 s 超时。
-
-### 3.3 套接字分工
-
-查看者有两个 UDP 套接字：`127.0.0.1` 本地套接字只服务本地 QUIC 客户端，
-可路由上游套接字负责会合、探测、打洞与转发。这样上游收到的陌生数据报
-不会污染本地 QUIC 客户端，也允许查看者把本地监听与对外绑定分开。
-主机使用同一个数据套接字完成保活、打洞、中继与本地转发；仅当本地控制
-地址属于另一地址族时另开一个只用于本地回环的套接字。
-
-### 3.4 超时与模式
-
-| 场景 | 直连预算 | 行为 |
-| --- | --- | --- |
-| `auto`，双方非对称 NAT | `--direct-timeout`（默认 3 s） | UDP 与 TCP 并行；任一条确认即锁定；超时切中继 |
-| `auto`，任一方对称 NAT | 1 s | 跳过公网 v4；UDP 只探 UPnP/IPv6/同网段，TCP 并行；超时切中继 |
-| `direct` | UDP 三次请求（等待窗口 3/6/9 s）+ 一次 3 s 探测；TCP 18 s | 两条路径都试；TCP 在窗口内反复重拨；没有中继回退 |
-| `tcp` | 18 s | 只走 TCP 打洞；UDP 打洞与中继不启动（本地/上游 UDP 套接字仍承载数据报） |
-| `relay`/`carrier` | — | 强制中继/共享载体 |
-
-## 4. 安全边界
-
-- 查看者 TCP 报到：`chast-punch-v1` HMAC（server-key），±60 s，nonce 8–64；
-- 主机 TCP 报到：`chast-tcp-punch-v1` Ed25519 签名，只有注册私钥能代表该 ID；
-- 配对键为 `host_id + nonce`；重复报到替换旧等待，会话 30 s 过期；
-  单 IP 每 10 s 最多 60 次报到，全局最多 1024 个进行中的会话；
-- 主机对同一 nonce 去重，最多 8 个并发的 TCP 打洞；
-- 打洞链路的首条报文由主机签名；查看者不签名，因为链路上层仍是端到端
-  认证的 QUIC，链路只负责搬运数据报——这与 RustDesk 的定位一致；
-- `relay-only` 服务器拒绝 TCP 打洞报到（监听仍绑定，报到一律返回错误），
-  并在查询中隐藏 `tcp_punch`，查看者不会拿到一个必然被拒绝的地址。
-
-## 5. 单机回环验证（2026-11-07）
-
-`go test ./...` 全部通过。与本轮直接相关的用例：
-
-| 用例 | 断言 |
+| 条件 | 实际连接预算 |
 | --- | --- |
-| `TestViewerDetectsOwnNATType` | 查看者用两个观察点区分 `asymmetric`/`symmetric` |
-| `TestViewerSymmetricNATShortensDirectWait` | 对称 NAT 把直连窗口压到 1 s |
-| `TestHostDetectsNATType` | 主机保持会合/中继双点分类 |
-| `TestHostSkipsV4PunchForSymmetricNAT` | 对称时跳过公网 v4 |
-| `TestHostPunchesViewerLocalCandidatesUnderSymmetricNAT` | 对称时仍探测同网段候选 |
-| `TestHostStillPunchesIPv6ForSymmetricNAT` | 对称时仍探测 IPv6 |
-| `TestHostPunchesBothFamiliesInParallel` | v4/v6 并行 |
-| `TestViewerPunchProbeAndAck` | 事务号探测/确认；单向来包不锁定 |
-| `TestViewerPunchRequestReportsSelfV6` / `ReportsLocalAddrs` | 候选上报内容 |
-| `TestViewerDropsIPv6CandidatesWithoutGlobalV6` | 无全局 v6 源时不发布 v6 |
-| `TestHostAnswersPunchProbeOnlyForAnnouncedViewer` | 只应答被通知的查看者来源 |
-| `TestNatProbeReportsObservedSource` / `TestNatProbeDropsShortNonce` | NAT 观察点与长度校验 |
-| `TestTCPPunchPairsBothHalves` | 两侧拿到对方套接字的观察地址 |
-| `TestTCPPunchRejectsBadHostSignature` / `RejectsViewerWithoutAuth` | TCP 协调鉴权负向 |
-| `TestTCPPunchPathThroughAgents` | 真实 TCP 打洞链路完成 QUIC 数据报回环，`path=direct`、`transport=tcp` |
-| `TestTCPPunchRejectsRelayOnly` | relay-only 下 `--mode tcp` 启动失败 |
+| 同网段或主机 symmetric | 1 s |
+| 没有中继地址，或 direct/tcp 不使用中继 | 18 s |
+| 双方 asymmetric，历史未失败 | 18 s |
+| 双方 asymmetric，历史失败 | max(1 s, punch × 6) |
+| 主机 asymmetric、查看者 symmetric | 1 s |
+| 其他 | max(1 s, punch × 6)，历史失败时乘 3 |
 
-链路生命周期对应的日志事件：`TCP punch paired`（debug）、
-`TCP direct path established`、`TCP viewer path established`、
-`TCP viewer path closed`；双机验收时用 `--verbose` 采集。
+主机 asymmetric 而本机 NAT 未知时，给后台检测最多 100 ms。
+NAT 观察不会启动或重置回退计时器。UDP 探测上限 3 s；TCP 使用计算出的连接预算。
+`auto` 在 TCP/UDP 直连失效后锁定中继/共享载体；`direct`/`tcp` 不回退，等待新会话重新查询；`relay`/`carrier` 强制相应路径。
+CLI 默认在用户配置目录 `ds-chcast/direct-history` 保存历史，`--direct-history-dir` 可指定目录或置空禁用；
+库调用者通过 `ViewerConfig.DirectHistoryDir` 启用持久化。
+
+## 3. 控制链路和数据流
+
+1. 主机注册后连接会合 TCP 端口，验证服务端签名挑战，并以注册私钥证明身份。
+   每条连接有独立双方 nonce，20 s 保活、60 s 空闲断开，不依赖中继数据链路。
+2. 查看者提交已认证请求。服务端签名通知含查看者观察地址、打洞 nonce、NAT 类型和同网段标志，
+   并绑定当前主机控制连接。无控制连接时尝试 UDP 通知。
+3. 跨网主机从协调连接端口预拨最多 30 ms，随后签名报到；同网段直接报告内网端点。
+   代理或公网对称 NAT 返回签名拒绝，其他路径仍可继续竞速。
+4. 服务端收到报告后释放查看者。双方关闭协调连接；主机监听，查看者复用原端口拨号。
+5. 查看者校验 `tcp_direct` 的主机签名与 nonce 后传输带帧边界的 QUIC 数据报。
+   数据链路 8 s 空闲、2 s 保活、写入 5 s 超时；主机握手最多 10 s，查看者握手受连接预算约束。
+6. UDP 直连选定后也定期探测。只有选定地址的真实数据或本轮保活 ACK 延长存活时间；
+   旧事务 ACK、其他候选、会合服务消息和自身发包不计入，失效后迟到数据不得重新选中旧地址。
+7. 会话重连先停止原生连接并清理旧隧道，再查询主机、创建新隧道、重新鉴权。
+   仍采用 1/2/4/8/15 s、最多五次的自动重试；已有重连序列中的离线、网络错误或临时服务错误
+   会继续下一次，首次启动失败不自动创建重试序列，身份、配置或鉴权失败停止。
+   新原生会话启动后才轮询状态，上一轮未返回的轮询结果丢弃。
+
+主机最多 8 个并发打洞、64 条活动 TCP 链路，nonce 保留 30 s 去重。
+控制连接与配对会话各最多 1024 个；每 IP 每 10 s 最多 60 次报到/重试。
+未认证查看者不获知主机存在性；主机未知 ID、错误公钥/签名统一返回鉴权失败。
+连接替换、租约删除或身份改变撤销旧控制权限。relay-only 禁止直连报到。
+
+## 4. 保留的实现差异
+
+- 本地参考 hbbs 用 UDP 队列下发打洞指令，参考客户端另支持 TCP/WS 会合。
+  本项目采用签名 TCP 会合加 UDP 备用，没有实现相同的 protobuf、加密控制协议或 WS 会合。
+- TCP 与 UDP 分别协调并计算耗时；RustDesk 使用一个协调请求携带 UDP 端口，再建立多个连接 future。
+  本项目等待所有已启动尝试结束才回退，一种协调通道无响应时，总耗时可能不同。
+- 查看者 TCP 阶段保留受预算约束的短间隔重拨，处理端口转为监听时的短暂拒绝；RustDesk 交给单个 connect future。
+  主机侧已移除重复反拨。不能据此宣称穿透成功率完全一样。
+- 数据面采用 QUIC 数据报/TCP 帧，RustDesk 使用自身流/KCP，不支持协议互通。
+  既有 UDP NAT 分类与 UPnP 探测保留；本轮不是 RustDesk 全部产品功能复刻。
+- RustDesk 参考实现主要在连接结束后重建会话，本项目 auto 先尝试在 QUIC 仍存活时切中继。
+  8 s 数据链路失效阈值是本项目适配：本机实验中 15 s 阈值已晚于 MsQuic 的丢包断连，
+  不能只依据 30 s idle timeout 决定回退时间。控制连接仍为 20/60 s。
+  自动重连的五次上限也是本项目策略，并非照搬 RustDesk 的全部重试条件和时长。
+- TCP 控制签名保证完整性，不提供元数据保密性。服务器与双方代理应同时升级，
+  不假定新的签名报告与旧版协调服务兼容。
+
+## 5. 回归验证
+
+新增测试覆盖无 UDP/无 carrier 的 TCP 直连、3 s 重传前不提前回退、TCP 断链回退、
+同端口预拨后报到且仅监听、对称 NAT/代理禁止直拨、nonce 去重、半帧响应跨重试、
+控制连接替换/租约撤销、签名字段篡改、历史状态保存/清除，以及迟到候选不得改路由。
+新增 UDP 保活 ACK 防重放、TCP 黑洞超时、主机换端口后新 Viewer 查询、启动错误分类、
+有限重试及新会话启动前禁止读取旧状态测试。Windows 可选原生测试实际运行采集、编码、
+MsQuic 和解码；只阻断直连，保留中继，验证回退后继续解码并恢复画面延迟。
+
+完整结果见 `rustdesk-alignment-2026-11-08.md`。
+本机 `CGO_ENABLED=0` 且缺少 gcc，未运行 Go race 检测。
 
 ## 6. 双机验收清单
 
@@ -190,16 +143,16 @@ chast-tunnel viewer --server https://<server> --server-key-stdin \
 
 | # | 网络条件 | 查看者命令 | 预期路径 | 判定 |
 | --- | --- | --- | --- | --- |
-| 1 | A/B 均为锥形 NAT | `--mode auto` | UDP 直连 | `path=direct`；会话期间中继字节为 0 |
+| 1 | A/B 均为锥形 NAT | `--mode auto` | UDP 或 TCP 直连 | `path=direct`；会话期间中继字节为 0 |
 | 2 | A/B 同一局域网，路由器不支持 hairpin | `--mode auto` | 同网段直连 | 主机日志含 `punching the viewer on the local network`；`candidate` 为内网地址 |
-| 3 | A 在对称 NAT（如手机热点） | `--mode auto` | IPv6/TCP 直连，或 1 s 后中继 | 主机日志含 `symmetric NAT; skipping the v4 punch`；切换时间 ≈1 s |
-| 4 | 服务器/主机放行 TCP 但丢弃全部 UDP | `--mode tcp` | TCP 直连 | `transport=tcp`；建立时间 ≤18 s；随后 `auto` 在 `--direct-timeout`（默认 3 s）内也应走 TCP |
+| 3 | A 在对称 NAT（如手机热点） | `--mode auto` | IPv6/同网段直连，或按预算中继 | 主机日志含 `symmetric NAT; skipping the v4 punch`；协调和连接分开计时，不把协调等待计入 1 s 连接预算 |
+| 4 | 服务器/主机放行 TCP 但丢弃全部 UDP | `--mode tcp` | TCP 直连 | `transport=tcp`；分别记录协调和连接耗时；`auto` 默认使用自适应预算 |
 | 5 | UDP 与 TCP 均不可直连 | `--mode auto` | 中继 | `path=relay`；中继字节 >0；切换时间符合预算 |
 | 6 | 双方有全局 IPv6 且防火墙放行 | `--mode direct` | IPv6 直连 | 查看者/主机候选含 v6；日志 `punching the viewer over IPv6` |
 | 7 | 服务器加 `--relay-only` | `--mode tcp` / `auto` | `tcp` 启动报错；`auto` 走载体/中继 | 查询无 `tcp_punch`，无直连候选 |
 | 8 | 同主机两个查看者 | 两个 `--mode tcp` 并发 | 两条 TCP 链路并存 | 关闭其中一个，另一个帧流不中断 |
 | 9 | TCP 链路中途断开（禁用网卡/拔线） | `--mode auto` | 回退中继 | 日志 `TCP direct path was lost; using relay`；会话不中断 |
-| 10 | 目录/令牌/防火墙变更 | `--mode tcp` 并删除服务器 TCP 放行 | 失败并回退 | `auto` 在预算内回退中继；`tcp` 18 s 后日志 `TCP punch was not confirmed`，代理继续运行 |
+| 10 | 目录/令牌/防火墙变更 | `--mode tcp` 并删除服务器 TCP 放行 | 失败并回退 | `auto` 在预算内回退中继；`tcp` 协调/连接失败后保持无中继；重新连接需重新发起会话 |
 
 ### 6.3 每个用例要采集
 
@@ -218,7 +171,8 @@ chast-tunnel viewer --server https://<server> --server-key-stdin \
 
 - 直连用例：会话数据不经过服务器中继（中继字节为 0），帧完整、0 CRC/
   解码错误；
-- 回退用例：在预算内完成切换，切换后会话继续，QUIC 不重连；
+- 回退用例：记录从故障到切换及首个恢复帧的时间，验证画面/输入恢复；若 QUIC 已断开，
+  必须走新会话查询并重新鉴权，不要求所有网络下原 QUIC 连接都能继续；
 - 重复性：每个场景连续 3 次，路径稳定；允许首次因 NAT 映射空闲而稍慢；
 - 安全负向：错误 server-key、错误主机签名、过期 nonce 的 TCP 报到被拒绝。
 

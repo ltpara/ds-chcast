@@ -18,13 +18,17 @@
 
 #include "chast/audio.h"
 #include "chast/audit_spool.h"
-#include "chast/bitrate_controller.h"
 #include "chast/camera_relay.h"
 #include "chast/capture.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/com_ptr.h"
 #include "chast/desktop.h"
+#include "host/desktop_stream.h"
+#include "chast/user_context.h"
+#include "host/display_selection.h"
+#include "host/display_topology.h"
+#include "host/shared_loopback.h"
 #include "chast/display_mode.h"
 #include "chast/display_privacy.h"
 #include "chast/file_transfer.h"
@@ -36,6 +40,27 @@
 #include "chast/virtual_display.h"
 
 namespace chast {
+
+namespace {
+class ScopedFileAccess {
+public:
+    explicit ScopedFileAccess(const std::shared_ptr<void>& token) {
+        if (!token) { ok_ = true; return; }
+        if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_IMPERSONATE, TRUE, &previous_) &&
+            GetLastError() != ERROR_NO_TOKEN) return;
+        changed_ = SetThreadToken(nullptr, token.get()) != FALSE;
+        ok_ = changed_;
+    }
+    ~ScopedFileAccess() {
+        if (changed_ && !SetThreadToken(nullptr, previous_)) std::terminate();
+        if (previous_) CloseHandle(previous_);
+    }
+    bool ok() const { return ok_; }
+private:
+    HANDLE previous_ = nullptr;
+    bool changed_ = false, ok_ = false;
+};
+}
 
 // Defined here, where the audio pipeline types are complete: the header only
 // forward-declares them, so an inline constructor would need their destructors
@@ -65,127 +90,9 @@ struct ViewerRegistry {
     std::set<std::string> audit_refs;
     std::mutex callback_mutex;
 
-    // The shared desktop stream. IDXGI allows one duplication per output per
-    // process, so exactly one desktop viewer captures and encodes; the others
-    // receive its frames. `desktop_publisher` is the worker that owns capture,
-    // `desktop_info` is the description it last announced, and the followers
-    // are live workers waiting for the broadcast. `desktop_version` only
-    // grows, so a follower that missed a description change can tell a new
-    // one from the old even after the publisher was replaced.
-    HostServer* desktop_publisher = nullptr;
-    ServerInfo desktop_info;
-    size_t desktop_display_index = 0;
-    std::string desktop_display_name;
-    uint64_t desktop_version = 0;
-    bool desktop_info_ready = false;
-    uint32_t desktop_keyframe_requests = 0;
-    DesktopKind desktop_kind = DesktopKind::Default;
-    std::vector<std::weak_ptr<HostServer>> desktop_followers;
-
-    bool claim_desktop(const std::shared_ptr<HostServer>& viewer) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (desktop_publisher != nullptr) {
-            return false;
-        }
-        desktop_publisher = viewer.get();
-        // A new publisher has not announced yet; followers wait for it.
-        desktop_info_ready = false;
-        desktop_info = ServerInfo{};
-        return true;
-    }
-    void release_desktop(HostServer* viewer) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (desktop_publisher == viewer) {
-            desktop_publisher = nullptr;
-            desktop_info_ready = false;
-        }
-    }
-    bool is_desktop_publisher(const HostServer* viewer) const {
-        std::lock_guard<std::mutex> lock(mutex);
-        return desktop_publisher == viewer;
-    }
-    bool has_desktop_publisher() const {
-        std::lock_guard<std::mutex> lock(mutex);
-        return desktop_publisher != nullptr;
-    }
-    void update_desktop_info(const ServerInfo& info, size_t display_index,
-                             const std::string& display_name) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (desktop_publisher == nullptr) {
-            return;
-        }
-        desktop_info = info;
-        desktop_display_index = display_index;
-        desktop_display_name = display_name;
-        ++desktop_version;
-        desktop_info_ready = true;
-    }
-    bool desktop_info_since(uint64_t known_version, ServerInfo& info, size_t& display_index,
-                            std::string& display_name, uint64_t& version) const {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!desktop_info_ready || desktop_version <= known_version) {
-            return false;
-        }
-        info = desktop_info;
-        display_index = desktop_display_index;
-        display_name = desktop_display_name;
-        version = desktop_version;
-        return true;
-    }
-    void request_desktop_keyframe() {
-        std::lock_guard<std::mutex> lock(mutex);
-        ++desktop_keyframe_requests;
-    }
-    bool take_desktop_keyframe_request() {
-        std::lock_guard<std::mutex> lock(mutex);
-        const bool requested = desktop_keyframe_requests > 0;
-        desktop_keyframe_requests = 0;
-        return requested;
-    }
-    void set_desktop_kind(DesktopKind kind) {
-        std::lock_guard<std::mutex> lock(mutex);
-        desktop_kind = kind;
-    }
-    DesktopKind get_desktop_kind() const {
-        std::lock_guard<std::mutex> lock(mutex);
-        return desktop_kind;
-    }
-    void add_desktop_follower(const std::shared_ptr<HostServer>& viewer) {
-        std::lock_guard<std::mutex> lock(mutex);
-        for (auto it = desktop_followers.begin(); it != desktop_followers.end();) {
-            if (it->expired()) {
-                it = desktop_followers.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        desktop_followers.push_back(viewer);
-    }
-    void remove_desktop_follower(HostServer* viewer) {
-        std::lock_guard<std::mutex> lock(mutex);
-        for (auto it = desktop_followers.begin(); it != desktop_followers.end();) {
-            const std::shared_ptr<HostServer> live = it->lock();
-            if (!live || live.get() == viewer) {
-                it = desktop_followers.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    std::vector<std::shared_ptr<HostServer>> desktop_follower_list() {
-        std::lock_guard<std::mutex> lock(mutex);
-        std::vector<std::shared_ptr<HostServer>> live;
-        for (auto it = desktop_followers.begin(); it != desktop_followers.end();) {
-            std::shared_ptr<HostServer> viewer = it->lock();
-            if (!viewer) {
-                it = desktop_followers.erase(it);
-                continue;
-            }
-            live.push_back(std::move(viewer));
-            ++it;
-        }
-        return live;
-    }
+    // Pipelines outlive individual connections while their display is subscribed.
+    DesktopStreamPool desktop_streams;
+    SharedLoopback system_audio;
 
     bool claim_audit_ref(const std::string& ref) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -366,16 +273,14 @@ const char* stream_quality_name(StreamQuality quality) {
     return "unknown";
 }
 
-uint32_t stream_quality_percent(StreamQuality quality) {
-    switch (quality) {
-        case StreamQuality::High:
-            return 100;
-        case StreamQuality::Balanced:
-            return 75;
-        case StreamQuality::Smooth:
-            return 50;
+std::optional<VideoCodec> codec_vote(StreamCodecPreference preference) {
+    switch (preference) {
+        case StreamCodecPreference::H264: return VideoCodec::H264;
+        case StreamCodecPreference::Hevc: return VideoCodec::Hevc;
+        case StreamCodecPreference::Av1: return VideoCodec::Av1;
+        case StreamCodecPreference::Vp9: return VideoCodec::Vp9;
+        default: return std::nullopt;
     }
-    return 100;
 }
 
 const char* sas_code_name(SasCode code) {
@@ -445,7 +350,7 @@ PermissionMask settings_permissions(const HostSettings& settings) {
     if (settings.allow_input) {
         mask |= kPermissionInput;
     }
-    if (settings.allow_clipboard) {
+    if (settings.allow_clipboard && settings.clipboard_direction != ClipboardDirection::Disabled) {
         mask |= kPermissionClipboard;
     }
     if (settings.allow_audio) {
@@ -645,6 +550,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     const DisplayInfo& display = capturer.display();
     ServerInfo info;
     info.codec = encoder.codec();
+    info.chroma = encoder.chroma();
     info.width = static_cast<uint16_t>(encoder.width());
     info.height = static_cast<uint16_t>(encoder.height());
     info.source_width = static_cast<uint16_t>(source_width);
@@ -680,11 +586,11 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
 
 size_t find_display(const std::vector<DisplayInfo>& attached, const DisplayInfo& display) {
     for (size_t i = 0; i < attached.size(); ++i) {
-        if (attached[i].device_name == display.device_name) {
+        if (same_display_identity(attached[i], display)) {
             return i;
         }
     }
-    return 0;
+    return attached.size();
 }
 
 // Index of the output containing a virtual-desktop point, or -1. The host is
@@ -746,6 +652,8 @@ const char* codec_name(VideoCodec codec) {
             return "h264";
         case VideoCodec::Hevc:
             return "hevc";
+        case VideoCodec::Vp9:
+            return "VP9";
         case VideoCodec::Av1:
             return "av1";
     }
@@ -1015,7 +923,8 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
         server->registry_->lock_after_session_end = server->settings_.lock_after_session_end;
     }
     server->publish_security_status();
-    if (server->config_.service_mode && server->settings_.password_hash.empty()) {
+    if (server->config_.service_mode && server->settings_.password_hash.empty() &&
+        (!server->config_.service_approval || server->settings_.auth_mode == HostAuthMode::Password)) {
         server->log("service mode has no permanent password; every viewer will be refused "
                     "until one is set");
     }
@@ -1025,7 +934,7 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
 HostServer::~HostServer() {
     stop();
     carrier_.reset();
-    if (registry_) {
+    if (registry_ && !adopted_) {
         std::lock_guard<std::mutex> lock(registry_->mutex);
         registry_->focused.reset();
     }
@@ -1122,11 +1031,14 @@ bool HostServer::open_session(std::string* error) {
     quic.bind_address = settings_.bind_address;
     quic.port = settings_.port;
     quic.identity_scope = config_.identity_scope;
+    quic.identity_user_token = config_.identity_user_token;
+    quic.expected_identity_fingerprint = config_.expected_identity_fingerprint;
     // Above one, the listener hands every connection to its own session
     // worker instead of holding a single slot.
     quic.max_clients = settings_.max_viewers > 1 ? settings_.max_viewers : 1;
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
+    quic.clipboard_direction = settings_.clipboard_direction;
     quic.allow_file_transfer = settings_.allow_file_transfer;
     quic.allow_port_forward = settings_.allow_port_forward;
     quic.allow_terminal = settings_.allow_terminal;
@@ -1220,11 +1132,13 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
     config.password_hash = settings_.password_hash;
     config.totp_secret = settings_.totp_secret;
     if (!config.totp_secret.empty()) {
+        ScopedUserContext original(config_.identity_user_token.get());
         // host.ini stores the secret DPAPI-protected; an early/hand-written
         // value may still be plain base32.
         std::string plain;
         std::string error;
-        if (unprotect_totp_secret(config.totp_secret, secret_scope(config_.identity_scope),
+        if (!original.ok()) error = "cannot enter original user context: " + std::to_string(original.error());
+        if (original.ok() && unprotect_totp_secret(config.totp_secret, secret_scope(config_.identity_scope),
                                   plain, &error)) {
             config.totp_secret = std::move(plain);
         } else {
@@ -1250,6 +1164,7 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
     config.allow_permission_change = settings_.allow_permission_change;
     config.ip_whitelist = settings_.ip_whitelist;
     config.service_mode = config_.service_mode;
+    config.service_approval = config_.service_approval && static_cast<bool>(config_.approve_client);
     config.token_auth = settings_.token_auth;
     config.access_token = settings_.access_token;
     config.host_fingerprint = fingerprint;
@@ -1465,15 +1380,61 @@ std::shared_ptr<HostServer> HostServer::focused_viewer() const {
     return registry_->focused.lock();
 }
 
-void HostServer::set_permissions(PermissionMask permissions) {
+std::shared_ptr<HostServer> HostServer::find_viewer(uint64_t id) const {
+    if (!id || !registry_) return {};
+    std::lock_guard lock(registry_->mutex);
+    for (const auto& weak : registry_->workers)
+        if (auto viewer = weak.lock(); viewer && viewer->connection_id_.load() == id) return viewer;
+    return {};
+}
+
+std::vector<HostViewer> HostServer::viewers() const {
+    std::vector<HostViewer> result;
+    const auto append = [&](const HostServer& viewer, bool controls) {
+        const auto state = viewer.status();
+        if (state.connection_id && state.state == HostState::Streaming)
+            result.push_back({state.connection_id, state.peer_address, state.session_mode,
+                state.session_permissions, state.approved_permissions, controls,
+                viewer.disconnect_requested_.load()});
+    };
     if (registry_ && !adopted_) {
-        std::shared_ptr<HostServer> target = focused_viewer();
-        if (!target) {
-            return;
+        std::vector<std::pair<std::shared_ptr<HostServer>, bool>> live;
+        {
+            std::lock_guard lock(registry_->mutex);
+            for (const auto& weak : registry_->workers)
+                if (auto viewer = weak.lock()) live.emplace_back(viewer, registry_->controller == viewer.get());
         }
-        target->set_permissions(permissions);
-        return;
+        for (const auto& [viewer, controls] : live) append(*viewer, controls);
+    } else {
+        const auto state = status();
+        append(*this, state.session_mode == SessionMode::Desktop && (state.session_permissions & kPermissionInput));
     }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+    return result;
+}
+
+bool HostServer::disconnect_viewer(uint64_t id) {
+    if (registry_ && !adopted_) {
+        auto target = find_viewer(id);
+        return target && target->disconnect_viewer(id);
+    }
+    std::lock_guard lock(operator_mutex_);
+    if (!id || connection_id_ != id || stopping_) return false;
+    disconnect_requested_ = true;
+    return true;
+}
+
+void HostServer::set_permissions(PermissionMask permissions) {
+    set_permissions(status().connection_id, permissions);
+}
+
+bool HostServer::set_permissions(uint64_t id, PermissionMask permissions) {
+    if (registry_ && !adopted_) {
+        auto target = find_viewer(id);
+        return target && target->set_permissions(id, permissions);
+    }
+    std::lock_guard action(operator_mutex_);
+    if (!id || connection_id_ != id || disconnect_requested_ || stopping_) return false;
     std::lock_guard<std::mutex> lock(permission_mutex_);
     PermissionMask mask = permissions & kPermissionAll;
     // Input injection has one owner. Granting input to a viewer that does not
@@ -1486,6 +1447,7 @@ void HostServer::set_permissions(PermissionMask permissions) {
     }
     pending_permissions_.store(mask);
     permission_update_pending_.store(true);
+    return true;
 }
 
 void HostServer::set_lock_after_session_end(bool enabled) {
@@ -1501,10 +1463,16 @@ void HostServer::set_lock_after_session_end(bool enabled) {
 }
 
 bool HostServer::send_chat(const std::string& text) {
+    return send_chat(status().connection_id, text);
+}
+
+bool HostServer::send_chat(uint64_t id, const std::string& text) {
     if (registry_ && !adopted_) {
-        std::shared_ptr<HostServer> target = focused_viewer();
-        return target ? target->send_chat(text) : false;
+        auto target = find_viewer(id);
+        return target && target->send_chat(id, text);
     }
+    std::lock_guard action(operator_mutex_);
+    if (!id || connection_id_ != id || disconnect_requested_ || stopping_) return false;
     if (!valid_chat_text(text)) {
         return false;
     }
@@ -1523,15 +1491,21 @@ bool HostServer::send_chat(const std::string& text) {
 }
 
 bool HostServer::start_file_download(const std::string& utf8_path, std::string* error) {
+    return start_file_download(status().connection_id, utf8_path, error);
+}
+
+bool HostServer::start_file_download(uint64_t id, const std::string& utf8_path, std::string* error,
+                                     std::shared_ptr<void> file_access_token) {
     if (registry_ && !adopted_) {
-        std::shared_ptr<HostServer> target = focused_viewer();
-        if (!target) {
-            if (error != nullptr) {
-                *error = "no viewer is streaming";
-            }
-            return false;
-        }
-        return target->start_file_download(utf8_path, error);
+        auto target = find_viewer(id);
+        if (target) return target->start_file_download(id, utf8_path, error, std::move(file_access_token));
+        if (error) *error = "the selected viewer is no longer connected";
+        return false;
+    }
+    std::lock_guard action(operator_mutex_);
+    if (!id || connection_id_ != id || disconnect_requested_ || stopping_) {
+        if (error) *error = "the selected viewer is no longer connected";
+        return false;
     }
     const auto fail = [error](const std::string& text) {
         if (error != nullptr) {
@@ -1556,9 +1530,20 @@ bool HostServer::start_file_download(const std::string& utf8_path, std::string* 
     }
     const std::filesystem::path path = path_from_utf8(utf8_path);
     std::error_code code;
-    const uintmax_t size = std::filesystem::file_size(path, code);
-    if (code || !std::filesystem::is_regular_file(path, code) || code) {
-        return fail("the path is not a readable file");
+    uintmax_t size = 0;
+    {
+        ScopedFileAccess access(file_access_token);
+        if (!access.ok()) return fail("the operator's file access token is unavailable");
+        size = std::filesystem::file_size(path, code);
+        if (code || !std::filesystem::is_regular_file(path, code) || code)
+            return fail("the path is not a readable file");
+        // Directory enumeration can expose size/attributes even when the
+        // file's DACL denies reading its contents. Refuse the IPC operation
+        // immediately instead of deferring that refusal to the hasher.
+        if (file_access_token) {
+            std::ifstream readable(path, std::ios::binary);
+            if (!readable) return fail("the path is not a readable file");
+        }
     }
     if (size > kMaxFileTransferBytes) {
         return fail("the file exceeds the protocol's 16 GiB limit");
@@ -1579,6 +1564,8 @@ bool HostServer::start_file_download(const std::string& utf8_path, std::string* 
                 break;
         }
         pending_download_path_ = utf8_path;
+        pending_download_clipboard_ = false;
+        pending_download_token_ = std::move(file_access_token);
     }
     return true;
 }
@@ -1744,6 +1731,14 @@ void HostServer::touch_viewer_activity() { last_viewer_activity_ = Clock::now();
 bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token,
                                        std::string* error, bool* peer_left) {
     *peer_left = false;
+    const SessionMode mode = session_->requested_mode();
+    std::unique_ptr<ISessionPowerRequest> power_request;
+    if (settings_.keep_awake) {
+        std::string power_error;
+        power_request = config_.power_request_factory(mode == SessionMode::Desktop, &power_error);
+        if (!power_request || !power_error.empty())
+            log("keep awake: " + (power_error.empty() ? std::string("power request unavailable") : power_error));
+    }
     // A new viewer starts with a fresh idle clock; the time it spent waiting
     // for approval or a first frame is not idleness.
     touch_viewer_activity();
@@ -1773,7 +1768,18 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
     session_audit_ref_absent_ = viewer_ref_absent;
     const int64_t audit_started_ms = unix_now_ms();
     {
+        static std::atomic<uint64_t> next_connection{1};
+        std::lock_guard action(operator_mutex_);
+        { std::lock_guard lock(chat_mutex_); pending_chat_.clear(); }
+        { std::lock_guard lock(permission_mutex_); permission_update_pending_ = false; }
+        { std::lock_guard lock(download_mutex_);
+          pending_download_path_.clear(); pending_download_token_.reset(); pending_download_transfer_id_ = 0; }
+        disconnect_requested_ = false;
+        connection_id_ = next_connection.fetch_add(1);
         std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.connection_id = connection_id_;
+        status_.session_mode = session_->requested_mode();
+        status_.approved_permissions = approved_permissions_;
         status_.peer_address = peer;
         status_.requested_display = session_->requested_display();
         status_.session_permissions = session_->permissions();
@@ -1786,16 +1792,40 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
     publish_state(HostState::Streaming);
     log(peer.empty() ? "a viewer connected" : "a viewer connected from " + peer);
 
-    const SessionMode mode = session_->requested_mode();
-    const bool ok = mode == SessionMode::FileTransfer
+    struct ElevationGuard {
+        std::shared_ptr<IElevationTask>& task;
+        ~ElevationGuard() { if (task) { task->cancel(); task.reset(); } }
+    } elevation_guard{elevation_task_};
+    auto elevation = config_.elevation_state ? config_.elevation_state() :
+        ElevationState{0, process_is_elevated() ? ElevationCode::Elevated : ElevationCode::Unsupported, {}};
+    if (mode != SessionMode::Desktop) elevation = {};
+    elevation.request_id = 0;
+    const auto announced = session_->send_elevation_state(elevation);
+    if (!announced.ok()) *error = announced.to_string();
+    const bool ok = announced.ok() && (mode == SessionMode::FileTransfer
                         ? file_session(stats, error, peer_left)
                         : mode == SessionMode::Desktop
                               ? stream_session(stats, error, peer_left)
-                              : control_session(mode, stats, error, peer_left);
+                              : control_session(mode, stats, error, peer_left));
+
+    bool operator_disconnected = false;
+    {
+        std::lock_guard action(operator_mutex_);
+        // Snapshot the disconnect request while retiring the ID so an
+        // accepted operator action is also reflected in finish and audit.
+        operator_disconnected = disconnect_requested_.load();
+        connection_id_ = 0;
+        { std::lock_guard lock(download_mutex_);
+          pending_download_path_.clear(); pending_download_token_.reset(); pending_download_transfer_id_ = 0; }
+        std::lock_guard lock(status_mutex_);
+        status_.connection_id = 0;
+    }
+    if (operator_disconnected) log("the operator disconnected this viewer");
 
     ClientStats peer_stats;
     bool stats_received = false;
     const auto finish_timeout = std::chrono::milliseconds(
+        operator_disconnected ? std::min<uint32_t>(config_.finish_timeout_ms, 500) :
         ok ? config_.finish_timeout_ms : std::min<uint32_t>(config_.finish_timeout_ms, 2000));
     Error finished = session_->finish_server(finish_timeout, peer_stats, stats_received);
     stats.peer_left = *peer_left;
@@ -1819,7 +1849,7 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
         // gone.
         log(*peer_left && !stats_received ? "the viewer disappeared" : "the viewer left");
     }
-    if (!finished.ok() && !*peer_left && error->empty() && !stopping_.load()) {
+    if (!finished.ok() && !*peer_left && error->empty() && !stopping_.load() && !operator_disconnected) {
         *error = "finish: " + finished.to_string();
     }
     // Every session leaves a host-side record. A viewer that sent no reference
@@ -1832,7 +1862,7 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
         record.started_at_ms = audit_started_ms;
         record.ended_at_ms = unix_now_ms();
         record.success = ok && error->empty();
-        record.detail = *error;
+        record.detail = operator_disconnected ? "disconnected by the local operator" : *error;
         std::string audit_error;
         if (!append_audit_session(settings_.audit_spool, record, &audit_error)) {
             log("audit: " + audit_error);
@@ -1861,6 +1891,7 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
         refresh_security_config();
         log("the one-time token was spent; a new token is ready");
     }
+    disconnect_requested_ = false;
     return ok;
 }
 
@@ -2177,9 +2208,7 @@ void HostServer::run_adopted() {
             }
         }
         {
-            // A publisher may hold a reference to this worker while it
-            // broadcasts; taking the same mutex it uses to reach the session
-            // keeps the handle from being destroyed under a send.
+            // Serialize teardown with operator access to the session.
             std::lock_guard<std::mutex> lock(session_mutex_);
             session_.reset();
         }
@@ -2236,566 +2265,16 @@ void HostServer::run_adopted() {
     }
     if (clipboard_worker_) clipboard_worker_->Cancel();
     finished_ = true;
+    clipboard_channel_.reset();
     running_ = false;
 }
 
 bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool* peer_left) {
-    *peer_left = false;
-    // A multi-viewer host has one shared desktop stream: the first viewer
-    // captures and encodes, the others follow and receive the same frames.
-    // When the publisher leaves, the follower that wins the free slot builds
-    // its own capture pipeline and continues the stream on its session.
-    bool promoted = false;
-    if (registry_ && adopted_) {
-        std::shared_ptr<HostServer> self = self_.lock();
-        if (!registry_->claim_desktop(self)) {
-            // follow_shared_desktop() claims the publisher role itself when
-            // the old publisher is gone, so a Promote result means this worker
-            // owns the role and needs its own capture pipeline.
-            const SharedFollowResult followed =
-                follow_shared_desktop(stats, error, peer_left, &promoted);
-            if (followed == SharedFollowResult::Ended) {
-                return error->empty();
-            }
-        }
-    }
-    desktop_publisher_ = true;
-    struct PublisherGuard {
-        HostServer* self;
-        ~PublisherGuard() { self->release_desktop_publisher(); }
-    } publisher_guard{this};
-    return stream_desktop(stats, error, peer_left, promoted);
+    return stream_desktop(stats, error, peer_left);
 }
 
-void HostServer::release_desktop_publisher() {
-    if (registry_ && desktop_publisher_) {
-        registry_->release_desktop(this);
-    }
-    desktop_publisher_ = false;
-    desktop_info_ready_ = false;
-}
-
-HostServer::SharedFollowResult HostServer::follow_shared_desktop(
-    HostServerStats& stats, std::string* error, bool* peer_left, bool* announced) {
+bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
-    *announced = false;
-    std::shared_ptr<HostServer> self = self_.lock();
-    if (!self) {
-        *error = "the viewer worker lost its identity";
-        return SharedFollowResult::Ended;
-    }
-    stats.audio_active = false;
-    stats.privacy_mode_active = false;
-    stats.privacy_mode_changes = 0;
-    stats.sas_requests = 0;
-    stats.sas_failures = 0;
-    stats.resolution_percent = 100;
-    stats.resolution_changes = 0;
-
-    begin_file_session();
-    struct FileSessionEnd {
-        HostServer* self;
-        ~FileSessionEnd() { self->end_file_session(); }
-    } file_session_end{this};
-
-    // The publisher's description is the only stream this session announces.
-    // A follower never captures; when the publisher leaves, the worker that
-    // wins the free role returns Promote and builds its own pipeline.
-    bool live = false;
-    bool follower_registered = false;
-    struct FollowerGuard {
-        HostServer* self;
-        ViewerRegistry* registry;
-        bool* registered;
-        ~FollowerGuard() {
-            if (*registered && registry != nullptr) {
-                registry->remove_desktop_follower(self);
-            }
-        }
-    } follower_guard{this, registry_.get(), &follower_registered};
-
-    clipboard_was_allowed_ = clipboard_allowed();
-    if (clipboard_was_allowed_) {
-        remember_local_clipboard();
-    }
-    clipboard_seq_ = 1;
-    next_clipboard_poll_ = Clock::now() + std::chrono::milliseconds(500);
-
-    auto send_failed = [&](const Error& sent, const std::string& what) -> bool {
-        if (sent.ok()) {
-            return true;
-        }
-        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
-            *peer_left = true;
-        } else {
-            ++stats.send_errors;
-            *error = what + ": " + sent.to_string();
-        }
-        return false;
-    };
-
-    ServerInfo info;
-    uint64_t known_version = 0;
-
-    // Wait for the publisher's first description. A publisher that fails
-    // before announcing releases the role, which is this worker's turn to
-    // take over instead of waiting forever.
-    while (!stopping_.load()) {
-        ServerInfo next;
-        size_t index = 0;
-        std::string name;
-        uint64_t version = 0;
-        if (registry_->desktop_info_since(known_version, next, index, name, version)) {
-            known_version = version;
-            info = next;
-            if (!live) {
-                Error sent = session_->announce(next);
-                if (!sent.ok()) {
-                    if (sent.status() == Status::Unavailable ||
-                        sent.status() == Status::WaitTimeout) {
-                        *peer_left = true;
-                    } else {
-                        *error = "announce: " + sent.to_string();
-                    }
-                    return SharedFollowResult::Ended;
-                }
-                live = true;
-                *announced = true;
-                publish_stream(next, index, name);
-                // The follower's viewer shows the same desktop banner as the
-                // publisher's, then receives every later change as a broadcast.
-                if (!send_failed(
-                        session_->send_desktop_state(registry_->get_desktop_kind()),
-                        "send_desktop_state")) {
-                    return SharedFollowResult::Ended;
-                }
-                registry_->add_desktop_follower(self);
-                follower_registered = true;
-                registry_->request_desktop_keyframe();
-                // The Hello went out view-only while another viewer held the
-                // control lease. The transport may grant input once the lease
-                // frees, without ever exceeding what the operator approved.
-                if (approved_permissions_ != 0) {
-                    session_->set_permission_ceiling(approved_permissions_);
-                }
-                log("following the shared desktop stream");
-            } else {
-                // The publisher rebuilt its stream (resolution, permissions or
-                // audio) while this worker was still waiting.
-                if (!send_failed(session_->refresh_stream(next), "refresh_stream")) {
-                    return SharedFollowResult::Ended;
-                }
-                ++stats.stream_updates;
-                publish_stream(next, index, name);
-            }
-            stats.target_bitrate = next.bitrate;
-            stats.framerate = next.framerate;
-            stats.audio_active = next.audio.enabled && shared_audio_ready_.load() &&
-                                 (session_->permissions() & kPermissionAudio) != 0;
-            if (next.source_width != 0) {
-                stats.resolution_percent = static_cast<uint16_t>(
-                    static_cast<uint64_t>(next.width) * 100 / next.source_width);
-            }
-            break;
-        }
-        if (!registry_->has_desktop_publisher() && registry_->claim_desktop(self)) {
-            // Nobody is capturing any more. Whatever this session already
-            // announced stays live; stream_desktop() refreshes it once its
-            // own capture produces a picture.
-            *announced = live;
-            return SharedFollowResult::Promote;
-        }
-        if (session_->viewer_finished()) {
-            return SharedFollowResult::Ended;
-        }
-        if (!session_->peer_alive()) {
-            *peer_left = true;
-            return SharedFollowResult::Ended;
-        }
-        const Error async = session_->async_error();
-        if (!async.ok()) {
-            *error = "transport: " + async.to_string();
-            return SharedFollowResult::Ended;
-        }
-        if (!sleep_unless_stopping(std::chrono::milliseconds(20))) {
-            break;
-        }
-    }
-    if (!live) {
-        return SharedFollowResult::Ended;
-    }
-
-    // Per-viewer control plane. Input, clipboard, chat, files, the
-    // microphone, SAS and the relays run on this viewer's own connection;
-    // only capture, encoding and host-wide display changes belong to the
-    // publisher.
-    auto apply_pending_permissions = [&]() {
-        bool pending = false;
-        PermissionMask requested = 0;
-        {
-            std::lock_guard<std::mutex> lock(permission_mutex_);
-            pending = permission_update_pending_.exchange(false);
-            requested = pending_permissions_.load();
-        }
-        const bool policy_changed = sync_remote_policy();
-        if (!pending && !policy_changed) {
-            return;
-        }
-        Error applied = pending ? session_->set_permissions(requested) : Error::success();
-        if (!applied.ok()) {
-            if (applied.status() != Status::InvalidCall) {
-                log("permission update failed: " + applied.to_string());
-            }
-            return;
-        }
-        const PermissionMask now_mask = session_->permissions();
-        {
-            std::lock_guard<std::mutex> lock(status_mutex_);
-            status_.session_permissions = now_mask;
-        }
-        if ((now_mask & kPermissionInput) == 0) {
-            registry_->release_control(this);
-        }
-        const Error refreshed = session_->refresh_stream(info);
-        if (!refreshed.ok()) {
-            shared_send_failed_.store(true);
-        }
-        log("the session permissions are now " + permission_names(now_mask));
-    };
-    auto fold_shared = [&] {
-        stats.encoded = shared_frames_.load();
-        stats.keyframes = shared_keyframes_.load();
-        stats.bytes = shared_bytes_.load();
-        stats.audio_packets = shared_audio_packets_.load();
-        stats.audio_bytes = shared_audio_bytes_.load();
-        stats.audio_dropped = shared_audio_drops_.load();
-        stats.audio_active = info.audio.enabled && shared_audio_ready_.load() &&
-                             (session_->permissions() & kPermissionAudio) != 0;
-        stats.cursor_sent = shared_cursor_sent_.load();
-        stats.cursor_dropped = shared_cursor_drops_.load();
-    };
-
-    PortForwardRelay port_forward(*session_);
-    TerminalRelay terminal(*session_, settings_.allow_terminal_persist,
-                           [this] { touch_viewer_activity(); });
-    // A follower has no capturer to borrow an adapter from; the camera relay
-    // opens its own device instead.
-    CameraRelay camera(*session_, [] { return LUID{}; },
-                       CameraRelayConfig{settings_.codec, settings_.quality,
-                                         config_.encoder_backend,
-                                         settings_.framerate > 0 ? settings_.framerate : 30u});
-
-    auto last_publish = Clock::now();
-    const auto run_start = Clock::now();
-    const Clock::duration idle_timeout = idle_disconnect_timeout();
-    while (!stopping_.load()) {
-        const auto now = Clock::now();
-        // A follower shares the listener's run budget the same way a
-        // publisher does; without this it would outlive the run.
-        if (config_.run_seconds > 0.0 &&
-            std::chrono::duration<double>(now - run_start).count() >= config_.run_seconds) {
-            break;
-        }
-        if (idle_timeout > Clock::duration::zero() &&
-            now - last_viewer_activity_ >= idle_timeout) {
-            ++stats.idle_disconnects;
-            log("idle: no viewer activity for " + std::to_string(idle_disconnect_seconds()) +
-                " s; closing the session");
-            drain_peer(stats);
-            return SharedFollowResult::Ended;
-        }
-        apply_pending_permissions();
-        uint16_t switch_index = kDisplayAuto;
-        uint8_t follow_request = 0;
-        if (session_->take_display_follow_request(follow_request)) {
-            touch_viewer_activity();
-            if (!send_failed(session_->send_display_follow_state({
-                    0, follow_request == 0 ? DisplayFollowCode::Ok : DisplayFollowCode::Unsupported,
-                    follow_request == 0 ? "" : "display follow requires the shared stream owner"}),
-                    "display_follow_state")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        if (!handle_os_login_requests(stats, error, peer_left) ||
-            !handle_session_requests(stats, error, peer_left) || stopping_.load()) {
-            return SharedFollowResult::Ended;
-        }
-        if (session_->take_display_switch_request(switch_index)) {
-            touch_viewer_activity();
-            ++stats.display_switch_failures;
-            if (!send_failed(
-                    session_->send_display_switch_result(
-                        switch_index, DisplaySwitchCode::Busy,
-                        "the shared desktop is controlled by the viewer that owns the stream"),
-                    "send_display_switch_result")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        uint16_t modes_index = 0;
-        if (session_->take_list_display_modes_request(modes_index)) {
-            touch_viewer_activity();
-            DisplayModeList list;
-            list.display = modes_index;
-            list.code = DisplayModeCode::Busy;
-            list.reason =
-                "the shared desktop's modes are controlled by the viewer that owns the stream";
-            if (!send_failed(session_->send_display_modes(list), "send_display_modes")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        uint16_t mode_index = 0;
-        uint16_t mode_width = 0;
-        uint16_t mode_height = 0;
-        uint16_t mode_refresh = 0;
-        if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
-                                                    mode_refresh)) {
-            touch_viewer_activity();
-            ++stats.display_mode_failures;
-            if (!send_failed(
-                    session_->send_display_mode_result(
-                        mode_index, mode_width, mode_height, mode_refresh,
-                        DisplayModeCode::Busy,
-                        "the shared desktop's modes are controlled by the viewer that owns the stream"),
-                    "send_display_mode_result")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        StreamOptions options;
-        if (session_->take_stream_options_request(options)) {
-            touch_viewer_activity();
-            ++stats.stream_option_requests;
-            ++stats.stream_option_failures;
-            StreamOptionsResult result;
-            result.code = StreamOptionsCode::Failed;
-            result.codec = info.codec;
-            result.fps = info.framerate;
-            result.quality = StreamQuality::High;
-            result.reason =
-                "the shared stream's picture settings are controlled by the viewer that owns it";
-            if (!send_failed(session_->send_stream_options_result(result),
-                             "send_stream_options_result")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        bool privacy_requested = false;
-        if (session_->take_privacy_mode_request(privacy_requested)) {
-            touch_viewer_activity();
-            ++stats.privacy_mode_changes;
-            if (!send_failed(
-                    session_->send_privacy_mode_state(
-                        false, PrivacyModeCode::Denied,
-                        "privacy mode is controlled by the viewer that owns the shared stream"),
-                    "privacy_mode_state")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        DisplayControlRequest display_request;
-        if (session_->take_display_control_request(display_request)) {
-            touch_viewer_activity();
-            DisplayControlState denied;
-            denied.code = DisplayControlCode::Denied;
-            denied.reason =
-                "display control is controlled by the viewer that owns the shared stream";
-            if (!send_failed(session_->send_display_control_state(denied),
-                             "display_control_state")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        while (session_->take_sas_request()) {
-            touch_viewer_activity();
-            if (!send_sas_result(stats, error, peer_left)) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        HostControlRequest host_action;
-        while (session_->take_host_action_request(host_action)) {
-            touch_viewer_activity();
-            ++stats.host_actions;
-            ++stats.host_action_failures;
-            HostControlResult denied;
-            denied.action = host_action.action;
-            denied.code = HostActionCode::Busy;
-            denied.reason =
-                "host actions are controlled by the viewer that owns the stream";
-            if (!send_failed(session_->send_host_action_result(denied),
-                             "host_action_result")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        // Followers can read the shared policy with the corresponding grant.
-        // Writes still belong to the publisher until host-wide control is
-        // separated from ownership of the shared media source.
-        RemoteConfigRequest config_request;
-        while (session_->take_remote_config_request(config_request)) {
-            touch_viewer_activity();
-            ++stats.remote_config_requests;
-            RemoteConfigState state;
-            if ((session_->permissions() & kPermissionRemoteConfig) == 0) {
-                ++stats.remote_config_failures;
-                state.code = RemoteConfigCode::Denied;
-                state.reason = "remote configuration is not permitted by the host";
-            } else if (config_request.keys != 0) {
-                ++stats.remote_config_failures;
-                state.code = RemoteConfigCode::Busy;
-                state.reason =
-                    "host settings are controlled by the viewer that owns the stream";
-            }
-            {
-                std::lock_guard<std::mutex> lock(registry_->mutex);
-                state.flags = registry_->remote_settings_valid
-                                  ? remote_config_flags(registry_->remote_settings)
-                                  : remote_config_flags(settings_);
-            }
-            if (!send_failed(session_->send_remote_config_state(state),
-                             "remote_config_state")) {
-                return SharedFollowResult::Ended;
-            }
-        }
-        std::string chat_text;
-        while (session_->take_chat(chat_text)) {
-            touch_viewer_activity();
-            ++stats.chat_received;
-            log("chat: received " + std::to_string(chat_text.size()) + " bytes");
-            if (config_.chat_message) {
-                config_.chat_message(chat_text);
-            }
-        }
-        std::string injected_text;
-        while (session_->take_text_input(injected_text)) {
-            touch_viewer_activity();
-            ++stats.text_received;
-            log("text input: received " + std::to_string(injected_text.size()) +
-                " bytes");
-            if (config_.text_input) {
-                config_.text_input(injected_text);
-            }
-        }
-        {
-            std::deque<std::string> outbox;
-            {
-                std::lock_guard<std::mutex> lock(chat_mutex_);
-                outbox.swap(pending_chat_);
-            }
-            for (const std::string& text : outbox) {
-                Error sent = session_->send_chat(text);
-                if (!sent.ok()) {
-                    ++stats.send_errors;
-                    log("chat: send failed: " + sent.to_string());
-                    break;
-                }
-                ++stats.chat_sent;
-                log("chat: sent " + std::to_string(text.size()) + " bytes");
-            }
-        }
-        PortForwardRequest forward_request;
-        while (session_->take_port_forward_request(forward_request)) {
-            touch_viewer_activity();
-            const Error answered = session_->send_port_forward_result(
-                forward_request.forward_id, PortForwardCode::Ok);
-            if (!answered.ok()) {
-                log("port forward: cannot approve target " + forward_request.host + ":" +
-                    std::to_string(forward_request.port) + ": " + answered.to_string());
-                break;
-            }
-            log("port forward: approved " + forward_request.host + ":" +
-                std::to_string(forward_request.port));
-        }
-        PortForwardStop forward_stop;
-        while (session_->take_port_forward_stop(forward_stop)) {
-            touch_viewer_activity();
-            log("port forward: stopped with code " +
-                std::to_string(static_cast<int>(forward_stop.code)) +
-                (forward_stop.reason.empty() ? std::string() : ": " + forward_stop.reason));
-        }
-        for (const std::string& event : port_forward.pump()) {
-            log(event);
-        }
-        for (const std::string& event : terminal.pump()) {
-            log(event);
-        }
-        for (const std::string& event : camera.pump()) {
-            log(event);
-        }
-        drain_peer(stats);
-        poll_clipboard(now, stats);
-        poll_files(stats);
-        drain_microphone(stats);
-        handle_voice_call_requests(stats);
-        drain_voice_call(stats);
-        if (session_->take_keyframe_request()) {
-            registry_->request_desktop_keyframe();
-        }
-
-        ServerInfo next;
-        size_t index = 0;
-        std::string name;
-        uint64_t version = 0;
-        if (registry_->desktop_info_since(known_version, next, index, name, version)) {
-            known_version = version;
-            if (!send_failed(session_->refresh_stream(next), "refresh_stream")) {
-                return SharedFollowResult::Ended;
-            }
-            ++stats.stream_updates;
-            info = next;
-            publish_stream(next, index, name);
-            stats.target_bitrate = next.bitrate;
-            stats.framerate = next.framerate;
-            stats.audio_active = next.audio.enabled && shared_audio_ready_.load() &&
-                                 (session_->permissions() & kPermissionAudio) != 0;
-            if (next.source_width != 0) {
-                stats.resolution_percent = static_cast<uint16_t>(
-                    static_cast<uint64_t>(next.width) * 100 / next.source_width);
-            }
-        }
-
-        if (!registry_->has_desktop_publisher()) {
-            if (registry_->claim_desktop(self)) {
-                if (follower_registered) {
-                    registry_->remove_desktop_follower(this);
-                    follower_registered = false;
-                }
-                shared_send_failed_.store(false);
-                publish_stats(stats);
-                *announced = true;
-                return SharedFollowResult::Promote;
-            }
-            // Another follower took the role; its description arrives above.
-        }
-        if (shared_send_failed_.exchange(false)) {
-            *error = "the shared stream could not be sent to this viewer";
-            return SharedFollowResult::Ended;
-        }
-        if (session_->viewer_finished()) {
-            return SharedFollowResult::Ended;
-        }
-        if (!session_->peer_alive()) {
-            *peer_left = true;
-            return SharedFollowResult::Ended;
-        }
-        const Error async = session_->async_error();
-        if (!async.ok()) {
-            *error = "transport: " + async.to_string();
-            return SharedFollowResult::Ended;
-        }
-        if (now - last_publish >= std::chrono::milliseconds(500)) {
-            last_publish = now;
-            fold_shared();
-            publish_stats(stats);
-        }
-        if (!sleep_unless_stopping(std::chrono::milliseconds(10))) {
-            break;
-        }
-    }
-    return SharedFollowResult::Ended;
-}
-
-bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left,
-                                bool already_announced) {
-    *peer_left = false;
-    {
-        std::lock_guard<std::mutex> lock(chat_mutex_);
-        pending_chat_.clear();
-    }
     stats.audio_active = false;
     stats.privacy_mode_active = false;
     stats.privacy_mode_changes = 0;
@@ -2818,7 +2297,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     } block_input_guard{this, &stats};
     // The last scale the ladder asked for. A merged canvas may cap it lower,
     // and stats.resolution_percent reports what is actually encoded.
-    uint16_t resolution_request = 100;
     std::vector<DisplayInfo> attached = config_.displays();
     if (attached.empty()) {
         *error = "no displays are attached";
@@ -2897,13 +2375,129 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     CaptureConfig capture;
     capture.want_hdr = config_.want_hdr;
     capture.capture_cursor = config_.capture_cursor;
+    capture.backend = config_.capture_backend;
     capture.nv12.enabled = true;
     capture.nv12.colorimetry = Nv12Colorimetry::Bt601Limited;
 
-    std::unique_ptr<IDxgiCapturer> capturer;
+    DesktopStreamPool standalone_streams;
+    auto& streams = registry_ ? registry_->desktop_streams : standalone_streams;
+    // One policy participant per connection, retained across display changes.
+    auto quality_peer = streams.connect_quality(settings_.framerate, settings_.quality,
+                                                config_.adaptive_bitrate);
+    auto codec_peer = streams.connect_codecs(session_->decoding_codecs(), codec_vote(session_->codec_preference()),
+        session_->decoding_444(), session_->chroma_preference());
+    auto subscribe_display = [&](const DisplayInfo& display, const CaptureConfig& cfg,
+                                 std::string* failure) {
+        const auto key = L"display:" + display.device_name + L":" +
+            std::to_wstring(display.adapter_luid.HighPart) + L":" +
+            std::to_wstring(display.adapter_luid.LowPart);
+        return streams.subscribe(key, [&](std::string* out) {
+            return config_.capture_factory(display, cfg, out);
+        }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
+           {settings_.record_incoming, settings_.record_directory, config_.log});
+    };
+    auto subscribe_merged = [&](const std::vector<DisplayInfo>& displays,
+                                const CaptureConfig& cfg, std::string* failure) {
+        std::wstring key = L"merged:";
+        for (const auto& display : displays) {
+            key += display.device_name + L":" + std::to_wstring(display.adapter_luid.HighPart) +
+                L":" + std::to_wstring(display.adapter_luid.LowPart) + L":" +
+                std::to_wstring(display.rect.left) + L":" + std::to_wstring(display.rect.top) +
+                L":" + std::to_wstring(display.rect.right) + L":" +
+                std::to_wstring(display.rect.bottom) + L";";
+        }
+        return streams.subscribe(key, [&](std::string* out) {
+            return create_merged_capturer(displays, cfg, out);
+        }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
+           {settings_.record_incoming, settings_.record_directory, config_.log});
+    };
+
+    struct DesktopVideo {
+        uint32_t id = 0;
+        std::unique_ptr<IDxgiCapturer> capture;
+        std::unique_ptr<IVideoEncoder> encoder;
+        ServerInfo info;
+        Clock::time_point last_keyframe = Clock::now();
+        Clock::time_point recovery_at{};
+        bool encoder_recovery_only = false;
+        bool force_keyframe = true, have_input = false, resolution_fixed = false;
+        bool probe_pending = false, needs_resync = false, cursor_sent_once = false;
+        uint32_t extra_idrs = 0, frames_without_nv12 = 0, framerate = 30;
+        uint16_t resolution_request = 100, resolution_percent = 100;
+        uint32_t target_bitrate = 0;
+        ComPtr<ID3D11Texture2D> cached_nv12;
+        FrameInfo cached_frame;
+        CursorUpdate cursor_sent;
+        std::vector<EncodedPacket> packets;
+    } video;
+    std::map<uint32_t, DesktopVideo> other_videos;
+    bool multiple_streams = false, pumping_extra = false;
+    std::wstring selected_device;
+    std::function<bool()> publish_subscriptions;
+    uint32_t next_video_id = 1, video_round = 0;
+    auto& capturer = video.capture;
+    auto& encoder = video.encoder;
+    auto& stream_info = video.info;
+    auto& resolution_request = video.resolution_request;
+
+    struct SavedDisplaySubscription {
+        uint32_t id = 0;
+        DisplayInfo display;
+        uint16_t resolution_request = 100;
+        bool resolution_fixed = false;
+    };
+    struct SavedDisplaySubscriptions {
+        bool active = false;
+        std::vector<SavedDisplaySubscription> streams;  // focused stream first
+    } saved_display_subscriptions;
+    std::function<bool(std::string*)> restore_display_subscriptions;
+    auto remember_display_subscriptions = [&] {
+        if (saved_display_subscriptions.active || !multiple_streams) return;
+        // Merged capture already has a dedicated restoration path. This
+        // snapshot is for independent per-display subscriptions.
+        if ((capturer && capturer->merged()) ||
+            std::any_of(other_videos.begin(), other_videos.end(), [](const auto& item) {
+                return item.second.capture && item.second.capture->merged();
+            })) {
+            return;
+        }
+        saved_display_subscriptions.active = true;
+        if (capturer) {
+            saved_display_subscriptions.streams.push_back(
+                {video.id, capturer->display(), video.resolution_request,
+                 video.resolution_fixed});
+        }
+        for (const auto& [id, entry] : other_videos) {
+            if (entry.capture) {
+                saved_display_subscriptions.streams.push_back(
+                    {id, entry.capture->display(), entry.resolution_request,
+                     entry.resolution_fixed});
+            }
+        }
+    };
+    auto swap_video = [&](DesktopVideo& other) {
+        video.target_bitrate = stats.target_bitrate;
+        video.resolution_percent = stats.resolution_percent;
+        std::swap(video, other);
+        stats.target_bitrate = video.target_bitrate;
+        stats.framerate = static_cast<uint16_t>(video.framerate);
+        stats.resolution_percent = video.resolution_percent;
+    };
+    auto video_index = [&](const IDxgiCapturer& source) -> uint16_t {
+        return source.merged() ? kDisplayAll : static_cast<uint16_t>(find_display(attached, source.display()));
+    };
+    auto refresh_video = [&](const ServerInfo& info) -> Error {
+        if (multiple_streams && capturer) {
+            auto result = session_->refresh_display_stream({video.id, video_index(*capturer), info});
+            if (!result.ok()) return result;
+        }
+        // Legacy StreamInfo still carries connection-wide permissions/audio.
+        // Extra displays must never replace that description or those grants.
+        return pumping_extra ? Error::success() : session_->refresh_stream(info);
+    };
     if (merged_requested) {
         std::string merged_error;
-        capturer = create_merged_capturer(attached, capture, &merged_error);
+        capturer = subscribe_merged(attached, capture, &merged_error);
         if (!capturer) {
             // A mixed-adapter or oversized layout still lets the viewer in:
             // fall back to the host's default single display and say why.
@@ -2921,10 +2515,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             log("merged view unavailable (" + merged_error + "); falling back to display " +
                 std::to_string(display_index));
-            capturer = config_.capture_factory(attached[display_index], capture, error);
+            capturer = subscribe_display(attached[display_index], capture, error);
         }
     } else {
-        capturer = config_.capture_factory(attached[display_index], capture, error);
+        capturer = subscribe_display(attached[display_index], capture, error);
     }
     if (!capturer) {
         *error = "capturer creation failed: " + *error;
@@ -2933,12 +2527,14 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     if (!wait_for_usable_frame(*capturer, true, stopping_, std::chrono::seconds(30), error)) {
         return false;
     }
-    const FrameInfo& first = capturer->frame();
-    // `first` is a view into the capturer's frame and goes stale once a
-    // switch swaps the capturer; this is the only field read later.
+    const FrameInfo first = capturer->frame();
+    // Negotiation can replace the subscription's picture. Retain metadata
+    // by value before opening the encoder and building HelloAck.
     const bool initial_pointer_only = !first.desktop_updated;
     stats.resolution_percent = static_cast<uint16_t>(capturer->nv12_scale_percent());
     auto publish_current = [&](const ServerInfo& info) {
+        if (pumping_extra || !capturer) return;
+        selected_device = capturer->display().device_name;
         const size_t index =
             capturer->merged() ? size_t{0} : find_display(attached, capturer->display());
         publish_stream(info, index, streamed_display_name(*capturer));
@@ -2961,6 +2557,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             std::to_string(find_display(attached, capturer->display())) + " (" +
             display_name_utf8(capturer->display()) + ")");
     }
+    log(std::string("capture backend: ") + capturer->implementation());
 
     EncoderConfig encoder_config;
     encoder_config.codec = settings_.codec;
@@ -2971,16 +2568,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     encoder_config.width = first.nv12_width;
     encoder_config.height = first.nv12_height;
     encoder_config.backend = config_.encoder_backend;
-    const AdapterDevice adapter = capturer->adapter_device();
-    std::unique_ptr<IVideoEncoder> encoder =
-        config_.encoder_factory(adapter.device, encoder_config, error);
+    encoder = DesktopStreamPool::encoder(*capturer, encoder_config, error);
     if (!encoder) {
         *error = "encoder creation failed: " + *error;
         return false;
     }
     if (encoder->codec() != settings_.codec) {
-        log(std::string("the encoder fell back: requested ") + codec_name(settings_.codec) +
-            ", producing " + codec_name(encoder->codec()));
+        log(std::string("global codec negotiation selected ") + codec_name(encoder->codec()));
     }
     log("encoder: " + (encoder->implementation().empty() ? std::string("oneVPL")
                                                          : encoder->implementation()) +
@@ -3077,7 +2671,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // SendSAS(), which needs the service worker's LocalSystem token. Every
     // request is answered, and a refusal or platform failure stays local to
     // this action instead of ending the session. The body lives in
-    // send_sas_result() so a follower session serves the request too.
+    // send_sas_result() and is available to every authorized connection.
     auto send_sas = [&]() -> bool { return send_sas_result(stats, error, peer_left); };
     // The endpoint stays open for the whole session even if audio was denied
     // at approval: the operator can grant it back live, and rebuilding WASAPI
@@ -3086,23 +2680,24 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // canceller the audio that actually comes out of this machine.
     bool audio_started = false;
     bool audio_policy_enabled = settings_.allow_audio;
+    SharedLoopback standalone_audio;
+    auto& shared_audio = registry_ ? registry_->system_audio : standalone_audio;
     auto open_system_audio = [&] {
         if (!settings_.allow_audio || audio_capture) return;
         const bool audio_aec = settings_.audio_aec;
         if (audio_aec) {
-            audio_reference_ = std::make_shared<AudioReference>();
+            audio_reference_ = shared_audio.reference;
         }
         std::string audio_error;
-        if (config_.audio_capture) {
-            audio_capture = config_.audio_capture(&audio_error);
-        } else {
+        audio_capture = shared_audio.subscribe([&](std::string* failure) {
+            if (config_.audio_capture) return config_.audio_capture(failure);
             LoopbackCaptureConfig audio_config;
             audio_config.device_id = settings_.audio_device;
             audio_config.reference = audio_reference_;
             audio_config.echo_cancellation = audio_aec;
             audio_config.silence_gate_ms = config_.audio_silence_gate_ms;
-            audio_capture = create_loopback_capture(audio_config, &audio_error);
-        }
+            return create_loopback_capture(audio_config, failure);
+        }, &audio_error);
         if (audio_capture) {
             audio_info = audio_capture->info();
             log("audio: Opus " + std::to_string(audio_info.sample_rate / 1000u) + " kHz, " +
@@ -3115,49 +2710,27 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
     };
     open_system_audio();
+    DesktopStreamPool::reserve_audio(*capturer, bitrate_reserve(audio_info));
     stats.audio_active =
         audio_info.enabled && (granted_permissions & kPermissionAudio) != 0;
 
-    // The configured bitrate is the whole session's budget, audio included;
-    // the video encoder starts at what is left after reserving it. The
-    // controller only ever lowers that and later climbs back to it. The base
-    // stays fixed for the session: a viewer quality preset scales it, and a
-    // rebuilt encoder reuses it instead of reading back its own rate.
-    uint32_t base_video_budget =
-        video_budget(encoder->bitrate(), bitrate_reserve(audio_info));
-    uint32_t video_floor_bps = video_floor(encoder->bitrate());
-    const uint16_t configured_fps = static_cast<uint16_t>(encoder->framerate());
-    StreamCodecPreference codec_preference = StreamCodecPreference::Auto;
-    StreamQuality stream_quality = StreamQuality::High;
+    // Display services own quality and rate. These fields retain only this
+    // connection's requested options and pacing of its compressed queue.
+    const uint16_t configured_fps = std::clamp<uint16_t>(settings_.framerate ? settings_.framerate : 30, 1, 120);
+    StreamCodecPreference codec_preference = session_->codec_preference();
+    VideoChroma chroma_preference = session_->chroma_preference();
+    StreamQuality stream_quality = settings_.quality >= 1.5f ? StreamQuality::High :
+        settings_.quality >= 0.67f ? StreamQuality::Balanced : StreamQuality::Smooth;
     uint16_t stream_fps_cap = 0;
-    auto quality_budget = [&](StreamQuality quality) {
-        return std::max(
-            video_floor_bps,
-            static_cast<uint32_t>(static_cast<uint64_t>(base_video_budget) *
-                                  stream_quality_percent(quality) / 100u));
-    };
     auto fps_ceiling = [&]() -> uint16_t {
-        return stream_fps_cap == 0 ? configured_fps
-                                   : std::min(configured_fps, stream_fps_cap);
+        return stream_fps_cap == 0 ? configured_fps : std::min(configured_fps, stream_fps_cap);
     };
-    uint32_t framerate = encoder->framerate();
-    BitrateController abr(base_video_budget, video_floor_bps, configured_fps,
-                          resolution_request);
-    if (abr.ceiling_bps() != encoder->bitrate()) {
-        log("video budget " + std::to_string(abr.ceiling_bps() / 1000u) +
-            " kbps after reserving audio out of " + std::to_string(encoder->bitrate() / 1000u) +
-            " kbps");
-        // The announcement below reads the encoder, and it must describe the
-        // rate that is actually running.
-        Error trimmed = encoder->set_rate(abr.ceiling_bps(), framerate);
-        if (!trimmed.ok()) {
-            log("cannot apply the video budget: " + trimmed.to_string());
-        }
-    }
+    auto& framerate = video.framerate;
+    framerate = encoder->framerate();
     stats.target_bitrate = encoder->bitrate();
     stats.framerate = static_cast<uint16_t>(framerate);
 
-    ServerInfo stream_info =
+    stream_info =
         describe_stream(attached, *capturer, *encoder, first.width, first.height,
                         static_cast<uint16_t>(framerate), granted_permissions, audio_info,
                         settings_.allow_terminal_persist);
@@ -3165,40 +2738,15 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     if (config_.stream_announced) {
         config_.stream_announced(stream_info);
     }
-    if (already_announced) {
-        // This worker followed the previous publisher, so the transport
-        // already has a stream: replace its description with the one this
-        // capture produces. The old publisher's frames have stopped.
-        Error refreshed = session_->refresh_stream(stream_info);
-        if (!refreshed.ok()) {
-            if (refreshed.status() == Status::Unavailable ||
-                refreshed.status() == Status::WaitTimeout) {
-                *peer_left = true;
-            } else {
-                ++stats.send_errors;
-                *error = "refresh_stream: " + refreshed.to_string();
-            }
-            return false;
-        }
-        ++stats.stream_updates;
-    } else {
-        Error announced = session_->announce(stream_info);
-        if (!announced.ok()) {
-            *error = "announce: " + announced.to_string();
-            return false;
-        }
+    Error announced = session_->announce(stream_info);
+    if (!announced.ok()) {
+        *error = "announce: " + announced.to_string();
+        return false;
     }
     if (registry_ && adopted_ && approved_permissions_ != 0) {
-        // A promoted viewer may have joined view-only while the previous
-        // publisher held the control lease; the stream now exists, so the
-        // transport may accept the operator's later input grant.
+        // A viewer can join while another holds the input lease. Preserve
+        // its approved ceiling for a later operator grant.
         session_->set_permission_ceiling(approved_permissions_);
-    }
-    if (registry_ && desktop_publisher_) {
-        // Followers wait for this first description before announcing their
-        // own sessions; later updates travel through publish_stream().
-        desktop_info_ready_ = true;
-        publish_current(stream_info);
     }
     // A UI request made between sessions is applied once the stream exists:
     // set_permissions() is only valid after the announcement.
@@ -3292,7 +2840,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // so a fresh description is what makes a restore usable.
         stream_info.audio.enabled = audio_info.enabled;
         publish_current(stream_info);
-        Error refreshed = session_->refresh_stream(stream_info);
+        Error refreshed = refresh_video(stream_info);
         if (!refreshed.ok()) {
             if (refreshed.status() == Status::Unavailable ||
                 refreshed.status() == Status::WaitTimeout) {
@@ -3321,38 +2869,27 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     }
 
     const auto start = run_start_;
-    // The capture cadence follows the controller's frame rate; 0 disables
-    // pacing entirely (capture() then waits on the desktop itself).
-    auto frame_duration = [&](uint32_t fps) {
-        // settings_.framerate == 0 means the host did not ask for pacing; a
-        // viewer cap still needs it, or the cap would only reach the encoder.
-        return (settings_.framerate == 0 && stream_fps_cap == 0) || fps == 0
-                   ? Clock::duration::zero()
-                   : std::chrono::duration_cast<Clock::duration>(
-                         std::chrono::duration<double>(1.0 / static_cast<double>(fps)));
-    };
-    auto frame_interval = frame_duration(framerate);
-    auto next_frame_due = Clock::now() + frame_interval;
-    auto last_keyframe = Clock::now();
+    auto& last_keyframe = video.last_keyframe;
     const auto next_reannounce = start + std::chrono::seconds(2);
     bool reannounced = false;
-    bool force_keyframe = true;
+    auto& force_keyframe = video.force_keyframe;
     // After a resize, one extra IDR follows the forced one: StreamInfo and the
     // video frames travel on different QUIC streams, so the viewer can see the
     // first new-size frame before it knows the new size and has to drop it.
     // The second IDR is decodable once the announcement has landed.
-    uint32_t extra_idrs = 0;
-    bool have_input = false;
+    auto& extra_idrs = video.extra_idrs;
+    auto& have_input = video.have_input;
     // Keep the last valid GPU surface alive across an idle capture call.
     // A forced IDR must not depend on the desktop changing again.
-    ComPtr<ID3D11Texture2D> cached_nv12;
-    FrameInfo cached_frame;
+    auto& cached_nv12 = video.cached_nv12;
+    auto& cached_frame = video.cached_frame;
     // Set when the GPU refused a scale: the captured NV12 size then stays put
     // for the rest of the session instead of retrying on every sample.
-    bool resolution_fixed = false;
-    bool probe_pending = config_.resolution_probe_percent != 0;
-    uint32_t frames_without_nv12 = 0;
-    std::vector<EncodedPacket> packets;
+    auto& resolution_fixed = video.resolution_fixed;
+    auto& probe_pending = video.probe_pending;
+    probe_pending = config_.resolution_probe_percent != 0;
+    auto& frames_without_nv12 = video.frames_without_nv12;
+    auto& packets = video.packets;
 
     // Clipboard baseline: remember what the host clipboard held when the
     // session started and upload only changes after that, never its history.
@@ -3386,7 +2923,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         stats.audio_active = false;
         stream_info.audio = audio_info;
         publish_current(stream_info);
-        Error refreshed = session_->refresh_stream(stream_info);
+        Error refreshed = refresh_video(stream_info);
         if (!refreshed.ok()) {
             log("audio off: could not announce it: " + refreshed.to_string());
         }
@@ -3417,7 +2954,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             header.frame_samples = audio_info.frame_samples;
             header.channels = audio_info.channels;
             header.codec = audio_info.codec;
-            broadcast_audio(header, packet.data.data(), packet.data.size());
             if ((session_->permissions() & kPermissionAudio) == 0) {
                 continue;
             }
@@ -3473,23 +3009,24 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     };
 
     // The viewer microphone pipeline lives in the members implemented by
-    // drain_microphone(), so a follower session can serve it too.
+    // drain_microphone(), shared with the other session modes.
 
     // Pointer state. Desktop Duplication keeps the pointer out of the desktop
     // image, so the viewer is told the sprite and where it is; the sprite
     // travels once per shape id and later updates carry only the position.
     // The cadence comes from capture(): DXGI produces a frame for every
     // pointer move, so no timer is needed and an idle pointer costs nothing.
-    bool cursor_sent_once = false;
-    CursorUpdate cursor_sent;
+    auto& cursor_sent_once = video.cursor_sent_once;
+    auto& cursor_sent = video.cursor_sent;
     auto publish_cursor = [&]() {
-        if (!config_.capture_cursor) {
+        if (!config_.capture_cursor || !capturer) {
             return;
         }
-        const CursorInfo& info = capturer->cursor();
-        if (!info.position_valid) {
+        const auto snapshot = DesktopStreamPool::cursor_snapshot(*capturer);
+        if (!snapshot || !snapshot->position_valid) {
             return;
         }
+        const CursorInfo& info = *snapshot;
         const bool shape_known = info.shape_valid && info.content_id != 0;
         CursorUpdate update;
         update.visible = info.visible;
@@ -3521,7 +3058,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             update.x == cursor_sent.x && update.y == cursor_sent.y) {
             return;
         }
-        Error sent = session_->send_cursor(update);
+        Error sent = multiple_streams ? session_->send_display_cursor({video.id, update}) :
+                                       session_->send_cursor(update);
         if (!sent.ok()) {
             if (sent.status() == Status::WaitTimeout) {
                 // The control queue is full; the next frame carries the same
@@ -3542,14 +3080,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         cursor_sent = std::move(update);
         cursor_sent_once = true;
-        broadcast_cursor(cursor_sent);
     };
 
     // Physical display privacy and management. Both paths rebuild the stream
     // through the same proof: the new output must produce an NV12 texture and
-    // a hardware-encoded key frame before anything is announced. There is no
-    // CPU or GDI fallback, and a virtual output that fails is rolled back to
-    // the original layout instead of being shown as a degraded stream.
+    // a hardware-encoded key frame before anything is announced. Auto capture
+    // may use the GDI uploader when DXGI is unavailable; a virtual output that
+    // still fails is rolled back instead of being announced as usable.
     std::wstring privacy_original_device;
     bool privacy_original_merged = false;
     // Set when the rebuilt stream could not be announced; retrying cannot
@@ -3582,8 +3119,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return false;
         }
         std::unique_ptr<IDxgiCapturer> next =
-            merged ? create_merged_capturer(fresh, capture, failure)
-                   : config_.capture_factory(fresh[target], capture, failure);
+            merged ? subscribe_merged(fresh, capture, failure)
+                   : subscribe_display(fresh[target], capture, failure);
         if (!next) {
             return false;
         }
@@ -3603,13 +3140,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         const uint16_t next_effective_percent =
             static_cast<uint16_t>(next->nv12_scale_percent());
-        const FrameInfo& frame = next->frame();
+        const FrameInfo frame = next->frame();
         EncoderConfig next_config = encoder_config;
         next_config.width = frame.nv12_width;
         next_config.height = frame.nv12_height;
-        const AdapterDevice next_adapter = next->adapter_device();
         std::unique_ptr<IVideoEncoder> next_encoder =
-            config_.encoder_factory(next_adapter.device, next_config, failure);
+            DesktopStreamPool::encoder(*next, next_config, failure);
         if (!next_encoder) {
             return false;
         }
@@ -3641,7 +3177,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         // The proof frame is discarded. The first transmitted frame is a new
         // IDR at the normal stream timestamp and follows the new StreamInfo.
-        // `frame` points into the capturer the move below hands to `capturer`.
+        // `frame` preserves the source dimensions across the subscription swap.
+        const bool new_subscription = !capturer;
         capturer = std::move(next);
         encoder = std::move(next_encoder);
         attached = std::move(fresh);
@@ -3661,11 +3198,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                                       static_cast<uint16_t>(framerate),
                                       session_->permissions(), audio_info,
                                       settings_.allow_terminal_persist);
+        if (multiple_streams && new_subscription) video.id = next_video_id++;
+        if (multiple_streams && publish_subscriptions && !publish_subscriptions()) return false;
         publish_current(stream_info);
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
         }
-        Error refreshed = session_->refresh_stream(stream_info);
+        Error refreshed = refresh_video(stream_info);
         if (!refreshed.ok()) {
             privacy_publish_failed = true;
             if (refreshed.status() == Status::Unavailable ||
@@ -3711,7 +3250,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         privacy_active = false;
         stats.privacy_mode_active = false;
-        return privacy_capture({}, true, failure);
+        if (!privacy_capture({}, true, failure)) return false;
+        return !restore_display_subscriptions || restore_display_subscriptions(failure);
     };
     set_privacy_mode = [&](bool wanted) -> bool {
         if (wanted && managed_displays.backend) {
@@ -3759,8 +3299,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             ++stats.privacy_mode_changes;
             return send_privacy_state(false, PrivacyModeCode::Failed, failure);
         }
-        privacy_original_device = capturer->display().device_name;
-        privacy_original_merged = capturer->merged();
+        remember_display_subscriptions();
+        privacy_original_device = capturer ? capturer->display().device_name : selected_device;
+        privacy_original_merged = capturer ? capturer->merged() : stream_info.merged;
         if (!virtual_privacy) {
             virtual_privacy = std::make_unique<VirtualDisplayPrivacy>(
                 make_display_privacy_backend(settings_.virtual_display_resolution,
@@ -3781,7 +3322,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             encoder.reset();
             capturer.reset();
             std::string stream_error;
-            if (!privacy_capture({}, true, &stream_error)) {
+            if (!privacy_capture({}, true, &stream_error) ||
+                (restore_display_subscriptions &&
+                 !restore_display_subscriptions(&stream_error))) {
                 *error = failure + "; stream recovery: " + stream_error;
                 return false;
             }
@@ -3878,7 +3421,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         managed_displays.backend.reset();
         privacy_original_device = managed_original_device;
         privacy_original_merged = managed_original_merged;
-        return privacy_capture({}, true, failure);
+        if (!privacy_capture({}, true, failure)) return false;
+        return !restore_display_subscriptions || restore_display_subscriptions(failure);
     };
     auto control_displays = [&](const DisplayControlRequest& request) -> bool {
         if (request.action == DisplayControlAction::Query) {
@@ -3961,14 +3505,15 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if (!backend->arm(&failure)) {
                 return send_display_control(DisplayControlCode::Failed, failure);
             }
-            managed_original_device = capturer->display().device_name;
-            managed_original_merged = capturer->merged();
+            remember_display_subscriptions();
+            managed_original_device = capturer ? capturer->display().device_name : selected_device;
+            managed_original_merged = capturer ? capturer->merged() : stream_info.merged;
             managed_displays.backend = std::move(backend);
         }
-        privacy_original_device = capturer->display().device_name;
-        privacy_original_merged = capturer->merged();
+        privacy_original_device = capturer ? capturer->display().device_name : selected_device;
+        privacy_original_merged = capturer ? capturer->merged() : stream_info.merged;
         std::wstring streamed_virtual_identity;
-        if (!capturer->merged()) {
+        if (capturer && !capturer->merged()) {
             for (const auto& item : display_identities) {
                 if (virtual_display_device_name(item.second) == privacy_original_device) {
                     streamed_virtual_identity = item.second;
@@ -3993,7 +3538,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                                                                 &failure);
         }
         // Prove capture/conversion/hardware encoding for each active virtual
-        // output before reporting success; never substitute CPU frames.
+        // output before reporting success. Auto capture may upload a GDI frame
+        // when Desktop Duplication is temporarily unavailable.
         if (changed) {
             for (const std::wstring& monitor : monitors) {
                 if (!privacy_capture(monitor, false, &failure)) {
@@ -4034,7 +3580,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return send_display_control(DisplayControlCode::Ok, {});
     };
 
-    auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms, bool idle = false) -> bool {
+    auto& video_needs_resync = video.needs_resync;
+    auto process_frame = [&](uint64_t pts_ms, bool idle = false) -> bool {
         const FrameInfo& frame = idle ? cached_frame : capturer->frame();
         if (!frame.nv12_texture) {
             have_input = false;
@@ -4090,17 +3637,25 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 continue;
             }
             FrameHeader header;
+            header.stream_id = video.id;
             header.pts_ms = packet.pts_ms;
             header.width = encoder->width();
             header.height = encoder->height();
             header.codec = encoder->codec();
+            header.chroma = encoder->chroma();
             header.keyframe = packet.keyframe;
             header.idr = packet.idr;
-            header.capture_ms = capture_ms;
-            Error sent = session_->send_frame(header, packet.data.data(), packet.data.size());
+            // Preserve service capture time through a slow subscriber's queue.
+            header.capture_ms = DesktopStreamPool::capture_time(*capturer) & 0xFFFFFFFFFFFFull;
+            Error sent = session_->send_frame_nowait(header, packet.data.data(), packet.data.size());
             if (!sent.ok()) {
-                if (sent.status() == Status::Unavailable ||
-                    sent.status() == Status::WaitTimeout) {
+                if (sent.status() == Status::WaitTimeout) {
+                    // The compressed reference chain may now have a hole.
+                    // Resume this subscription with an IDR once it can send.
+                    video_needs_resync = true;
+                    return true;
+                }
+                if (sent.status() == Status::Unavailable) {
                     *peer_left = true;
                 } else {
                     ++stats.send_errors;
@@ -4108,7 +3663,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 }
                 return false;
             }
-            broadcast_video(header, packet.data.data(), packet.data.size());
             if (config_.packet) {
                 config_.packet(header, packet.data.data(), packet.data.size());
             }
@@ -4129,9 +3683,319 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
+    auto describe_video = [&](DesktopVideo& entry) {
+        const auto frame = entry.capture->frame();
+        entry.framerate = entry.encoder->framerate();
+        entry.target_bitrate = entry.encoder->bitrate();
+        entry.resolution_percent = static_cast<uint16_t>(entry.capture->nv12_scale_percent());
+        entry.info = describe_stream(attached, *entry.capture, *entry.encoder,
+            frame.width ? frame.width : entry.info.source_width,
+            frame.height ? frame.height : entry.info.source_height,
+            static_cast<uint16_t>(entry.framerate), session_->permissions(), audio_info,
+            settings_.allow_terminal_persist);
+    };
+    auto refresh_adapters = [&]() -> bool {
+        auto refresh = [&](DesktopVideo& entry) {
+            if (!entry.capture || entry.recovery_at != Clock::time_point{}) return true;
+            std::string failure;
+            auto replacement = DesktopStreamPool::encoder(*entry.capture, encoder_config, &failure);
+            if (!replacement) {
+                entry.encoder.reset(); entry.cached_nv12.reset(); entry.have_input = false;
+                entry.recovery_at = Clock::now() + std::chrono::seconds(1);
+                log("display encoder recovery pending: " + failure);
+                return true;
+            }
+            const bool changed = !entry.encoder || replacement->codec() != entry.encoder->codec() ||
+                replacement->chroma() != entry.encoder->chroma() ||
+                replacement->width() != entry.encoder->width() || replacement->height() != entry.encoder->height();
+            entry.encoder = std::move(replacement);
+            if (changed) { entry.force_keyframe = true; entry.cached_nv12.reset(); entry.have_input = false; }
+            describe_video(entry);
+            return true;
+        };
+        if (!refresh(video)) return false;
+        for (auto& [id, entry] : other_videos) if (!refresh(entry)) return false;
+        stats.target_bitrate = video.target_bitrate;
+        stats.framerate = static_cast<uint16_t>(framerate);
+        stats.resolution_percent = video.resolution_percent;
+        return true;
+    };
+    auto send_subscriptions = [&](uint32_t request_id, DisplaySwitchCode code,
+                                  const std::string& reason) -> bool {
+        CaptureDisplaysResult result;
+        result.request_id = request_id; result.code = code; result.reason = reason;
+        if (capturer) result.streams.push_back({video.id, video_index(*capturer), stream_info});
+        for (const auto& [id, entry] : other_videos)
+            result.streams.push_back({id, video_index(*entry.capture), entry.info});
+        auto sent = session_->send_capture_displays_result(result);
+        if (!sent.ok()) {
+            if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) *peer_left = true;
+            else *error = "display subscriptions: " + sent.to_string();
+            return false;
+        }
+        return true;
+    };
+    publish_subscriptions = [&] { return send_subscriptions(0, DisplaySwitchCode::Ok, {}); };
+    auto focus_video = [&](uint32_t id) {
+        const auto found = other_videos.find(id);
+        if (found == other_videos.end()) return;
+        DesktopVideo next = std::move(found->second);
+        other_videos.erase(found);
+        swap_video(next);
+        if (next.capture) other_videos.emplace(next.id, std::move(next));
+    };
+    auto topology_seen = attached;
+    auto topology_due = Clock::now();
+    bool recover_primary = false;
+    auto refresh_topology = [&](bool force) -> bool {
+        if (!multiple_streams || (!force && Clock::now() < topology_due)) return true;
+        topology_due = Clock::now() + std::chrono::milliseconds(300);
+        auto fresh = config_.displays();
+        if (fresh.size() > kMaxDisplayCount) fresh.resize(kMaxDisplayCount);
+        const bool changed = !same_display_layout(topology_seen, fresh);
+        if (!changed && !recover_primary) return true;
+        topology_seen = fresh;
+        const bool had_video = capturer || !other_videos.empty();
+        auto present = [&](const IDxgiCapturer& source) {
+            return source.merged() ? !fresh.empty() : find_display(fresh, source.display()) < fresh.size();
+        };
+        std::set<uint16_t> occupied;
+        if (capturer && present(*capturer)) occupied.insert(capturer->merged() ? kDisplayAll :
+            static_cast<uint16_t>(find_display(fresh, capturer->display())));
+        for (auto it = other_videos.begin(); it != other_videos.end();) {
+            const auto& source = *it->second.capture;
+            const auto index = source.merged() ? kDisplayAll : static_cast<uint16_t>(find_display(fresh, source.display()));
+            if (!present(source) || !occupied.insert(index).second) it = other_videos.erase(it);
+            else ++it;
+        }
+        if (capturer && !present(*capturer)) {
+            cached_nv12.reset(); encoder.reset(); capturer.reset(); have_input = false;
+        }
+        if (!capturer && !other_videos.empty()) focus_video(other_videos.begin()->first);
+        if (had_video && !capturer) recover_primary = true;
+        attached = fresh;
+        std::string fallback_error;
+        if (recover_primary && !fresh.empty()) {
+            auto primary = std::find_if(fresh.begin(), fresh.end(), [](const auto& d) { return d.primary; });
+            if (primary == fresh.end()) primary = fresh.begin();
+            DesktopVideo replacement;
+            if (!next_video_id) fallback_error = "video stream ID space exhausted";
+            else replacement.capture = subscribe_display(*primary, capture, &fallback_error);
+            if (replacement.capture && wait_for_usable_frame(*replacement.capture, true, stopping_,
+                    std::chrono::seconds(3), &fallback_error)) {
+                DesktopStreamPool::reserve_audio(*replacement.capture, bitrate_reserve(audio_info));
+                replacement.encoder = DesktopStreamPool::encoder(*replacement.capture, encoder_config, &fallback_error);
+                if (replacement.encoder) {
+                    replacement.id = next_video_id++;
+                    describe_video(replacement);
+                    swap_video(replacement);
+                    recover_primary = false;
+                    fallback_error.clear();
+                }
+            }
+        }
+        auto update = [&](DesktopVideo& entry) {
+            if (!entry.capture) return;
+            if (!entry.capture->merged()) {
+                const auto index = find_display(fresh, entry.capture->display());
+                if (index >= fresh.size()) return;
+                const auto& display = fresh[index];
+                bool rebuilt = false;
+                auto result = DesktopStreamPool::refresh_display(*entry.capture, display, &rebuilt);
+                if (rebuilt || !result.ok()) {
+                    entry.encoder.reset(); entry.cached_nv12.reset(); entry.have_input = false;
+                    entry.force_keyframe = true; entry.frames_without_nv12 = 0;
+                    entry.cursor_sent_once = false; entry.cursor_sent = {};
+                    entry.recovery_at = result.ok() ? Clock::time_point{} : Clock::now() + std::chrono::seconds(1);
+                }
+                entry.info.origin_x = display.rect.left; entry.info.origin_y = display.rect.top;
+            }
+            entry.info.displays.clear();
+            for (const auto& display : fresh) entry.info.displays.push_back({
+                display_name_utf8(display), display.rect.left, display.rect.top,
+                display.rect.right, display.rect.bottom, static_cast<uint16_t>(display.rotation_degrees), display.primary});
+        };
+        update(video);
+        for (auto& [id, entry] : other_videos) update(entry);
+        // The display list is connection state even while no video is selected.
+        if (!capturer) {
+            stream_info.displays.clear();
+            for (const auto& display : fresh) stream_info.displays.push_back({
+                display_name_utf8(display), display.rect.left, display.rect.top,
+                display.rect.right, display.rect.bottom, static_cast<uint16_t>(display.rotation_degrees), display.primary});
+        }
+        if (!send_subscriptions(0, DisplaySwitchCode::Ok, {})) return false;
+        const auto sent = session_->refresh_stream(stream_info);
+        if (!sent.ok()) { *error = "display topology: " + sent.to_string(); return false; }
+        publish_current(stream_info);
+        if (!fallback_error.empty()) log("display recovery pending: " + fallback_error);
+        return true;
+    };
+    publish_subscriptions = [&] {
+        topology_due = {};
+        if (!refresh_topology(true)) return false;
+        return send_subscriptions(0, DisplaySwitchCode::Ok, {});
+    };
+    auto capture_displays = [&](const CaptureDisplaysRequest& request) -> bool {
+        if (!multiple_streams) {
+            cursor_sent_once = false;
+            cursor_sent = {};
+        }
+        multiple_streams = true;
+        if (!refresh_topology(true)) return false;
+        const auto fresh = topology_seen;
+        std::vector<uint16_t> current;
+        auto index_in = [&](const IDxgiCapturer& source) -> uint16_t {
+            return source.merged() ? kDisplayAll : static_cast<uint16_t>(find_display(fresh, source.display()));
+        };
+        if (capturer) current.push_back(index_in(*capturer));
+        for (const auto& [id, entry] : other_videos) current.push_back(index_in(*entry.capture));
+        const auto wanted = select_capture_displays(current, request, fresh.size());
+        if (wanted.size() > kMaxDisplayCount)
+            return send_subscriptions(request.request_id, DisplaySwitchCode::Failed, "too many simultaneous display streams");
+        if (virtual_privacy && virtual_privacy->recovery_pending() && wanted != current)
+            return send_subscriptions(request.request_id, DisplaySwitchCode::Busy,
+                "turn off virtual display privacy before changing display subscriptions");
+        std::map<uint32_t, DesktopVideo> prepared;
+        std::string failure;
+        for (auto index : wanted) {
+            if (std::find(current.begin(), current.end(), index) != current.end()) continue;
+            if (!next_video_id) { failure = "video stream ID space exhausted"; break; }
+            DesktopVideo next;
+            next.id = next_video_id++;
+            next.capture = subscribe_display(fresh[index], capture, &failure);
+            if (!next.capture || !wait_for_usable_frame(*next.capture, true, stopping_,
+                    std::chrono::seconds(3), &failure)) break;
+            DesktopStreamPool::reserve_audio(*next.capture, bitrate_reserve(audio_info));
+            next.encoder = DesktopStreamPool::encoder(*next.capture, encoder_config, &failure);
+            if (!next.encoder) break;
+            failure.clear(); // failed codec candidates can precede a usable one
+            prepared.emplace(next.id, std::move(next));
+        }
+        if (!failure.empty()) {
+            prepared.clear(); // rollback global source restrictions before describing survivors
+            // Existing adapters will follow the surviving source's format on
+            // the next tick; a rejected request never removes a subscription.
+            return send_subscriptions(request.request_id, DisplaySwitchCode::Failed, failure);
+        }
+        attached = std::move(fresh);
+        recover_primary = false; // An explicit empty set must stay empty after a hotplug.
+        auto keep = [&](const IDxgiCapturer& source) {
+            const auto index = video_index(source);
+            return std::find(wanted.begin(), wanted.end(), index) != wanted.end();
+        };
+        for (auto it = other_videos.begin(); it != other_videos.end();)
+            if (!keep(*it->second.capture)) it = other_videos.erase(it); else ++it;
+        other_videos.merge(prepared);
+        if (capturer && !keep(*capturer)) {
+            cached_nv12.reset(); encoder.reset(); capturer.reset();
+            have_input = false;
+        }
+        if (!capturer && !other_videos.empty()) focus_video(other_videos.begin()->first);
+        if (!refresh_adapters()) return false;
+        if (!send_subscriptions(request.request_id, DisplaySwitchCode::Ok, {})) return false;
+        publish_current(stream_info);
+        return true;
+    };
+
+    restore_display_subscriptions = [&](std::string* failure) -> bool {
+        if (!saved_display_subscriptions.active) return true;
+
+        std::vector<DisplayInfo> fresh = config_.displays();
+        if (fresh.size() > kMaxDisplayCount) fresh.resize(kMaxDisplayCount);
+        multiple_streams = true;
+
+        if (saved_display_subscriptions.streams.empty()) {
+            cached_nv12.reset();
+            encoder.reset();
+            capturer.reset();
+            other_videos.clear();
+            have_input = false;
+            attached = std::move(fresh);
+            recover_primary = false;
+            stream_info.displays.clear();
+            for (const auto& display : attached) {
+                stream_info.displays.push_back(
+                    {display_name_utf8(display), display.rect.left, display.rect.top,
+                     display.rect.right, display.rect.bottom,
+                     static_cast<uint16_t>(display.rotation_degrees), display.primary});
+            }
+            saved_display_subscriptions = {};
+            if (!send_subscriptions(0, DisplaySwitchCode::Ok, {})) return false;
+            Error refreshed = session_->refresh_stream(stream_info);
+            if (!refreshed.ok()) {
+                *failure = "restore empty display subscription: " + refreshed.to_string();
+                return false;
+            }
+            return true;
+        }
+
+        std::map<uint32_t, DesktopVideo> rebuilt;
+        for (const SavedDisplaySubscription& saved : saved_display_subscriptions.streams) {
+            const auto target = std::find_if(fresh.begin(), fresh.end(), [&](const auto& display) {
+                return same_display_identity(saved.display, display);
+            });
+            if (target == fresh.end()) {
+                *failure = "previously subscribed display is not attached: " +
+                           display_name_utf8(saved.display);
+                return false;
+            }
+            DesktopVideo next;
+            next.id = saved.id;
+            next.resolution_request = saved.resolution_request;
+            next.resolution_fixed = saved.resolution_fixed;
+            next.capture = subscribe_display(*target, capture, failure);
+            if (!next.capture) return false;
+            if (next.resolution_request != 100) {
+                Error scaled = next.capture->set_nv12_scale(next.resolution_request);
+                if (!scaled.ok()) {
+                    *failure = "cannot restore display resolution: " + scaled.to_string();
+                    return false;
+                }
+            }
+            if (!wait_for_usable_frame(*next.capture, true, stopping_,
+                                       std::chrono::seconds(5), failure)) {
+                return false;
+            }
+            DesktopStreamPool::reserve_audio(*next.capture, bitrate_reserve(audio_info));
+            next.encoder = DesktopStreamPool::encoder(*next.capture, encoder_config, failure);
+            if (!next.encoder) return false;
+            rebuilt.emplace(next.id, std::move(next));
+        }
+
+        attached = std::move(fresh);
+        for (auto& [id, entry] : rebuilt) describe_video(entry);
+        const uint32_t focused_id = saved_display_subscriptions.streams.front().id;
+        auto focused = rebuilt.find(focused_id);
+        if (focused == rebuilt.end()) {
+            *failure = "the focused display subscription could not be restored";
+            return false;
+        }
+        DesktopVideo focused_video = std::move(focused->second);
+        rebuilt.erase(focused);
+        video = std::move(focused_video);
+        other_videos = std::move(rebuilt);
+        recover_primary = false;
+        stats.target_bitrate = video.target_bitrate;
+        stats.framerate = static_cast<uint16_t>(video.framerate);
+        stats.resolution_percent = video.resolution_percent;
+        selected_device = capturer->display().device_name;
+        saved_display_subscriptions = {};
+
+        if (!send_subscriptions(0, DisplaySwitchCode::Ok, {})) return false;
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            *failure = "restore display subscriptions: " + refreshed.to_string();
+            return false;
+        }
+        publish_current(stream_info);
+        log("restored the complete multi-display subscription set");
+        return true;
+    };
+
     // A viewer can ask for another output without reconnecting. The new
-    // capturer and encoder are built beside the running pair and swapped in
-    // only after both produced a picture, so a failed switch leaves the old
+    // subscription is prepared beside the running one and committed only
+    // after capture and encoding are ready, so a failed switch leaves the old
     // stream untouched. Runs on the host thread at the top of the loop.
     bool switched_once = false;
     Clock::time_point last_switch_at{};
@@ -4157,9 +4021,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return answer(code, reason);
         };
 
-        if ((session_->permissions() & kPermissionInput) == 0) {
-            return refuse(DisplaySwitchCode::Failed, "input control is disabled");
-        }
         // Overlay privacy masks the local screen but leaves capture running,
         // so it never blocks a switch. Virtual display privacy does: the
         // session is capturing the privacy output until the guardian restores
@@ -4200,7 +4061,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                           "display " + std::to_string(requested_index) + " is not attached");
         }
         bool already_streaming = false;
-        if (merged_target && capturer->merged()) {
+        if (capturer && merged_target && capturer->merged()) {
             // Members can move or change size without changing count, so the
             // union is compared too, not just the member count.
             const std::vector<DisplayInfo> members = merged_members(fresh, capturer->display());
@@ -4218,8 +4079,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             already_streaming = members.size() == capturer->merged_display_count() &&
                                 left == running.left && top == running.top &&
                                 right == running.right && bottom == running.bottom;
-        } else if (!merged_target && !capturer->merged()) {
-            already_streaming = fresh[target].device_name == capturer->display().device_name;
+        } else if (capturer && !merged_target && !capturer->merged()) {
+            already_streaming = same_display_identity(fresh[target], capturer->display());
         }
         if (already_streaming) {
             switched_once = true;
@@ -4230,17 +4091,33 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return answer(DisplaySwitchCode::Ok, std::string());
         }
 
+        if (multiple_streams && !merged_target) {
+            CaptureDisplaysRequest add;
+            add.add = {static_cast<uint16_t>(target)};
+            if (!capture_displays(add)) return false;
+            auto selected = std::find_if(other_videos.begin(), other_videos.end(), [&](const auto& entry) {
+                return same_display_identity(entry.second.capture->display(), fresh[target]);
+            });
+            if (selected != other_videos.end()) focus_video(selected->first);
+            if (!capturer || !same_display_identity(capturer->display(), fresh[target]))
+                return refuse(DisplaySwitchCode::Failed, "the requested display could not be subscribed");
+            ++stats.display_switches;
+            switched_once = true; last_switch_at = now;
+            publish_current(stream_info);
+            return answer(DisplaySwitchCode::Ok, {}) && refresh_video(stream_info).ok();
+        }
+
         std::string switch_error;
         std::unique_ptr<IDxgiCapturer> next;
         if (merged_target) {
-            next = create_merged_capturer(fresh, capture, &switch_error);
+            next = subscribe_merged(fresh, capture, &switch_error);
             if (!next) {
                 return refuse(DisplaySwitchCode::Failed,
                               "cannot merge " + std::to_string(fresh.size()) +
                                   " displays: " + switch_error);
             }
         } else {
-            next = config_.capture_factory(fresh[target], capture, &switch_error);
+            next = subscribe_display(fresh[target], capture, &switch_error);
             if (!next) {
                 return refuse(DisplaySwitchCode::Failed,
                               "cannot capture display " + std::to_string(target) + ": " +
@@ -4268,13 +4145,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // a later refusal must leave the running capture's state alone.
         const uint16_t next_effective_percent =
             static_cast<uint16_t>(next->nv12_scale_percent());
-        const FrameInfo& next_frame = next->frame();
+        DesktopStreamPool::reserve_audio(*next, bitrate_reserve(audio_info));
+        const FrameInfo next_frame = next->frame();
         EncoderConfig next_config = encoder_config;
         next_config.width = next_frame.nv12_width;
         next_config.height = next_frame.nv12_height;
-        const AdapterDevice next_adapter = next->adapter_device();
         std::unique_ptr<IVideoEncoder> next_encoder =
-            config_.encoder_factory(next_adapter.device, next_config, &switch_error);
+            DesktopStreamPool::encoder(*next, next_config, &switch_error);
         if (!next_encoder) {
             return refuse(DisplaySwitchCode::Failed,
                           "encoder creation failed: " + switch_error);
@@ -4320,7 +4197,14 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
 
         // Both sides are ready; swap and describe what now runs. `next_frame`
-        // points into the capturer the move below hands to `capturer`.
+        // preserves the source dimensions across the subscription swap.
+        if (multiple_streams) {
+            if (!next_video_id) return refuse(DisplaySwitchCode::Failed, "video stream ID space exhausted");
+            DesktopVideo previous;
+            swap_video(previous);
+            if (previous.capture) other_videos.emplace(previous.id, std::move(previous));
+            video.id = next_video_id++;
+        }
         capturer = std::move(next);
         encoder = std::move(next_encoder);
         attached = std::move(fresh);
@@ -4345,6 +4229,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                                       next_frame.height, static_cast<uint16_t>(framerate),
                                       session_->permissions(), audio_info,
                                       settings_.allow_terminal_persist);
+        if (multiple_streams && !send_subscriptions(0, DisplaySwitchCode::Ok, {})) return false;
         publish_current(stream_info);
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
@@ -4352,7 +4237,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (!answer(DisplaySwitchCode::Ok, std::string())) {
             return false;
         }
-        Error refreshed = session_->refresh_stream(stream_info);
+        Error refreshed = refresh_video(stream_info);
         if (!refreshed.ok()) {
             if (refreshed.status() == Status::Unavailable ||
                 refreshed.status() == Status::WaitTimeout) {
@@ -4383,7 +4268,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
 
     // Automatic display following. The viewer toggles it per session; the
     // host polls at a low rate and moves its capture through switch_display,
-    // so a followed switch has exactly the same rebuild, cooldown and refusal
+    // so a followed switch has exactly the same subscription, cooldown and refusal
     // rules as one the viewer asked for. A candidate must stay put for a
     // moment before it is taken, so a pointer crossing two outputs quickly
     // cannot trigger two rebuilds.
@@ -4423,7 +4308,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         answer_list.display = requested_index;
         std::vector<DisplayInfo> fresh = config_.displays();
         std::string list_error;
-        if (capturer->merged()) {
+        if (capturer && capturer->merged()) {
             answer_list.code = DisplayModeCode::Failed;
             answer_list.reason = "the merged view does not support single display modes";
         } else if (fresh.empty()) {
@@ -4552,6 +4437,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (mode_changed_once && now - last_mode_change_at < std::chrono::seconds(1)) {
             return answer(DisplayModeCode::Busy, "a display mode change just happened");
         }
+        if (!capturer) {
+            return refuse(DisplayModeCode::NotFound, "no desktop display is subscribed");
+        }
         if (capturer->merged()) {
             return refuse(DisplayModeCode::Failed,
                           "the merged view does not support single display modes");
@@ -4653,13 +4541,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (!rebuild_after_mode_change(*wanted, true, &mode_error)) {
             return rollback("the display produced no frame in the new mode: " + mode_error);
         }
-        const FrameInfo& mode_frame = capturer->frame();
+        const FrameInfo mode_frame = capturer->frame();
         EncoderConfig mode_config = encoder_config;
         mode_config.width = mode_frame.nv12_width;
         mode_config.height = mode_frame.nv12_height;
-        const AdapterDevice mode_adapter = capturer->adapter_device();
         std::unique_ptr<IVideoEncoder> mode_encoder =
-            config_.encoder_factory(mode_adapter.device, mode_config, &mode_error);
+            DesktopStreamPool::encoder(*capturer, mode_config, &mode_error);
         if (!mode_encoder) {
             return rollback("encoder creation failed: " + mode_error);
         }
@@ -4680,8 +4567,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
         }
 
-        // `mode_frame` points into the capturer, not the encoder, so it stays
-        // valid across the move below.
         encoder = std::move(mode_encoder);
         have_input = false;
         cached_nv12.reset();
@@ -4704,7 +4589,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (!answer(DisplayModeCode::Ok, std::string())) {
             return false;
         }
-        Error refreshed = session_->refresh_stream(stream_info);
+        Error refreshed = refresh_video(stream_info);
         if (!refreshed.ok()) {
             if (refreshed.status() == Status::Unavailable ||
                 refreshed.status() == Status::WaitTimeout) {
@@ -4727,19 +4612,17 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
-    // The viewer's own picture preferences. A codec change builds the
-    // replacement beside the running encoder and swaps only after it produced
-    // the requested family; quality and frame rate are set_rate calls that
-    // need no rebuild. Every request is answered exactly once.
-    bool codec_changed_once = false;
-    Clock::time_point last_codec_change_at{};
+    // Each viewer votes in the shared codec and quality policies. Candidate
+    // codecs are proved on every active display before committing; the actual
+    // family may differ from this viewer's preference. Quality and FPS changes
+    // use set_rate without rebuilding. Every request is answered exactly once.
     auto apply_stream_options = [&](const StreamOptions& options) -> bool {
         ++stats.stream_option_requests;
-        const auto now = Clock::now();
         auto answer = [&](StreamOptionsCode code, const std::string& reason) -> bool {
             StreamOptionsResult result;
             result.code = code;
             result.codec = encoder ? encoder->codec() : settings_.codec;
+            result.chroma = encoder ? encoder->chroma() : VideoChroma::Yuv420;
             result.fps = fps_ceiling();
             result.quality = stream_quality;
             result.reason = reason;
@@ -4762,139 +4645,71 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return answer(code, reason);
         };
 
-        const bool quality_change = options.quality != stream_quality;
         const bool cap_change = options.max_fps != stream_fps_cap;
-        const bool preference_change = options.codec != codec_preference;
+        const bool preference_change = options.codec != codec_preference || options.chroma != chroma_preference;
+        // Re-selecting the same preset is an intentional vote: another viewer
+        // may have changed global quality since this connection selected it.
+        const bool quality_change = options.quality != stream_quality || (!cap_change && !preference_change);
         if (!quality_change && !cap_change && !preference_change) {
             return answer(StreamOptionsCode::Ok, std::string());
         }
 
-        VideoCodec wanted_codec = encoder->codec();
-        bool codec_rebuild = false;
-        if (preference_change) {
-            if (options.codec == StreamCodecPreference::Auto) {
-                wanted_codec = settings_.codec;
-            } else if (options.codec == StreamCodecPreference::Hevc) {
-                wanted_codec = VideoCodec::Hevc;
-            } else if (options.codec == StreamCodecPreference::Av1) {
-                wanted_codec = VideoCodec::Av1;
-            } else {
-                wanted_codec = VideoCodec::H264;
-            }
-            codec_rebuild = wanted_codec != encoder->codec();
-        }
-        if (codec_rebuild && codec_changed_once &&
-            now - last_codec_change_at < std::chrono::seconds(1)) {
-            return refuse(StreamOptionsCode::Busy, "a codec change just happened");
-        }
-
-        // Work the new rate out on a copy first: a refused codec rebuild must
-        // leave the running stream exactly as it was.
-        BitrateController next_abr = abr;
-        bool rate_change = false;
-        if (cap_change) {
-            const uint16_t top = options.max_fps == 0
-                                     ? configured_fps
-                                     : std::min(configured_fps, options.max_fps);
-            rate_change = next_abr.set_top_framerate(top).changed || rate_change;
-        }
-        if (quality_change) {
-            rate_change =
-                next_abr.set_ceiling(quality_budget(options.quality)).changed || rate_change;
-        }
-
-        std::unique_ptr<IVideoEncoder> replacement;
-        if (codec_rebuild) {
-            EncoderConfig next_config = encoder_config;
-            next_config.codec = wanted_codec;
-            next_config.width = encoder->width();
-            next_config.height = encoder->height();
-            // Start the replacement at the rate the stream runs at; runtimes
-            // that cannot reprogram a session would otherwise open it twice.
-            next_config.bitrate = next_abr.target_bps();
-            if (next_abr.framerate() != 0) {
-                next_config.framerate = next_abr.framerate();
-            }
-            const AdapterDevice codec_adapter = capturer->adapter_device();
-            std::string codec_error;
-            replacement = config_.encoder_factory(codec_adapter.device, next_config, &codec_error);
-            if (!replacement) {
-                const bool unsupported =
-                    options.codec == StreamCodecPreference::Hevc ||
-                    options.codec == StreamCodecPreference::Av1;
-                return refuse(unsupported ? StreamOptionsCode::Unsupported
-                                          : StreamOptionsCode::Failed,
-                              "encoder creation failed: " + codec_error);
-            }
-            if (options.codec != StreamCodecPreference::Auto &&
-                replacement->codec() != wanted_codec) {
-                log(std::string("the encoder fell back: requested ") +
-                    codec_name(wanted_codec) + ", producing " +
-                    codec_name(replacement->codec()));
-                return refuse(StreamOptionsCode::Unsupported,
-                              std::string("the host cannot produce ") +
-                                  codec_name(wanted_codec));
-            }
-            const uint16_t target_fps = next_abr.framerate();
-            if (replacement->bitrate() != next_abr.target_bps() ||
-                (target_fps != 0 && replacement->framerate() != target_fps)) {
-                Error rated = replacement->set_rate(next_abr.target_bps(), target_fps);
-                if (!rated.ok()) {
-                    return refuse(StreamOptionsCode::Failed,
-                                  "cannot apply the current bitrate: " + rated.to_string());
-                }
-            }
+        if (!capturer || !encoder) {
+            std::string failure;
+            if (!DesktopStreamPool::vote_peer(*codec_peer, codec_vote(options.codec), &failure, options.chroma))
+                return refuse(StreamOptionsCode::Failed, failure);
+            quality_peer->options(options.max_fps, quality_change
+                ? std::optional<VideoQos::Quality>(options.quality == StreamQuality::High ? VideoQos::Quality::High :
+                    options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced : VideoQos::Quality::Smooth)
+                : std::nullopt);
+            codec_preference = options.codec;
+            chroma_preference = options.chroma;
+            stream_quality = options.quality;
+            stream_fps_cap = options.max_fps;
+            return answer(StreamOptionsCode::Ok, {});
         }
 
         bool applied = false;
-        // A replacement encoder always starts from a fresh reference state;
-        // only set_rate on the running encoder can report a continued
-        // sequence that needs no IDR.
-        bool keyframe_required = true;
-        if (replacement) {
-            encoder = std::move(replacement);
-            abr = next_abr;
-            encoder_config.codec = options.codec == StreamCodecPreference::Auto
-                                       ? settings_.codec
-                                       : wanted_codec;
-            codec_preference = options.codec;
-            codec_changed_once = true;
-            last_codec_change_at = now;
-            // A new encoder starts from a fresh reference state. Two IDRs let
-            // the viewer decode once it applied the StreamInfo announcing the
-            // codec change.
-            have_input = false;
-            cached_nv12.reset();
-            extra_idrs = 1;
-            applied = true;
-        } else if (rate_change) {
-            Error rated = encoder->set_rate(next_abr.target_bps(), next_abr.framerate(),
-                                            &keyframe_required);
-            if (!rated.ok()) {
-                return refuse(StreamOptionsCode::Failed,
-                              "cannot apply the current bitrate: " + rated.to_string());
+        bool keyframe_required = false;
+        const auto previous_rate = encoder->bitrate();
+        const auto previous_fps = encoder->framerate();
+        if (preference_change) {
+            std::string codec_error;
+            auto wanted = encoder_config;
+            wanted.chroma = options.chroma;
+            auto replacement = DesktopStreamPool::vote_codec(*capturer, wanted,
+                codec_vote(options.codec), &codec_error);
+            if (!replacement) return refuse(StreamOptionsCode::Failed, codec_error);
+            keyframe_required = replacement->codec() != encoder->codec() || replacement->chroma() != encoder->chroma() ||
+                replacement->width() != encoder->width() || replacement->height() != encoder->height();
+            if (keyframe_required) {
+                encoder = std::move(replacement);
+                have_input = false;
+                cached_nv12.reset();
+                extra_idrs = 1;
+                applied = true;
             }
-            abr = next_abr;
-            applied = true;
-        } else if (preference_change) {
-            // No rebuild was needed, but later capture rebuilds must follow
-            // the preference that just became current.
-            encoder_config.codec = options.codec == StreamCodecPreference::Auto
-                                       ? settings_.codec
-                                       : wanted_codec;
+            encoder_config.codec = encoder->codec();
+            encoder_config.chroma = encoder->chroma();
             codec_preference = options.codec;
+            chroma_preference = options.chroma;
         }
 
+        quality_peer->options(options.max_fps, quality_change
+            ? std::optional<VideoQos::Quality>(options.quality == StreamQuality::High ? VideoQos::Quality::High :
+                options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced : VideoQos::Quality::Smooth)
+            : std::nullopt);
+        auto shared_rate = encoder->set_rate(0, 0);
+        if (!shared_rate.ok()) log("shared video rate: " + shared_rate.to_string());
+        applied = applied || encoder->bitrate() != previous_rate || encoder->framerate() != previous_fps;
         stream_quality = options.quality;
         stream_fps_cap = options.max_fps;
 
         if (applied) {
             ++stats.stream_option_changes;
             stats.target_bitrate = encoder->bitrate();
-            stats.framerate = static_cast<uint16_t>(abr.framerate());
-            framerate = abr.framerate();
-            frame_interval = frame_duration(framerate);
-            next_frame_due = now + frame_interval;
+            stats.framerate = static_cast<uint16_t>(encoder->framerate());
+            framerate = encoder->framerate();
             force_keyframe = force_keyframe || keyframe_required;
             stream_info =
                 describe_stream(attached, *capturer, *encoder, stream_info.source_width,
@@ -4918,7 +4733,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return false;
         }
         if (applied) {
-            Error refreshed = session_->refresh_stream(stream_info);
+            Error refreshed = refresh_video(stream_info);
             if (!refreshed.ok()) {
                 if (refreshed.status() == Status::Unavailable ||
                     refreshed.status() == Status::WaitTimeout) {
@@ -4935,158 +4750,67 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
-    // Twice a second: link telemetry for the tray, and the bitrate decision
-    // that follows from it. Runs on the host thread between frames so the
-    // encoder reset set_rate performs cannot overlap an encode call. The
-    // cadence is what bounds how long an unwanted capacity step goes
-    // unnoticed; the controller still gates cuts with its own cooldowns.
+    // Network observations belong to this connection; only the host-wide QoS
+    // policy changes display encoders. A fast viewer cannot overwrite a slow
+    // viewer's limit, and a display switch keeps the same policy participant.
     auto last_link_sample = Clock::now();
     uint64_t last_sample_bytes = stats.bytes;
-    uint64_t last_sent_packets = 0;
-    uint64_t last_lost_packets = 0;
+    uint64_t qos_replies = 0;
+    uint64_t video_replies = 0;
     auto sample_link = [&](Clock::time_point now) -> bool {
-        const uint32_t elapsed_ms = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_link_sample)
-                .count());
-        if (elapsed_ms == 0) {
-            return true;
-        }
-        const uint64_t byte_delta =
-            stats.bytes >= last_sample_bytes ? stats.bytes - last_sample_bytes : 0;
-        // bytes * 8 / milliseconds is exactly kilobits per second.
-        stats.send_kbps =
-            static_cast<double>(byte_delta) * 8.0 / static_cast<double>(elapsed_ms);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_link_sample).count();
+        if (elapsed <= 0) return true;
+        stats.send_kbps = static_cast<double>(stats.bytes - last_sample_bytes) * 8.0 / elapsed;
         last_sample_bytes = stats.bytes;
         last_link_sample = now;
-
-        const TransportStats transport = session_->transport_stats();
-        if (!transport.available) {
-            return true;
+        const auto transport = session_->transport_stats();
+        if (transport.available) {
+            stats.rtt_ms = static_cast<double>(transport.rtt_us) / 1000;
+            stats.min_rtt_ms = static_cast<double>(transport.min_rtt_us) / 1000;
         }
-        stats.rtt_ms = static_cast<double>(transport.rtt_us) / 1000.0;
-        stats.min_rtt_ms = static_cast<double>(transport.min_rtt_us) / 1000.0;
-        const uint64_t sent_delta = transport.sent_packets >= last_sent_packets
-                                        ? transport.sent_packets - last_sent_packets
-                                        : 0;
-        const uint64_t lost_delta = transport.lost_packets >= last_lost_packets
-                                        ? transport.lost_packets - last_lost_packets
-                                        : 0;
-        last_sent_packets = transport.sent_packets;
-        last_lost_packets = transport.lost_packets;
-        if (!config_.adaptive_bitrate) {
-            return true;
+        const auto latency = session_->latency();
+        stats.application_rtt_ms = static_cast<double>(latency.rtt_us) / 1000;
+        stats.qos_probe_replies = latency.replies;
+        stats.video_delivery_ms = static_cast<double>(latency.video_delay_us) / 1000;
+        stats.video_pending_ms = static_cast<double>(latency.video_pending_us) / 1000;
+        stats.video_receipts = latency.video_replies;
+        stats.video_pending_frames = latency.video_pending_frames;
+        // Do not keep an old video delay alive on a static desktop. A fresh
+        // receipt or outstanding frame participates alongside the probe.
+        const auto video_delay = latency.video_replies != video_replies ? latency.video_delay_us : 0;
+        const auto delay = std::max({latency.rtt_us, video_delay, latency.video_pending_us});
+        quality_peer->feedback(static_cast<uint32_t>(std::min<uint64_t>(delay / 1000, UINT32_MAX)),
+                               std::max(latency.pending_us, latency.video_pending_us) / 1000,
+                               latency.replies != qos_replies || latency.video_replies != video_replies);
+        qos_replies = latency.replies;
+        video_replies = latency.video_replies;
+        auto probed = session_->send_latency_probe();
+        if (!probed.ok() && !session_->peer_alive()) {
+            *peer_left = true;
+            return false;
         }
-
-        BitrateSample sample;
-        sample.rtt_us = transport.rtt_us;
-        sample.min_rtt_us = transport.min_rtt_us;
-        sample.queued_bytes = transport.queued_bytes;
-        sample.congestion_window = transport.congestion_window;
-        sample.sent_bytes = transport.send_bytes;
-        sample.lost_packets = transport.lost_packets;
-        sample.sent_packets = transport.sent_packets;
-        const BitrateDecision decision = abr.update(sample, elapsed_ms);
-        if (!decision.changed) {
-            return true;
+        if (!encoder) return true;
+        auto rated = encoder->set_rate(0, 0); // synchronizes the shared decision
+        if (!rated.ok()) log("shared video rate: " + rated.to_string());
+        UINT rate = 0, fps = 0;
+        if (!DesktopStreamPool::read_rate(*encoder, rate, fps)) { publish_stats(stats); return true; }
+        if (rate == stats.target_bitrate && fps == stats.framerate) { publish_stats(stats); return true; }
+        stats.target_bitrate = rate;
+        stats.framerate = static_cast<uint16_t>(fps);
+        if (!stats.lowest_target_bitrate || rate < stats.lowest_target_bitrate) stats.lowest_target_bitrate = rate;
+        ++stats.abr_changes;
+        framerate = fps;
+        stream_info.bitrate = rate;
+        stream_info.framerate = static_cast<uint16_t>(fps);
+        publish_current(stream_info);
+        auto refreshed = refresh_video(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable || refreshed.status() == Status::WaitTimeout)
+                *peer_left = true;
+            else *error = "refresh shared video rate: " + refreshed.to_string();
+            return false;
         }
-        const bool rate_changed = decision.target_bps != stats.target_bitrate ||
-                                  decision.framerate != stats.framerate;
-        // The ladder names a rung; a merged canvas may not be able to reach it.
-        // Compare against the request, not the effective scale, or the host
-        // would retry the same capped change every second.
-        const bool size_changed =
-            !resolution_fixed && decision.resolution_percent != resolution_request;
-        if (!rate_changed && !size_changed) {
-            return true;
-        }
-
-        if (rate_changed) {
-            bool keyframe_required = true;
-            Error applied =
-                encoder->set_rate(decision.target_bps, decision.framerate, &keyframe_required);
-            if (!applied.ok()) {
-                log("adaptive bitrate: cannot apply " +
-                    std::to_string(decision.target_bps / 1000u) + " kbps at " +
-                    std::to_string(decision.framerate) + " fps after " + decision.reason + ": " +
-                    applied.to_string());
-                return true;
-            }
-            stats.target_bitrate = decision.target_bps;
-            if (stats.lowest_target_bitrate == 0 ||
-                decision.target_bps < stats.lowest_target_bitrate) {
-                stats.lowest_target_bitrate = decision.target_bps;
-            }
-            stats.framerate = decision.framerate;
-            ++stats.abr_changes;
-            // The capture cadence has to follow the rate the encoder now
-            // divides its budget over, or every frame keeps a budget for a
-            // frame nobody sends. A pure bitrate step continues the coded
-            // sequence, so an IDR is only forced when the encoder says the
-            // references are gone.
-            force_keyframe = force_keyframe || keyframe_required;
-            framerate = decision.framerate;
-            frame_interval = frame_duration(framerate);
-            next_frame_due = now + frame_interval;
-        }
-
-        bool announce_now = true;
-        if (size_changed) {
-            Error scaled = capturer->set_nv12_scale(decision.resolution_percent);
-            if (!scaled.ok()) {
-                resolution_fixed = true;
-                log("adaptive resolution: cannot scale to " +
-                    std::to_string(decision.resolution_percent) +
-                    "%; staying at " + std::to_string(stats.resolution_percent) +
-                    "% for this session: " + scaled.to_string());
-            } else {
-                resolution_request = decision.resolution_percent;
-                const uint16_t effective =
-                    static_cast<uint16_t>(capturer->nv12_scale_percent());
-                if (effective != stats.resolution_percent) {
-                    stats.resolution_percent = effective;
-                    ++stats.resolution_changes;
-                    force_keyframe = true;
-                    extra_idrs = 1;
-                    // The frame loop rebuilds the encoder at the new captured
-                    // size and announces that description once the encoder
-                    // accepted it; announcing the intended size here could
-                    // disagree with what the encoder lands on.
-                    announce_now = false;
-                    log("adaptive resolution: " + std::string(decision.reason) + "; " +
-                        std::to_string(effective) + "% of the captured frame");
-                } else {
-                    log("adaptive resolution: " + std::string(decision.reason) +
-                        "; requested " + std::to_string(decision.resolution_percent) +
-                        "%, the canvas stays at " + std::to_string(effective) + "%");
-                }
-            }
-        }
-        if (announce_now) {
-            stream_info.bitrate = stats.target_bitrate;
-            stream_info.framerate = static_cast<uint16_t>(framerate);
-            publish_current(stream_info);
-            Error refreshed = session_->refresh_stream(stream_info);
-            if (!refreshed.ok()) {
-                if (refreshed.status() == Status::Unavailable ||
-                    refreshed.status() == Status::WaitTimeout) {
-                    *peer_left = true;
-                } else {
-                    ++stats.send_errors;
-                    *error = "refresh_stream: " + refreshed.to_string();
-                }
-                return false;
-            }
-            ++stats.stream_updates;
-        }
-        if (rate_changed) {
-            log("adaptive bitrate: " + std::string(decision.reason) + "; target " +
-                std::to_string(decision.target_bps / 1000u) + " kbps at " +
-                std::to_string(framerate) + " fps, RTT " +
-                std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms, loss " +
-                std::to_string(lost_delta) + "/" + std::to_string(sent_delta) +
-                " pkts, queued " + std::to_string(transport.queued_bytes) + " of cwnd " +
-                std::to_string(transport.congestion_window));
-        }
+        ++stats.stream_updates;
         publish_stats(stats);
         return true;
     };
@@ -5112,10 +4836,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return false;
         }
         reported_desktop = kind;
-        if (registry_ && desktop_publisher_) {
-            registry_->set_desktop_kind(kind);
-            broadcast_desktop_state(kind);
-        }
         return true;
     };
     // Follows the input desktop: a lock screen or UAC prompt moves input to a
@@ -5152,8 +4872,26 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             log("the input desktop is now " +
                 (status.name.empty() ? std::string("not Default") : "\"" + status.name + "\""));
         }
+        for (auto& [id, entry] : other_videos) {
+            auto rebuilt = entry.capture->reinitialize();
+            if (!rebuilt.ok()) {
+                if (!multiple_streams) { desktop_paused = true; return true; }
+                entry.recovery_at = Clock::now() + std::chrono::seconds(1);
+            } else entry.recovery_at = {};
+            entry.encoder.reset(); entry.cached_nv12.reset();
+            entry.have_input = false; entry.force_keyframe = true;
+            entry.cursor_sent_once = false; entry.cursor_sent = {};
+        }
+        if (!capturer) { desktop_paused = false; return true; }
         Error rebuilt = capturer->reinitialize();
         if (!rebuilt.ok()) {
+            if (multiple_streams) {
+                encoder.reset(); cached_nv12.reset(); have_input = false;
+                video.recovery_at = Clock::now() + std::chrono::seconds(1);
+                desktop_paused = false;
+                desktop_reinitialized = true;
+                return true;
+            }
             if (!desktop_paused) {
                 log("capture paused: cannot capture the current desktop yet: " +
                     rebuilt.to_string());
@@ -5166,11 +4904,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         desktop_paused = false;
         desktop_reinitialized = true;
+        video.recovery_at = {};
+        cursor_sent_once = false; cursor_sent = {};
         encoder.reset();
         have_input = false;
         cached_nv12.reset();
         force_keyframe = true;
-        next_frame_due = Clock::now();
         return true;
     };
     if (!sync_desktop(true)) {
@@ -5186,7 +4925,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (initial_pointer_only) {
             ++stats.pointer_only;
         }
-        if (!process_frame(0, capture_clock_ms(Clock::now()))) {
+        if (!process_frame(0)) {
             // A vanished viewer is a normal end, not a failure.
             const bool clean = error->empty();
             drain_peer(stats);
@@ -5203,14 +4942,333 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // The camera opens only when the viewer asks, and only if the host allows
     // cameras; it encodes on the capture adapter with its own device so it
     // never shares the capturer's immediate context.
+    const auto camera_adapter = capturer->adapter_device().luid;
     CameraRelay camera(
-        *session_, [&capturer] { return capturer->adapter_device().luid; },
+        *session_, [&capturer, camera_adapter] { return capturer ? capturer->adapter_device().luid : camera_adapter; },
         CameraRelayConfig{settings_.codec, settings_.quality, config_.encoder_backend,
-                          settings_.framerate > 0 ? settings_.framerate : 30u});
+                          settings_.framerate > 0 ? settings_.framerate : 30u,
+                          config_.cameras, config_.camera_capture_factory},
+        [&, peer = codec_peer, decoders = session_->decoding_codecs()](
+                const std::wstring& key, CameraRelay::CaptureFactory capture, std::string* failure) {
+            return CameraRelay::Subscription{{}, streams.subscribe(key, std::move(capture),
+                config_.encoder_factory, failure, {}, decoders, peer,
+                {settings_.record_incoming, settings_.record_directory, config_.log})};
+        });
+
+    auto pump_video = [&]() -> bool {
+        if (!capturer) return true;
+        if (video.recovery_at != Clock::time_point{}) {
+            if (Clock::now() < video.recovery_at) return true;
+            if (!video.encoder_recovery_only) {
+                auto result = capturer->reinitialize();
+                if (!result.ok()) { video.recovery_at = Clock::now() + std::chrono::seconds(1); return true; }
+            }
+            video.encoder_recovery_only = false;
+            video.recovery_at = {};
+            encoder.reset(); cached_nv12.reset(); have_input = false; force_keyframe = true;
+            cursor_sent_once = false; cursor_sent = {}; frames_without_nv12 = 0;
+        }
+        publish_cursor();
+        if (config_.keyframe_interval_ms > 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - last_keyframe).count() >=
+                static_cast<long long>(config_.keyframe_interval_ms)) force_keyframe = true;
+        if (multiple_streams && encoder) {
+            UINT rate = 0, fps = 0;
+            if (DesktopStreamPool::read_rate(*encoder, rate, fps) &&
+                (rate != stream_info.bitrate || fps != stream_info.framerate)) {
+                stream_info.bitrate = rate;
+                stream_info.framerate = static_cast<uint16_t>(fps);
+                framerate = fps; stats.target_bitrate = rate;
+                auto sent = refresh_video(stream_info);
+                if (!sent.ok()) { *error = sent.to_string(); return false; }
+            }
+        }
+        if (!session_->video_send_ready()) {
+            video_needs_resync = true;
+            return true;
+        }
+        if (video_needs_resync) {
+            DesktopStreamPool::discard_backlog(*capturer);
+            force_keyframe = true;
+            video_needs_resync = false;
+        }
+
+        // The display service already paces production. A second frame-rate
+        // sleep here would age its queued frames and delay control/QoS when
+        // weak links lower FPS. Readers wait briefly only when no frame exists.
+        const bool audio_active = audio_capture != nullptr;
+        if (force_keyframe) DesktopStreamPool::request_keyframe(*capturer);
+        const CaptureResult result = capturer->capture(
+            std::chrono::milliseconds(other_videos.empty() ? (audio_active ? 5 : 100) : 0));
+        // The endpoint keeps producing while capture waits for the next
+        // present; drain here so audio does not wait behind a slow frame.
+        drain_audio();
+        drain_microphone(stats);
+        handle_voice_call_requests(stats);
+        drain_voice_call(stats);
+        switch (result) {
+            case CaptureResult::NoNewFrame:
+                // A failed conversion leaves no NV12 behind. If the desktop
+                // stays quiet, no Frame event will advance the counter.
+                if (frames_without_nv12 > 0 && ++frames_without_nv12 >= 3) {
+                    *error = "capture produced no NV12 image for 3 frames";
+                    const Error& capture_error = capturer->last_error();
+                    if (!capture_error.ok()) {
+                        *error += ": " + capture_error.to_string();
+                    }
+                    drain_peer(stats);
+                    return false;
+                }
+                if (force_keyframe && have_input && encoder && cached_nv12) {
+                    const auto repeated_at = Clock::now();
+                    const uint64_t pts_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            repeated_at - start).count());
+                    if (!process_frame(pts_ms, true)) {
+                        drain_peer(stats);
+                        return error->empty();
+                    }
+                }
+                return true;
+            case CaptureResult::ReinitNeeded: {
+                log("reinitializing: " + capturer->last_error().to_string());
+                // The common cause is a desktop switch: the duplication was
+                // attached to the old desktop. Follow first, then rebuild.
+                if (!sync_desktop(false)) {
+                    const bool clean = error->empty();
+                    drain_peer(stats);
+                    return clean;
+                }
+                if (desktop_paused || desktop_reinitialized) {
+                    return true;
+                }
+                Error err = capturer->reinitialize();
+                if (!err.ok()) {
+                    if (multiple_streams) {
+                        log("display capture recovery pending: " + err.to_string());
+                        encoder.reset(); cached_nv12.reset(); have_input = false;
+                        video.recovery_at = Clock::now() + std::chrono::seconds(1);
+                        return true;
+                    }
+                    *error = "reinit failed: " + err.to_string();
+                    drain_peer(stats);
+                    return false;
+                }
+                encoder.reset();
+                have_input = false;
+                cached_nv12.reset();
+                force_keyframe = true;
+                // The rebuilt duplication has no frame yet; a quiet desktop is
+                // not the same as a broken NV12 conversion.
+                frames_without_nv12 = 0;
+                return true;
+            }
+            case CaptureResult::FatalError: {
+                const std::string failure = capturer->last_error().to_string();
+                log("capture failed: " + failure);
+                if (!sync_desktop(false)) {
+                    const bool clean = error->empty();
+                    drain_peer(stats);
+                    return clean;
+                }
+                if (desktop_paused || desktop_reinitialized) {
+                    return true;
+                }
+                if (multiple_streams) {
+                    encoder.reset(); cached_nv12.reset(); have_input = false;
+                    video.recovery_at = Clock::now() + std::chrono::seconds(1);
+                    return true;
+                }
+                *error = "capture failed: " + failure;
+                drain_peer(stats);
+                return false;
+            }
+            case CaptureResult::Frame:
+                break;
+        }
+
+        ++stats.frames;
+        const FrameInfo frame = capturer->frame();
+        if (!frame.desktop_updated) {
+            ++stats.pointer_only;
+        }
+        if (!encoder) {
+            // The capture rebuilt: the output may have moved, rotated or
+            // changed size, and the encoder may land on a different codec.
+            encoder_config.width = frame.nv12_width;
+            encoder_config.height = frame.nv12_height;
+            std::string encoder_error;
+            encoder = DesktopStreamPool::encoder(*capturer, encoder_config, &encoder_error);
+            if (!encoder) {
+                video.encoder_recovery_only = DesktopStreamPool::encoder_recovery_pending(*capturer);
+                if (multiple_streams || video.encoder_recovery_only) {
+                    video.recovery_at = Clock::now() + std::chrono::seconds(1);
+                    log("display encoder recovery pending: " + encoder_error);
+                    return true;
+                }
+                *error = "encoder recreation failed: " + encoder_error;
+                drain_peer(stats);
+                return false;
+            }
+            if (encoder->codec() != encoder_config.codec) {
+                log(std::string("the encoder fell back: requested ") +
+                    codec_name(encoder_config.codec) + ", producing " +
+                    codec_name(encoder->codec()));
+            }
+            // The service retained all viewer votes while capture rebuilt.
+            DesktopStreamPool::reserve_audio(*capturer, bitrate_reserve(audio_info));
+            stats.resolution_percent = static_cast<uint16_t>(capturer->nv12_scale_percent());
+            framerate = encoder->framerate();
+            stats.target_bitrate = encoder->bitrate();
+            stats.framerate = static_cast<uint16_t>(framerate);
+            const std::vector<DisplayInfo> refreshed = config_.displays();
+            // The output may have moved or been renumbered while capture was
+            // down; StreamInfo and the pointer origin must describe the list
+            // the viewer is about to receive.
+            if (!multiple_streams) attached = refreshed;
+            stream_info =
+                describe_stream(attached, *capturer, *encoder, frame.width, frame.height,
+                                static_cast<uint16_t>(framerate), session_->permissions(),
+                                audio_info, settings_.allow_terminal_persist);
+            publish_current(stream_info);
+            if (config_.stream_announced) {
+                config_.stream_announced(stream_info);
+            }
+            Error refreshed_err = refresh_video(stream_info);
+            if (!refreshed_err.ok()) {
+                if (refreshed_err.status() == Status::Unavailable ||
+                    refreshed_err.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                } else {
+                    *error = "refresh_stream: " + refreshed_err.to_string();
+                }
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
+            ++stats.stream_updates;
+            log("stream changed to " + std::to_string(stream_info.width) + "x" +
+                std::to_string(stream_info.height) + " at " +
+                std::to_string(stream_info.origin_x) + "," +
+                std::to_string(stream_info.origin_y) + "; re-announced");
+            force_keyframe = true;
+        }
+
+        // Adaptive resolution: the capture now publishes a smaller NV12 image
+        // than the encoder was built for. VPL fixes the coded size at session
+        // creation, so a size change is a new encoder -- built with the rate
+        // and frame rate the controller currently holds -- not a reset.
+        if (frame.nv12_texture &&
+            (frame.nv12_width != encoder->width() || frame.nv12_height != encoder->height() ||
+             DesktopStreamPool::codec(*capturer) != encoder->codec() ||
+             DesktopStreamPool::chroma(*capturer) != encoder->chroma())) {
+            EncoderConfig resized = encoder_config;
+            resized.width = frame.nv12_width;
+            resized.height = frame.nv12_height;
+            resized.bitrate = stats.target_bitrate;
+            resized.framerate = framerate;
+            std::string resize_error;
+            std::unique_ptr<IVideoEncoder> next =
+                DesktopStreamPool::encoder(*capturer, resized, &resize_error);
+            if (!next) {
+                if (multiple_streams) {
+                    encoder.reset(); cached_nv12.reset(); have_input = false;
+                    video.recovery_at = Clock::now() + std::chrono::seconds(1);
+                    log("display encoder recovery pending: " + resize_error);
+                    return true;
+                }
+                // Keep the stream that is running: put the capture back on the
+                // size the current encoder was built for and stop resizing.
+                resolution_fixed = true;
+                Error reverted = capturer->set_nv12_scale(stats.resolution_percent);
+                if (!reverted.ok()) {
+                    log("adaptive resolution: revert failed: " + reverted.to_string());
+                }
+                resolution_request = stats.resolution_percent;
+                log("adaptive resolution: encoder recreation at " +
+                    std::to_string(resized.width) + "x" +
+                    std::to_string(resized.height) + " failed; staying at " +
+                    std::to_string(stats.resolution_percent) + "%: " + resize_error);
+                stream_info.bitrate = stats.target_bitrate;
+                stream_info.framerate = static_cast<uint16_t>(framerate);
+                publish_current(stream_info);
+                Error refreshed = refresh_video(stream_info);
+                if (!refreshed.ok()) {
+                    if (refreshed.status() == Status::Unavailable ||
+                        refreshed.status() == Status::WaitTimeout) {
+                        *peer_left = true;
+                    } else {
+                        ++stats.send_errors;
+                        *error = "refresh_stream: " + refreshed.to_string();
+                    }
+                    const bool clean = error->empty();
+                    drain_peer(stats);
+                    return clean;
+                }
+                ++stats.stream_updates;
+                publish_stats(stats);
+                // This frame still holds the refused size and cannot feed the
+                // old encoder; the reverted pass produces a matching one next.
+                return true;
+            }
+            encoder = std::move(next);
+            have_input = false;
+            cached_nv12.reset();
+            force_keyframe = true;
+            extra_idrs = 1;
+            stats.target_bitrate = encoder->bitrate();
+            stats.framerate = static_cast<uint16_t>(framerate);
+            stream_info =
+                describe_stream(attached, *capturer, *encoder, frame.width, frame.height,
+                                static_cast<uint16_t>(framerate), session_->permissions(),
+                                audio_info, settings_.allow_terminal_persist);
+            publish_current(stream_info);
+            if (config_.stream_announced) {
+                config_.stream_announced(stream_info);
+            }
+            Error resized_err = refresh_video(stream_info);
+            if (!resized_err.ok()) {
+                if (resized_err.status() == Status::Unavailable ||
+                    resized_err.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                } else {
+                    ++stats.send_errors;
+                    *error = "refresh_stream: " + resized_err.to_string();
+                }
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
+            ++stats.stream_updates;
+            log("stream resized to " + std::to_string(stream_info.width) + "x" +
+                std::to_string(stream_info.height) + " (" +
+                std::to_string(stats.resolution_percent) + "% of " +
+                std::to_string(stream_info.source_width) + "x" +
+                std::to_string(stream_info.source_height) + "); re-announced");
+            publish_stats(stats);
+        }
+        const uint64_t pts_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
+        if (!process_frame(pts_ms)) {
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
+        }
+        publish_cursor();
+        return true;
+    };
 
     const Clock::duration idle_timeout = idle_disconnect_timeout();
-    while (!stopping_.load()) {
+    while (!stopping_.load() && !disconnect_requested_.load()) {
         const auto now = Clock::now();
+        if (!handle_elevation_requests(error)) return false;
+        if (now >= next_desktop_check) {
+            next_desktop_check = now + std::chrono::seconds(1);
+            if (!sync_desktop(false)) {
+                drain_peer(stats);
+                return error->empty();
+            }
+        }
         if (config_.run_seconds > 0.0 &&
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
@@ -5235,6 +5293,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 " s; closing the session");
             drain_peer(stats);
             return error->empty();
+        }
+        if (!refresh_topology(false)) { drain_peer(stats); return error->empty(); }
+        CaptureDisplaysRequest display_subscriptions;
+        if (session_->take_capture_displays_request(display_subscriptions)) {
+            touch_viewer_activity();
+            if (!capture_displays(display_subscriptions)) { drain_peer(stats); return error->empty(); }
         }
         uint16_t switch_index = kDisplayAuto;
         if (session_->take_display_switch_request(switch_index)) {
@@ -5261,7 +5325,19 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
                                                     mode_refresh)) {
             touch_viewer_activity();
-            if (!change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
+            // Apply the mode to the requested subscription while retaining the
+            // viewer's focused display, including when permission is refused.
+            const auto fresh = config_.displays();
+            auto mode_target = other_videos.end();
+            if (mode_index < fresh.size()) {
+                mode_target = std::find_if(other_videos.begin(), other_videos.end(), [&](const auto& entry) {
+                    return entry.second.capture->display().device_name == fresh[mode_index].device_name;
+                });
+            }
+            if (mode_target != other_videos.end()) { swap_video(mode_target->second); pumping_extra = true; }
+            const bool changed = change_display_mode(mode_index, mode_width, mode_height, mode_refresh);
+            if (mode_target != other_videos.end()) { swap_video(mode_target->second); pumping_extra = false; }
+            if (!changed) {
                 const bool clean = error->empty();
                 drain_peer(stats);
                 return clean;
@@ -5277,7 +5353,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 applied = 0;
                 code = DisplayFollowCode::Failed;
                 reason = "input control is disabled";
-            } else if (applied != 0 && capturer->merged()) {
+            } else if (applied != 0 && capturer && capturer->merged()) {
                 applied = 0;
                 code = DisplayFollowCode::Unsupported;
                 reason = "the merged view already shows every display";
@@ -5305,7 +5381,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 return clean;
             }
         }
-        if (follow_flags != 0 && now - follow_polled_at >= kFollowPollInterval) {
+        if (follow_flags != 0 && capturer && other_videos.empty() && now - follow_polled_at >= kFollowPollInterval) {
             follow_polled_at = now;
             const int streamed = capturer->merged()
                                      ? -1
@@ -5441,14 +5517,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             drain_peer(stats);
             return clean;
         }
-        std::string chat_text;
-        while (session_->take_chat(chat_text)) {
-            touch_viewer_activity();
-            ++stats.chat_received;
-            log("chat: received " + std::to_string(chat_text.size()) + " bytes");
-            if (config_.chat_message) {
-                config_.chat_message(chat_text);
-            }
+        if (!drain_chat(stats, error)) {
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
         }
         std::string injected_text;
         while (session_->take_text_input(injected_text)) {
@@ -5458,31 +5530,6 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 " bytes");
             if (config_.text_input) {
                 config_.text_input(injected_text);
-            }
-        }
-        {
-            std::deque<std::string> outbox;
-            {
-                std::lock_guard<std::mutex> lock(chat_mutex_);
-                outbox.swap(pending_chat_);
-            }
-            for (const std::string& text : outbox) {
-                Error sent = session_->send_chat(text);
-                if (!sent.ok()) {
-                    ++stats.send_errors;
-                    log("chat: send failed: " + sent.to_string());
-                    break;
-                }
-                ++stats.chat_sent;
-                log("chat: sent " + std::to_string(text.size()) + " bytes");
-            }
-        }
-        if (now >= next_desktop_check) {
-            next_desktop_check = now + std::chrono::seconds(1);
-            if (!sync_desktop(false)) {
-                const bool clean = error->empty();
-                drain_peer(stats);
-                return clean;
             }
         }
         drain_audio();
@@ -5532,14 +5579,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         if (session_->take_keyframe_request()) {
             force_keyframe = true;
+            for (auto& [id, entry] : other_videos) entry.force_keyframe = true;
         }
-        if (registry_ && registry_->take_desktop_keyframe_request()) {
-            // A follower joined or changed its description. Its video stream
-            // starts between key frames, and it may not hold the pointer
-            // sprite yet; the next frame carries both.
-            force_keyframe = true;
-            cursor_sent_once = false;
-            cursor_sent = CursorUpdate{};
+        uint32_t requested_stream = 0;
+        while (session_->take_display_keyframe_request(requested_stream)) {
+            if (requested_stream == video.id && capturer) force_keyframe = true;
+            const auto found = other_videos.find(requested_stream);
+            if (found != other_videos.end()) found->second.force_keyframe = true;
         }
         if (config_.keyframe_interval_ms > 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keyframe).count() >=
@@ -5548,7 +5594,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         if (config_.reannounce && !reannounced && now >= next_reannounce) {
             reannounced = true;
-            Error refreshed = session_->refresh_stream(stream_info);
+            Error refreshed = refresh_video(stream_info);
             if (!refreshed.ok()) {
                 if (refreshed.status() == Status::Unavailable ||
                     refreshed.status() == Status::WaitTimeout) {
@@ -5564,7 +5610,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             ++stats.stream_updates;
             log("re-announced the stream description");
         }
-        if (probe_pending && now - start >= std::chrono::milliseconds(2500)) {
+        if (capturer && probe_pending && now - start >= std::chrono::milliseconds(2500)) {
             probe_pending = false;
             if (!resolution_fixed &&
                 config_.resolution_probe_percent != resolution_request) {
@@ -5595,304 +5641,24 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             continue;
         }
 
-        if (frame_interval != Clock::duration::zero()) {
-            const auto wait_now = Clock::now();
-            if (next_frame_due > wait_now) {
-                // Audio leaves the host close to its capture time only if the
-                // pump runs between video frames: one drain per frame turns
-                // the pacing interval into burstiness, and the viewer has to
-                // anchor playback after the slowest arrival or drop packets.
-                // Slice the wait into short pumps; the deadline stays
-                // absolute so the video frame rate is unchanged.
-                bool stopped = false;
-                while (next_frame_due > Clock::now()) {
-                    const auto remaining = next_frame_due - Clock::now();
-                    const auto slice = (std::min)(
-                        remaining,
-                        std::chrono::duration_cast<Clock::duration>(
-                            std::chrono::milliseconds(5)));
-                    if (!sleep_unless_stopping(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(slice))) {
-                        stopped = true;
-                        break;
-                    }
-                    drain_audio();
-                    drain_microphone(stats);
-                    handle_voice_call_requests(stats);
-                    drain_voice_call(stats);
-                }
-                if (stopped) {
-                    break;
-                }
-            }
-            // Advance on an absolute timeline; capture() itself waits for the
-            // next present, so a relative sleep would halve the frame rate.
-            next_frame_due += frame_interval;
-            if (Clock::now() - next_frame_due > std::chrono::seconds(1)) {
-                next_frame_due = Clock::now();
-            }
+        if (!capturer) {
+            sleep_unless_stopping(std::chrono::milliseconds(5));
+            continue;
         }
-
-        // A running camera needs the session loop's pump to run at the camera
-        // rate even when the desktop is static; the idle capture wait would
-        // starve it to 10 fps. System audio needs the same pump: the loopback
-        // endpoint produces every few milliseconds, and sending only at video
-        // frame boundaries makes the viewer drain whole bursts, which either
-        // starves the playback endpoint or forces it to buffer a frame.
-        const bool audio_active = audio_capture != nullptr;
-        const CaptureResult result = capturer->capture(
-            std::chrono::milliseconds(camera.streaming() ? 10 : (audio_active ? 5 : 100)));
-        const auto captured_at = Clock::now();
-        // The endpoint keeps producing while capture waits for the next
-        // present; drain here so audio does not wait behind a slow frame.
-        drain_audio();
-        drain_microphone(stats);
-        handle_voice_call_requests(stats);
-        drain_voice_call(stats);
-        switch (result) {
-            case CaptureResult::NoNewFrame:
-                // A failed conversion leaves no NV12 behind. If the desktop
-                // stays quiet, no Frame event will advance the counter.
-                if (frames_without_nv12 > 0 && ++frames_without_nv12 >= 3) {
-                    *error = "capture produced no NV12 image for 3 frames";
-                    const Error& capture_error = capturer->last_error();
-                    if (!capture_error.ok()) {
-                        *error += ": " + capture_error.to_string();
-                    }
-                    drain_peer(stats);
-                    return false;
-                }
-                if (force_keyframe && have_input && encoder && cached_nv12) {
-                    const auto repeated_at = Clock::now();
-                    const uint64_t pts_ms = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            repeated_at - start).count());
-                    if (!process_frame(pts_ms, capture_clock_ms(repeated_at), true)) {
-                        drain_peer(stats);
-                        return error->empty();
-                    }
-                }
-                continue;
-            case CaptureResult::ReinitNeeded: {
-                log("reinitializing: " + capturer->last_error().to_string());
-                // The common cause is a desktop switch: the duplication was
-                // attached to the old desktop. Follow first, then rebuild.
-                if (!sync_desktop(false)) {
-                    const bool clean = error->empty();
-                    drain_peer(stats);
-                    return clean;
-                }
-                if (desktop_paused || desktop_reinitialized) {
-                    continue;
-                }
-                Error err = capturer->reinitialize();
-                if (!err.ok()) {
-                    *error = "reinit failed: " + err.to_string();
-                    drain_peer(stats);
-                    return false;
-                }
-                encoder.reset();
-                have_input = false;
-                cached_nv12.reset();
-                force_keyframe = true;
-                // The rebuilt duplication has no frame yet; a quiet desktop is
-                // not the same as a broken NV12 conversion.
-                frames_without_nv12 = 0;
-                continue;
-            }
-            case CaptureResult::FatalError: {
-                const std::string failure = capturer->last_error().to_string();
-                log("capture failed: " + failure);
-                if (!sync_desktop(false)) {
-                    const bool clean = error->empty();
-                    drain_peer(stats);
-                    return clean;
-                }
-                if (desktop_paused || desktop_reinitialized) {
-                    continue;
-                }
-                *error = "capture failed: " + failure;
-                drain_peer(stats);
-                return false;
-            }
-            case CaptureResult::Frame:
-                break;
+        // Rotate which display goes first when the connection window is tight.
+        // All captures/encoders still run on their own service threads.
+        std::vector<uint32_t> order{video.id};
+        for (const auto& [id, entry] : other_videos) order.push_back(id);
+        std::rotate(order.begin(), order.begin() + (video_round++ % order.size()), order.end());
+        for (auto id : order) {
+            auto found = other_videos.find(id);
+            if (found != other_videos.end()) { swap_video(found->second); pumping_extra = true; }
+            const bool ok = pump_video();
+            if (found != other_videos.end()) { swap_video(found->second); pumping_extra = false; }
+            if (!ok || *peer_left) { drain_peer(stats); return error->empty(); }
         }
-
-        ++stats.frames;
-        const FrameInfo& frame = capturer->frame();
-        if (!frame.desktop_updated) {
-            ++stats.pointer_only;
-        }
-        if (!encoder) {
-            // The capture rebuilt: the output may have moved, rotated or
-            // changed size, and the encoder may land on a different codec.
-            encoder_config.width = frame.nv12_width;
-            encoder_config.height = frame.nv12_height;
-            const AdapterDevice rebuilt_adapter = capturer->adapter_device();
-            encoder = config_.encoder_factory(rebuilt_adapter.device, encoder_config, error);
-            if (!encoder) {
-                *error = "encoder recreation failed: " + *error;
-                drain_peer(stats);
-                return false;
-            }
-            if (encoder->codec() != encoder_config.codec) {
-                log(std::string("the encoder fell back: requested ") +
-                    codec_name(encoder_config.codec) + ", producing " +
-                    codec_name(encoder->codec()));
-            }
-            // A rebuilt encoder starts from the configured bitrate again, and
-            // an automatic rate may differ after a desktop or size change.
-            // Recompute the session budget from it, then reapply the viewer's
-            // quality preset and frame-rate cap.
-            base_video_budget =
-                video_budget(encoder->bitrate(), bitrate_reserve(audio_info));
-            video_floor_bps = video_floor(encoder->bitrate());
-            // A rebuilt merged canvas can change the cap under the running
-            // scale; report what capture now produces before anything reads it.
-            stats.resolution_percent = static_cast<uint16_t>(capturer->nv12_scale_percent());
-            abr = BitrateController(quality_budget(stream_quality), video_floor_bps,
-                                    fps_ceiling(), resolution_request);
-            framerate = abr.framerate();
-            frame_interval = frame_duration(framerate);
-            next_frame_due = Clock::now() + frame_interval;
-            if (abr.ceiling_bps() != encoder->bitrate()) {
-                // Same reservation as at session start: the rebuilt encoder
-                // came back at the configured rate, audio included.
-                Error trimmed = encoder->set_rate(abr.ceiling_bps(), framerate);
-                if (!trimmed.ok()) {
-                    log("cannot apply the video budget: " + trimmed.to_string());
-                }
-            }
-            stats.target_bitrate = encoder->bitrate();
-            stats.framerate = static_cast<uint16_t>(framerate);
-            const std::vector<DisplayInfo> refreshed = config_.displays();
-            // The output may have moved or been renumbered while capture was
-            // down; StreamInfo and the pointer origin must describe the list
-            // the viewer is about to receive.
-            attached = refreshed;
-            stream_info =
-                describe_stream(refreshed, *capturer, *encoder, frame.width, frame.height,
-                                static_cast<uint16_t>(framerate), session_->permissions(),
-                                audio_info, settings_.allow_terminal_persist);
-            publish_current(stream_info);
-            if (config_.stream_announced) {
-                config_.stream_announced(stream_info);
-            }
-            Error refreshed_err = session_->refresh_stream(stream_info);
-            if (!refreshed_err.ok()) {
-                if (refreshed_err.status() == Status::Unavailable ||
-                    refreshed_err.status() == Status::WaitTimeout) {
-                    *peer_left = true;
-                } else {
-                    *error = "refresh_stream: " + refreshed_err.to_string();
-                }
-                const bool clean = error->empty();
-                drain_peer(stats);
-                return clean;
-            }
-            ++stats.stream_updates;
-            log("stream changed to " + std::to_string(stream_info.width) + "x" +
-                std::to_string(stream_info.height) + " at " +
-                std::to_string(stream_info.origin_x) + "," +
-                std::to_string(stream_info.origin_y) + "; re-announced");
-            force_keyframe = true;
-        }
-
-        // Adaptive resolution: the capture now publishes a smaller NV12 image
-        // than the encoder was built for. VPL fixes the coded size at session
-        // creation, so a size change is a new encoder -- built with the rate
-        // and frame rate the controller currently holds -- not a reset.
-        if (frame.nv12_texture &&
-            (frame.nv12_width != encoder->width() || frame.nv12_height != encoder->height())) {
-            EncoderConfig resized = encoder_config;
-            resized.width = frame.nv12_width;
-            resized.height = frame.nv12_height;
-            resized.bitrate = stats.target_bitrate;
-            resized.framerate = framerate;
-            const AdapterDevice resize_adapter = capturer->adapter_device();
-            std::string resize_error;
-            std::unique_ptr<IVideoEncoder> next =
-                config_.encoder_factory(resize_adapter.device, resized, &resize_error);
-            if (!next) {
-                // Keep the stream that is running: put the capture back on the
-                // size the current encoder was built for and stop resizing.
-                resolution_fixed = true;
-                Error reverted = capturer->set_nv12_scale(stats.resolution_percent);
-                if (!reverted.ok()) {
-                    log("adaptive resolution: revert failed: " + reverted.to_string());
-                }
-                resolution_request = stats.resolution_percent;
-                log("adaptive resolution: encoder recreation at " +
-                    std::to_string(resized.width) + "x" +
-                    std::to_string(resized.height) + " failed; staying at " +
-                    std::to_string(stats.resolution_percent) + "%: " + resize_error);
-                stream_info.bitrate = stats.target_bitrate;
-                stream_info.framerate = static_cast<uint16_t>(framerate);
-                publish_current(stream_info);
-                Error refreshed = session_->refresh_stream(stream_info);
-                if (!refreshed.ok()) {
-                    if (refreshed.status() == Status::Unavailable ||
-                        refreshed.status() == Status::WaitTimeout) {
-                        *peer_left = true;
-                    } else {
-                        ++stats.send_errors;
-                        *error = "refresh_stream: " + refreshed.to_string();
-                    }
-                    const bool clean = error->empty();
-                    drain_peer(stats);
-                    return clean;
-                }
-                ++stats.stream_updates;
-                publish_stats(stats);
-                // This frame still holds the refused size and cannot feed the
-                // old encoder; the reverted pass produces a matching one next.
-                continue;
-            }
-            encoder = std::move(next);
-            have_input = false;
-            cached_nv12.reset();
-            force_keyframe = true;
-            extra_idrs = 1;
-            stats.target_bitrate = encoder->bitrate();
-            stats.framerate = static_cast<uint16_t>(framerate);
-            stream_info =
-                describe_stream(attached, *capturer, *encoder, frame.width, frame.height,
-                                static_cast<uint16_t>(framerate), session_->permissions(),
-                                audio_info, settings_.allow_terminal_persist);
-            publish_current(stream_info);
-            if (config_.stream_announced) {
-                config_.stream_announced(stream_info);
-            }
-            Error resized_err = session_->refresh_stream(stream_info);
-            if (!resized_err.ok()) {
-                if (resized_err.status() == Status::Unavailable ||
-                    resized_err.status() == Status::WaitTimeout) {
-                    *peer_left = true;
-                } else {
-                    ++stats.send_errors;
-                    *error = "refresh_stream: " + resized_err.to_string();
-                }
-                const bool clean = error->empty();
-                drain_peer(stats);
-                return clean;
-            }
-            ++stats.stream_updates;
-            log("stream resized to " + std::to_string(stream_info.width) + "x" +
-                std::to_string(stream_info.height) + " (" +
-                std::to_string(stats.resolution_percent) + "% of " +
-                std::to_string(stream_info.source_width) + "x" +
-                std::to_string(stream_info.source_height) + "); re-announced");
-            publish_stats(stats);
-        }
-        const uint64_t pts_ms = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
-        if (!process_frame(pts_ms, capture_clock_ms(captured_at))) {
-            const bool clean = error->empty();
-            drain_peer(stats);
-            return clean;
-        }
-        publish_cursor();
+        if (!other_videos.empty() || !session_->video_send_ready())
+            sleep_unless_stopping(std::chrono::milliseconds(1));
     }
 
     end_file_session();
@@ -5903,13 +5669,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
 // ----- file transfer shared by both session kinds -----
 
 void HostServer::begin_file_session() {
-    {
-        // A request aimed at the previous session must not leak into this
-        // one: the mask was computed by the approval of this connection.
-        std::lock_guard<std::mutex> lock(permission_mutex_);
-        pending_permissions_.store(0);
-        permission_update_pending_.store(false);
-    }
+    last_peer_clipboard_seq_ = 0;
+    last_file_source_version_ = 0;
+    // Pending operator work was cleared before this connection ID was
+    // published. Keep requests made while the initial media is opening.
     file_receive_directory_ = settings_.file_receive_directory.empty()
                                   ? default_receive_directory()
                                   : settings_.file_receive_directory;
@@ -5955,12 +5718,12 @@ void HostServer::end_file_session() {
     bool marked = false;
     {
         std::lock_guard<std::mutex> lock(download_mutex_);
-        // A viewer-requested download belongs to the session that asked for
-        // it; an operator download outlives sessions.
-        if (pending_download_transfer_id_ != 0) {
-            pending_download_path_.clear();
-            pending_download_transfer_id_ = 0;
-        }
+        // Operator and viewer requests both belong to this connection. Never
+        // offer a queued local file to the next sequential viewer.
+        pending_download_path_.clear();
+        pending_download_token_.reset();
+        pending_download_transfer_id_ = 0;
+        send_.file_access_token.reset();
         switch (send_.stage) {
             case FileSend::Stage::kHashing:
             case FileSend::Stage::kReady:
@@ -5997,8 +5760,7 @@ bool HostServer::file_transfer_allowed() const {
 }
 
 bool HostServer::clipboard_transfer_allowed() const {
-    return settings_.allow_clipboard &&
-           (session_->permissions() & kPermissionClipboard) != 0;
+    return clipboard_allowed() && clipboard_to_host(settings_.clipboard_direction);
 }
 
 void HostServer::reset_clipboard_incoming(bool remove_directory) {
@@ -6045,6 +5807,8 @@ bool HostServer::begin_clipboard_incoming(const std::vector<ClipboardFileEntry>&
         *error = "cannot create the clipboard staging folder";
         return false;
     }
+    const std::u8string u8root = root.u8string();
+    clipboard_incoming_.directory.assign(u8root.begin(), u8root.end());
     clipboard_incoming_.entries = entries;
     clipboard_incoming_.landed.assign(entries.size(), std::string());
     clipboard_incoming_.relative.resize(entries.size());
@@ -6076,16 +5840,24 @@ bool HostServer::begin_clipboard_incoming(const std::vector<ClipboardFileEntry>&
         const std::string root_dir = ".root-" + std::to_string(root_index);
         // The copied folder itself is part of the staged path, so a file at
         // its root and a file one level down never collide.
-        std::string relative = root_dir + "/" + top;
-        if (last != std::string::npos) {
-            relative += "/" + inside.substr(0, last);
-        }
+        const auto parent_end = entry.rel_path.rfind('/');
+        const std::string relative = root_dir + (parent_end == std::string::npos ? "" :
+            "/" + entry.rel_path.substr(0, parent_end));
         clipboard_incoming_.relative[index] = relative;
         clipboard_incoming_.top_relative[index] = root_dir + "/" + top;
     }
-    const std::u8string u8root = root.u8string();
-    clipboard_incoming_.directory.assign(u8root.begin(), u8root.end());
+    for (size_t index = 0; index < entries.size(); ++index) {
+        if (!entries[index].directory) continue;
+        const auto relative = clipboard_incoming_.relative[index] + "/" + entries[index].name;
+        if (!create_receive_directory(clipboard_incoming_.directory, relative, error)) {
+            reset_clipboard_incoming(true);
+            return false;
+        }
+        clipboard_incoming_.landed[index] = clipboard_incoming_.directory + "/" + relative;
+    }
     clipboard_incoming_.next = 0;
+    while (clipboard_incoming_.next < entries.size() && entries[clipboard_incoming_.next].directory)
+        ++clipboard_incoming_.next;
     clipboard_incoming_.identity = clipboard_file_identity_hash(entries);
     clipboard_incoming_.active = clipboard_incoming_.identity != 0;
     if (!clipboard_incoming_.active) {
@@ -6094,7 +5866,8 @@ bool HostServer::begin_clipboard_incoming(const std::vector<ClipboardFileEntry>&
         return false;
     }
     log("clipboard: the viewer announced " + std::to_string(entries.size()) +
-        " file(s); staging them for the host clipboard");
+        " item(s); staging them for the host clipboard");
+    if (clipboard_incoming_.next == entries.size()) finish_clipboard_incoming(stats);
     return true;
 }
 
@@ -6261,8 +6034,10 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
                 continue;
             }
             FileReceiveOptions options;
-            options.directory =
-                clipboard_incoming_.directory + "/" + clipboard_incoming_.relative[index];
+            // Keep .chast-partial outside CF_HDROP's top-level items. A
+            // copied tree must not acquire our internal resume directory.
+            options.directory = clipboard_incoming_.directory;
+            options.relative_path = clipboard_incoming_.relative[index];
             options.name = expected.name;
             options.size = offer.size;
             options.sha256 = offer.sha256;
@@ -6453,6 +6228,9 @@ void HostServer::drain_file_data(HostServerStats& stats) {
         }
         if (clipboard_incoming_.active) {
             ++clipboard_incoming_.next;
+            while (clipboard_incoming_.next < clipboard_incoming_.entries.size() &&
+                   clipboard_incoming_.entries[clipboard_incoming_.next].directory)
+                ++clipboard_incoming_.next;
         }
         upload_->receiver.reset();
         upload_.reset();
@@ -6510,7 +6288,8 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
     (void)stats;
     uint32_t request_id = 0;
     std::string directory;
-    while (session_->take_file_list_request(request_id, directory)) {
+    std::string cursor;
+    while (session_->take_file_list_request(request_id, directory, &cursor)) {
         FileListResult result;
         result.request_id = request_id;
         if (!file_transfer_allowed()) {
@@ -6520,7 +6299,7 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
             result.code = FileCode::Refused;
             result.reason = "the host has no receive directory";
         } else {
-            list_receive_directory(file_receive_directory_, directory, result);
+            list_receive_directory(file_receive_directory_, directory, result, cursor);
         }
         const Error sent = session_->send_file_list_result(result);
         if (!sent.ok()) {
@@ -6531,7 +6310,7 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
             log("file: listed " +
                 (directory.empty() ? std::string(".") : directory) + " (" +
                 std::to_string(result.entries.size()) + " entries" +
-                (result.truncated ? ", truncated)" : ")"));
+                (result.truncated ? ", more pages)" : ")"));
         } else {
             log("file: refused to list " +
                 (directory.empty() ? std::string(".") : directory) + ": " +
@@ -6549,12 +6328,13 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
         if (clipboard_file_index(path, clipboard_index)) {
             // A clipboard file is served from the announced absolute path,
             // gated by the clipboard permission rather than file transfer.
-            const bool clipboard_ok =
-                settings_.allow_clipboard &&
-                (session_->permissions() & kPermissionClipboard) != 0;
+            const bool clipboard_ok = clipboard_allowed() &&
+                clipboard_from_host(settings_.clipboard_direction);
             {
                 std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
-                if (clipboard_index < clipboard_file_paths_.size()) {
+                if (clipboard_index < clipboard_file_paths_.size() &&
+                    clipboard_index < clipboard_file_entries_.size() &&
+                    !clipboard_file_entries_[clipboard_index].directory) {
                     full_path = clipboard_file_paths_[clipboard_index];
                 }
             }
@@ -6606,12 +6386,14 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
                     answer.reason = "another file is already being sent";
                 } else {
                     pending_download_path_ = std::move(full_path);
+                    pending_download_clipboard_ = clipboard_file_index(path, clipboard_index);
+                    pending_download_token_.reset();
                     pending_download_transfer_id_ = next_send_id_++;
                     answer.transfer_id = pending_download_transfer_id_;
                 }
             }
         }
-        const Error sent = session_->send_file_download_result(answer);
+        const Error sent = session_->send_file_download_result(answer, clipboard_file_index(path, clipboard_index));
         if (!sent.ok()) {
             log("file: cannot answer a download request: " + sent.to_string());
             return;
@@ -6739,7 +6521,9 @@ void HostServer::drive_file_download(HostServerStats& stats) {
         snapshot.stage == FileSend::Stage::kDone ||
         snapshot.stage == FileSend::Stage::kFailed) {
         std::string requested;
+        std::shared_ptr<void> file_access_token;
         uint32_t preassigned_transfer_id = 0;
+        bool clipboard = false;
         {
             std::lock_guard<std::mutex> lock(download_mutex_);
             const bool idle = send_.stage == FileSend::Stage::kNone ||
@@ -6747,6 +6531,9 @@ void HostServer::drive_file_download(HostServerStats& stats) {
                               send_.stage == FileSend::Stage::kFailed;
             if (idle && !pending_download_path_.empty()) {
                 requested = std::move(pending_download_path_);
+                clipboard = pending_download_clipboard_;
+                pending_download_clipboard_ = false;
+                file_access_token = std::move(pending_download_token_);
                 pending_download_path_.clear();
                 preassigned_transfer_id = pending_download_transfer_id_;
                 pending_download_transfer_id_ = 0;
@@ -6765,6 +6552,8 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             send_ = FileSend{};
             send_.stage = FileSend::Stage::kHashing;
             send_.path = requested;
+            send_.clipboard = clipboard;
+            send_.file_access_token = std::move(file_access_token);
             send_.name.assign(reinterpret_cast<const char*>(u8name.data()), u8name.size());
             send_.transfer_id = preassigned_transfer_id != 0 ? preassigned_transfer_id
                                                              : next_send_id_++;
@@ -6772,14 +6561,20 @@ void HostServer::drive_file_download(HostServerStats& stats) {
         }
         send_hasher_ = std::thread([this, transfer_id] {
             std::string path;
+            std::shared_ptr<void> file_access_token;
             {
                 std::lock_guard<std::mutex> lock(download_mutex_);
                 path = send_.path;
+                file_access_token = send_.file_access_token;
             }
             uint64_t size = 0;
             std::array<uint8_t, 32> digest{};
             std::string error;
-            bool ok = sha256_file(path, size, digest, &error);
+            bool ok = false;
+            {
+                ScopedFileAccess access(file_access_token);
+                ok = access.ok() && sha256_file(path, size, digest, &error);
+            }
             if (ok && size > kMaxFileTransferBytes) {
                 ok = false;
                 error = "the file exceeds the protocol's 16 GiB limit";
@@ -6872,8 +6667,9 @@ void HostServer::drive_file_download(HostServerStats& stats) {
         return;
     }
 
-    if (!file_transfer_allowed()) {
-        send_file_failure("file transfer was disabled", true, stats);
+    if (snapshot.clipboard ? !(clipboard_allowed() && clipboard_from_host(settings_.clipboard_direction))
+                           : !file_transfer_allowed()) {
+        send_file_failure("file or clipboard permission was disabled", true, stats);
         return;
     }
 
@@ -6943,6 +6739,7 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             offer.resume = true;
             offer.sha256 = snapshot.digest;
             offer.name = snapshot.name;
+            offer.clipboard = snapshot.clipboard;
             Error sent = session_->offer_file(offer);
             if (!sent.ok()) {
                 send_file_failure("offer: " + sent.to_string(), false, stats);
@@ -6979,7 +6776,11 @@ void HostServer::drive_file_download(HostServerStats& stats) {
                                       true, stats);
                     return;
                 }
-                download_stream_.open(path_from_utf8(snapshot.path), std::ios::binary);
+                {
+                    ScopedFileAccess access(snapshot.file_access_token);
+                    if (access.ok()) download_stream_.open(path_from_utf8(snapshot.path), std::ios::binary);
+                    else download_stream_.setstate(std::ios::failbit);
+                }
                 if (!download_stream_) {
                     send_file_failure("the local file cannot be opened", false, stats);
                     return;
@@ -7105,7 +6906,7 @@ void HostServer::poll_files(HostServerStats& stats) {
     drive_file_download(stats);
 }
 
-bool HostServer::reject_desktop_requests(std::string* error) {
+bool HostServer::reject_desktop_requests(std::string* error, bool camera_options) {
     const std::string reason = "this operation requires a desktop session";
     auto answered = [error](const Error& sent) {
         if (!sent.ok()) {
@@ -7140,7 +6941,7 @@ bool HostServer::reject_desktop_requests(std::string* error) {
         return false;
     }
     StreamOptions options;
-    if (session_->take_stream_options_request(options)) {
+    if (!camera_options && session_->take_stream_options_request(options)) {
         StreamOptionsResult result;
         result.code = StreamOptionsCode::Unsupported;
         result.reason = reason;
@@ -7231,8 +7032,10 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     auto last_activity = Clock::now();
     auto last_file_activity = file_activity();
 
-    while (!stopping_.load()) {
+    while (!stopping_.load() && !disconnect_requested_.load()) {
         apply_pending_permissions();
+        if (!handle_elevation_requests(error)) return false;
+        if (!drain_chat(stats, error)) return false;
         if (!reject_desktop_requests(error)) {
             return false;
         }
@@ -7452,14 +7255,40 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
                            [this] { touch_viewer_activity(); });
     // A control-only session has no capturer to borrow an adapter from; the
     // camera relay opens its own device instead.
+    DesktopStreamPool standalone_streams;
+    auto& streams = registry_ ? registry_->desktop_streams : standalone_streams;
     CameraRelay camera(*session_, [] { return LUID{}; },
                        CameraRelayConfig{settings_.codec, settings_.quality,
                                          config_.encoder_backend,
-                                         settings_.framerate > 0 ? settings_.framerate : 30u});
+                                         settings_.framerate > 0 ? settings_.framerate : 30u,
+                                         config_.cameras, config_.camera_capture_factory,
+                                         mode == SessionMode::Camera},
+        [&, decoders = session_->decoding_codecs(), preference = codec_vote(session_->codec_preference()),
+            decoders_444 = session_->decoding_444(), chroma = session_->chroma_preference()](
+                const std::wstring& key, CameraRelay::CaptureFactory capture, std::string* failure) {
+            // A camera-only connection participates while its camera is open.
+            // Stop/revocation releases this peer with the worker subscription.
+            auto peer = streams.connect_codecs(decoders, preference, decoders_444, chroma);
+            auto quality = streams.connect_quality(settings_.framerate, settings_.quality,
+                config_.adaptive_bitrate);
+            CameraRelay::Subscription result;
+            result.quality = [quality](const StreamOptions& options) {
+                quality->options(options.max_fps,
+                    options.quality == StreamQuality::High ? VideoQos::Quality::High :
+                    options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced :
+                    VideoQos::Quality::Smooth);
+            };
+            result.capture = streams.subscribe(key, std::move(capture), config_.encoder_factory,
+                failure, {}, decoders, std::move(peer),
+                {settings_.record_incoming, settings_.record_directory, config_.log});
+            return result;
+        });
 
-    while (!stopping_.load()) {
+    while (!stopping_.load() && !disconnect_requested_.load()) {
         apply_pending_permissions();
-        if (!reject_desktop_requests(error)) {
+        if (!handle_elevation_requests(error)) return false;
+        if (!drain_chat(stats, error)) return false;
+        if (!reject_desktop_requests(error, mode == SessionMode::Camera)) {
             return false;
         }
 
@@ -7640,139 +7469,15 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
     return error->empty();
 }
 
-// ----- shared desktop broadcasts (publisher side) -----
-
-void HostServer::broadcast_video(const FrameHeader& header, const uint8_t* data, size_t size) {
-    if (!registry_ || !desktop_publisher_) {
-        return;
-    }
-    const std::vector<std::shared_ptr<HostServer>> followers =
-        registry_->desktop_follower_list();
-    for (const std::shared_ptr<HostServer>& follower : followers) {
-        if (follower.get() == this || !data || size == 0) {
-            continue;
-        }
-        Error sent = Error::success();
-        {
-            std::lock_guard<std::mutex> lock(follower->session_mutex_);
-            if (!follower->session_) {
-                continue;
-            }
-            // Never block the capture loop on one viewer: a full queue drops
-            // this frame for that follower, and the next key frame repairs it.
-            sent = follower->session_->send_frame_nowait(header, data, size);
-        }
-        if (sent.ok()) {
-            follower->shared_frames_.fetch_add(1, std::memory_order_relaxed);
-            if (header.keyframe) {
-                follower->shared_keyframes_.fetch_add(1, std::memory_order_relaxed);
-            }
-            follower->shared_bytes_.fetch_add(size, std::memory_order_relaxed);
-        } else if (sent.status() == Status::WaitTimeout) {
-            follower->shared_frame_drops_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
-            follower->shared_send_failed_.store(true, std::memory_order_relaxed);
-        }
-    }
-}
-
-void HostServer::broadcast_audio(const AudioHeader& header, const uint8_t* data, size_t size) {
-    if (!registry_ || !desktop_publisher_) {
-        return;
-    }
-    const std::vector<std::shared_ptr<HostServer>> followers =
-        registry_->desktop_follower_list();
-    for (const std::shared_ptr<HostServer>& follower : followers) {
-        if (follower.get() == this || !data || size == 0) {
-            continue;
-        }
-        Error sent = Error::success();
-        {
-            std::lock_guard<std::mutex> lock(follower->session_mutex_);
-            if (!follower->session_) {
-                continue;
-            }
-            sent = follower->session_->send_audio(header, data, size);
-        }
-        if (sent.ok()) {
-            follower->shared_audio_packets_.fetch_add(1, std::memory_order_relaxed);
-            follower->shared_audio_bytes_.fetch_add(size, std::memory_order_relaxed);
-            follower->shared_audio_ready_.store(true, std::memory_order_relaxed);
-        } else if (sent.status() == Status::WaitTimeout) {
-            follower->shared_audio_drops_.fetch_add(1, std::memory_order_relaxed);
-        } else if (sent.status() != Status::PermissionDenied &&
-                   sent.status() != Status::InvalidCall &&
-                   sent.status() != Status::Unavailable) {
-            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
-        }
-        // PermissionDenied and InvalidCall mean this follower has no audio
-        // stream; Unavailable means its session is going away. The follower's
-        // own loop handles all three, and audio is optional per viewer.
-    }
-}
-
-void HostServer::broadcast_cursor(const CursorUpdate& update) {
-    if (!registry_ || !desktop_publisher_) {
-        return;
-    }
-    const std::vector<std::shared_ptr<HostServer>> followers =
-        registry_->desktop_follower_list();
-    for (const std::shared_ptr<HostServer>& follower : followers) {
-        if (follower.get() == this) {
-            continue;
-        }
-        Error sent = Error::success();
-        {
-            std::lock_guard<std::mutex> lock(follower->session_mutex_);
-            if (!follower->session_) {
-                continue;
-            }
-            sent = follower->session_->send_cursor(update);
-        }
-        if (sent.ok()) {
-            follower->shared_cursor_sent_.fetch_add(1, std::memory_order_relaxed);
-        } else if (sent.status() == Status::WaitTimeout) {
-            follower->shared_cursor_drops_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-}
-
-void HostServer::broadcast_desktop_state(DesktopKind kind) {
-    if (!registry_ || !desktop_publisher_) {
-        return;
-    }
-    const std::vector<std::shared_ptr<HostServer>> followers =
-        registry_->desktop_follower_list();
-    for (const std::shared_ptr<HostServer>& follower : followers) {
-        if (follower.get() == this) {
-            continue;
-        }
-        Error sent = Error::success();
-        {
-            std::lock_guard<std::mutex> lock(follower->session_mutex_);
-            if (!follower->session_) {
-                continue;
-            }
-            sent = follower->session_->send_desktop_state(kind);
-        }
-        if (!sent.ok() && sent.status() != Status::Unavailable &&
-            sent.status() != Status::WaitTimeout) {
-            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-}
-
 // ----- per-viewer clipboard and microphone plumbing -----
 
 bool HostServer::clipboard_allowed() const {
-    return settings_.allow_clipboard &&
+    return settings_.allow_clipboard && settings_.clipboard_direction != ClipboardDirection::Disabled &&
            (session_->permissions() & kPermissionClipboard) != 0;
 }
 
 void HostServer::request_local_clipboard() {
+    if (!clipboard_channel_) clipboard_channel_ = std::make_unique<ClipboardFileChannel>();
     if (!clipboard_worker_) {
         ClipboardBackend backend;
         if (config_.clipboard_read) {
@@ -7788,14 +7493,17 @@ void HostServer::request_local_clipboard() {
         }
         backend.write = config_.clipboard_write;
         backend.write_files = config_.clipboard_write_files;
+        backend.write_virtual_files = config_.clipboard_write_virtual_files;
         clipboard_worker_ = std::make_unique<ClipboardWorker>(std::move(backend));
     }
-    clipboard_worker_->Read(clipboard_epoch_);
+    if (clipboard_from_host(settings_.clipboard_direction)) clipboard_worker_->Read(clipboard_epoch_);
 }
 
 void HostServer::cancel_clipboard_work() {
     ++clipboard_epoch_;
     if (clipboard_worker_) clipboard_worker_->Cancel();
+    if (clipboard_channel_) clipboard_channel_->CancelRemote();
+    pending_virtual_files_.reset();
     clipboard_write_pending_ = false;
     clipboard_write_inflight_ = false;
     pending_clipboard_content_ = {};
@@ -7814,6 +7522,9 @@ void HostServer::remember_local_clipboard() {
 }
 
 void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats& stats) {
+    if (!clipboard_transfer_allowed()) return;
+    if (content.seq && content.seq <= last_peer_clipboard_seq_) return;
+    if (content.seq) last_peer_clipboard_seq_ = content.seq;
     if (const ClipboardFormatData* list = content.find(ClipboardFormat::FileList)) {
         // Protocol v34: the viewer copied files. Only the list crosses the
         // clipboard stream; the bytes follow as clipboard-marked FileOffers
@@ -7827,6 +7538,17 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
         cancel_clipboard_work();
         last_clipboard_hash_ = clipboard_content_hash(content);
         last_clipboard_ = ClipboardContent{};
+        if (!config_.clipboard_write_files || config_.clipboard_write_virtual_files) {
+            if (!clipboard_channel_) clipboard_channel_ = std::make_unique<ClipboardFileChannel>();
+            clipboard_channel_->ClearLocal();
+            pending_virtual_files_ = clipboard_channel_->Receive(content.seq, std::move(entries));
+            if (!pending_virtual_files_) { log("clipboard: the virtual file offer has no generation"); return; }
+            clipboard_write_pending_ = true;
+            clipboard_write_is_files_ = true;
+            clipboard_write_attempts_ = 0;
+            clipboard_write_retry_ = Clock::now();
+            return;
+        }
         std::string begin_error;
         if (!begin_clipboard_incoming(entries, stats, &begin_error)) {
             log("clipboard: cannot stage the viewer's files: " + begin_error);
@@ -7844,6 +7566,7 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
     }
     // New peer content supersedes a queued retry and invalidates older reads.
     cancel_clipboard_work();
+    if (clipboard_channel_) clipboard_channel_->ClearLocal();
     if (upload_ && upload_->offer.clipboard) {
         end_upload(FileCode::Cancelled, "the viewer replaced its clipboard list", true, true, stats);
     }
@@ -7865,7 +7588,7 @@ void HostServer::drain_peer(HostServerStats& stats) {
     }
     stats.input_stats = session_->input_stats();
     stats.input_releases = session_->input_release_requests();
-    if (!clipboard_allowed()) {
+    if (!clipboard_transfer_allowed()) {
         return;
     }
     // Establish the new epoch before accepting peer content on a restored
@@ -7897,6 +7620,8 @@ void HostServer::drain_peer(HostServerStats& stats) {
 
 void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
                                 HostServerStats& stats) {
+    if (clipboard_channel_) clipboard_channel_->Poll(*session_,
+        clipboard_allowed() && clipboard_from_host(settings_.clipboard_direction), clipboard_transfer_allowed());
     if (!clipboard_allowed()) {
         if (clipboard_was_allowed_) cancel_clipboard_work();
         clipboard_was_allowed_ = false;
@@ -7919,10 +7644,12 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
                 clipboard_write_pending_ = false;
                 clipboard_baseline_pending_ = false;
                 if (clipboard_write_is_files_) {
-                    last_file_identity_ = clipboard_incoming_.identity;
-                    last_file_entries_ = clipboard_incoming_.entries;
+                    last_file_entries_ = pending_virtual_files_ ? pending_virtual_files_->entries() : clipboard_incoming_.entries;
+                    last_file_identity_ = clipboard_file_identity_hash(last_file_entries_);
+                    last_file_source_version_ = 0;
                     last_file_paths_ = pending_clipboard_paths_;
                     clipboard_incoming_.active = false;
+                    pending_virtual_files_.reset();
                 } else {
                     last_clipboard_hash_ = clipboard_content_hash(pending_clipboard_content_);
                     last_clipboard_ = std::move(pending_clipboard_content_);
@@ -7936,6 +7663,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
                 if (++clipboard_write_attempts_ >= 10) {
                     clipboard_write_pending_ = false;
                     log("clipboard: write failed after 10 attempts");
+                    if (pending_virtual_files_ && clipboard_channel_) { clipboard_channel_->CancelRemote(); pending_virtual_files_.reset(); }
                     if (clipboard_write_is_files_) reset_clipboard_incoming(true);
                 }
                 clipboard_write_retry_ = now + std::chrono::milliseconds(250);
@@ -7944,12 +7672,15 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     if (clipboard_write_pending_) {
         if (!clipboard_write_inflight_ && now >= clipboard_write_retry_ && clipboard_worker_) {
-            clipboard_write_inflight_ = clipboard_write_is_files_
+            clipboard_write_inflight_ = pending_virtual_files_
+                ? clipboard_worker_->WriteVirtualFiles(clipboard_epoch_, pending_virtual_files_)
+                : clipboard_write_is_files_
                 ? clipboard_worker_->WriteFiles(clipboard_epoch_, pending_clipboard_paths_)
                 : clipboard_worker_->Write(clipboard_epoch_, pending_clipboard_content_);
         }
         return;
     }
+    if (!clipboard_from_host(settings_.clipboard_direction)) return;
     if (!have_read) {
         if (now >= next_clipboard_poll_) request_local_clipboard();
         return;
@@ -7965,6 +7696,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         last_clipboard_ = std::move(snapshot.content);
         last_file_identity_ = snapshot.has_files
                                   ? clipboard_file_identity_hash(snapshot.entries) : 0;
+        last_file_source_version_ = snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
         last_file_entries_ = std::move(snapshot.entries);
         last_file_paths_ = std::move(snapshot.paths);
         return;
@@ -7975,7 +7707,9 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         const uint64_t identity = clipboard_file_identity_hash(current_files);
         last_clipboard_ = ClipboardContent{};
         last_clipboard_hash_ = 0;
-        if (identity == 0 || identity == last_file_identity_) {
+        const auto source_version = snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
+        if (identity == 0 || (identity == last_file_identity_ &&
+            (!last_file_source_version_ || last_file_source_version_ == source_version))) {
             return;
         }
         last_file_entries_ = std::move(current_files);
@@ -8005,11 +7739,15 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
             clipboard_file_entries_ = last_file_entries_;
             clipboard_file_paths_ = last_file_paths_;
         }
+        clipboard_channel_->CancelRemote();
+        clipboard_channel_->SetLocal(clipboard_seq_, std::move(snapshot.local_files));
+        last_file_source_version_ = source_version;
         ++clipboard_seq_;
         ++stats.clipboard_sent;
         return;
     }
     // No files now, so a later text item is a fresh change again.
+    if (clipboard_channel_) clipboard_channel_->ClearLocal();
     last_file_identity_ = 0;
     last_file_entries_.clear();
     last_file_paths_.clear();
@@ -8502,6 +8240,73 @@ bool HostServer::sync_remote_policy() {
     return changed || status_.session_permissions != session_->permissions();
 }
 
+bool HostServer::handle_elevation_requests(std::string* error) {
+    const auto allowed = [&] {
+        return !stopping_.load() && !disconnect_requested_.load() && session_->peer_alive() &&
+               session_->requested_mode() == SessionMode::Desktop && settings_.allow_input &&
+               (session_->permissions() & kPermissionInput) &&
+               (!registry_ || registry_->may_change_host_state(this));
+    };
+    const auto send = [&](ElevationState state) {
+        const auto sent = session_->send_elevation_state(state);
+        if (!sent.ok()) { *error = "elevation: " + sent.to_string(); return false; }
+        return true;
+    };
+    uint32_t request = 0;
+    while (session_->take_elevation_request(request)) {
+        touch_viewer_activity();
+        ElevationState state{request, ElevationCode::Unsupported, {}};
+        if (!allowed()) {
+            state.code = ElevationCode::Denied;
+            state.reason = "elevation requires desktop input control";
+        } else if (elevation_task_) {
+            state.code = ElevationCode::Busy;
+            state.reason = "an elevation request is already pending";
+        } else {
+            state = config_.elevation_state ? config_.elevation_state() :
+                ElevationState{0, process_is_elevated() ? ElevationCode::Elevated : ElevationCode::Unsupported, {}};
+            state.request_id = request;
+            if (state.code == ElevationCode::Available || state.code == ElevationCode::Failed ||
+                state.code == ElevationCode::Cancelled) {
+                try {
+                    elevation_task_ = config_.request_elevation ? config_.request_elevation() : nullptr;
+                    if (elevation_task_) {
+                        state = elevation_task_->poll();
+                        state.request_id = elevation_request_ = request;
+                        // Always send Pending before consuming a completed task.
+                        if (state.code == ElevationCode::Restarting) state.code = ElevationCode::Pending;
+                        elevation_last_code_ = state.code;
+                        elevation_deadline_ = Clock::now() + std::chrono::minutes(3);
+                    } else state.code = ElevationCode::Unsupported;
+                } catch (const std::exception& failure) {
+                    state.code = ElevationCode::Failed; state.reason = failure.what();
+                }
+            }
+        }
+        if (!send(state)) return false;
+    }
+    if (!elevation_task_) return true;
+    auto state = elevation_task_->poll();
+    state.request_id = elevation_request_;
+    if (elevation_last_code_ == ElevationCode::Restarting) return true;
+    if (!allowed() || Clock::now() >= elevation_deadline_) {
+        elevation_task_->cancel();
+        state.code = allowed() ? ElevationCode::Cancelled : ElevationCode::Denied;
+        state.reason = allowed() ? "the elevation request timed out" : "input control was revoked";
+    }
+    if (state.code != elevation_last_code_) {
+        if (!send(state)) return false;
+        elevation_last_code_ = state.code;
+    }
+    if (state.code == ElevationCode::Restarting) {
+        elevation_task_->commit();
+    } else if (state.code != ElevationCode::Pending) {
+        elevation_task_->cancel();
+        elevation_task_.reset();
+    }
+    return true;
+}
+
 bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::string* error,
                                                bool* peer_left) {
     RemoteConfigRequest request;
@@ -8959,6 +8764,28 @@ bool HostServer::sleep_unless_stopping(std::chrono::milliseconds duration) {
     return false;
 }
 
+bool HostServer::drain_chat(HostServerStats& stats, std::string* error) {
+    std::string text;
+    while (session_->take_chat(text)) {
+        touch_viewer_activity();
+        ++stats.chat_received;
+        if (config_.viewer_chat_message) config_.viewer_chat_message(connection_id_, text);
+        if (config_.chat_message) config_.chat_message(text);
+    }
+    std::deque<std::string> outbox;
+    { std::lock_guard lock(chat_mutex_); outbox.swap(pending_chat_); }
+    for (const auto& line : outbox) {
+        auto sent = session_->send_chat(line);
+        if (!sent.ok()) {
+            ++stats.send_errors;
+            *error = "chat: " + sent.to_string();
+            return false;
+        }
+        ++stats.chat_sent;
+    }
+    return true;
+}
+
 void HostServer::log(const std::string& message) {
     if (config_.log) {
         config_.log(log_safe(message));
@@ -8982,11 +8809,6 @@ void HostServer::publish_stats(const HostServerStats& stats) {
 
 void HostServer::publish_stream(const ServerInfo& info, size_t display_index,
                                 const std::string& display_name) {
-    // The registry lock is taken before the status lock; status() takes them
-    // in the opposite order, so never hold status_mutex_ across this call.
-    if (registry_ && desktop_publisher_ && desktop_info_ready_) {
-        registry_->update_desktop_info(info, display_index, display_name);
-    }
     std::lock_guard<std::mutex> lock(status_mutex_);
     status_.stream = info;
     status_.display_index = display_index;

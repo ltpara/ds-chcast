@@ -56,6 +56,15 @@ public:
     AdapterDevice adapter_device() const override {
         return AdapterDevice{device_.get(), vendor_id_, adapter_luid_};
     }
+    const char* implementation() const noexcept override {
+        for (const auto& child : children_) {
+            if (std::string_view(child.capturer->implementation()).find("gdi") !=
+                std::string_view::npos) {
+                return "gdi-merged";
+            }
+        }
+        return "dxgi-merged";
+    }
     Error reinitialize() override;
     Error set_nv12_scale(UINT percent) override;
     bool merged() const override { return true; }

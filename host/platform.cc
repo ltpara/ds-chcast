@@ -75,8 +75,13 @@ std::string narrow(const std::wstring& text) {
 
 bool set_autostart(bool enabled, std::string* error) {
     HKEY key = nullptr;
-    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
-                                     KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr);
+    HKEY user = nullptr;
+    LSTATUS status = RegOpenCurrentUser(KEY_WRITE, &user);
+    if (status == ERROR_SUCCESS) {
+        status = RegCreateKeyExW(user, kRunKey, 0, nullptr, 0,
+                                KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr);
+        RegCloseKey(user);
+    }
     if (status != ERROR_SUCCESS) {
         *error = "无法打开启动项注册表（错误 " + std::to_string(status) + "）";
         return false;

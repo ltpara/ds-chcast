@@ -165,7 +165,7 @@ void HostSecurity::set_default_permissions(PermissionMask permissions) {
 
 void HostSecurity::set_config(Config config) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (config.service_mode) {
+    if (config.service_mode && !config.service_approval) {
         config.mode = HostAuthMode::Password;
     }
     config.default_permissions &= kPermissionAll;
@@ -352,9 +352,10 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         }
     }
 
-    // Service mode has nobody to ask and no temporary password: without a
-    // permanent password it cannot let anyone in, not even with a token.
-    if (config_.service_mode && config_.password_hash.empty()) {
+    // Unattended/password-only services require a permanent password, even
+    // with a legacy token. Click/Both can instead ask the local operator.
+    if (config_.service_mode && config_.password_hash.empty() &&
+        (!config_.service_approval || config_.mode == HostAuthMode::Password)) {
         result = deny(AccessDenial::PasswordRequired,
                       "the service has no permanent password; set one before connecting");
         result.peer_address = peer_address;

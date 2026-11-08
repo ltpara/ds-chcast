@@ -38,6 +38,7 @@ constexpr UINT_PTR kWindowSubclassId = 2;
 // LPARAM owns a SecurityKeyCompletion that only the platform thread may answer.
 constexpr UINT kSecurityKeyDoneMessage = WM_APP + 0x51;
 constexpr UINT kKeyboardEscapeMessage = WM_APP + 0x52;
+constexpr UINT kLocalKeyMessage = WM_APP + 0x53;
 // The Dart side uses a server URL or host:port as the password-store key.
 constexpr size_t kMaxTrustKeyLength = 512;
 // Binds account-token ciphertext to its purpose, so a blob lifted from another
@@ -258,17 +259,28 @@ bool write_text_file(const std::filesystem::path& path, const std::string& text,
 
 }  // namespace
 
-ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
-    : engine_(engine), window_(window) {
-    texture_sink_ = std::make_unique<GpuFrameSink>();
-    camera_sink_ = std::make_unique<GpuFrameSink>();
-    viewer_ = std::make_unique<ViewerEngine>(texture_sink_.get(), camera_sink_.get());
+ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window,
+    std::shared_ptr<SharedViewerSession> session, std::optional<uint32_t> display_stream)
+    : engine_(engine), window_(window),
+      session_(session ? std::move(session) : std::make_shared<SharedViewerSession>()),
+      display_stream_(display_stream) {
+    session_generation_ = session_->generation.load();
+    texture_sink_ = &session_->primary;
+    camera_sink_ = &session_->camera;
+    viewer_ = &session_->viewer;
+    if (display_stream_) session_->windows[*display_stream_] = window_;
     keyboard_capture_ = std::make_unique<KeyboardCapture>(window_,
         [this](const chast::InputEvent& event) {
-            return viewer_ != nullptr && viewer_->SendInput(event);
+            return local_keyboard_.load() ? PostLocalKey(event) : QueueInput(event);
         },
-        [this] { if (viewer_ != nullptr) viewer_->ReleaseInput(); },
-        [this] { PostMessageW(window_, kKeyboardEscapeMessage, 0, 0); });
+        [this] {
+            if (local_keyboard_.load()) PostLocalKey({}, true);
+            else ReleaseInput();
+        },
+        [this] { PostMessageW(window_, kKeyboardEscapeMessage, 0, 0); },
+        [this](const KBDLLHOOKSTRUCT& key, bool down, const chast::InputEvent& event, bool consumed) {
+            return QueueLocalKey(key, down, event, consumed);
+        });
     channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
         engine_->messenger(), "chast/viewer", &flutter::StandardMethodCodec::GetInstance());
     channel_->SetMethodCallHandler(
@@ -284,9 +296,17 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
                       reinterpret_cast<DWORD_PTR>(this));
     view_ = FindWindowExW(window_, nullptr, L"FLUTTERVIEW", nullptr);
     if (view_ != nullptr) {
+        local_text_input_ = std::make_unique<LocalTextInput>(view_,
+            [this](const std::string& text) {
+                const bool accepted = session_ && session_->SendText(this,
+                    session_generation_.load(), display_stream_, window_, text);
+                if (!accepted && channel_) channel_->InvokeMethod("keyboardTextRejected", nullptr);
+                return accepted;
+            },
+            [this](bool composing) { if (keyboard_capture_) keyboard_capture_->SetComposing(composing); });
         SetWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId,
                           reinterpret_cast<DWORD_PTR>(this));
-        DragAcceptFiles(view_, TRUE);
+        DragAcceptFiles(view_, display_stream_ ? FALSE : TRUE);
     }
 }
 
@@ -303,6 +323,7 @@ void ViewerBridge::Shutdown() {
     // the flag itself; clearing it here covers the window already being gone.
     security_key_busy_->store(false);
     SetKeyCapture(false);
+    local_text_input_.reset();
     keyboard_capture_.reset();
     SetRelativeMouse(false, 1.0);
     ClearCursor();
@@ -319,18 +340,23 @@ void ViewerBridge::Shutdown() {
     if (channel_) {
         channel_->SetMethodCallHandler(nullptr);
     }
-    if (viewer_) {
+    if (session_ && !display_stream_) {
+        session_->InvalidateWindows();
         viewer_->Stop();
-    }
-    if (texture_sink_) {
         texture_sink_->SetOutput(nullptr);
-    }
-    if (camera_sink_) {
         camera_sink_->SetOutput(nullptr);
     }
-    viewer_.reset();
-    texture_sink_.reset();
-    camera_sink_.reset();
+    if (session_) {
+        session_->Detach(this);
+        if (display_stream_) {
+            const auto it = session_->windows.find(*display_stream_);
+            if (it != session_->windows.end() && it->second == window_) session_->windows.erase(it);
+        }
+    }
+    viewer_ = nullptr;
+    texture_sink_ = nullptr;
+    camera_sink_ = nullptr;
+    session_.reset();
     channel_.reset();
 }
 
@@ -363,6 +389,48 @@ void ViewerBridge::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
     const std::string& method = call.method_name();
+
+    if (display_stream_) {
+        // Child engines can only render and control their assigned stream.
+        // In particular they cannot stop, authenticate or reconfigure the session.
+        if (method != "displayStreams" && method != "bindDisplayOutput" &&
+            method != "takeDisplayCursors" && method != "focusDisplay" &&
+            method != "status" && method != "sendInput" && method != "releaseInput" &&
+            method != "setKeyCapture" && method != "keyboardState" &&
+            method != "setKeyboardMode" &&
+            method != "setFullscreen" && method != "closeSessionWindow") {
+            result->Error("display_window", "This window shares its parent session");
+            return;
+        }
+        if (session_generation_.load() != session_->generation.load() &&
+            method != "bindDisplayOutput" && method != "releaseInput" &&
+            method != "setKeyCapture" && method != "closeSessionWindow") {
+            PostMessageW(window_, WM_CLOSE, 0, 0);
+            result->Error("session_ended", "The parent session has ended");
+            return;
+        }
+    }
+
+    if (method == "openDisplayWindow") {
+        const auto* id = std::get_if<int64_t>(call.arguments());
+        const auto* id32 = std::get_if<int32_t>(call.arguments());
+        const int64_t value = id ? *id : id32 ? *id32 : -1;
+        const auto status = viewer_->Snapshot();
+        if (value < 0 || value > UINT32_MAX || status.state != ViewerState::kStreaming ||
+            !status.multiple_displays || std::none_of(status.display_streams.begin(),
+                status.display_streams.end(), [value](const auto& s) { return s.stream.stream_id == value; })) {
+            result->Success(flutter::EncodableValue(false)); return;
+        }
+        const auto stream = static_cast<uint32_t>(value);
+        const auto it = session_->windows.find(stream);
+        if (it != session_->windows.end() && IsWindow(it->second)) {
+            ShowWindow(it->second, SW_RESTORE);
+            SetForegroundWindow(it->second);
+            result->Success(flutter::EncodableValue(true)); return;
+        }
+        result->Success(flutter::EncodableValue(open_display_window && open_display_window(session_, stream)));
+        return;
+    }
 
     if (method == "openSessionWindow") {
         const auto* payload = std::get_if<std::string>(call.arguments());
@@ -521,6 +589,10 @@ void ViewerBridge::HandleMethodCall(
         // Attach only after the engine accepted the session: a rejected start
         // must leave the running session's output untouched. The handshake
         // takes longer than this call, so no frame is drawn before the attach.
+        SetKeyCapture(false);
+        session_->InvalidateWindows();
+        session_generation_ = session_->generation.load();
+        cursor_revisions_.clear();
         if (output > 0) {
             texture_sink_->SetOutput(
                 reinterpret_cast<void*>(static_cast<intptr_t>(output)));
@@ -530,6 +602,10 @@ void ViewerBridge::HandleMethodCall(
     }
 
     if (method == "stop") {
+        SetKeyCapture(false);
+        session_->InvalidateWindows();
+        session_generation_ = session_->generation.load();
+        cursor_revisions_.clear();
         viewer_->Stop();
         // The plugin textures may be unregistered as soon as this returns.
         texture_sink_->SetOutput(nullptr);
@@ -538,8 +614,150 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "captureDisplays") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t request_id = 0;
+        chast::CaptureDisplaysRequest request;
+        auto list = [&](const char* name, std::vector<uint16_t>& out) {
+            const auto it = args->find(key(name));
+            if (it == args->end()) return true;
+            const auto* items = std::get_if<flutter::EncodableList>(&it->second);
+            if (!items || items->size() > chast::kMaxDisplayCount) return false;
+            for (const auto& item : *items) {
+                const auto* index = std::get_if<int32_t>(&item);
+                if (!index || *index < 0 || *index >= chast::kMaxDisplayCount) return false;
+                out.push_back(static_cast<uint16_t>(*index));
+            }
+            return true;
+        };
+        if (!args || !map_int(*args, "requestId", &request_id) || request_id < 0 || request_id > UINT32_MAX ||
+            !list("add", request.add) || !list("sub", request.sub) || !list("set", request.set)) {
+            result->Error("bad_args", "captureDisplays requires an ID and display index lists"); return;
+        }
+        request.request_id = static_cast<uint32_t>(request_id);
+        result->Success(flutter::EncodableValue(viewer_->CaptureDisplays(std::move(request))));
+        return;
+    }
+    if (method == "bindDisplayOutput") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t id = 0, output = 0;
+        if (!args || !map_int(*args, "streamId", &id) || !map_int(*args, "output", &output) ||
+            id < 0 || id > UINT32_MAX || output < 0) {
+            result->Error("bad_args", "bindDisplayOutput requires a stream ID and output pointer"); return;
+        }
+        const auto stream_id = static_cast<uint32_t>(id);
+        if (display_stream_ && (*display_stream_ != stream_id ||
+            (output != 0 && session_generation_.load() != session_->generation.load()))) {
+            result->Success(flutter::EncodableValue(false)); return;
+        }
+        auto& sinks = session_->displays;
+        auto it = sinks.find(stream_id);
+        if (output == 0) {
+            // Clear the borrowed plugin pointer synchronously. Dart can then
+            // unregister its texture even if the worker is finishing a frame.
+            if (it != sinks.end()) {
+                it->second->SetOutputForOwner(this, nullptr);
+                if (!it->second->HasOutputs()) {
+                    viewer_->BindDisplay(stream_id, nullptr);
+                    sinks.erase(it);
+                }
+            }
+            cursor_revisions_.erase(stream_id);
+            result->Success(flutter::EncodableValue(true)); return;
+        }
+        const auto status = viewer_->Snapshot();
+        if (status.state != ViewerState::kStreaming || !status.multiple_displays ||
+            std::none_of(status.display_streams.begin(), status.display_streams.end(),
+                [stream_id](const auto& stream) { return stream.stream.stream_id == stream_id; })) {
+            result->Success(flutter::EncodableValue(false)); return;
+        }
+        auto sink = it == sinks.end() ? std::make_shared<GpuFrameSink>() : it->second;
+        if (!sink->ready()) { result->Error("no_gpu", sink->error()); return; }
+        // The extra window only adds an output to the existing decoder's sink.
+        if (it == sinks.end() && !viewer_->BindDisplay(stream_id, sink)) {
+            result->Success(flutter::EncodableValue(false)); return;
+        }
+        sink->SetOutputForOwner(this, reinterpret_cast<void*>(static_cast<intptr_t>(output)));
+        sinks[stream_id] = std::move(sink);
+        result->Success(flutter::EncodableValue(true)); return;
+    }
+    if (method == "focusDisplay") {
+        const auto* id = std::get_if<int64_t>(call.arguments());
+        const auto* id32 = std::get_if<int32_t>(call.arguments());
+        const int64_t value = id ? *id : id32 ? *id32 : -1;
+        if (display_stream_) {
+            const auto status = viewer_->Snapshot();
+            result->Success(flutter::EncodableValue(value == *display_stream_ &&
+                status.state == ViewerState::kStreaming && status.multiple_displays &&
+                std::any_of(status.display_streams.begin(), status.display_streams.end(),
+                    [value](const auto& stream) { return stream.stream.stream_id == value; })));
+            return;
+        }
+        result->Success(flutter::EncodableValue(value >= 0 && value <= UINT32_MAX &&
+            viewer_->FocusDisplay(static_cast<uint32_t>(value))));
+        return;
+    }
+    if (method == "displayStreams") {
+        const auto status = viewer_->Snapshot();
+        session_->Prune(status);
+        flutter::EncodableMap state;
+        state[key("active")] = flutter::EncodableValue(status.multiple_displays);
+        state[key("requestId")] = flutter::EncodableValue(static_cast<int64_t>(status.display_subscription_request));
+        state[key("results")] = flutter::EncodableValue(static_cast<int64_t>(status.display_subscription_results));
+        state[key("error")] = flutter::EncodableValue(status.display_subscription_error);
+        const auto focused = display_stream_ ? display_stream_ : status.focused_display;
+        state[key("focused")] = flutter::EncodableValue(focused ? static_cast<int64_t>(*focused) : int64_t(-1));
+        flutter::EncodableList streams;
+        for (const auto& stream : status.display_streams) {
+            if (display_stream_ && stream.stream.stream_id != *display_stream_) continue;
+            const auto& info = stream.stream.info;
+            flutter::EncodableMap item;
+            item[key("streamId")] = flutter::EncodableValue(static_cast<int64_t>(stream.stream.stream_id));
+            item[key("displayIndex")] = flutter::EncodableValue(static_cast<int32_t>(stream.stream.display_index));
+            item[key("width")] = flutter::EncodableValue(static_cast<int32_t>(info.width));
+            item[key("height")] = flutter::EncodableValue(static_cast<int32_t>(info.height));
+            item[key("sourceWidth")] = flutter::EncodableValue(static_cast<int32_t>(info.source_width));
+            item[key("sourceHeight")] = flutter::EncodableValue(static_cast<int32_t>(info.source_height));
+            item[key("originX")] = flutter::EncodableValue(info.origin_x);
+            item[key("originY")] = flutter::EncodableValue(info.origin_y);
+            item[key("published")] = flutter::EncodableValue(static_cast<int64_t>(stream.published));
+            item[key("decoded")] = flutter::EncodableValue(static_cast<int64_t>(stream.decoded));
+            item[key("dropped")] = flutter::EncodableValue(static_cast<int64_t>(stream.dropped));
+            item[key("bound")] = flutter::EncodableValue(stream.bound);
+            item[key("ready")] = flutter::EncodableValue(stream.ready);
+            item[key("error")] = flutter::EncodableValue(stream.error);
+            streams.emplace_back(std::move(item));
+        }
+        state[key("streams")] = flutter::EncodableValue(std::move(streams));
+        result->Success(flutter::EncodableValue(std::move(state))); return;
+    }
+    if (method == "takeDisplayCursors") {
+        flutter::EncodableList updates;
+        session_->CollectCursors();
+        for (const auto& [stream_id, cached] : session_->cursors) {
+            if ((display_stream_ && stream_id != *display_stream_) ||
+                cursor_revisions_[stream_id] == cached.revision) continue;
+            cursor_revisions_[stream_id] = cached.revision;
+            const auto& cursor = cached.value;
+            flutter::EncodableMap item;
+            item[key("streamId")] = flutter::EncodableValue(static_cast<int64_t>(stream_id));
+            item[key("visible")] = flutter::EncodableValue(cursor.visible);
+            item[key("x")] = flutter::EncodableValue(cursor.x); item[key("y")] = flutter::EncodableValue(cursor.y);
+            item[key("width")] = flutter::EncodableValue(static_cast<int32_t>(cursor.width));
+            item[key("height")] = flutter::EncodableValue(static_cast<int32_t>(cursor.height));
+            item[key("hotspotX")] = flutter::EncodableValue(static_cast<int32_t>(cursor.hotspot_x));
+            item[key("hotspotY")] = flutter::EncodableValue(static_cast<int32_t>(cursor.hotspot_y));
+            item[key("shapeId")] = flutter::EncodableValue(static_cast<int64_t>(cursor.shape_id));
+            item[key("bgra")] = flutter::EncodableValue(cursor.sprite);
+            updates.emplace_back(std::move(item));
+        }
+        result->Success(flutter::EncodableValue(std::move(updates))); return;
+    }
+
     if (method == "status") {
         const ViewerStatus status = viewer_->Snapshot();
+        if (key_capture_ && (status.state != ViewerState::kStreaming || !status.input_enabled))
+            SetKeyCapture(false);
         flutter::EncodableMap map;
         map[key("state")] = flutter::EncodableValue(std::string(state_name(status.state)));
         map[key("error")] = flutter::EncodableValue(status.error);
@@ -550,7 +768,7 @@ void ViewerBridge::HandleMethodCall(
         map[key("codec")] = flutter::EncodableValue(std::string(
             status.codec == chast::VideoCodec::H264
                 ? "h264"
-                : (status.codec == chast::VideoCodec::Hevc ? "hevc" : "av1")));
+                : (status.codec == chast::VideoCodec::Hevc ? "hevc" : status.codec == chast::VideoCodec::Vp9 ? "vp9" : "av1")));
         map[key("width")] = flutter::EncodableValue(static_cast<int32_t>(status.width));
         map[key("height")] = flutter::EncodableValue(static_cast<int32_t>(status.height));
         map[key("sourceWidth")] =
@@ -604,6 +822,7 @@ void ViewerBridge::HandleMethodCall(
         map[key("inputFailed")] =
             flutter::EncodableValue(static_cast<int64_t>(status.input_failed));
         map[key("clipboardEnabled")] = flutter::EncodableValue(status.clipboard_enabled);
+        map[key("clipboardDirection")] = flutter::EncodableValue(static_cast<int>(status.clipboard_direction));
         map[key("clipboardSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.clipboard_sent));
         map[key("clipboardReceived")] =
@@ -839,6 +1058,10 @@ void ViewerBridge::HandleMethodCall(
         map[key("osLoginError")] = flutter::EncodableValue(status.os_login_error);
         map[key("osLoginUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.os_login_updates));
+        map[key("elevationCode")] = flutter::EncodableValue(static_cast<int32_t>(status.elevation.code));
+        map[key("elevationRequestId")] = flutter::EncodableValue(static_cast<int64_t>(status.elevation.request_id));
+        map[key("elevationReason")] = flutter::EncodableValue(status.elevation.reason);
+        map[key("elevationUpdates")] = flutter::EncodableValue(static_cast<int64_t>(status.elevation_updates));
         map[key("sessionSelectSupported")] =
             flutter::EncodableValue(status.session_select_supported);
         map[key("sessionListCode")] =
@@ -982,6 +1205,7 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(status.display_follow_error);
         map[key("displayFollowResults")] =
             flutter::EncodableValue(static_cast<int64_t>(status.display_follow_results));
+        map[key("chroma")] = flutter::EncodableValue(static_cast<int>(status.chroma));
         map[key("streamQuality")] =
             flutter::EncodableValue(static_cast<int32_t>(status.stream_quality));
         map[key("streamOptionCode")] =
@@ -1066,6 +1290,16 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setKeyboardMode") {
+        const auto* mode = std::get_if<std::string>(call.arguments());
+        if (!mode || (*mode != "physical" && *mode != "local")) {
+            result->Error("bad_args", "keyboard mode must be physical or local"); return;
+        }
+        if (!SetKeyboardMode(*mode == "local")) {
+            result->Error("keyboard_unavailable", "The local input method is not available"); return;
+        }
+        result->Success(); return;
+    }
     if (method == "setKeyCapture") {
         const auto* enable = std::get_if<bool>(call.arguments());
         if (enable == nullptr) {
@@ -1073,6 +1307,10 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         SetKeyCapture(*enable);
+        if (*enable && local_keyboard_ && (!key_capture_ || !keyboard_capture_ ||
+            !keyboard_capture_->enabled())) {
+            result->Error("keyboard_unavailable", "The local input method is not available"); return;
+        }
         result->Success(
             flutter::EncodableValue(keyboard_capture_ && keyboard_capture_->enabled()));
         return;
@@ -1096,7 +1334,7 @@ void ViewerBridge::HandleMethodCall(
     }
 
     if (method == "releaseInput") {
-        const bool queued = viewer_ != nullptr && viewer_->ReleaseInput();
+        const bool queued = ReleaseInput();
         result->Success(flutter::EncodableValue(queued));
         return;
     }
@@ -1190,12 +1428,13 @@ void ViewerBridge::HandleMethodCall(
         }
         int64_t codec = 0;
         int64_t max_fps = 0;
-        int64_t quality = 0;
+        int64_t quality = 0, chroma = 0;
+        map_int(*args, "chroma", &chroma);
         if (!map_int(*args, "codec", &codec) || !map_int(*args, "maxFps", &max_fps) ||
-            !map_int(*args, "quality", &quality) || codec < 0 || codec > 3 ||
+            !map_int(*args, "quality", &quality) || codec < 0 || codec > 4 || chroma < 0 || chroma > 1 ||
             max_fps < 0 || max_fps > chast::kMaxStreamFps || quality < 0 || quality > 2) {
             result->Error("bad_args",
-                          "setStreamOptions wants codec in 0..3 and quality in 0..2 and maxFps in "
+                          "setStreamOptions wants codec in 0..4, chroma in 0..1 and quality in 0..2 and maxFps in "
                           "0..240");
             return;
         }
@@ -1203,7 +1442,7 @@ void ViewerBridge::HandleMethodCall(
             viewer_ != nullptr &&
             viewer_->SetStreamOptions(static_cast<chast::StreamCodecPreference>(codec),
                                       static_cast<uint16_t>(max_fps),
-                                      static_cast<chast::StreamQuality>(quality));
+                                      static_cast<chast::StreamQuality>(quality), static_cast<chast::VideoChroma>(chroma));
         result->Success(flutter::EncodableValue(queued));
         return;
     }
@@ -1382,13 +1621,26 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "requestFileList" || method == "requestFileDownload") {
         const auto* path = std::get_if<std::string>(call.arguments());
+        std::string cursor;
+        if (method == "requestFileList") {
+            if (const auto* args = std::get_if<flutter::EncodableMap>(call.arguments())) {
+                const auto directory = args->find(key("directory"));
+                if (directory != args->end()) path = std::get_if<std::string>(&directory->second);
+                const auto after = args->find(key("cursor"));
+                if (after != args->end()) {
+                    const auto* value = std::get_if<std::string>(&after->second);
+                    if (!value) { result->Error("bad_args", "cursor must be a string"); return; }
+                    cursor = *value;
+                }
+            }
+        }
         if (path == nullptr) {
             result->Error("bad_args", "the request wants a '/'-separated relative path");
             return;
         }
         const bool queued =
             viewer_ != nullptr && (method == "requestFileList"
-                                       ? viewer_->RequestFileList(*path)
+                                       ? viewer_->RequestFileList(*path, std::move(cursor))
                                        : viewer_->RequestFileDownload(*path));
         result->Success(flutter::EncodableValue(queued));
         return;
@@ -1509,6 +1761,8 @@ void ViewerBridge::HandleMethodCall(
         }
         flutter::EncodableMap map;
         map[key("directory")] = flutter::EncodableValue(answer.directory);
+        map[key("cursor")] = flutter::EncodableValue(answer.cursor);
+        map[key("nextCursor")] = flutter::EncodableValue(answer.result.next_cursor);
         map[key("code")] = flutter::EncodableValue(static_cast<int32_t>(answer.result.code));
         map[key("reason")] = flutter::EncodableValue(answer.result.reason);
         map[key("truncated")] = flutter::EncodableValue(answer.result.truncated);
@@ -1699,6 +1953,10 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "requestElevation") {
+        result->Success(flutter::EncodableValue(viewer_ != nullptr && viewer_->RequestElevation()));
+        return;
+    }
     if (method == "requestSessionList") {
         const bool queued = viewer_ != nullptr && viewer_->RequestSessionList();
         result->Success(flutter::EncodableValue(queued));
@@ -2330,12 +2588,17 @@ LRESULT CALLBACK ViewerBridge::WindowSubclassProc(HWND window, UINT message, WPA
         bridge->channel_->InvokeMethod("keyboardEscape", nullptr);
         return 0;
     }
+    if (message == kLocalKeyMessage && bridge != nullptr) {
+        bridge->DrainLocalKey(static_cast<uintptr_t>(wparam));
+        return 0;
+    }
     if (message == WM_ACTIVATE && LOWORD(wparam) == WA_INACTIVE && bridge != nullptr &&
         bridge->keyboard_capture_ && bridge->keyboard_capture_->enabled()) {
+        if (bridge->local_text_input_) bridge->local_text_input_->Cancel();
         bridge->keyboard_capture_->Release();
     }
     if (message == WM_CLOSE && bridge != nullptr && bridge->window_close_handler_ &&
-        !bridge->shutting_down_) {
+        !bridge->shutting_down_ && !bridge->display_stream_) {
         // The session window must wind its session down before the engine
         // goes away. Tell Dart once; its shutdown asks for the real close.
         if (!bridge->window_close_requested_) {
@@ -2494,33 +2757,167 @@ void ViewerBridge::SendInput(
         event.modifiers = keyboard_capture_->InputState();
     }
     last_modifiers_ = event.modifiers;
-    const bool queued = viewer_ != nullptr && viewer_->SendInput(event);
+    const bool queued = QueueInput(event);
     result->Success(flutter::EncodableValue(queued));
 }
 
+bool ViewerBridge::QueueInput(const chast::InputEvent& event) {
+    return session_ && session_->SendInput(this, session_generation_.load(), display_stream_, window_, event);
+}
+
+bool ViewerBridge::PostLocalKey(const chast::InputEvent& event, bool release) {
+    std::lock_guard lock(local_keys_mutex_);
+    // Focus loss can prevent delivery of native keys that were still queued.
+    // Discard their barriers and release rather than waiting for another window.
+    if (release) {
+        local_keys_.clear();
+        local_ime_keys_.fill(false);
+    }
+    if (local_keys_.size() >= 256) return false;
+    const auto ticket = ++next_local_ticket_;
+    local_keys_.push_back({event, release, session_generation_.load(), ticket});
+    if (!PostMessageW(window_, kLocalKeyMessage, ticket, 0)) {
+        local_keys_.pop_back();
+        return false;
+    }
+    return true;
+}
+
+bool ViewerBridge::QueueLocalKey(const KBDLLHOOKSTRUCT& key, bool down,
+    const chast::InputEvent& event, bool consumed) {
+    if (consumed) return event.kind != chast::InputKind::Key || PostLocalKey(event);
+    std::lock_guard lock(local_keys_mutex_);
+    if (local_keys_.size() >= 256) return false;
+    LocalKey pending{event, false, session_generation_.load(), ++next_local_ticket_};
+    pending.scan = static_cast<uint16_t>((key.scanCode & 0xff) | ((key.flags & LLKHF_EXTENDED) ? 0x100 : 0));
+    pending.virtual_key = key.vkCode;
+    pending.usage = chast::windows_key_to_hid(key.vkCode, key.scanCode, (key.flags & LLKHF_EXTENDED) != 0);
+    pending.down = down;
+    pending.native = true;
+    pending.completed = false;
+    local_keys_.push_back(pending);
+    return true;
+}
+
+bool ViewerBridge::ObserveLocalKey(UINT message, WPARAM wparam, LPARAM lparam) {
+    if (!local_keyboard_ || !key_capture_ ||
+        static_cast<ULONG_PTR>(GetMessageExtraInfo()) == chast::kInputInjectionTag) return false;
+    const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    const uint16_t scan = static_cast<uint16_t>((lparam >> 16) & 0x1ff);
+    const unsigned repeats = (std::max)(1u, static_cast<unsigned>(LOWORD(lparam)));
+    bool remote = false;
+    std::lock_guard lock(local_keys_mutex_);
+    for (unsigned i = 0; i < repeats; ++i) {
+        const auto found = std::find_if(local_keys_.begin(), local_keys_.end(), [&](const LocalKey& key) {
+            return key.native && !key.received && key.down == down && key.scan == scan &&
+                (scan != 0 || key.virtual_key == wparam || wparam == VK_PROCESSKEY);
+        });
+        if (found == local_keys_.end()) break;
+        if (found->usage != 0 && found->usage < 0xe0) {
+            auto& ime = local_ime_keys_[found->usage];
+            if (down) ime = wparam == VK_PROCESSKEY || (local_text_input_ && local_text_input_->composing());
+            if (ime) found->event = {};
+            if (!down) ime = false;
+        }
+        remote |= found->event.kind == chast::InputKind::Key;
+        found->received = true;
+        // TranslateMessage has already posted this key's WM_CHAR. Complete its
+        // barrier only after that character, before allowing later shortcuts.
+        // A hook's earlier PostMessage can otherwise overtake native key input.
+        if (!PostMessageW(window_, kLocalKeyMessage, found->ticket, 0)) {
+            local_keys_.clear();
+            ReleaseInput();
+            break;
+        }
+    }
+    return remote;
+}
+
+void ViewerBridge::DrainLocalKey(uintptr_t ticket) {
+    std::deque<LocalKey> ready;
+    {
+        std::lock_guard lock(local_keys_mutex_);
+        const auto found = std::find_if(local_keys_.begin(), local_keys_.end(),
+            [ticket](const LocalKey& key) { return key.ticket == ticket; });
+        if (found == local_keys_.end()) return;
+        if (found->native && found->received) found->completed = true;
+        while (!local_keys_.empty() && local_keys_.front().completed) {
+            ready.push_back(local_keys_.front());
+            local_keys_.pop_front();
+        }
+    }
+    for (const auto& key : ready) {
+        if (key.generation != session_generation_.load()) continue;
+        if (key.release) ReleaseInput();
+        else if (key_capture_ && local_keyboard_ && key.event.kind == chast::InputKind::Key &&
+                 !QueueInput(key.event)) ReleaseInput();
+    }
+}
+
+bool ViewerBridge::ReleaseInput() {
+    return session_ && session_->ReleaseInput(this, session_generation_.load());
+}
+
+bool ViewerBridge::SetKeyboardMode(bool local) {
+    if (local_keyboard_ == local) return true;
+    if (local && (!local_text_input_ || !keyboard_capture_ || !keyboard_capture_->available())) return false;
+    const bool captured = key_capture_.load();
+    SetKeyCapture(false);
+    ReleaseInput();
+    local_keyboard_ = local;
+    keyboard_capture_->SetTranslated(local);
+    SetKeyCapture(captured);
+    if (captured && local && !key_capture_) {
+        SetKeyCapture(false);
+        local_keyboard_ = false;
+        keyboard_capture_->SetTranslated(false);
+        SetKeyCapture(captured);
+        return false;
+    }
+    return true;
+}
+
 void ViewerBridge::SetKeyCapture(bool enable) {
-    if (keyboard_capture_) keyboard_capture_->Enable(enable);
+    if (enable && display_stream_ && session_generation_.load() != session_->generation.load()) enable = false;
+    if (keyboard_capture_) {
+        const bool captured = keyboard_capture_->Enable(enable);
+        if (enable && local_keyboard_ && !captured) enable = false;
+    }
+    if (!enable) {
+        std::lock_guard lock(local_keys_mutex_);
+        local_keys_.clear();
+        local_ime_keys_.fill(false);
+        ReleaseInput();
+    }
     const bool was = key_capture_.exchange(enable, std::memory_order_relaxed);
     if (was == enable || view_ == nullptr || !IsWindow(view_)) {
         return;
     }
-    if (enable) {
+    if (enable && local_keyboard_) {
+        if (!local_text_input_ || !local_text_input_->Enable(true)) {
+            key_capture_ = false;
+            if (keyboard_capture_) keyboard_capture_->Enable(false);
+        }
+    } else if (enable) {
         saved_himc_ = ImmAssociateContext(view_, nullptr);
-    } else if (saved_himc_ != nullptr) {
-        ImmAssociateContext(view_, saved_himc_);
-        saved_himc_ = nullptr;
+    } else {
+        if (local_text_input_) local_text_input_->Enable(false);
+        if (saved_himc_ != nullptr) {
+            ImmAssociateContext(view_, saved_himc_);
+            saved_himc_ = nullptr;
+        }
     }
 }
 
 void ViewerBridge::SetRelativeMouse(bool enable, double scale) {
     if (keyboard_capture_) keyboard_capture_->set_relative(enable);
     relative_scale_ = scale > 0.0 ? scale : 1.0;
-    relative_mouse_.store(enable, std::memory_order_relaxed);
+    const bool was_enabled = relative_mouse_.exchange(enable, std::memory_order_relaxed);
     if (view_ == nullptr || !IsWindow(view_)) {
         return;
     }
     if (!enable) {
-        ClipCursor(nullptr);
+        if (was_enabled) ClipCursor(nullptr);
         return;
     }
     // Park the pointer in the middle so the first relative move starts from a
@@ -2564,6 +2961,9 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                                                 LPARAM lparam, UINT_PTR id, DWORD_PTR ref_data) {
     auto* self = reinterpret_cast<ViewerBridge*>(ref_data);
     if (self != nullptr) {
+        LRESULT local_result = 0;
+        if (self->local_text_input_ && self->local_text_input_->Handle(message, wparam, lparam, local_result))
+            return local_result;
         switch (message) {
             case WM_MOUSEMOVE:
                 // Relative mode owns the pointer: report the offset from the
@@ -2600,7 +3000,7 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                             event.mouse.buttons = 0;
                             event.mouse.x = move_x;
                             event.mouse.y = move_y;
-                            self->viewer_->SendInput(event);
+                            self->QueueInput(event);
                         }
                     }
                     POINT center{center_x, center_y};
@@ -2630,7 +3030,13 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
             case WM_KEYUP:
-            case WM_SYSKEYUP:
+            case WM_SYSKEYUP: {
+                const bool remote = self->ObserveLocalKey(message, wparam, lparam);
+                if (self->key_capture_ && self->local_keyboard_) {
+                    // IMM owns these keys. Flutter has no active text client
+                    // here and must not redispatch them as unhandled input.
+                    return remote ? 0 : DefWindowProcW(window, message, wparam, lparam);
+                }
                 // An active local IME replaces the virtual key with
                 // VK_PROCESSKEY and the engine drops such events; while the
                 // remote host owns composition, hand it the physical key.
@@ -2638,7 +3044,7 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                 // but not for synthesized ones, so fall back to the scan code
                 // in lParam (the remote side injects by HID usage anyway).
                 if (wparam == VK_PROCESSKEY &&
-                    self->key_capture_.load(std::memory_order_relaxed)) {
+                    self->key_capture_.load(std::memory_order_relaxed) && !self->local_keyboard_) {
                     UINT original = ImmGetVirtualKey(window);
                     if (original == 0 || original == VK_PROCESSKEY) {
                         const UINT scan = static_cast<UINT>((lparam >> 16) & 0xff);
@@ -2653,6 +3059,7 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                     }
                 }
                 break;
+            }
             case WM_SETCURSOR:
                 // The host's pointer shape over the video area. Answering here
                 // keeps Flutter from installing its own cursor on top: the

@@ -106,6 +106,9 @@ type Options struct {
 	// CarrierV6 adds an IPv6 shared-carrier listener on ::1 and advertises it,
 	// so tests can cover dual-stack carrier endpoints.
 	CarrierV6 bool
+	// RegistryOfflineAfter controls how long a host remains UDP-online after
+	// its last rendezvous keepalive. Zero keeps the production default.
+	RegistryOfflineAfter time.Duration
 	// Tracer exports request spans. Nil disables tracing.
 	Tracer *tracing.Tracer
 }
@@ -138,7 +141,11 @@ func Start(t testing.TB) *Server {
 func StartWith(t testing.TB, opts Options) *Server {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(5 * time.Second)
+	offlineAfter := opts.RegistryOfflineAfter
+	if offlineAfter <= 0 {
+		offlineAfter = 5 * time.Second
+	}
+	reg := registry.New(offlineAfter)
 	var accounts *account.Store
 	if !opts.NoAccounts {
 		var err error
@@ -204,9 +211,20 @@ func StartWith(t testing.TB, opts Options) *Server {
 	}
 	relayOnly := &atomic.Bool{}
 	relayOnly.Store(opts.RelayOnly)
+	var pool *relaypool.Pool
 	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log,
 		rendezvous.WithServerKey(ServerKey),
 		rendezvous.WithRelayOnly(relayOnly.Load),
+		rendezvous.WithHostCarrierLinked(func(id string) bool {
+			host, ok := reg.Lookup(id)
+			if !ok {
+				return false
+			}
+			if host.RelayNode != "" {
+				return pool != nil && pool.HostLinked(host.RelayNode, id)
+			}
+			return rm.HostLinked(id)
+		}),
 	)
 	if err != nil {
 		rm.Close()
@@ -226,7 +244,6 @@ func StartWith(t testing.TB, opts Options) *Server {
 	if err != nil {
 		t.Fatalf("relay addresses: %v", err)
 	}
-	var pool *relaypool.Pool
 	if len(opts.RelayNodes) > 0 {
 		key := opts.RelayNodeKey
 		if key == "" {
@@ -287,6 +304,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		Identity:                   serverIdentity,
 		PunchAddr:                  meet.Addr(),
 		TCPPunchAddr:               meet.TCPAddr(),
+		HostControlLinked:          meet.HostControlLinked,
 		RelayHost:                  "127.0.0.1",
 		ServerKey:                  ServerKey,
 		WakeRelays:                 opts.WakeRelays,

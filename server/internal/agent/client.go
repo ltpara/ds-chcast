@@ -138,6 +138,15 @@ type apiError struct {
 	Error string `json:"error"`
 }
 
+type apiStatusError struct {
+	method, path, detail string
+	status               int
+}
+
+func (e *apiStatusError) Error() string {
+	return fmt.Sprintf("%s %s: %s", e.method, e.path, e.detail)
+}
+
 func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey ed25519.PrivateKey, fingerprint string, wakeRelay bool, wakeTargets []string) (registerResult, error) {
 	timestamp := time.Now().Unix()
 	hostname, _ := os.Hostname()
@@ -211,10 +220,11 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 	}
 	if resp.StatusCode >= 300 {
 		var e apiError
+		detail := fmt.Sprintf("HTTP %d", resp.StatusCode)
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("%s %s: %s", method, path, e.Error)
+			detail = e.Error
 		}
-		return fmt.Errorf("%s %s: HTTP %d", method, path, resp.StatusCode)
+		return &apiStatusError{method: method, path: path, detail: detail, status: resp.StatusCode}
 	}
 	if out == nil {
 		return nil

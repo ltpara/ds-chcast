@@ -50,6 +50,7 @@ type options struct {
 	tcpPunchListenSet bool
 	tcpPunchListen    string
 	relayOnly         func() bool
+	hostCarrierLinked func(string) bool
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -104,6 +105,15 @@ func WithRelayOnly(relayOnly func() bool) Option {
 	return func(o *options) { o.relayOnly = relayOnly }
 }
 
+// WithHostCarrierLinked lets TCP punch coordination treat an authenticated
+// shared-carrier link as proof that a host is online. This matches the lookup
+// path: a host whose UDP mapping expired but whose carrier is connected is
+// still online. Punch instructions use the independent rendezvous control
+// link or UDP; the carrier only supplies a compatible liveness signal.
+func WithHostCarrierLinked(linked func(string) bool) Option {
+	return func(o *options) { o.hostCarrierLinked = linked }
+}
+
 type Server struct {
 	conn      *net.UDPConn
 	reg       *registry.Registry
@@ -119,11 +129,12 @@ type Server struct {
 	keepaliveLimiter *limiter
 	// natProbeLimiter throttles stateless NAT observation replies so the punch
 	// port cannot be used as a reflector.
-	natProbeLimiter *limiter
-	serverKey       string
-	tracer          *tracing.Tracer
-	readBuffer      int
-	relayOnly       func() bool
+	natProbeLimiter   *limiter
+	serverKey         string
+	tracer            *tracing.Tracer
+	readBuffer        int
+	relayOnly         func() bool
+	hostCarrierLinked func(string) bool
 	// tcpPunch is nil when the coordination listener is disabled or could not
 	// bind; punching then stays on UDP.
 	tcpPunch  *tcpPuncher
@@ -154,18 +165,19 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 			"requested", cfg.readBuffer, "error", err)
 	}
 	server := &Server{
-		conn:             conn,
-		reg:              reg,
-		relayAddr:        relayAddr,
-		log:              log,
-		limiter:          newLimiter(cfg.rateMax, defaultRateSpan),
-		keepaliveLimiter: newLimiter(cfg.keepaliveRateMax, defaultRateSpan),
-		natProbeLimiter:  newLimiter(DefaultNatProbeRateMax, defaultRateSpan),
-		serverKey:        cfg.serverKey,
-		tracer:           cfg.tracer,
-		readBuffer:       readBuffer,
-		relayOnly:        cfg.relayOnly,
-		done:             make(chan struct{}),
+		conn:              conn,
+		reg:               reg,
+		relayAddr:         relayAddr,
+		log:               log,
+		limiter:           newLimiter(cfg.rateMax, defaultRateSpan),
+		keepaliveLimiter:  newLimiter(cfg.keepaliveRateMax, defaultRateSpan),
+		natProbeLimiter:   newLimiter(DefaultNatProbeRateMax, defaultRateSpan),
+		serverKey:         cfg.serverKey,
+		tracer:            cfg.tracer,
+		readBuffer:        readBuffer,
+		relayOnly:         cfg.relayOnly,
+		hostCarrierLinked: cfg.hostCarrierLinked,
+		done:              make(chan struct{}),
 	}
 	server.startTCPPunch(cfg)
 	return server, nil
@@ -485,6 +497,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	reply.LocalAddrs = host.LocalAddrs
 	reply.LocalAddrsV6 = host.LocalAddrsV6
 	reply.NATType = host.NATType
+	reply.IsLocal = sameObservedIP(host.Candidate, src.String())
 	reply.PublicKey = host.PublicKey
 	reply.Fingerprint = host.Fingerprint
 	if s.identity != nil && host.PublicKey != "" {

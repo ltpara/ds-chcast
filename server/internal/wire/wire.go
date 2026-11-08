@@ -35,6 +35,10 @@ const (
 	// the server's TCP punch port and learn the endpoint the server observed
 	// for their peer, mirroring RustDesk's punch-hole TCP channel.
 	TypeTCPPunch = "tcp_punch"
+	// TypeRendezvousControl opens the authenticated host control connection.
+	// TypeRendezvousProof answers its per-connection challenge.
+	TypeRendezvousControl = "rendezvous_control"
+	TypeRendezvousProof   = "rendezvous_proof"
 	// TypeTCPDirect is the signed hello of a punched TCP link itself.
 	TypeTCPDirect      = "tcp_direct"
 	TypeRelayHello     = "relay_hello"
@@ -73,6 +77,7 @@ type Message struct {
 	// LocalAddrsV6 mirrors LocalAddrs for IPv6. RustDesk carries the same split
 	// as socket_addr/socket_addr_v6; a dual-stack agent reports both.
 	LocalAddrsV6 []string `json:"local_addrs_v6,omitempty"`
+	IsLocal      bool     `json:"is_local,omitempty"`
 	NATType      string   `json:"nat_type,omitempty"`
 	// UpnpPort is the external UDP port an agent mapped on its gateway. It is
 	// only a hint: the peer still has to be reached through the NAT, but a

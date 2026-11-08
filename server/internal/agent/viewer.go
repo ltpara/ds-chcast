@@ -53,8 +53,11 @@ type ViewerConfig struct {
 	HostID          string
 	ListenAddr      string
 	Mode            string
-	DirectTimeout   time.Duration
-	Logger          *slog.Logger
+	// DirectTimeout > 0 explicitly caps the whole auto attempt, including coordination.
+	// Zero uses RustDesk's separate coordination and adaptive connection budgets.
+	DirectTimeout    time.Duration
+	DirectHistoryDir string
+	Logger           *slog.Logger
 	// UPnP maps the viewer's UDP socket on the local gateway so the host can
 	// punch towards a stable external port. It is opt-in.
 	UPnP bool
@@ -98,8 +101,14 @@ type ViewerAgent struct {
 	servers *serverPool
 	log     *slog.Logger
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx           context.Context
+	cancel        context.CancelFunc
+	directCtx     context.Context
+	directCancel  context.CancelFunc
+	pendingDirect int
+	directFailed  bool
+	historyPath   string
+	historyMu     sync.Mutex
 
 	punch  *net.UDPAddr
 	punch6 *net.UDPAddr
@@ -113,7 +122,8 @@ type ViewerAgent struct {
 	carrierToken string
 	// relayOnly means the server hides direct candidates; transport is its
 	// hint (direct, relay or carrier). carrierMode forwards local datagrams
-	// through the shared TCP carrier instead of a UDP address.
+	// through the shared TCP carrier instead of a UDP address. carrierMode is
+	// guarded by mu because auto mode can switch to it after a direct attempt.
 	relayOnly   bool
 	transport   string
 	carrierMode bool
@@ -124,26 +134,24 @@ type ViewerAgent struct {
 	// either address family. It is empty while no link is up.
 	carrierUsed atomic.Value
 
-	mu         sync.Mutex
-	remote     *net.UDPAddr
-	local      *net.UDPAddr
-	latched    bool
-	timer      *time.Timer
-	timerArmed bool
-	directOK   atomic.Bool
-	punched    atomic.Bool
+	mu                 sync.Mutex
+	remote             *net.UDPAddr
+	local              *net.UDPAddr
+	latched            bool
+	timer              *time.Timer
+	directOK           atomic.Bool
+	directLost         bool // A failed established path requires a new viewer/lookup.
+	lastDirectReceive  time.Time
+	directKeepaliveTID string
+	punched            atomic.Bool
 	// punchActive is true while this viewer probes for the host; only then may
 	// a peer probe be acknowledged, which is the same window RustDesk keeps its
 	// punch loop open.
 	punchActive atomic.Bool
-	// directTrying is true while the TCP punch still runs without a UDP path.
-	// Auto mode arms its relay fallback timer on it, so a UDP-blocked network
-	// still reaches the relay at the same deadline.
-	directTrying atomic.Bool
-	relayAuthOK  atomic.Bool
-	relayAuth    sync.Once
-	fellBack     bool
-	nonce        string
+	relayAuthOK atomic.Bool
+	relayAuth   sync.Once
+	fellBack    bool
+	nonce       string
 	// tcpPunch is the rendezvous service's TCP punch coordination endpoint and
 	// hostPub verifies the host hello on the punched socket. Both are empty
 	// when the server did not advertise a TCP punch.
@@ -162,10 +170,7 @@ type ViewerAgent struct {
 	punchTID    string
 	lastPathKey string
 	candidates  []*net.UDPAddr
-	// directWait is how long an unanswered direct path is tried before the
-	// relay takes over. A symmetric NAT on either side shortens it, matching
-	// RustDesk's MIN connect timeout for that case.
-	directWait time.Duration
+	udpLocal    bool
 	// natType is the host's advertised NAT classification; ownNAT is the
 	// viewer's own, measured against the rendezvous and relay ports.
 	natType  string
@@ -235,11 +240,6 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	if cfg.Mode != ModeAuto && cfg.Mode != ModeDirect && cfg.Mode != ModeRelay && cfg.Mode != ModeCarrier && cfg.Mode != ModeTCP {
 		return nil, fmt.Errorf("--mode must be auto, direct, relay, carrier or tcp")
 	}
-	if cfg.DirectTimeout <= 0 {
-		// One punch window: the same budget RustDesk's punch_udp gives the
-		// direct path before the relay takes over.
-		cfg.DirectTimeout = punchProbeWindow
-	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -277,13 +277,14 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel:  cancel,
 		nonce:   newNonce(),
 	}
+	v.directCtx, v.directCancel = context.WithCancel(ctx)
 	v.localAddrs, v.localAddrsV6 = splitByFamily(localCandidates(out.LocalAddr().(*net.UDPAddr)))
 
 	host, err := v.lookupWithFailover(ctx)
 	if err != nil {
 		v.closeSockets()
 		cancel()
-		return nil, fmt.Errorf("lookup: %w", err)
+		return nil, &viewerStartError{err: fmt.Errorf("lookup: %w", err), retryable: retryableLookupError(err)}
 	}
 	if err := checkHostBinding(cfg.ServerPublicKey, cfg.HostID, host); err != nil {
 		v.closeSockets()
@@ -306,7 +307,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	if !host.Online {
 		v.closeSockets()
 		cancel()
-		return nil, fmt.Errorf("host %s is registered but offline", cfg.HostID)
+		return nil, &viewerStartError{err: fmt.Errorf("host %s is registered but offline", cfg.HostID), retryable: true}
 	}
 	if cfg.UPnP && cfg.Proxy == nil {
 		mapCtx, mapCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -364,11 +365,9 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	if len(v.candidates) > 0 {
 		v.direct = v.candidates[0]
 	}
+	v.initDirectHistory()
 	v.natType = host.NATType
-	v.directWait = cfg.DirectTimeout
-	if host.NATType == NATSymmetric {
-		v.directWait = symmetricDirectWait
-	}
+
 	v.carrier = host.Carrier
 	v.carrierV6 = host.CarrierV6
 	v.carrierToken = host.CarrierToken
@@ -387,6 +386,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		}
 	}
 	carrierReady := v.carrierToken != "" && len(v.carrierCandidates()) > 0
+	tcpReady := v.tcpPunch != nil && v.hostPub != nil
 	useCarrier := false
 
 	if cfg.Proxy != nil {
@@ -450,7 +450,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 			}
 		default:
 			switch {
-			case !host.RelayOnly && v.direct != nil:
+			case !host.RelayOnly && (v.direct != nil || tcpReady):
 				v.remote = v.direct
 			case host.Transport == "carrier" && carrierReady:
 				useCarrier = true
@@ -468,37 +468,52 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		}
 	}
 	v.carrierMode = useCarrier
-
-	go v.readLoop()
-	go v.localLoop()
-	go v.natProbeLoop()
-	if v.remote != nil && v.relay != nil && sameAddr(v.remote, v.relay) {
-		v.startRelayAuth()
-	}
-	if v.carrierMode {
-		go v.carrierLoop()
-	} else {
-		if cfg.Mode != ModeRelay && cfg.Mode != ModeTCP && !host.RelayOnly && v.punch != nil && v.direct != nil {
-			v.sendPunchRequest()
-			go v.punchLoop()
-		}
-		// The TCP punch races beside the UDP punch, as RustDesk races its TCP
-		// direct transport beside UDP. In auto mode it shares the same direct
-		// deadline, so the relay takes over at one point regardless of family.
-		if cfg.Mode != ModeRelay && !host.RelayOnly && v.tcpPunch != nil && v.hostPub != nil {
-			go v.tcpPunchLoop()
-		}
-	}
+	startTCP := !useCarrier && cfg.Mode != ModeRelay && !host.RelayOnly && tcpReady
+	startUDP := !useCarrier && cfg.Mode != ModeRelay && cfg.Mode != ModeTCP &&
+		!host.RelayOnly && v.punch != nil && v.direct != nil
+	startOnRelay := v.remote != nil && v.relay != nil && sameAddr(v.remote, v.relay)
 	path := "relay " + addrText(v.relay)
-	if v.carrierMode {
+	if useCarrier {
 		path = "carrier " + v.carrierEndpoint()
-	} else if cfg.Mode == ModeTCP {
+	} else if cfg.Mode == ModeTCP || (startTCP && v.direct == nil) {
 		path = "tcp punch " + v.tcpPunch.String()
 	} else if v.remote != nil && sameAddr(v.remote, v.direct) {
 		path = "direct " + addrText(v.direct)
 	}
 	v.log.Info("viewer agent listening", "on", conn.LocalAddr().String(),
 		"upstream", v.out.LocalAddr().String(), "path", path)
+	if startTCP {
+		v.pendingDirect++
+	}
+	if startUDP {
+		v.pendingDirect++
+	}
+	if (startTCP || startUDP) && cfg.Mode == ModeAuto && cfg.DirectTimeout > 0 {
+		v.mu.Lock()
+		v.timer = time.AfterFunc(cfg.DirectTimeout, v.onDirectTimeout)
+		v.mu.Unlock()
+	}
+
+	go v.readLoop()
+	go v.localLoop()
+	go v.natProbeLoop()
+	if startOnRelay {
+		v.startRelayAuth()
+	}
+	if useCarrier {
+		go v.carrierLoop()
+	} else {
+		if startUDP {
+			v.sendPunchRequest()
+			go v.punchLoop()
+		}
+		// The TCP punch races beside the UDP punch, as RustDesk races its TCP
+		// direct transport beside UDP. Relay starts after all eligible attempts
+		// finish, unless the user explicitly caps the whole attempt.
+		if startTCP {
+			go v.tcpPunchLoop()
+		}
+	}
 	v.reportPath()
 	return v, nil
 }
@@ -551,7 +566,7 @@ func (v *ViewerAgent) pathLocked() PathInfo {
 	} else if v.remote != nil {
 		if v.relay != nil && sameAddr(v.remote, v.relay) {
 			path = "relay"
-		} else {
+		} else if v.directOK.Load() {
 			path = "direct"
 		}
 	}
@@ -701,6 +716,8 @@ const (
 )
 
 func (v *ViewerAgent) punchLoop() {
+	defer v.directAttemptDone()
+	started := time.Now()
 	// The first request left with the lookup; later attempts re-ask the server
 	// with RustDesk's increasing deadlines while the response is outstanding.
 	for attempt := 1; attempt <= punchRequestAttempts; attempt++ {
@@ -718,20 +735,20 @@ func (v *ViewerAgent) punchLoop() {
 		v.log.Warn("no punch reply from the rendezvous service", "nonce", v.nonce)
 		return
 	}
-	v.probeCandidates()
+	v.probeCandidatesFor(v.connectWait(time.Since(started), v.udpIsLocal()))
 }
 
 func (v *ViewerAgent) waitPunchReply(wait time.Duration) bool {
 	deadline := time.Now().Add(wait)
 	for !v.punched.Load() {
-		if v.ctx.Err() != nil {
+		if v.directContext().Err() != nil {
 			return false
 		}
 		if time.Now().After(deadline) {
 			return true
 		}
 		select {
-		case <-v.ctx.Done():
+		case <-v.directContext().Done():
 			return false
 		case <-time.After(25 * time.Millisecond):
 		}
@@ -743,25 +760,25 @@ func (v *ViewerAgent) waitPunchReply(wait time.Duration) bool {
 // fresh transaction id, back off from 20ms to 200ms, and stop only when that id
 // comes back acknowledged or real peer data arrives. A datagram that merely
 // arrived proves nothing about the return path.
-func (v *ViewerAgent) probeCandidates() {
+func (v *ViewerAgent) probeCandidatesFor(wait time.Duration) {
 	tid := newNonce()
 	v.mu.Lock()
 	v.punchTID = tid
 	v.mu.Unlock()
 	v.punchActive.Store(true)
 	defer v.punchActive.Store(false)
-	deadline := time.Now().Add(punchProbeWindow)
+	deadline := time.Now().Add(minDuration(punchProbeWindow, wait))
 	gap := punchProbeMinGap
 	for {
-		if v.ctx.Err() != nil || v.directOK.Load() || time.Now().After(deadline) {
-			if v.ctx.Err() == nil && !v.directOK.Load() {
+		if v.directContext().Err() != nil || v.directOK.Load() || time.Now().After(deadline) {
+			if v.directContext().Err() == nil && !v.directOK.Load() {
 				v.log.Info("direct punch was not confirmed", "window", punchProbeWindow)
 			}
 			return
 		}
 		v.sendPunchProbe(tid)
 		select {
-		case <-v.ctx.Done():
+		case <-v.directContext().Done():
 			return
 		case <-time.After(gap):
 		}
@@ -799,6 +816,15 @@ func (v *ViewerAgent) answerPunchProbe(src *net.UDPAddr, msg wire.Message) {
 // the one message that proves the path carries traffic in both directions.
 func (v *ViewerAgent) confirmPunchAck(src *net.UDPAddr, msg wire.Message) {
 	v.mu.Lock()
+	if v.directOK.Load() {
+		if !v.tcpActive.Load() && !v.fellBack && !v.directLost &&
+			v.directKeepaliveTID != "" && msg.TID == v.directKeepaliveTID && sameAddr(src, v.direct) {
+			v.lastDirectReceive = time.Now()
+			v.directKeepaliveTID = ""
+		}
+		v.mu.Unlock()
+		return
+	}
 	tid := v.punchTID
 	v.mu.Unlock()
 	if tid == "" || msg.TID != tid {
@@ -810,11 +836,6 @@ func (v *ViewerAgent) confirmPunchAck(src *net.UDPAddr, msg wire.Message) {
 const (
 	natProbeAttempts = 3
 	natProbeTimeout  = 750 * time.Millisecond
-	// symmetricDirectWait mirrors RustDesk's MIN connect timeout: a symmetric
-	// NAT on either side makes the v4 punch useless, so the direct attempt only
-	// gets one second before the relay takes over. An IPv6 path still races
-	// inside that window because it does not traverse the NAT.
-	symmetricDirectWait = time.Second
 )
 
 // natProbeLoop classifies this viewer's own NAT the way the host does: the
@@ -896,17 +917,6 @@ func (v *ViewerAgent) setOwnNAT(nat string) {
 		return
 	}
 	v.ownNAT = nat
-	// RustDesk does not latch the relay the moment a symmetric NAT is measured;
-	// it shortens the direct attempt to its MIN timeout, which still leaves room
-	// for an IPv6 path that does not traverse the v4 mapping.
-	if nat == NATSymmetric && v.cfg.Mode == ModeAuto && !v.carrierMode &&
-		!v.latched && !v.directOK.Load() && v.directWait > symmetricDirectWait {
-		v.directWait = symmetricDirectWait
-		if v.timerArmed && v.timer != nil {
-			v.timer.Stop()
-			v.timer = time.AfterFunc(v.directWait, v.onDirectTimeout)
-		}
-	}
 	v.mu.Unlock()
 	v.log.Info("viewer NAT type detected", "nat", nat)
 	v.reportPath()
@@ -1176,15 +1186,9 @@ func (v *ViewerAgent) localLoop() {
 			}
 		}
 		remote := cloneAddr(v.remote)
-		// While the TCP punch has not answered there may be no UDP remote at
-		// all; the relay still has to take over at the same deadline.
-		if v.cfg.Mode == ModeAuto && !v.timerArmed &&
-			((remote != nil && !sameAddr(remote, v.relay)) || v.directTrying.Load()) {
-			v.timerArmed = true
-			v.timer = time.AfterFunc(v.directWait, v.onDirectTimeout)
-		}
+		useCarrier := v.carrierMode
 		v.mu.Unlock()
-		if v.carrierMode {
+		if useCarrier {
 			v.writeCarrier(data)
 			continue
 		}
@@ -1229,7 +1233,7 @@ func (v *ViewerAgent) readLoop() {
 				switch msg.Type {
 				case wire.TypePunch:
 					// Older hosts only announce the hole with the session nonce.
-					if msg.Nonce == v.nonce {
+					if msg.Nonce == v.nonce && !v.directOK.Load() {
 						v.onDirectPacket(src)
 					}
 				case wire.TypePunchProbe:
@@ -1256,8 +1260,9 @@ func (v *ViewerAgent) readLoop() {
 			// Host data from any announced candidate, or from the address a
 			// confirmed punch recorded. Real peer data is also how RustDesk's
 			// listener-side punch ends: the peer already speaks the transport.
-			v.onDirectPacket(src)
-			v.writeLocal(data)
+			if v.onDirectPacket(src) {
+				v.writeLocal(data)
+			}
 			continue
 		}
 		// Neither the announced host path, the relay nor a nonce-checked punch:
@@ -1265,14 +1270,16 @@ func (v *ViewerAgent) readLoop() {
 	}
 }
 
-func (v *ViewerAgent) onDirectPacket(src *net.UDPAddr) {
-	if v.carrierMode || v.cfg.Mode == ModeTCP || v.tcpActive.Load() {
-		// The TCP link is the direct path of this session; a late UDP probe
-		// must not redirect the local client onto a different transport.
-		return
-	}
-	v.directOK.Store(true)
+func (v *ViewerAgent) onDirectPacket(src *net.UDPAddr) bool {
 	v.mu.Lock()
+	if v.ctx.Err() != nil || v.directLost || v.carrierMode || v.fellBack || v.cfg.Mode == ModeTCP || v.cfg.Mode == ModeRelay || v.tcpActive.Load() ||
+		(v.directOK.Load() && !sameAddr(v.direct, src)) {
+		// A late UDP probe must not redirect a TCP or fallback session.
+		v.mu.Unlock()
+		return false
+	}
+	first := !v.directOK.Swap(true)
+	v.lastDirectReceive = time.Now()
 	if !sameAddr(v.direct, src) {
 		v.direct = cloneAddr(src)
 	}
@@ -1287,34 +1294,58 @@ func (v *ViewerAgent) onDirectPacket(src *net.UDPAddr) {
 		}
 	}
 	v.mu.Unlock()
+	v.stopDirectAttempts()
+	if first {
+		v.recordDirectResult(false)
+		if v.out != nil {
+			go v.udpDirectKeepalive()
+		}
+	}
 	v.reportPath()
+	return true
 }
 
 func (v *ViewerAgent) onDirectTimeout() {
-	v.fallBackToRelay("direct path did not answer; using relay")
+	v.fallBackToRelay("direct path did not answer")
 }
 
-// fallBackToRelay moves an unanswered direct path onto the relay. Once the
+// fallBackToRelay moves a failed direct path onto the UDP relay or carrier. Once the
 // fallback happens a late direct packet must not switch the session back:
 // QUIC above the tunnel has already retransmitted on the relay path.
 func (v *ViewerAgent) fallBackToRelay(reason string) {
 	v.mu.Lock()
-	if v.latched || v.ctx.Err() != nil || v.relay == nil || v.cfg.Mode == ModeTCP ||
-		sameAddr(v.remote, v.relay) {
+	if v.latched || v.ctx.Err() != nil || v.carrierMode || v.cfg.Mode != ModeAuto {
+		v.mu.Unlock()
+		return
+	}
+	carrierReady := v.carrierToken != "" && len(v.carrierCandidates()) > 0
+	useCarrier := carrierReady && (v.transport == "carrier" || v.relay == nil)
+	if !useCarrier && (v.relay == nil || sameAddr(v.remote, v.relay)) {
 		v.mu.Unlock()
 		return
 	}
 	relay := cloneAddr(v.relay)
 	v.latched = true
 	v.fellBack = true
-	v.directTrying.Store(false)
-	v.remote = relay
+	v.carrierMode = useCarrier
+	if useCarrier {
+		v.remote = nil
+	} else {
+		v.remote = relay
+	}
 	if v.timer != nil {
 		v.timer.Stop()
 	}
 	v.mu.Unlock()
-	v.log.Warn(reason, "relay", relay.String())
-	v.startRelayAuth()
+	v.stopDirectAttempts()
+	v.recordDirectResult(true)
+	if useCarrier {
+		v.log.Warn(reason+"; using carrier", "carrier", v.carrierEndpoint())
+		go v.carrierLoop()
+	} else {
+		v.log.Warn(reason+"; using relay", "relay", relay.String())
+		v.startRelayAuth()
+	}
 	v.reportPath()
 }
 
@@ -1327,6 +1358,12 @@ func (v *ViewerAgent) handleControl(src *net.UDPAddr, data []byte) {
 	case wire.TypeNatProbeAck:
 		v.noteNatProbeAck(src, msg)
 	case wire.TypePunchPeer:
+		v.mu.Lock()
+		finished := v.directLost || v.fellBack || v.directOK.Load()
+		v.mu.Unlock()
+		if finished {
+			return
+		}
 		if !msg.OK {
 			v.log.Warn("punch request refused", "error", msg.Error)
 			return
@@ -1367,6 +1404,9 @@ func (v *ViewerAgent) handleControl(src *net.UDPAddr, data []byte) {
 			}
 			v.mu.Unlock()
 			if len(merged) > 0 {
+				v.mu.Lock()
+				v.udpLocal = msg.IsLocal
+				v.mu.Unlock()
 				v.punched.Store(true)
 			}
 		}

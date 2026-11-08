@@ -13,9 +13,9 @@
 // desktop image never reaches system memory; cursor shapes are the only pixels
 // that do, and DXGI only hands them over on request.
 //
-// There is no CPU fallback by design. When DuplicateOutput fails (RDP
-// sessions, protected content, no GPU) capturer creation fails and says why,
-// instead of silently degrading to GDI BitBlt.
+// This implementation itself stays GPU-only. CaptureBackend::Auto wraps it
+// and switches to the GDI uploader when DuplicateOutput cannot be opened or
+// later cannot be reinitialized.
 
 #include "capture/detail.h"
 #include "capture/rotation.h"
@@ -156,6 +156,115 @@ private:
     // is then treated as a desktop update even if its Info says pointer-only.
     bool frame_dirty_ = false;
     uint64_t frame_number_ = 0;
+};
+
+// Keeps the Auto policy alive after creation. If a live DXGI capturer can no
+// longer reinitialize, the subscription changes to GDI without reconnecting.
+class AutoCapturer final : public IDxgiCapturer {
+public:
+    AutoCapturer(DisplayInfo display, CaptureConfig config, ID3D11Device* device = nullptr,
+                 ID3D11DeviceContext* context = nullptr, UINT vendor_id = 0)
+        : display_(std::move(display)), config_(config), device_(device), context_(context),
+          vendor_id_(vendor_id), external_device_(device != nullptr) {
+        if (device_) device_.add_ref();
+        if (context_) context_.add_ref();
+    }
+
+    Error initialize(std::string* detail) {
+        std::string dxgi_error;
+        if (auto capture = make_dxgi(&dxgi_error)) {
+            active_ = std::move(capture);
+            implementation_ = "dxgi";
+            return Error::success();
+        }
+        std::string gdi_error;
+        if (auto capture = make_gdi(&gdi_error)) {
+            active_ = std::move(capture);
+            implementation_ = "gdi fallback (" + dxgi_error + ")";
+            return Error::success();
+        }
+        if (detail) *detail = "DXGI: " + dxgi_error + "; GDI: " + gdi_error;
+        return Error(Status::CaptureFailed, detail ? *detail : "DXGI and GDI capture failed");
+    }
+
+    CaptureResult capture(std::chrono::milliseconds timeout) override {
+        return active_->capture(timeout);
+    }
+    const FrameInfo& frame() const override { return active_->frame(); }
+    const CursorInfo& cursor() const override { return active_->cursor(); }
+    const DisplayInfo& display() const override { return active_->display(); }
+    AdapterDevice adapter_device() const override { return active_->adapter_device(); }
+    const char* implementation() const noexcept override { return implementation_.c_str(); }
+
+    Error reinitialize() override {
+        Error result = active_->reinitialize();
+        if (result.ok()) return result;
+
+        const bool was_gdi = std::string_view(active_->implementation()).find("gdi") !=
+                             std::string_view::npos;
+        display_ = active_->display();
+        std::string replacement_error;
+        std::unique_ptr<IDxgiCapturer> replacement =
+            was_gdi ? make_dxgi(&replacement_error) : make_gdi(&replacement_error);
+        if (!replacement) {
+            return Error(result.status(), result.to_string() + "; alternate capture: " +
+                                              replacement_error);
+        }
+        if (nv12_percent_ != 100) {
+            Error scale = replacement->set_nv12_scale(nv12_percent_);
+            if (!scale.ok()) return scale;
+        }
+        active_ = std::move(replacement);
+        implementation_ = was_gdi ? "dxgi" : "gdi fallback (" + result.to_string() + ")";
+        return Error::success();
+    }
+
+    Error set_nv12_scale(UINT percent) override {
+        Error result = active_->set_nv12_scale(percent);
+        if (result.ok()) nv12_percent_ = percent;
+        return result;
+    }
+    UINT nv12_scale_percent() const override { return active_->nv12_scale_percent(); }
+    const Error& last_error() const override { return active_->last_error(); }
+
+private:
+    std::unique_ptr<IDxgiCapturer> make_dxgi(std::string* error) {
+        CaptureConfig forced = config_;
+        forced.backend = CaptureBackend::Dxgi;
+        std::unique_ptr<DxgiCapturer> capture;
+        if (external_device_) {
+            capture = std::make_unique<DxgiCapturer>(display_, forced, device_.get(),
+                                                     context_.get(), vendor_id_);
+        } else {
+            capture = std::make_unique<DxgiCapturer>(display_, forced);
+        }
+        Error result = capture->initialize();
+        if (!result.ok()) {
+            if (error) *error = result.to_string();
+            return nullptr;
+        }
+        return capture;
+    }
+
+    std::unique_ptr<IDxgiCapturer> make_gdi(std::string* error) {
+        CaptureConfig forced = config_;
+        forced.backend = CaptureBackend::Gdi;
+        if (external_device_) {
+            return detail::create_gdi_capturer_on_device(display_, forced, device_.get(),
+                                                          context_.get(), vendor_id_, error);
+        }
+        return detail::create_gdi_capturer(display_, forced, error);
+    }
+
+    DisplayInfo display_;
+    CaptureConfig config_;
+    ComPtr<ID3D11Device> device_;
+    ComPtr<ID3D11DeviceContext> context_;
+    UINT vendor_id_ = 0;
+    UINT nv12_percent_ = 100;
+    bool external_device_ = false;
+    std::string implementation_;
+    std::unique_ptr<IDxgiCapturer> active_;
 };
 
 Error DxgiCapturer::initialize() {
@@ -977,19 +1086,50 @@ std::unique_ptr<IDxgiCapturer> create_capturer_on_device(const DisplayInfo& disp
         }
         return nullptr;
     }
-    auto capturer =
-        std::make_unique<DxgiCapturer>(display, config, device, context, vendor_id);
-    Error err = capturer->initialize();
-    if (!err.ok()) {
-        if (error) {
-            *error = err.to_string();
-        }
-        return nullptr;
+    if (config.backend == CaptureBackend::Gdi) {
+        return create_gdi_capturer_on_device(display, config, device, context, vendor_id, error);
     }
-    return capturer;
+
+    if (config.backend == CaptureBackend::Auto) {
+        auto capture = std::make_unique<AutoCapturer>(display, config, device, context, vendor_id);
+        Error result = capture->initialize(error);
+        if (!result.ok()) return nullptr;
+        return capture;
+    }
+
+    auto capturer = std::make_unique<DxgiCapturer>(display, config, device, context, vendor_id);
+    Error err = capturer->initialize();
+    if (err.ok()) return capturer;
+    if (error) *error = err.to_string();
+    return nullptr;
 }
 
 }  // namespace detail
+
+const char* capture_backend_name(CaptureBackend backend) {
+    switch (backend) {
+        case CaptureBackend::Dxgi: return "dxgi";
+        case CaptureBackend::Gdi: return "gdi";
+        case CaptureBackend::Auto:
+        default: return "auto";
+    }
+}
+
+bool parse_capture_backend(std::string_view text, CaptureBackend& backend) {
+    if (text == "auto") {
+        backend = CaptureBackend::Auto;
+        return true;
+    }
+    if (text == "dxgi") {
+        backend = CaptureBackend::Dxgi;
+        return true;
+    }
+    if (text == "gdi") {
+        backend = CaptureBackend::Gdi;
+        return true;
+    }
+    return false;
+}
 
 bool duplication_supported() {
     // DuplicateOutput needs an attached output on an adapter DXGI can see;
@@ -1043,15 +1183,20 @@ std::unique_ptr<IDxgiCapturer> create_capturer(size_t display_index, const Captu
 
 std::unique_ptr<IDxgiCapturer> create_capturer(const DisplayInfo& display,
                                                const CaptureConfig& config, std::string* error) {
+    if (config.backend == CaptureBackend::Gdi) {
+        return detail::create_gdi_capturer(display, config, error);
+    }
+    if (config.backend == CaptureBackend::Auto) {
+        auto capture = std::make_unique<AutoCapturer>(display, config);
+        Error result = capture->initialize(error);
+        if (!result.ok()) return nullptr;
+        return capture;
+    }
     auto capturer = std::make_unique<DxgiCapturer>(display, config);
     Error err = capturer->initialize();
-    if (!err.ok()) {
-        if (error) {
-            *error = err.to_string();
-        }
-        return nullptr;
-    }
-    return capturer;
+    if (err.ok()) return capturer;
+    if (error) *error = err.to_string();
+    return nullptr;
 }
 
 }  // namespace chast

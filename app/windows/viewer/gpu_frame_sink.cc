@@ -170,8 +170,37 @@ bool GpuFrameSink::init_device() {
 }
 
 void GpuFrameSink::SetOutput(void* output) {
+    std::lock_guard frame_lock(frame_mutex_);
+    std::lock_guard lock(mutex_);
+    if (output) outputs_[nullptr] = output;
+    else outputs_.erase(nullptr);
+}
+
+void GpuFrameSink::SetOutputForOwner(const void* owner, void* output) {
+    std::lock_guard frame_lock(frame_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
-    output_ = output;
+    if (!output) {
+        outputs_.erase(owner);
+        return;
+    }
+    outputs_[owner] = output;
+    if (last_slot_valid_ && slots_[last_slot_].texture && set_texture_) {
+        set_texture_(output, slots_[last_slot_].texture.get());
+        context_->End(slot_done_[last_slot_].get());
+        context_->Flush();
+        slot_done_pending_[last_slot_] = true;
+    }
+}
+
+void GpuFrameSink::ClearOutputs() {
+    std::lock_guard frame_lock(frame_mutex_);
+    std::lock_guard lock(mutex_);
+    outputs_.clear();
+}
+
+bool GpuFrameSink::HasOutputs() const {
+    std::lock_guard lock(mutex_);
+    return !outputs_.empty();
 }
 
 ID3D11Device* GpuFrameSink::device() {
@@ -212,6 +241,7 @@ void GpuFrameSink::drop_pipeline() {
 }
 
 bool GpuFrameSink::Reset() {
+    std::lock_guard frame_lock(frame_mutex_);
     drop_pipeline();
     frame_done_.reset();
     video_context1_.reset();
@@ -238,7 +268,7 @@ bool GpuFrameSink::Reset() {
 
 bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t width,
                                    uint32_t height) {
-    if (pipeline_ready_ && input.Width == pipeline_input_width_ &&
+    if (pipeline_ready_ && input.Format == pipeline_input_format_ && input.Width == pipeline_input_width_ &&
         input.Height == pipeline_input_height_ && width == pipeline_width_ &&
         height == pipeline_height_) {
         return true;
@@ -354,6 +384,7 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
     enumerator_ = std::move(enumerator);
     processor_ = std::move(processor);
     pipeline_input_width_ = input.Width;
+    pipeline_input_format_ = input.Format;
     pipeline_input_height_ = input.Height;
     pipeline_width_ = width;
     pipeline_height_ = height;
@@ -364,6 +395,15 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
 bool GpuFrameSink::render(Slot& slot, ID3D11Texture2D* nv12, uint32_t subresource,
                           uint32_t width, uint32_t height, uint32_t crop_x,
                           uint32_t crop_y) {
+    D3D11_TEXTURE2D_DESC input{};
+    nv12->GetDesc(&input);
+    if (input.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        // Software I444 decoding uploads full-resolution BGRA. A GPU copy
+        // preserves those chroma samples; converting via NV12 would lose them.
+        D3D11_BOX box{crop_x, crop_y, 0, crop_x + width, crop_y + height, 1};
+        context_->CopySubresourceRegion(slot.texture.get(), 0, 0, 0, 0, nv12, subresource, &box);
+        return true;
+    }
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC view_desc{};
     view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
     view_desc.Texture2D.MipSlice = 0;
@@ -443,6 +483,7 @@ bool GpuFrameSink::wait_for_query(ID3D11Query* query) {
 bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint32_t width,
                               uint32_t height, uint32_t crop_x, uint32_t crop_y,
                               uint64_t pts_ms) {
+    std::lock_guard frame_lock(frame_mutex_);
     (void)pts_ms;
     if (!ready_ || nv12 == nullptr || width == 0 || height == 0) {
         return false;
@@ -462,8 +503,13 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
         set_error("the decoder surface is larger than this viewer accepts");
         return false;
     }
-    if (desc.Format != DXGI_FORMAT_NV12) {
-        set_error("the decoder surface is not NV12");
+    if (desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        set_error("the decoder surface is neither NV12 nor BGRA");
+        return false;
+    }
+    if (crop_x > desc.Width || crop_y > desc.Height || width > desc.Width - crop_x ||
+        height > desc.Height - crop_y) {
+        set_error("the decoded crop exceeds its texture");
         return false;
     }
     if (subresource >= desc.ArraySize) {
@@ -474,12 +520,7 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
         return false;
     }
 
-    void* output = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        output = output_;
-    }
-    if (output == nullptr || set_texture_ == nullptr) {
+    if (!HasOutputs() || set_texture_ == nullptr) {
         return false;
     }
 
@@ -500,19 +541,14 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
     if (!render(slot, nv12, subresource, width, height, crop_x, crop_y)) {
         return false;
     }
-    // The plugin copies the slot into the single texture it registered with
-    // Flutter and marks that frame available. GPU work on one immediate
-    // context is ordered, so the next pass over this slot cannot overwrite it
-    // before the copy has read it. The call stays under mutex_ and re-reads
-    // output_: SetOutput(nullptr) is issued right before Dart unregisters the
-    // texture, so it must not return while a plugin call on the old output is
-    // still in flight, and a detach during the blit drops this frame instead.
+    // Decode and conversion happen once. Each engine receives a GPU copy;
+    // detaching an owner waits until all calls using its output have finished.
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (output_ == nullptr) {
+        if (outputs_.empty()) {
             return false;
         }
-        set_texture_(output_, slot.texture.get());
+        for (const auto& entry : outputs_) set_texture_(entry.second, slot.texture.get());
     }
     // The plugin flushes after its copy. Flush again so this event query is
     // submitted even on a plugin path that returns before copying.
@@ -527,6 +563,7 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
 
 bool GpuFrameSink::CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width,
                                uint32_t& height, std::string* error) {
+    std::lock_guard frame_lock(frame_mutex_);
     auto fail = [&](std::string message) {
         if (error != nullptr) {
             *error = std::move(message);

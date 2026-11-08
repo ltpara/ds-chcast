@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "chast/identity.h"
+#include "chast/user_context.h"
 
 namespace chast {
 
@@ -47,6 +48,10 @@ namespace {
 
 constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
+constexpr size_t kMaxPendingVideoFrames = 60;
+constexpr size_t kMaxDisplaySubscriptionRequests = 32;
+constexpr size_t kMaxPendingVideoBytes = 8u * 1024u * 1024u;
+constexpr uint64_t kVideoDeliveryWindowUs = 500000;
 constexpr uint64_t kKeepAliveMs = 5000;
 
 // v35 datagram audio. A 20 ms stereo packet at the configured 128 kbps is
@@ -293,7 +298,7 @@ bool certificate_is_current(PCCERT_CONTEXT certificate) {
 }
 
 // Newest valid certificate in `store` that belongs to this installation.
-PCCERT_CONTEXT find_stored_identity(HCERTSTORE store) {
+PCCERT_CONTEXT find_stored_identity(HCERTSTORE store, const std::string& expected) {
     PCCERT_CONTEXT best = nullptr;
     FILETIME best_time{};
     for (PCCERT_CONTEXT current = CertEnumCertificatesInStore(store, nullptr); current;
@@ -307,6 +312,7 @@ PCCERT_CONTEXT find_stored_identity(HCERTSTORE store) {
         if (!certificate_uses_our_key(current) || !certificate_is_current(current)) {
             continue;
         }
+        if (!expected.empty() && certificate_fingerprint(current) != expected) continue;
         if (!best || CompareFileTime(&current->pCertInfo->NotBefore, &best_time) > 0) {
             if (best) {
                 CertFreeCertificateContext(best);
@@ -472,7 +478,7 @@ PCCERT_CONTEXT create_identity_certificate(IdentityScope scope, std::string* err
 // The identity must survive restarts, otherwise a pinned client would refuse
 // the server after a reboot. Reuse the stored certificate when it is still
 // valid; create and store one otherwise.
-PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, std::string* error) {
+PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, const std::string& expected, std::string* error) {
     const DWORD store_location = scope == IdentityScope::LocalMachine
                                      ? CERT_SYSTEM_STORE_LOCAL_MACHINE
                                      : CERT_SYSTEM_STORE_CURRENT_USER;
@@ -483,10 +489,15 @@ PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, std::string* error) 
                  " certificate store, GetLastError=" + std::to_string(GetLastError());
         return nullptr;
     }
-    PCCERT_CONTEXT existing = find_stored_identity(store);
+    PCCERT_CONTEXT existing = find_stored_identity(store, expected);
     if (existing) {
         CertCloseStore(store, 0);
         return existing;
+    }
+    if (!expected.empty()) {
+        CertCloseStore(store, 0);
+        *error = "the original host certificate is unavailable; refusing to replace its identity";
+        return nullptr;
     }
     PCCERT_CONTEXT created = create_identity_certificate(scope, error);
     if (!created) {
@@ -604,12 +615,16 @@ struct QuicSession::Impl {
     // MsQuic worker, and closing the connection from its own callback is not
     // allowed.
     uint16_t requested_display = kDisplayAuto;
+    VideoCodecMask decoding_codecs = kVideoCodecAll;
+    VideoCodecMask decoding_444 = 0;
+    VideoChroma initial_chroma_preference = VideoChroma::Yuv420;
     SessionMode requested_mode = SessionMode::Desktop;
     std::string requested_peer;
     // Audit reference of the accepted Hello. pending_hello is consumed by
     // wait_for_client, so the accessor reads this copy instead.
     std::string session_audit_ref;
     ClientHello pending_hello;
+    StreamCodecPreference initial_codec_preference = StreamCodecPreference::Auto;
     // Server: the newest SwitchDisplay the viewer asked for. Intermediate
     // targets are not queued; a viewer clicking through the list wants the
     // last one, not a tour of every output in between.
@@ -622,6 +637,12 @@ struct QuicSession::Impl {
     DisplaySwitchCode display_switch_code = DisplaySwitchCode::Ok;
     std::string display_switch_reason;
     uint64_t display_switch_results_seen = 0;
+    std::deque<CaptureDisplaysRequest> capture_display_requests;
+    std::deque<CaptureDisplaysResult> capture_display_results;
+    std::map<uint32_t, uint16_t> subscribed_display_streams;
+    std::map<uint32_t, DisplayStreamInfo> display_stream_updates;
+    std::map<uint32_t, CursorUpdate> display_cursor_updates;
+    std::deque<uint32_t> display_keyframe_requests;
     // Server: the newest mode list request and mode change request. Client:
     // the newest answers, for the same reason as the switch pair above.
     bool display_modes_request_ready = false;
@@ -674,6 +695,8 @@ struct QuicSession::Impl {
     // Host-control requests and answers are short ordered queues: a toggle
     // sequence must run in order, and every action produces one answer.
     std::deque<HostControlRequest> host_action_requests;
+    std::deque<uint32_t> elevation_requests;
+    std::deque<ElevationState> elevation_states;
     uint64_t host_action_requests_seen = 0;
     std::deque<HostControlResult> host_action_results;
     uint64_t host_action_results_seen = 0;
@@ -731,6 +754,7 @@ struct QuicSession::Impl {
     // Client: the mask the host last announced. Atomic because the transport
     // callbacks read it while the application thread updates it.
     std::atomic<PermissionMask> session_permissions{0};
+    std::atomic<ClipboardDirection> peer_clipboard_direction{ClipboardDirection::Both};
     PermissionMask pending_policy_revocations = 0;  // guarded by mutex
     PermissionMask permission_ceiling = 0;
     // Client: a PermissionUpdate arrived since take_permission_update().
@@ -824,6 +848,7 @@ struct QuicSession::Impl {
         bool finished = false;
     };
     struct ReceivedUpload {
+        bool clipboard = false;
         HQUIC stream = nullptr;
         uint64_t start_offset = 0;
         uint64_t received = 0;
@@ -872,6 +897,10 @@ struct QuicSession::Impl {
     std::vector<ClipboardStream> clipboard_streams;
     size_t pending_clipboard_bytes = 0;
     std::deque<ClipboardContent> clipboard_contents;
+    std::deque<ClipboardFileRead> clipboard_file_reads;
+    std::deque<ClipboardFileData> clipboard_file_data;
+    std::map<uint32_t, ClipboardFileRead> requested_clipboard_reads;
+    std::map<uint32_t, ClipboardFileRead> accepted_clipboard_reads;
     uint64_t clipboard_contents_seen = 0;
     // Chat lines waiting for the application. Chat is low-rate; a full queue
     // drops the newest message rather than replaying stale conversation.
@@ -903,13 +932,15 @@ struct QuicSession::Impl {
     std::deque<FileChunk> file_chunks;
     size_t buffered_file_bytes = 0;
     std::map<uint32_t, ReceivedUpload> received_uploads;
+    struct IncomingFileOffer { bool clipboard = false; bool accepted = false; };
+    std::map<uint32_t, IncomingFileOffer> incoming_file_offers;
     std::deque<FileCancel> file_cancels;
     std::map<uint32_t, OutgoingUpload> outgoing_uploads;
     std::deque<FileAnswer> file_answers;
     std::deque<FileResult> file_results;
     // Shared-folder browsing (protocol v30). Requests keep the viewer's id so
     // every one is answered; results keep the host's id for the same reason.
-    std::deque<std::pair<uint32_t, std::string>> file_list_requests;
+    std::deque<FileListRequest> file_list_requests;
     std::deque<FileListResult> file_list_results;
     std::deque<std::pair<uint32_t, std::string>> file_download_requests;
     std::deque<FileDownloadResult> file_download_results;
@@ -1002,6 +1033,16 @@ struct QuicSession::Impl {
     // that overtook a newer one on the control stream.
     LatencySample latency;
     uint64_t last_reply_probe_us = 0;
+    uint64_t pending_qos_probe_us = 0;
+    uint64_t last_qos_probe_send_us = 0;
+
+    struct VideoSend { uint64_t sequence, sent_us, capture_us; size_t bytes; };
+    std::deque<VideoSend> pending_video;
+    size_t pending_video_bytes = 0;
+    std::optional<uint64_t> pending_video_receipt;
+    // Serialize sequence assignment with StreamSend; a refused send must not
+    // leave a sequence gap, nor can concurrent callers reorder the stream.
+    std::mutex video_send_mutex;
 
     std::atomic<uint64_t> next_seq{0};
     std::atomic<uint64_t> next_audio_seq{0};
@@ -1086,6 +1127,17 @@ struct QuicSession::Impl {
         }
         std::lock_guard<std::mutex> lock(mutex);
         return !peer_closed && !shutdown_complete && !transport_failed;
+    }
+
+    bool desktop_subscription_ready() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        // Requests may reach the server immediately after HelloAck, before
+        // announce() returns. Likewise initial metadata can reach the client
+        // before handshake() wakes. Gate on accepted/parsed authentication,
+        // not whether the application's blocking call has returned yet.
+        return role == Role::Server
+            ? client_accepted && requested_mode == SessionMode::Desktop
+            : hello_ack_ready && client_config.session_mode == SessionMode::Desktop;
     }
 
     // ----- callbacks -----
@@ -1541,9 +1593,7 @@ struct QuicSession::Impl {
                     }
                 }
             } else if (std::memcmp(pending->data(), kClipboardStreamMagic, 4) == 0) {
-                const bool allowed =
-                    role != Role::Server ||
-                    (effective_permissions() & kPermissionClipboard) != 0;
+                const bool allowed = clipboard_allowed(false);
                 if (!allowed) {
                     // A revoked permission is recoverable: refuse this push,
                     // keep the session.
@@ -1563,10 +1613,6 @@ struct QuicSession::Impl {
                     kind = Kind::Clipboard;
                 }
             } else if (std::memcmp(pending->data(), kFileStreamMagic, 4) == 0) {
-                // Either side may send; the permission bit says whether the
-                // session carries file transfers at all.
-                const bool allowed =
-                    (effective_permissions() & kPermissionFileTransfer) != 0;
                 FileStreamHeader header;
                 std::string error;
                 const bool header_ready = pending->size() >= kFileStreamHeaderSize;
@@ -1576,6 +1622,10 @@ struct QuicSession::Impl {
                     header_ready &&
                     decode_file_stream_header(pending->data(), kFileStreamHeaderSize,
                                               header, &error);
+                if (!header_ready) return;
+                const auto offered = incoming_file_offers.find(header.transfer_id);
+                const bool allowed = header_ok && offered != incoming_file_offers.end() &&
+                    offered->second.accepted && file_allowed(offered->second.clipboard, false);
                 if (!allowed) {
                     // Revoking file transfer must not end a live session that
                     // still has a CFIL stream in flight. When the header is
@@ -1604,6 +1654,7 @@ struct QuicSession::Impl {
                     kind = Kind::Reject;
                 } else {
                     ReceivedUpload upload;
+                    upload.clipboard = offered->second.clipboard;
                     upload.stream = stream;
                     upload.start_offset = header.offset;
                     const auto inserted =
@@ -1876,6 +1927,15 @@ struct QuicSession::Impl {
     void push_file_chunk_locked(ReceivedUpload& upload, uint32_t id, const uint8_t* data,
                                 size_t size, uint64_t offset) {
         if (upload.finished) {
+            return;
+        }
+        // A shared policy may reduce the atomic grant before the host loop
+        // reaches its stream cleanup. Do not buffer bytes during that gap.
+        if (!file_allowed(upload.clipboard, false)) {
+            upload.finished = true;
+            upload.error = "file or clipboard permission was disabled";
+            drop_file_chunks_locked(id);
+            if (upload.stream) api->StreamShutdown(upload.stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
             return;
         }
         if (buffered_file_bytes + size > kMaxBufferedFileBytes) {
@@ -2359,11 +2419,14 @@ struct QuicSession::Impl {
         pending_clipboard_bytes = 0;
         clipboard_contents.clear();
         clipboard_contents_seen = 0;
+        clipboard_file_reads.clear(); clipboard_file_data.clear();
+        requested_clipboard_reads.clear(); accepted_clipboard_reads.clear();
         file_offers.clear();
         file_offers_seen = 0;
         file_chunks.clear();
         buffered_file_bytes = 0;
         received_uploads.clear();
+        incoming_file_offers.clear();
         file_cancels.clear();
         outgoing_uploads.clear();
         file_answers.clear();
@@ -2496,9 +2559,7 @@ struct QuicSession::Impl {
                             }
                             entry.finished = true;
                             matched = true;
-                            const bool allowed =
-                                role != Role::Server ||
-                                (effective_permissions() & kPermissionClipboard) != 0;
+                            const bool allowed = clipboard_allowed(false);
                             if (allowed) {
                                 ClipboardContent content;
                                 std::string error;
@@ -2812,6 +2873,10 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     requested_display = hello.display;
+                    decoding_codecs = hello.decoding_codecs;
+                    decoding_444 = hello.decoding_444;
+                    initial_chroma_preference = hello.prefer_chroma;
+                    initial_codec_preference = hello.codec_preference;
                     requested_mode = hello.mode;
                     requested_peer = remote_address();
                     session_audit_ref = hello.audit_ref;
@@ -2854,6 +2919,7 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     session_permissions = permission_mask_from_info(info);
+                    peer_clipboard_direction = info.clipboard_direction;
                     peer_info = std::move(info);
                     hello_ack_ready = true;
                 }
@@ -2874,6 +2940,7 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     session_permissions = permission_mask_from_info(info);
+                    peer_clipboard_direction = info.clipboard_direction;
                     peer_info = std::move(info);
                     stream_update_ready = true;
                     ++stream_updates;
@@ -2985,8 +3052,32 @@ struct QuicSession::Impl {
                 }
                 break;
             }
+            case ControlType::VideoReceipt: {
+                if (role != Role::Server || !hello_complete) break;
+                uint64_t sequence = 0;
+                if (!parse_video_receipt(payload, sequence, &error)) {
+                    control_protocol_failure("VideoReceipt: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // Duplicate, stale and future receipts cannot erase the
+                    // outstanding window or manufacture a delay sample.
+                    if (pending_video.empty() || sequence < pending_video.front().sequence ||
+                        sequence > pending_video.back().sequence) break;
+                    const auto now = steady_us();
+                    while (!pending_video.empty() && pending_video.front().sequence <= sequence) {
+                        latency.video_delay_us = now - pending_video.front().capture_us;
+                        pending_video_bytes -= pending_video.front().bytes;
+                        pending_video.pop_front();
+                    }
+                    ++latency.video_replies;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::LatencyProbe: {
-                if (role != Role::Server) {
+                if (!hello_complete) {
                     break;
                 }
                 uint64_t client_us = 0;
@@ -3000,12 +3091,10 @@ struct QuicSession::Impl {
                 // A full send queue drops this sample; the viewer probes again
                 // in a second. Blocking a MsQuic worker here would be worse.
                 try_send_bytes(control.load(), reply, QUIC_SEND_FLAG_NONE);
+                if (role == Role::Client) flush_video_receipt();
                 break;
             }
             case ControlType::LatencyReply: {
-                if (role != Role::Client) {
-                    break;
-                }
                 uint64_t client_us = 0;
                 uint64_t host_recv_us = 0;
                 uint64_t host_send_us = 0;
@@ -3015,6 +3104,17 @@ struct QuicSession::Impl {
                     break;
                 }
                 const uint64_t received_us = steady_us();
+                if (role == Role::Server) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (pending_qos_probe_us && client_us == pending_qos_probe_us &&
+                        received_us >= client_us) {
+                        latency.valid = true;
+                        latency.rtt_us = received_us - client_us;
+                        ++latency.replies;
+                        pending_qos_probe_us = 0;
+                    }
+                    break;
+                }
                 if (received_us < client_us) {
                     // The host echoed a stamp from the viewer's future. Only a
                     // broken clock or a forged message does that.
@@ -3060,18 +3160,11 @@ struct QuicSession::Impl {
                     ++permission_updates;
                     if ((permissions & kPermissionClipboard) == 0) {
                         clipboard_contents.clear();
+                        clipboard_updates.clear();
+                        clipboard_file_reads.clear(); clipboard_file_data.clear();
+                        requested_clipboard_reads.clear(); accepted_clipboard_reads.clear();
                     }
-                    if ((permissions & kPermissionFileTransfer) == 0) {
-                        for (auto& entry : outgoing_uploads) {
-                            if (!entry.second.finished) {
-                                entry.second.finished = true;
-                                if (entry.second.stream) {
-                                    api->StreamShutdown(entry.second.stream,
-                                                        QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-                                }
-                            }
-                        }
-                    }
+                    revoke_file_permissions_locked();
                     if ((permissions & kPermissionPortForward) == 0) {
                         aborts = clear_port_forward_locked("port forwarding was revoked");
                     }
@@ -3097,11 +3190,8 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::SwitchDisplay: {
-                if (role != Role::Server ||
-                    (effective_permissions() & kPermissionInput) == 0) {
-                    // Switching outputs changes what the viewer sees, so it
-                    // travels with input control; a viewer without it is
-                    // dropped rather than allowed to move the host's view.
+                // Selecting a subscription does not change host input or topology.
+                if (role != Role::Server || !hello_complete || requested_mode != SessionMode::Desktop) {
                     break;
                 }
                 uint16_t index = kDisplayAuto;
@@ -3114,6 +3204,81 @@ struct QuicSession::Impl {
                     display_switch_index = index;
                     display_switch_ready = true;
                 }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::CaptureDisplays: {
+                if (role != Role::Server || !desktop_subscription_ready()) break;
+                CaptureDisplaysRequest request;
+                if (!parse_capture_displays(payload, request, &error)) {
+                    control_protocol_failure("CaptureDisplays: " + error); break;
+                }
+                bool overflow = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    overflow = capture_display_requests.size() >= kMaxDisplaySubscriptionRequests;
+                    if (!overflow) capture_display_requests.push_back(std::move(request));
+                }
+                if (overflow) control_protocol_failure("too many pending display subscription operations");
+                cv.notify_all();
+                break;
+            }
+            case ControlType::CaptureDisplaysResult: {
+                if (role != Role::Client || !desktop_subscription_ready()) break;
+                CaptureDisplaysResult result;
+                if (!parse_capture_displays_result(payload, result, &error)) {
+                    control_protocol_failure("CaptureDisplaysResult: " + error); break;
+                }
+                bool overflow = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    overflow = capture_display_results.size() >= kMaxDisplaySubscriptionRequests;
+                    if (!overflow) {
+                        subscribed_display_streams.clear();
+                        display_stream_updates.clear(); // the complete result supersedes older updates
+                        for (const auto& stream : result.streams)
+                            subscribed_display_streams.emplace(stream.stream_id, stream.display_index);
+                        for (auto it = display_cursor_updates.begin(); it != display_cursor_updates.end();)
+                            if (!subscribed_display_streams.count(it->first)) it = display_cursor_updates.erase(it);
+                            else ++it;
+                        capture_display_results.push_back(std::move(result));
+                    }
+                }
+                if (overflow) control_protocol_failure("too many unread display subscription results");
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayStreamInfo: {
+                if (role != Role::Client || !desktop_subscription_ready()) break;
+                DisplayStreamInfo info;
+                if (!parse_display_stream_info(payload, info, &error)) {
+                    control_protocol_failure("DisplayStreamInfo: " + error); break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto found = subscribed_display_streams.find(info.stream_id);
+                    if (found != subscribed_display_streams.end() && found->second == info.display_index)
+                        display_stream_updates[info.stream_id] = std::move(info);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayKeyframeRequest: {
+                if (role != Role::Server || !desktop_subscription_ready()) break;
+                uint32_t id = 0;
+                if (!parse_display_keyframe_request(payload, id, &error)) {
+                    control_protocol_failure("DisplayKeyframeRequest: " + error); break;
+                }
+                bool overflow = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (std::find(display_keyframe_requests.begin(), display_keyframe_requests.end(), id) ==
+                        display_keyframe_requests.end()) {
+                        overflow = display_keyframe_requests.size() >= kMaxDisplayCount;
+                        if (!overflow) display_keyframe_requests.push_back(id);
+                    }
+                }
+                if (overflow) control_protocol_failure("too many pending display keyframes");
                 cv.notify_all();
                 break;
             }
@@ -3392,6 +3557,36 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::ElevationRequest: {
+                if (role != Role::Server) break;
+                uint32_t request = 0;
+                if (!parse_elevation_request(payload, request, &error)) {
+                    control_protocol_failure(error); break;
+                }
+                bool full = false;
+                {
+                    std::lock_guard lock(mutex);
+                    full = elevation_requests.size() >= 8;
+                    if (!full) elevation_requests.push_back(request);
+                }
+                if (full) control_protocol_failure("too many pending elevation requests");
+                cv.notify_all();
+                break;
+            }
+            case ControlType::ElevationState: {
+                if (role != Role::Client) break;
+                ElevationState state;
+                if (!parse_elevation_state(payload, state, &error)) {
+                    control_protocol_failure(error); break;
+                }
+                {
+                    std::lock_guard lock(mutex);
+                    if (elevation_states.size() >= 16) elevation_states.pop_front();
+                    elevation_states.push_back(std::move(state));
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::HostActionResult: {
                 if (role != Role::Client) {
                     break;
@@ -3637,8 +3832,7 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::ClipboardUpdate: {
-                if (role == Role::Server &&
-                    (effective_permissions() & kPermissionClipboard) == 0) {
+                if (!clipboard_allowed(false)) {
                     // The HelloAck already reported clipboard off; a client
                     // that sends it anyway is dropped, not fatal.
                     break;
@@ -3658,6 +3852,48 @@ struct QuicSession::Impl {
                 }
                 cv.notify_all();
                 break;
+            }
+            case ControlType::ClipboardFileRead: {
+                if (!clipboard_allowed(true)) break;
+                ClipboardFileRead request;
+                if (!parse_clipboard_file_read(payload, request, &error)) {
+                    control_protocol_failure("ClipboardFileRead: " + error); break;
+                }
+                bool overflow = false;
+                {
+                    std::lock_guard lock(mutex);
+                    if (!clipboard_allowed(true)) break;
+                    if (accepted_clipboard_reads.count(request.request_id)) break;
+                    overflow = accepted_clipboard_reads.size() >= 8;
+                    if (!overflow) {
+                        accepted_clipboard_reads.emplace(request.request_id, request);
+                        clipboard_file_reads.push_back(request);
+                    }
+                }
+                if (overflow) {
+                    // A cancelled old paste can overlap a new one. Refuse the
+                    // bounded read rather than terminating a healthy session.
+                    (void)send_bytes(control.load(), make_clipboard_file_data(
+                        {request.request_id, request.generation}), QUIC_SEND_FLAG_NONE);
+                }
+                cv.notify_all(); break;
+            }
+            case ControlType::ClipboardFileData: {
+                if (!clipboard_allowed(false)) break;
+                ClipboardFileData response;
+                if (!parse_clipboard_file_data(payload, response, &error)) {
+                    control_protocol_failure("ClipboardFileData: " + error); break;
+                }
+                {
+                    std::lock_guard lock(mutex);
+                    if (!clipboard_allowed(false)) break;
+                    const auto found = requested_clipboard_reads.find(response.request_id);
+                    if (found == requested_clipboard_reads.end() || found->second.generation != response.generation) break;
+                    if (response.bytes.size() > found->second.length) { response.ok = false; response.bytes.clear(); }
+                    requested_clipboard_reads.erase(found);
+                    if (clipboard_file_data.size() < 8) clipboard_file_data.push_back(std::move(response));
+                }
+                cv.notify_all(); break;
             }
             case ControlType::ChatMessage: {
                 std::string text;
@@ -3817,6 +4053,17 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::DisplayCursorUpdate: {
+                if (role != Role::Client || !desktop_subscription_ready()) break;
+                DisplayCursorUpdate update;
+                if (!parse_display_cursor_update(payload, update, &error)) break;
+                std::lock_guard<std::mutex> lock(mutex);
+                if (subscribed_display_streams.count(update.stream_id)) {
+                    coalesce_cursor_update(display_cursor_updates[update.stream_id], std::move(update.cursor));
+                    ++cursor_received;
+                }
+                break;
+            }
             case ControlType::CursorUpdate: {
                 if (role != Role::Client) {
                     break;
@@ -3829,18 +4076,24 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    cursor_update = std::move(update);
+                    if (cursor_update) coalesce_cursor_update(*cursor_update, std::move(update));
+                    else cursor_update = std::move(update);
                     ++cursor_received;
                 }
                 break;
             }
             case ControlType::FileOffer: {
-                if ((effective_permissions() & kPermissionFileTransfer) == 0) {
-                    break;
-                }
                 FileOffer offer;
                 if (!parse_file_offer(payload, offer, &error)) {
                     control_protocol_failure("FileOffer: " + error);
+                    break;
+                }
+                if (!file_allowed(offer.clipboard, false)) {
+                    FileAnswer refused;
+                    refused.transfer_id = offer.transfer_id;
+                    refused.code = FileCode::Refused;
+                    refused.reason = "file or clipboard direction is disabled";
+                    try_send_bytes(control.load(), make_file_answer(refused), QUIC_SEND_FLAG_NONE);
                     break;
                 }
                 {
@@ -3848,9 +4101,12 @@ struct QuicSession::Impl {
                     // The sender waits for an answer; dropping an offer past
                     // the queue is a refusal by silence only when the queue
                     // never drains, which the receiver prevents.
-                    if (file_offers.size() >= kMaxQueuedOffers) {
+                    if (file_offers.size() >= kMaxQueuedOffers ||
+                        incoming_file_offers.size() >= kMaxQueuedOffers ||
+                        incoming_file_offers.count(offer.transfer_id) != 0) {
                         break;
                     }
+                    incoming_file_offers.emplace(offer.transfer_id, IncomingFileOffer{offer.clipboard, false});
                     file_offers.push_back(std::move(offer));
                     ++file_offers_seen;
                 }
@@ -3921,6 +4177,7 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    incoming_file_offers.erase(cancel.transfer_id);
                     const auto it = received_uploads.find(cancel.transfer_id);
                     if (it != received_uploads.end()) {
                         it->second.finished = true;
@@ -3945,7 +4202,8 @@ struct QuicSession::Impl {
                 }
                 uint32_t request_id = 0;
                 std::string directory;
-                if (!parse_file_list_request(payload, request_id, directory, &error)) {
+                std::string cursor;
+                if (!parse_file_list_request(payload, request_id, directory, &error, &cursor)) {
                     control_protocol_failure("FileListRequest: " + error);
                     break;
                 }
@@ -3954,7 +4212,7 @@ struct QuicSession::Impl {
                     while (file_list_requests.size() >= 8) {
                         file_list_requests.pop_front();
                     }
-                    file_list_requests.emplace_back(request_id, std::move(directory));
+                    file_list_requests.push_back({request_id, std::move(directory), std::move(cursor)});
                 }
                 cv.notify_all();
                 break;
@@ -4532,9 +4790,7 @@ struct QuicSession::Impl {
         return Error::success();
     }
 
-    // `wait_for_capacity` is false only for messages sent from a MsQuic
-    // callback (a latency reply). Blocking there could stall the transport's
-    // own worker, so such a send is dropped when the queue is full instead.
+    // Callback replies and real-time media never wait for transport capacity.
     Error send_bytes_impl(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags,
                           bool wait_for_capacity,
                           std::chrono::steady_clock::time_point deadline = kNoSendDeadline) {
@@ -4593,6 +4849,29 @@ struct QuicSession::Impl {
 
     Error send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
         return send_bytes_impl(stream, std::move(bytes), flags, true);
+    }
+
+    // Caller holds mutex. A single large IDR is allowed into an empty window;
+    // subsequent frames wait for the application to consume it.
+    bool video_capacity_locked(size_t bytes = 0) const {
+        return pending_video.empty() ||
+            (pending_video.size() < kMaxPendingVideoFrames &&
+             pending_video_bytes + bytes <= kMaxPendingVideoBytes &&
+             steady_us() - pending_video.front().sent_us < kVideoDeliveryWindowUs);
+    }
+
+    void flush_video_receipt() {
+        std::optional<uint64_t> sequence;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            sequence = pending_video_receipt;
+        }
+        if (!sequence) return;
+        auto sent = try_send_bytes(control.load(), make_video_receipt(*sequence), QUIC_SEND_FLAG_NONE);
+        if (sent) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (pending_video_receipt == sequence) pending_video_receipt.reset();
+        }
     }
 
     // A forwarded TCP pump may not block forever: a stalled queue returns
@@ -4783,7 +5062,11 @@ struct QuicSession::Impl {
             hello_ready = false;
             hello_ack_ready = false;
             pending_hello = ClientHello{};
+            initial_codec_preference = StreamCodecPreference::Auto;
             requested_display = kDisplayAuto;
+            decoding_codecs = kVideoCodecAll;
+            decoding_444 = 0;
+            initial_chroma_preference = VideoChroma::Yuv420;
             requested_mode = SessionMode::Desktop;
             requested_peer.clear();
             session_audit_ref.clear();
@@ -4794,6 +5077,12 @@ struct QuicSession::Impl {
             display_switch_code = DisplaySwitchCode::Ok;
             display_switch_reason.clear();
             display_switch_results_seen = 0;
+            capture_display_requests.clear();
+            capture_display_results.clear();
+            subscribed_display_streams.clear();
+            display_cursor_updates.clear();
+            display_stream_updates.clear();
+            display_keyframe_requests.clear();
             display_modes_request_ready = false;
             display_modes_request_display = 0;
             display_modes_ready = false;
@@ -4830,6 +5119,8 @@ struct QuicSession::Impl {
             sas_reason.clear();
             sas_results_seen = 0;
             host_action_requests.clear();
+            elevation_requests.clear();
+            elevation_states.clear();
             host_action_requests_seen = 0;
             host_action_results.clear();
             host_action_results_seen = 0;
@@ -4893,6 +5184,11 @@ struct QuicSession::Impl {
             cursor_received = 0;
             latency = LatencySample{};
             last_reply_probe_us = 0;
+            pending_qos_probe_us = 0;
+            last_qos_probe_send_us = 0;
+            pending_video.clear();
+            pending_video_bytes = 0;
+            pending_video_receipt.reset();
             received.clear();
             audio_received.clear();
             audio_datagrams.clear();
@@ -4952,7 +5248,7 @@ struct QuicSession::Impl {
         if (server_config.allow_input) {
             mask |= kPermissionInput;
         }
-        if (server_config.allow_clipboard) {
+        if (server_config.allow_clipboard && server_config.clipboard_direction != ClipboardDirection::Disabled) {
             mask |= kPermissionClipboard;
         }
         if (server_config.allow_file_transfer) {
@@ -5000,6 +5296,39 @@ struct QuicSession::Impl {
     PermissionMask effective_permissions() const {
         const PermissionMask granted = session_permissions.load();
         return role == Role::Server ? granted & config_permissions() : granted;
+    }
+
+    bool clipboard_allowed(bool sending) const {
+        const auto direction = role == Role::Server ? server_config.clipboard_direction
+                                                     : peer_clipboard_direction.load();
+        return (effective_permissions() & kPermissionClipboard) != 0 &&
+            ((role == Role::Server) == sending ? clipboard_from_host(direction)
+                                               : clipboard_to_host(direction));
+    }
+    bool file_allowed(bool clipboard, bool sending) const {
+        return clipboard ? clipboard_allowed(sending)
+                         : (effective_permissions() & kPermissionFileTransfer) != 0;
+    }
+
+    // Caller holds mutex; clipboard files and browser transfers have
+    // independent grants. Remove queued bytes before aborting their streams.
+    void revoke_file_permissions_locked() {
+        std::erase_if(file_offers, [&](const auto& offer) { return !file_allowed(offer.clipboard, false); });
+        std::erase_if(incoming_file_offers, [&](const auto& item) { return !file_allowed(item.second.clipboard, false); });
+        for (auto& [id, upload] : received_uploads) {
+            if (!file_allowed(upload.clipboard, false)) {
+                upload.finished = true;
+                upload.error = "file or clipboard permission was disabled";
+                drop_file_chunks_locked(id);
+                if (upload.stream) api->StreamShutdown(upload.stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        for (auto& [id, upload] : outgoing_uploads) {
+            if (!file_allowed(upload.offer.clipboard, true)) {
+                upload.finished = true;
+                if (upload.stream) api->StreamShutdown(upload.stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
     }
 
     // Spends a one-time token once a client was accepted.
@@ -5198,25 +5527,54 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
         return nullptr;
     }
 
-    impl.certificate = open_or_create_identity(config.identity_scope, error);
-    if (!impl.certificate) {
-        return nullptr;
-    }
-    impl.identity_fingerprint = certificate_fingerprint(impl.certificate);
-    if (impl.identity_fingerprint.empty()) {
-        *error = "cannot fingerprint the server identity certificate";
-        return nullptr;
-    }
-    QUIC_CREDENTIAL_CONFIG credential{};
-    credential.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
-    credential.Flags = QUIC_CREDENTIAL_FLAG_NONE;
-    credential.CertificateContext =
-        reinterpret_cast<QUIC_CERTIFICATE*>(const_cast<CERT_CONTEXT*>(impl.certificate));
-    status = impl.api->ConfigurationLoadCredential(impl.configuration, &credential);
-    if (QUIC_FAILED(status)) {
-        *error = "QUIC ConfigurationLoadCredential failed: " + status_hex(status);
-        return nullptr;
-    }
+    const auto load_identity = [&]() {
+        ScopedUserContext original(config.identity_user_token.get());
+        if (!original.ok()) {
+            *error = "cannot enter the original host identity: " + std::to_string(original.error());
+            return false;
+        }
+        impl.certificate = open_or_create_identity(config.identity_scope, config.expected_identity_fingerprint, error);
+        if (!impl.certificate) {
+            return false;
+        }
+        if (config.identity_user_token) {
+            // SChannel can use the certificate after this thread returns to
+            // its elevated identity. Cache the original user's acquired key
+            // on the certificate instead of reopening its container later.
+            HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key = 0;
+            DWORD spec = 0;
+            BOOL caller_frees = FALSE;
+            if (!CryptAcquireCertificatePrivateKey(impl.certificate,
+                    CRYPT_ACQUIRE_CACHE_FLAG | CRYPT_ACQUIRE_SILENT_FLAG | CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
+                    nullptr, &key, &spec, &caller_frees)) {
+                *error = "cannot acquire the original user's identity key: " + std::to_string(GetLastError());
+                return false;
+            }
+            if (caller_frees) {
+                if (spec == CERT_NCRYPT_KEY_SPEC) NCryptFreeObject(key);
+                else CryptReleaseContext(key, 0);
+                *error = "the original identity key could not be cached";
+                return false;
+            }
+        }
+        impl.identity_fingerprint = certificate_fingerprint(impl.certificate);
+        if (impl.identity_fingerprint.empty()) {
+            *error = "cannot fingerprint the server identity certificate";
+            return false;
+        }
+        QUIC_CREDENTIAL_CONFIG credential{};
+        credential.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
+        credential.Flags = QUIC_CREDENTIAL_FLAG_NONE;
+        credential.CertificateContext =
+            reinterpret_cast<QUIC_CERTIFICATE*>(const_cast<CERT_CONTEXT*>(impl.certificate));
+        status = impl.api->ConfigurationLoadCredential(impl.configuration, &credential);
+        if (QUIC_FAILED(status)) {
+            *error = "QUIC ConfigurationLoadCredential failed: " + status_hex(status);
+            return false;
+        }
+        return true;
+    };
+    if (!load_identity()) return nullptr;
 
     status = impl.api->ListenerOpen(impl.registration, &Impl::listener_callback,
                                     &impl, &impl.listener);
@@ -5543,6 +5901,22 @@ uint16_t QuicSession::requested_display() const {
     return impl_->requested_display;
 }
 
+VideoCodecMask QuicSession::decoding_codecs() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->decoding_codecs;
+}
+
+StreamCodecPreference QuicSession::codec_preference() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->initial_codec_preference;
+}
+VideoCodecMask QuicSession::decoding_444() const {
+    std::lock_guard lock(impl_->mutex); return impl_->decoding_444;
+}
+VideoChroma QuicSession::chroma_preference() const {
+    std::lock_guard lock(impl_->mutex); return impl_->initial_chroma_preference;
+}
+
 SessionMode QuicSession::requested_mode() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->requested_mode;
@@ -5654,49 +6028,15 @@ Error QuicSession::set_permissions_impl(PermissionMask permissions, bool policy_
             impl.clipboard_streams.clear();
             impl.pending_clipboard_bytes = 0;
             impl.clipboard_contents.clear();
+            impl.clipboard_updates.clear();
+            impl.clipboard_file_reads.clear(); impl.clipboard_file_data.clear();
+            impl.requested_clipboard_reads.clear(); impl.accepted_clipboard_reads.clear();
             impl.abort_streams_locked(aborts);
         }
     }
-    if ((next & kPermissionFileTransfer) == 0) {
-        std::vector<std::pair<uint32_t, uint64_t>> cancelled;
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            for (auto& entry : impl.received_uploads) {
-                if (!entry.second.finished) {
-                    cancelled.emplace_back(entry.first, entry.second.received);
-                    entry.second.finished = true;
-                    entry.second.error = "file transfer was disabled";
-                    if (entry.second.stream) {
-                        aborts.push_back(entry.second.stream);
-                    }
-                }
-            }
-            impl.file_offers.clear();
-            impl.file_chunks.clear();
-            impl.buffered_file_bytes = 0;
-            // The download direction is the host's own outgoing uploads; the
-            // stream abort stops the viewer's receive before the next chunk,
-            // and send_file_data() refuses any queued chunk after that.
-            for (auto& entry : impl.outgoing_uploads) {
-                if (!entry.second.finished) {
-                    entry.second.finished = true;
-                    if (entry.second.stream) {
-                        aborts.push_back(entry.second.stream);
-                    }
-                }
-            }
-            impl.abort_streams_locked(aborts);
-        }
-        for (const auto& entry : cancelled) {
-            FileResult result;
-            result.transfer_id = entry.first;
-            result.code = FileCode::Cancelled;
-            result.received = entry.second;
-            result.reason = "file transfer was disabled";
-            impl.try_send_bytes(impl.control.load(), make_file_result(result),
-                                QUIC_SEND_FLAG_NONE);
-        }
+    {
+        std::lock_guard lock(impl.mutex);
+        impl.revoke_file_permissions_locked();
     }
     if ((next & kPermissionPortForward) == 0) {
         // The targets and connections are host authority; drop them before
@@ -5816,6 +6156,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     const PermissionMask granted = impl.effective_permissions();
     ack.input_enabled = (granted & kPermissionInput) != 0;
     ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
+    ack.clipboard_direction = impl.server_config.clipboard_direction;
     ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     ack.microphone_enabled = (granted & kPermissionMicrophone) != 0;
     ack.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
@@ -5950,6 +6291,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     const PermissionMask granted = impl.effective_permissions();
     update.input_enabled = (granted & kPermissionInput) != 0;
     update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
+    update.clipboard_direction = impl.server_config.clipboard_direction;
     update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     update.microphone_enabled = (granted & kPermissionMicrophone) != 0;
     update.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
@@ -6022,12 +6364,87 @@ Error QuicSession::request_display_switch(uint16_t display_index) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.effective_permissions() & kPermissionInput) == 0) {
-            return Error(Status::PermissionDenied, "input is disabled by the host");
+        if (impl.client_config.session_mode != SessionMode::Desktop) {
+            return Error(Status::InvalidCall, "display selection requires a desktop session");
         }
     }
     return impl.send_bytes(impl.control.load(), make_switch_display(display_index),
                            QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_capture_displays(const CaptureDisplaysRequest& request) {
+    auto& impl = *impl_;
+    if (impl.role != Impl::Role::Client) return Error(Status::InvalidCall, "capture displays is a client operation");
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete || impl.client_config.session_mode != SessionMode::Desktop)
+            return Error(Status::InvalidCall, "display subscriptions require a desktop handshake");
+    }
+    auto message = make_capture_displays(request);
+    if (message.empty()) return Error(Status::InvalidCall, "too many display indices");
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_capture_displays_request(CaptureDisplaysRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->capture_display_requests.empty()) return false;
+    request = std::move(impl_->capture_display_requests.front());
+    impl_->capture_display_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_capture_displays_result(const CaptureDisplaysResult& result) {
+    auto& impl = *impl_;
+    if (impl.role != Impl::Role::Server || !impl.announced || impl.requested_mode != SessionMode::Desktop)
+        return Error(Status::InvalidCall, "display subscription results require an announced desktop");
+    auto message = make_capture_displays_result(result);
+    if (message.empty()) return Error(Status::InvalidCall, "invalid display subscription result");
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_capture_displays_result(CaptureDisplaysResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->capture_display_results.empty()) return false;
+    result = std::move(impl_->capture_display_results.front());
+    impl_->capture_display_results.pop_front();
+    return true;
+}
+
+Error QuicSession::refresh_display_stream(const DisplayStreamInfo& info) {
+    auto& impl = *impl_;
+    if (impl.role != Impl::Role::Server || !impl.announced || impl.requested_mode != SessionMode::Desktop)
+        return Error(Status::InvalidCall, "display stream updates require an announced desktop");
+    auto message = make_display_stream_info(info);
+    if (message.empty()) return Error(Status::InvalidCall, "invalid display stream description");
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_stream_update(DisplayStreamInfo& info) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->display_stream_updates.empty()) return false;
+    auto first = impl_->display_stream_updates.begin();
+    info = std::move(first->second);
+    impl_->display_stream_updates.erase(first);
+    return true;
+}
+
+Error QuicSession::request_display_keyframe(uint32_t stream_id) {
+    auto& impl = *impl_;
+    if (impl.role != Impl::Role::Client) return Error(Status::InvalidCall, "display keyframes are a client operation");
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete || impl.client_config.session_mode != SessionMode::Desktop)
+            return Error(Status::InvalidCall, "display keyframes require a desktop handshake");
+    }
+    return impl.send_bytes(impl.control.load(), make_display_keyframe_request(stream_id), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_keyframe_request(uint32_t& stream_id) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->display_keyframe_requests.empty()) return false;
+    stream_id = impl_->display_keyframe_requests.front();
+    impl_->display_keyframe_requests.pop_front();
+    return true;
 }
 
 bool QuicSession::take_display_switch_result(uint16_t& display_index, DisplaySwitchCode& code,
@@ -6261,6 +6678,39 @@ bool QuicSession::take_sas_result(SasCode& code, std::string& reason) {
 uint64_t QuicSession::sas_results() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->sas_results_seen;
+}
+
+bool QuicSession::take_elevation_request(uint32_t& request_id) {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->elevation_requests.empty()) return false;
+    request_id = impl_->elevation_requests.front();
+    impl_->elevation_requests.pop_front();
+    return true;
+}
+Error QuicSession::send_elevation_state(const ElevationState& state) {
+    if (impl_->role != Impl::Role::Server) return Error(Status::InvalidCall, "not a host");
+    auto bytes = make_elevation_state(state);
+    if (bytes.empty()) return Error(Status::InvalidCall, "invalid elevation state");
+    return impl_->send_bytes(impl_->control.load(), bytes, QUIC_SEND_FLAG_NONE);
+}
+Error QuicSession::request_elevation(uint32_t request_id) {
+    if (impl_->role != Impl::Role::Client) return Error(Status::InvalidCall, "not a viewer");
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (!impl_->hello_complete) return Error(Status::InvalidCall, "the handshake has not completed");
+        if (!(impl_->effective_permissions() & kPermissionInput))
+            return Error(Status::PermissionDenied, "elevation requires input control");
+    }
+    auto bytes = make_elevation_request(request_id);
+    if (bytes.empty()) return Error(Status::InvalidCall, "invalid elevation request");
+    return impl_->send_bytes(impl_->control.load(), bytes, QUIC_SEND_FLAG_NONE);
+}
+bool QuicSession::take_elevation_state(ElevationState& state) {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->elevation_states.empty()) return false;
+    state = std::move(impl_->elevation_states.front());
+    impl_->elevation_states.pop_front();
+    return true;
 }
 
 bool QuicSession::take_host_action_request(HostControlRequest& request) {
@@ -6769,6 +7219,11 @@ Error QuicSession::send_frame_nowait(FrameHeader header, const uint8_t* payload,
     return send_frame_impl(header, payload, size, false);
 }
 
+bool QuicSession::video_send_ready() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->video_capacity_locked() && impl_->has_send_capacity(1);
+}
+
 Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size,
                                    bool wait) {
     Impl& impl = *impl_;
@@ -6785,13 +7240,47 @@ Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, s
     if (!video) {
         return Error(Status::Unavailable, "the video stream is gone");
     }
-    header.seq = impl.next_seq.fetch_add(1);
+    std::unique_lock<std::mutex> sending(impl.video_send_mutex);
+    const auto bytes_needed = kFrameHeaderSize + size;
+    {
+        std::unique_lock<std::mutex> lock(impl.mutex);
+        if (!valid_video_format(header.codec, header.chroma) ||
+            !(impl.decoding_codecs & video_codec_bit(header.codec)) ||
+            (header.chroma == VideoChroma::Yuv444 && !(impl.decoding_444 & video_codec_bit(header.codec))))
+            return Error(Status::Unsupported, "the viewer cannot decode this video format");
+        const auto ready = [&] { return impl.video_capacity_locked(bytes_needed) || impl.transport_down.load(); };
+        if (wait) {
+            if (!impl.cv.wait_for(lock, kSendCapacityTimeout, ready))
+                return Error(Status::WaitTimeout, "video delivery window did not drain");
+        } else if (!ready()) {
+            return Error(Status::WaitTimeout, "video delivery window is full");
+        }
+        if (impl.transport_down.load()) return Error(Status::Unavailable, "connection closed before video send");
+    }
+    header.seq = impl.next_seq.load();
     header.payload_size = static_cast<uint32_t>(size);
     header.payload_crc32 = crc32(payload, size);
     std::vector<uint8_t> bytes(kFrameHeaderSize + size);
     encode_frame_header(header, bytes.data());
     std::memcpy(bytes.data() + kFrameHeaderSize, payload, size);
-    return impl.send_bytes_impl(video, std::move(bytes), QUIC_SEND_FLAG_NONE, wait);
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto now = steady_us();
+        const auto captured = header.capture_ms && header.capture_ms <= now / 1000 ? header.capture_ms * 1000 : now;
+        impl.pending_video.push_back({header.seq, now, captured, bytes.size()});
+        impl.pending_video_bytes += bytes.size();
+    }
+    auto sent = impl.send_bytes_impl(video, std::move(bytes), QUIC_SEND_FLAG_NONE, wait);
+    if (sent.ok()) {
+        ++impl.next_seq;
+    } else {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.pending_video.empty() && impl.pending_video.back().sequence == header.seq) {
+            impl.pending_video_bytes -= impl.pending_video.back().bytes;
+            impl.pending_video.pop_back();
+        }
+    }
+    return sent;
 }
 
 bool QuicSession::take_keyframe_request() {
@@ -7091,6 +7580,10 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     hello.requested_permissions = impl.client_config.requested_permissions & kPermissionAll;
     hello.mode = impl.client_config.session_mode;
     hello.capabilities = impl.client_config.audio_datagram ? kClientCapabilityAudioDatagram : 0;
+    hello.decoding_codecs = impl.client_config.decoding_codecs;
+    hello.codec_preference = impl.client_config.codec_preference;
+    hello.decoding_444 = impl.client_config.decoding_444;
+    hello.prefer_chroma = impl.client_config.prefer_chroma;
     if (impl.client_config.device_identity) {
         const DeviceIdentity& identity = *impl.client_config.device_identity;
         hello.device_key = identity.public_key();
@@ -7149,6 +7642,7 @@ Error QuicSession::receive_frame(FrameHeader& header, std::vector<uint8_t>& payl
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "receive_frame is a client operation");
     }
+    impl.flush_video_receipt();
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock<std::mutex> lock(impl.mutex);
     for (;;) {
@@ -7173,6 +7667,9 @@ Error QuicSession::receive_frame(FrameHeader& header, std::vector<uint8_t>& payl
             case FrameParser::Status::Frame: {
                 payload.assign(frame_payload, frame_payload + header.payload_size);
                 impl.frame_parser.consume();
+                impl.pending_video_receipt = header.seq;
+                lock.unlock();
+                impl.flush_video_receipt();
                 return Error::success();
             }
             case FrameParser::Status::Error:
@@ -7474,11 +7971,25 @@ Error QuicSession::request_keyframe() {
 
 Error QuicSession::send_latency_probe() {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Client) {
-        return Error(Status::InvalidCall, "send_latency_probe is a client operation");
+    const auto now = steady_us();
+    auto timestamp = now;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) return Error(Status::InvalidCall, "handshake not complete");
+        if (impl.role == Impl::Role::Server) {
+            if (impl.pending_qos_probe_us) {
+                // Callback replies are nonblocking and may have been dropped
+                // by a full queue. Retry the same stamp, preserving its age.
+                if (now - impl.last_qos_probe_send_us < 1000000) return Error::success();
+                timestamp = impl.pending_qos_probe_us;
+            } else {
+                impl.pending_qos_probe_us = timestamp;
+            }
+            impl.last_qos_probe_send_us = now;
+        }
     }
-    Error sent = impl.send_bytes(impl.control.load(), make_latency_probe(steady_us()),
-                                 QUIC_SEND_FLAG_NONE);
+    Error sent = impl.send_bytes_impl(impl.control.load(), make_latency_probe(timestamp),
+                                      QUIC_SEND_FLAG_NONE, false);
     if (sent.ok()) {
         std::lock_guard<std::mutex> lock(impl.mutex);
         ++impl.latency.probes_sent;
@@ -7488,7 +7999,12 @@ Error QuicSession::send_latency_probe() {
 
 LatencySample QuicSession::latency() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->latency;
+    auto sample = impl_->latency;
+    if (impl_->pending_qos_probe_us) sample.pending_us = steady_us() - impl_->pending_qos_probe_us;
+    if (!impl_->pending_video.empty()) sample.video_pending_us = steady_us() - impl_->pending_video.front().capture_us;
+    sample.video_pending_frames = impl_->pending_video.size();
+    sample.video_pending_bytes = impl_->pending_video_bytes;
+    return sample;
 }
 
 TransportStats QuicSession::transport_stats() const {
@@ -7568,7 +8084,7 @@ Error QuicSession::release_input() {
 Error QuicSession::send_clipboard(uint64_t seq, const std::string& text) {
     Impl& impl = *impl_;
     if (impl.role == Impl::Role::Server) {
-        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
+        if (!impl.clipboard_allowed(true)) {
             return Error(Status::PermissionDenied, "clipboard is disabled for this session");
         }
     } else {
@@ -7576,7 +8092,7 @@ Error QuicSession::send_clipboard(uint64_t seq, const std::string& text) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
+        if (!impl.clipboard_allowed(true)) {
             return Error(Status::PermissionDenied, "clipboard is disabled by the host");
         }
     }
@@ -7613,7 +8129,7 @@ Error QuicSession::send_clipboard_content(ClipboardContent content) {
 Error QuicSession::send_clipboard_blob(std::vector<uint8_t> blob) {
     Impl& impl = *impl_;
     if (impl.role == Impl::Role::Server) {
-        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
+        if (!impl.clipboard_allowed(true)) {
             return Error(Status::PermissionDenied, "clipboard is disabled for this session");
         }
     } else {
@@ -7621,7 +8137,7 @@ Error QuicSession::send_clipboard_blob(std::vector<uint8_t> blob) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.effective_permissions() & kPermissionClipboard) == 0) {
+        if (!impl.clipboard_allowed(true)) {
             return Error(Status::PermissionDenied, "clipboard is disabled by the host");
         }
     }
@@ -7668,6 +8184,65 @@ bool QuicSession::take_clipboard_content(ClipboardContent& content) {
 uint64_t QuicSession::clipboard_contents_received() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->clipboard_contents_seen;
+}
+
+Error QuicSession::request_clipboard_file(const ClipboardFileRead& request) {
+    auto message = make_clipboard_file_read(request);
+    if (message.empty()) return Error(Status::InvalidCall, "invalid clipboard file read");
+    auto& impl = *impl_;
+    {
+        std::lock_guard lock(impl.mutex);
+        if (!impl.clipboard_allowed(false)) return Error(Status::PermissionDenied, "clipboard receive is disabled");
+        if (impl.requested_clipboard_reads.size() + impl.clipboard_file_data.size() >= 8 ||
+            impl.requested_clipboard_reads.count(request.request_id))
+            return Error(Status::Unavailable, "clipboard file read queue is full");
+        impl.requested_clipboard_reads.emplace(request.request_id, request);
+    }
+    auto sent = impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) { std::lock_guard lock(impl.mutex); impl.requested_clipboard_reads.erase(request.request_id); }
+    return sent;
+}
+
+Error QuicSession::send_clipboard_file_data(const ClipboardFileData& response) {
+    auto message = make_clipboard_file_data(response);
+    if (message.empty()) return Error(Status::InvalidCall, "invalid clipboard file data");
+    auto& impl = *impl_;
+    {
+        std::lock_guard lock(impl.mutex);
+        if (!impl.clipboard_allowed(true)) return Error(Status::PermissionDenied, "clipboard send is disabled");
+        const auto found = impl.accepted_clipboard_reads.find(response.request_id);
+        if (found == impl.accepted_clipboard_reads.end() || found->second.generation != response.generation ||
+            response.bytes.size() > found->second.length)
+            return Error(Status::InvalidCall, "clipboard data has no matching read");
+        impl.accepted_clipboard_reads.erase(found);
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_clipboard_file_read(ClipboardFileRead& request) {
+    auto& impl = *impl_;
+    std::lock_guard lock(impl.mutex);
+    if (!impl.clipboard_allowed(true)) {
+        impl.clipboard_file_reads.clear(); impl.accepted_clipboard_reads.clear(); return false;
+    }
+    if (impl.clipboard_file_reads.empty()) return false;
+    request = impl.clipboard_file_reads.front(); impl.clipboard_file_reads.pop_front(); return true;
+}
+
+bool QuicSession::take_clipboard_file_data(ClipboardFileData& response) {
+    auto& impl = *impl_;
+    std::lock_guard lock(impl.mutex);
+    if (!impl.clipboard_allowed(false)) {
+        impl.clipboard_file_data.clear(); impl.requested_clipboard_reads.clear(); return false;
+    }
+    if (impl.clipboard_file_data.empty()) return false;
+    response = std::move(impl.clipboard_file_data.front()); impl.clipboard_file_data.pop_front(); return true;
+}
+
+void QuicSession::cancel_clipboard_file_reads(uint64_t generation) {
+    std::lock_guard lock(impl_->mutex);
+    std::erase_if(impl_->requested_clipboard_reads, [&](const auto& item) { return item.second.generation == generation; });
+    std::erase_if(impl_->clipboard_file_data, [&](const auto& item) { return item.generation == generation; });
 }
 
 Error QuicSession::send_chat(const std::string& text) {
@@ -7959,6 +8534,18 @@ Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_
     if (code != FileCode::Ok && resume_offset != 0) {
         return Error(Status::InvalidCall, "only an accepted upload carries a resume offset");
     }
+    {
+        std::lock_guard lock(impl.mutex);
+        const auto it = impl.incoming_file_offers.find(transfer_id);
+        if (code == FileCode::Ok) {
+            if (it == impl.incoming_file_offers.end() || !impl.file_allowed(it->second.clipboard, false)) {
+                return Error(Status::PermissionDenied, "file offer is missing or permission was revoked");
+            }
+            it->second.accepted = true;
+        } else {
+            impl.incoming_file_offers.erase(transfer_id);
+        }
+    }
     if (code != FileCode::Ok) {
         HQUIC stream = nullptr;
         {
@@ -8042,6 +8629,7 @@ Error QuicSession::send_file_result(uint32_t transfer_id, FileCode code, uint64_
     HQUIC stream = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.incoming_file_offers.erase(transfer_id);
         const auto it = impl.received_uploads.find(transfer_id);
         if (it != impl.received_uploads.end()) {
             stream = it->second.stream;
@@ -8078,7 +8666,7 @@ Error QuicSession::offer_file(const FileOffer& offer) {
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
+        if (!impl.file_allowed(offer.clipboard, true)) {
             return Error(Status::PermissionDenied, "file transfer is disabled by the host");
         }
         if (impl.outgoing_uploads.count(offer.transfer_id) != 0) {
@@ -8127,11 +8715,6 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
     if (!data || size == 0 || size > kFileChunkBytes) {
         return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
     }
-    // Checked per chunk: a revocation between two chunks ends the transfer
-    // before another byte leaves the host.
-    if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
-        return Error(Status::PermissionDenied, "file transfer was disabled");
-    }
     HQUIC stream = nullptr;
     std::vector<uint8_t> bytes;
     bool starting = false;
@@ -8143,6 +8726,9 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
             return Error(Status::InvalidCall, "the upload was not accepted");
         }
         Impl::OutgoingUpload& upload = it->second;
+        if (!impl.file_allowed(upload.offer.clipboard, true)) {
+            return Error(Status::PermissionDenied, "file or clipboard permission was disabled");
+        }
         if (!upload.started) {
             QUIC_STATUS status = impl.api->StreamOpen(
                 impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
@@ -8199,9 +8785,6 @@ Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data,
 
 Error QuicSession::finish_file_upload(uint32_t transfer_id) {
     Impl& impl = *impl_;
-    if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
-        return Error(Status::PermissionDenied, "file transfer was disabled");
-    }
     HQUIC stream = nullptr;
     bool starting = false;
     std::vector<uint8_t> header_bytes;
@@ -8213,6 +8796,9 @@ Error QuicSession::finish_file_upload(uint32_t transfer_id) {
             return Error(Status::InvalidCall, "the upload was not accepted");
         }
         Impl::OutgoingUpload& upload = it->second;
+        if (!impl.file_allowed(upload.offer.clipboard, true)) {
+            return Error(Status::PermissionDenied, "file or clipboard permission was disabled");
+        }
         if (!upload.started) {
             // A zero-byte file never called send_file_data(); the stream still
             // needs its header so the host can match it to the offer.
@@ -8307,13 +8893,14 @@ bool QuicSession::take_file_result(FileResult& result) {
 
 // ----- shared-folder browsing -----
 
-bool QuicSession::take_file_list_request(uint32_t& request_id, std::string& directory) {
+bool QuicSession::take_file_list_request(uint32_t& request_id, std::string& directory, std::string* cursor) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->file_list_requests.empty()) {
         return false;
     }
-    request_id = impl_->file_list_requests.front().first;
-    directory = std::move(impl_->file_list_requests.front().second);
+    request_id = impl_->file_list_requests.front().request_id;
+    directory = std::move(impl_->file_list_requests.front().directory);
+    if (cursor) *cursor = std::move(impl_->file_list_requests.front().cursor);
     impl_->file_list_requests.pop_front();
     return true;
 }
@@ -8332,6 +8919,7 @@ Error QuicSession::send_file_list_result(const FileListResult& result) {
         if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
             answer.entries.clear();
             answer.truncated = false;
+            answer.next_cursor.clear();
             answer.code = FileCode::Refused;
             answer.reason = "file transfer was revoked";
         }
@@ -8354,7 +8942,7 @@ bool QuicSession::take_file_download_request(uint32_t& request_id, std::string& 
     return true;
 }
 
-Error QuicSession::send_file_download_result(const FileDownloadResult& result) {
+Error QuicSession::send_file_download_result(const FileDownloadResult& result, bool clipboard) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "send_file_download_result is a server operation");
@@ -8365,7 +8953,7 @@ Error QuicSession::send_file_download_result(const FileDownloadResult& result) {
         if (!impl.announced) {
             return Error(Status::InvalidCall, "the stream is not open");
         }
-        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
+        if (!impl.file_allowed(clipboard, true)) {
             answer.transfer_id = 0;
             answer.code = FileCode::Refused;
             answer.reason = "file transfer was revoked";
@@ -8378,12 +8966,12 @@ Error QuicSession::send_file_download_result(const FileDownloadResult& result) {
     return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
 }
 
-Error QuicSession::request_file_list(uint32_t request_id, const std::string& directory) {
+Error QuicSession::request_file_list(uint32_t request_id, const std::string& directory, const std::string& cursor) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "request_file_list is a client operation");
     }
-    std::vector<uint8_t> message = make_file_list_request(request_id, directory);
+    std::vector<uint8_t> message = make_file_list_request(request_id, directory, cursor);
     if (message.empty()) {
         return Error(Status::InvalidCall, "invalid file list request");
     }
@@ -8424,7 +9012,7 @@ Error QuicSession::request_file_download(uint32_t request_id, const std::string&
         if (!impl.hello_complete) {
             return Error(Status::InvalidCall, "the handshake has not completed");
         }
-        if ((impl.effective_permissions() & kPermissionFileTransfer) == 0) {
+        if (!impl.file_allowed(path.starts_with(".chast-clipboard/"), false)) {
             return Error(Status::PermissionDenied,
                          "the host did not grant file transfer");
         }
@@ -9711,6 +10299,10 @@ Error QuicSession::send_camera_frame(FrameHeader header, const uint8_t* payload,
         if ((impl.effective_permissions() & kPermissionCamera) == 0) {
             return Error(Status::PermissionDenied, "camera access was revoked");
         }
+        if (!(impl.decoding_codecs & video_codec_bit(header.codec)) ||
+            (header.chroma == VideoChroma::Yuv444 && !(impl.decoding_444 & video_codec_bit(header.codec)))) {
+            return Error(Status::Unsupported, "the viewer cannot decode this camera format");
+        }
         if (impl.camera_finished) {
             return Error(Status::Unavailable, "the camera stream is finished");
         }
@@ -9962,6 +10554,25 @@ bool QuicSession::take_cursor_update(CursorUpdate& update) {
     }
     update = std::move(*impl_->cursor_update);
     impl_->cursor_update.reset();
+    return true;
+}
+
+Error QuicSession::send_display_cursor(const DisplayCursorUpdate& update) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server || !impl.desktop_subscription_ready())
+        return Error(Status::InvalidCall, "display cursor requires an accepted desktop viewer");
+    auto message = make_display_cursor_update(update);
+    if (message.empty()) return Error(Status::InvalidCall, "invalid display cursor");
+    return impl.send_bytes_impl(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE, false);
+}
+
+bool QuicSession::take_display_cursor_update(DisplayCursorUpdate& update) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->display_cursor_updates.empty()) return false;
+    auto it = impl_->display_cursor_updates.begin();
+    update.stream_id = it->first;
+    update.cursor = std::move(it->second);
+    impl_->display_cursor_updates.erase(it);
     return true;
 }
 

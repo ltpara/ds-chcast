@@ -16,11 +16,13 @@ class KeyboardState {
 public:
     void Reset(uint16_t modifiers = 0);
     bool Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks,
-                bool relative, chast::InputEvent& event, bool& escape);
+                bool relative, chast::InputEvent& event, bool& escape,
+                bool translated = false, bool composing = false);
     uint16_t modifiers() const { return modifiers_; }
 private:
     uint16_t modifiers_ = 0;
     std::array<bool, 256> held_{};
+    std::array<bool, 256> forwarded_{};
     bool escape_held_ = false;
 };
 
@@ -28,8 +30,11 @@ private:
 // rendering. Only the foreground window with remote focus owns keyboard input.
 class KeyboardCapture {
 public:
+    using LocalDispatch = std::function<bool(const KBDLLHOOKSTRUCT&, bool,
+                                             const chast::InputEvent&, bool)>;
     KeyboardCapture(HWND window, std::function<bool(const chast::InputEvent&)> send,
-                    std::function<void()> release, std::function<void()> escape);
+                    std::function<void()> release, std::function<void()> escape,
+                    LocalDispatch local_dispatch = {});
     ~KeyboardCapture();
     bool Enable(bool enabled);
     bool available() const;
@@ -37,6 +42,8 @@ public:
     uint16_t InputState() const;
     void Release();
     void set_relative(bool enabled);
+    void SetTranslated(bool enabled);
+    void SetComposing(bool composing);
 private:
     void Run();
     void UpdateForeground(bool foreground);  // mutex_ must be held.
@@ -46,6 +53,7 @@ private:
     std::function<bool(const chast::InputEvent&)> send_;
     std::function<void()> release_;
     std::function<void()> escape_;
+    LocalDispatch local_dispatch_;
     KeyboardState state_;
     mutable std::mutex mutex_;
     std::condition_variable ready_cv_;
@@ -59,5 +67,7 @@ private:
     bool was_foreground_ = false;
     bool enabled_ = false;
     bool relative_ = false;
+    bool translated_ = false;
+    bool composing_ = false;
 };
 }  // namespace chast_viewer

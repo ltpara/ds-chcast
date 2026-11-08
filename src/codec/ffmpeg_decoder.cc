@@ -33,6 +33,7 @@ extern "C" {
 #include <vector>
 
 #include "chast/com_ptr.h"
+#include "vpx_internal.h"
 
 namespace chast {
 
@@ -421,6 +422,11 @@ Error FFmpegDecoder::flush(std::vector<DecodedFrame>& out) {
 
 std::unique_ptr<IVideoDecoder> create_decoder(const DecoderConfig& config,
                                               std::string* error) {
+    if (config.codec == VideoCodec::Vp9) return create_vpx_decoder(config, error);
+    if (config.chroma != VideoChroma::Yuv420) {
+        if (error) *error = "this decoder supports 4:2:0 only";
+        return nullptr;
+    }
     auto decoder = std::make_unique<FFmpegDecoder>(config.codec, config);
     Error opened = decoder->open();
     if (!opened.ok()) {
@@ -431,5 +437,43 @@ std::unique_ptr<IVideoDecoder> create_decoder(const DecoderConfig& config,
     }
     return decoder;
 }
+
+VideoCodecMask supported_decoder_codecs(ID3D11Device* device) {
+    VideoCodecMask available = 0;
+    for (auto codec : {VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1}) {
+        const auto* decoder = find_decoder(codec);
+        if (!decoder) continue;
+        if (!device) {
+            available |= video_codec_bit(codec);
+            continue;
+        }
+        for (int index = 0; const auto* config = avcodec_get_hw_config(decoder, index); ++index) {
+            if (config->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+                config->pix_fmt == AV_PIX_FMT_D3D11 &&
+                (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+                available |= video_codec_bit(codec);
+                break;
+            }
+        }
+    }
+    if (!device) return available | kVideoCodecVp9;
+    auto video = com_query<ID3D11VideoDevice>(device);
+    if (!video) return kVideoCodecVp9;
+    VideoCodecMask supported = 0;
+    for (UINT index = 0; index < video->GetVideoDecoderProfileCount(); ++index) {
+        GUID profile{};
+        if (FAILED(video->GetVideoDecoderProfile(index, &profile))) continue;
+        VideoCodecMask bit = 0;
+        if (profile == D3D11_DECODER_PROFILE_H264_VLD_NOFGT) bit = kVideoCodecH264;
+        else if (profile == D3D11_DECODER_PROFILE_HEVC_VLD_MAIN) bit = kVideoCodecHevc;
+        else if (profile == D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0) bit = kVideoCodecAv1;
+        BOOL nv12 = FALSE;
+        if (bit && SUCCEEDED(video->CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12, &nv12)) && nv12)
+            supported |= bit;
+    }
+    return (supported & available) | kVideoCodecVp9;
+}
+
+VideoCodecMask supported_decoder_444_codecs(ID3D11Device*) { return kVideoCodecVp9; }
 
 }  // namespace chast

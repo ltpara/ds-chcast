@@ -23,6 +23,34 @@ void main() {
     await server.close(force: true);
   });
 
+  for (final int status in <int>[401, 403, 404, 408, 429, 503]) {
+    test('identity request HTTP $status keeps its retry classification', () async {
+      server.listen((HttpRequest request) async {
+        request.response.statusCode = status;
+        await request.response.close();
+      });
+      await expectLater(
+        ServerApi.serverIdentity(settings),
+        throwsA(isA<ServerApiException>().having(
+          (ServerApiException e) => e.retryable,
+          'retryable',
+          status == 408 || status == 429 || status >= 500,
+        )),
+      );
+    });
+  }
+
+  test('identity request timeout is retryable', () async {
+    server.listen((HttpRequest request) {});
+    await expectLater(
+      ServerApi.serverIdentity(settings,
+          timeout: const Duration(milliseconds: 100)),
+      throwsA(isA<ServerApiException>().having(
+        (ServerApiException e) => e.retryable, 'retryable', isTrue,
+      )),
+    );
+  });
+
   test('lookup parses a host and keeps the requested id', () async {
     Uri? requested;
     String? authorization;

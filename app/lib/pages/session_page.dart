@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +9,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
 
 import '../account_store.dart';
+import '../display_stream_bridge.dart';
+import '../display_stream_controller.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
@@ -24,6 +27,7 @@ import '../tunnel_agent.dart';
 import '../view_prefs.dart';
 import '../viewer_bridge.dart';
 import '../widgets/camera_panel.dart';
+import '../widgets/display_stream_view.dart';
 import '../widgets/chat_panel.dart';
 import '../widgets/file_browser_panel.dart';
 import '../widgets/remote_toolbar.dart';
@@ -33,6 +37,8 @@ import '../widgets/stats_overlay.dart';
 import '../widgets/terminal_tabs.dart';
 import 'package:chast_viewer/l10n.dart';
 
+enum _DisplayStreamLayout { single, grid, desktop }
+
 class SessionPage extends StatefulWidget {
   const SessionPage({
     super.key,
@@ -40,6 +46,7 @@ class SessionPage extends StatefulWidget {
     this.account,
     this.settings = const ServerSettings(),
     this.identityStore,
+    this.trustStore,
     this.fileTransferOnly = false,
     this.sessionMode = 'desktop',
     this.rdpPort = 0,
@@ -88,6 +95,9 @@ class SessionPage extends StatefulWidget {
   /// Server identity pins; tests inject a file-backed store.
   final ServerIdentityStore? identityStore;
 
+  /// Host certificate pins; tests inject an isolated file-backed store.
+  final TrustStore? trustStore;
+
   @override
   State<SessionPage> createState() => _SessionPageState();
 }
@@ -98,11 +108,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   final FocusNode _focus = FocusNode(debugLabel: 'session');
   final FlutterGpuTextureRenderer _gpuTexture = FlutterGpuTextureRenderer();
-  final TrustStore _trustStore = TrustStore();
+  late final TrustStore _trustStore = widget.trustStore ?? TrustStore();
   late final ServerIdentityStore _identityStore =
       widget.identityStore ?? ServerIdentityStore();
 
   Timer? _pollTimer;
+  int _pollEpoch = 0;
   Timer? _hideTimer;
   ViewerStatus _status = const ViewerStatus();
   // Local clipboard switch, independent of the host's gate: turning it off
@@ -189,6 +200,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       );
   String? _startError;
   int _textureId = -1;
+  DisplayStreamController? _displayStreams;
+  bool _openingDisplayWindow = false;
+  List<int>? _displaySelection;
+  _DisplayStreamLayout? _displayStreamLayout;
+  bool get _independentDisplays => _displayStreams?.state.active == true;
   Future<void>? _teardown;
   Future<void>? _starting;
   Future<void>? _shutdownFuture;
@@ -203,6 +219,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _closing = false;
   bool _controlEnabled = false;
   bool _nativeKeyCapture = false;
+  bool _localKeyboardUnavailable = false;
+  ViewerKeyboardMode _keyboardMode = ViewerKeyboardMode.physical;
+  bool _keyboardChanging = false;
   int _keyCaptureGeneration = 0;
   // Relative mode pins the local pointer to the window and sends host motion
   // itself; it is session-only and starts off.
@@ -211,6 +230,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // An accepted Windows session switch ends this connection on purpose; the
   // page reconnects through the backoff ladder instead of showing a drop.
   bool _sessionSwitchPending = false;
+  bool _elevationSubmitting = false;
+  bool _elevationReconnectPending = false;
   double _wheelY = 0;
   double _wheelX = 0;
   int _heldButtons = 0;
@@ -232,6 +253,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // toolbar marks it while the host works; a refusal drops it and leaves
   // [_display] pointing at the output that is still streaming.
   int? _pendingDisplay;
+  // The output chosen by the host when this connection started in automatic
+  // mode. Keep it stable while local multi-display layouts change focus.
+  int? _serverDefaultDisplay;
   // Resolution menu. The mode list is fetched once the stream is live for the
   // displayed output and again after an accepted change, because the host's
   // current-mode marker moves with it.
@@ -245,6 +269,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // optimistic: a refusal restores the previous selection and explains itself
   // in a snack bar.
   ViewerStreamCodec _streamCodec = ViewerStreamCodec.auto;
+  bool _streamFullColor = false;
   ViewerStreamQuality _streamQuality = ViewerStreamQuality.high;
   int _streamMaxFps = 0;
   // Answers already consumed and requests still in flight, so a stale answer
@@ -284,8 +309,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   String _totp = '';
   bool _authPromptOpen = false;
   int _challengeDenial = 0;
-  // One viewer tunnel for the lifetime of this page; reconnects reuse it so
-  // the host sees a stable NAT mapping and the selected path survives.
+  // One tunnel per connection attempt. Reconnects must look up the host again:
+  // a running helper can still hold a dead NAT mapping or an expired token.
   TunnelAgent? _tunnel;
   Future<TunnelAgent>? _tunnelStarting;
   // Automatic reconnect after an unexpected drop. The policy holds the
@@ -304,7 +329,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _fileReportBusy = false;
 
   bool get _inputActive =>
-      _controlEnabled && _status.acceptsInput && _startError == null;
+      !_keyboardChanging && _controlEnabled && _status.acceptsInput && _startError == null;
 
   /// Physical cursor pixels per captured pixel. The native side needs this to
   /// size the host's sprite the way the frame is being drawn, so a stream
@@ -329,9 +354,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     final StreamPreferences prefs = StreamPreferences.load();
     _streamCodec = _streamCodecFor(prefs.codec);
+    _streamFullColor = prefs.fullColor;
     _streamQuality = _streamQualityFor(prefs.quality);
     _streamMaxFps = prefs.maxFps;
+    ViewerBridge.setKeyboardTextRejectedHandler(() {
+      if (mounted && !_closing) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr('文字未发送，请检查控制权限或连接状态'))));
+      }
+    });
     final ViewPreferences viewPrefs = ViewPreferences.load();
+    _keyboardMode = viewPrefs.keyboardMode == 'local' ? ViewerKeyboardMode.local : ViewerKeyboardMode.physical;
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _statsVisible = viewPrefs.stats;
     _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
@@ -342,7 +374,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       reverseWheel: viewPrefs.reverseWheel,
       swapButtons: viewPrefs.swapButtons,
     );
-    _startPolling();
     _starting = _start();
     unawaited(_starting);
   }
@@ -353,10 +384,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _closing = true;
     ViewerBridge.setDropHandler(null);
     ViewerBridge.setKeyboardEscapeHandler(null);
+    ViewerBridge.setKeyboardTextRejectedHandler(null);
     if (widget.windowSession) {
       unawaited(ViewerBridge.setWindowCloseHandler(null));
     }
-    _pollTimer?.cancel();
+    _stopPolling();
     _hideTimer?.cancel();
     _autoTimer?.cancel();
     _chatInputFocus.removeListener(_onChatFocusChanged);
@@ -445,8 +477,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       final ServerSettings settings = ServerSettings(url: account.server);
       // The server accepts at most 200 rows per call.
       for (int start = 0; start < files.length; start += 200) {
-        final int end =
-            start + 200 < files.length ? start + 200 : files.length;
+        final int end = start + 200 < files.length ? start + 200 : files.length;
         final List<FileTransferReport> items = <FileTransferReport>[
           for (final ViewerCompletedFile file in files.sublist(start, end))
             FileTransferReport(
@@ -456,8 +487,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               success: file.success,
               detail: file.detail,
               occurredAt: file.occurredAtMs > 0
-                  ? DateTime.fromMillisecondsSinceEpoch(file.occurredAtMs,
-                      isUtc: true)
+                  ? DateTime.fromMillisecondsSinceEpoch(
+                      file.occurredAtMs,
+                      isUtc: true,
+                    )
                   : null,
             ),
         ];
@@ -629,23 +662,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         }
         return;
       } on TunnelException catch (error) {
-        // A connection service that cannot start is not a transient drop;
-        // retrying it in a loop would just hide the failure.
-        _cancelAutoReconnect();
         if (mounted) {
           setState(
             () => _startError = tr('无法通过连接服务打开设备：{p1}', <String, Object?>{
               'p1': error.message,
             }),
           );
+          final Duration? delay = _autoPolicy.afterStartupFailure(
+            retryable: error.retryable && !_closing && !_identityChanged,
+          );
+          _scheduleAutoReconnect(delay);
         }
         return;
       }
     }
   }
 
-  /// Starts the viewer agent on first use. A reconnect keeps the same agent,
-  /// so its direct/relay decision and the host's NAT mapping do not reset.
+  /// Reuses the agent within an attempt. _reconnect retires it before starting
+  /// the next attempt so addresses, tokens and path selection are refreshed.
   Future<TunnelAgent?> _ensureTunnel() async {
     if (!widget.target.viaServer) {
       return null;
@@ -702,6 +736,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     } on ServerApiException catch (error) {
       throw TunnelException(
         tr('无法读取服务器身份：{p2}', <String, Object?>{'p2': error.message}),
+        retryable: error.retryable,
       );
     }
     final ServerIdentityPin? pinned = await _identityStore.pinFor(settings.url);
@@ -760,8 +795,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     _textureId = id;
-    final String storedPin =
-        await _trustStore.fingerprintFor(widget.target.trustKey);
+    final String storedPin = await _trustStore.fingerprintFor(
+      widget.target.trustKey,
+    );
     if (!mounted) {
       await _stopSession();
       return;
@@ -870,13 +906,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       // do not briefly show the host's defaults.
       if (_streamCodec != ViewerStreamCodec.auto ||
           _streamQuality != ViewerStreamQuality.high ||
-          _streamMaxFps != 0) {
+          _streamMaxFps != 0 || _streamFullColor) {
         ++_streamPending;
         try {
           if (!await ViewerBridge.setStreamOptions(
             codec: _streamCodec.code,
             maxFps: _streamMaxFps,
             quality: _streamQuality.code,
+            chroma: _streamFullColor ? 1 : 0,
           )) {
             --_streamPending;
           }
@@ -893,11 +930,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _teardown = null;
       rethrow;
     }
-    if (!mounted) {
+    if (!mounted || _closing) {
       await _stopSession();
       return;
     }
     setState(() => _startError = null);
+    _startPolling();
   }
 
   /// Stops the native session, then releases the plugin texture. The native
@@ -908,6 +946,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _teardownSession() async {
+    _stopPolling();
+    final displays = _displayStreams;
+    _displayStreams = null;
+    displays?.removeListener(_displayStreamsChanged);
+    // Stop registration before stopping native media; retry cleanup after
+    // Stop has detached every output if the channel failed during detach.
+    try {
+      await displays?.close();
+    } catch (_) {
+      /* Retained until Stop. */
+    }
     final int id = _textureId;
     final int cameraId = _cameraTextureId;
     _textureId = -1;
@@ -915,6 +964,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _cameraOpen = false;
     try {
       await ViewerBridge.stop();
+      await displays?.close(sessionStopped: true);
     } on MissingPluginException {
       // Nothing to stop.
     } on PlatformException {
@@ -926,24 +976,39 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (id >= 0) {
       await _gpuTexture.unregisterTexture(id);
     }
+    displays?.dispose();
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    ++_pollEpoch;
   }
 
   void _startPolling() {
-    _pollTimer?.cancel();
+    _stopPolling();
     _pollTimer = Timer.periodic(_pollInterval, (_) => unawaited(_poll()));
   }
 
   Future<void> _poll() async {
-    if (_polling || !mounted) {
+    if (_polling || !mounted || _closing || _reconnecting) {
       return;
     }
+    final int epoch = _pollEpoch;
     _polling = true;
     try {
       final ViewerStatus status = await ViewerBridge.status();
-      if (!mounted) {
+      if (!mounted || _closing || _reconnecting || epoch != _pollEpoch) {
         return;
       }
       _applyStatus(status);
+      if (_displayStreams == null &&
+          _displaySelection != null &&
+          status.isLive) {
+        _createDisplayStreams();
+        await _displayStreams!.select(_displaySelection!);
+      }
+      await _displayStreams?.refresh();
       // Drain after the status update: the audit reference and route of the
       // connection are only current once _applyStatus has read this poll.
       unawaited(_reportCompletedFiles());
@@ -960,6 +1025,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Captured before the setState below replaces _status: the answer checks
     // further down need the snapshot this poll is being compared against.
     final ViewerStatus previous = _status;
+    if (_serverDefaultDisplay == null &&
+        _display == kViewerDisplayAuto &&
+        status.isLive &&
+        status.streamedDisplayIndex != null) {
+      _serverDefaultDisplay = status.streamedDisplayIndex;
+    }
     // First contact: the native side connected without a pin so it could
     // report the certificate. Ask before remembering it; every later
     // connection is verified against the accepted value.
@@ -1096,14 +1167,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             _streamCodec = streamRollback.codec;
             _streamQuality = streamRollback.quality;
             _streamMaxFps = streamRollback.maxFps;
+            _streamFullColor = streamRollback.fullColor;
           } else {
             // A preference re-applied after a reconnect was refused; show the
             // values the host actually runs.
-            _streamCodec = status.codec == 'hevc'
+            _streamFullColor = status.chroma == 1;
+            _streamCodec = status.codec == 'vp9' ? ViewerStreamCodec.vp9 : status.codec == 'hevc'
                 ? ViewerStreamCodec.hevc
                 : (status.codec == 'av1'
-                    ? ViewerStreamCodec.av1
-                    : ViewerStreamCodec.h264);
+                      ? ViewerStreamCodec.av1
+                      : ViewerStreamCodec.h264);
             _streamQuality = _streamQualityFor(status.streamQuality);
           }
         } else {
@@ -1159,6 +1232,43 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             duration: const Duration(seconds: 5),
           ),
         );
+      }
+    }
+    if (status.elevationUpdates > previous.elevationUpdates) {
+      if (status.elevationCode == 4) _sessionSwitchPending = true;
+      if (status.elevationRequestId != 0 ||
+          (_elevationReconnectPending && status.elevationCode == 2)) {
+        String? message;
+        switch (status.elevationCode) {
+          case 2:
+            message = tr('主机已取得管理员权限');
+            _elevationReconnectPending = false;
+          case 3:
+            message = tr('等待主机本地确认 UAC…');
+          case 4:
+            _elevationReconnectPending = true;
+            message = tr('主机正在取得管理员权限，即将重新连接…');
+          case 5:
+            message = tr('主机本地取消了提权请求');
+          case 6:
+            message = tr('提权需要远程键鼠控制权限');
+          case 7:
+            message = tr('主机已有提权请求，请稍后重试');
+          case 8:
+            message = tr('提权失败：{reason}', <String, Object?>{
+              'reason': status.elevationReason,
+            });
+        }
+        if (message != null) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+        }
+      } else if (_elevationReconnectPending && status.elevationCode == 1) {
+        _elevationReconnectPending = false;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(tr('提权未完成，已重新连接到原主机'))));
       }
     }
     if (justOver) {
@@ -1320,9 +1430,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           content: Text(
             reason.isEmpty
                 ? tr('显示设置未应用')
-                : tr('显示设置未应用：{reason}', <String, Object?>{
-                    'reason': reason,
-                  }),
+                : tr('显示设置未应用：{reason}', <String, Object?>{'reason': reason}),
           ),
           duration: const Duration(seconds: 4),
         ),
@@ -1356,16 +1464,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       final String action = _hostActionText(status.hostActionAction);
       final String text;
       if (status.hostActionCode != ViewerHostActionCode.ok.code) {
-        final String detail =
-            reason.isEmpty ? _hostActionCodeText(status.hostActionCode) : reason;
+        final String detail = reason.isEmpty
+            ? _hostActionCodeText(status.hostActionCode)
+            : reason;
         text = tr('{action}未执行：{detail}', <String, Object?>{
           'action': action,
           'detail': detail,
         });
       } else if (status.hostActionAction == ViewerHostAction.blockInput.code) {
-        text = status.blockInputActive
-            ? tr('主机本地输入已阻止')
-            : tr('主机本地输入已恢复');
+        text = status.blockInputActive ? tr('主机本地输入已阻止') : tr('主机本地输入已恢复');
       } else if (status.hostActionAction == ViewerHostAction.lockScreen.code) {
         text = tr('已请求主机锁屏');
       } else {
@@ -1383,8 +1490,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (status.osLoginCode == ViewerHostActionCode.ok.code) {
         text = tr('已在主机登录/锁屏界面输入密码');
       } else {
-        final String detail =
-            reason.isEmpty ? _osLoginCodeText(status.osLoginCode) : reason;
+        final String detail = reason.isEmpty
+            ? _osLoginCodeText(status.osLoginCode)
+            : reason;
         text = tr('系统登录失败：{detail}', <String, Object?>{'detail': detail});
       }
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1467,7 +1575,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// on. Cheap to call every poll: nothing happens unless the host's counter,
   /// the control gate or the drawn scale changed since the last call.
   void _syncCursor() {
-    final bool enabled = _inputActive;
+    final bool enabled = _inputActive && !_independentDisplays;
     final double scale = _cursorTargetScale;
     if (_cursorSynced &&
         enabled == _cursorWanted &&
@@ -1733,6 +1841,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         terminalFontSize: _terminalFontSize,
         reverseWheel: _mouse.reverseWheel,
         swapButtons: _mouse.swapButtons,
+        keyboardMode: _keyboardMode.name,
       ),
     );
   }
@@ -1896,11 +2005,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _controlDisplays(
-    int action,
-    int value, {
-    int target = 0,
-  }) async {
+  Future<void> _controlDisplays(int action, int value, {int target = 0}) async {
     try {
       final bool queued = await ViewerBridge.controlDisplays(
         action,
@@ -1926,6 +2031,45 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// Runs one entry of the toolbar's host-control menu. Restart interrupts
   /// this session, so it asks first; the host's answer arrives later through
   /// [ViewerStatus.hostActionUpdates].
+  Future<void> _requestElevation() async {
+    if (_elevationSubmitting || !_status.elevationAvailable) return;
+    setState(() => _elevationSubmitting = true);
+    try {
+      final bool? confirmed = await showDialog<bool>(
+        context: context,
+        builder: (BuildContext context) => AlertDialog(
+          title: Text(tr('请求管理员权限')),
+          content: Text(tr('主机本地需要确认 Windows UAC。确认后连接会短暂中断并自动重连，其他查看者也会断开。')),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text(tr('取消')),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: Text(tr('请求管理员权限')),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted || !_status.elevationAvailable) return;
+      final bool queued = await ViewerBridge.requestElevation();
+      if (!queued && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(tr('提权请求未发送，请确认连接和控制权限'))));
+      }
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message ?? error.code)));
+      }
+    } finally {
+      if (mounted) setState(() => _elevationSubmitting = false);
+    }
+  }
+
   Future<void> _onHostAction(ViewerHostAction action) async {
     switch (action) {
       case ViewerHostAction.restart:
@@ -2061,10 +2205,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   onPressed: () => Navigator.of(dialogContext).pop(),
                   child: Text(tr('取消')),
                 ),
-                FilledButton(
-                  onPressed: submit,
-                  child: Text(tr('输入密码')),
-                ),
+                FilledButton(onPressed: submit, child: Text(tr('输入密码'))),
               ],
             );
           },
@@ -2202,7 +2343,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_closing || _autoTimer != null) {
       return;
     }
-    _autoPolicy.reset();
+    // Elevation can need time to roll back a child that did not start. Keep
+    // the retry count bounded while covering its startup/cleanup deadline.
+    _autoPolicy.reset(hostRestart: _elevationReconnectPending);
     // Reserve the first attempt; a failed reconnect continues the ladder at
     // the next backoff instead of starting over at one second.
     _autoPolicy.next();
@@ -2317,18 +2460,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               final int? remote = int.tryParse(remoteController.text.trim());
               final String host = hostController.text.trim();
               if (local == null || local < 0 || local > 65535) {
-                setDialogState(
-                  () => error = tr('本地端口须为 0–65535（0 表示自动分配）'),
-                );
+                setDialogState(() => error = tr('本地端口须为 0–65535（0 表示自动分配）'));
                 return;
               }
               if (host.isEmpty ||
                   remote == null ||
                   remote < 1 ||
                   remote > 65535) {
-                setDialogState(
-                  () => error = tr('请填写目标主机和 1–65535 的目标端口'),
-                );
+                setDialogState(() => error = tr('请填写目标主机和 1–65535 的目标端口'));
                 return;
               }
               setDialogState(() {
@@ -2709,6 +2848,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// matched against the stream's origin and size, which is how HelloAck
   /// identifies the captured output.
   int get _activeDisplay {
+    if (_independentDisplays) {
+      if (_displayStreamLayout == _DisplayStreamLayout.desktop) {
+        return kViewerDisplayAll;
+      }
+      if (_displayStreamLayout == _DisplayStreamLayout.grid) {
+        return -3;
+      }
+      final streams = _displayStreams!.state.streams;
+      return streams.length == 1
+          ? streams.single.displayIndex
+          : kViewerDisplayAuto;
+    }
     if (_pendingDisplay != null) {
       return _pendingDisplay!;
     }
@@ -2774,6 +2925,27 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_reconnecting) {
       return;
     }
+    if (display == kViewerDisplayAll) {
+      await _selectDisplayStreams(
+        _status.displays.map((d) => d.index).toList(),
+        layout: _DisplayStreamLayout.desktop,
+        reconnectDisplay: kViewerDisplayAuto,
+      );
+      return;
+    }
+    if (_displayStreams != null) {
+      final int selected = display == kViewerDisplayAuto
+          ? _defaultDisplayIndex()
+          : display;
+      if (selected >= 0) {
+        await _selectDisplayStreams(
+          [selected],
+          layout: _DisplayStreamLayout.single,
+          reconnectDisplay: display,
+        );
+      }
+      return;
+    }
     // A manual choice takes the host's automatic following out of the loop;
     // otherwise the host would switch back on its next poll.
     if (_followCursor || _followWindow) {
@@ -2786,10 +2958,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (display == _activeDisplay) {
       return;
     }
-    // A live session moves its capture without a reconnect, but only while
-    // the host grants input; otherwise the Hello-time selection is the only
-    // way to change outputs.
-    if (_status.isLive && _status.acceptsInput && !_over) {
+    // Selecting this connection's display also works for view-only sessions.
+    if (_status.isLive && !_over) {
       setState(() => _pendingDisplay = display);
       bool queued = false;
       try {
@@ -2814,29 +2984,343 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _reconnect();
   }
 
-  /// Starts a second session in its own window, fixed to one output. The new
-  /// window gets the same target and credentials through
-  /// [SessionWindowRequest], so it never touches a command line or a file.
+  void _createDisplayStreams() {
+    _displayStreams = DisplayStreamController()
+      ..addListener(_displayStreamsChanged);
+  }
+
+  void _displayStreamsChanged() {
+    if (!mounted || _closing || _reconnecting) return;
+    final controller = _displayStreams;
+    if (controller == null) return;
+    if (controller.state.active && !controller.busy) {
+      _displaySelection = controller.state.streams
+          .map((s) => s.displayIndex)
+          .toList();
+      _displayStreamLayout ??= controller.state.streams.length == 1
+          ? _DisplayStreamLayout.single
+          : _DisplayStreamLayout.grid;
+    }
+    setState(() {});
+    _syncCursor();
+  }
+
+  int _defaultDisplayIndex() {
+    final remembered = _serverDefaultDisplay;
+    if (remembered != null &&
+        _status.displays.any((display) => display.index == remembered)) {
+      return remembered;
+    }
+    for (final display in _status.displays) {
+      if (display.primary) return display.index;
+    }
+    return _status.displays.isEmpty ? -1 : _status.displays.first.index;
+  }
+
+  Future<void> _selectDisplayStreams(
+    List<int> displays, {
+    required _DisplayStreamLayout layout,
+    int? reconnectDisplay,
+  }) async {
+    if (!_status.isLive || _reconnecting || _closing) return;
+    if (_followCursor || _followWindow) {
+      if (!await _setFollow(cursor: false, window: false)) return;
+    }
+    if (!mounted || _closing || _reconnecting) return;
+    if (_relativeMouse) _toggleRelativeMouse();
+    if (_displayStreams == null) _createDisplayStreams();
+    final controller = _displayStreams!;
+    final available = _status.displays.map((display) => display.index).toSet();
+    final normalized = displays.where(available.contains).toSet().toList()
+      ..sort();
+    final current = controller.state.streams
+        .map((stream) => stream.displayIndex)
+        .toSet();
+    if (controller.state.active &&
+        current.length == normalized.length &&
+        current.containsAll(normalized)) {
+      setState(() {
+        _displayStreamLayout = layout;
+        _displaySelection = normalized;
+        if (reconnectDisplay != null) _display = reconnectDisplay;
+      });
+      return;
+    }
+    final accepted = await controller.select(normalized);
+    if (accepted && mounted && controller == _displayStreams) {
+      setState(() {
+        _displayStreamLayout = layout;
+        _displaySelection = normalized;
+        if (reconnectDisplay != null) _display = reconnectDisplay;
+      });
+    }
+    await controller.refresh();
+    if (!accepted &&
+        mounted &&
+        !_closing &&
+        controller == _displayStreams &&
+        controller.error.isNotEmpty &&
+        !_independentDisplays) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(controller.error)));
+    }
+  }
+
+  void _focusDisplay(int id) {
+    _focus.requestFocus();
+    unawaited(_displayStreams?.focus(id));
+  }
+
+  Widget _buildIndependentDisplays() {
+    final controller = _displayStreams!;
+    final textures = controller.textures;
+    return Padding(
+      padding: const EdgeInsets.only(top: 64, bottom: 12, left: 12, right: 12),
+      child: Column(
+        children: [
+          if (controller.error.isNotEmpty)
+            Text(
+              controller.error,
+              style: const TextStyle(color: Colors.orangeAccent),
+            ),
+          Expanded(
+            child: textures.isEmpty
+                ? Center(
+                    child: Text(
+                      tr('未选择显示器，请从显示器菜单添加'),
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  )
+                : LayoutBuilder(
+                    builder: (context, constraints) {
+                      final columns =
+                          textures.length > 1 && constraints.maxWidth >= 600
+                          ? 2
+                          : 1;
+                      final rows = (textures.length / columns).ceil();
+                      return GridView.count(
+                        crossAxisCount: columns,
+                        mainAxisSpacing: 8,
+                        crossAxisSpacing: 8,
+                        childAspectRatio:
+                            ((constraints.maxWidth - (columns - 1) * 8) /
+                                columns) /
+                            ((constraints.maxHeight / rows).clamp(
+                              180.0,
+                              double.infinity,
+                            )),
+                        children: [
+                          for (final texture in textures)
+                            _buildIndependentDisplay(texture),
+                        ],
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildIndependentDisplay(DisplayTexture texture) {
+    final stream = texture.stream;
+    final controller = _displayStreams!;
+    return DisplayStreamView(
+      key: ValueKey(stream.streamId),
+      texture: texture,
+      focused: controller.focused == stream.streamId,
+      onFocus: () => _focusDisplay(stream.streamId),
+      onClose: controller.busy
+          ? null
+          : () => unawaited(
+              _selectDisplayStreams([
+                for (final other in controller.state.streams)
+                  if (other.streamId != stream.streamId) other.displayIndex,
+              ], layout: _DisplayStreamLayout.grid),
+            ),
+      view: _buildDisplayRemoteView(texture),
+    );
+  }
+
+  Widget _buildDisplayRemoteView(DisplayTexture texture, {ViewFit? fit}) {
+    final stream = texture.stream;
+    return ListenableBuilder(
+      listenable: texture,
+      builder: (context, _) => RemoteView(
+        key: ValueKey('display-texture-${stream.streamId}'),
+        textureId: texture.textureId,
+        videoWidth: stream.width,
+        videoHeight: stream.height,
+        sourceWidth: stream.sourceWidth,
+        sourceHeight: stream.sourceHeight,
+        fit: fit ?? _fit,
+        captureInput: _inputActive,
+        hideCursor:
+            texture.pointer?.visible == true &&
+            texture.cursor != null &&
+            texture.cursorShape == texture.pointer?.shapeId,
+        overlayBuilder: (size) => displayCursorOverlay(texture, size),
+        onFocusRequested: () => _focusDisplay(stream.streamId),
+        onHover: (p, b) => _onPointerHover(p, b, display: stream),
+        onMove: (p, b) => _onPointerMove(p, b, display: stream),
+        onButton: (p, b, down) => _onPointerButton(p, b, down, display: stream),
+        onScroll: (p, d) => _onPointerScroll(p, d, display: stream),
+        onGesture: (p, zoom, x, y) =>
+            _onGesture(p, zoom, x, y, display: stream),
+        onDevicePointer: (e, p) => _onDevicePointer(e, p, display: stream),
+        onDeviceCancel: (e, p) => _onDeviceCancel(e, p, display: stream),
+      ),
+    );
+  }
+
+  Widget _buildSingleDisplayStream() {
+    final controller = _displayStreams!;
+    final texture =
+        controller.selected ??
+        (controller.textures.isEmpty ? null : controller.textures.first);
+    if (texture == null) {
+      return Center(
+        child: Text(
+          tr('未选择显示器，请从显示器菜单添加'),
+          style: const TextStyle(color: Colors.white70),
+        ),
+      );
+    }
+    return _buildDisplayRemoteView(texture);
+  }
+
+  Widget _buildDesktopDisplays() {
+    final controller = _displayStreams!;
+    final textures = controller.textures;
+    if (textures.isEmpty) {
+      return Center(
+        child: Text(
+          tr('未选择显示器，请从显示器菜单添加'),
+          style: const TextStyle(color: Colors.white70),
+        ),
+      );
+    }
+    int left = textures.first.stream.originX;
+    int top = textures.first.stream.originY;
+    int right = left + _streamSourceWidth(textures.first.stream);
+    int bottom = top + _streamSourceHeight(textures.first.stream);
+    for (final texture in textures.skip(1)) {
+      final stream = texture.stream;
+      left = math.min(left, stream.originX);
+      top = math.min(top, stream.originY);
+      right = math.max(right, stream.originX + _streamSourceWidth(stream));
+      bottom = math.max(bottom, stream.originY + _streamSourceHeight(stream));
+    }
+    final double desktopWidth = math.max(1, right - left).toDouble();
+    final double desktopHeight = math.max(1, bottom - top).toDouble();
+    return Padding(
+      padding: const EdgeInsets.only(top: 64),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final available = constraints.biggest;
+          final double scale = _fit == ViewFit.adaptive
+              ? math.min(
+                  available.width / desktopWidth,
+                  available.height / desktopHeight,
+                )
+              : 1.0;
+          final size = Size(desktopWidth * scale, desktopHeight * scale);
+          final canvas = SizedBox.fromSize(
+            size: size,
+            child: Stack(
+              clipBehavior: Clip.hardEdge,
+              children: [
+                for (final texture in textures)
+                  Positioned(
+                    left: (texture.stream.originX - left) * scale,
+                    top: (texture.stream.originY - top) * scale,
+                    width: _streamSourceWidth(texture.stream) * scale,
+                    height: _streamSourceHeight(texture.stream) * scale,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: controller.focused == texture.stream.streamId
+                              ? Colors.lightBlueAccent
+                              : Colors.black54,
+                        ),
+                      ),
+                      child: texture.stream.ready
+                          ? _buildDisplayRemoteView(
+                              texture,
+                              fit: ViewFit.adaptive,
+                            )
+                          : const ColoredBox(color: Color(0xff18191d)),
+                    ),
+                  ),
+              ],
+            ),
+          );
+          if (_fit == ViewFit.adaptive) return Center(child: canvas);
+          if (_inputActive) {
+            return ClipRect(
+              child: OverflowBox(
+                alignment: Alignment.topLeft,
+                minWidth: size.width,
+                maxWidth: size.width,
+                minHeight: size.height,
+                maxHeight: size.height,
+                child: canvas,
+              ),
+            );
+          }
+          return SingleChildScrollView(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: canvas,
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  int _streamSourceWidth(DisplayVideoStream stream) =>
+      stream.sourceWidth > 0 ? stream.sourceWidth : stream.width;
+
+  int _streamSourceHeight(DisplayVideoStream stream) =>
+      stream.sourceHeight > 0 ? stream.sourceHeight : stream.height;
+
+  /// Adds the display to this connection and opens a view of its existing
+  /// decoder. The runner shares the native session without connection secrets.
   Future<void> _openDisplayWindow(int display) async {
+    if (_openingDisplayWindow || !_status.isLive || _closing || _reconnecting) return;
+    _openingDisplayWindow = true;
     try {
-      final bool opened = await SessionWindowRequest(
-        target: widget.target,
-        account: widget.account,
-        settings: widget.settings,
-        sessionMode: 'desktop',
-        display: display,
-      ).open();
-      if (opened || !mounted) {
-        return;
+      final selected = _displayStreams?.state.streams.map((s) => s.displayIndex).toSet() ?? <int>{};
+      if (selected.isEmpty) {
+        final primary = _status.streamedDisplayIndex ?? _defaultDisplayIndex();
+        if (primary >= 0) selected.add(primary);
+      }
+      selected.add(display);
+      await _selectDisplayStreams(selected.toList(),
+          layout: _displayStreamLayout ?? _DisplayStreamLayout.single);
+      final controller = _displayStreams;
+      if (controller == null) return;
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (mounted && !_closing && !_reconnecting && controller == _displayStreams) {
+        await controller.refresh();
+        if (!mounted || _closing || _reconnecting || controller != _displayStreams) return;
+        final stream = controller.state.streams.where((s) => s.displayIndex == display).firstOrNull;
+        if (stream != null && await DisplayStreamBridge.openWindow(stream.streamId)) return;
+        if (!controller.busy || DateTime.now().isAfter(deadline)) break;
+        await Future<void>.delayed(const Duration(milliseconds: 100));
       }
     } on PlatformException {
-      if (!mounted) {
-        return;
-      }
+      // A stopped session or exhausted window limit is reported below.
+    } on MissingPluginException {
+      // Older runners do not support shared display windows.
+    } finally {
+      _openingDisplayWindow = false;
     }
+    if (!mounted || _closing || _reconnecting) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(tr('无法打开会话窗口'))),
-    );
+        SnackBar(content: Text(tr('无法打开会话窗口'))));
   }
 
   /// Fetches the mode list for the streamed output once the session is live.
@@ -2923,24 +3407,28 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     ViewerStreamCodec? codec,
     ViewerStreamQuality? quality,
     int? maxFps,
+    bool? fullColor,
   }) async {
-    final ViewerStreamCodec nextCodec = codec ?? _streamCodec;
+    final bool nextFullColor = fullColor ?? (codec != null && codec != ViewerStreamCodec.vp9 ? false : _streamFullColor);
+    final ViewerStreamCodec nextCodec = fullColor == true ? ViewerStreamCodec.vp9 : codec ?? _streamCodec;
     final ViewerStreamQuality nextQuality = quality ?? _streamQuality;
     final int nextFps = maxFps ?? _streamMaxFps;
     if (nextCodec == _streamCodec &&
         nextQuality == _streamQuality &&
-        nextFps == _streamMaxFps) {
+        nextFps == _streamMaxFps && nextFullColor == _streamFullColor) {
       return;
     }
     final _StreamOptionSnapshot previous = _StreamOptionSnapshot(
       _streamCodec,
       _streamQuality,
       _streamMaxFps,
+      _streamFullColor,
     );
     setState(() {
       _streamCodec = nextCodec;
       _streamQuality = nextQuality;
       _streamMaxFps = nextFps;
+      _streamFullColor = nextFullColor;
       _streamRollback = previous;
     });
     // Count the request before awaiting the platform reply: the host's answer
@@ -2952,6 +3440,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         codec: nextCodec.code,
         maxFps: nextFps,
         quality: nextQuality.code,
+        chroma: nextFullColor ? 1 : 0,
       );
     } on PlatformException {
       queued = false;
@@ -2970,6 +3459,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _streamCodec = previous.codec;
       _streamQuality = previous.quality;
       _streamMaxFps = previous.maxFps;
+      _streamFullColor = previous.fullColor;
       _streamRollback = null;
     });
     _saveStreamPreferences();
@@ -2985,6 +3475,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       StreamPreferences(
         codec: _streamCodec.code,
         quality: _streamQuality.code,
+        fullColor: _streamFullColor,
         maxFps: _streamMaxFps,
       ),
     );
@@ -3028,8 +3519,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       });
       return;
     }
-    final String saved =
-        await _trustStore.trust(widget.target.trustKey, fingerprint);
+    final String saved = await _trustStore.trust(
+      widget.target.trustKey,
+      fingerprint,
+    );
     if (!mounted) {
       return;
     }
@@ -3056,8 +3549,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (fresh.isEmpty || _reconnecting) {
       return;
     }
-    final String saved =
-        await _trustStore.trust(widget.target.trustKey, fresh);
+    final String saved = await _trustStore.trust(widget.target.trustKey, fresh);
     if (!mounted) {
       return;
     }
@@ -3215,7 +3707,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!seriesActive && !_sawFrame) {
       return;
     }
-    final Duration? delay = _autoPolicy.next();
+    _scheduleAutoReconnect(_autoPolicy.next());
+  }
+
+  void _scheduleAutoReconnect(Duration? delay) {
+    if (!mounted || _closing || _autoTimer != null) {
+      return;
+    }
     if (delay == null) {
       // The ladder is exhausted: fall back to the normal card, whose manual
       // reconnect starts a fresh series.
@@ -3233,7 +3731,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _reconnect({bool automatic = false}) async {
-    if (_reconnecting) {
+    if (_reconnecting || _closing) {
       return;
     }
     if (!automatic) {
@@ -3252,7 +3750,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _startError = null;
       _challengeDenial = 0;
     });
-    _pollTimer?.cancel();
+    _stopPolling();
     _hideTimer?.cancel();
     if (_controlEnabled) {
       // The session is about to be torn down; lift what this page still holds
@@ -3271,8 +3769,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Teardown fails queued uploads and an unfinished download; drain those
     // rows while the old audit reference and route are still current.
     await _reportCompletedFiles();
+    await _stopTunnel();
     _clearCursor();
-    if (!mounted) {
+    if (!mounted || _closing) {
       return;
     }
     setState(() {
@@ -3283,6 +3782,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _reconnecting = false;
       _controlEnabled = false;
       _pendingDisplay = null;
+      _serverDefaultDisplay = null;
       _wheelX = 0;
       _wheelY = 0;
       _heldButtons = 0;
@@ -3308,7 +3808,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _terminalFocus.unfocus();
     }
     _setKeyCapture(false);
-    _startPolling();
     _starting = _start();
     await _starting;
   }
@@ -3323,9 +3822,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _teardown = null;
     await _stopSession();
     await _reportCompletedFiles();
-    await _tunnel?.stop();
+    await _stopTunnel();
+  }
+
+  Future<void> _stopTunnel() async {
+    final TunnelAgent? previous = _tunnel;
     _tunnel = null;
     _tunnelStarting = null;
+    await previous?.stop();
   }
 
   /// The native window's close button. The session has to wind down before the
@@ -3388,7 +3892,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return KeyEventResult.ignored;
     }
     if (_inputActive) {
-      if (_nativeKeyCapture) {
+      if (_nativeKeyCapture || _keyboardMode == ViewerKeyboardMode.local) {
         // Native capture already enqueues keys. Caps/Num are deliberately
         // left local so Windows maintains the lock state used by the hook.
         return KeyEventResult.handled;
@@ -3409,7 +3913,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         _swallowEscapeChordUp = true;
         return KeyEventResult.handled;
       }
-      if (event is KeyDownEvent || event is KeyRepeatEvent || event is KeyUpEvent) {
+      if (event is KeyDownEvent ||
+          event is KeyRepeatEvent ||
+          event is KeyUpEvent) {
         // Flutter's usbHidUsage carries the usage page in the upper half
         // (0x00070004 for A); the protocol wants the page-0x07 id alone.
         final int raw = event.physicalKey.usbHidUsage;
@@ -3632,9 +4138,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           return;
         }
         for (final ViewerPortForwardRule rule in _portForwardRules.value) {
-          if (rule.ruleId == ruleId &&
-              rule.active &&
-              rule.localPort != 0) {
+          if (rule.ruleId == ruleId && rule.active && rule.localPort != 0) {
             _rdpLaunched = true;
             await _launchRdpClient(rule.localPort);
             return;
@@ -3649,9 +4153,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     } on PlatformException catch (failure) {
       if (mounted) {
-        _showRdpMessage(
-          failure.message ?? tr('RDP 转发未就绪：请确认主机允许端口转发'),
-        );
+        _showRdpMessage(failure.message ?? tr('RDP 转发未就绪：请确认主机允许端口转发'));
       }
     } on MissingPluginException {
       // The native viewer is going away; _start reports the real error.
@@ -3667,16 +4169,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       }
       _showRdpMessage(
-        tr('已启动远程桌面：127.0.0.1:{port}', <String, Object?>{
-          'port': localPort,
-        }),
+        tr('已启动远程桌面：127.0.0.1:{port}', <String, Object?>{'port': localPort}),
       );
     } on ProcessException catch (failure) {
       if (mounted) {
         _showRdpMessage(
-          tr('无法启动远程桌面：{error}', <String, Object?>{
-            'error': failure.message,
-          }),
+          tr('无法启动远程桌面：{error}', <String, Object?>{'error': failure.message}),
         );
       }
     }
@@ -4021,10 +4519,37 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _changeKeyboardMode(ViewerKeyboardMode mode) async {
+    if (_keyboardChanging || mode == _keyboardMode) return;
+    _keyboardChanging = true;
+    _releaseRemoteInput();
+    _setKeyCapture(false);
+    try {
+      await ViewerBridge.setKeyboardMode(mode);
+      if (!mounted || _closing) return;
+      setState(() => _keyboardMode = mode);
+      _saveViewPreferences();
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message ?? tr('无法切换键盘模式'))));
+      }
+    } finally {
+      _keyboardChanging = false;
+      if (mounted && !_closing) {
+        _focus.requestFocus();
+        _setKeyCapture(_inputActive);
+      }
+    }
+  }
+
   void _setKeyCapture(bool enable) {
     final AppLifecycleState? lifecycle = WidgetsBinding.instance.lifecycleState;
-    final bool wanted = enable && _focus.hasPrimaryFocus &&
-        !_chatTyping && !_terminalTyping &&
+    final bool wanted =
+        enable &&
+        _focus.hasPrimaryFocus &&
+        !_chatTyping &&
+        !_terminalTyping &&
         (lifecycle == null || lifecycle == AppLifecycleState.resumed);
     if (!wanted) {
       _disableRelativeMouse();
@@ -4037,6 +4562,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Future<void> _updateKeyCapture(bool enable, int generation) async {
     bool captured = false;
     try {
+      if (enable) await ViewerBridge.setKeyboardMode(_keyboardMode);
+      if (!mounted || generation != _keyCaptureGeneration) return;
       captured = await ViewerBridge.setKeyCapture(enable);
     } on PlatformException {
       // Keep the Flutter path when native capture is unavailable.
@@ -4045,6 +4572,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     if (mounted && generation == _keyCaptureGeneration) {
       _nativeKeyCapture = enable && captured;
+      if (enable && _keyboardMode == ViewerKeyboardMode.local && !captured) {
+        if (!_localKeyboardUnavailable) {
+          _localKeyboardUnavailable = true;
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(tr('本地输入法未启用，请重新聚焦画面或切换物理按键')),
+          ));
+        }
+      } else if (captured || _keyboardMode == ViewerKeyboardMode.physical) {
+        _localKeyboardUnavailable = false;
+      }
     }
   }
 
@@ -4220,8 +4757,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _sendKey(int usage, bool down) {
     return _guardSend(
-      ViewerBridge.sendKey(usage: usage, down: down, modifiers: _inputState(),
-          physical: true),
+      ViewerBridge.sendKey(
+        usage: usage,
+        down: down,
+        modifiers: _inputState(),
+        physical: true,
+      ),
     );
   }
 
@@ -4238,7 +4779,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// down and up, then the modifiers up in reverse order. Every event carries
   /// the bitmap at that instant, matching a physical chord on the host.
   Future<void> _sendChord(List<int> modifierUsages, int keyUsage) async {
-    final int modifiers = await ViewerBridge.keyboardState(fallback: _inputState());
+    final int modifiers = await ViewerBridge.keyboardState(
+      fallback: _inputState(),
+    );
     for (final RemoteKeyEvent event in buildRemoteChord(
       modifierUsages,
       keyUsage,
@@ -4251,7 +4794,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// Win is itself a modifier, so a tap clears its bit before the key-up event
   /// rather than sending a second, duplicate down.
   Future<void> _sendWinTap() async {
-    final int modifiers = await ViewerBridge.keyboardState(fallback: _inputState());
+    final int modifiers = await ViewerBridge.keyboardState(
+      fallback: _inputState(),
+    );
     for (final RemoteKeyEvent event in buildRemoteWinTap(
       modifiers,
       ViewerModifier.leftGui,
@@ -4325,33 +4870,54 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   int get _sourceHeight =>
       _status.sourceHeight > 0 ? _status.sourceHeight : _status.height;
 
-  (int, int) _desktopPoint(Offset frame) => frameToDesktop(
-    frame,
-    originX: _status.originX,
-    originY: _status.originY,
-    width: _sourceWidth,
-    height: _sourceHeight,
-  );
+  (int, int) _desktopPoint(Offset frame, [DisplayVideoStream? display]) =>
+      frameToDesktop(
+        frame,
+        originX: display?.originX ?? _status.originX,
+        originY: display?.originY ?? _status.originY,
+        width: display == null
+            ? _sourceWidth
+            : (display.sourceWidth > 0 ? display.sourceWidth : display.width),
+        height: display == null
+            ? _sourceHeight
+            : (display.sourceHeight > 0
+                  ? display.sourceHeight
+                  : display.height),
+      );
 
-  void _onPointerHover(Offset frame, int buttons) {
+  void _onPointerHover(
+    Offset frame,
+    int buttons, {
+    DisplayVideoStream? display,
+  }) {
     if (_relativeMouse) {
       // Native capture already reported the motion; an absolute move would
       // drag the host pointer back to the pinned local position.
       return;
     }
-    final (int x, int y) = _desktopPoint(frame);
+    final (int x, int y) = _desktopPoint(frame, display);
     _sendMouse(ViewerMouse.move, buttons: _mouse.buttons(buttons), x: x, y: y);
   }
 
-  void _onPointerMove(Offset frame, int buttons) {
+  void _onPointerMove(
+    Offset frame,
+    int buttons, {
+    DisplayVideoStream? display,
+  }) {
     if (_relativeMouse) {
       return;
     }
-    final (int x, int y) = _desktopPoint(frame);
+    final (int x, int y) = _desktopPoint(frame, display);
     _sendMouse(ViewerMouse.move, buttons: _mouse.buttons(buttons), x: x, y: y);
   }
 
-  void _onPointerButton(Offset frame, int button, bool down) {
+  void _onPointerButton(
+    Offset frame,
+    int button,
+    bool down, {
+    DisplayVideoStream? display,
+  }) {
+    if (display != null) _onPointerMove(frame, _heldButtons, display: display);
     if (down) {
       _heldButtons |= button;
       final int remote = _mouse.buttons(button);
@@ -4359,12 +4925,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _sendMouse(ViewerMouse.buttonDown, buttons: remote);
     } else {
       _heldButtons &= ~button;
-      final int remote = _remoteButtons.remove(button) ?? _mouse.buttons(button);
+      final int remote =
+          _remoteButtons.remove(button) ?? _mouse.buttons(button);
       _sendMouse(ViewerMouse.buttonUp, buttons: remote);
     }
   }
 
-  void _onPointerScroll(Offset frame, Offset delta) {
+  void _onPointerScroll(
+    Offset frame,
+    Offset delta, {
+    DisplayVideoStream? display,
+  }) {
+    if (display != null) _onPointerMove(frame, _heldButtons, display: display);
     _wheelY += delta.dy;
     _wheelX += delta.dx;
     final int stepsY = (_wheelY / kViewerScrollPixelsPerNotch)
@@ -4393,7 +4965,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  void _onGesture(Offset frame, bool zoom, int deltaX, int deltaY) {
+  void _onGesture(
+    Offset frame,
+    bool zoom,
+    int deltaX,
+    int deltaY, {
+    DisplayVideoStream? display,
+  }) {
+    if (display != null) _onPointerMove(frame, _heldButtons, display: display);
     unawaited(
       _guardSend(
         ViewerBridge.sendGesture(
@@ -4406,8 +4985,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     );
   }
 
-  void _onDevicePointer(PointerEvent event, Offset frame) {
-    final (int x, int y) = _desktopPoint(frame);
+  void _onDevicePointer(
+    PointerEvent event,
+    Offset frame, {
+    DisplayVideoStream? display,
+  }) {
+    final (int x, int y) = _desktopPoint(frame, display);
     if (event.kind == PointerDeviceKind.touch) {
       _handleTouchPointer(event, x, y);
     } else {
@@ -4415,8 +4998,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  void _onDeviceCancel(PointerEvent event, Offset frame) {
-    final (int x, int y) = _desktopPoint(frame);
+  void _onDeviceCancel(
+    PointerEvent event,
+    Offset frame, {
+    DisplayVideoStream? display,
+  }) {
+    final (int x, int y) = _desktopPoint(frame, display);
     if (event.kind == PointerDeviceKind.touch) {
       _handleTouchPointer(event, x, y);
     } else {
@@ -4478,7 +5065,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       event.pressureMax,
     );
     final int flags = windowsPenFlags(event.kind, event.buttons);
-    final (int tiltX, int tiltY) = windowsPenTilt(event.tilt, event.orientation);
+    final (int tiltX, int tiltY) = windowsPenTilt(
+      event.tilt,
+      event.orientation,
+    );
     void send(int action) => _sendPen(
       action,
       x: x,
@@ -4613,7 +5203,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_status.controlOnly || controlMode != 'desktop') {
       return _buildControlOnly(controlMode);
     }
-    final bool hasFrame = _status.hasFrame;
+    final bool hasFrame = _status.hasFrame || _independentDisplays;
     final bool showOverlay = _startError != null || _status.isOver;
 
     return PopScope(
@@ -4635,7 +5225,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             child: Stack(
               fit: StackFit.expand,
               children: <Widget>[
-                if (hasFrame && _textureId >= 0)
+                if (_independentDisplays)
+                  switch (_displayStreamLayout) {
+                    _DisplayStreamLayout.desktop => _buildDesktopDisplays(),
+                    _DisplayStreamLayout.single => _buildSingleDisplayStream(),
+                    _ => _buildIndependentDisplays(),
+                  }
+                else if (hasFrame && _textureId >= 0)
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onDoubleTap: _inputActive ? null : _toggleFullscreen,
@@ -4647,7 +5243,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       sourceHeight: _status.sourceHeight,
                       fit: _fit,
                       captureInput: _inputActive,
-                      hideCursor: _inputActive && (_cursorInstalled || _relativeMouse),
+                      hideCursor:
+                          _inputActive && (_cursorInstalled || _relativeMouse),
                       onScaleChanged: _onViewScale,
                       onHover: _inputActive ? _onPointerHover : null,
                       onMove: _inputActive ? _onPointerMove : null,
@@ -4683,6 +5280,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         inputAvailable: _status.acceptsInput,
                         clipboardEnabled: _clipboardSync,
                         clipboardAvailable: _status.acceptsClipboard,
+                        clipboardDirection: _status.clipboardDirection,
                         fileAvailable: _status.acceptsFiles,
                         fileActive: _status.fileActive,
                         audioAvailable: _status.acceptsAudio,
@@ -4707,6 +5305,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         osLoginAvailable: _status.acceptsOsLogin,
                         onOsLogin: () => unawaited(_openOsLoginDialog()),
                         sessionSelectAvailable: _status.acceptsSessionSelect,
+                        elevationAvailable:
+                            _status.elevationAvailable && !_elevationSubmitting,
+                        elevationPending:
+                            _status.elevationPending || _elevationSubmitting,
+                        elevated: _status.elevationCode == 2,
+                        onElevation: () => unawaited(_requestElevation()),
                         onSessionSelect: () => unawaited(_openSessionDialog()),
                         remoteConfigAvailable: _status.remoteConfigSupported,
                         onRemoteConfig: () =>
@@ -4725,6 +5329,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_openPortForwardDialog()),
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
+                        independentDisplays: _independentDisplays,
+                        onIndependentDisplays: _status.isLive
+                            ? () => unawaited(
+                                _selectDisplayStreams(
+                                  _status.displays.map((d) => d.index).toList(),
+                                  layout: _DisplayStreamLayout.grid,
+                                  reconnectDisplay: kViewerDisplayAuto,
+                                ),
+                              )
+                            : null,
                         followCursor: _followCursor,
                         followWindow: _followWindow,
                         onToggleFollowCursor: _toggleFollowCursor,
@@ -4742,11 +5356,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             ? _status.displayModes
                             : const <ViewerDisplayMode>[],
                         modeChangeAvailable:
-                            _status.acceptsInput && !_status.mergedLayout,
+                            _status.acceptsInput &&
+                            !_status.mergedLayout &&
+                            !_independentDisplays,
                         onSelectMode: (ViewerDisplayMode mode) =>
                             unawaited(_changeDisplayMode(mode)),
                         streamOptionsAvailable: _status.isLive,
                         streamCodec: _streamCodec,
+                        streamFullColor: _streamFullColor,
+                        streamActualFormat: "${_status.codec.toUpperCase()} · ${_status.chroma == 1 ? '4:4:4' : '4:2:0'}",
+                        onSelectStreamFullColor: (value) => unawaited(_changeStreamOptions(fullColor: value)),
                         streamQuality: _streamQuality,
                         streamMaxFps: _streamMaxFps,
                         onSelectStreamCodec: (ViewerStreamCodec codec) =>
@@ -4756,17 +5375,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onSelectStreamFps: (int fps) =>
                             unawaited(_changeStreamOptions(maxFps: fps)),
                         onToggleControl: _toggleControl,
+                        keyboardMode: _keyboardMode,
+                        onKeyboardMode: (mode) => unawaited(_changeKeyboardMode(mode)),
                         reverseWheel: _mouse.reverseWheel,
                         swapButtons: _mouse.swapButtons,
                         onToggleReverseWheel: _toggleReverseWheel,
                         onToggleSwapButtons: _toggleSwapButtons,
                         relativeMouse: _relativeMouse,
-                        onToggleRelativeMouse: _toggleRelativeMouse,
+                        onToggleRelativeMouse: _independentDisplays
+                            ? null
+                            : _toggleRelativeMouse,
                         specialKeysAvailable: _inputActive,
                         onSpecialAction: (RemoteSpecialAction action) =>
                             unawaited(_sendSpecialAction(action)),
                         onSendText: () => unawaited(_openSendTextDialog()),
-                        screenshotAvailable: _status.hasFrame,
+                        screenshotAvailable: _independentDisplays
+                            ? _displayStreams?.selected?.stream.ready == true
+                            : _status.hasFrame,
                         onScreenshot: _takeScreenshot,
                         onToggleClipboard: _toggleClipboardSync,
                         onSendFile: () => unawaited(_sendFile()),
@@ -4792,15 +5417,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         displayControlCount: _status.displayControlCount,
                         displayControlPrivacy: _status.displayControlPrivacy,
                         onControlDisplays: _controlDisplays,
-                        displayControlOutputs:
-                            _status.displayControlOutputs,
+                        displayControlOutputs: _status.displayControlOutputs,
                         onToggleVirtualDisplay: (int target, bool enabled) =>
                             unawaited(
-                              _controlDisplays(4, enabled ? 1 : 0, target: target),
+                              _controlDisplays(
+                                4,
+                                enabled ? 1 : 0,
+                                target: target,
+                              ),
                             ),
                         onTogglePrivacy: () => unawaited(_togglePrivacy()),
                         recordingAvailable:
-                            _status.acceptsRecording || _status.recording,
+                            (_status.acceptsRecording &&
+                                (!_independentDisplays ||
+                                    _displayStreams?.selected?.stream.ready ==
+                                        true)) ||
+                            _status.recording,
                         recordingDenied:
                             _status.isLive && !_status.acceptsRecording,
                         recording: _status.recording,
@@ -4874,7 +5506,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             color: Colors.black.withValues(alpha: 0.68),
                             borderRadius: BorderRadius.circular(6),
                             border: Border.all(
-                              color: Colors.orangeAccent.withValues(alpha: 0.45),
+                              color: Colors.orangeAccent.withValues(
+                                alpha: 0.45,
+                              ),
                             ),
                           ),
                           child: Row(
@@ -4970,12 +5604,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         children: <Widget>[
                           if (_status.privacyEnabled)
                             _statusBadge(Icons.shield_rounded, tr('隐私模式')),
-                          if (_status.privacyEnabled && _status.blockInputActive)
+                          if (_status.privacyEnabled &&
+                              _status.blockInputActive)
                             const SizedBox(height: 6),
                           if (_status.blockInputActive)
                             _statusBadge(
-                                Icons.pause_circle_rounded, tr('主机输入已阻止')),
-                          if ((_status.privacyEnabled || _status.blockInputActive) &&
+                              Icons.pause_circle_rounded,
+                              tr('主机输入已阻止'),
+                            ),
+                          if ((_status.privacyEnabled ||
+                                  _status.blockInputActive) &&
                               _status.acceptsAudio &&
                               _status.audioMuted)
                             const SizedBox(height: 6),
@@ -5408,9 +6046,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return _buildControlNote(
         icon: Icons.alt_route_rounded,
         title: tr('端口转发'),
-        detail: tr(
-          '本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。本地端口填 0 由系统分配。',
-        ),
+        detail: tr('本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。本地端口填 0 由系统分配。'),
         actionLabel: tr('配置端口转发'),
         onAction: () => unawaited(_openPortForwardDialog()),
       );
@@ -5830,7 +6466,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               Text(
                 tr('正在自动重连（第 {p24}/{p25} 次）', <String, Object?>{
                   'p24': _autoPolicy.attempt,
-                  'p25': AutoReconnectPolicy.limit,
+                  'p25': _autoPolicy.attemptLimit,
                 }),
                 style: const TextStyle(color: Colors.white54, fontSize: 12.5),
               ),
@@ -6270,11 +6906,12 @@ String _formatBytes(int bytes) {
 /// What the picture menu showed before an optimistic change, so a refused
 /// request can put it back.
 class _StreamOptionSnapshot {
-  const _StreamOptionSnapshot(this.codec, this.quality, this.maxFps);
+  const _StreamOptionSnapshot(this.codec, this.quality, this.maxFps, this.fullColor);
 
   final ViewerStreamCodec codec;
   final ViewerStreamQuality quality;
   final int maxFps;
+  final bool fullColor;
 }
 
 ViewerStreamQuality _streamQualityFor(int code) {
@@ -6722,9 +7359,7 @@ class _RemoteConfigDialogState extends State<_RemoteConfigDialog> {
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
-                  tr('修改未生效：{reason}', <String, Object?>{
-                    'reason': _error!,
-                  }),
+                  tr('修改未生效：{reason}', <String, Object?>{'reason': _error!}),
                   style: const TextStyle(fontSize: 12, color: Colors.redAccent),
                 ),
               ),
@@ -6864,9 +7499,7 @@ class _SessionPickerDialogState extends State<_SessionPickerDialog> {
       final String detail = _status.sessionListError.isNotEmpty
           ? _status.sessionListError
           : _sessionListCodeText(_status.sessionListCode);
-      body = Text(
-        tr('读取会话列表失败：{detail}', <String, Object?>{'detail': detail}),
-      );
+      body = Text(tr('读取会话列表失败：{detail}', <String, Object?>{'detail': detail}));
     } else if (sessions.isEmpty) {
       body = Text(tr('主机上没有可切换的已登录会话。'));
     } else {
@@ -6889,8 +7522,7 @@ class _SessionPickerDialogState extends State<_SessionPickerDialog> {
                     leading: const Icon(Icons.desktop_windows_outlined),
                     title: Text(session.label),
                     subtitle: session.current ? Text(tr('当前会话')) : null,
-                    enabled:
-                        !_selecting && session.active && !session.current,
+                    enabled: !_selecting && session.active && !session.current,
                     onTap: () => unawaited(_select(session)),
                   ),
               ],

@@ -595,6 +595,34 @@ void test_service_mode() {
     result = security.evaluate(hello, "127.0.0.1:8000", 1003);
     check(result.decision == Decision::Allow && result.via_token,
           "the service accepts an explicitly enabled token");
+
+    config.service_approval = true;
+    config.password_hash.clear();
+    config.token_auth = false;
+    security.set_config(config);
+    hello = hello_with("");
+    result = security.evaluate(hello, "127.0.0.1:8000", 1004);
+    check(security.config().mode == chast::HostAuthMode::Click && result.decision == Decision::RequireApproval,
+          "an authenticated service approval channel preserves Click without a permanent password");
+    check(!security.has_temporary_password(), "service approval never enables temporary passwords");
+    config.mode = chast::HostAuthMode::Both;
+    config.password_hash = test_password_hash();
+    security.set_config(config);
+    result = security.evaluate(hello, "127.0.0.1:8000", 1005);
+    check(result.decision == Decision::RequireApproval, "service Both without a supplied password requires approval");
+    hello.password = "incorrect-password";
+    result = security.evaluate(hello, "127.0.0.1:8000", 1006);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::WrongPassword,
+          "service approval does not bypass an incorrect supplied password");
+    hello.password = test_password();
+    result = security.evaluate(hello, "127.0.0.1:8000", 1007);
+    check(result.decision == Decision::Allow, "service Both keeps authenticated unattended access");
+    config.mode = chast::HostAuthMode::Password;
+    config.password_hash.clear();
+    security.set_config(config);
+    result = security.evaluate(hello, "127.0.0.1:8000", 1008);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::PasswordRequired,
+          "service Password still refuses all connections without its permanent password");
 }
 
 void test_password_and_permissions() {

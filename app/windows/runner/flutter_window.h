@@ -13,9 +13,13 @@
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
  public:
+  using OpenDisplayWindow = std::function<bool(std::shared_ptr<chast_viewer::SharedViewerSession>, uint32_t)>;
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project,
-                         std::function<bool(const std::string&)> open_window = {});
+                         std::function<bool(const std::string&)> open_window = {},
+                         OpenDisplayWindow open_display = {},
+                         std::shared_ptr<chast_viewer::SharedViewerSession> session = {},
+                         std::optional<uint32_t> stream = {});
   virtual ~FlutterWindow();
 
  protected:
@@ -31,6 +35,9 @@ class FlutterWindow : public Win32Window {
 
   // Runner hook that starts another session window.
   std::function<bool(const std::string&)> open_window_;
+  OpenDisplayWindow open_display_;
+  std::shared_ptr<chast_viewer::SharedViewerSession> session_;
+  std::optional<uint32_t> stream_;
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;

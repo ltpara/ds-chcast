@@ -8,11 +8,11 @@
 // paste target can pick the richest one it understands.
 //
 // A copied file list (CF_HDROP) travels as FileList: the list of names, sizes
-// and folder layout crosses the clipboard stream, and the bytes follow through
-// the file transfer channel when the receiver asks for them. Copied folders
-// are flattened into one entry per file; the receiver rebuilds the tree from
-// each entry's rel_path. Protocol v33 ships host -> viewer, v34 adds the
-// reverse direction with clipboard-marked FileOffers.
+// and folder layout crosses the clipboard stream. v59 publishes virtual files
+// and requests byte ranges when the paste target reads an IStream. Copied folders
+// are flattened into regular files and empty directory leaves; the receiver
+// rebuilds the tree from each entry's rel_path. Directory entries (v58) have
+// no data stream. Legacy staged-file hooks retain the v33/v34 transfer path.
 //
 // The content model and container codec are platform independent; the
 // read_clipboard()/write_clipboard() functions at the bottom are the Win32
@@ -45,10 +45,10 @@ inline constexpr uint32_t kMaxClipboardFileListBytes = 64u * 1024u;
 inline constexpr uint16_t kMaxClipboardFileEntries = 256;
 
 inline constexpr char kClipboardStreamMagic[4] = {'C', 'C', 'L', 'B'};
-inline constexpr uint8_t kClipboardStreamVersion = 1;
+inline constexpr uint8_t kClipboardStreamVersion = 2;
 // magic (4) + version (1) + format count (1) + reserved (2) + hash (8) +
-// total payload length (8).
-inline constexpr size_t kClipboardStreamHeaderSize = 24;
+// total payload length (8) + sender generation (8, v59).
+inline constexpr size_t kClipboardStreamHeaderSize = 32;
 // Per entry: format (1) + reserved (1) + reserved (2) + length (4).
 inline constexpr size_t kClipboardEntryHeaderSize = 8;
 
@@ -58,7 +58,7 @@ struct ClipboardFormatData {
 };
 
 struct ClipboardContent {
-    // Diagnostic counter from the sender. The stream already preserves order.
+    // Sender generation (v59), binding delayed file reads to one copied item.
     uint64_t seq = 0;
     // Filled in by encode/decode; 0 in a freshly read local clipboard.
     uint64_t hash = 0;
@@ -70,7 +70,7 @@ struct ClipboardContent {
     std::string text() const;
 };
 
-// One regular file in a FileList item. `rel_path` is the file's '/'-separated
+// One regular file or directory in a FileList item. `rel_path` is its '/'-separated
 // place inside the copied tree, empty for a flat list. A sender that stages
 // the copies first fills it with the staging path; receivers join it under
 // their own staging root and must never treat it as a host path.
@@ -78,10 +78,11 @@ struct ClipboardFileEntry {
     std::string name;  // UTF-8 base name, no separators
     uint64_t size = 0;
     std::string rel_path;  // '/'-separated relative path, may be empty
+    bool directory = false;  // v58; size must be zero, never offered as a file
 };
 
 // FileList payload: u16 count, then per entry u16 name length, u16 flags
-// (bit0 rel_path present), u16 rel length, u16 reserved, u64 size, name and
+// (bit0 rel_path present, bit1 directory), u16 rel length, u16 reserved, u64 size, name and
 // rel_path bytes. Returns empty when the list is invalid.
 std::vector<uint8_t> encode_clipboard_file_list(const std::vector<ClipboardFileEntry>& files);
 bool decode_clipboard_file_list(const std::vector<uint8_t>& payload,
@@ -96,11 +97,11 @@ bool valid_clipboard_rel_path(const std::string& path);
 uint64_t clipboard_file_identity_hash(const std::vector<ClipboardFileEntry>& files);
 
 // Expands top-level CF_HDROP paths (files and folders) into the FileList
-// model: one entry per regular file, copied folders flattened with a rel_path
+// model: one entry per regular file or empty directory leaf, with a rel_path
 // of "<folder>/<sub…>/<name>". `entries` and `paths` stay parallel, and the
 // result is sorted by (rel_path, name) so both sides hash the same list no
-// matter how the filesystem enumerated it. Reparse points and unreadable
-// entries are skipped; more than kMaxClipboardFileEntries files, a tree
+// matter how the filesystem enumerated it. Reparse points are skipped;
+// unreadable entries, more than kMaxClipboardFileEntries entries, a tree
 // deeper than 16 levels or an unreadable subtree refuses the whole list,
 // clears both outputs and fills `error`.
 bool collect_clipboard_files(const std::vector<std::string>& top_level_paths,

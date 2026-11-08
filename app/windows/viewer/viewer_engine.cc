@@ -20,6 +20,7 @@
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/clipboard_worker.h"
+#include "chast/clipboard_channel.h"
 #include "chast/decoder.h"
 #include "chast/file_transfer.h"
 #include "chast/identity.h"
@@ -164,6 +165,8 @@ std::string codec_name(chast::VideoCodec codec) {
             return "H.264";
         case chast::VideoCodec::Hevc:
             return "HEVC";
+        case chast::VideoCodec::Vp9:
+            return "VP9";
         case chast::VideoCodec::Av1:
             return "AV1";
     }
@@ -417,8 +420,9 @@ constexpr size_t kMaxCompletedFiles = 512;
 
 }  // namespace
 
-ViewerEngine::ViewerEngine(FrameSink* sink, FrameSink* camera_sink)
-    : sink_(sink), camera_sink_(camera_sink) {}
+ViewerEngine::ViewerEngine(FrameSink* sink, FrameSink* camera_sink,
+                           DisplayVideoReceiver::DecoderFactory decoder_factory)
+    : sink_(sink), camera_sink_(camera_sink), decoder_factory_(std::move(decoder_factory)) {}
 
 ViewerEngine::~ViewerEngine() {
     Stop();
@@ -480,6 +484,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = ViewerStatus{};
+        pending_elevation_.store(0);
         status_.host = host;
         status_.port = port;
         status_.state = ViewerState::kConnecting;
@@ -506,11 +511,17 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     {
         std::lock_guard<std::mutex> lock(cursor_mutex_);
         pending_cursor_.reset();
+        pending_display_cursors_.clear();
         cursor_updates_ = 0;
     }
     {
         std::lock_guard<std::mutex> lock(switch_mutex_);
         pending_switch_.reset();
+    }
+    {
+        std::lock_guard lock(displays_mutex_);
+        pending_displays_.clear();
+        pending_display_sinks_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(mode_mutex_);
@@ -531,6 +542,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(browse_mutex_);
         pending_browse_.clear();
         browse_paths_.clear();
+        latest_list_request_.reset();
         newest_file_list_.reset();
         next_browse_id_ = 1;
     }
@@ -575,7 +587,6 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(chat_mutex_);
         pending_chat_.clear();
         received_chat_.clear();
-        pending_text_.clear();
     }
     // Consoles belong to one session too; neither their commands nor their
     // unread output may leak into the next connection.
@@ -596,6 +607,11 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     microphone_wanted_.store(false, std::memory_order_relaxed);
     voice_wanted_.store(false, std::memory_order_relaxed);
     record_wanted_.store(false, std::memory_order_relaxed);
+    { std::lock_guard lock(record_mutex_); record_stream_.reset(); pending_record_keyframe_.reset(); }
+    {
+        std::lock_guard lock(screenshot_mutex_);
+        pending_screenshot_.reset(); pending_screenshot_stream_.reset();
+    }
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
@@ -658,13 +674,55 @@ bool ViewerEngine::ReleaseInput() {
     return true;
 }
 
+bool ViewerEngine::CaptureDisplays(chast::CaptureDisplaysRequest request) {
+    if (!running_.load(std::memory_order_acquire) || chast::make_capture_displays(request).empty()) return false;
+    {
+        std::lock_guard lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || status_.control_only) return false;
+    }
+    std::lock_guard lock(displays_mutex_);
+    if (pending_displays_.size() >= 32) return false;
+    pending_displays_.push_back(std::move(request));
+    return true;
+}
+
+bool ViewerEngine::BindDisplay(uint32_t id, std::shared_ptr<FrameSink> sink) {
+    if (!running_.load(std::memory_order_acquire)) return false;
+    {
+        std::lock_guard lock(mutex_);
+        if (!status_.multiple_displays || std::none_of(status_.display_streams.begin(), status_.display_streams.end(),
+                [id](const auto& entry) { return entry.stream.stream_id == id; })) return false;
+    }
+    std::lock_guard lock(displays_mutex_);
+    pending_display_sinks_[id] = std::move(sink);
+    return true;
+}
+
+bool ViewerEngine::TakeDisplayCursor(chast::DisplayCursorUpdate& update) {
+    std::lock_guard lock(cursor_mutex_);
+    if (pending_display_cursors_.empty()) return false;
+    auto it = pending_display_cursors_.begin();
+    update.stream_id = it->first; update.cursor = std::move(it->second);
+    pending_display_cursors_.erase(it);
+    return true;
+}
+
+bool ViewerEngine::FocusDisplay(uint32_t id) {
+    std::lock_guard lock(mutex_);
+    if (!running_.load() || !status_.multiple_displays ||
+        std::none_of(status_.display_streams.begin(), status_.display_streams.end(),
+            [id](const auto& stream) { return stream.stream.stream_id == id; })) return false;
+    status_.focused_display = id;
+    return true;
+}
+
 bool ViewerEngine::SwitchDisplay(uint16_t display) {
     if (!running_.load(std::memory_order_acquire)) {
         return false;
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+        if (status_.state != ViewerState::kStreaming) {
             return false;
         }
         if (display != chast::kDisplayAuto && display != chast::kDisplayAll &&
@@ -744,14 +802,15 @@ bool ViewerEngine::SetDisplayFollow(bool cursor, bool window) {
 }
 
 bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
-                                    chast::StreamQuality quality) {
-    if (!running_.load(std::memory_order_acquire) || max_fps > chast::kMaxStreamFps) {
+                                    chast::StreamQuality quality, chast::VideoChroma chroma) {
+    if (!running_.load(std::memory_order_acquire) || max_fps > chast::kMaxStreamFps || static_cast<unsigned>(chroma) > 1) {
         return false;
     }
     switch (codec) {
         case chast::StreamCodecPreference::Auto:
         case chast::StreamCodecPreference::H264:
         case chast::StreamCodecPreference::Hevc:
+        case chast::StreamCodecPreference::Vp9:
         case chast::StreamCodecPreference::Av1:
             break;
         default:
@@ -767,6 +826,7 @@ bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t
     }
     chast::StreamOptions options;
     options.codec = codec;
+    options.chroma = chroma;
     options.max_fps = max_fps;
     options.quality = quality;
     std::lock_guard<std::mutex> lock(stream_option_mutex_);
@@ -802,6 +862,12 @@ void ViewerEngine::SetClipboardFileSource(
     std::function<bool(std::vector<std::string>&)> source) {
     std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
     clipboard_file_source_ = std::move(source);
+}
+
+void ViewerEngine::SetClipboardVirtualSink(
+    std::function<bool(std::shared_ptr<chast::ClipboardVirtualFiles>)> sink) {
+    std::lock_guard lock(clipboard_sink_mutex_);
+    clipboard_virtual_sink_ = std::move(sink);
 }
 
 bool ViewerEngine::SendFiles(const std::vector<std::string>& paths,
@@ -852,9 +918,9 @@ constexpr size_t kMaxFolderWalkDepth = 64;
 
 }  // namespace
 
-bool ViewerEngine::RequestFileList(std::string directory) {
+bool ViewerEngine::RequestFileList(std::string directory, std::string cursor) {
     if (!running_.load(std::memory_order_acquire) ||
-        (!directory.empty() && !chast::valid_file_browser_path(directory))) {
+        !chast::valid_file_browser_path(directory) || !chast::valid_file_list_cursor(cursor)) {
         return false;
     }
     {
@@ -871,7 +937,9 @@ bool ViewerEngine::RequestFileList(std::string directory) {
     BrowseCommand command;
     command.request_id = next_browse_id_++;
     command.path = std::move(directory);
-    browse_paths_[command.request_id] = command.path;
+    command.cursor = std::move(cursor);
+    latest_list_request_ = chast::FileListRequest{command.request_id, command.path, command.cursor};
+    newest_file_list_.reset();
     pending_browse_.push_back(std::move(command));
     return true;
 }
@@ -1261,6 +1329,7 @@ bool ViewerEngine::SetAudioMuted(bool mute) {
 }
 
 bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
+    std::optional<uint32_t> target;
     if (enabled) {
         std::lock_guard<std::mutex> lock(mutex_);
         // The host grants recording explicitly; the stream itself is always
@@ -1271,27 +1340,37 @@ bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
             (status_.permissions & chast::kPermissionRecord) == 0) {
             return false;
         }
+        target = status_.focused_display;
+        if (status_.multiple_displays && !target) return false;
     }
-    if (!directory.empty()) {
+    if (!record_wanted_.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lock(record_mutex_);
-        record_dir_ = std::move(directory);
+        record_stream_ = target;
+        if (!directory.empty()) record_dir_ = std::move(directory);
     }
     const bool was_wanted = record_wanted_.exchange(enabled, std::memory_order_relaxed);
     if (enabled && !was_wanted) {
-        keyframe_wanted_.store(true, std::memory_order_relaxed);
+        if (target) {
+            std::lock_guard lock(record_mutex_);
+            pending_record_keyframe_ = target;
+        } else keyframe_wanted_.store(true, std::memory_order_relaxed);
     }
     return true;
 }
 
 bool ViewerEngine::SaveScreenshot(std::string directory) {
+    std::optional<uint32_t> target;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (status_.state != ViewerState::kStreaming || status_.control_only) {
             return false;
         }
+        target = status_.focused_display;
+        if (status_.multiple_displays && !target) return false;
     }
     std::lock_guard<std::mutex> lock(screenshot_mutex_);
     pending_screenshot_ = std::move(directory);
+    pending_screenshot_stream_ = target;
     return true;
 }
 
@@ -1315,14 +1394,18 @@ void ViewerEngine::ProcessScreenshot() {
         return;
     }
 
+    SaveScreenshotFromSink(sink_, *directory);
+}
+
+void ViewerEngine::SaveScreenshotFromSink(FrameSink* sink, const std::string& directory) {
     std::string error;
     std::string path;
     std::vector<uint8_t> bgra;
     uint32_t width = 0;
     uint32_t height = 0;
-    if (sink_ == nullptr) {
+    if (sink == nullptr) {
         error = "the session has no picture sink";
-    } else if (!sink_->CaptureBgra(bgra, width, height, &error)) {
+    } else if (!sink->CaptureBgra(bgra, width, height, &error)) {
         if (error.empty()) {
             error = "the picture could not be read back";
         }
@@ -1330,7 +1413,7 @@ void ViewerEngine::ProcessScreenshot() {
         error = "the remote picture is empty";
     } else {
         const std::string folder =
-            directory->empty() ? default_screenshot_directory() : *directory;
+            directory.empty() ? default_screenshot_directory() : directory;
         path = screenshot_file_path(folder);
         if (!chast::write_png_bgra(path, bgra.data(), width, height, width * 4, &error)) {
             path.clear();
@@ -1533,6 +1616,19 @@ bool ViewerEngine::RequestSessionList() {
     return true;
 }
 
+bool ViewerEngine::RequestElevation() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto code = status_.elevation.code;
+    if (!running_.load() || status_.state != ViewerState::kStreaming || !status_.input_enabled ||
+        (code != chast::ElevationCode::Available && code != chast::ElevationCode::Cancelled &&
+         code != chast::ElevationCode::Denied && code != chast::ElevationCode::Failed && code != chast::ElevationCode::Busy)) return false;
+    if (++next_elevation_id_ == 0) ++next_elevation_id_;
+    status_.elevation = {next_elevation_id_, chast::ElevationCode::Pending, {}};
+    ++status_.elevation_updates;
+    pending_elevation_.store(next_elevation_id_);
+    return true;
+}
+
 bool ViewerEngine::RequestSessionSelect(uint32_t session_id) {
     if (chast::make_session_select_request(session_id).empty()) {
         return false;
@@ -1604,11 +1700,15 @@ bool ViewerEngine::SendText(const std::string& text) {
             return false;
         }
     }
-    std::lock_guard<std::mutex> lock(chat_mutex_);
-    if (pending_text_.size() >= 16) {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (!input_enabled_ || pending_input_.size() >= kMaxPendingInput ||
+        std::count_if(pending_input_.begin(), pending_input_.end(),
+            [](const auto& pending) { return !pending.text.empty(); }) >= 16) {
         return false;
     }
-    pending_text_.push_back(text);
+    PendingInput pending;
+    pending.text = text;
+    pending_input_.push_back(std::move(pending));
     return true;
 }
 
@@ -1988,6 +2088,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t input_sent = 0;
     uint64_t input_failed = 0;
     bool clipboard_enabled = false;
+    chast::ClipboardDirection clipboard_direction = chast::ClipboardDirection::Both;
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
@@ -2198,8 +2299,70 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     // starts, so a choice made mid-session applies to the next segment.
     std::unique_ptr<chast_tools::Mp4Recorder> recorder;
     std::string record_error;
+    const auto close_recording = [&] {
+        if (!recorder) return;
+        recorder->close();
+        if (recorder->failed()) record_error = recorder->error();
+        // close() flushes the final sample; retain its counters before the
+        // recorder is released so the UI sees the completed file's totals.
+        {
+            std::lock_guard lock(mutex_);
+            status_.record_samples = recorder->samples();
+            status_.record_keyframes = recorder->keyframes();
+            status_.record_skipped = recorder->skipped();
+            status_.record_segments = static_cast<uint32_t>(recorder->segments().size());
+            status_.record_path = recorder->segments().empty() ? std::string() : recorder->segments().back();
+        }
+        recorder.reset();
+    };
+
+    DisplayVideoReceiver display_receiver(decoder_factory_);
+    bool multiple_displays = false;
+    uint64_t window_multi_published = 0;
+
+    auto record_picture = [&](const chast::FrameHeader& header, const std::vector<uint8_t>& payload,
+                              const chast::ServerInfo& picture_info) {
+        const bool record_wanted =
+            record_wanted_.load(std::memory_order_relaxed);
+        if (record_wanted && !recorder) {
+            std::string directory;
+            {
+                std::lock_guard<std::mutex> lock(record_mutex_);
+                directory = record_dir_;
+            }
+            if (directory.empty()) {
+                directory = default_record_directory();
+            }
+            std::error_code dir_ec;
+            std::filesystem::create_directories(directory, dir_ec);
+            std::string open_error;
+            auto fresh = std::make_unique<chast_tools::Mp4Recorder>();
+            if (!fresh->open(record_file_path(directory), picture_info.codec, picture_info.width,
+                             picture_info.height, &open_error)) {
+                record_error = open_error;
+                record_wanted_.store(false, std::memory_order_relaxed);
+            } else {
+                record_error.clear();
+                std::fprintf(stderr, "viewer: recording started\n");
+                recorder = std::move(fresh);
+            }
+        } else if (!record_wanted && recorder) {
+            close_recording();
+            std::fprintf(stderr, "viewer: recording stopped\n");
+        }
+        if (recorder) {
+            recorder->write(header, payload.data(), payload.size());
+            if (recorder->failed()) {
+                record_error = recorder->error();
+                close_recording();
+                record_wanted_.store(false, std::memory_order_relaxed);
+            }
+        }
+    };
 
     auto sync_status = [&](bool final) {
+        const auto display_streams = display_receiver.Snapshot();
+        const auto multi_totals = display_receiver.Totals();
         const auto now = Clock::now();
         const double window_seconds =
             std::chrono::duration<double>(now - window_start).count();
@@ -2228,17 +2391,29 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (window_seconds >= 1.0) {
-                fps = static_cast<double>(window_frames) / window_seconds;
+                fps = static_cast<double>(window_frames + multi_totals.published - window_multi_published) / window_seconds;
                 kbps = static_cast<double>(window_bytes) * 8.0 / 1000.0 / window_seconds;
                 status_.fps = fps;
                 status_.kbps = kbps;
             }
             status_.received = received;
-            status_.decoded = decoded;
+            status_.decoded = decoded + multi_totals.decoded;
             status_.keyframes = keyframes;
-            status_.published = published;
+            status_.published = published + multi_totals.published;
+            status_.multiple_displays = multiple_displays;
+            status_.display_streams = display_streams;
+            if (multiple_displays && !display_streams.empty()) {
+                const auto focused = std::find_if(display_streams.begin(), display_streams.end(), [&](const auto& stream) {
+                    return status_.focused_display && stream.stream.stream_id == *status_.focused_display;
+                });
+                const auto& actual = (focused == display_streams.end() ? display_streams.front() : *focused).stream.info;
+                status_.codec = actual.codec;
+                status_.chroma = actual.chroma;
+                status_.framerate = actual.framerate;
+                status_.server_encoder = actual.encoder;
+            }
             status_.crc_errors = crc_errors;
-            status_.decode_errors = decode_errors;
+            status_.decode_errors = decode_errors + multi_totals.decode_errors;
             status_.protocol_errors = protocol_errors;
             status_.gaps = gaps;
             status_.bytes = bytes;
@@ -2251,6 +2426,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.input_sent = input_sent;
             status_.input_failed = input_failed;
             status_.clipboard_enabled = clipboard_enabled;
+            status_.clipboard_direction = clipboard_direction;
             status_.clipboard_sent = clipboard_sent;
             status_.clipboard_received = clipboard_received;
             status_.clipboard_failed = clipboard_failed;
@@ -2443,6 +2619,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             }
         }
         if (window_seconds >= 1.0) {
+            window_multi_published = multi_totals.published;
             window_frames = 0;
             window_bytes = 0;
             window_start = now;
@@ -2582,6 +2759,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         client_config.device_identity = device_identity_.get();
         client_config.trust_device = trust_device;
         client_config.audit_ref = audit_ref;
+        {
+            std::lock_guard<std::mutex> lock(stream_option_mutex_);
+            if (pending_stream_options_) {
+                client_config.codec_preference = pending_stream_options_->codec;
+                client_config.prefer_chroma = pending_stream_options_->chroma;
+            }
+        }
+        client_config.decoding_444 = sink_ && sink_->device() ? sink_->Decoding444Codecs() : 0;
+        client_config.decoding_codecs = sink_ && sink_->device()
+            ? sink_->DecodingCodecs() : 0;
         client_config.session_mode =
             session_mode != chast::SessionMode::Desktop
                 ? session_mode
@@ -2662,6 +2849,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 status_.control_only = control_only;
                 status_.session_mode = session_mode_name(info.mode);
                 status_.codec = info.codec;
+                status_.chroma = info.chroma;
                 status_.width = info.width;
                 status_.height = info.height;
                 status_.source_width = info.source_width;
@@ -2671,6 +2859,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 status_.server_encoder = info.encoder;
                 status_.input_enabled = info.input_enabled;
                 status_.clipboard_enabled = info.clipboard_enabled;
+                status_.clipboard_direction = info.clipboard_direction;
                 status_.origin_x = info.origin_x;
                 status_.origin_y = info.origin_y;
                 status_.displays = info.displays;
@@ -2682,6 +2871,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 input_enabled_ = info.input_enabled;
             }
             clipboard_enabled = info.clipboard_enabled;
+            clipboard_direction = info.clipboard_direction;
 
             // Audio is optional end to end: a missing render endpoint or a
             // decoder that cannot start leaves video untouched and reports
@@ -2917,6 +3107,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             std::unique_ptr<chast::IVideoDecoder> decoder;
             if (!control_only) {
                 decoder_config.codec = info.codec;
+                decoder_config.chroma = info.chroma;
                 const bool picture_fits =
                     info.width <= kMaxFrameSide && info.height <= kMaxFrameSide &&
                     static_cast<uint64_t>(info.width) * info.height <= kMaxFramePixels;
@@ -2992,7 +3183,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     return chast::Error::success();
                 };
                 decoder = decoder_config.d3d11_device != nullptr
-                              ? chast::create_decoder(decoder_config, &error)
+                              ? decoder_factory_(decoder_config, &error)
                               : nullptr;
                 if (!decoder && failure.empty()) {
                     fail("decoder (" + codec_name(info.codec) + "): " + error);
@@ -3016,8 +3207,98 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     const auto now = Clock::now();
                     if (now - last_keyframe_request >= kKeyframeRetry) {
                         last_keyframe_request = now;
-                        session->request_keyframe();
+                        if (multiple_displays) {
+                            for (const auto& entry : display_receiver.Snapshot())
+                                display_receiver.Recover(entry.stream.stream_id);
+                        } else session->request_keyframe();
                     }
+                };
+
+                auto poll_displays = [&]() -> bool {
+                    chast::CaptureDisplaysResult result;
+                    while (session->take_capture_displays_result(result)) {
+                        if (!display_receiver.Apply(result, &error)) { fail(error); return false; }
+                        if (!multiple_displays && record_wanted_.load()) {
+                            std::lock_guard lock(record_mutex_);
+                            record_stream_ = 0; // the original decoder's stream identity
+                        }
+                        multiple_displays = true;
+                        decoder.reset();
+                        {
+                            std::lock_guard lock(cursor_mutex_);
+                            pending_cursor_.reset();
+                            for (auto it = pending_display_cursors_.begin(); it != pending_display_cursors_.end();)
+                                if (!display_receiver.Contains(it->first)) it = pending_display_cursors_.erase(it);
+                                else ++it;
+                        }
+                        {
+                            std::lock_guard lock(mutex_);
+                            ++status_.display_subscription_results;
+                            // Topology notifications must not hide a completed UI request.
+                            if (result.request_id != 0) {
+                                status_.display_subscription_request = result.request_id;
+                                status_.display_subscription_error = result.code == chast::DisplaySwitchCode::Ok ? "" : result.reason;
+                            }
+                            if (!status_.focused_display || !display_receiver.Contains(*status_.focused_display))
+                                status_.focused_display = result.streams.empty() ? std::optional<uint32_t>{} : result.streams.front().stream_id;
+                        }
+                    }
+                    chast::DisplayStreamInfo update;
+                    while (session->take_display_stream_update(update)) {
+                        if (!display_receiver.Update(update, &error)) { fail(error); return false; }
+                    }
+                    std::deque<chast::CaptureDisplaysRequest> requests;
+                    std::map<uint32_t, std::shared_ptr<FrameSink>> outputs;
+                    {
+                        std::lock_guard lock(displays_mutex_);
+                        requests.swap(pending_displays_); outputs.swap(pending_display_sinks_);
+                    }
+                    for (const auto& request : requests) {
+                        const auto sent = session->request_capture_displays(request);
+                        if (!sent.ok()) { fail("display subscriptions: " + sent.to_string()); return false; }
+                    }
+                    for (auto& [id, output] : outputs) {
+                        if (!display_receiver.Bind(id, std::move(output)) && display_receiver.Contains(id)) {
+                            std::lock_guard lock(mutex_);
+                            status_.display_subscription_error = "a display output is already used by another stream";
+                        }
+                    }
+                    chast::DisplayCursorUpdate cursor;
+                    while (session->take_display_cursor_update(cursor)) {
+                        if (!display_receiver.Contains(cursor.stream_id)) continue;
+                        std::lock_guard lock(cursor_mutex_);
+                        chast::coalesce_cursor_update(pending_display_cursors_[cursor.stream_id], std::move(cursor.cursor));
+                    }
+                    {
+                        std::lock_guard lock(record_mutex_);
+                        if (pending_record_keyframe_) {
+                            display_receiver.Recover(*pending_record_keyframe_);
+                            pending_record_keyframe_.reset();
+                        }
+                    }
+                    for (auto id : display_receiver.TakeKeyframeRequests()) session->request_display_keyframe(id);
+                    if (multiple_displays) {
+                        std::optional<uint32_t> record_target;
+                        { std::lock_guard lock(record_mutex_); record_target = record_stream_; }
+                        if (record_wanted_.load() && record_target && !display_receiver.Contains(*record_target)) {
+                            record_wanted_.store(false);
+                            record_error = "the recorded display was unsubscribed";
+                        }
+                        std::optional<std::string> directory;
+                        std::optional<uint32_t> target;
+                        {
+                            std::lock_guard lock(screenshot_mutex_);
+                            directory.swap(pending_screenshot_); target = pending_screenshot_stream_;
+                        }
+                        if (directory) {
+                            auto save = [this, path = *directory](FrameSink* sink) { SaveScreenshotFromSink(sink, path); };
+                            if (!target || !display_receiver.WithFrame(*target, save)) save(nullptr);
+                        }
+                    }
+                    if (!record_wanted_.load() && recorder) {
+                        close_recording();
+                    }
+                    return true;
                 };
 
                 // Sends everything the UI queued since the last poll, in
@@ -3037,7 +3318,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     for (const PendingInput& pending : events) {
                         chast::Error sent = pending.release
                                                 ? session->release_input()
-                                                : session->send_input(pending.event);
+                                                : !pending.text.empty()
+                                                    ? session->send_text_input(pending.text)
+                                                    : session->send_input(pending.event);
                         if (sent.ok()) {
                             ++input_sent;
                             continue;
@@ -3067,9 +3350,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 uint64_t clipboard_hash = 0;
                 uint64_t clipboard_peer_file_list = 0;
                 uint64_t clipboard_out_identity = 0;
+                uint64_t clipboard_source_version = 0;
+                uint64_t last_peer_clipboard_seq = 0;
                 bool clipboard_has_files = false;
                 auto next_clipboard_poll = Clock::now();
                 std::optional<chast::ClipboardSnapshot> clipboard_snapshot;
+                chast::ClipboardFileChannel clipboard_channel;
+                bool virtual_clipboard_files = true;
                 struct PendingClipboard {
                     bool active = false;
                     bool inflight = false;
@@ -3077,6 +3364,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     unsigned attempts = 0;
                     chast::ClipboardContent content;
                     std::vector<std::string> paths;
+                    std::shared_ptr<chast::ClipboardVirtualFiles> virtual_files;
                     Clock::time_point retry{};
                 } pending_clipboard;
                 {
@@ -3097,6 +3385,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                     backend.write = clipboard_sink_;
                     backend.write_files = clipboard_file_sink_;
+                    backend.write_virtual_files = clipboard_virtual_sink_;
+                    virtual_clipboard_files = !clipboard_file_sink_ || static_cast<bool>(clipboard_virtual_sink_);
                     if (!clipboard_worker_) {
                         clipboard_worker_ = std::make_unique<chast::ClipboardWorker>(std::move(backend));
                     } else {
@@ -3112,9 +3402,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                            (permissions & chast::kPermissionClipboard) != 0 &&
                            clipboard_sync_.load(std::memory_order_relaxed);
                 };
+                auto clipboard_send_allowed = [&] {
+                    return clipboard_allowed() && chast::clipboard_to_host(clipboard_direction);
+                };
+                auto clipboard_receive_allowed = [&] {
+                    return clipboard_allowed() && chast::clipboard_from_host(clipboard_direction);
+                };
                 auto cancel_clipboard_work = [&] {
                     ++clipboard_epoch;
                     clipboard_worker_->Cancel();
+                    clipboard_channel.CancelRemote();
                     pending_clipboard = {};
                     clipboard_snapshot.reset();
                 };
@@ -3168,7 +3465,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
                 auto start_clipboard_files =
                     [&](std::vector<chast::ClipboardFileEntry> entries, uint64_t hash) {
-                        if (entries.empty() || !clipboard_allowed()) {
+                        if (entries.empty() || !clipboard_receive_allowed()) {
                             return;
                         }
                         if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {
@@ -3186,18 +3483,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                          "viewer: clipboard files: no temporary directory\n");
                             return;
                         }
-                        const std::filesystem::path directory =
-                            base / ("chast-clipboard-" +
-                                    std::to_string(
-                                        static_cast<unsigned long long>(std::time(nullptr))) +
-                                    "-" + std::to_string(++clipboard_staging_seq));
-                        std::filesystem::create_directories(directory, ec);
-                        if (ec) {
+                        std::filesystem::path directory;
+                        bool created = false;
+                        for (int attempt = 0; attempt < 100 && !created; ++attempt) {
+                            directory = base / ("chast-clipboard-" +
+                                std::to_string(static_cast<unsigned long long>(std::time(nullptr))) +
+                                "-" + std::to_string(++clipboard_staging_seq));
+                            created = std::filesystem::create_directory(directory, ec);
+                            if (ec) break;
+                        }
+                        if (!created) {
                             ++clipboard_failed;
-                            std::fprintf(stderr,
-                                         "viewer: clipboard files: cannot create the "
-                                         "staging folder: %s\n",
-                                         ec.message().c_str());
+                            std::fprintf(stderr, "viewer: clipboard files: cannot create the staging folder: %s\n",
+                                         ec ? ec.message().c_str() : "no unused staging name");
                             return;
                         }
                         clipboard_files.entries = std::move(entries);
@@ -3211,7 +3509,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     if (clipboard_files.stage == ClipboardFiles::Stage::kIdle) {
                         return;
                     }
-                    if (!clipboard_allowed()) {
+                    if (!clipboard_receive_allowed()) {
                         clip_files_fail("clipboard sync is disabled");
                         return;
                     }
@@ -3239,6 +3537,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 now + std::chrono::milliseconds(500);
                             return;
                         }
+                    }
+                    // Empty directory entries only carry metadata. Create
+                    // them locally, retaining their original list indices so
+                    // subsequent .chast-clipboard/<index> requests stay valid.
+                    while (clipboard_files.next < clipboard_files.entries.size() &&
+                           clipboard_files.entries[clipboard_files.next].directory) {
+                        const auto& entry = clipboard_files.entries[clipboard_files.next];
+                        const auto relative = entry.rel_path.empty() ? entry.name : entry.rel_path;
+                        std::string error;
+                        if (!chast::create_receive_directory(clipboard_files.directory, relative, &error)) {
+                            clip_files_fail(error);
+                            return;
+                        }
+                        const auto slash = relative.find('/');
+                        const auto top = utf8_from_path(path_from_utf8(clipboard_files.directory) /
+                            path_from_utf8(relative.substr(0, slash)));
+                        if (std::find(clipboard_files.paths.begin(), clipboard_files.paths.end(), top) == clipboard_files.paths.end())
+                            clipboard_files.paths.push_back(top);
+                        ++clipboard_files.next;
                     }
                     if (clipboard_files.next >= clipboard_files.entries.size()) {
                         if (clipboard_peer_file_list != clipboard_files.hash) {
@@ -3272,6 +3589,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
 
                 auto poll_clipboard = [&] {
+                    if (!clipboard_send_allowed()) return;
                     if (!clipboard_snapshot || clipboard_snapshot->has_files ||
                         clipboard_snapshot->state != chast::ClipboardReadState::Content) return;
                     chast::ClipboardContent current = std::move(clipboard_snapshot->content);
@@ -3309,8 +3627,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
 
                 auto apply_peer_clipboard = [&](chast::ClipboardContent content) {
+                    if (!clipboard_receive_allowed()) return;
+                    if (content.seq && content.seq <= last_peer_clipboard_seq) return;
+                    if (content.seq) last_peer_clipboard_seq = content.seq;
                     const uint64_t hash = chast::clipboard_content_hash(content);
-                    if (hash == clipboard_hash && !pending_clipboard.active) {
+                    if (hash == clipboard_hash && !pending_clipboard.active && !content.find(chast::ClipboardFormat::FileList)) {
                         return;
                     }
                     std::string content_error;
@@ -3346,11 +3667,21 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         cancel_clipboard_work();
                         clipboard_hash = hash;
                         clipboard_peer_file_list = hash;
+                        clipboard_channel.ClearLocal();
+                        if (virtual_clipboard_files) {
+                            pending_clipboard.virtual_files = clipboard_channel.Receive(content.seq, std::move(entries));
+                            if (!pending_clipboard.virtual_files) { ++clipboard_failed; return; }
+                            pending_clipboard.active = true;
+                            pending_clipboard.files = true;
+                            pending_clipboard.retry = Clock::now();
+                            return;
+                        }
                         start_clipboard_files(std::move(entries), hash);
                         return;
                     }
                     cancel_clipboard_work();
                     clipboard_peer_file_list = 0;
+                    clipboard_channel.ClearLocal();
                     pending_clipboard.active = true;
                     pending_clipboard.content = std::move(content);
                     pending_clipboard.retry = Clock::now();
@@ -3358,13 +3689,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
 
                 auto receive_clipboard = [&] {
                     chast::ClipboardContent content;
-                    while (clipboard_allowed() && session->take_clipboard_content(content)) {
+                    while (clipboard_receive_allowed() && session->take_clipboard_content(content)) {
                         apply_peer_clipboard(std::move(content));
                     }
                     // A v15 host may still send the text message; treat it as
                     // a text-only item rather than dropping it.
                     chast::ClipboardUpdate legacy;
-                    while (clipboard_allowed() && session->take_clipboard_update(legacy)) {
+                    while (clipboard_receive_allowed() && session->take_clipboard_update(legacy)) {
                         chast::ClipboardContent text_only;
                         text_only.seq = legacy.seq;
                         chast::ClipboardFormatData text;
@@ -3534,6 +3865,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // on the clipboard before the session is never flushed.
                 auto pump_clipboard = [&] {
                     const auto now = Clock::now();
+                    clipboard_channel.Poll(*session, clipboard_send_allowed(), clipboard_receive_allowed());
                     clipboard_snapshot.reset();
                     const uint64_t version = clipboard_sync_version_.load(std::memory_order_acquire);
                     if (version != clipboard_sync_version) {
@@ -3566,6 +3898,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         : chast::clipboard_content_hash(result.snapshot.content);
                                     clipboard_out_identity = clipboard_has_files
                                         ? chast::clipboard_file_identity_hash(result.snapshot.entries) : 0;
+                                    clipboard_source_version = result.snapshot.local_files ? result.snapshot.local_files->SourceVersion() : 0;
                                 } else {
                                     clipboard_snapshot = std::move(result.snapshot);
                                 }
@@ -3578,7 +3911,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 ++clipboard_received;
                                 if (pending_clipboard.files) {
                                     clipboard_received_formats = 1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
-                                    clipboard_out_identity = chast::clipboard_file_identity_hash(clipboard_files.entries);
+                                    clipboard_out_identity = chast::clipboard_file_identity_hash(pending_clipboard.virtual_files
+                                        ? pending_clipboard.virtual_files->entries() : clipboard_files.entries);
+                                    clipboard_source_version = 0;
                                     clipboard_files = ClipboardFiles{};
                                 } else {
                                     clipboard_hash = chast::clipboard_content_hash(pending_clipboard.content);
@@ -3589,6 +3924,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             } else {
                                 ++clipboard_failed;
                                 if (++pending_clipboard.attempts >= 10) {
+                                    if (pending_clipboard.virtual_files) clipboard_channel.CancelRemote();
                                     if (pending_clipboard.files) discard_clipboard_files();
                                     pending_clipboard = {};
                                 } else {
@@ -3599,25 +3935,31 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                     if (pending_clipboard.active) {
                         if (!pending_clipboard.inflight && now >= pending_clipboard.retry) {
-                            pending_clipboard.inflight = pending_clipboard.files
+                            pending_clipboard.inflight = pending_clipboard.virtual_files
+                                ? clipboard_worker_->WriteVirtualFiles(clipboard_epoch, pending_clipboard.virtual_files)
+                                : pending_clipboard.files
                                 ? clipboard_worker_->WriteFiles(clipboard_epoch, pending_clipboard.paths)
                                 : clipboard_worker_->Write(clipboard_epoch, pending_clipboard.content);
                         }
-                    } else if (now >= next_clipboard_poll) {
+                    } else if (clipboard_send_allowed() && now >= next_clipboard_poll) {
                         clipboard_worker_->Read(clipboard_epoch);
                     }
                 };
                 auto poll_local_clipboard_files = [&] {
+                    if (!clipboard_send_allowed()) return;
                     if (!clipboard_snapshot) return;
                     if (!clipboard_snapshot->has_files) {
                         clipboard_out_identity = 0;
+                        clipboard_channel.ClearLocal();
                         return;
                     }
                     auto entries = std::move(clipboard_snapshot->entries);
-                    auto paths = std::move(clipboard_snapshot->paths);
+                    auto local_files = std::move(clipboard_snapshot->local_files);
                     clipboard_snapshot.reset();
                     const uint64_t identity = chast::clipboard_file_identity_hash(entries);
-                    if (identity == 0 || identity == clipboard_out_identity) {
+                    const auto source_version = local_files ? local_files->SourceVersion() : 0;
+                    if (identity == 0 || (identity == clipboard_out_identity &&
+                        (!clipboard_source_version || source_version == clipboard_source_version))) {
                         return;
                     }
                     chast::ClipboardFormatData format;
@@ -3657,58 +3999,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                      "the host's list\n");
                         discard_clipboard_files();
                     }
-                    // The host expects the offers in list order and refuses the
-                    // whole list on the first mismatch, so all entries must fit
-                    // in the queue before the list is announced.
-                    size_t room = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(file_mutex_);
-                        size_t ordinary = 0;
-                        for (const FileUpload& upload : uploads_) {
-                            if (!upload.clipboard) {
-                                ++ordinary;
-                            }
-                        }
-                        room = kMaxQueuedUploads > ordinary ? kMaxQueuedUploads - ordinary : 0;
-                    }
-                    if (entries.size() > room) {
-                        clipboard_out_identity = identity;
-                        std::fprintf(stderr,
-                                     "viewer: clipboard files: the upload queue is full; "
-                                     "the list was not announced\n");
-                        return;
-                    }
+                    // Publish metadata only. The host's paste target requests
+                    // bounded ranges through the per-session clipboard channel.
                     drop_clipboard_uploads("the local clipboard changed");
-                    bool queued = false;
-                    {
-                        std::lock_guard<std::mutex> lock(file_mutex_);
-                        if (uploads_.size() + entries.size() <= kMaxQueuedUploads) {
-                            for (size_t i = 0; i < entries.size(); ++i) {
-                                const std::string& rel = entries[i].rel_path;
-                                const size_t slash = rel.rfind('/');
-                                FileUpload upload;
-                                upload.path = paths[i];
-                                upload.name = entries[i].name;
-                                if (slash != std::string::npos) {
-                                    upload.relative_path = rel.substr(0, slash);
-                                }
-                                upload.transfer_id = next_file_id_++;
-                                upload.clipboard = true;
-                                uploads_.push_back(std::move(upload));
-                            }
-                            queued = true;
-                        }
-                    }
-                    if (!queued) {
-                        // A folder walk filled the queue between the check and
-                        // the enqueue; the current host-side list stays valid.
-                        clipboard_out_identity = identity;
-                        std::fprintf(stderr,
-                                     "viewer: clipboard files: the upload queue is full; "
-                                     "the list was not announced\n");
-                        return;
-                    }
-                    file_work_cv_.notify_all();
                     const uint64_t sent_identity = identity;
                     chast::ClipboardContent content;
                     content.seq = clipboard_seq;
@@ -3722,6 +4015,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         return;
                     }
                     clipboard_out_identity = sent_identity;
+                    clipboard_channel.CancelRemote();
+                    clipboard_channel.SetLocal(clipboard_seq, std::move(local_files));
+                    clipboard_source_version = source_version;
                     // Files own the clipboard now; the next rich item counts as
                     // a fresh change even if it matches the old text.
                     clipboard_hash = 0;
@@ -3729,7 +4025,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
                     ++clipboard_seq;
                     ++clipboard_sent;
-                    std::fprintf(stderr, "viewer: clipboard files announced (%zu file(s))\n",
+                    std::fprintf(stderr, "viewer: clipboard files announced (%zu item(s))\n",
                                  entries.size());
                 };
 
@@ -3762,7 +4058,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // The clipboard half of the queue has its own gate, and an
                     // incoming host list supersedes whatever the local poll
                     // queued: the host's clipboard is the current one.
-                    if (!clipboard_allowed()) {
+                    if (!clipboard_send_allowed()) {
                         drop_clipboard_uploads("clipboard sync was disabled");
                     } else if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {
                         drop_clipboard_uploads("the host replaced the clipboard");
@@ -4189,7 +4485,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         (permissions & chast::kPermissionFileTransfer) == 0) {
                         download_fail("the host revoked file transfer", false);
                     }
-                    if (transfer_receiving && clipboard_receiving && !clipboard_allowed()) {
+                    if (transfer_receiving && clipboard_receiving && !clipboard_receive_allowed()) {
                         download_fail("clipboard sync is disabled", false);
                     }
                     chast::FileOffer offer;
@@ -4197,11 +4493,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         const bool clipboard_transfer =
                             clipboard_files.stage == ClipboardFiles::Stage::kOffering &&
                             clipboard_files.transfer_id == offer.transfer_id;
+                        if (offer.clipboard != clipboard_transfer) {
+                            (void)session->send_file_answer(offer.transfer_id, chast::FileCode::Refused, 0,
+                                "clipboard offer does not match a requested clipboard file");
+                            continue;
+                        }
                         if ((permissions & chast::kPermissionFileTransfer) == 0 &&
                             !clipboard_transfer) {
                             continue;
                         }
-                        if (clipboard_transfer && !clipboard_allowed()) {
+                        if (clipboard_transfer && !clipboard_receive_allowed()) {
                             (void)session->send_file_answer(
                                 offer.transfer_id, chast::FileCode::Busy, 0,
                                 "clipboard sync is disabled");
@@ -4586,6 +4887,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             std::lock_guard<std::mutex> lock(browse_mutex_);
                             pending_browse_.clear();
                             browse_paths_.clear();
+                            latest_list_request_.reset();
+                            newest_file_list_.reset();
                             return;
                         }
                         BrowseCommand command;
@@ -4596,6 +4899,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             }
                             command = std::move(pending_browse_.front());
                             pending_browse_.pop_front();
+                            if (command.kind == BrowseCommand::Kind::kList &&
+                                (!latest_list_request_ || latest_list_request_->request_id != command.request_id)) continue;
                         }
                         chast::Error sent =
                             command.kind == BrowseCommand::Kind::kDownload
@@ -4603,13 +4908,22 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             : command.kind == BrowseCommand::Kind::kOperation
                                 ? session->request_file_op(command.request_id, command.operation,
                                                            command.path, command.new_name)
-                                : session->request_file_list(command.request_id, command.path);
+                                : session->request_file_list(command.request_id, command.path, command.cursor);
                         if (sent.ok()) {
                             continue;
                         }
                         {
                             std::lock_guard<std::mutex> lock(browse_mutex_);
                             browse_paths_.erase(command.request_id);
+                            if (command.kind == BrowseCommand::Kind::kList) {
+                                if (!latest_list_request_ || latest_list_request_->request_id != command.request_id) continue;
+                                newest_file_list_ = FileListAnswer{};
+                                newest_file_list_->directory = command.path;
+                                newest_file_list_->cursor = command.cursor;
+                                newest_file_list_->result.code = chast::FileCode::IoError;
+                                newest_file_list_->result.reason = "request: " + sent.to_string();
+                                latest_list_request_.reset();
+                            }
                         }
                         std::lock_guard<std::mutex> lock(mutex_);
                         if (command.kind == BrowseCommand::Kind::kDownload) {
@@ -4648,13 +4962,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 folder_.stage == FolderDownload::Stage::kListing) {
                                 walk = true;
                                 const std::string listed = folder_.listing_path;
+                                const std::string cursor = folder_.listing_cursor;
                                 folder_.listing_id = 0;
                                 folder_.listing_path.clear();
+                                folder_.listing_cursor.clear();
                                 if (list.code != chast::FileCode::Ok) {
                                     walk_error = list.reason.empty() ? file_code_name(list.code)
                                                                      : list.reason;
-                                } else if (list.truncated) {
-                                    walk_error = "the folder has too many entries to download";
+                                } else if (!cursor.empty() && !list.entries.empty() &&
+                                    chast::file_list_cursor(list.entries.front()) <= cursor) {
+                                    walk_error = "directory continuation did not advance";
                                 } else {
                                     std::string local_sub;
                                     if (listed.size() > folder_.root.size() + 1) {
@@ -4705,7 +5022,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                         "download";
                                                     break;
                                                 }
-                                                folder_.directories.push_back(child);
+                                                folder_.directories.emplace_back(child, std::string{});
                                             } else {
                                                 std::string local = folder_.name;
                                                 if (!local_sub.empty()) {
@@ -4715,6 +5032,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                 ++folder_.files_total;
                                             }
                                         }
+                                        if (walk_error.empty() && list.truncated)
+                                            folder_.directories.emplace_front(listed, list.next_cursor);
                                     }
                                 }
                             }
@@ -4728,22 +5047,30 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             list = chast::FileListResult{};
                             continue;
                         }
-                        const std::string error =
-                            list.code == chast::FileCode::Ok
-                                ? std::string()
-                                : (list.reason.empty() ? file_code_name(list.code) : list.reason);
-                        const uint32_t entries = static_cast<uint32_t>(list.entries.size());
-                        const bool truncated = list.truncated;
+                        std::string error;
+                        uint32_t entries = 0;
+                        bool truncated = false;
                         std::string directory;
                         {
                             std::lock_guard<std::mutex> lock(browse_mutex_);
-                            auto it = browse_paths_.find(list.request_id);
-                            if (it != browse_paths_.end()) {
-                                directory = it->second;
-                                browse_paths_.erase(it);
-                            }
+                            // Late replies from a previous folder, refresh or
+                            // cancelled walk must never replace the current page.
+                            if (!latest_list_request_ || list.request_id != latest_list_request_->request_id) continue;
+                            directory = latest_list_request_->directory;
                             newest_file_list_ = FileListAnswer{};
                             newest_file_list_->directory = directory;
+                            newest_file_list_->cursor = latest_list_request_->cursor;
+                            if (!latest_list_request_->cursor.empty() && !list.entries.empty() &&
+                                chast::file_list_cursor(list.entries.front()) <= latest_list_request_->cursor) {
+                                list.entries.clear(); list.truncated = false; list.next_cursor.clear();
+                                list.code = chast::FileCode::IoError;
+                                list.reason = "directory continuation did not advance";
+                            }
+                            latest_list_request_.reset();
+                            error = list.code == chast::FileCode::Ok ? std::string() :
+                                (list.reason.empty() ? file_code_name(list.code) : list.reason);
+                            entries = static_cast<uint32_t>(list.entries.size());
+                            truncated = list.truncated;
                             newest_file_list_->result = std::move(list);
                             list = chast::FileListResult{};
                         }
@@ -4895,6 +5222,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         slash == std::string::npos ? walk.root : walk.root.substr(slash + 1);
                     walk.listing_id = 0;
                     walk.listing_path.clear();
+                    walk.listing_cursor.clear();
                     walk.download_id = 0;
                     walk.download_path.clear();
                     walk.download_directory.clear();
@@ -4905,7 +5233,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     walk.transfer_deadline = now;
                     if (root.directory) {
                         walk.stage = FolderDownload::Stage::kListing;
-                        walk.directories.push_back(walk.root);
+                        walk.directories.emplace_back(walk.root, std::string{});
                     } else {
                         walk.stage = FolderDownload::Stage::kDownloading;
                         walk.files.emplace_back(walk.root, std::string());
@@ -5134,6 +5462,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     if (stage == FolderDownload::Stage::kListing) {
                         uint32_t request_id = 0;
                         std::string path;
+                        std::string cursor;
                         bool listed_all = false;
                         bool advanced = false;
                         std::string timed_out;
@@ -5153,11 +5482,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     listed_all = true;
                                 }
                             } else {
-                                path = folder_.directories.front();
+                                path = folder_.directories.front().first;
+                                cursor = folder_.directories.front().second;
                                 folder_.directories.pop_front();
                                 request_id = next_browse_id_++;
                                 folder_.listing_id = request_id;
                                 folder_.listing_path = path;
+                                folder_.listing_cursor = cursor;
                                 folder_.transfer_deadline = now + std::chrono::seconds(10);
                             }
                         }
@@ -5173,7 +5504,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             publish_folder_progress();
                             return;
                         }
-                        chast::Error sent = session->request_file_list(request_id, path);
+                        chast::Error sent = session->request_file_list(request_id, path, cursor);
                         if (!sent.ok()) {
                             finish_folder_download(1, "listing '" + path + "': " + sent.to_string());
                         }
@@ -5265,7 +5596,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         any = true;
                         ++cursor_updates;
                         std::lock_guard<std::mutex> lock(cursor_mutex_);
-                        pending_cursor_ = std::move(update);
+                        if (pending_cursor_) chast::coalesce_cursor_update(*pending_cursor_, std::move(update));
+                        else pending_cursor_ = std::move(update);
                         ++cursor_updates_;
                     }
                     if (any) {
@@ -5923,6 +6255,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // failure (the permission was revoked between the queue and
                 // the send) is reported like the host's answer, so the UI
                 // always gets one.
+                auto drain_elevation = [&] {
+                    const auto request = pending_elevation_.exchange(0);
+                    if (request) {
+                        const auto sent = session->request_elevation(request);
+                        if (!sent.ok()) {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.elevation = {request, chast::ElevationCode::Failed, sent.to_string()};
+                            ++status_.elevation_updates;
+                        }
+                    }
+                    chast::ElevationState state;
+                    while (session->take_elevation_state(state)) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (state.request_id == 0 && status_.elevation.request_id != 0) continue;
+                        if (state.request_id != 0 && state.request_id != status_.elevation.request_id) continue;
+                        status_.elevation = state;
+                        ++status_.elevation_updates;
+                    }
+                };
                 auto drain_session_requests = [&] {
                     bool list = false;
                     std::optional<uint32_t> select;
@@ -6071,27 +6422,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.chat_sent = chat_sent;
                         }
                         std::fprintf(stderr, "viewer: chat sent (%zu bytes)\n", text.size());
-                    }
-                };
-
-                // Composed text is queued like chat, but a block the host
-                // refused ends the drain: the permission was revoked and the
-                // next block would fail for the same reason.
-                auto drain_text = [&] {
-                    std::deque<std::string> outbox;
-                    {
-                        std::lock_guard<std::mutex> lock(chat_mutex_);
-                        outbox.swap(pending_text_);
-                    }
-                    for (const std::string& text : outbox) {
-                        chast::Error sent = session->send_text_input(text);
-                        if (!sent.ok()) {
-                            std::fprintf(stderr, "viewer: send text input: %s\n",
-                                         sent.to_string().c_str());
-                            break;
-                        }
-                        std::fprintf(stderr, "viewer: text input sent (%zu bytes)\n",
-                                     text.size());
                     }
                 };
 
@@ -6646,6 +6976,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 bool camera_stopping = false;
                 std::unique_ptr<chast::IVideoDecoder> camera_decoder;
                 chast::VideoCodec camera_codec = chast::VideoCodec::H264;
+                chast::VideoChroma camera_chroma = chast::VideoChroma::Yuv420;
                 uint32_t camera_decode_width = 0;
                 uint32_t camera_decode_height = 0;
                 uint64_t camera_frames = 0;
@@ -6880,11 +7211,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         camera_next_seq = header.seq + 1;
                         camera_seq_valid = true;
-                        if (!camera_decoder || header.codec != camera_codec ||
+                        if (!camera_decoder || header.codec != camera_codec || header.chroma != camera_chroma ||
                             header.width != camera_decode_width ||
                             header.height != camera_decode_height) {
                             chast::DecoderConfig camera_config;
                             camera_config.codec = header.codec;
+                            camera_config.chroma = header.chroma;
                             camera_config.d3d11_device =
                                 camera_sink_ != nullptr ? camera_sink_->device()
                                                         : nullptr;
@@ -6947,6 +7279,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 break;
                             }
                             camera_codec = header.codec;
+                            camera_chroma = header.chroma;
                             camera_decode_width = header.width;
                             camera_decode_height = header.height;
                             camera_decode_errors = 0;
@@ -7163,6 +7496,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             continue;
                         }
                         desktop = kind;
+                        // UAC/lock-screen capture pauses are announced by the
+                        // host. Resume gets a fresh frame deadline instead of
+                        // inheriting the time spent on the secure desktop.
+                        last_frame = Clock::now();
                         ++desktop_updates;
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
@@ -7411,6 +7748,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.stream_option_results = stream_option_results;
                             status_.stream_quality = stream_quality;
                             status_.codec = result.codec;
+                            status_.chroma = result.chroma;
                             status_.framerate = result.fps;
                         }
                         std::fprintf(stderr,
@@ -7444,7 +7782,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                  "viewer accepts");
                             return false;
                         }
-                        const bool needs_decoder = update.codec != info.codec ||
+                        const bool needs_decoder = update.codec != info.codec || update.chroma != info.chroma ||
                                                    update.width != info.width ||
                                                    update.height != info.height;
                         info = update;
@@ -7463,11 +7801,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
                             status_.codec = info.codec;
+                            status_.chroma = info.chroma;
                             status_.framerate = info.framerate;
                             status_.server_bitrate = info.bitrate;
                             status_.server_encoder = info.encoder;
                             status_.input_enabled = info.input_enabled;
                             status_.clipboard_enabled = info.clipboard_enabled;
+                            status_.clipboard_direction = info.clipboard_direction;
                             status_.origin_x = info.origin_x;
                             status_.origin_y = info.origin_y;
                             status_.displays = info.displays;
@@ -7480,6 +7820,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             input_enabled_ = info.input_enabled;
                         }
                         clipboard_enabled = info.clipboard_enabled;
+                        clipboard_direction = info.clipboard_direction;
                         // StreamInfo carries the permission mask too (for
                         // example after the host rebuilt its capture under a
                         // reduced grant), so adopt it before announcing.
@@ -7488,12 +7829,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                      "viewer: stream is now %s %ux%u at %d,%d\n",
                                      codec_name(info.codec).c_str(), info.width, info.height,
                                      info.origin_x, info.origin_y);
-                        if (!needs_decoder) {
+                        if (!needs_decoder || multiple_displays) {
                             continue;
                         }
                         decoder.reset();
                         decoder_config.codec = info.codec;
-                        decoder = chast::create_decoder(decoder_config, &error);
+                        decoder_config.chroma = info.chroma;
+                        decoder = decoder_factory_(decoder_config, &error);
                         if (!decoder) {
                             fail("decoder (" + codec_name(info.codec) + "): " + error);
                             return false;
@@ -7516,6 +7858,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
 
                 while (!stop_requested_.load(std::memory_order_acquire)) {
+                    if (!poll_displays()) break;
                     if (!apply_stream_updates()) {
                         break;
                     }
@@ -7531,11 +7874,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_remote_config();
                     drain_os_login();
                     receive_os_login();
+                    drain_elevation();
                     drain_session_requests();
                     receive_session_answers();
                     receive_chat();
                     drain_chat();
-                    drain_text();
                     poll_terminal();
                     drain_terminal();
                     poll_camera();
@@ -7609,7 +7952,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         microphone_wanted_.load(std::memory_order_relaxed) ||
                         voice_wanted_.load(std::memory_order_relaxed) || voice_active ||
                         voice_pending || !forwards.empty() || terminals_active() ||
-                        camera_active;
+                        camera_active || multiple_displays;
                     if (keyframe_wanted_.exchange(false, std::memory_order_relaxed)) {
                         request_keyframe();
                     }
@@ -7648,11 +7991,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_remote_config();
                     drain_os_login();
                     receive_os_login();
+                    drain_elevation();
                     drain_session_requests();
                     receive_session_answers();
                     receive_chat();
                     drain_chat();
-                    drain_text();
                     poll_terminal();
                     drain_terminal();
                     poll_camera();
@@ -7667,6 +8010,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_stream_options();
                     const auto now = Clock::now();
 
+                    if (!poll_displays()) break;
                     if (received_frame.status() == chast::Status::WaitTimeout) {
                         const chast::Error async = session->async_error();
                         if (!async.ok()) {
@@ -7677,16 +8021,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             video_finished = true;
                             break;
                         }
-                        if (!control_only && now - last_frame >= kFrameStall) {
+                        if (!control_only && !multiple_displays && desktop == chast::DesktopKind::Default &&
+                            now - last_frame >= kFrameStall) {
                             fail("no frames arrived for 20 s");
                             break;
                         }
-                        if (!control_only && sink_ != nullptr && !sink_->error().empty()) {
+                        if (!control_only && !multiple_displays && sink_ != nullptr && !sink_->error().empty()) {
                             fail("display: " + sink_->error());
                             break;
                         }
                         sync_status(false);
-                        ProcessScreenshot();
+                        if (!multiple_displays) ProcessScreenshot();
                         continue;
                     }
                     if (received_frame.status() == chast::Status::Unavailable) {
@@ -7728,7 +8073,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                     expected_seq = header.seq + 1;
 
-                    if (header.codec != info.codec || header.width != info.width ||
+                    if (multiple_displays) {
+                        std::optional<uint32_t> record_target;
+                        { std::lock_guard lock(record_mutex_); record_target = record_stream_; }
+                        if (record_target && *record_target == header.stream_id &&
+                            chast::crc32(payload.data(), payload.size()) == header.payload_crc32) {
+                            for (const auto& stream : display_receiver.Snapshot()) {
+                                const auto& described = stream.stream.info;
+                                if (stream.stream.stream_id == header.stream_id && header.codec == described.codec && header.chroma == described.chroma &&
+                                    header.width == described.width && header.height == described.height) {
+                                    record_picture(header, payload, described);
+                                    break;
+                                }
+                            }
+                        }
+                        display_receiver.Push(header, std::move(payload));
+                        sync_status(false);
+                        continue;
+                    }
+
+                    if (header.codec != info.codec || header.chroma != info.chroma || header.width != info.width ||
                         header.height != info.height) {
                         // The description and the first picture of a rebuilt
                         // stream travel on different QUIC streams, so the
@@ -7738,7 +8102,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             break;
                         }
                     }
-                    if (header.codec != info.codec || header.width != info.width ||
+                    if (header.codec != info.codec || header.chroma != info.chroma || header.width != info.width ||
                         header.height != info.height) {
                         ++protocol_errors;
                         sync_status(false);
@@ -7750,47 +8114,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         continue;
                     }
 
-                    // Viewer-side recording. The switch may arrive mid-session,
-                    // so it is applied here, on a picture the decoder also
-                    // accepts: the muxer waits for the next key frame before it
-                    // writes anything, and a size change rolls into a new file.
-                    const bool record_wanted =
-                        record_wanted_.load(std::memory_order_relaxed);
-                    if (record_wanted && !recorder) {
-                        std::string directory;
-                        {
-                            std::lock_guard<std::mutex> lock(record_mutex_);
-                            directory = record_dir_;
-                        }
-                        if (directory.empty()) {
-                            directory = default_record_directory();
-                        }
-                        std::error_code dir_ec;
-                        std::filesystem::create_directories(directory, dir_ec);
-                        std::string open_error;
-                        auto fresh = std::make_unique<chast_tools::Mp4Recorder>();
-                        if (!fresh->open(record_file_path(directory), info.codec, info.width,
-                                         info.height, &open_error)) {
-                            record_error = open_error;
-                            record_wanted_.store(false, std::memory_order_relaxed);
-                        } else {
-                            record_error.clear();
-                            std::fprintf(stderr, "viewer: recording started\n");
-                            recorder = std::move(fresh);
-                        }
-                    } else if (!record_wanted && recorder) {
-                        recorder->close();
-                        recorder.reset();
-                        std::fprintf(stderr, "viewer: recording stopped\n");
-                    }
-                    if (recorder) {
-                        recorder->write(header, payload.data(), payload.size());
-                        if (recorder->failed()) {
-                            record_error = recorder->error();
-                            recorder.reset();
-                            record_wanted_.store(false, std::memory_order_relaxed);
-                        }
-                    }
+                    record_picture(header, payload, info);
 
                     frames.clear();
                     chast::Error decode_error = decoder->decode(
@@ -7813,7 +8137,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 decoder_config.d3d11_device = sink_->device();
                                 std::string rebuild_error;
                                 decoder =
-                                    chast::create_decoder(decoder_config, &rebuild_error);
+                                    decoder_factory_(decoder_config, &rebuild_error);
                                 if (decoder) {
                                     {
                                         std::lock_guard<std::mutex> lock(mutex_);
@@ -7887,13 +8211,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
 
     // Finalise any recording before the session teardown; a file that fails
     // here still reports why through ViewerStatus::record_error.
-    if (recorder) {
-        recorder->close();
-        if (recorder->failed()) {
-            record_error = recorder->error();
-        }
-        recorder.reset();
-    }
+    close_recording();
 
     if (!stop_requested_.load(std::memory_order_acquire) && failure.empty() &&
         !video_finished && handshaken) {
@@ -8029,6 +8347,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         session->finish_client(closing, std::chrono::milliseconds(1500));
     }
 
+    display_receiver.Reset();
     sync_status(true);
     if (!failure.empty()) {
         std::fprintf(stderr, "viewer: %s\n", failure.c_str());

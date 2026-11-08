@@ -1,19 +1,21 @@
-// End-to-end harness for the hardware encode path:
+// End-to-end harness for the encode path:
 //
 //   DXGI duplication -> Nv12Pass -> FrameInfo::nv12_texture
 //     -> oneVPL ImportFrameSurface (2.10+) or direct wrap (legacy mfxhw64)
 //        or FFmpeg's nvenc/amf/qsv pool (GPU copy)
-//     -> MFXVideoENCODE / libavcodec -> elementary stream file
+//        or OpenH264 (GPU readback and I420 CPU encoding)
+//     -> MFXVideoENCODE / libavcodec / OpenH264 -> elementary stream file
 //
-// The desktop image stays in VRAM the whole way: the runtime either maps the
+// Hardware backends keep the desktop image in VRAM: the runtime either maps the
 // NV12 texture, GPU-copies it into its own pool, or reads it in place on the
 // legacy path. The only bytes that reach the CPU are the compressed access
-// units this tool writes out, which is what the real server will hand to the
-// network.
+// units this tool writes out, which is what the real server hands to the
+// network. OpenH264 stages the image into CPU memory instead.
 //
 //   chast-encode [--display N] [--seconds S] [--codec h264|hevc] [--out file]
-//                [--encoder auto|vpl|ffmpeg] [--bitrate kbps]
-//                [--keyframe-interval MS] [--bitrate-switch MS:KBPS]
+//                [--encoder auto|vpl|ffmpeg|software] [--bitrate kbps]
+//                [--capture auto|dxgi|gdi]
+//                [--keyframe-interval MS] [--bitrate-switch MS:KBPS[:FPS]]
 //                [--quality RATIO] [--framerate F] [--no-hdr] [--no-cursor] [--quiet]
 //
 // Verification with ffmpeg (elementary stream, so the codec must be named):
@@ -45,6 +47,7 @@ struct Options {
     UINT keyframe_ms = 0;       // 0 = only the first frame and on request
     UINT change_bitrate_ms = 0; // >0: switch to change_bitrate_kbps at this time
     UINT change_bitrate_kbps = 0;
+    UINT change_framerate = 0;
     float quality = 0.67f;      // RustDesk Quality::Balanced
     UINT framerate = 30;
     chast::CaptureConfig config;
@@ -73,7 +76,13 @@ bool parse_args(int argc, char** argv, Options& options) {
                 }
             } else if (arg == "--encoder" && i + 1 < argc) {
                 if (!chast::parse_encoder_backend(argv[++i], options.backend)) {
-                    std::fprintf(stderr, "--encoder wants auto, vpl or ffmpeg\n");
+                    std::fprintf(stderr,
+                                 "--encoder wants auto, vpl, ffmpeg or software\n");
+                    return false;
+                }
+            } else if (arg == "--capture" && i + 1 < argc) {
+                if (!chast::parse_capture_backend(argv[++i], options.config.backend)) {
+                    std::fprintf(stderr, "--capture wants auto, dxgi or gdi\n");
                     return false;
                 }
             } else if (arg == "--out" && i + 1 < argc) {
@@ -84,18 +93,23 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--keyframe-interval" && i + 1 < argc) {
                 options.keyframe_ms = static_cast<UINT>(std::stoul(argv[++i]));
             } else if (arg == "--bitrate-switch" && i + 1 < argc) {
-                // "after-ms:kbps": exercises set_rate() mid-stream, the way
+                // "after-ms:kbps[:fps]": exercises set_rate() mid-stream, the way
                 // the quality setting moves during a session.
                 const std::string value = argv[++i];
                 const size_t colon = value.find(':');
                 if (colon == std::string::npos) {
-                    std::fprintf(stderr, "--bitrate-switch wants MS:KBPS\n");
+                    std::fprintf(stderr, "--bitrate-switch wants MS:KBPS[:FPS]\n");
                     return false;
                 }
                 options.change_bitrate_ms =
                     static_cast<UINT>(std::stoul(value.substr(0, colon)));
                 options.change_bitrate_kbps =
                     static_cast<UINT>(std::stoul(value.substr(colon + 1)));
+                const size_t fps_colon = value.find(':', colon + 1);
+                if (fps_colon != std::string::npos) {
+                    options.change_framerate =
+                        static_cast<UINT>(std::stoul(value.substr(fps_colon + 1)));
+                }
             } else if (arg == "--quality" && i + 1 < argc) {
                 options.quality = std::stof(argv[++i]);
             } else if (arg == "--framerate" && i + 1 < argc) {
@@ -116,7 +130,8 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "invalid argument value: %s\n", e.what());
         return false;
     }
-    // The hardware encoder consumes NV12 and nothing else.
+    // Every backend consumes the capturer's NV12 texture. The software backend
+    // performs its readback and I420 conversion internally.
     options.config.nv12.enabled = true;
     options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt601Limited;
     return true;
@@ -155,13 +170,15 @@ int main(int argc, char** argv) {
     if (!options.quiet) {
         std::printf("capturing %ls: %ux%u, hdr=%d, rotation=%u\n", display.device_name.c_str(),
                     display.width, display.height, display.hdr, display.rotation_degrees);
-        std::printf("encoder: %s available on the capture adapter: %d\n",
-                    codec_name(options.codec),
-                    chast::hardware_encoder_available(options.codec,
-                                                      capturer->adapter_device().device,
-                                                      options.backend)
-                        ? 1
-                        : 0);
+        if (options.backend != chast::EncoderBackend::Software) {
+            std::printf("hardware encoder: %s available on the capture adapter: %d\n",
+                        codec_name(options.codec),
+                        chast::hardware_encoder_available(
+                            options.codec, capturer->adapter_device().device,
+                            options.backend)
+                            ? 1
+                            : 0);
+        }
     }
 
     // The encoder is built from the first published frame, not from the
@@ -250,8 +267,7 @@ int main(int argc, char** argv) {
             ++pointer_only;
         }
         if (!frame.nv12_texture) {
-            // Without NV12 there is nothing the hardware encoder can take;
-            // there is no CPU conversion to fall back on.
+            // Every encoder backend consumes the published NV12 texture.
             ++errors;
             if (errors == 1 && !options.quiet) {
                 std::fprintf(stderr, "frame has no NV12 texture: %s\n",
@@ -334,13 +350,15 @@ int main(int argc, char** argv) {
             bitrate_changed = true;
             bool keyframe_required = true;
             const chast::Error change = encoder->set_rate(
-                options.change_bitrate_kbps * 1000u, options.framerate, &keyframe_required);
+                options.change_bitrate_kbps * 1000u,
+                options.change_framerate ? options.change_framerate : options.framerate,
+                &keyframe_required);
             if (!change.ok()) {
                 std::fprintf(stderr, "set_rate failed: %s\n", change.to_string().c_str());
                 ++errors;
             } else if (!options.quiet) {
-                std::printf("bitrate switched to %u kbps at %u ms (%s)\n",
-                            encoder->bitrate() / 1000u, options.change_bitrate_ms,
+                std::printf("rate switched to %u kbps, %u fps at %u ms (%s)\n",
+                            encoder->bitrate() / 1000u, encoder->framerate(), options.change_bitrate_ms,
                             keyframe_required ? "IDR required" : "sequence continued");
             }
             force_keyframe = force_keyframe || keyframe_required;
@@ -413,12 +431,14 @@ int main(int argc, char** argv) {
     std::printf("wrote %s (%s, %llu bytes)\n", options.out_path.c_str(),
                 codec_name(encoder ? encoder->codec() : options.codec),
                 static_cast<unsigned long long>(bytes));
-    // Where the frames went on the GPU: mapped in place, or GPU-copied into the
-    // runtime's own surface pool. A system-memory path never exists here.
+    // Hardware backends report whether they mapped or copied the GPU texture.
+    // OpenH264 reports copy because it stages the frame into system memory.
     if (encoder) {
+        const bool software = encoder->backend() == chast::EncoderBackend::Software;
         std::printf("import: %s\n", encoder->shared_import()
                                         ? "shared (texture mapped, no copy)"
-                                        : "copy (GPU to GPU, no system memory)");
+                                        : (software ? "copy (GPU readback to OpenH264)"
+                                                    : "copy (GPU to GPU)"));
     }
     return errors == 0 ? 0 : 1;
 }

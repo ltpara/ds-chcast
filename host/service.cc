@@ -7,12 +7,15 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "chast/host_settings.h"
 #include "platform.h"
 #include "service_log.h"
+#include "service_manager_startup.h"
+#include "windows_sessions.h"
 
 namespace chast::host {
 
@@ -30,11 +33,13 @@ HANDLE g_worker_switch = nullptr;
 HANDLE g_job = nullptr;
 HANDLE g_worker_process = nullptr;
 DWORD g_worker_session = 0;
+uint64_t g_worker_logon = 0;
 // A viewer-selected session outranks the console while it stays active. It is
-// cleared when the session goes away, so the service falls back to the console
-// without any operator action.
-DWORD g_selected_session = 0;
+// cleared when that logon goes away, so automatic console/RDP selection resumes.
+WindowsSessionTarget g_selected_session;
 std::string g_log_path;
+std::mutex g_logoff_mutex;
+std::vector<DWORD> g_logged_off_sessions;
 
 bool is_elevated() {
     HANDLE token = nullptr;
@@ -183,80 +188,29 @@ DWORD find_process_in_session(const wchar_t* executable, DWORD session) {
     return found;
 }
 
-bool session_has_user(DWORD session) {
-    LPWSTR name = nullptr;
-    DWORD bytes = 0;
-    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &name,
-                                     &bytes)) {
-        return false;
-    }
-    const bool has_user = name != nullptr && name[0] != L'\0';
-    WTSFreeMemory(name);
-    return has_user;
-}
-
-// DXGI cannot capture a disconnected desktop, so a session is only a valid
-// switch target while Windows reports it active.
-bool session_is_active(DWORD session) {
-    WTS_CONNECTSTATE_CLASS* state = nullptr;
-    DWORD bytes = 0;
-    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session,
-                                     WTSConnectState,
-                                     reinterpret_cast<LPWSTR*>(&state), &bytes)) {
-        return false;
-    }
-    const bool active = state != nullptr && *state == WTSActive;
-    WTSFreeMemory(state);
-    return active;
-}
-
-// Reads and removes the worker's switch request. The file carries only a
-// decimal session id; anything malformed is dropped, and deleting it before
-// acting means a stale request can never redirect a later worker.
-bool take_session_switch_request(DWORD& session) {
+// Consume one complete, versioned request bound to its worker and target logon.
+bool take_session_switch_request(SessionSwitchRequest& request) {
     const std::wstring path = session_switch_path();
-    if (path.empty()) {
-        return false;
-    }
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    char buffer[32] = {};
+    if (path.empty()) return false;
+    // Delete the file we opened, not a newer request atomically renamed over
+    // its path while we read. Oversize/truncated IDs are consumed and rejected.
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    char buffer[96]{};
+    LARGE_INTEGER size{};
     DWORD read = 0;
-    const BOOL ok = ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
+    const bool valid = GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= sizeof(buffer) &&
+        ReadFile(file, buffer, static_cast<DWORD>(size.QuadPart), &read, nullptr) && read == size.QuadPart;
     CloseHandle(file);
-    DeleteFileW(path.c_str());
-    if (!ok || read == 0) {
-        return false;
-    }
-    uint32_t value = 0;
-    for (DWORD i = 0; i < read; ++i) {
-        const char ch = buffer[i];
-        if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') {
-            continue;
-        }
-        if (ch < '0' || ch > '9') {
-            return false;
-        }
-        value = value * 10 + static_cast<uint32_t>(ch - '0');
-        if (value > 0xFFFFFFFEu) {
-            return false;
-        }
-    }
-    if (value == 0) {
-        return false;
-    }
-    session = value;
-    return true;
+    return valid && parse_session_switch(std::string_view(buffer, read), request);
 }
 
 std::wstring worker_command_line() {
     return L"\"" + executable_path() + L"\" --worker";
 }
 
-bool start_worker(DWORD session, std::string* error) {
+bool start_worker(DWORD session, uint64_t logon, std::string* error) {
     if (g_worker_stop != nullptr) {
         ResetEvent(g_worker_stop);
     }
@@ -321,6 +275,7 @@ bool start_worker(DWORD session, std::string* error) {
     CloseHandle(info.hThread);
     g_worker_process = info.hProcess;
     g_worker_session = session;
+    g_worker_logon = logon;
     log_event(g_log_path, "worker.start",
               {{"pid", std::to_string(info.dwProcessId)},
                {"session", std::to_string(session)}});
@@ -348,14 +303,13 @@ void stop_worker() {
     CloseHandle(g_worker_process);
     g_worker_process = nullptr;
     g_worker_session = 0;
+    g_worker_logon = 0;
     if (g_worker_stop != nullptr) {
         ResetEvent(g_worker_stop);
     }
 }
 
 DWORD WINAPI service_handler(DWORD control, DWORD event_type, void* event_data, void* context) {
-    (void)event_type;
-    (void)event_data;
     (void)context;
     switch (control) {
         case SERVICE_CONTROL_STOP:
@@ -368,6 +322,10 @@ DWORD WINAPI service_handler(DWORD control, DWORD event_type, void* event_data, 
             }
             return NO_ERROR;
         case SERVICE_CONTROL_SESSIONCHANGE:
+            if (event_type == WTS_SESSION_LOGOFF && event_data) {
+                std::lock_guard lock(g_logoff_mutex);
+                g_logged_off_sessions.push_back(static_cast<WTSSESSION_NOTIFICATION*>(event_data)->dwSessionId);
+            }
             if (g_session_wake != nullptr) {
                 SetEvent(g_session_wake);
             }
@@ -452,51 +410,63 @@ void service_main(DWORD argc, LPWSTR* argv) {
     report_status(SERVICE_RUNNING);
     log_event(g_log_path, "service.running");
 
+    ServiceManagerStartup managers(service_manager_executable());
     auto retry_at = std::chrono::steady_clock::now();
+    std::string session_snapshot_error;
     for (;;) {
         if (WaitForSingleObject(g_service_stop, 0) == WAIT_OBJECT_0) {
             break;
         }
         const auto now = std::chrono::steady_clock::now();
-        DWORD requested_session = 0;
-        if (take_session_switch_request(requested_session)) {
-            if (requested_session == g_worker_session) {
-                log_event(g_log_path, "session.switch_ignored",
-                          {{"session", std::to_string(requested_session)}});
-            } else if (!session_is_active(requested_session) ||
-                       !session_has_user(requested_session)) {
-                log_event(g_log_path, "session.switch_refused",
-                          {{"session", std::to_string(requested_session)}});
-            } else {
-                log_event(g_log_path, "session.switch_requested",
-                          {{"session", std::to_string(requested_session)}});
-                g_selected_session = requested_session;
-                if (g_worker_process != nullptr) {
-                    stop_worker();
-                    retry_at = now;
+        std::vector<DWORD> logged_off;
+        {
+            std::lock_guard lock(g_logoff_mutex);
+            logged_off.swap(g_logged_off_sessions);
+        }
+        for (auto ended : logged_off) {
+            managers.logged_off(ended);
+            if (ended == g_selected_session.id) g_selected_session = {};
+            if (ended == g_worker_session) { stop_worker(); retry_at = now; }
+        }
+        std::vector<WindowsSession> sessions;
+        std::string snapshot_error;
+        const bool snapshot_ready = read_windows_sessions(sessions, &snapshot_error);
+        if (!snapshot_ready && snapshot_error != session_snapshot_error)
+            log_event(g_log_path, "session.snapshot_failed", {{"error", snapshot_error}});
+        if (snapshot_ready && !session_snapshot_error.empty()) log_event(g_log_path, "session.snapshot_recovered");
+        session_snapshot_error = snapshot_error;
+        DWORD session = g_worker_session;
+        uint64_t logon = g_worker_logon;
+        if (snapshot_ready) {
+            SessionSwitchRequest request;
+            if (take_session_switch_request(request)) {
+                const auto* requested = find_windows_session(sessions, request.session_id);
+                if (!requested || requested->logon_id != request.logon_id || !g_worker_process ||
+                    GetProcessId(g_worker_process) != request.worker_pid)
+                    log_event(g_log_path, "session.switch_refused", {{"session", std::to_string(request.session_id)}});
+                else {
+                    g_selected_session = {request.session_id, requested->logon_id};
+                    log_event(g_log_path, "session.switch_requested", {{"session", std::to_string(request.session_id)}});
                 }
             }
+            const auto previous_choice = g_selected_session.id;
+            const auto target = choose_windows_session(sessions, WTSGetActiveConsoleSessionId(), g_worker_session, g_selected_session);
+            if (previous_choice && !g_selected_session.id)
+                log_event(g_log_path, "session.selected_lost", {{"session", std::to_string(previous_choice)}});
+            session = target.id;
+            logon = target.logon_id;
         }
-
-        const DWORD console_session = WTSGetActiveConsoleSessionId();
-        DWORD session = console_session;
-        bool logged_in = console_session != 0xFFFFFFFF && session_has_user(console_session);
-        if (g_selected_session != 0) {
-            if (session_is_active(g_selected_session) &&
-                session_has_user(g_selected_session)) {
-                // A viewer-chosen session outranks the console until it goes
-                // away; then the next pass falls back to the console.
-                session = g_selected_session;
-                logged_in = true;
-            } else {
-                log_event(g_log_path, "session.selected_lost",
-                          {{"session", std::to_string(g_selected_session)}});
-                g_selected_session = 0;
-            }
+        const bool logged_in = snapshot_ready && session != 0;
+        if (logged_in) {
+            const auto manager = managers.poll(session);
+            if (manager.process_id) log_event(g_log_path, "manager.start",
+                {{"session", std::to_string(session)}, {"pid", std::to_string(manager.process_id)}});
+            if (!manager.error.empty()) log_event(g_log_path, "manager.start_failed",
+                {{"session", std::to_string(session)}, {"error", manager.error}});
         }
 
         if (g_worker_process != nullptr) {
-            if (!logged_in || session != g_worker_session) {
+            if (snapshot_ready && (!logged_in || session != g_worker_session || logon != g_worker_logon)) {
                 log_event(g_log_path, "session.changed",
                           {{"from", std::to_string(g_worker_session)},
                            {"to", std::to_string(session)}});
@@ -511,6 +481,7 @@ void service_main(DWORD argc, LPWSTR* argv) {
                 CloseHandle(g_worker_process);
                 g_worker_process = nullptr;
                 g_worker_session = 0;
+                g_worker_logon = 0;
                 retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(3);
             }
         }
@@ -518,7 +489,7 @@ void service_main(DWORD argc, LPWSTR* argv) {
         if (g_worker_process == nullptr && logged_in &&
             std::chrono::steady_clock::now() >= retry_at) {
             std::string error;
-            if (!start_worker(session, &error)) {
+            if (!start_worker(session, logon, &error)) {
                 log_event(g_log_path, "worker.start_failed", {{"error", error}});
                 retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             }
@@ -557,20 +528,36 @@ std::wstring session_switch_path() {
     return path.wstring();
 }
 
-bool service_installed() {
+ServicePresence service_presence() {
     SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (manager == nullptr) {
-        return false;
+        return ServicePresence::Unknown;
     }
     SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS);
     if (service == nullptr) {
         const DWORD error = GetLastError();
         CloseServiceHandle(manager);
-        return error == ERROR_ACCESS_DENIED;
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST || error == ERROR_SERVICE_MARKED_FOR_DELETE)
+            return ServicePresence::Missing;
+        return error == ERROR_ACCESS_DENIED ? ServicePresence::Installed : ServicePresence::Unknown;
     }
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
-    return true;
+    return ServicePresence::Installed;
+}
+bool service_installed() { return service_presence() == ServicePresence::Installed; }
+
+ServiceState service_state() {
+    DWORD state = 0;
+    if (!query_service_state(&state)) return ServiceState::Unknown;
+    switch (state) {
+        case SERVICE_STOPPED: return ServiceState::Stopped;
+        case SERVICE_START_PENDING: return ServiceState::Starting;
+        case SERVICE_RUNNING: return ServiceState::Running;
+        case SERVICE_STOP_PENDING: return ServiceState::Stopping;
+        case SERVICE_PAUSED: return ServiceState::Paused;
+        default: return ServiceState::Unknown;
+    }
 }
 
 bool service_running() {
@@ -626,6 +613,12 @@ bool load_machine_settings(HostSettings& settings, std::string* path, std::strin
 int install_service(std::string* error) {
     if (!is_elevated()) {
         *error = "安装服务需要管理员权限，请从提升的命令行运行 --install";
+        return 1;
+    }
+    const auto manager_path = service_manager_executable();
+    const auto manager_attributes = GetFileAttributesW(manager_path.c_str());
+    if (manager_attributes == INVALID_FILE_ATTRIBUTES || (manager_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        *error = "安装服务需要同目录下的 chast-host.exe，用于用户登录后的连接管理与审批";
         return 1;
     }
     HostSettings settings;
@@ -684,9 +677,6 @@ int install_service(std::string* error) {
     failures.cActions = 3;
     failures.lpsaActions = actions;
     (void)ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failures);
-
-    std::string ignored;
-    (void)set_autostart(false, &ignored);
 
     if (!StartServiceW(service, 0, nullptr)) {
         const DWORD started = GetLastError();

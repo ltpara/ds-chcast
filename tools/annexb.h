@@ -133,6 +133,8 @@ inline const char* codec_name(chast::VideoCodec codec) {
             return "H.264";
         case chast::VideoCodec::Hevc:
             return "HEVC";
+        case chast::VideoCodec::Vp9:
+            return "VP9";
         case chast::VideoCodec::Av1:
             return "AV1";
     }

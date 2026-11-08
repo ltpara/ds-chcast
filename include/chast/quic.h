@@ -147,6 +147,7 @@ struct QuicServerConfig {
     // own. Off by default for the same reason as allow_input; HostServer turns
     // it on from the host settings.
     bool allow_clipboard = false;
+    ClipboardDirection clipboard_direction = ClipboardDirection::Both;
     // Accept CCLB streams from the viewer and let the viewer upload files.
     // Same default and same reason as allow_clipboard.
     bool allow_file_transfer = false;
@@ -239,6 +240,13 @@ struct QuicServerConfig {
     // LocalMachine requires the caller to be able to create machine keys and
     // write to the machine certificate store (a service running as SYSTEM).
     IdentityScope identity_scope = IdentityScope::CurrentUser;
+    // Local UAC handoff only: retain the original user's certificate/DPAPI
+    // identity even when UAC was approved by a different administrator.
+    // Owns a token HANDLE with CloseHandle as its deleter; never sent on QUIC.
+    std::shared_ptr<void> identity_user_token;
+    // Local handoff must reuse this exact stored identity and must never
+    // create a replacement certificate when the original cannot be opened.
+    std::string expected_identity_fingerprint;
 };
 
 // What the QUIC stack says about the connection. RTT and loss come from the
@@ -268,6 +276,16 @@ struct LatencySample {
     int64_t offset_us = 0;
     uint64_t probes_sent = 0;
     uint64_t replies = 0;
+    // Server probes measure application round trips, including reply handling.
+    // Nonzero while its one outstanding probe has not been answered.
+    uint64_t pending_us = 0;
+    // Server: capture-to-application-receipt round trip. This includes video
+    // backlog that a probe on the independent control stream cannot observe.
+    uint64_t video_delay_us = 0;
+    uint64_t video_pending_us = 0;
+    uint64_t video_replies = 0;
+    size_t video_pending_frames = 0;
+    size_t video_pending_bytes = 0;
 };
 
 // One piece of a CFIL upload. `offset` is the absolute file offset of the
@@ -346,6 +364,12 @@ struct QuicClientConfig {
     // system audio as QUIC DATAGRAM frames. On by default; false asks for the
     // reliable audio stream (A/B measurements and very small datagram paths).
     bool audio_datagram = true;
+    // Tool receivers support all compiled formats by default. Product GPU
+    // receivers must populate this from the rendering device's decoder caps.
+    VideoCodecMask decoding_codecs = kVideoCodecAll;
+    StreamCodecPreference codec_preference = StreamCodecPreference::Auto;
+    VideoCodecMask decoding_444 = 0;
+    VideoChroma prefer_chroma = VideoChroma::Yuv420;
 };
 
 class QuicSession {
@@ -391,6 +415,10 @@ public:
     // once wait_for_client() succeeded; the server creates its capturer after
     // that so the request can pick the output.
     uint16_t requested_display() const;
+    VideoCodecMask decoding_codecs() const;
+    StreamCodecPreference codec_preference() const;
+    VideoCodecMask decoding_444() const;
+    VideoChroma chroma_preference() const;
     // The session mode the client asked for in Hello. Valid once
     // wait_for_client() succeeded; the host decides whether to serve it.
     SessionMode requested_mode() const;
@@ -466,6 +494,9 @@ public:
     // A host that shares one encoded stream between viewers uses this so a
     // slow viewer cannot stall the capture loop.
     Error send_frame_nowait(FrameHeader header, const uint8_t* payload, size_t size);
+    // Advisory: bounded video delivery window and transport capacity. A
+    // refused nowait send consumes neither a frame nor a sequence number.
+    bool video_send_ready() const;
     // Sends one audio access unit on the audio stream. Like send_frame it
     // fills in the sequence number, size and CRC. Unlike it, the send never
     // waits: when the shared video/audio queue is full the packet is dropped
@@ -566,6 +597,8 @@ public:
     // send_host_action_result(). A viewer without the matching permission gets
     // Denied instead of silence.
     bool take_host_action_request(HostControlRequest& request);
+    bool take_elevation_request(uint32_t& request_id);
+    Error send_elevation_state(const ElevationState& state);
     // Number of HostActionRequests received. Observation hook for tools and
     // the host's own counters.
     uint64_t host_action_requests() const;
@@ -722,9 +755,9 @@ public:
     Error stop_microphone();
     // Asks the server for an IDR (sent on the control stream).
     Error request_keyframe();
-    // Sends one LatencyProbe carrying this process's steady clock. The server
-    // answers automatically; the result appears in latency(). Call about once
-    // a second while streaming.
+    // Sends a LatencyProbe. Both endpoints answer automatically. Client probes
+    // synchronize clocks; server probes measure application RTT for shared
+    // video QoS. The server keeps at most one probe outstanding.
     Error send_latency_probe();
     // Last clock-sync result and probe/reply counters.
     LatencySample latency() const;
@@ -739,10 +772,21 @@ public:
     uint64_t stream_updates() const;
     // Asks the host to capture another display mid-session. `display_index`
     // names an entry of the last announced display list, or kDisplayAuto.
-    // Requires the handshake and input permission; the answer arrives through
+    // Requires a desktop handshake, including view-only; the answer arrives through
     // take_display_switch_result(). On Ok a StreamInfo describing the new
     // output follows on the same control stream.
     Error request_display_switch(uint16_t display_index);
+    // v54 ordered add/sub/set subscription requests, available to view-only
+    // desktop sessions too. Empty set stops all desktop video subscriptions.
+    Error request_capture_displays(const CaptureDisplaysRequest& request);
+    bool take_capture_displays_request(CaptureDisplaysRequest& request);
+    Error send_capture_displays_result(const CaptureDisplaysResult& result);
+    bool take_capture_displays_result(CaptureDisplaysResult& result);
+    // Stream metadata never changes connection-wide permissions or audio.
+    Error refresh_display_stream(const DisplayStreamInfo& info);
+    bool take_display_stream_update(DisplayStreamInfo& info);
+    Error request_display_keyframe(uint32_t stream_id);
+    bool take_display_keyframe_request(uint32_t& stream_id);
     // Pops the newest DisplaySwitchResult. The reason is the host's UTF-8
     // explanation, empty when it has none.
     bool take_display_switch_result(uint16_t& display_index, DisplaySwitchCode& code,
@@ -800,6 +844,8 @@ public:
     // Pops the oldest host-control answer. Results are a short ordered queue
     // because each block-input toggle and each action produces one.
     bool take_host_action_result(HostControlResult& result);
+    Error request_elevation(uint32_t request_id);
+    bool take_elevation_state(ElevationState& state);
     // Total host-control answers received. Observation hook for tools.
     uint64_t host_action_results() const;
     // Asks the host to read or change its exposed policy switches. Requires
@@ -837,12 +883,11 @@ public:
     bool take_session_select_result(SessionSelectResult& result);
     // Total session select answers received. Observation hook for tools.
     uint64_t session_select_results() const;
-    // Asks the host to change this session's video preferences (encoder,
-    // frame-rate ceiling and quality preset). The host can only lower its own
-    // budget; the answer arrives through take_stream_options_result(). No
-    // permission is required because the change only affects this viewer's
-    // picture. Unlike display switches, a changed preference survives a
-    // reconnect only by being sent again.
+    // Sets this session's codec, frame-rate ceiling and quality preferences.
+    // Input control is not required. Each viewer contributes to shared codec
+    // and quality policies, so the effective result can differ from its request.
+    // The answer arrives through take_stream_options_result(); preferences
+    // must be sent again when reconnecting.
     Error request_stream_options(const StreamOptions& options);
     // Pops the newest StreamOptionsResult. The effective fields describe the
     // running stream even on a refusal, so a menu can roll back to reality.
@@ -895,6 +940,12 @@ public:
     bool take_clipboard_content(ClipboardContent& content);
     // Total CCLB blobs received since the connection started.
     uint64_t clipboard_contents_received() const;
+
+    Error request_clipboard_file(const ClipboardFileRead& request);
+    Error send_clipboard_file_data(const ClipboardFileData& response);
+    bool take_clipboard_file_read(ClipboardFileRead& request);
+    bool take_clipboard_file_data(ClipboardFileData& response);
+    void cancel_clipboard_file_reads(uint64_t generation);
 
     // ----- session chat (both roles, protocol v24) -----
 
@@ -1172,8 +1223,8 @@ public:
     // The side that offers a file is the sender; the side that answers is the
     // receiver and writes the bytes. A viewer upload has the host as receiver;
     // a host download has the viewer as receiver. Every call below works on
-    // both roles, and `session_permissions` must carry
-    // kPermissionFileTransfer.
+    // both roles. Ordinary offers require kPermissionFileTransfer; marked
+    // clipboard offers require kPermissionClipboard and the allowed direction.
 
     // Receiver: pops the oldest FileOffer the peer sent. Nothing is accepted
     // until send_file_answer() says so.
@@ -1237,7 +1288,7 @@ public:
 
     // Server: pops the oldest browse request (the viewer's request id and a
     // relative directory). The host answers with send_file_list_result().
-    bool take_file_list_request(uint32_t& request_id, std::string& directory);
+    bool take_file_list_request(uint32_t& request_id, std::string& directory, std::string* cursor = nullptr);
     // Server: answers one browse request on the control stream.
     Error send_file_list_result(const FileListResult& result);
     // Server: pops the oldest download request (the viewer's request id and a
@@ -1246,10 +1297,10 @@ public:
     bool take_file_download_request(uint32_t& request_id, std::string& path);
     // Server: answers one download request. Ok must name the transfer id the
     // host is about to offer; every other code must pass 0.
-    Error send_file_download_result(const FileDownloadResult& result);
+    Error send_file_download_result(const FileDownloadResult& result, bool clipboard = false);
     // Client: asks for one directory listing. The answer arrives through
     // take_file_list_result().
-    Error request_file_list(uint32_t request_id, const std::string& directory);
+    Error request_file_list(uint32_t request_id, const std::string& directory, const std::string& cursor = {});
     // Client: pops the oldest listing.
     bool take_file_list_result(FileListResult& result);
     // Client: asks the host to offer one file. The answer arrives through
@@ -1282,6 +1333,10 @@ public:
     // any older ones that were never taken. Returns false when nothing new
     // arrived.
     bool take_cursor_update(CursorUpdate& update);
+    // Independent pending state per subscribed source. Late updates for a
+    // removed stream are discarded; surviving streams retain unread sprites.
+    Error send_display_cursor(const DisplayCursorUpdate& update);
+    bool take_display_cursor_update(DisplayCursorUpdate& update);
     // Total CursorUpdates received since the connection started.
     uint64_t cursor_updates_received() const;
 

@@ -8,10 +8,13 @@ set(VIEWER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../viewer")
 # uses the standard library's threading primitives.
 add_library(chast_viewer_core STATIC
   "${VIEWER_DIR}/gpu_frame_sink.cc"
+  "${VIEWER_DIR}/shared_viewer_session.cc"
   "${VIEWER_DIR}/viewer_engine.cc"
+  "${VIEWER_DIR}/display_video_receiver.cc"
   "${VIEWER_DIR}/remote_cursor.cc"
   "${VIEWER_DIR}/security_key.cc"
   "${VIEWER_DIR}/keyboard_capture.cc"
+  "${VIEWER_DIR}/local_text_input.cc"
 )
 target_include_directories(chast_viewer_core PUBLIC "${VIEWER_DIR}")
 # The viewer records with the same muxer the command-line tool uses, so the

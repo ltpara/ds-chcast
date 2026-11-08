@@ -8,9 +8,9 @@
 // sequence; above 1 the listener hands every accepted connection to a
 // per-viewer HostServer worker, so a slow, stalled or vanishing viewer cannot
 // hold up the others. Each viewer gets its own handshake, approval,
-// permissions, capturer, encoder, streams and audit record; the policy, the
-// listener, the certificate and the TCP carrier are shared. Only one desktop
-// viewer at a time holds the control lease, so input injection and the
+// permissions, streams and audit record. Desktop capture/encoding are shared
+// per display; system audio, policy, listener, certificate and carrier are
+// shared. Only one desktop viewer at a time holds the control lease, so input injection and the
 // host-wide privacy overlay have a single owner.
 //
 // A viewer picks a display in Hello; the capturer and encoder are created after
@@ -21,7 +21,8 @@
 //
 // status() may be read from any thread. A multi-viewer host reports the
 // focused (most recently admitted) viewer and the live viewer count; the
-// operator actions below target that focused viewer.
+// legacy operator actions below target that focused viewer. Operator UIs use
+// connection IDs so admission or departure cannot silently retarget an action.
 
 #include <array>
 #include <atomic>
@@ -39,11 +40,15 @@
 
 #include "chast/carrier.h"
 #include "chast/capture.h"
+#include "chast/camera.h"
 #include "chast/clipboard.h"
 #include "chast/clipboard_worker.h"
+#include "chast/clipboard_channel.h"
 #include "chast/encoder.h"
+#include "chast/elevation.h"
 #include "chast/file_transfer.h"
 #include "chast/host_security.h"
+#include "chast/power_request.h"
 #include "chast/desktop.h"
 #include "chast/host_settings.h"
 #include "chast/input.h"
@@ -101,6 +106,12 @@ struct HostServerStats {
     uint64_t display_mode_failures = 0;
     double rtt_ms = 0.0;
     double min_rtt_ms = 0.0;
+    double application_rtt_ms = 0.0;
+    uint64_t qos_probe_replies = 0;
+    double video_delivery_ms = 0.0;
+    double video_pending_ms = 0.0;
+    uint64_t video_receipts = 0;
+    uint64_t video_pending_frames = 0;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
     bool client_connected = false;  // at least one viewer got through
     bool peer_left = false;         // the last session ended with the peer gone
@@ -231,6 +242,9 @@ struct HostServerStats {
 
 struct HostStatus {
     HostState state = HostState::Stopped;
+    uint64_t connection_id = 0; // Process-local, never reused; zero outside a live session.
+    SessionMode session_mode = SessionMode::Desktop;
+    PermissionMask approved_permissions = 0;
     // Viewers admitted right now. Above one, the fields below describe the
     // focused viewer (the most recently admitted) and stats.sessions counts
     // every viewer this host has admitted.
@@ -276,10 +290,25 @@ struct HostStatus {
     std::string error;  // empty unless the run stopped on a failure
 };
 
+struct HostViewer {
+    uint64_t id = 0;
+    std::string peer_address;
+    SessionMode mode = SessionMode::Desktop;
+    PermissionMask permissions = 0;
+    PermissionMask approved_permissions = 0;
+    bool controls_input = false;
+    bool disconnecting = false;
+};
+
 struct HostServerConfig {
     HostSettings settings;
+    // Held only after admission and released on every session exit. Tests
+    // can observe ownership without changing the machine's power behavior.
+    std::function<std::unique_ptr<ISessionPowerRequest>(bool, std::string*)>
+        power_request_factory = create_session_power_request;
     // Injectable platform boundaries for deterministic host integration tests.
-    // Defaults retain DXGI capture, GPU conversion and hardware-only encoding.
+    // Defaults prefer DXGI capture and fall back to GDI while retaining GPU
+    // conversion and hardware encoding.
     std::function<std::vector<DisplayInfo>()> displays = enumerate_displays;
     std::function<std::unique_ptr<IDxgiCapturer>(const DisplayInfo&, const CaptureConfig&,
                                                std::string*)> capture_factory =
@@ -288,19 +317,29 @@ struct HostServerConfig {
         };
     std::function<std::unique_ptr<IVideoEncoder>(ID3D11Device*, const EncoderConfig&,
                                                 std::string*)> encoder_factory = create_encoder;
+    std::function<std::vector<CameraDevice>()> cameras = enumerate_cameras;
+    std::function<std::unique_ptr<IDxgiCapturer>(const CameraDevice&, LUID, uint32_t,
+                                               std::string*)> camera_capture_factory = create_camera_capturer;
     std::function<InputDesktopStatus()> desktop_status = input_desktop_status;
     std::function<bool(std::string*, bool*)> follow_desktop = follow_input_desktop;
     // The tray keeps its identity in the user's store; the Windows service
     // worker uses the machine store so the fingerprint survives logins.
     IdentityScope identity_scope = IdentityScope::CurrentUser;
-    // No operator is present: click approval and the temporary password are
-    // unavailable and a permanent password is mandatory. A host without one
-    // still listens, but refuses every viewer and says why in the log.
+    std::shared_ptr<void> identity_user_token;
+    std::string expected_identity_fingerprint;
+    std::function<ElevationState()> elevation_state;
+    std::function<std::shared_ptr<IElevationTask>()> request_elevation;
+    // Machine worker: no temporary password. By default it requires a
+    // permanent password; service_approval can enable an operator channel.
     bool service_mode = false;
+    // Enables Click/Both only when the worker supplies an authenticated local
+    // approval channel. A missing operator must refuse, never auto-approve.
+    bool service_approval = false;
     // Walk the injection path without calling SendInput. Only for tests.
     bool dry_run_input = false;
     bool want_hdr = true;
     bool capture_cursor = true;
+    CaptureBackend capture_backend = CaptureBackend::Auto;
     // Loopback silence gate: after this much digital silence the encoder stops
     // receiving samples. Zero encodes silence too, keeping the receiver's
     // playout fed so starvation measurements are not confused with host gating.
@@ -385,14 +424,17 @@ struct HostServerConfig {
     // This legacy test hook returns false for no file list; the real backend
     // distinguishes failed access from an observed empty list.
     std::function<bool(std::vector<std::string>&)> clipboard_read_files;
-    // CF_HDROP write used when a viewer's clipboard file copy has been staged
-    // (protocol v34). Empty writes the real clipboard; the loopback check
-    // captures the list so an automated run never touches the operator's
-    // clipboard. The staged files stay valid for the rest of the session.
+    // Optional legacy staged-file sink for integrations that need CF_HDROP
+    // paths. With neither hook set, native Windows publishes virtual files.
     std::function<bool(const std::vector<std::string>&)> clipboard_write_files;
+    // Receives an offer without reading it. Takes precedence over the legacy
+    // sink; callbacks retain shared state if their paste target uses it later.
+    std::function<bool(std::shared_ptr<ClipboardVirtualFiles>)> clipboard_write_virtual_files;
     // Called on the host thread for every ChatMessage the viewer sent. The
     // operator UI appends it to the chat window; the message is not echoed.
     std::function<void(const std::string&)> chat_message;
+    // Identifies the sender even while other viewers join or leave.
+    std::function<void(uint64_t, const std::string&)> viewer_chat_message;
     // Called on the host thread for every composed text block the injector
     // accepted (protocol v36). The text has already been queued for Unicode
     // injection; the hook is for diagnostics and the loopback check.
@@ -470,6 +512,16 @@ public:
     bool running() const;
 
     HostStatus status() const;
+    std::vector<HostViewer> viewers() const;
+    // All ID-based actions fail for a departed connection. They never choose
+    // another viewer, including a subsequent viewer on a sequential listener.
+    bool set_permissions(uint64_t connection_id, PermissionMask permissions);
+    bool send_chat(uint64_t connection_id, const std::string& text);
+    // An authenticated service operator supplies an owned impersonation token.
+    // Validation, hashing and opening then use that user's access rights.
+    bool start_file_download(uint64_t connection_id, const std::string& utf8_path, std::string* error,
+                             std::shared_ptr<void> file_access_token = {});
+    bool disconnect_viewer(uint64_t connection_id);
     // The token CLI/automation needs right now. Rotates after a one-time
     // session.
     std::string token() const;
@@ -546,6 +598,8 @@ private:
     // The viewer status(), send_chat() and the operator actions target: the
     // focused live worker, or null when nobody is streaming.
     std::shared_ptr<HostServer> focused_viewer() const;
+    std::shared_ptr<HostServer> find_viewer(uint64_t connection_id) const;
+    bool drain_chat(HostServerStats& stats, std::string* error);
     bool open_session(std::string* error);
     // Serves the connected viewer until the peer leaves, the run ends or an
     // error stops it. Returns false only for a failure, not for a normal
@@ -555,33 +609,10 @@ private:
     // encoder is started, and only that feature's control plane runs.
     bool control_session(SessionMode mode, HostServerStats& stats, std::string* error,
                          bool* peer_left);
-    // The desktop stream itself. A multi-viewer host elects one publisher:
-    // the first desktop viewer captures and encodes once and later viewers
-    // receive the same frames (a second IDXGIOutputDuplication cannot exist
-    // in one process). `already_announced` means this viewer followed before
-    // and owns a live stream, so the description is refreshed, not announced.
-    bool stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left,
-                        bool already_announced);
-    enum class SharedFollowResult {
-        Ended,    // the viewer left, the run stopped or following failed
-        Promote,  // no publisher is left and this worker took the role over
-    };
-    // Serves a desktop viewer that is not the publisher: waits for the
-    // publisher's stream description, announces (or refreshes) it and runs
-    // this viewer's own control plane. `announced` says whether this session
-    // already has a stream. Returns Promote after claiming the publisher role.
-    SharedFollowResult follow_shared_desktop(HostServerStats& stats, std::string* error,
-                                             bool* peer_left, bool* announced);
-    void release_desktop_publisher();
-    // Fans the publisher's output out to its followers. These run on the
-    // publisher thread and never block, so a slow follower cannot stall the
-    // capture loop. A follower that cannot keep up drops frames.
-    void broadcast_video(const FrameHeader& header, const uint8_t* data, size_t size);
-    void broadcast_audio(const AudioHeader& header, const uint8_t* data, size_t size);
-    void broadcast_cursor(const CursorUpdate& update);
-    void broadcast_desktop_state(DesktopKind kind);
-    // Clipboard and microphone plumbing shared by the publisher and follower
-    // paths; each worker owns its viewer's state.
+    // Each connection keeps its control plane while subscribing to a
+    // display-owned capture/encoder pipeline shared with same-display viewers.
+    bool stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left);
+    // Each worker owns its viewer's clipboard and microphone state.
     bool clipboard_allowed() const;
     void request_local_clipboard();
     void cancel_clipboard_work();
@@ -599,8 +630,8 @@ private:
     void drain_microphone(HostServerStats& stats);
     // Host microphone uplink of a voice call. handle_voice_call_requests()
     // answers the viewer's control messages and owns the capture lifetime;
-    // drain_voice_call() forwards encoded packets. Both run per worker, so a
-    // follower session can serve its own call without owning the desktop.
+    // drain_voice_call() forwards encoded packets. Both run per worker, so
+    // every connection can serve its own call independently of its display.
     void handle_voice_call_requests(HostServerStats& stats);
     void drain_voice_call(HostServerStats& stats);
     void stop_voice_call(HostServerStats& stats, const std::string& reason,
@@ -641,6 +672,11 @@ private:
     // encoder, display or audio exists. The same file machinery as a desktop
     // session runs in a short polling loop until the viewer leaves.
     bool file_session(HostServerStats& stats, std::string* error, bool* peer_left);
+    bool handle_elevation_requests(std::string* error);
+    std::shared_ptr<IElevationTask> elevation_task_;
+    uint32_t elevation_request_ = 0;
+    ElevationCode elevation_last_code_ = ElevationCode::Unsupported;
+    std::chrono::steady_clock::time_point elevation_deadline_{};
     bool sleep_unless_stopping(std::chrono::milliseconds duration);
     void log(const std::string& message);
     void publish_state(HostState state, const std::string& error = {});
@@ -658,7 +694,7 @@ private:
     void refresh_security_config();
     PermissionMask policy_permissions() const;
     bool sync_remote_policy();
-    bool reject_desktop_requests(std::string* error);
+    bool reject_desktop_requests(std::string* error, bool camera_options = false);
     void publish_trusted_devices();
 
     HostServerConfig config_;
@@ -688,6 +724,11 @@ private:
     std::atomic<PermissionMask> pending_permissions_{0};
     std::thread thread_;
     std::atomic<bool> stopping_{false};
+    // Serializes local actions with session admission/retirement. The ID is
+    // atomic only for registry lookup; actions recheck it under this mutex.
+    mutable std::mutex operator_mutex_;
+    std::atomic<uint64_t> connection_id_{0};
+    std::atomic<bool> disconnect_requested_{false};
     std::atomic<bool> running_{false};
     bool started_ = false;
     // True while this session's block-input action is in effect. The OS
@@ -734,6 +775,8 @@ private:
         Stage stage = Stage::kNone;
         uint32_t transfer_id = 0;
         std::string path;
+        std::shared_ptr<void> file_access_token;
+        bool clipboard = false;
         std::string name;
         std::string error;
         uint64_t size = 0;
@@ -760,6 +803,8 @@ private:
     std::thread send_hasher_;
     uint32_t next_send_id_ = 1;
     std::string pending_download_path_;
+    bool pending_download_clipboard_ = false;
+    std::shared_ptr<void> pending_download_token_;
     // Preassigned for a viewer-requested download so the answer can name the
     // transfer id before hashing starts; 0 for an operator download.
     uint32_t pending_download_transfer_id_ = 0;
@@ -772,6 +817,8 @@ private:
     std::vector<std::string> clipboard_file_paths_;
     std::vector<ClipboardFileEntry> clipboard_file_entries_;
     uint64_t last_file_identity_ = 0;
+    uint64_t last_file_source_version_ = 0;
+    uint64_t last_peer_clipboard_seq_ = 0;
     std::vector<ClipboardFileEntry> last_file_entries_;
     std::vector<std::string> last_file_paths_;
 
@@ -876,36 +923,17 @@ private:
     mutable std::mutex chat_mutex_;
     std::deque<std::string> pending_chat_;
 
-    // Multi-viewer desktop sharing. A multi-viewer host elects one publisher
-    // that captures and encodes once; every later desktop viewer follows it.
-    // The role flags belong to this worker's session thread; `session_mutex_`
-    // guards the session handle against a publisher broadcasting into a
-    // follower that is being torn down. The shared_* counters carry the
-    // follower's broadcast traffic back to its own loop.
-    bool desktop_publisher_ = false;
-    bool desktop_info_ready_ = false;
+    // Guards operator access while a connection is being torn down.
     std::mutex session_mutex_;
-    std::atomic<uint64_t> shared_frames_{0};
-    std::atomic<uint64_t> shared_keyframes_{0};
-    std::atomic<uint64_t> shared_bytes_{0};
-    std::atomic<uint64_t> shared_frame_drops_{0};
-    std::atomic<uint64_t> shared_send_errors_{0};
-    std::atomic<uint64_t> shared_audio_packets_{0};
-    std::atomic<uint64_t> shared_audio_bytes_{0};
-    std::atomic<uint64_t> shared_audio_drops_{0};
-    std::atomic<uint64_t> shared_cursor_sent_{0};
-    std::atomic<uint64_t> shared_cursor_drops_{0};
-    std::atomic<bool> shared_send_failed_{false};
-    std::atomic<bool> shared_audio_ready_{false};
 
     // Clipboard baseline and microphone pipeline of this worker's viewer.
-    // They live here instead of in stream_desktop() because the follower path
-    // serves the same per-viewer features without owning capture.
     bool clipboard_was_allowed_ = false;
     // A delayed clipboard owner or a slow copied folder must not stall
     // capture, control requests or permission revocation. Only the session
     // thread consumes results; callbacks own their lifetime independently.
     std::unique_ptr<ClipboardWorker> clipboard_worker_;
+    std::unique_ptr<ClipboardFileChannel> clipboard_channel_;
+    std::shared_ptr<ClipboardVirtualFiles> pending_virtual_files_;
     uint64_t clipboard_epoch_ = 0;
     bool clipboard_baseline_pending_ = true;
     bool clipboard_write_pending_ = false;
@@ -923,9 +951,7 @@ private:
     std::unique_ptr<IAudioPlayer> microphone_player_;
     AudioInfo microphone_info_;
     bool microphone_broken_ = false;
-    // The publisher's loopback capture feeds the echo canceller; a follower
-    // plays its microphone without one because the reference belongs to the
-    // publisher's audio pipeline.
+    // All viewers feed the reference used by the shared loopback echo canceller.
     std::shared_ptr<AudioReference> audio_reference_;
 
     // Voice call of this worker's viewer. The capture is created when the

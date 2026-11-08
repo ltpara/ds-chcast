@@ -303,6 +303,7 @@ public:
     UINT height() const noexcept override { return height_; }
     const std::string& implementation() const noexcept override { return implementation_; }
     bool shared_import() const noexcept override { return legacy_memory_ || import_shared_; }
+    EncoderBackend backend() const noexcept override { return EncoderBackend::Vpl; }
 
 private:
     void close();

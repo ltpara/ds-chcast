@@ -19,6 +19,8 @@ class TunnelEvent {
     this.relay = '',
     this.carrier = '',
     this.carrierToken = '',
+    this.error = '',
+    this.retryable = false,
   });
 
   final String event;
@@ -30,6 +32,8 @@ class TunnelEvent {
   final String relay;
   final String carrier;
   final String carrierToken;
+  final String error;
+  final bool retryable;
 
   static TunnelEvent? decode(String line) {
     final String text = line.trim();
@@ -43,7 +47,7 @@ class TunnelEvent {
       }
       String field(String key) => value[key]?.toString() ?? '';
       final String event = field('event');
-      if (event != 'ready' && event != 'path') {
+      if (event != 'ready' && event != 'path' && event != 'error') {
         return null;
       }
       return TunnelEvent(
@@ -56,6 +60,8 @@ class TunnelEvent {
         relay: field('relay'),
         carrier: field('carrier'),
         carrierToken: field('carrier_token'),
+        error: field('error'),
+        retryable: value['retryable'] == true,
       );
     } catch (_) {
       return null;
@@ -64,9 +70,10 @@ class TunnelEvent {
 }
 
 class TunnelException implements Exception {
-  const TunnelException(this.message);
+  const TunnelException(this.message, {this.retryable = false});
 
   final String message;
+  final bool retryable;
 
   @override
   String toString() => message;
@@ -89,6 +96,8 @@ class TunnelAgent {
   StreamSubscription<String>? _stderr;
   final List<String> _logs = <String>[];
   Completer<void>? _ready;
+  final Completer<void> _stdoutDone = Completer<void>();
+  final Completer<void> _stderrDone = Completer<void>();
   String _path = 'connecting';
   String _remote = '';
   String _relay = '';
@@ -251,11 +260,13 @@ class TunnelAgent {
     agent._stdout = process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .listen(agent._onLine, onError: agent._onStreamError);
+        .listen(agent._onLine,
+            onError: agent._onStreamError, onDone: agent._stdoutDone.complete);
     agent._stderr = process.stderr
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .listen(agent._noteLog, onError: agent._onStreamError);
+        .listen(agent._noteLog,
+            onError: agent._onStreamError, onDone: agent._stderrDone.complete);
     unawaited(agent._watchExit());
     try {
       await agent._ready!.future.timeout(timeout);
@@ -263,6 +274,7 @@ class TunnelAgent {
       await agent.stop();
       throw TunnelException(
         tr('隧道代理在 {p3} 秒内没有就绪{p4}', <String, Object?>{'p3': timeout.inSeconds, 'p4': agent._logSuffix()}),
+        retryable: true,
       );
     } catch (_) {
       await agent.stop();
@@ -340,6 +352,10 @@ class TunnelAgent {
       }
       return;
     }
+    if (event.event == 'error') {
+      _fail(TunnelException(event.error, retryable: event.retryable));
+      return;
+    }
     if (event.path.isNotEmpty) {
       _path = event.path;
     }
@@ -390,6 +406,8 @@ class TunnelAgent {
   Future<void> _watchExit() async {
     final int code = await _process.exitCode;
     _running = false;
+    // Process exit can arrive before its final JSON error or diagnostics.
+    await Future.wait(<Future<void>>[_stdoutDone.future, _stderrDone.future]);
     if (!_stopping && !(_ready?.isCompleted ?? true)) {
       _fail(TunnelException(
         tr('隧道代理启动失败（退出码 {code}）{p7}', <String, Object?>{'code': code, 'p7': _logSuffix()}),
@@ -411,6 +429,8 @@ class TunnelAgent {
     _running = false;
     await _stdout?.cancel();
     await _stderr?.cancel();
+    if (!_stdoutDone.isCompleted) _stdoutDone.complete();
+    if (!_stderrDone.isCompleted) _stderrDone.complete();
     _stdout = null;
     _stderr = null;
     if (!_process.kill()) {

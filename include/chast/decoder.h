@@ -1,6 +1,6 @@
 #pragma once
 
-// Hardware video decoder for the access units the encoder produces.
+// Video decoders for the access units the encoder produces.
 //
 // Input is an Annex B access unit as it arrives from the encoder (start-code
 // prefixed NAL units, SPS/PPS repeated on key frames). Decoding runs through
@@ -18,6 +18,10 @@
 // The decoder is deliberately independent of the capture device: it runs on a
 // different machine than the encoder and must not try to pin itself to the
 // sender's adapter.
+//
+// VP9 uses libvpx software decoding. GPU mode converts I420/I444 directly
+// to BGRA and uploads it to the display device. A full-chroma picture never
+// passes through NV12. CPU measurement mode retains I444 as packed BGRA.
 
 #include <cstdint>
 #include <functional>
@@ -47,6 +51,9 @@ struct DecodedFrame {
     // Tightly packed NV12 of the visible rectangle, only filled when
     // DecoderConfig::copy_frames is set.
     std::vector<uint8_t> nv12;
+    // Full-chroma measurements retain packed BGRA, without a 4:2:0 round trip.
+    std::vector<uint8_t> bgra;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
 
 // One decoded picture in D3D11 video memory. The texture borrows the decoder's
@@ -76,6 +83,7 @@ struct DecoderConfig {
     // every picture through gpu_handler. `out` is left empty in that mode.
     ID3D11Device* d3d11_device = nullptr;
     GpuFrameHandler gpu_handler;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
 
 class IVideoDecoder {
@@ -108,5 +116,10 @@ public:
 // itself is opened on the first key frame, because that is the first access
 // unit that carries a sequence header.
 std::unique_ptr<IVideoDecoder> create_decoder(const DecoderConfig& config, std::string* error);
+
+// NV12 decoder profiles advertised by this GPU and available in the decoder
+// build. Null probes the software-capable measurement path, not a GUI device.
+VideoCodecMask supported_decoder_codecs(ID3D11Device* device);
+VideoCodecMask supported_decoder_444_codecs(ID3D11Device* device);
 
 }  // namespace chast

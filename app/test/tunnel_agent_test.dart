@@ -6,6 +6,27 @@ import 'package:chast_viewer/server_settings.dart';
 import 'package:chast_viewer/tunnel_agent.dart';
 
 void main() {
+  for (final bool retryable in <bool>[true, false]) {
+    test('startup error preserves retryable=$retryable before exit', () async {
+      final File script = await _bat(
+        '@echo {"event":"error","error":"lookup failed","retryable":$retryable}\r\n'
+        '@exit /b 1\r\n',
+      );
+      await expectLater(
+        _start(script),
+        throwsA(isA<TunnelException>()
+            .having((TunnelException e) => e.message, 'message', 'lookup failed')
+            .having((TunnelException e) => e.retryable, 'retryable', retryable)),
+      );
+    }, skip: !Platform.isWindows);
+  }
+
+  test('unknown startup errors do not opt into retries', () {
+    expect(TunnelEvent.decode('{"event":"error","error":"denied"}')!.retryable,
+        isFalse);
+    expect(const TunnelException('identity changed').retryable, isFalse);
+  });
+
   test('decodes ready and path events and ignores other output', () {
     final TunnelEvent? ready = TunnelEvent.decode(
       '{"event":"ready","listen":"127.0.0.1:45678","host":"devbox",'

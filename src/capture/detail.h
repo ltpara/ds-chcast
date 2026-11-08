@@ -280,6 +280,15 @@ std::unique_ptr<IDxgiCapturer> create_capturer_on_device(const DisplayInfo& disp
                                                          ID3D11DeviceContext* context,
                                                          UINT vendor_id, std::string* error);
 
+// GDI fallback with the same GPU-facing frame contract. When a device is
+// supplied (merged capture), the DIB is uploaded directly to that device.
+std::unique_ptr<IDxgiCapturer> create_gdi_capturer(const DisplayInfo& display,
+                                                   const CaptureConfig& config,
+                                                   std::string* error);
+std::unique_ptr<IDxgiCapturer> create_gdi_capturer_on_device(
+    const DisplayInfo& display, const CaptureConfig& config, ID3D11Device* device,
+    ID3D11DeviceContext* context, UINT vendor_id, std::string* error);
+
 // A reader of the output's shared duplication, running on `device`/`context`
 // (the merged compositor's) or on its own device when both are null.
 std::unique_ptr<IDxgiCapturer> create_shared_capturer_on_device(const DisplayInfo& display,

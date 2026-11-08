@@ -4,14 +4,8 @@
 //
 // Media Foundation is the only webcam provider here: DXGI has no camera path,
 // and the Media Foundation source reader hands frames over in system memory.
-// This is therefore the one capture path in chast that starts in RAM; the
-// host relay uploads each NV12 frame into a shared D3D11 texture on the
-// capture adapter and the hardware encoder takes it from there, so encoding
-// stays on the GPU and on the adapter the desktop stream already uses.
-//
-// As with desktop capture there is no software encoder fallback: a machine
-// whose GPU cannot hardware-encode fails the camera start instead of silently
-// moving the camera onto the CPU.
+// A shared video source uploads NV12 into its own D3D11 texture. Hardware and
+// software encoder selection then follows the same policy as desktop video.
 
 #include <chrono>
 #include <cstdint>
@@ -21,6 +15,7 @@
 #include <vector>
 
 #include "chast/error.h"
+#include "chast/capture.h"
 
 namespace chast {
 
@@ -89,5 +84,11 @@ public:
 // failure.
 std::unique_ptr<ICameraCapture> open_camera(const CameraDevice& device, uint32_t framerate,
                                             std::string* error = nullptr);
+
+// Camera adapter for the shared video service. The calling service thread
+// owns capture, upload, recovery and teardown. A zero LUID selects the default
+// graphics adapter, including camera-only sessions with no desktop capture.
+std::unique_ptr<IDxgiCapturer> create_camera_capturer(const CameraDevice& camera,
+    LUID adapter, uint32_t framerate, std::string* error);
 
 }  // namespace chast

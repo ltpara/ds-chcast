@@ -7,6 +7,7 @@
 #include <flutter/method_channel.h>
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -14,7 +15,9 @@
 
 #include "remote_cursor.h"
 #include "keyboard_capture.h"
+#include "local_text_input.h"
 #include "viewer_engine.h"
+#include "shared_viewer_session.h"
 
 namespace flutter {
 class FlutterEngine;
@@ -24,14 +27,16 @@ namespace chast_viewer {
 
 class GpuFrameSink;
 
-// Owns the viewer session and exposes it to Dart over a MethodChannel. One
-// instance lives for the lifetime of the runner window. Dart registers the
+// Exposes a shared viewer session to Dart over a MethodChannel. The parent
+// window owns its lifetime; display windows borrow it. Dart registers the
 // display texture with flutter_gpu_texture_renderer and passes the plugin's
 // output pointer in with the start call; the sink borrows it until the session
 // thread has stopped.
 class ViewerBridge {
 public:
-    ViewerBridge(flutter::FlutterEngine* engine, HWND window);
+    ViewerBridge(flutter::FlutterEngine* engine, HWND window,
+                 std::shared_ptr<SharedViewerSession> session = {},
+                 std::optional<uint32_t> display_stream = {});
     ~ViewerBridge();
 
     ViewerBridge(const ViewerBridge&) = delete;
@@ -46,8 +51,17 @@ public:
     // SessionWindowRequest. False means the caller should fall back to an
     // in-process page.
     std::function<bool(const std::string&)> open_session_window;
+    std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t)> open_display_window;
 
 private:
+    bool QueueInput(const chast::InputEvent& event);
+    bool ReleaseInput();
+    bool SetKeyboardMode(bool local);
+    bool PostLocalKey(const chast::InputEvent& event, bool release = false);
+    bool QueueLocalKey(const KBDLLHOOKSTRUCT& key, bool down,
+                       const chast::InputEvent& event, bool consumed);
+    bool ObserveLocalKey(UINT message, WPARAM wparam, LPARAM lparam);
+    void DrainLocalKey(uintptr_t ticket);
     void HandleMethodCall(
         const flutter::MethodCall<flutter::EncodableValue>& call,
         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
@@ -95,6 +109,25 @@ private:
     HWND view_ = nullptr;
     std::atomic<bool> key_capture_{false};
     std::unique_ptr<KeyboardCapture> keyboard_capture_;
+    std::unique_ptr<LocalTextInput> local_text_input_;
+    std::atomic<bool> local_keyboard_{false};
+    struct LocalKey {
+        chast::InputEvent event;
+        bool release = false;
+        uint64_t generation = 0;
+        uintptr_t ticket = 0;
+        uint16_t scan = 0;
+        uint16_t usage = 0;
+        uint32_t virtual_key = 0;
+        bool down = false;
+        bool native = false;
+        bool received = false;
+        bool completed = true;
+    };
+    std::mutex local_keys_mutex_;
+    std::deque<LocalKey> local_keys_;
+    uintptr_t next_local_ticket_ = 0;
+    std::array<bool, 256> local_ime_keys_{};
     std::atomic<bool> relative_mouse_{false};
     // Physical pixels per captured pixel. Relative moves use the native
     // keyboard snapshot; the last Dart bitmap is the hook-failure fallback.
@@ -111,11 +144,15 @@ private:
     uint64_t cursor_shape_ = 0;
     double cursor_scale_ = 1.0;
     std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
-    std::unique_ptr<GpuFrameSink> texture_sink_;
+    std::shared_ptr<SharedViewerSession> session_;
+    std::optional<uint32_t> display_stream_;
+    std::atomic<uint64_t> session_generation_{0};
+    std::map<uint32_t, uint64_t> cursor_revisions_;
+    GpuFrameSink* texture_sink_ = nullptr;
     // The shared camera gets its own Flutter texture and sink, so both
     // pictures can render at once.
-    std::unique_ptr<GpuFrameSink> camera_sink_;
-    std::unique_ptr<ViewerEngine> viewer_;
+    GpuFrameSink* camera_sink_ = nullptr;
+    ViewerEngine* viewer_ = nullptr;
     std::shared_ptr<chast::DeviceIdentity> identity_;
     bool identity_loaded_ = false;
     // One Windows Hello prompt at a time: webauthn.dll would otherwise stack

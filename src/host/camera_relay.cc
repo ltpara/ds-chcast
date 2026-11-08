@@ -6,21 +6,19 @@
 #include "chast/camera_relay.h"
 
 #include <windows.h>
-#include <d3d11.h>
-#include <dxgi1_2.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include "chast/com_ptr.h"
+#include "host/desktop_stream.h"
 
 namespace chast {
 
@@ -28,22 +26,21 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Hard ceiling on encoded packets waiting for the session thread. The worker
-// already stops encoding once two are queued, so reaching four means a burst
-// (an IDR plus deltas) that still has to be bounded.
+// Each connection bounds its relay independently of the shared source.
 constexpr size_t kMaxQueuedPackets = 4;
 constexpr size_t kMaxQueuedBytes = 4u * 1024u * 1024u;
-// Encoded frames queued before the worker skips capture frames entirely: a
-// skipped source frame costs nothing, while an encoded frame that is dropped
-// later breaks the reference chain.
-constexpr size_t kBacklogSkip = 2;
-// A healthy camera delivers every few dozen milliseconds; the timeout bounds
-// both a stalled device and how long teardown waits for the worker.
-constexpr auto kReadTimeout = std::chrono::milliseconds(200);
+constexpr auto kReadTimeout = std::chrono::milliseconds(5);
+constexpr auto kStartupTimeout = std::chrono::seconds(10);
 
-// Intel's video-memory frames must be 16-aligned; the desktop pipeline pads
-// for the same reason. Padding stays black.
-uint32_t align16(uint32_t value) { return (value + 15u) & ~15u; }
+std::optional<VideoCodec> codec_vote(StreamCodecPreference preference) {
+    switch (preference) {
+        case StreamCodecPreference::H264: return VideoCodec::H264;
+        case StreamCodecPreference::Hevc: return VideoCodec::Hevc;
+        case StreamCodecPreference::Av1: return VideoCodec::Av1;
+        case StreamCodecPreference::Vp9: return VideoCodec::Vp9;
+        default: return std::nullopt;
+    }
+}
 
 const char* codec_name(VideoCodec codec) {
     switch (codec) {
@@ -51,57 +48,12 @@ const char* codec_name(VideoCodec codec) {
             return "h264";
         case VideoCodec::Hevc:
             return "hevc";
+        case VideoCodec::Vp9:
+            return "VP9";
         case VideoCodec::Av1:
             return "av1";
     }
     return "h264";
-}
-
-// Same clock and encoding as the desktop stream (FrameHeader::capture_ms).
-uint64_t capture_clock_ms() {
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        Clock::now().time_since_epoch())
-                        .count();
-    return static_cast<uint64_t>(ms) & 0xFFFFFFFFFFFFull;
-}
-
-bool create_device(LUID luid, ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& context,
-                   std::string* error) {
-    ComPtr<IDXGIFactory1> factory;
-    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
-                                    reinterpret_cast<void**>(factory.put()));
-    if (FAILED(hr)) {
-        *error = "CreateDXGIFactory1 failed";
-        return false;
-    }
-    ComPtr<IDXGIAdapter1> adapter;
-    for (UINT index = 0;; ++index) {
-        if (factory->EnumAdapters1(index, adapter.put()) == DXGI_ERROR_NOT_FOUND) {
-            *error = "the capture adapter is gone";
-            return false;
-        }
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(adapter->GetDesc1(&desc)) && desc.AdapterLuid.LowPart == luid.LowPart &&
-            desc.AdapterLuid.HighPart == luid.HighPart) {
-            break;
-        }
-    }
-    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
-                           ARRAYSIZE(levels), D3D11_SDK_VERSION, device.put(), &level,
-                           context.put());
-    if (hr == E_INVALIDARG) {
-        // Pre-Windows 8 runtimes reject 11_1 in the feature-level list.
-        hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, &levels[1],
-                               1, D3D11_SDK_VERSION, device.put(), &level, context.put());
-    }
-    if (FAILED(hr)) {
-        *error = "D3D11CreateDevice on the capture adapter failed";
-        return false;
-    }
-    return true;
 }
 
 }  // namespace
@@ -123,22 +75,27 @@ struct CameraRelay::Worker {
     bool answered = false;
     bool failed = false;
     bool ended = false;
+    bool waiting_idr = true;
+    bool options_inflight = false;
+    std::optional<StreamOptions> pending_options;
+    std::optional<StreamOptions> accepted_options;
+    std::optional<StreamOptionsResult> options_result;
     std::string failure;
     std::string detail;
     uint32_t width = 0;
     uint32_t height = 0;
     uint64_t dropped = 0;
-    uint64_t skipped = 0;
     std::atomic<bool> stop{false};
     // Set whenever an encoded frame was lost (queue overflow or a transport
     // drop). The next encoded frame must be an IDR or the viewer cannot
     // decode anything that follows.
     std::atomic<bool> force_keyframe{false};
 
-    void run(LUID adapter, CameraRelayConfig config, CameraDevice camera);
+    void run(LUID adapter, CameraRelayConfig config, CameraDevice camera, Subscribe subscribe);
     void resolve_failed(const std::string& reason);
     void mark_ended(const std::string& reason, bool bad);
     void publish(Packet packet);
+    void resync();
 };
 
 void CameraRelay::Worker::resolve_failed(const std::string& reason) {
@@ -157,202 +114,211 @@ void CameraRelay::Worker::mark_ended(const std::string& reason, bool bad) {
     failure = reason;
 }
 
+void CameraRelay::Worker::resync() {
+    std::lock_guard<std::mutex> lock(mutex);
+    frames.clear();
+    frame_bytes = 0;
+    waiting_idr = true;
+    force_keyframe = true;
+}
+
 void CameraRelay::Worker::publish(Packet packet) {
     std::lock_guard<std::mutex> lock(mutex);
     if (frames.size() >= kMaxQueuedPackets ||
         frame_bytes + packet.payload.size() > kMaxQueuedBytes) {
-        ++dropped;
+        dropped += frames.size();
+        frames.clear();
+        frame_bytes = 0;
+        waiting_idr = true;
         force_keyframe = true;
+    }
+    if ((waiting_idr && !packet.header.idr) || packet.payload.size() > kMaxQueuedBytes) {
+        ++dropped;
         return;
     }
+    waiting_idr = false;
     frame_bytes += packet.payload.size();
     frames.push_back(std::move(packet));
 }
 
-void CameraRelay::Worker::run(LUID adapter, CameraRelayConfig config, CameraDevice camera) {
-    struct ComScope {
-        const HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        ~ComScope() {
-            if (SUCCEEDED(result)) {
-                CoUninitialize();
-            }
-        }
-    } com;
-    if (FAILED(com.result)) {
-        resolve_failed("camera capture needs a thread initialized as MTA");
-        return;
-    }
-
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    {
-        std::string reason;
-        if (!create_device(adapter, device, context, &reason)) {
-            resolve_failed(reason);
-            return;
-        }
-    }
-    std::string reason;
-    std::unique_ptr<ICameraCapture> capture = open_camera(camera, config.framerate, &reason);
-    if (!capture) {
-        resolve_failed(reason);
-        return;
-    }
-    const uint32_t source_width = capture->width();
-    const uint32_t source_height = capture->height();
-    if (stop.load()) {
-        resolve_failed("stopped before streaming");
-        return;
-    }
-
-    const UINT surface_width = align16(source_width);
-    const UINT surface_height = align16(source_height);
-    EncoderConfig encoder_config;
-    encoder_config.codec = config.codec;
-    encoder_config.width = surface_width;
-    encoder_config.height = surface_height;
-    encoder_config.framerate = capture->framerate() > 0 ? capture->framerate() : config.framerate;
-    encoder_config.gop_size = 0;
-    encoder_config.quality_ratio = config.quality_ratio;
-    encoder_config.backend = config.backend;
-    encoder_config.bitrate = hardware_bitrate(surface_width, surface_height,
-                                              config.quality_ratio,
-                                              config.codec == VideoCodec::H264);
-    std::unique_ptr<IVideoEncoder> encoder = create_encoder(device.get(), encoder_config, &reason);
-    if (!encoder) {
-        resolve_failed("encoder: " + reason);
-        return;
-    }
-
-    // The texture keeps the desktop NV12 flags: oneVPL mirrors the descriptor
-    // of the surface it imports and refuses a texture without the codec
-    // bindings, and the shared flag is what lets the runtime import it at all.
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = surface_width;
-    desc.Height = surface_height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_NV12;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER |
-                     D3D11_BIND_SHADER_RESOURCE;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    ComPtr<ID3D11Texture2D> texture;
-    if (FAILED(device->CreateTexture2D(&desc, nullptr, texture.put()))) {
-        resolve_failed("CreateTexture2D(NV12) failed on the capture adapter");
-        return;
-    }
-
-    // Padded NV12 upload buffer. The visible area is overwritten per frame;
-    // the padding rows keep the black written here.
-    std::vector<uint8_t> upload(static_cast<size_t>(surface_width) * surface_height * 3 / 2, 0);
-    const size_t luma_bytes = static_cast<size_t>(surface_width) * surface_height;
-    std::fill(upload.begin(), upload.begin() + luma_bytes, 16);
-    std::fill(upload.begin() + luma_bytes, upload.end(), 128);
-
-    {
+void CameraRelay::Worker::run(LUID adapter, CameraRelayConfig config, CameraDevice camera,
+                              Subscribe subscribe) {
+    const auto fail = [&](const std::string& reason) {
+        // Also resolves a failed first-frame wait; drive() must always be able
+        // to answer a pending StartCamera before collecting the worker.
         std::lock_guard<std::mutex> lock(mutex);
-        resolved = true;
-        ready = true;
-        width = surface_width;
-        height = surface_height;
-        detail = std::to_string(source_width) + "x" + std::to_string(source_height) +
-                 " encoded at " + std::to_string(surface_width) + "x" +
-                 std::to_string(surface_height) + ", " + codec_name(encoder->codec()) + ", " +
-                 encoder->implementation() + ", " +
-                 std::to_string(encoder->bitrate() / 1000u) + " kbps";
+        if (!resolved) { resolved = true; ready = false; }
+        failed = ended = true;
+        failure = reason;
+    };
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        camera.symbolic_link.data(), static_cast<int>(camera.symbolic_link.size()), nullptr, 0);
+    if (length <= 0 || !subscribe || !config.capture) {
+        fail("camera has no valid capture service or device identity");
+        return;
     }
+    std::wstring key(length, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, camera.symbolic_link.data(),
+        static_cast<int>(camera.symbolic_link.size()), key.data(), length);
+    std::string reason;
+    auto subscription = subscribe(L"camera:" + key, [config, camera, adapter](std::string* error) {
+        return config.capture(camera, adapter, config.framerate, error);
+    }, &reason);
+    auto& capture = subscription.capture;
+    if (!capture) { fail(reason); return; }
+    // The relay copies the last accepted settings before this thread starts.
+    const auto initial_options = accepted_options;
+    if (initial_options && subscription.quality) subscription.quality(*initial_options);
 
-    D3D11_BOX box{};
-    box.right = surface_width;
-    box.bottom = surface_height;
-    box.back = 1;
-    std::vector<EncodedPacket> packets;
-    bool first = true;
-    uint64_t first_pts = 0;
+    EncoderConfig wanted;
+    wanted.codec = config.codec;
+    if (initial_options) wanted.chroma = initial_options->chroma;
+    wanted.framerate = config.framerate;
+    wanted.quality_ratio = config.quality_ratio;
+    wanted.backend = config.backend;
+    std::unique_ptr<IVideoEncoder> encoder;
+    const auto started = Clock::now();
+    auto retry = Clock::time_point{};
+    auto missing_since = started;
+    bool first = true, need_idr = true, reinitialize = false;
+    StreamOptionsResult effective;
+    effective.fps = static_cast<uint16_t>(config.framerate);
+    effective.quality = config.quality_ratio >= 1.0f ? StreamQuality::High :
+        config.quality_ratio >= 0.6f ? StreamQuality::Balanced : StreamQuality::Smooth;
+    if (initial_options) effective.quality = initial_options->quality;
     while (!stop.load()) {
-        CameraFrame frame;
-        const Error read = capture->read(kReadTimeout, [&](CameraFrame&& got) {
-            frame = std::move(got);
-        });
-        if (!read.ok()) {
-            if (stop.load()) {
-                break;
+        std::optional<StreamOptions> options;
+        { std::lock_guard<std::mutex> lock(mutex); options.swap(pending_options); }
+        if (options) {
+            auto result = effective;
+            auto requested = wanted;
+            requested.chroma = options->chroma;
+            auto replacement = DesktopStreamPool::vote_codec(*capture, requested, codec_vote(options->codec), &reason);
+            if (replacement) {
+                wanted.chroma = options->chroma;
+                const bool changed = !encoder || encoder->codec() != replacement->codec() || encoder->chroma() != replacement->chroma() ||
+                    encoder->width() != replacement->width() || encoder->height() != replacement->height();
+                encoder = std::move(replacement);
+                if (subscription.quality) subscription.quality(*options);
+                encoder->set_rate(0, 0); // Applies the shared policy; retries are owned by the service.
+                effective.codec = encoder->codec();
+                effective.chroma = encoder->chroma();
+                effective.fps = static_cast<uint16_t>(encoder->framerate());
+                effective.quality = options->quality;
+                result = effective;
+                if (changed) resync();
+            } else {
+                result.code = StreamOptionsCode::Failed;
+                result.reason = reason;
             }
-            if (read.status() == Status::WaitTimeout) {
-                continue;
-            }
-            mark_ended("capture: " + read.to_string(), true);
-            return;
-        }
-        if (frame.width != source_width || frame.height != source_height) {
-            mark_ended("the camera changed its frame size", true);
-            return;
-        }
-        if (first) {
-            first_pts = frame.timestamp_ms;
-        }
-        const uint64_t pts_ms = frame.timestamp_ms - first_pts;
-        const bool force = first || force_keyframe.exchange(false);
-        if (!force) {
             std::lock_guard<std::mutex> lock(mutex);
-            if (frames.size() >= kBacklogSkip) {
-                // The session thread is behind; this frame would only be
-                // dropped after encoding. Skipping it loses no encoded frame,
-                // so no IDR is needed.
-                ++skipped;
+            if (result.code == StreamOptionsCode::Ok) accepted_options = *options;
+            options_result = std::move(result);
+        }
+        if (Clock::now() < retry) {
+            std::this_thread::sleep_for(kReadTimeout);
+            continue;
+        }
+        if (force_keyframe.exchange(false)) {
+            DesktopStreamPool::discard_backlog(*capture);
+            need_idr = true;
+        }
+        if (reinitialize) {
+            const auto result = capture->reinitialize();
+            if (!result.ok()) {
+                if (Clock::now() - missing_since >= kStartupTimeout) {
+                    fail("capture recovery: " + result.to_string());
+                    return;
+                }
+                retry = Clock::now() + std::chrono::seconds(1);
                 continue;
             }
+            reinitialize = false;
         }
-
-        for (uint32_t row = 0; row < source_height; ++row) {
-            std::memcpy(upload.data() + static_cast<size_t>(row) * surface_width,
-                        frame.data.data() + static_cast<size_t>(row) * source_width,
-                        source_width);
+        const auto result = capture->capture(kReadTimeout);
+        if (result == CaptureResult::ReinitNeeded) {
+            resync();
+            encoder.reset();
+            reinitialize = true;
+            continue;
         }
-        const uint8_t* source_chroma =
-            frame.data.data() + static_cast<size_t>(source_width) * source_height;
-        uint8_t* target_chroma = upload.data() + luma_bytes;
-        for (uint32_t row = 0; row < source_height / 2; ++row) {
-            std::memcpy(target_chroma + static_cast<size_t>(row) * surface_width,
-                        source_chroma + static_cast<size_t>(row) * source_width, source_width);
-        }
-        // One call fills the whole NV12 surface: the runtime takes the chroma
-        // plane from the second half of the source buffer.
-        context->UpdateSubresource(texture.get(), 0, &box, upload.data(), surface_width, 0);
-
-        packets.clear();
-        const Error encoded = encoder->encode(texture.get(), pts_ms, force, packets);
-        if (!encoded.ok()) {
-            mark_ended("encode: " + encoded.to_string(), true);
+        if (result == CaptureResult::FatalError) {
+            fail("video service: " + capture->last_error().to_string());
             return;
         }
-        for (EncodedPacket& packet : packets) {
-            if (packet.data.empty()) {
-                continue;
+        if (result != CaptureResult::Frame) {
+            if (first && Clock::now() - missing_since >= kStartupTimeout) {
+                fail("camera produced no usable first frame");
+                return;
+            }
+            continue;
+        }
+        const auto frame = capture->frame();
+        if (!encoder || encoder->codec() != DesktopStreamPool::codec(*capture) ||
+            encoder->chroma() != DesktopStreamPool::chroma(*capture) ||
+            encoder->width() != frame.nv12_width || encoder->height() != frame.nv12_height) {
+            encoder = first && initial_options
+                ? DesktopStreamPool::vote_codec(*capture, wanted, codec_vote(initial_options->codec), &reason)
+                : DesktopStreamPool::encoder(*capture, wanted, &reason);
+            if (!encoder) {
+                if (!first && DesktopStreamPool::encoder_recovery_pending(*capture)) {
+                    retry = Clock::now() + std::chrono::seconds(1);
+                    continue;
+                }
+                fail("encoder: " + reason);
+                return;
+            }
+            // A new generation starts with a fresh reference chain, including
+            // when another viewer changes the global codec.
+            { std::lock_guard<std::mutex> lock(mutex);
+              frames.clear(); frame_bytes = 0; waiting_idr = true; }
+            need_idr = true;
+        }
+        effective.codec = encoder->codec();
+        effective.chroma = encoder->chroma();
+        effective.fps = static_cast<uint16_t>(encoder->framerate());
+        std::vector<EncodedPacket> packets;
+        const auto pts = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - started).count());
+        const auto encoded = encoder->encode(nullptr, pts, need_idr, packets);
+        if (!encoded.ok()) { fail("shared camera encoder: " + encoded.to_string()); return; }
+        for (auto& packet : packets) {
+            if (packet.data.empty() || (need_idr && !packet.idr)) continue;
+            if (packet.data.size() > kMaxQueuedBytes) {
+                fail("camera access unit exceeds the relay buffer limit");
+                return;
+            }
+            need_idr = false;
+            if (first) {
+                std::lock_guard<std::mutex> lock(mutex);
+                resolved = ready = true;
+                width = encoder->width(); height = encoder->height();
+                detail = std::to_string(width) + "x" + std::to_string(height) + ", " +
+                    codec_name(encoder->codec()) + ", " + encoder->implementation();
+                first = false;
             }
             FrameHeader header;
             header.pts_ms = packet.pts_ms;
-            header.width = encoder->width();
-            header.height = encoder->height();
+            header.width = encoder->width(); header.height = encoder->height();
             header.codec = encoder->codec();
-            header.keyframe = packet.keyframe;
-            header.idr = packet.idr;
-            header.capture_ms = capture_clock_ms();
+            header.chroma = encoder->chroma();
+            header.keyframe = packet.keyframe; header.idr = packet.idr;
+            header.capture_ms = DesktopStreamPool::capture_time(*capture) & 0xFFFFFFFFFFFFull;
             publish(Packet{header, std::move(packet.data)});
+            missing_since = Clock::now();
         }
-        first = false;
+        if (first && Clock::now() - started >= kStartupTimeout) {
+            fail("camera encoder produced no usable first IDR");
+            return;
+        }
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        ended = true;
-    }
+    mark_ended({}, false);
 }
 
 CameraRelay::CameraRelay(QuicSession& session, AdapterProvider adapter,
-                         const CameraRelayConfig& config)
-    : session_(session), adapter_(std::move(adapter)), config_(config) {}
+                         const CameraRelayConfig& config, Subscribe subscribe)
+    : session_(session), adapter_(std::move(adapter)), config_(config),
+      subscribe_(std::move(subscribe)) {}
 
 CameraRelay::~CameraRelay() {
     if (!worker_) {
@@ -375,7 +341,7 @@ void CameraRelay::send_list() {
         list.code = CameraCode::Refused;
         list.reason = "camera access is not permitted by the host";
     } else {
-        listed_ = enumerate_cameras();
+        listed_ = config_.devices ? config_.devices() : std::vector<CameraDevice>{};
         for (const CameraDevice& device : listed_) {
             list.cameras.push_back(CameraDescription{device.id, device.name, device.is_default});
         }
@@ -414,12 +380,16 @@ void CameraRelay::start_camera(uint16_t camera_id, std::vector<std::string>& eve
     worker_ = std::make_unique<Worker>();
     worker_->camera_id = camera_id;
     worker_->name = chosen->name;
+    worker_->accepted_options = options_;
     Worker* worker = worker_.get();
     const CameraDevice camera = *chosen;
     const LUID adapter = adapter_();
     const CameraRelayConfig config = config_;
-    worker->thread = std::thread(
-        [worker, adapter, config, camera] { worker->run(adapter, config, camera); });
+    worker->thread = std::thread([worker, adapter, config, camera, subscribe = subscribe_] {
+        try { worker->run(adapter, config, camera, subscribe); }
+        catch (const std::exception& error) { worker->resolve_failed(error.what()); }
+        catch (...) { worker->resolve_failed("unexpected camera service failure"); }
+    });
     events.push_back("camera \"" + chosen->name + "\": opening");
 }
 
@@ -503,7 +473,7 @@ void CameraRelay::drive(std::vector<std::string>& events) {
 
 void CameraRelay::send_frames(std::vector<std::string>& events) {
     Worker& worker = *worker_;
-    if (!worker.answered) {
+    if (!worker.answered || worker.stop.load()) {
         return;
     }
     for (;;) {
@@ -527,8 +497,8 @@ void CameraRelay::send_frames(std::vector<std::string>& events) {
         if (sent.status() == Status::WaitTimeout) {
             // The transport dropped this packet; the reference chain is broken
             // from here, so the encoder has to produce an IDR next.
-            worker.force_keyframe = true;
-            continue;
+            worker.resync();
+            break;
         }
         events.push_back("camera \"" + worker.name + "\": cannot send a frame: " +
                          sent.to_string());
@@ -537,8 +507,40 @@ void CameraRelay::send_frames(std::vector<std::string>& events) {
     }
 }
 
+void CameraRelay::stream_options() {
+    if (!config_.stream_options) return;
+    std::optional<StreamOptionsResult> answer;
+    if (worker_) {
+        std::lock_guard<std::mutex> lock(worker_->mutex);
+        answer.swap(worker_->options_result);
+        if (answer && answer->code == StreamOptionsCode::Ok) options_ = worker_->accepted_options;
+        if (!answer && worker_->options_inflight && (worker_->ended || worker_->stop.load())) {
+            answer = StreamOptionsResult{};
+            answer->code = StreamOptionsCode::Failed;
+            answer->reason = "the camera stopped while changing video options";
+        }
+        if (answer) worker_->options_inflight = false;
+    }
+    if (answer) session_.send_stream_options_result(*answer);
+    StreamOptions options;
+    if (!session_.take_stream_options_request(options)) return;
+    if (worker_) {
+        std::lock_guard<std::mutex> lock(worker_->mutex);
+        if (worker_->ready && !worker_->ended && !worker_->stop.load() && !worker_->options_inflight) {
+            worker_->pending_options = options;
+            worker_->options_inflight = true;
+            return;
+        }
+    }
+    StreamOptionsResult busy;
+    busy.code = StreamOptionsCode::Busy;
+    busy.reason = "wait for the camera to stream and its previous options to finish";
+    session_.send_stream_options_result(busy);
+}
+
 std::vector<std::string> CameraRelay::pump() {
     std::vector<std::string> events;
+    if (worker_ && (session_.permissions() & kPermissionCamera) == 0) worker_->stop = true;
     if (session_.take_camera_list_request()) {
         send_list();
     }
@@ -553,6 +555,7 @@ std::vector<std::string> CameraRelay::pump() {
             events.push_back("camera \"" + worker_->name + "\": stopped by the viewer");
         }
     }
+    stream_options();
     if (worker_) {
         drive(events);
     }

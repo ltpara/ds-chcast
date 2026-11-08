@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 49.
+// The chast wire protocol, version 60.
 //
 // One QUIC connection carries:
 //
@@ -52,13 +52,13 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 49;
+inline constexpr uint16_t kProtocolVersion = 61;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
 inline constexpr char kAlpn[] = "chast/1";
 
-inline constexpr size_t kFrameHeaderSize = 48;
+inline constexpr size_t kFrameHeaderSize = 52;
 inline constexpr size_t kAudioHeaderSize = 48;
 inline constexpr size_t kControlHeaderSize = 12;
 inline constexpr uint32_t kMaxFramePayload = 32u * 1024u * 1024u;
@@ -92,7 +92,8 @@ enum class ControlType : uint16_t {
     // answers on the same control stream with LatencyReply. The four
     // timestamps give the viewer the round-trip time and the offset between
     // the two monotonic clocks, which is what turns FrameHeader::capture_ms
-    // into an end-to-end frame age. Sent about once a second.
+    // into an end-to-end frame age. The host also sends probes for application
+    // RTT (v51); replies echo the origin stamp with the receiver's two stamps.
     LatencyProbe = 10,
     // Answer to LatencyProbe. Payload: client_us, host_recv_us, host_send_us
     // (u64 each). All are steady_clock readings in microseconds since that
@@ -190,9 +191,8 @@ enum class ControlType : uint16_t {
     // Viewer -> host: the video preferences for this session. Payload:
     // codec (u8, see StreamCodecPreference), maximum frame rate (u16,
     // 0 = the host's configured rate), and quality (u8, see StreamQuality).
-    // The host can only lower its own budget, never raise it; the answer is
-    // StreamOptionsResult. Changing preferences does not require input
-    // permission because it only affects this viewer's picture.
+    // The host aggregates desktop viewers' preferences; the answer is
+    // StreamOptionsResult. Changing preferences does not require input control.
     SetStreamOptions = 30,
     // Host -> viewer: the outcome of SetStreamOptions. Payload: code (u8),
     // effective codec (u8, 1 = H.264, 2 = HEVC, 3 = AV1), effective frame rate (u16),
@@ -264,7 +264,8 @@ enum class ControlType : uint16_t {
     // request id (u32), directory length (u16), UTF-8 directory relative to
     // the shared root with '/' separators (empty means the root). Requires
     // the file-transfer permission and the host's gate; the host answers
-    // FileListResult. Protocol v30.
+    // FileListResult. Since v56, a u16 length and UTF-8 continuation cursor
+    // follow the directory. An empty cursor starts a fresh listing.
     FileListRequest = 45,
     // Host -> viewer: the answer to FileListRequest. Payload: request id
     // (u32), code (u8, see FileCode), flags (u8, bit 0 = cut at the entry
@@ -272,7 +273,8 @@ enum class ControlType : uint16_t {
     // UTF-8 name (u16 length), size (u64), modification time (u64, Unix
     // milliseconds, 0 when unknown) and flags (u8, bit 0 = directory).
     // Entries are directories first, then by name; a non-Ok answer carries
-    // no entries.
+    // no entries. Since v56, a u16 length and UTF-8 next cursor follow all
+    // entries; the cursor is nonempty exactly when another page exists.
     FileListResult = 46,
     // Viewer -> host: ask for one file from the shared folder. Payload:
     // request id (u32), path length (u16), UTF-8 path relative to the shared
@@ -416,6 +418,25 @@ enum class ControlType : uint16_t {
     // of attached desktop outputs, not allocated PnP monitors, and ids stay
     // stable for the session so a list index is never a wire identity.
     DisplayControlState = 68,
+    // Viewer -> host: cumulative desktop access-unit receipt, after the
+    // application takes the frame. Payload: sequence (u64). Protocol v52.
+    VideoReceipt = 69,
+    // Ordered desktop subscription mutations with RustDesk add/sub/set
+    // semantics. Unlike SwitchDisplay, these must never be coalesced.
+    CaptureDisplays = 70,
+    CaptureDisplaysResult = 71,
+    // One independently decoded desktop stream changed its format/geometry.
+    DisplayStreamInfo = 72,
+    // A keyframe request names one stream, leaving other decoders alone.
+    DisplayKeyframeRequest = 73,
+    // Source-relative cursor state for one subscribed desktop stream. v55.
+    DisplayCursorUpdate = 74,
+    // v59, either direction. A bounded range of one advertised clipboard file.
+    ClipboardFileRead = 75,
+    ClipboardFileData = 76,
+    // v60: request local UAC approval. No OS credential travels on the wire.
+    ElevationRequest = 77,
+    ElevationState = 78,
 };
 
 // ----- input -----
@@ -622,6 +643,25 @@ struct ClipboardUpdate {
     std::string text;
 };
 
+inline constexpr uint32_t kMaxClipboardFileRead = 64 * 1024;
+struct ClipboardFileRead {
+    uint32_t request_id = 0;
+    uint64_t generation = 0;
+    uint32_t index = 0;
+    uint64_t offset = 0;
+    uint32_t length = 0;
+};
+struct ClipboardFileData {
+    uint32_t request_id = 0;
+    uint64_t generation = 0;
+    bool ok = false;
+    std::vector<uint8_t> bytes;
+};
+std::vector<uint8_t> make_clipboard_file_read(const ClipboardFileRead& request);
+bool parse_clipboard_file_read(const std::vector<uint8_t>& payload, ClipboardFileRead& request, std::string* error);
+std::vector<uint8_t> make_clipboard_file_data(const ClipboardFileData& response);
+bool parse_clipboard_file_data(const std::vector<uint8_t>& payload, ClipboardFileData& response, std::string* error);
+
 // ----- file transfer -----
 //
 // A transfer starts with FileOffer on the control stream and, once the
@@ -732,12 +772,29 @@ struct FileListEntry {
     bool directory = false;
 };
 
+// Stateless continuation in directory-first, UTF-8 byte name order. A cursor
+// is empty or "d:<name>" / "f:<name>"; it never supplies a filesystem path.
+bool valid_file_list_cursor(const std::string& cursor);
+inline std::string file_list_cursor(const FileListEntry& entry) {
+    return std::string(entry.directory ? "d:" : "f:") + entry.name;
+}
+inline bool file_list_entry_less(const FileListEntry& left, const FileListEntry& right) {
+    return left.directory != right.directory ? left.directory : left.name < right.name;
+}
+
+struct FileListRequest {
+    uint32_t request_id = 0;
+    std::string directory;
+    std::string cursor;
+};
+
 struct FileListResult {
     uint32_t request_id = 0;
     FileCode code = FileCode::Ok;
     bool truncated = false;
     std::string reason;
     std::vector<FileListEntry> entries;
+    std::string next_cursor;
 };
 
 struct FileDownloadResult {
@@ -769,9 +826,11 @@ bool valid_file_browser_name(const std::string& name);
 // reasons and return an empty vector; the parsers reject the same cases plus
 // trailing bytes.
 std::vector<uint8_t> make_file_list_request(uint32_t request_id,
-                                            const std::string& directory);
+                                            const std::string& directory,
+                                            const std::string& cursor = {});
 bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
-                             std::string& directory, std::string* error);
+                             std::string& directory, std::string* error,
+                             std::string* cursor = nullptr);
 std::vector<uint8_t> make_file_list_result(const FileListResult& result);
 bool parse_file_list_result(const std::vector<uint8_t>& payload, FileListResult& result,
                             std::string* error);
@@ -833,6 +892,14 @@ struct CursorUpdate {
     std::vector<uint8_t> sprite;
 };
 
+struct DisplayCursorUpdate {
+    uint32_t stream_id = 0;
+    CursorUpdate cursor;
+};
+
+// Keep a not-yet-consumed shape when a later update only moves that shape.
+void coalesce_cursor_update(CursorUpdate& pending, CursorUpdate update);
+
 // ----- audio -----
 //
 // System sound travels one way on a server-initiated `CAUD` stream; the
@@ -864,6 +931,9 @@ struct AudioInfo {
 };
 
 struct FrameHeader {
+    // v54: 0 is the original desktop (and camera) stream. Additional desktop
+    // subscriptions use connection-local IDs, never reused during a session.
+    uint32_t stream_id = 0;
     uint64_t seq = 0;
     // Presentation time relative to the host session's first stream. Ordering
     // and pacing only; it is not comparable across sessions or machines.
@@ -880,6 +950,7 @@ struct FrameHeader {
     // picture without assuming the two clocks share an epoch. Zero when the
     // sender does not know (a synthetic frame).
     uint64_t capture_ms = 0;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
 
 // One compressed audio access unit. A media stream never mixes audio and
@@ -930,7 +1001,7 @@ bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo
                                      size_t& consumed, std::string* error);
 
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents; bit 1 tells
-// it that both sides may exchange clipboard content; bit 2 tells it the host
+// it that clipboard is granted within clipboard_direction; bit 2 tells it the host
 // opened an audio stream and described the format in the audio block; bit 3
 // tells it that file offers are accepted; bit 4 that the viewer may open a
 // microphone stream; bit 5 that SetPrivacyMode is accepted; bit 7 that the
@@ -967,6 +1038,7 @@ inline constexpr uint16_t kServerInfoControlOnly = 0x2000;
 // The terminal permission must also be granted. Not a permission bit: it says
 // the operator enabled terminal persistence (host.ini terminal_persist=).
 inline constexpr uint16_t kServerInfoTerminalPersist = 0x4000;
+inline constexpr uint16_t kServerInfoYuv444 = 0x8000;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
 // this mask rather than with every known flag. Restart and block input have no
@@ -987,7 +1059,7 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoFileTransferOnly |
                                                   kServerInfoAudioDatagram |
                                                   kServerInfoControlOnly |
-                                                  kServerInfoTerminalPersist;
+                                                  kServerInfoTerminalPersist | kServerInfoYuv444;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size (a u32 since v49), PermissionUpdate replaces it
@@ -1188,6 +1260,21 @@ struct DisplayModeList {
 // whether an audio stream follows; when true, `audio` carries the codec, rate,
 // channel count and AudioSpecificConfig needed to decode it. Audio that fails
 // mid-session is turned off with a StreamInfo.
+// v57: clipboard policy is always expressed relative to the host. The
+// permission bit and the viewer's pause switch remain independent gates.
+enum class ClipboardDirection : uint8_t {
+    Disabled = 0,
+    HostToViewer = 1,
+    ViewerToHost = 2,
+    Both = 3,
+};
+inline constexpr bool clipboard_from_host(ClipboardDirection direction) {
+    return (static_cast<uint8_t>(direction) & 1) != 0;
+}
+inline constexpr bool clipboard_to_host(ClipboardDirection direction) {
+    return (static_cast<uint8_t>(direction) & 2) != 0;
+}
+
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
     uint16_t width = 0;         // encoded picture size
@@ -1200,6 +1287,7 @@ struct ServerInfo {
     int32_t origin_y = 0;
     bool input_enabled = false;
     bool clipboard_enabled = false;
+    ClipboardDirection clipboard_direction = ClipboardDirection::Both;
     bool file_transfer_enabled = false;
     // The picture is the union of every attached output (kDisplayAll), not a
     // single captured output. `origin_x/y` and `source_width/height` describe
@@ -1263,7 +1351,43 @@ struct ServerInfo {
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
+
+struct CaptureDisplaysRequest {
+    uint32_t request_id = 0;
+    std::vector<uint16_t> add;
+    // Keep only these already-subscribed displays; do not create new ones.
+    std::vector<uint16_t> sub;
+    std::vector<uint16_t> set;
+};
+
+struct DisplayStreamInfo {
+    uint32_t stream_id = 0;
+    uint16_t display_index = 0;
+    ServerInfo info;
+};
+
+struct CaptureDisplaysResult {
+    uint32_t request_id = 0;
+    DisplaySwitchCode code = DisplaySwitchCode::Ok;
+    std::string reason;
+    // Complete resulting subscription set, including on refusal.
+    std::vector<DisplayStreamInfo> streams;
+};
+
+std::vector<uint8_t> make_capture_displays(const CaptureDisplaysRequest& request);
+bool parse_capture_displays(const std::vector<uint8_t>& payload,
+                            CaptureDisplaysRequest& request, std::string* error);
+std::vector<uint8_t> make_capture_displays_result(const CaptureDisplaysResult& result);
+bool parse_capture_displays_result(const std::vector<uint8_t>& payload,
+                                   CaptureDisplaysResult& result, std::string* error);
+std::vector<uint8_t> make_display_stream_info(const DisplayStreamInfo& info);
+bool parse_display_stream_info(const std::vector<uint8_t>& payload,
+                               DisplayStreamInfo& info, std::string* error);
+std::vector<uint8_t> make_display_keyframe_request(uint32_t stream_id);
+bool parse_display_keyframe_request(const std::vector<uint8_t>& payload,
+                                    uint32_t& stream_id, std::string* error);
 
 // What the receiver reports before it closes the connection.
 struct ClientStats {
@@ -1333,6 +1457,7 @@ inline constexpr uint8_t kAuthFlagsKnown = kAuthFlagTrustDevice | kAuthFlagSigne
 inline constexpr uint8_t kClientCapabilityAudioDatagram = 0x01;
 inline constexpr uint8_t kClientCapabilitiesKnown = kClientCapabilityAudioDatagram;
 
+enum class StreamCodecPreference : uint8_t;
 struct ClientHello {
     uint16_t display = kDisplayAuto;
     std::string access_token;
@@ -1366,6 +1491,12 @@ struct ClientHello {
     // fills it from its configuration so a client can opt out of datagram
     // audio for A/B measurements.
     uint8_t capabilities = 0;
+    // v50: formats this receiver can actually decode. Shared encoders use the
+    // intersection of their subscribers. Non-video modes may advertise zero.
+    VideoCodecMask decoding_codecs = kVideoCodecAll;
+    StreamCodecPreference codec_preference = static_cast<StreamCodecPreference>(0);
+    VideoCodecMask decoding_444 = 0;
+    VideoChroma prefer_chroma = VideoChroma::Yuv420;
 };
 
 // The server accepts an empty reference or 8..64 lowercase hex digits. The
@@ -1432,6 +1563,9 @@ bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::s
 // values are steady_clock microseconds; the host echoes the client's stamp so
 // an out-of-order reply can still be paired with its probe.
 std::vector<uint8_t> make_latency_probe(uint64_t client_us);
+std::vector<uint8_t> make_video_receipt(uint64_t sequence);
+bool parse_video_receipt(const std::vector<uint8_t>& payload, uint64_t& sequence,
+                         std::string* error);
 bool parse_latency_probe(const std::vector<uint8_t>& payload, uint64_t& client_us,
                          std::string* error);
 std::vector<uint8_t> make_latency_reply(uint64_t client_us, uint64_t host_recv_us,
@@ -1773,6 +1907,21 @@ bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
 // to deserve its own permission bit and an explicit answer. Block input is a
 // state, so its request carries the wanted state and the answer carries the
 // state in effect after the call.
+// request_id == 0 is a host announcement; requests require a nonzero id.
+enum class ElevationCode : uint8_t {
+    Unsupported = 0, Available = 1, Elevated = 2, Pending = 3,
+    Restarting = 4, Cancelled = 5, Denied = 6, Busy = 7, Failed = 8,
+};
+struct ElevationState {
+    uint32_t request_id = 0;
+    ElevationCode code = ElevationCode::Unsupported;
+    std::string reason;
+};
+std::vector<uint8_t> make_elevation_request(uint32_t request_id);
+bool parse_elevation_request(const std::vector<uint8_t>& payload, uint32_t& request_id, std::string* error);
+std::vector<uint8_t> make_elevation_state(const ElevationState& state);
+bool parse_elevation_state(const std::vector<uint8_t>& payload, ElevationState& state, std::string* error);
+
 inline constexpr size_t kMaxHostActionReason = 256;
 
 enum class HostAction : uint8_t {
@@ -1923,6 +2072,9 @@ bool parse_session_select_result(const std::vector<uint8_t>& payload,
 std::vector<uint8_t> make_cursor_update(const CursorUpdate& update);
 bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& update,
                          std::string* error);
+std::vector<uint8_t> make_display_cursor_update(const DisplayCursorUpdate& update);
+bool parse_display_cursor_update(const std::vector<uint8_t>& payload,
+                                 DisplayCursorUpdate& update, std::string* error);
 // Host -> viewer permission change. Unknown bits are rejected so a newer
 // sender cannot silently grant something this build does not understand.
 std::vector<uint8_t> make_permission_update(PermissionMask permissions);
@@ -2000,31 +2152,31 @@ bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
 
 // ----- stream options -----
 //
-// The viewer chooses how its own picture is produced: encoder family, a
-// frame-rate ceiling, and a quality preset that scales the host's video
-// budget. The host keeps its configured bitrate as a hard ceiling and never
-// follows a preference beyond it, so a viewer can only ask for less. The
-// choice lives for the session; a reconnect starts from the host's defaults
-// until the viewer sends it again.
+// Each connection contributes a codec vote, FPS ceiling and quality choice
+// to the host-wide policy. Codec votes use the global capability intersection;
+// FPS takes the lowest ceiling and quality uses the latest explicit choice.
+// The host's configured bitrate remains a hard ceiling. Hello carries the
+// initial codec vote; these options update it without changing subscriptions.
 
 enum class StreamCodecPreference : uint8_t {
-    Auto = 0,  // follow the host's configured encoder
-    H264 = 1,  // require H.264
-    Hevc = 2,  // require HEVC; refused when the host cannot produce it
-    // Require AV1 from a hardware encoder. Refused on hosts whose GPU has no
-    // AV1 encoder; there is no software fallback. Protocol v45.
+    Auto = 0,  // no vote: prefer usable HEVC, H.264, then AV1
+    H264 = 1,  // vote for H.264 across all desktop connections
+    Hevc = 2,  // vote for HEVC when every viewer and active display support it
+    // Vote for hardware AV1. An unusable vote is retained but not counted;
+    // there is no software fallback. Introduced in v45; voting since v53.
     Av1 = 3,
+    Vp9 = 4,
 };
 
 enum class StreamQuality : uint8_t {
-    High = 0,      // the full video budget
-    Balanced = 1,  // 75% of it
-    Smooth = 2,    // 50% of it
+    High = 0,      // RustDesk Best ratio: 1.5
+    Balanced = 1,  // RustDesk Balanced ratio: 0.67
+    Smooth = 2,    // RustDesk Low ratio: 0.5
 };
 
-// Why a preference change did not fully take effect. Ok means the stream now
-// matches the request (or already did); every other code leaves the running
-// stream untouched.
+// Ok accepts the vote; the returned codec is the globally negotiated result
+// and may differ from this viewer's preference. Unusable votes are retained
+// but excluded from counting. Other codes leave the previous vote in place.
 enum class StreamOptionsCode : uint8_t {
     Ok = 0,
     Unsupported = 1,  // the host cannot produce the requested encoder
@@ -2041,6 +2193,7 @@ struct StreamOptions {
     // a ceiling: the adaptive ladder may still go below it.
     uint16_t max_fps = 0;
     StreamQuality quality = StreamQuality::High;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
 
 struct StreamOptionsResult {
@@ -2052,6 +2205,7 @@ struct StreamOptionsResult {
     uint16_t fps = 0;
     StreamQuality quality = StreamQuality::High;
     std::string reason;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
 
 std::vector<uint8_t> make_set_stream_options(const StreamOptions& options);

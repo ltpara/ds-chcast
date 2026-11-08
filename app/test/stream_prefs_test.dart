@@ -44,7 +44,14 @@ void main() {
       'stream_codec': 2,
       'stream_quality': 1,
       'stream_max_fps': 30,
+      'stream_full_color': false,
     });
+  });
+
+  test('VP9 full color persists independently of quality', () {
+    StreamPreferences.save(const StreamPreferences(codec: 4, fullColor: true));
+    expect(StreamPreferences.load().codec, 4);
+    expect(StreamPreferences.load().fullColor, isTrue);
   });
 
   test('each invalid value falls back on its own', () {
@@ -79,6 +86,7 @@ void main() {
       'stream_codec': 0,
       'stream_quality': 0,
       'stream_max_fps': 0,
+      'stream_full_color': false,
     });
   });
 
@@ -90,6 +98,7 @@ void main() {
       'stream_codec': 1,
       'stream_quality': 2,
       'stream_max_fps': 60,
+      'stream_full_color': false,
       'language': 'en',
     });
     expect(StreamPreferences.load().maxFps, 60);

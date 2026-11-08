@@ -118,7 +118,7 @@ func TestTCPPunchRejectsBadHostSignature(t *testing.T) {
 	if reply.err != nil {
 		t.Fatalf("announce: %v", reply.err)
 	}
-	if reply.reply.OK || reply.reply.Error != "host signature does not match" {
+	if reply.reply.OK || reply.reply.Error != "punch authentication failed" {
 		t.Fatalf("bad host signature accepted: %+v", reply.reply)
 	}
 }
@@ -141,5 +141,63 @@ func TestTCPPunchRejectsViewerWithoutAuth(t *testing.T) {
 	}
 	if reply.reply.OK || reply.reply.Error != "punch authentication failed" {
 		t.Fatalf("unauthenticated viewer accepted: %+v", reply.reply)
+	}
+}
+
+func TestTCPPunchAcceptsHostOnlineThroughCarrier(t *testing.T) {
+	meet, _, _, priv := startMeet(t,
+		WithServerKey("test-key"),
+		WithHostCarrierLinked(func(id string) bool { return id == "devbox" }),
+	)
+	p := &tcpPuncher{srv: meet}
+	nonce := "tcp-punch-carrier-only"
+	if err := p.checkAnnounce(viewerAnnounce(nonce, time.Now().Unix())); err != nil {
+		t.Fatalf("carrier-backed host was rejected: %v", err)
+	}
+	if err := p.checkAnnounce(hostAnnounce(priv, nonce, time.Now().Unix())); err != nil {
+		t.Fatalf("authenticated carrier-backed host was rejected: %v", err)
+	}
+}
+
+func TestTCPPunchUnauthenticatedRolesDoNotRevealHostState(t *testing.T) {
+	for _, online := range []bool{false, true} {
+		name := "offline"
+		if online {
+			name = "online"
+		}
+		t.Run(name, func(t *testing.T) {
+			meet, reg, _, _ := startMeet(t, WithServerKey("test-key"))
+			if online {
+				if err := reg.Touch("devbox", "127.0.0.1:40001", nil, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, role := range []string{wire.RoleViewer, wire.RoleHost} {
+				for _, id := range []string{"devbox", "unknown-host"} {
+					msg := wire.Message{
+						Type: wire.TypeTCPPunch, Role: role, HostID: id,
+						Nonce: "tcp-punch-auth-state", Timestamp: time.Now().Unix(),
+					}
+					reply := tcpAnnounce(tcpPunchAddr(t, meet), msg)
+					if reply.err != nil {
+						t.Fatal(reply.err)
+					}
+					if reply.reply.OK || reply.reply.Error != "punch authentication failed" {
+						t.Fatalf("role %s, id %s disclosed host state: %+v", role, id, reply.reply)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTCPPunchAuthenticatesViewerBeforeRevealingHostState(t *testing.T) {
+	meet, _, _, _ := startMeet(t, WithServerKey("test-key"))
+	p := &tcpPuncher{srv: meet}
+	msg := viewerAnnounce("tcp-punch-auth-order", time.Now().Unix())
+	msg.Auth = ""
+	err := p.checkAnnounce(msg)
+	if err == nil || err.Error() != "punch authentication failed" {
+		t.Fatalf("unauthenticated announce error = %v, want authentication failure", err)
 	}
 }

@@ -15,7 +15,14 @@ drivers/usbmmidd_v2/
 # on first run, and the viewer writes its settings next to the executable.
 chast-server-identity.key
 chast-server-state.db
+chast-server-state.json
 ds-chcastbuildpf-gui.ini
+
+# Local process markers and temporary review snapshots.
+/host.pid
+/server/server.pid
+/.hostdiff.txt
+/.hs_review.diff
 
 # Certificates, private keys, logs and audit spools produced by local runs.
 # These are runtime material; a development tree must never publish them.

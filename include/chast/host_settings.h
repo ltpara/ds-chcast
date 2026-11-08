@@ -67,10 +67,12 @@ struct HostSettings {
     // The gate belongs to the host, and a remote-desktop host is not useful
     // without it; access control is the token and the approval, not this.
     bool allow_input = true;
-    // Sync clipboard changes (text, HTML, RTF and images) in both directions.
+    // Sync clipboard changes (including copied files) within the direction
+    // policy below. Direction can only be changed by the local operator.
     // Off means the HelloAck reports clipboard unavailable and the viewer
     // stays silent.
     bool allow_clipboard = true;
+    ClipboardDirection clipboard_direction = ClipboardDirection::Both;
     // Let the viewer offer files; the host answers and receives them into
     // file_receive_directory. Off means the HelloAck reports file transfer
     // unavailable and every FileOffer is ignored.
@@ -101,6 +103,10 @@ struct HostSettings {
     // RustDesk's "enable-record-session". On by default; advisory, because the
     // host cannot stop a recording once the stream has reached the viewer.
     bool allow_record = true;
+    // Local-only incoming video archive, independent of viewer consent.
+    // Off by default; enabling requires an explicit absolute UTF-8 folder.
+    bool record_incoming = false;
+    std::string record_directory;
     // UTF-8 directory for received files. Empty means Downloads\chast.
     std::string file_receive_directory;
     // Send the system sound to the viewer. Off means no audio stream is
@@ -179,6 +185,10 @@ struct HostSettings {
     // host-state change, like a restart. The lock runs after the session has
     // already ended, so it never interrupts the viewer.
     bool lock_after_session_end = false;
+    // Hold a power request during authenticated connections. Desktop sessions
+    // also keep the display awake; other session modes only keep the system
+    // awake. Local policy, applied when the host next starts.
+    bool keep_awake = true;
     // Close the session after this many minutes without viewer activity
     // (input, chat, clipboard and other viewer requests). 0 keeps it open until
     // one side leaves and is the default: a forgotten viewer should not hold
@@ -262,6 +272,11 @@ struct HostSettingsLoad {
 
 HostSettingsLoad load_host_settings(const std::string& path);
 bool save_host_settings(const std::string& path, const HostSettings& settings, std::string* error);
+// Same representation as host.ini, for authenticated local process handoffs.
+// source_path preserves path-derived defaults; these functions do no file I/O.
+HostSettingsLoad parse_host_settings(const std::string& text, const std::string& source_path);
+bool serialize_host_settings(const std::string& source_path, const HostSettings& settings,
+                             std::string& text, std::string* error);
 
 // %APPDATA%\chast and %ProgramData%\chast. The tray uses the first (per-user),
 // the service the second (machine-wide). Empty when the folder cannot be

@@ -6,11 +6,9 @@
 // the access units are muxed into MP4 unchanged, so recording costs no
 // encoder and no pixel copy.
 //
-// The wire format is Annex B with the parameter sets repeated on every key
-// frame (see chast/decoder.h), while MP4 stores samples as length-prefixed
-// NAL units plus an avcC (H.264) or hvcC (HEVC) record. The first key frame
-// therefore supplies the parameter sets and every sample is rewritten from
-// start codes to 4-byte lengths.
+// H.264/HEVC arrive as Annex B with parameter sets repeated on key frames;
+// MP4 needs length-prefixed NAL units plus avcC/hvcC. AV1 arrives as OBUs;
+// its first sequence header supplies av1C without the NAL conversion.
 //
 // A mid-session picture-size change (chast's resolution ladder stepping down
 // under pressure, or a display switch) or a codec change (the viewer's stream
@@ -38,9 +36,7 @@ extern "C" {
 
 namespace chast_tools {
 
-// H.264 and HEVC: both are muxed from the parameter sets the host repeats on
-// every key frame. An unsupported codec is refused with a clear message
-// instead of producing a file players cannot open.
+// H.264/HEVC use Annex B parameter sets; AV1 uses low-overhead OBUs.
 class Mp4Recorder {
 public:
     ~Mp4Recorder() { close(); }
@@ -54,13 +50,14 @@ public:
         base_path_ = path;
         codec_ = codec;
         if (!supported(codec)) {
-            *error = "MP4 recording supports H.264 and HEVC only; the host encoded " +
-                     std::string(chast_tools::codec_name(codec));
+            error_ = "unsupported recording codec: " + std::string(codec_name(codec));
+            if (error) *error = error_;
             failed_ = true;
             return false;
         }
         if (width == 0 || height == 0) {
-            *error = "the stream has no picture size to record";
+            error_ = "the stream has no picture size to record";
+            if (error) *error = error_;
             failed_ = true;
             return false;
         }
@@ -87,7 +84,7 @@ public:
             }
             return;
         }
-        if (header.codec != codec_ || header.width != width_ || header.height != height_) {
+        if (header.codec != codec_ || header.chroma != chroma_ || header.width != width_ || header.height != height_) {
             // The host re-announced a new picture size (the resolution ladder
             // stepped down or the display changed) or a new codec (the viewer
             // changed the stream options). One MP4 sample description cannot
@@ -98,7 +95,8 @@ public:
                 ++skipped_;
                 return;
             }
-            finalize_segment();
+            finalize_segment(header.pts_ms);
+            if (failed_) return;
             std::string error;
             if (!start(header, data, size, &error)) {
                 failed_ = true;
@@ -109,8 +107,10 @@ public:
         write_packet(header, data, size);
     }
 
-    void close() {
-        finalize_segment();
+    // An optional source-clock end preserves the quiet tail of a desktop
+    // session without encoding duplicate images just to advance a timestamp.
+    void close(uint64_t end_pts_ms = 0) {
+        finalize_segment(end_pts_ms);
         if (packet_) {
             av_packet_free(&packet_);
         }
@@ -127,7 +127,8 @@ public:
     const std::string& error() const { return error_; }
 
     static bool supported(chast::VideoCodec codec) {
-        return codec == chast::VideoCodec::H264 || codec == chast::VideoCodec::Hevc;
+        return codec == chast::VideoCodec::H264 || codec == chast::VideoCodec::Hevc ||
+               codec == chast::VideoCodec::Av1 || codec == chast::VideoCodec::Vp9;
     }
 
     // Re-opens the finished file with the FFmpeg demuxer and counts the
@@ -148,10 +149,10 @@ public:
         }
         AVStream* stream = format->nb_streams > 0 ? format->streams[0] : nullptr;
         const AVCodecID want =
-            expected == chast::VideoCodec::Hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+            codec_id(expected);
         if (!stream || stream->codecpar->codec_id != want ||
             stream->codecpar->width == 0 || stream->codecpar->height == 0 ||
-            stream->codecpar->extradata_size == 0) {
+            (expected != chast::VideoCodec::Vp9 && stream->codecpar->extradata_size == 0)) {
             avformat_close_input(&format);
             *error = "the recording has no usable " + std::string(codec_name(expected)) +
                      " stream";
@@ -179,18 +180,24 @@ public:
     }
 
 private:
+    static AVCodecID codec_id(chast::VideoCodec codec) {
+        return codec == chast::VideoCodec::Hevc ? AV_CODEC_ID_HEVC :
+               codec == chast::VideoCodec::Av1 ? AV_CODEC_ID_AV1 :
+               codec == chast::VideoCodec::Vp9 ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
+    }
     bool start(const chast::FrameHeader& header, const uint8_t* data, size_t size,
                std::string* error) {
         codec_ = header.codec;
-        if (!supported(codec_)) {
-            *error = "MP4 recording supports H.264 and HEVC only; the host encoded " +
-                     std::string(chast_tools::codec_name(codec_));
+        chroma_ = header.chroma;
+        if (!supported(codec_) || !chast::valid_video_format(codec_, chroma_)) {
+            *error = "unsupported recording codec: " + std::string(codec_name(codec_));
             return false;
         }
         std::vector<uint8_t> extradata;
         if (!build_extradata(data, size, &extradata)) {
             *error = std::string("the key frame carried no parameter sets to build ") +
-                     (codec_ == chast::VideoCodec::Hevc ? "hvcC" : "avcC");
+                     (codec_ == chast::VideoCodec::Hevc ? "hvcC" :
+                      codec_ == chast::VideoCodec::Av1 ? "av1C" : codec_ == chast::VideoCodec::Vp9 ? "vpcC" : "avcC");
             return false;
         }
         // The sample description follows the encoded picture, which is what the
@@ -209,8 +216,11 @@ private:
             return false;
         }
         stream_->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        stream_->codecpar->codec_id =
-            codec_ == chast::VideoCodec::Hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+        stream_->codecpar->codec_id = codec_id(codec_);
+        // Our realtime VP9 encoder emits one visible frame per access unit
+        // (no alt-ref or lookahead). Its packets are already MP4 samples;
+        // the optional vp9_superframe filter is neither needed nor bundled.
+        if (codec_ == chast::VideoCodec::Vp9) format_->flags &= ~AVFMT_FLAG_AUTO_BSF;
         // hvc1 keeps the parameter sets in hvcC; the in-band copies the host
         // repeats on key frames are identical to them for a given encoder.
         if (codec_ == chast::VideoCodec::Hevc) {
@@ -218,6 +228,17 @@ private:
         }
         stream_->codecpar->width = static_cast<int>(width_);
         stream_->codecpar->height = static_cast<int>(height_);
+        if (codec_ == chast::VideoCodec::Vp9) {
+            const bool full = chroma_ == chast::VideoChroma::Yuv444;
+            stream_->codecpar->format = full ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+            stream_->codecpar->profile = full ? AV_PROFILE_VP9_1 : AV_PROFILE_VP9_0;
+            stream_->codecpar->color_range = AVCOL_RANGE_MPEG;
+            stream_->codecpar->color_space = AVCOL_SPC_SMPTE170M;
+            stream_->codecpar->color_primaries = AVCOL_PRI_BT709;
+            stream_->codecpar->color_trc = AVCOL_TRC_BT709;
+            stream_->codecpar->chroma_location = AVCHROMA_LOC_LEFT;
+        }
+        if (!extradata.empty()) {
         stream_->codecpar->extradata =
             static_cast<uint8_t*>(av_malloc(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!stream_->codecpar->extradata) {
@@ -228,6 +249,7 @@ private:
         std::memset(stream_->codecpar->extradata + extradata.size(), 0,
                     AV_INPUT_BUFFER_PADDING_SIZE);
         stream_->codecpar->extradata_size = static_cast<int>(extradata.size());
+        }
         stream_->time_base = AVRational{1, 1000};
         if (avio_open(&format_->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) {
             *error = "could not open " + path + " for writing";
@@ -243,20 +265,29 @@ private:
         first_pts_ms_ = -1;
         last_pts_ms_ = -1;
         write_packet(header, data, size);
+        if (failed_) *error = error_;
         return !failed_;
     }
 
     // Finalises and releases the current segment. Safe to call when no segment
     // is open, so close() and a rollover share it.
-    void finalize_segment() {
+    void finalize_segment(uint64_t end_pts_ms = 0) {
         if (!format_) {
             return;
         }
         if (header_started_) {
-            av_write_trailer(format_);
+            flush_packet(end_pts_ms);
+            const int result = av_write_trailer(format_);
+            if (result < 0 || (format_->pb && format_->pb->error < 0)) {
+                failed_ = true;
+                if (error_.empty()) error_ = "could not finalize the MP4 recording: " + base_path_;
+            }
         }
         if (format_->pb) {
-            avio_closep(&format_->pb);
+            if (avio_closep(&format_->pb) < 0) {
+                failed_ = true;
+                if (error_.empty()) error_ = "could not close the MP4 recording: " + base_path_;
+            }
         }
         // The context owns the stream's codecpar (including extradata), so
         // freeing the context releases both.
@@ -279,14 +310,24 @@ private:
     }
 
     void write_packet(const chast::FrameHeader& header, const uint8_t* data, size_t size) {
-        std::vector<uint8_t> sample;
-        if (!to_length_prefixed(data, size, &sample)) {
+        if (!data || !size || size > INT_MAX ||
+            (last_pts_ms_ >= 0 && header.pts_ms <= static_cast<uint64_t>(last_pts_ms_))) {
+            ++skipped_;
             return;
         }
+        std::vector<uint8_t> sample;
+        if (codec_ == chast::VideoCodec::Av1 || codec_ == chast::VideoCodec::Vp9) sample.assign(data, data + size);
+        else if (!to_length_prefixed(data, size, &sample)) {
+            failed_ = true;
+            error_ = "invalid Annex B recording sample";
+            return;
+        }
+        flush_packet(header.pts_ms);
+        if (failed_) return;
         if (!packet_) {
             packet_ = av_packet_alloc();
         }
-        if (av_new_packet(packet_, static_cast<int>(sample.size())) < 0) {
+        if (!packet_ || sample.size() > INT_MAX || av_new_packet(packet_, static_cast<int>(sample.size())) < 0) {
             failed_ = true;
             error_ = "out of memory for a recording sample";
             return;
@@ -309,12 +350,21 @@ private:
         // drop the last picture. The previous spacing is the best estimate
         // available for the one that has nothing following it.
         const int64_t spacing_ms =
-            last_pts_ms_ >= 0 && pts_ms > last_pts_ms_ ? pts_ms - last_pts_ms_ : 0;
+            last_pts_ms_ >= 0 && pts_ms > last_pts_ms_ ? pts_ms - last_pts_ms_ : 33;
         packet_->duration =
             av_rescale_q(spacing_ms, AVRational{1, 1000}, stream_->time_base);
         last_pts_ms_ = pts_ms;
         packet_->stream_index = stream_->index;
         packet_->flags = header.keyframe ? AV_PKT_FLAG_KEY : 0;
+    }
+
+    void flush_packet(uint64_t end_pts_ms) {
+        if (!packet_ || !packet_->size) return;
+        if (end_pts_ms > static_cast<uint64_t>(last_pts_ms_)) {
+            packet_->duration = av_rescale_q(static_cast<int64_t>(end_pts_ms) - last_pts_ms_,
+                                             AVRational{1, 1000}, stream_->time_base);
+        }
+        const bool keyframe = (packet_->flags & AV_PKT_FLAG_KEY) != 0;
         if (av_interleaved_write_frame(format_, packet_) < 0) {
             failed_ = true;
             error_ = "could not write a sample to " +
@@ -324,14 +374,52 @@ private:
         }
         av_packet_unref(packet_);
         ++samples_;
-        if (header.keyframe) {
+        if (keyframe) {
             ++write_keyframes_;
         }
     }
 
     bool build_extradata(const uint8_t* data, size_t size, std::vector<uint8_t>* out) const {
+        if (codec_ == chast::VideoCodec::Vp9) {
+            // VP9 has no initialization data. FFmpeg writes vpcC from the
+            // profile, pixel format and colorimetry on codecpar. Require a
+            // matching, independently decodable 8-bit keyframe first.
+            if (!data || size < 4 || (data[0] & 0xcc) != 0x80 ||
+                data[1] != 0x49 || data[2] != 0x83 || data[3] != 0x42) return false;
+            const unsigned profile = ((data[0] >> 5) & 1) | (((data[0] >> 4) & 1) << 1);
+            return profile == (chroma_ == chast::VideoChroma::Yuv444 ? 1u : 0u);
+        }
+        if (codec_ == chast::VideoCodec::Av1) return av1_sequence(data, size, out);
         return codec_ == chast::VideoCodec::Hevc ? build_hvcc(data, size, out)
                                                  : build_avcc(data, size, out);
+    }
+
+    // The MP4 muxer builds av1C from a raw sequence-header OBU. Parse only
+    // OBU framing here; FFmpeg owns the sequence-header syntax and profile.
+    static bool av1_sequence(const uint8_t* data, size_t size, std::vector<uint8_t>* out) {
+        size_t pos = 0;
+        while (pos < size) {
+            const size_t start = pos;
+            const uint8_t header = data[pos++];
+            if ((header & 0x81) || !(header & 2)) return false;
+            if (header & 4) {
+                if (pos == size || (data[pos++] & 7)) return false;
+            }
+            uint64_t length = 0;
+            bool complete = false;
+            for (unsigned i = 0; i < 8 && pos < size; ++i) {
+                const uint8_t byte = data[pos++];
+                length |= uint64_t(byte & 127) << (i * 7);
+                if (!(byte & 128)) { complete = true; break; }
+            }
+            if (!complete || length > size - pos) return false;
+            if (((header >> 3) & 15) == 1) {
+                if (!length || !out->empty()) return false;
+                out->assign(data + start, data + pos + static_cast<size_t>(length));
+            }
+            pos += static_cast<size_t>(length);
+        }
+        return !out->empty();
     }
 
     // AVCDecoderConfigurationRecord (ISO/IEC 14496-15, 5.2.4.1.1) built from
@@ -659,6 +747,7 @@ private:
     std::vector<std::string> segments_;
     std::vector<chast::VideoCodec> segment_codecs_;
     chast::VideoCodec codec_ = chast::VideoCodec::H264;
+    chast::VideoChroma chroma_ = chast::VideoChroma::Yuv420;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     AVFormatContext* format_ = nullptr;

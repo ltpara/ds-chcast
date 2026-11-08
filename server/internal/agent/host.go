@@ -211,9 +211,14 @@ type HostAgent struct {
 	// tcpPunch is the rendezvous service's TCP punch coordination endpoint.
 	// tcpPunches bounds the host-side punch goroutines by nonce; tcpLinks are
 	// the live punched viewers, closed on shutdown so their routes end too.
-	tcpPunch   *net.TCPAddr
-	tcpPunches map[string]time.Time
-	tcpLinks   map[net.Conn]struct{}
+	tcpPunch         *net.TCPAddr
+	tcpPunches       map[string]time.Time
+	tcpPunchRunning  int
+	tcpLinks         map[net.Conn]string
+	controlConn      net.Conn
+	controlServerKey string
+	controlReady     chan struct{}
+	controlOnce      sync.Once
 
 	keepaliveOnce  sync.Once
 	relayOnce      sync.Once
@@ -315,6 +320,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		keepaliveReady: make(chan struct{}),
 		relayReady:     make(chan struct{}),
 		carrierReady:   make(chan struct{}),
+		controlReady:   make(chan struct{}),
 	}
 	reg, err := h.registerWithFailover(ctx)
 	if err != nil {
@@ -336,7 +342,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	h.applyRegistration(reg)
 	h.migratedFrom = reg.MigratedFrom
 
-	if cfg.UPnP {
+	if cfg.UPnP && cfg.Proxy == nil {
 		mapCtx, mapCancel := context.WithTimeout(ctx, 5*time.Second)
 		mapper, mapErr := upnp.Map(mapCtx, conn.LocalAddr().(*net.UDPAddr).Port, "chast host "+cfg.ID)
 		mapCancel()
@@ -356,6 +362,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		go h.localLoop()
 	}
 	go h.keepaliveLoop()
+	go h.rendezvousControlLoop()
 	go h.relayHelloLoop()
 	go h.refreshLoop()
 	if h.carrier != nil {
@@ -441,6 +448,9 @@ func (h *HostAgent) Close() {
 	h.routes.close()
 	h.cancel()
 	h.mu.Lock()
+	if h.controlConn != nil {
+		h.controlConn.Close()
+	}
 	for conn := range h.tcpLinks {
 		conn.Close()
 	}
@@ -453,8 +463,8 @@ func (h *HostAgent) Close() {
 
 // WaitReady waits for the first keepalive acknowledgement, which is what makes
 // the host's observed address usable for punching. An authenticated shared
-// carrier link is accepted instead: it is what keeps the host online when UDP
-// cannot leave its network. The relay acknowledgement is waited for briefly but
+// carrier or rendezvous control link is accepted instead when UDP cannot
+// leave its network. The relay acknowledgement is waited for briefly but
 // is not required: a direct-only deployment may not have a relay.
 func (h *HostAgent) WaitReady(ctx context.Context) error {
 	viaCarrier := false
@@ -463,6 +473,18 @@ func (h *HostAgent) WaitReady(ctx context.Context) error {
 	case <-h.carrierReady:
 		viaCarrier = true
 		h.log.Warn("keepalive has not answered; continuing on the carrier link")
+	case <-h.controlReady:
+		// Prefer the UDP registration when both are starting together: its
+		// acknowledgement also records direct candidates and relay readiness.
+		select {
+		case <-h.keepaliveReady:
+		case <-h.carrierReady:
+			return nil
+		case <-time.After(300 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -599,6 +621,7 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.log.Info("carrier endpoint updated", "carrier", reg.Carrier, "carrier_v6", reg.CarrierV6)
 	}
 	h.sharedCarrierToken = reg.CarrierToken
+	h.controlServerKey = reg.ServerPublicKey
 	var notice *softwareInfo
 	if reg.Software.updateAvailable() {
 		if h.softwareSeen != reg.Software.Version {
@@ -1089,7 +1112,7 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 		}
 		h.keepaliveOnce.Do(func() { close(h.keepaliveReady) })
 	case wire.TypePunchPeer:
-		if !fromPunch {
+		if !fromPunch || h.cfg.Proxy != nil {
 			return
 		}
 		conn := h.conn.LocalAddr().(*net.UDPAddr)
@@ -1156,7 +1179,7 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 			return
 		}
 		h.log.Debug("TCP punch trigger received", "nonce", msg.Nonce)
-		h.startTCPPunch(msg.Nonce)
+		h.startTCPPunch(msg.Nonce, msg.Candidate, msg.NATType, msg.IsLocal)
 	case wire.TypeRelayChallenge:
 		if !fromRelay || msg.HostID != h.cfg.ID ||
 			msg.Candidate == "" || msg.Nonce == "" {
@@ -1189,6 +1212,9 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 }
 
 func (h *HostAgent) sendPunches(peer *net.UDPAddr, nonce string) {
+	if h.cfg.Proxy != nil {
+		return
+	}
 	// The listener side of RustDesk's punch_udp: probe with a transaction id
 	// and stop on the viewer's first real packet, because an acknowledgement
 	// only proves our probe survived, not that the peer is ready to talk.
@@ -1285,6 +1311,9 @@ func (h *HostAgent) sendKeepalive() {
 }
 
 func (h *HostAgent) keepaliveLoop() {
+	if h.cfg.Proxy != nil {
+		return
+	}
 	ticker := time.NewTicker(h.cfg.Keepalive)
 	defer ticker.Stop()
 	h.sendKeepalive()
@@ -1299,6 +1328,9 @@ func (h *HostAgent) keepaliveLoop() {
 }
 
 func (h *HostAgent) relayHelloLoop() {
+	if h.cfg.Proxy != nil {
+		return
+	}
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	send := func() {

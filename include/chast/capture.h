@@ -19,9 +19,11 @@
 // RustDesk's hwcodec does), so the encoded frame never touches system memory
 // either.
 //
-// There is intentionally no CPU fallback: outputs that cannot be duplicated
-// with Desktop Duplication fail to create a capturer instead of silently
-// degrading to GDI Screen BitBlt, which would put every frame through sysmem.
+// Auto capture prefers Desktop Duplication. When duplication cannot be opened
+// (for example after an access-denied driver/session transition), the GDI
+// fallback captures through a DIB and uploads the frame to this same D3D11
+// surface contract. Consumers therefore keep using the normal NV12 and encoder
+// pipeline even though that fallback frame crosses system memory once.
 
 #include <windows.h>
 #include <d3d11.h>
@@ -31,6 +33,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "chast/com_ptr.h"
@@ -102,12 +105,22 @@ struct Nv12Config {
     Nv12Colorimetry colorimetry = Nv12Colorimetry::Bt601Limited;
 };
 
+enum class CaptureBackend {
+    Auto,  // Desktop Duplication first, GDI when duplication cannot be opened.
+    Dxgi,  // Require Desktop Duplication.
+    Gdi,   // Force BitBlt capture and upload to D3D11.
+};
+
+const char* capture_backend_name(CaptureBackend backend);
+bool parse_capture_backend(std::string_view text, CaptureBackend& backend);
+
 struct CaptureConfig {
     // Ask DXGI for FP16 frames on HDR/advanced-color desktops and normalize
     // them to BGRA8 on the GPU. When false, DXGI's legacy clipped BGRA8
     // conversion is used (washed out on HDR hosts, but cheaper).
     bool want_hdr = true;
     bool capture_cursor = true;
+    CaptureBackend backend = CaptureBackend::Auto;
     // Convert each frame to NV12 on the GPU for hardware encoders. The BGRA8
     // frame stays available either way.
     Nv12Config nv12;
@@ -227,6 +240,13 @@ public:
     virtual const DisplayInfo& display() const = 0;
     virtual AdapterDevice adapter_device() const = 0;
 
+    // Active capture implementation, used for host diagnostics. A shared
+    // reader reports its underlying source ("dxgi" or "gdi").
+    virtual const char* implementation() const noexcept { return "dxgi"; }
+    // Fixed-rate devices (such as cameras) cap the shared encoder's rate.
+    // Zero means the source has no negotiated device-rate ceiling.
+    virtual UINT max_framerate() const { return 0; }
+
     // Recreates device + duplication after ReinitNeeded. Display, cursor and
     // frame state are reset; the next capture() returns a full frame.
     virtual Error reinitialize() = 0;
@@ -256,8 +276,8 @@ public:
     virtual const Error& last_error() const = 0;
 };
 
-// False on sessions where Desktop Duplication cannot work at all (RDP,
-// non-interactive sessions on older builds). There is no CPU fallback.
+// False on sessions where Desktop Duplication cannot work at all. Auto capture
+// may still work through GDI when an interactive desktop is available.
 bool duplication_supported();
 
 // Creates a capturer for the display with the given index into

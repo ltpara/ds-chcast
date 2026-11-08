@@ -14,6 +14,7 @@
 #include <d3d11.h>
 #include <windows.h>
 #include <wrl/client.h>
+#include <shlobj.h>
 
 #include <atomic>
 #include <chrono>
@@ -25,12 +26,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
 
 #include "chast/clipboard.h"
+#include "chast/clipboard_virtual.h"
 #include "chast/error.h"
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
@@ -38,6 +41,7 @@
 #include "chast/protocol.h"
 #include "chast/security.h"
 #include "viewer_engine.h"
+#include "mp4_recorder.h"
 
 namespace {
 
@@ -246,6 +250,81 @@ struct ClipboardCapture {
     std::condition_variable cv;
     bool landed = false;
     std::vector<std::string> paths;
+    std::shared_ptr<chast::ClipboardVirtualFiles> virtual_files;
+
+    bool virtual_sink(std::shared_ptr<chast::ClipboardVirtualFiles> files) {
+        { std::lock_guard lock(mutex); virtual_files = std::move(files); landed = true; }
+        cv.notify_all(); return true;
+    }
+
+    bool paste(const fs::path& destination, std::string* error) {
+        std::shared_ptr<chast::ClipboardVirtualFiles> files;
+        { std::lock_guard lock(mutex); files = virtual_files; }
+        auto fail = [&](const char* why) { *error = why; return false; };
+        if (!files || !files->Active() || fs::exists(destination)) return fail("virtual clipboard was not published before paste");
+        // Inspect the actual Shell object without replacing the user's clipboard.
+        ComPtr<IDataObject> object;
+        object.Attach(chast::make_virtual_file_data_object(files, error));
+        if (!object) return false;
+        FORMATETC format{static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileGroupDescriptorW")),
+                         nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium{};
+        if (FAILED(object->GetData(&format, &medium))) return fail("virtual file descriptors unavailable");
+        const auto* group = static_cast<FILEGROUPDESCRIPTORW*>(GlobalLock(medium.hGlobal));
+        if (!group) { ReleaseStgMedium(&medium); return fail("cannot read descriptors"); }
+        std::vector<FILEDESCRIPTORW> descriptors(group->fgd, group->fgd + group->cItems);
+        GlobalUnlock(medium.hGlobal); ReleaseStgMedium(&medium);
+        std::this_thread::sleep_for(350ms);
+        if (!paths.empty() || fs::exists(destination)) return fail("file content appeared before paste");
+        std::printf("viewer-probe: %zu Shell descriptors ready; paste begins now\n", descriptors.size());
+        fs::create_directories(destination);
+        std::set<std::string> tops;
+        for (size_t i = 0; i < descriptors.size(); ++i) {
+            const auto& descriptor = descriptors[i];
+            const fs::path relative(descriptor.cFileName);
+            const auto target = destination / relative;
+            tops.insert(utf8(destination / *relative.begin()));
+            if (descriptor.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                fs::create_directories(target); continue;
+            }
+            format = {static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileContents")), nullptr,
+                      DVASPECT_CONTENT, static_cast<LONG>(i), TYMED_ISTREAM};
+            if (FAILED(object->GetData(&format, &medium))) return fail("virtual file stream unavailable");
+            ComPtr<IStream> stream;
+            stream.Attach(medium.pstm); medium = {};
+            STATSTG stat{};
+            const uint64_t size = (static_cast<uint64_t>(descriptor.nFileSizeHigh) << 32) | descriptor.nFileSizeLow;
+            if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart != size)
+                return fail("virtual stream size disagrees with descriptor");
+            if (size) {
+                LARGE_INTEGER end{}; end.QuadPart = -1;
+                ComPtr<IStream> clone;
+                uint8_t tail = 0, copied = 0;
+                ULONG got = 0;
+                if (FAILED(stream->Seek(end, STREAM_SEEK_END, nullptr)) || FAILED(stream->Clone(&clone)) ||
+                    stream->Read(&tail, 1, &got) != S_OK || got != 1 ||
+                    clone->Read(&copied, 1, &got) != S_OK || got != 1 || tail != copied)
+                    return fail("random access or cloned virtual stream failed");
+                LARGE_INTEGER begin{};
+                if (FAILED(stream->Seek(begin, STREAM_SEEK_SET, nullptr))) return fail("virtual stream could not rewind");
+            }
+            fs::create_directories(target.parent_path());
+            std::ofstream output(target, std::ios::binary);
+            std::vector<uint8_t> buffer(chast::kMaxClipboardFileRead);
+            uint64_t done = 0;
+            while (done < size) {
+                const ULONG want = static_cast<ULONG>(std::min<uint64_t>(buffer.size(), size - done));
+                ULONG got = 0;
+                if (stream->Read(buffer.data(), want, &got) != S_OK || got != want) return fail("paste-time read failed");
+                output.write(reinterpret_cast<const char*>(buffer.data()), got); done += got;
+            }
+            ULONG got = 1;
+            if (stream->Read(buffer.data(), 1, &got) != S_FALSE || got != 0) return fail("virtual stream EOF is incorrect");
+            if (!output) return fail("could not write pasted file");
+        }
+        paths.assign(tops.begin(), tops.end());
+        return true;
+    }
 
     bool sink(const std::vector<std::string>& files) {
         {
@@ -288,6 +367,8 @@ struct ClipboardSeed {
     std::string inner_bytes;
     std::string deep_name;
     std::string deep_bytes;
+    std::string empty_name = "独立空目录";
+    bool directories_only = false;
 };
 
 std::string clipboard_binary_bytes() {
@@ -308,7 +389,15 @@ bool seed_clipboard(const fs::path& directory, const ClipboardSeed& seed,
         *error = "cannot seed the clipboard folder: " + ec.message();
         return false;
     }
-    return write_file(directory / from_utf8(seed.text_name), seed.text_bytes, error) &&
+    fs::create_directories(directory / from_utf8(seed.empty_name), ec);
+    if (ec) { *error = ec.message(); return false; }
+    fs::create_directories(directory / from_utf8(seed.folder_name) / "a-empty" / "leaf", ec);
+    if (ec) { *error = ec.message(); return false; }
+    fs::create_directories(directory / from_utf8(seed.folder_name) / "z-empty", ec);
+    if (ec) { *error = ec.message(); return false; }
+    if (seed.directories_only) return true;
+    return write_file(directory / from_utf8(seed.folder_name) / "zero.bin", "", error) &&
+           write_file(directory / from_utf8(seed.text_name), seed.text_bytes, error) &&
            write_file(directory / from_utf8(seed.binary_name), seed.binary_bytes, error) &&
            write_file(directory / from_utf8(seed.folder_name) / from_utf8(seed.inner_name),
                       seed.inner_bytes, error) &&
@@ -332,14 +421,56 @@ bool check_clipboard_bytes(const fs::path& path, const std::string& expected,
     return true;
 }
 
+std::vector<std::string> clipboard_sources(const fs::path& root, const ClipboardSeed& seed) {
+    std::vector<std::string> paths{utf8(root / from_utf8(seed.folder_name)), utf8(root / from_utf8(seed.empty_name))};
+    if (!seed.directories_only) {
+        paths.push_back(utf8(root / from_utf8(seed.text_name)));
+        paths.push_back(utf8(root / from_utf8(seed.binary_name)));
+    }
+    return paths;
+}
+
+bool check_clipboard_identity(const std::vector<std::string>& original,
+                              const std::vector<std::string>& staged, std::string* error) {
+    std::vector<chast::ClipboardFileEntry> before, after;
+    std::vector<std::string> paths;
+    if (!chast::collect_clipboard_files(original, before, paths, error) ||
+        !chast::collect_clipboard_files(staged, after, paths, error)) return false;
+    if (chast::clipboard_file_identity_hash(before) != chast::clipboard_file_identity_hash(after)) {
+        *error = "staged clipboard tree changed its echo-suppression identity";
+        return false;
+    }
+    return true;
+}
+
+bool check_clipboard_directories(const fs::path& folder, const fs::path& empty,
+                                  const ClipboardSeed& seed, std::string* error) {
+    std::error_code ec;
+    for (const auto& path : {empty, folder / "a-empty" / "leaf", folder / "z-empty"}) {
+        if (!fs::is_directory(path, ec) || ec || !fs::is_empty(path, ec) || ec) {
+            *error = "empty clipboard directory was lost or populated: " + utf8(path);
+            return false;
+        }
+    }
+    if (seed.directories_only) {
+        size_t files = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(folder))
+            if (entry.is_regular_file()) ++files;
+        if (files != 0) { *error = "directory-only clipboard created file data"; return false; }
+        return true;
+    }
+    return check_clipboard_bytes(folder / "zero.bin", "", error);
+}
+
 // The viewer's clipboard must hold the two flat files and the copied folder,
 // all inside one staging folder, with the folder tree rebuilt and intact.
 bool check_clipboard_files(const std::vector<std::string>& paths,
                            const ClipboardSeed& seed, std::string* staging,
                            std::string* error) {
-    if (paths.size() != 3) {
+    const size_t expected = seed.directories_only ? 2 : 4;
+    if (paths.size() != expected) {
         *error = "the clipboard received " + std::to_string(paths.size()) +
-                 " top-level item(s), expected 3";
+                 " top-level item(s), expected " + std::to_string(expected);
         return false;
     }
     const fs::path first = from_utf8(paths[0]);
@@ -352,6 +483,7 @@ bool check_clipboard_files(const std::vector<std::string>& paths,
     fs::path text;
     fs::path binary;
     fs::path folder;
+    fs::path empty;
     for (const std::string& item : paths) {
         const fs::path path = from_utf8(item);
         if (path.parent_path() != first.parent_path()) {
@@ -363,6 +495,8 @@ bool check_clipboard_files(const std::vector<std::string>& paths,
             text = path;
         } else if (name == seed.binary_name) {
             binary = path;
+        } else if (name == seed.empty_name) {
+            empty = path;
         } else if (name == seed.folder_name) {
             folder = path;
         } else {
@@ -370,8 +504,8 @@ bool check_clipboard_files(const std::vector<std::string>& paths,
             return false;
         }
     }
-    if (text.empty() || binary.empty() || folder.empty()) {
-        *error = "the clipboard lost one of the three seeded top-level items";
+    if (empty.empty() || folder.empty() || (!seed.directories_only && (text.empty() || binary.empty()))) {
+        *error = "the clipboard lost a seeded top-level item";
         return false;
     }
     std::error_code ec;
@@ -384,15 +518,17 @@ bool check_clipboard_files(const std::vector<std::string>& paths,
         }
         ++top_level;
     }
-    if (ec || top_level != 3) {
+    if (ec || top_level != expected) {
         *error = "the staging folder holds " + std::to_string(top_level) +
-                 " top-level item(s), expected 3";
+                 " top-level item(s), expected " + std::to_string(expected);
         return false;
     }
     if (!fs::is_directory(folder, ec) || ec) {
         *error = "the copied folder did not arrive as a directory";
         return false;
     }
+    if (!check_clipboard_directories(folder, empty, seed, error)) return false;
+    if (seed.directories_only) return true;
     return check_clipboard_bytes(text, seed.text_bytes, error) &&
            check_clipboard_bytes(binary, seed.binary_bytes, error) &&
            check_clipboard_bytes(folder / from_utf8(seed.inner_name), seed.inner_bytes, error) &&
@@ -407,9 +543,10 @@ bool check_clipboard_files(const std::vector<std::string>& paths,
 bool check_host_clipboard_files(const std::vector<std::string>& paths,
                                 const ClipboardSeed& seed, const fs::path& share,
                                 std::string* staging, std::string* error) {
-    if (paths.size() != 3) {
+    const size_t expected = seed.directories_only ? 2 : 4;
+    if (paths.size() != expected) {
         *error = "the host clipboard received " + std::to_string(paths.size()) +
-                 " top-level item(s), expected 3";
+                 " top-level item(s), expected " + std::to_string(expected);
         return false;
     }
     const fs::path root = from_utf8(paths[0]).parent_path().parent_path();
@@ -438,6 +575,7 @@ bool check_host_clipboard_files(const std::vector<std::string>& paths,
     fs::path text;
     fs::path binary;
     fs::path folder;
+    fs::path empty;
     for (const std::string& item : paths) {
         const fs::path path = from_utf8(item);
         if (path.parent_path().parent_path() != root) {
@@ -455,6 +593,8 @@ bool check_host_clipboard_files(const std::vector<std::string>& paths,
             text = path;
         } else if (item_name == seed.binary_name) {
             binary = path;
+        } else if (item_name == seed.empty_name) {
+            empty = path;
         } else if (item_name == seed.folder_name) {
             folder = path;
         } else {
@@ -462,8 +602,8 @@ bool check_host_clipboard_files(const std::vector<std::string>& paths,
             return false;
         }
     }
-    if (text.empty() || binary.empty() || folder.empty()) {
-        *error = "the host clipboard lost one of the three copied top-level items";
+    if (empty.empty() || folder.empty() || (!seed.directories_only && (text.empty() || binary.empty()))) {
+        *error = "the host clipboard lost a copied top-level item";
         return false;
     }
     size_t top_level = 0;
@@ -473,12 +613,12 @@ bool check_host_clipboard_files(const std::vector<std::string>& paths,
         }
         ++top_level;
     }
-    if (ec || top_level != 3) {
+    if (ec || top_level != expected) {
         *error = "the host staging folder holds " + std::to_string(top_level) +
-                 " top-level item(s), expected 3";
+                 " top-level item(s), expected " + std::to_string(expected);
         return false;
     }
-    if (!fs::is_regular_file(text, ec) || ec) {
+    if (!seed.directories_only && (!fs::is_regular_file(text, ec) || ec)) {
         *error = "the flat file did not arrive as a regular file";
         return false;
     }
@@ -486,6 +626,8 @@ bool check_host_clipboard_files(const std::vector<std::string>& paths,
         *error = "the copied folder did not arrive as a directory";
         return false;
     }
+    if (!check_clipboard_directories(folder, empty, seed, error)) return false;
+    if (seed.directories_only) return true;
     return check_clipboard_bytes(text, seed.text_bytes, error) &&
            check_clipboard_bytes(binary, seed.binary_bytes, error) &&
            check_clipboard_bytes(folder / from_utf8(seed.inner_name), seed.inner_bytes, error) &&
@@ -497,7 +639,11 @@ std::unique_ptr<chast::HostServer> start_host(
     const std::string& share_directory, uint16_t port, std::string* error,
     bool allow_file_transfer = true, std::vector<std::string> clipboard_files = {},
     std::shared_ptr<std::atomic<bool>> clipboard_ready = nullptr,
-    std::function<bool(const std::vector<std::string>&)> clipboard_write_files = {}) {
+    std::function<bool(const std::vector<std::string>&)> clipboard_write_files = {},
+    chast::ClipboardDirection clipboard_direction = chast::ClipboardDirection::Both,
+    std::function<bool(std::shared_ptr<chast::ClipboardVirtualFiles>)> virtual_sink = {},
+    const std::string& record_directory = {},
+    std::function<void(chast::HostServerConfig&)> configure = {}) {
     chast::HostServerConfig config;
     config.settings.bind_address = "127.0.0.1";
     config.settings.port = port;
@@ -505,16 +651,31 @@ std::unique_ptr<chast::HostServer> start_host(
     config.settings.auth_mode = chast::HostAuthMode::Password;
     config.settings.password_hash = chast::hash_password(kPassword);
     config.settings.allow_file_transfer = allow_file_transfer;
+    config.settings.clipboard_direction = clipboard_direction;
     config.settings.allow_terminal = true;
     config.settings.file_receive_directory = share_directory;
     config.serve_once = true;
     config.keyframe_interval_ms = 500;
+    if (!record_directory.empty()) {
+        config.serve_once = false;
+        config.settings.record_incoming = true;
+        config.settings.record_directory = record_directory;
+        config.settings.allow_record = false; // Independent of viewer recording consent.
+        config.settings.allow_clipboard = false;
+        config.settings.allow_audio = false;
+        config.settings.allow_input = false;
+        config.settings.allow_terminal = false;
+        config.settings.max_viewers = 2;
+        config.settings.codec = chast::VideoCodec::H264;
+        config.encoder_backend = chast::EncoderBackend::Software;
+    }
     // Loopback acceptance must not read or write the operator's clipboard.
     config.clipboard_read = [](chast::ClipboardContent&) { return true; };
     config.clipboard_write = [](const chast::ClipboardContent&) { return true; };
     // A viewer's clipboard list must never reach the real CF_HDROP here; the
     // scenario captures it instead, and everything else acknowledges silently.
     config.clipboard_write_files = std::move(clipboard_write_files);
+    config.clipboard_write_virtual_files = std::move(virtual_sink);
     if (!config.clipboard_write_files) {
         config.clipboard_write_files = [](const std::vector<std::string>&) { return true; };
     }
@@ -532,6 +693,7 @@ std::unique_ptr<chast::HostServer> start_host(
     config.log = [](const std::string& message) {
         std::fprintf(stderr, "host: %s\n", message.c_str());
     };
+    if (configure) configure(config);
 
     std::unique_ptr<chast::HostServer> server =
         chast::HostServer::create(std::move(config), error);
@@ -1550,26 +1712,325 @@ bool check_no_files(const fs::path& directory, std::string* error) {
 
 }  // namespace
 
+bool seed_file_pages(const fs::path& tree, std::string* error) {
+    for (size_t i = 0; i < chast::kMaxFileListEntries + 1; ++i) {
+        std::error_code ec;
+        fs::create_directories(tree / ("page-empty-" + std::to_string(i)), ec);
+        if (ec) { *error = "cannot seed directory pages: " + ec.message(); return false; }
+    }
+    return write_file(tree / "zz-after-page.txt", "data from the last directory page", error);
+}
+
+bool verify_file_pages(chast_viewer::ViewerEngine& engine, const ShareSeed& names,
+                       const fs::path& downloads, std::string* error) {
+    std::set<std::string> seen;
+    std::string cursor;
+    int pages = 0;
+    // A superseded browse reply must not replace the most recent folder.
+    if (!engine.RequestFileList("")) { *error = "cannot queue root listing"; return false; }
+    do {
+        if (!engine.RequestFileList(names.tree_name, cursor)) { *error = "cannot queue directory page"; return false; }
+        chast_viewer::ViewerEngine::FileListAnswer page;
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        bool ready = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (engine.TakeFileList(page)) { ready = true; break; }
+            std::this_thread::sleep_for(5ms);
+        }
+        if (!ready || page.directory != names.tree_name || page.cursor != cursor || page.result.code != chast::FileCode::Ok) {
+            *error = "directory page missing or replaced by a stale reply"; return false;
+        }
+        for (const auto& entry : page.result.entries) {
+            if (!seen.insert(entry.name).second) { *error = "duplicate directory entry across pages"; return false; }
+        }
+        cursor = page.result.next_cursor;
+        ++pages;
+    } while (!cursor.empty() && pages < 4);
+    if (!cursor.empty() || pages != 2 || seen.size() != chast::kMaxFileListEntries + 6 || !seen.contains("zz-after-page.txt")) {
+        *error = "paged listing did not include every folder and the final file"; return false;
+    }
+    WalkOutcome walk;
+    if (!run_walk(engine, names.tree_name, 120s, &walk, error)) return false;
+    if (walk.code != 0 || walk.done != 4 || walk.total != 4) {
+        *error = "paged folder download failed: " + walk.error; return false;
+    }
+    const auto destination = from_utf8(walk.destination);
+    if (!check_tree(destination, names.tree_name, downloads, error)) return false;
+    for (size_t i = 0; i < chast::kMaxFileListEntries + 1; ++i) {
+        std::error_code ec;
+        if (!fs::is_directory(destination / ("page-empty-" + std::to_string(i)), ec)) {
+            *error = "paged empty folder was not mirrored"; return false;
+        }
+    }
+    std::string bytes;
+    if (!read_file(destination / "zz-after-page.txt", &bytes, error) || bytes != "data from the last directory page") {
+        *error = "final-page file contents differ"; return false;
+    }
+    std::printf("viewer-probe: 2 listing pages, 1030 entries, 1025 paged empty folders and 4 files mirrored over QUIC\n");
+    return true;
+}
+
+int native_clipboard_probe() {
+    // A private window station has its own clipboard. No interactive user's
+    // clipboard is saved, cleared or replaced by this integration check.
+    const std::wstring station_name = L"ChastClipboardProbe-" + std::to_wstring(GetCurrentProcessId());
+    HWINSTA station = CreateWindowStationW(station_name.c_str(), 0, WINSTA_ALL_ACCESS, nullptr);
+    if (!station || !SetProcessWindowStation(station)) {
+        std::fprintf(stderr, "viewer-probe: cannot create private clipboard station (%lu)\n", GetLastError()); return 1;
+    }
+    HDESK desktop = CreateDesktopW(L"ChastProbe", nullptr, nullptr, 0,
+                                  DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS, nullptr);
+    if (!desktop || !SetThreadDesktop(desktop) || FAILED(OleInitialize(nullptr))) {
+        std::fprintf(stderr, "viewer-probe: cannot initialize private OLE desktop (%lu)\n", GetLastError()); return 1;
+    }
+    struct Source final : chast::ClipboardVirtualFiles {
+        std::vector<chast::ClipboardFileEntry> list{{"native.txt", 5}};
+        std::atomic<bool> active{true};
+        std::atomic<unsigned> reads{0};
+        const std::vector<chast::ClipboardFileEntry>& entries() const override { return list; }
+        bool Active() const override { return active.load(); }
+        void Cancel() override { active = false; }
+        bool Read(size_t index, uint64_t offset, uint32_t length, std::vector<uint8_t>& bytes, std::string*) override {
+            if (!Active() || index || offset > 5 || length > 5 - offset) return false;
+            ++reads; const std::string text = "hello";
+            bytes.assign(text.begin() + static_cast<size_t>(offset), text.begin() + static_cast<size_t>(offset + length)); return true;
+        }
+    };
+    auto source = std::make_shared<Source>();
+    int result = 1;
+    {
+        chast::VirtualClipboard owner;
+        std::string error;
+        ComPtr<IDataObject> object;
+        if (!OpenClipboard(nullptr)) return 1;
+        const bool published_while_busy = owner.Publish(source, &error);
+        CloseClipboard();
+        if (published_while_busy || !source->Active() || source->reads != 0) {
+            std::fprintf(stderr, "viewer-probe: busy clipboard did not preserve the offer for retry\n"); return 1;
+        }
+        if (!owner.Publish(source, &error) || OleGetClipboard(&object) != S_OK || !object) {
+            std::fprintf(stderr, "viewer-probe: native publication failed: %s\n", error.c_str());
+        } else {
+            FORMATETC format{static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileGroupDescriptorW")),
+                             nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+            STGMEDIUM medium{};
+            bool ok = source->reads == 0 && object->GetData(&format, &medium) == S_OK;
+            if (ok) {
+                const auto* group = static_cast<FILEGROUPDESCRIPTORW*>(GlobalLock(medium.hGlobal));
+                ok = group && group->cItems == 1 && std::wstring(group->fgd[0].cFileName) == L"native.txt";
+                if (group) GlobalUnlock(medium.hGlobal);
+                ReleaseStgMedium(&medium); medium = {};
+            }
+            format = {static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileContents")), nullptr,
+                      DVASPECT_CONTENT, -1, TYMED_ISTREAM};
+            ok = ok && object->QueryGetData(&format) == S_OK;
+            format.lindex = 0;
+            ok = ok && source->reads == 0 && object->GetData(&format, &medium) == S_OK && source->reads == 0;
+            if (ok) {
+                char data[5]{}; ULONG got = 0;
+                ok = medium.pstm->Read(data, 5, &got) == S_OK && got == 5 && std::string(data, 5) == "hello" && source->reads == 1;
+                // Replacing the clipboard must invalidate retained old streams.
+                OleSetClipboard(nullptr);
+                const auto until = std::chrono::steady_clock::now() + 2s;
+                while (source->Active() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(10ms);
+                LARGE_INTEGER begin{};
+                ok = ok && !source->Active() && FAILED(medium.pstm->Seek(begin, STREAM_SEEK_SET, nullptr));
+            }
+            if (medium.tymed != TYMED_NULL) ReleaseStgMedium(&medium);
+            if (ok) { std::puts("viewer-probe: private OLE clipboard: metadata-only publish, marshalled IStream read and ownership cancellation passed"); result = 0; }
+            else std::fprintf(stderr, "viewer-probe: native clipboard contract failed (reads=%u)\n", source->reads.load());
+        }
+    }
+    OleUninitialize();
+    // The OS closes private station/desktop handles when this dedicated probe exits.
+    return result;
+}
+
+int host_recording_probe() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const auto root = fs::temp_directory_path() / ("chast-host-recording-probe-" +
+        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
+    const auto recordings = root / L"录像 archive";
+    std::string error;
+    ProbeSink first_sink, second_sink;
+    std::unique_ptr<chast::HostServer> host;
+    std::unique_ptr<chast_viewer::ViewerEngine> first, second;
+    bool ok = false;
+    try {
+        const auto require = [](bool condition, const std::string& message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        require(first_sink.create(&error) && second_sink.create(&error), error);
+        const auto port = pick_free_port();
+        require(port != 0, "no loopback port");
+        host = start_host(utf8(root / "share"), port, &error, false, {}, {}, {},
+                         chast::ClipboardDirection::Disabled, {}, utf8(recordings));
+        require(host != nullptr, error);
+        const auto connect = [&](ProbeSink& sink) {
+            auto viewer = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+            viewer->SetClipboardSync(false);
+            require(viewer->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {}, kPassword),
+                    "start recording viewer");
+            require(wait_streaming(*viewer, 20s, &error), error);
+            return viewer;
+        };
+        first = connect(first_sink);
+        second = connect(second_sink);
+        const auto wait_frames = [&](auto& viewer, uint64_t previous) {
+            const auto until = std::chrono::steady_clock::now() + 10s;
+            while (std::chrono::steady_clock::now() < until) {
+                const auto status = viewer.Snapshot();
+                if (status.received > previous) return true;
+                std::this_thread::sleep_for(20ms);
+            }
+            return false;
+        };
+        require(wait_frames(*first, 0) && wait_frames(*second, 0), "both viewers receive encoded video");
+        require(!first->Snapshot().recording && !second->Snapshot().recording,
+                "viewer-side recorders remain off");
+        first->Stop(); first.reset();
+        const auto before = second->Snapshot().received;
+        require(wait_frames(*second, before), "remaining viewer survives the first viewer leaving");
+        std::this_thread::sleep_for(1100ms);
+        second->Stop(); second.reset();
+        host->stop(); host.reset();
+        size_t directories = 0, files = 0;
+        for (const auto& entry : fs::directory_iterator(recordings)) if (entry.is_directory()) ++directories;
+        require(directories == 1, "two viewers of one source must create exactly one recording directory");
+        for (const auto& entry : fs::recursive_directory_iterator(recordings)) {
+            if (entry.path().extension() != ".mp4") continue;
+            uint64_t samples = 0, keys = 0;
+            require(chast_tools::Mp4Recorder::verify(utf8(entry.path()), chast::VideoCodec::H264,
+                        &samples, &keys, &error) && keys > 0, "cannot reopen host recording: " + error);
+            std::printf("host-recording-probe: %s samples=%llu keys=%llu\n", utf8(entry.path()).c_str(),
+                static_cast<unsigned long long>(samples), static_cast<unsigned long long>(keys));
+            ++files;
+        }
+        require(files == 1, "stable shared stream should produce exactly one finished MP4");
+        std::puts("host-recording-probe: PASS real QUIC + OpenH264, two viewers, publisher departure, final save and Unicode folder");
+        ok = true;
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "host-recording-probe: FAIL %s\n", exception.what());
+    }
+    if (first) first->Stop();
+    if (second) second->Stop();
+    if (host) host->stop();
+    CoUninitialize();
+    return ok ? 0 : 1;
+}
+
+int elevation_probe() {
+    using namespace chast;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    struct Task final : IElevationTask {
+        std::atomic<ElevationCode> code{ElevationCode::Pending};
+        std::atomic<bool> committed{false};
+        ElevationState poll() override { return {0, code.load(), {}}; }
+        void commit() override { committed = true; }
+        void cancel() override {}
+    };
+    auto task = std::make_shared<Task>();
+    auto paused = std::make_shared<std::atomic<bool>>(false);
+    ProbeSink sink;
+    std::unique_ptr<HostServer> host;
+    std::unique_ptr<chast_viewer::ViewerEngine> viewer;
+    std::string error;
+    bool success = false;
+    const auto require = [](bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); };
+    const auto wait = [](auto predicate, std::chrono::milliseconds duration = 10s) {
+        const auto until = std::chrono::steady_clock::now() + duration;
+        while (std::chrono::steady_clock::now() < until) {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(20ms);
+        }
+        return predicate();
+    };
+    try {
+        require(sink.create(&error), error);
+        const auto port = pick_free_port();
+        host = start_host({}, port, &error, false, {}, {}, {}, ClipboardDirection::Disabled, {}, {},
+            [=](HostServerConfig& config) {
+                config.settings.max_viewers = 1;
+                config.settings.allow_input = true;
+                config.settings.allow_audio = config.settings.allow_clipboard = false;
+                config.settings.allow_terminal = false;
+                config.settings.codec = VideoCodec::H264;
+                config.encoder_backend = EncoderBackend::Software;
+                config.elevation_state = [] { return ElevationState{0, ElevationCode::Available, {}}; };
+                config.request_elevation = [task] { return task; };
+                config.desktop_status = [paused] {
+                    return *paused ? InputDesktopStatus{InputDesktopKind::Unavailable, false, {}, "simulated local UAC"}
+                                   : input_desktop_status();
+                };
+                config.follow_desktop = [paused](std::string* reason, bool* switched) {
+                    if (*paused) { *reason = "simulated local UAC"; *switched = false; return false; }
+                    return follow_input_desktop(reason, switched);
+                };
+            });
+        require(host != nullptr, error);
+        viewer = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        viewer->SetClipboardSync(false);
+        require(viewer->Start("127.0.0.1", port, kDisplayAuto, host->status().fingerprint, false, {}, kPassword), "start elevation viewer");
+        require(wait_streaming(*viewer, 20s, &error) && wait([&] { return viewer->Snapshot().elevation.code == ElevationCode::Available; }), error);
+        require(viewer->RequestElevation(), "queue first elevation request");
+        require(wait([&] { return viewer->Snapshot().elevation.code == ElevationCode::Pending; }), "pending response");
+        const auto first_id = viewer->Snapshot().elevation.request_id;
+        require(first_id && !viewer->RequestElevation(), "pending request cannot be duplicated");
+        *paused = true;
+        require(wait([&] { return viewer->Snapshot().desktop == DesktopKind::Unavailable; }), "viewer receives UAC capture pause");
+        std::this_thread::sleep_for(500ms);
+        const auto before = viewer->Snapshot().received;
+        std::this_thread::sleep_for(22000ms);
+        require(viewer->Snapshot().state == chast_viewer::ViewerState::kStreaming && viewer->Snapshot().received == before,
+                "announced UAC pause survives the ordinary 20-second video stall deadline");
+        task->code = ElevationCode::Cancelled; *paused = false;
+        require(wait([&] { return viewer->Snapshot().elevation.code == ElevationCode::Cancelled && viewer->Snapshot().received > before; }),
+                "cancelled UAC resumes real captured video");
+        task->code = ElevationCode::Pending;
+        require(viewer->RequestElevation(), "retry elevation after cancellation");
+        require(wait([&] { return viewer->Snapshot().elevation.code == ElevationCode::Pending; }), "second pending response");
+        require(viewer->Snapshot().elevation.request_id != first_id, "retry has a new correlation id");
+        task->code = ElevationCode::Restarting;
+        require(wait([&] { return task->committed && viewer->Snapshot().elevation.code == ElevationCode::Restarting; }),
+                "native viewer receives restart state before handoff");
+        std::puts("elevation-probe: PASS real DXGI/OpenH264/QUIC/ViewerEngine, 22-second UAC pause, cancel/resume, retry and restart state");
+        success = true;
+    } catch (const std::exception& e) { std::fprintf(stderr, "elevation-probe: FAIL %s\n", e.what()); }
+    if (viewer) viewer->Stop();
+    if (host) host->stop();
+    CoUninitialize();
+    return success ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--elevation") return elevation_probe();
+    if (argc == 2 && std::string(argv[1]) == "--clipboard-native") return native_clipboard_probe();
+    if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
     bool files_only = false;
+    bool file_pages = false;
     bool file_transfer_denied = false;
     bool clipboard_scenario = false;
+    bool clipboard_empty = false;
     bool clipboard_upload_scenario = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--files-only") {
             files_only = true;
+        } else if (arg == "--file-pages") {
+            file_pages = files_only = true;
         } else if (arg == "--files-only-denied") {
             files_only = true;
             file_transfer_denied = true;
+        } else if (arg == "--clipboard-empty") {
+            clipboard_empty = true;
         } else if (arg == "--clipboard-files") {
             clipboard_scenario = true;
         } else if (arg == "--clipboard-files-up") {
             clipboard_upload_scenario = true;
         } else {
             std::fprintf(stderr,
-                         "usage: chast-viewer-probe [--files-only | --files-only-denied | "
-                         "--clipboard-files | --clipboard-files-up]\n");
+                         "usage: chast-viewer-probe [--files-only | --file-pages | --files-only-denied | "
+                         "--clipboard-files | --clipboard-files-up] [--clipboard-empty]\n");
             return 2;
         }
     }
@@ -1599,6 +2060,8 @@ int main(int argc, char** argv) {
         if (!seed_share(share, names, &error)) {
             std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
         } else if (!seed_upload(work_directory, share, &error)) {
+            std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        } else if (file_pages && !seed_file_pages(share / names.tree_name, &error)) {
             std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
         } else if (files_only) {
             // Protocol v32: the same file machinery on a session that never
@@ -1655,6 +2118,8 @@ int main(int argc, char** argv) {
                     error = "the files-only answer carried a picture";
                 } else if (!wait_file_permission(*engine, 10s)) {
                     error = "the host never granted file transfer";
+                } else if (file_pages) {
+                    if (verify_file_pages(*engine, names, downloads, &error)) exit_code = 0;
                 } else {
                     WalkOutcome walk;
                     uint64_t uploaded = 0;
@@ -1725,9 +2190,10 @@ int main(int argc, char** argv) {
             // download channel and are handed to the clipboard in one item.
             // The sink captures what CF_HDROP would have received, so the
             // incoming list never overwrites the operator's clipboard.
-            const ClipboardSeed clip{"clip-one.txt", "名字 二.bin", "clip-folder",
+            ClipboardSeed clip{"clip-one.txt", "名字 二.bin", "clip-folder",
                                      "clipboard one", clipboard_binary_bytes(), "inner.txt",
                                      "clipboard inner", "deep.bin", "clipboard deep"};
+            clip.directories_only = clipboard_empty;
             const fs::path clipboard_source = work_directory / "clipboard";
             auto ready = std::make_shared<std::atomic<bool>>(false);
             const uint16_t port = pick_free_port();
@@ -1741,21 +2207,20 @@ int main(int argc, char** argv) {
                 // keep the error
             } else {
                 host = start_host(
-                    utf8(share), port, &error, true,
-                    {utf8(clipboard_source / from_utf8(clip.text_name)),
-                     utf8(clipboard_source / from_utf8(clip.binary_name)),
-                     utf8(clipboard_source / from_utf8(clip.folder_name))},
-                    ready);
+                    utf8(share), port, &error, false,
+                    clipboard_sources(clipboard_source, clip),
+                    ready, {}, chast::ClipboardDirection::HostToViewer);
             }
             auto capture = std::make_shared<ClipboardCapture>();
+            auto reads = std::make_shared<std::atomic<unsigned>>(0);
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
                 engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
-                engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
-                engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
-                engine->SetClipboardFileSink(
-                    [capture](const std::vector<std::string>& files) {
-                        return capture->sink(files);
+                engine->SetClipboardSource([reads](chast::ClipboardContent&) { ++*reads; return true; });
+                engine->SetClipboardFileSource([reads](std::vector<std::string>&) { ++*reads; return false; });
+                engine->SetClipboardVirtualSink(
+                    [capture](std::shared_ptr<chast::ClipboardVirtualFiles> files) {
+                        return capture->virtual_sink(std::move(files));
                     });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
                                    kPassword)) {
@@ -1764,7 +2229,10 @@ int main(int argc, char** argv) {
                 }
             }
             if (engine && wait_streaming(*engine, 20s, &error)) {
-                if (!wait_permission(*engine, chast::kPermissionClipboard, 10s)) {
+                if (engine->Snapshot().clipboard_direction != chast::ClipboardDirection::HostToViewer ||
+                    (engine->Snapshot().permissions & chast::kPermissionFileTransfer) != 0) {
+                    error = "viewer did not adopt clipboard-only host-to-viewer policy";
+                } else if (!wait_permission(*engine, chast::kPermissionClipboard, 10s)) {
                     error = "the host never granted the clipboard";
                 } else {
                     // The copy happens now, after the session's empty baseline.
@@ -1773,7 +2241,9 @@ int main(int argc, char** argv) {
                         error = "the clipboard files never reached the viewer";
                     } else {
                         std::string staging;
-                        if (!check_clipboard_files(capture->paths, clip, &staging, &error)) {
+                        if (!capture->paste(work_directory / "chast-clipboard-paste-down", &error) ||
+                            !check_clipboard_files(capture->paths, clip, &staging, &error) ||
+                            !check_clipboard_identity(clipboard_sources(clipboard_source, clip), capture->paths, &error)) {
                             // error already set
                         } else if (!wait_clipboard_received(*engine, 5s)) {
                             error = "the viewer did not count the clipboard item";
@@ -1782,7 +2252,9 @@ int main(int argc, char** argv) {
                             const uint32_t file_list_bit =
                                 1u << static_cast<uint32_t>(
                                     chast::ClipboardFormat::FileList);
-                            if (after.clipboard_failed != 0) {
+                            if (clip.directories_only && after.files_received != 0) {
+                                error = "directory-only clipboard unexpectedly downloaded file data";
+                            } else if (after.clipboard_failed != 0) {
                                 error = "the clipboard transfer reported " +
                                         std::to_string(after.clipboard_failed) +
                                         " failure(s)";
@@ -1795,9 +2267,9 @@ int main(int argc, char** argv) {
                                         " clipboard item(s), expected 1";
                             } else {
                                 std::printf(
-                                    "viewer-probe: clipboard files -> 3 top-level items "
-                                    "(4 files) staged in %s, formats=0x%X, received=%llu\n",
-                                    staging.c_str(),
+                                    "viewer-probe: clipboard files -> %zu top-level items "
+                                    "(empty directories preserved) staged in %s, formats=0x%X, received=%llu\n",
+                                    capture->paths.size(), staging.c_str(),
                                     static_cast<unsigned>(after.clipboard_received_formats),
                                     static_cast<unsigned long long>(after.clipboard_received));
                                 exit_code = 0;
@@ -1813,6 +2285,14 @@ int main(int argc, char** argv) {
             if (exit_code != 0 && !error.empty()) {
                 std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
             }
+            if (*reads != 0) { error = "receive-only viewer read its local clipboard"; exit_code = 1; }
+            if (exit_code == 0 && capture->virtual_files) {
+                engine->SetClipboardSync(false);
+                const auto until = std::chrono::steady_clock::now() + 2s;
+                while (capture->virtual_files->Active() && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(10ms);
+                if (capture->virtual_files->Active()) { std::fprintf(stderr, "viewer-probe: pausing sync retained a readable offer\n"); exit_code = 1; }
+            }
             if (engine) {
                 engine->Stop();
             }
@@ -1825,15 +2305,13 @@ int main(int argc, char** argv) {
             // session temp folder and hands the staged top items to CF_HDROP.
             // Neither real clipboard is touched: the source supplies the
             // viewer's list and the host's write is captured.
-            const ClipboardSeed clip{"up-one.txt", "向上 二.bin", "up-folder",
+            ClipboardSeed clip{"up-one.txt", "向上 二.bin", "up-folder",
                                      "viewer one", clipboard_binary_bytes(), "inner.txt",
                                      "viewer inner", "deep.bin", "viewer deep"};
+            clip.directories_only = clipboard_empty;
             const fs::path clipboard_source = work_directory / "clipboard-up";
             auto ready = std::make_shared<std::atomic<bool>>(false);
-            const std::vector<std::string> source_paths = {
-                utf8(clipboard_source / from_utf8(clip.text_name)),
-                utf8(clipboard_source / from_utf8(clip.binary_name)),
-                utf8(clipboard_source / from_utf8(clip.folder_name))};
+            const auto source_paths = clipboard_sources(clipboard_source, clip);
             const uint16_t port = pick_free_port();
             ProbeSink sink;
             auto host_clipboard = std::make_shared<ClipboardCapture>();
@@ -1846,9 +2324,12 @@ int main(int argc, char** argv) {
                 // keep the error
             } else {
                 host = start_host(
-                    utf8(share), port, &error, true, {}, nullptr,
+                    utf8(share), port, &error, false, {}, nullptr,
                     [host_clipboard](const std::vector<std::string>& files) {
                         return host_clipboard->sink(files);
+                    }, chast::ClipboardDirection::ViewerToHost,
+                    [host_clipboard](std::shared_ptr<chast::ClipboardVirtualFiles> files) {
+                        return host_clipboard->virtual_sink(std::move(files));
                     });
             }
             auto viewer_clipboard = std::make_shared<ClipboardCapture>();
@@ -1877,7 +2358,10 @@ int main(int argc, char** argv) {
             }
             std::string staging;
             if (engine && wait_streaming(*engine, 20s, &error)) {
-                if (!wait_permission(*engine, chast::kPermissionClipboard, 10s)) {
+                if (engine->Snapshot().clipboard_direction != chast::ClipboardDirection::ViewerToHost ||
+                    (engine->Snapshot().permissions & chast::kPermissionFileTransfer) != 0) {
+                    error = "viewer did not adopt clipboard-only viewer-to-host policy";
+                } else if (!wait_permission(*engine, chast::kPermissionClipboard, 10s)) {
                     error = "the host never granted the clipboard";
                 } else {
                     // The baseline must be the empty clipboard before `ready`;
@@ -1887,15 +2371,18 @@ int main(int argc, char** argv) {
                     ready->store(true);
                     if (!host_clipboard->wait(30s)) {
                         error = "the viewer's clipboard files never reached the host";
-                    } else if (!check_host_clipboard_files(host_clipboard->paths, clip, share,
-                                                           &staging, &error)) {
+                    } else if (!host_clipboard->paste(work_directory / "chast-clipboard-paste-up", &error) ||
+                               !check_clipboard_files(host_clipboard->paths, clip, &staging, &error) ||
+                               !check_clipboard_identity(source_paths, host_clipboard->paths, &error)) {
                         // error already set
                     } else {
                         // A few poll cycles prove the staged list is not sent
                         // back to the viewer as a new clipboard item.
                         std::this_thread::sleep_for(1500ms);
                         const chast_viewer::ViewerStatus after = engine->Snapshot();
-                        if (viewer_clipboard->wait(0ms)) {
+                        if (clip.directories_only && after.files_sent != 0) {
+                            error = "directory-only clipboard unexpectedly uploaded file data";
+                        } else if (viewer_clipboard->wait(0ms)) {
                             error = "the host's staged list was echoed back to the viewer";
                         } else if (after.clipboard_received != 0) {
                             error = "the viewer counted " +
@@ -1907,31 +2394,33 @@ int main(int argc, char** argv) {
                                     " failure(s)";
                         } else {
                             std::printf(
-                                "viewer-probe: clipboard files up -> 3 top-level items "
-                                "(4 files) staged in %s, no echo, failures=0\n",
-                                staging.c_str());
+                                "viewer-probe: clipboard files up -> %zu top-level items "
+                                "(empty directories preserved) staged in %s, no echo, failures=0\n",
+                                host_clipboard->paths.size(), staging.c_str());
                             exit_code = 0;
                         }
                     }
                 }
             }
-            if (engine) {
-                engine->Stop();
+            if (exit_code == 0 && host_clipboard->virtual_files) {
+                host->set_permissions(static_cast<chast::PermissionMask>(engine->Snapshot().permissions & ~chast::kPermissionClipboard));
+                const auto until = std::chrono::steady_clock::now() + 2s;
+                while (host_clipboard->virtual_files->Active() && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(10ms);
+                if (host_clipboard->virtual_files->Active()) { std::fprintf(stderr, "viewer-probe: revocation retained a readable offer\n"); exit_code = 1; }
             }
-            if (host) {
-                host->stop();
-            }
-            // The staging folder outlives the transfer for CF_HDROP but not
-            // the session: nothing may be left in the temp directory.
+            if (engine) engine->Stop();
+            if (host) host->stop();
+            // The paste target owns the completed files, including after the
+            // remote connection is closed. The probe removes only its own copy.
             if (exit_code == 0 && !staging.empty()) {
                 std::error_code ec;
-                if (fs::exists(from_utf8(staging), ec)) {
-                    std::fprintf(stderr,
-                                 "viewer-probe: the host staging folder survived the "
-                                 "session: %s\n",
-                                 staging.c_str());
+                if (!fs::exists(from_utf8(staging), ec) || !host_clipboard->virtual_files ||
+                    host_clipboard->virtual_files->Active()) {
+                    std::fprintf(stderr, "viewer-probe: paste lifetime or remote cancellation failed\n");
                     exit_code = 1;
                 }
+                fs::remove_all(from_utf8(staging), ec);
             }
             if (exit_code != 0 && !error.empty()) {
                 std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());

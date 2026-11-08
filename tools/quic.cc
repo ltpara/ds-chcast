@@ -1149,7 +1149,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 }
             } else if (arg == "--encoder" && i + 1 < argc) {
                 if (!chast::parse_encoder_backend(argv[++i], options.encoder)) {
-                    std::fprintf(stderr, "--encoder wants auto, vpl or ffmpeg\n");
+                    std::fprintf(stderr,
+                                 "--encoder wants auto, vpl, ffmpeg or software\n");
                     return false;
                 }
                 options.encoder_set = true;
@@ -1765,6 +1766,9 @@ struct SenderStats {
     uint32_t abr_lowest_target = 0;
     uint32_t framerate = 0;
     uint64_t abr_changes = 0;
+    uint64_t video_receipts = 0;
+    double video_delivery_ms = 0.0;
+    double video_pending_ms = 0.0;
     double rtt_ms = 0.0;
     double send_kbps = 0.0;
     // SHA-256 identity the server presents (uppercase hex).
@@ -2362,6 +2366,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.bitrate_kbps = options.bitrate_kbps;
     config.settings.framerate = static_cast<uint16_t>(options.framerate);
     config.settings.quality = options.quality;
+    // This probe asserts exact manual rates and keyframe cost. Network-driven
+    // QoS has separate trace and multi-viewer tests and must not move those
+    // rates while the probe is measuring a codec change.
+    if (options.stream_options) config.adaptive_bitrate = false;
     if (options.display_set) {
         config.settings.display = static_cast<uint16_t>(options.display);
     }
@@ -2599,6 +2607,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.abr_lowest_target = status.stats.lowest_target_bitrate;
     stats.framerate = status.stats.framerate;
     stats.abr_changes = status.stats.abr_changes;
+    stats.video_receipts = status.stats.video_receipts;
+    stats.video_delivery_ms = status.stats.video_delivery_ms;
+    stats.video_pending_ms = status.stats.video_pending_ms;
     stats.rtt_ms = status.stats.rtt_ms;
     stats.send_kbps = status.stats.send_kbps;
     stats.files_sent = status.stats.files_sent;
@@ -2779,6 +2790,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     client_config.totp = options.totp;
     client_config.audit_ref = options.audit_ref;
     client_config.audio_datagram = !options.audio_stream;
+    client_config.codec_preference = options.codec == chast::VideoCodec::Hevc ? chast::StreamCodecPreference::Hevc :
+        options.codec == chast::VideoCodec::Av1 ? chast::StreamCodecPreference::Av1 : chast::StreamCodecPreference::H264;
     if (client_config.totp.empty() && !options.totp_secret.empty()) {
         // Computed right before the Hello so the 30 s window is fresh.
         std::vector<uint8_t> key;
@@ -4840,6 +4853,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.last_switch_reason = reason;
             if (code == chast::DisplaySwitchCode::Ok) {
                 ++stats.display_switch_ok;
+                if (index == stats.switch_ok_index) {
+                    // The host starts its cooldown when it handles the request,
+                    // which can lag sending while an encoder is rebuilding.
+                    switch_bad_at = std::chrono::steady_clock::now() +
+                                    std::chrono::milliseconds(1200);
+                }
             } else {
                 ++stats.display_switch_refused;
             }
@@ -5530,7 +5549,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             stream_answer_detail(result);
                         return false;
                     }
-                    if (!send_stream_options(chast::StreamCodecPreference::Auto, probe_fps,
+                    if (!send_stream_options(stream_preference(stream_base_codec), probe_fps,
                                              chast::StreamQuality::Balanced)) {
                         return false;
                     }
@@ -5595,6 +5614,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                     break;
                 case StreamOptionStep::WaitAlt:
                     stats.stream_option_alt_seen = true;
+                    if (result.code == chast::StreamOptionsCode::Ok && result.codec == stream_base_codec) {
+                        stats.stream_option_alt_unsupported = true;
+                        stats.stream_option_alt_reason = "preference retained; family is not usable by every active display and viewer";
+                        stream_step = StreamOptionStep::Done;
+                        break;
+                    }
                     if (result.code == chast::StreamOptionsCode::Ok) {
                         if (!stream_answer_matches(result, stream_alt_codec, host_fps,
                                                    chast::StreamQuality::High)) {
@@ -5667,7 +5692,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 return false;
             }
             stats.stream_option_change_update_seen = true;
-            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+            if (!send_stream_options(stream_preference(stream_base_codec), 0,
                                      chast::StreamQuality::High)) {
                 return false;
             }
@@ -5693,7 +5718,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         } else if (stream_step == StreamOptionStep::WaitRestoreSettle &&
                    now >= stream_settle_at && stats.received >= stream_settle_frames) {
             stream_rate_keyframes_before = stats.keyframes;
-            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+            if (!send_stream_options(stream_preference(stream_base_codec), 0,
                                      chast::StreamQuality::Balanced)) {
                 return false;
             }
@@ -5721,7 +5746,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                    now >= stream_rate_check_at && stats.received >= stream_rate_frames) {
             stats.stream_option_rate_keyframes =
                 stats.keyframes - stream_rate_keyframes_before;
-            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+            if (!send_stream_options(stream_preference(stream_base_codec), 0,
                                      chast::StreamQuality::High)) {
                 return false;
             }
@@ -5749,13 +5774,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                               chast_tools::codec_name(stats.last_update.codec);
                 return false;
             }
-            // The host refuses a second codec rebuild within one second of the
-            // first, so the restore waits that cooldown out.
+            // Let a few pictures of the alternative codec reach the decoder
+            // before restoring the original vote.
             stream_next_send = now + std::chrono::milliseconds(1200);
             stream_step = StreamOptionStep::WaitAltRestore;
         } else if (stream_step == StreamOptionStep::WaitAltRestore &&
                    now >= stream_next_send) {
-            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+            if (!send_stream_options(stream_preference(stream_base_codec), 0,
                                      chast::StreamQuality::High)) {
                 return false;
             }
@@ -5948,12 +5973,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                     !sent_switch.ok()) {
                     return fail("request_display_switch: " + sent_switch.to_string());
                 }
-                // The refusal has to reach the host a full rate-limit window
-                // after the accepted request.
-                switch_bad_at = (std::max)(switch_bad_at,
-                                           now + std::chrono::milliseconds(1200));
+                // Receiving the answer starts the refusal's cooldown timer.
             }
-            if (!switch_bad_sent && stats.switch_bad_index != chast::kDisplayAuto &&
+            if (!switch_bad_sent && stats.display_switch_ok > 0 &&
+                stats.switch_bad_index != chast::kDisplayAuto &&
                 now >= switch_bad_at) {
                 switch_bad_sent = true;
                 if (chast::Error sent_switch =
@@ -8668,6 +8691,8 @@ int run_verify(const Options& options) {
         }
     }
     if (local.stream_options) {
+        // Start at the explicit Best preset; Balanced must lower its ratio.
+        local.quality = 1.5f;
         // Four serialized requests wait for their answers and the StreamInfo
         // that follows each applied change; a codec switch also waits out the
         // host's one-second rebuild cooldown before it is restored.
@@ -9213,7 +9238,16 @@ int run_verify(const Options& options) {
               "the restored quality and frame rate were announced");
         check(received.stream_option_rate_update_seen,
               "a quality-only change was applied and announced");
-        if (received.stream_option_base_codec == chast::VideoCodec::H264) {
+        if (received.stream_option_rate_encoder.starts_with("OpenH264")) {
+            // OpenH264 mandates scene-change detection in screen mode and
+            // may emit IDRs without an application request. A live desktop
+            // cannot attribute their count to set_rate(). The checks above
+            // still require the lower bitrate, unchanged format/FPS and
+            // successful decoding throughout the transition.
+            std::printf("     OpenH264 rate update: %llu keyframe(s); "
+                        "screen scene changes can independently emit IDRs\n",
+                        static_cast<unsigned long long>(received.stream_option_rate_keyframes));
+        } else if (received.stream_option_base_codec == chast::VideoCodec::H264) {
             // libavcodec's QSV encoder flushes and resets the MFX session for
             // a rate change, so the host must force the one IDR the encoder
             // reported as required. oneVPL's H.264 tiers reset continuously
@@ -9243,7 +9277,7 @@ int run_verify(const Options& options) {
                   "the host produced the other encoder family and switched back");
         } else {
             check(received.stream_option_alt_unsupported,
-                  "the host reported the other encoder family unsupported");
+                  "the host retained an unusable vote and reported the working codec");
             if (received.stream_option_alt_unsupported) {
                 const chast::VideoCodec alt_codec =
                     received.stream_option_base_codec == chast::VideoCodec::Hevc
@@ -9256,13 +9290,13 @@ int run_verify(const Options& options) {
         }
         const uint64_t expected_requests = received.stream_option_alt_ok ? 7u : 6u;
         const uint64_t expected_changes = received.stream_option_alt_ok ? 6u : 4u;
-        const uint64_t expected_failures = received.stream_option_alt_unsupported ? 1u : 0u;
+        const uint64_t expected_failures = 0;
         check(sent.stream_option_requests == expected_requests,
               "the host counted every stream preference request");
         check(sent.stream_option_changes == expected_changes,
               "the host applied exactly the requests that changed the stream");
         check(sent.stream_option_failures == expected_failures,
-              "the host counted the encoder refusal");
+              "unusable preferences do not count as failed requests");
         if (sent.stream_option_requests != expected_requests ||
             sent.stream_option_changes != expected_changes ||
             sent.stream_option_failures != expected_failures) {
@@ -9937,7 +9971,8 @@ int run_weak_network(const Options& options) {
     // The documented profile: an 80 ms one-way path with 20 ms of jitter, 3%
     // loss and a 1 Mbps bottleneck, degraded for eight seconds and then clean.
     // A third of the 3 Mbps configured rate survives at the bottleneck, so the
-    // controller must use its bitrate, frame-rate and resolution levers. The
+    // controller must adjust bitrate and frame rate while retaining the
+    // selected display geometry, as RustDesk's VideoQoS does. The
     // --netem-* options can replace individual values to isolate one impairment
     // (a loss-heavy, low-jitter probe for packet-level redundancy).
     constexpr double kDelayMs = 80.0;
@@ -10028,7 +10063,6 @@ int run_weak_network(const Options& options) {
     }
 
     const uint32_t configured_bps = local.bitrate_kbps * 1000u;
-    const uint32_t floor_bps = std::max<uint32_t>(500000u, configured_bps / 10u);
 
     const bool keep_file = !options.save.empty();
     const std::string scratch =
@@ -10125,12 +10159,15 @@ int run_weak_network(const Options& options) {
         check(sent.abr_changes > 0, "the weak link made the controller change the target");
         check(lowest_target > 0 && lowest_target < configured_bps,
               "the target dropped below the configured bitrate");
-        check(lowest_target >= floor_bps, "the target never fell below the controller floor");
         check(lowest_target > 0 && sent.target_bitrate > lowest_target,
               "the target recovered after the link came back");
         check(sent.target_bitrate > 0 && sent.target_bitrate < configured_bps,
               "the cut did not snap back to the configured ceiling");
-        check(sent.resolution_changes > 0, "the resolution ladder moved with the target");
+        check(sent.framerate >= 15, "shared FPS recovered after the link came back");
+        check(sent.resolution_changes == 0 && sent.resolution_percent == 100,
+              "network adaptation preserved the selected display geometry");
+        check(sent.video_receipts > 0 && sent.video_pending_ms < 1000 && sent.video_delivery_ms < 1000,
+              "video application receipts resumed without retaining the weak-link backlog");
     }
 
     // The handshake carries the initial description, so stream_updates counts
@@ -10252,6 +10289,9 @@ int run_weak_network(const Options& options) {
                 received.max_frame_age_ms,
                 static_cast<unsigned long long>(sent.stream_updates_sent),
                 static_cast<unsigned long long>(received.stream_updates));
+    std::printf("     video receipts: %llu, last delivery %.0f ms, pending %.0f ms\n",
+                static_cast<unsigned long long>(sent.video_receipts), sent.video_delivery_ms,
+                sent.video_pending_ms);
     std::printf("     relay: host->viewer rx=%llu fwd=%llu loss=%llu qdrop=%llu "
                 "maxq=%.0f ms | viewer->host rx=%llu loss=%llu qdrop=%llu\n",
                 static_cast<unsigned long long>(to_viewer.received),

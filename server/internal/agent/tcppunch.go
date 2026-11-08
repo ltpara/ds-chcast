@@ -2,7 +2,7 @@ package agent
 
 import (
 	"bufio"
-	"errors"
+	"context"
 	"net"
 	"time"
 
@@ -11,25 +11,22 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
-// TCP punch timings mirror RustDesk. The coordination server pairs the two
-// announcements in milliseconds; the window is what the peer has to complete
-// the punch itself, and it is the same CONNECT_TIMEOUT hbbs uses.
+// RustDesk pre-punch and connection limits; datagrams use our framing.
 const (
 	tcpPunchDialWait    = 5 * time.Second
 	tcpPunchReplyWait   = 5 * time.Second
 	tcpPunchWindow      = 18 * time.Second
-	tcpPunchGrace       = 3 * time.Second
 	tcpPunchMinGap      = 150 * time.Millisecond
 	tcpPunchMaxGap      = 2 * time.Second
 	tcpPunchDialTimeout = 3 * time.Second
-	tcpPunchRetryWait   = 500 * time.Millisecond
 	tcpPrePunch         = 30 * time.Millisecond
-	tcpLinkIdle         = 60 * time.Second
-	tcpLinkKeepalive    = 20 * time.Second
+	tcpLinkIdle         = directPathIdle
+	tcpLinkKeepalive    = directPathKeepalive
 	tcpLinkWrite        = 5 * time.Second
 	tcpLinkHandshake    = 10 * time.Second
 	tcpPunchNonceTTL    = 30 * time.Second
 	tcpPunchMaxRunning  = 8
+	tcpLinkMax          = 64
 )
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -70,137 +67,139 @@ func resolveTCP(text string) *net.TCPAddr {
 	return addr
 }
 
-// tcpWindow is how long a viewer keeps trying to complete the TCP punch. With
-// a relay behind it the window matches the UDP direct attempt, because the
-// relay takes over at the same deadline; direct-only and TCP-only sessions get
-// RustDesk's full connect timeout.
-func (v *ViewerAgent) tcpWindow() time.Duration {
-	if v.cfg.Mode == ModeAuto {
-		return v.directWait
-	}
-	return tcpPunchWindow
-}
-
-// tcpPunchLoop coordinates a punch and then owns the link until it dies. In
-// auto mode a lost link falls back to the relay; direct and tcp modes keep
-// re-punching for the life of the agent.
+// tcpPunchLoop races the UDP path. Coordination has its own 3/6/9s budget;
+// the connection budget starts only after the host's pre-punch report.
 func (v *ViewerAgent) tcpPunchLoop() {
-	v.directTrying.Store(true)
-	defer v.directTrying.Store(false)
-	deadline := time.Now().Add(v.tcpWindow())
+	defer v.directAttemptDone()
 	for {
-		if v.ctx.Err() != nil || v.fellBack || v.directOK.Load() {
+		ctx := v.directContext()
+		conn, br, ok := v.tcpPunchRound(ctx)
+		if !ok {
 			return
 		}
-		conn, br, ok := v.tcpPunchRound(deadline)
-		if !ok {
-			if time.Now().After(deadline) {
-				v.log.Info("TCP punch was not confirmed", "window", v.tcpWindow())
-				return
-			}
-			select {
-			case <-v.ctx.Done():
-				return
-			case <-time.After(tcpPunchRetryWait):
-			}
-			continue
+		if !v.attachTCP(conn) {
+			conn.Close()
+			return
 		}
-		v.attachTCP(conn)
 		v.tcpReadLoop(conn, br)
 		v.detachTCP(conn)
 		if v.cfg.Mode == ModeAuto {
-			if !v.fellBack {
-				v.fallBackToRelay("TCP direct path was lost; using relay")
-			}
+			v.fallBackToRelay("TCP direct path was lost")
 			return
 		}
-		deadline = time.Now().Add(v.tcpWindow())
+		// A new session must look up current addresses and relay credentials.
+		return
 	}
 }
 
-// tcpPunchRound announces one nonce, learns the host's observed TCP endpoint
-// and dials it from the address the announcement was sent from. Keeping that
-// address is the whole trick: it is the mapping the host was told to punch.
-func (v *ViewerAgent) tcpPunchRound(deadline time.Time) (net.Conn, *bufio.Reader, bool) {
-	if v.tcpPunch == nil {
+type tcpCoordinationReply struct {
+	msg wire.Message
+	err error
+}
+
+// Keep a single reader alive while retransmitting the same request on the same
+// socket. Read deadlines between frames would discard partial frame headers.
+func coordinateTCP(ctx context.Context, conn net.Conn, msg wire.Message, step time.Duration) (wire.Message, error) {
+	responses := make(chan tcpCoordinationReply, 1)
+	go func() {
+		reply, err := readHandshake(bufio.NewReader(conn))
+		responses <- tcpCoordinationReply{reply, err}
+	}()
+	for attempt := 1; attempt <= punchRequestAttempts; attempt++ {
+		_ = conn.SetWriteDeadline(time.Now().Add(tcpLinkWrite))
+		if err := writeHandshake(conn, msg); err != nil {
+			return wire.Message{}, err
+		}
+		timer := time.NewTimer(time.Duration(attempt) * step)
+		select {
+		case response := <-responses:
+			timer.Stop()
+			return response.msg, response.err
+		case <-ctx.Done():
+			timer.Stop()
+			return wire.Message{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return wire.Message{}, context.DeadlineExceeded
+}
+
+func (v *ViewerAgent) tcpPunchRound(ctx context.Context) (net.Conn, *bufio.Reader, bool) {
+	if v.tcpPunch == nil || ctx.Err() != nil {
 		return nil, nil, false
 	}
-	wait := minDuration(tcpPunchReplyWait, time.Until(deadline))
-	if wait <= 0 {
-		return nil, nil, false
-	}
-	announce, err := tcpDialReuse(nil, v.tcpPunch, minDuration(tcpPunchDialWait, wait))
+	started := time.Now()
+	announce, err := tcpDialReuseContext(ctx, nil, v.tcpPunch, tcpPunchWindow)
 	if err != nil {
-		v.log.Debug("TCP punch announce failed", "server", v.tcpPunch.String(), "error", err)
 		return nil, nil, false
 	}
+	defer announce.Close()
+	stopClose := context.AfterFunc(ctx, func() { announce.Close() })
+	defer stopClose()
 	local, ok := announce.LocalAddr().(*net.TCPAddr)
 	if !ok {
-		announce.Close()
 		return nil, nil, false
 	}
 	nonce := newNonce()
-	_ = announce.SetDeadline(time.Now().Add(wait + time.Second))
 	ts := time.Now().Unix()
-	msg := wire.Message{
-		Type:      wire.TypeTCPPunch,
-		Role:      wire.RoleViewer,
-		HostID:    v.cfg.HostID,
-		Nonce:     nonce,
-		Timestamp: ts,
-	}
+	v.mu.Lock()
+	ownNAT := v.ownNAT
+	v.mu.Unlock()
+	msg := wire.Message{Type: wire.TypeTCPPunch, Role: wire.RoleViewer,
+		HostID: v.cfg.HostID, Nonce: nonce, Timestamp: ts, NATType: ownNAT}
 	if v.cfg.ServerKey != "" {
 		msg.Auth = identity.PunchAuth(v.cfg.ServerKey, v.cfg.HostID, nonce, ts)
 	}
-	if err := writeHandshake(announce, msg); err != nil {
-		announce.Close()
-		return nil, nil, false
-	}
-	buf := bufio.NewReader(announce)
-	reply, err := readHandshake(buf)
-	if err != nil || !reply.OK || (reply.Nonce != "" && reply.Nonce != nonce) {
-		if err != nil {
-			v.log.Debug("TCP punch announce failed", "server", v.tcpPunch.String(), "error", err)
-		} else {
-			v.log.Debug("TCP punch announce refused", "error", reply.Error)
-		}
-		announce.Close()
+	reply, err := coordinateTCP(ctx, announce, msg, punchRequestStep)
+	if err != nil || !reply.OK || reply.Type != wire.TypeTCPPunch || reply.Nonce != nonce {
+		v.log.Debug("TCP punch coordination failed", "error", err, "reply", reply.Error)
 		return nil, nil, false
 	}
 	hostAddr := resolveTCP(reply.Candidate)
 	if hostAddr == nil {
-		v.log.Debug("TCP punch reply carried no endpoint", "candidate", reply.Candidate)
-		announce.Close()
 		return nil, nil, false
 	}
-	v.log.Debug("TCP punch paired", "host", hostAddr.String(), "local", local.String())
-	// The announce socket stays open for the whole dial phase: it is the
-	// mapping the host punches, and closing it early can drop that mapping
-	// before the peer's SYN arrives.
+	v.mu.Lock()
+	if reply.NATType != "" {
+		v.natType = reply.NATType
+	}
+	v.mu.Unlock()
+	wait := v.connectWait(time.Since(started), reply.IsLocal)
+	// RustDesk drops the rendezvous socket before connecting from its port.
+	announce.Close()
+	connectCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	deadline, _ := connectCtx.Deadline()
 	gap := tcpPunchMinGap
-	for {
-		left := time.Until(deadline)
-		if left <= 0 || v.ctx.Err() != nil || v.fellBack || v.directOK.Load() {
-			break
-		}
-		conn, err := tcpDialReuse(local, hostAddr, minDuration(tcpPunchDialTimeout, left))
+	for connectCtx.Err() == nil {
+		conn, err := tcpDialReuseContext(connectCtx, local, hostAddr, minDuration(tcpPunchDialTimeout, time.Until(deadline)))
 		if err == nil {
-			_ = conn.SetDeadline(time.Now().Add(tcpLinkHandshake))
-			cbr := bufio.NewReader(conn)
-			if v.tcpHandshake(conn, cbr, nonce) {
-				announce.Close()
-				return conn, cbr, true
+			stopConn := context.AfterFunc(connectCtx, func() { conn.Close() })
+			_ = conn.SetDeadline(deadline)
+			br := bufio.NewReader(conn)
+			valid := v.tcpHandshake(conn, br, nonce)
+			// Cancellation must not close the selected connection after attachTCP.
+			detached := stopConn()
+			if valid && detached && connectCtx.Err() == nil {
+				return conn, br, true
 			}
 			conn.Close()
 		}
+		timer := time.NewTimer(gap)
 		select {
-		case <-v.ctx.Done():
-		case <-time.After(gap):
+		case <-connectCtx.Done():
+			timer.Stop()
+		case <-timer.C:
 		}
 		gap = nextTCPGap(gap)
 	}
-	announce.Close()
 	return nil, nil, false
+}
+
+func (v *ViewerAgent) fellBackNow() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.fellBack
 }
 
 // tcpHandshake proves the peer owns the host id before any datagram reaches
@@ -232,34 +231,45 @@ func (v *ViewerAgent) tcpHandshake(conn net.Conn, br *bufio.Reader, nonce string
 	return true
 }
 
-func (v *ViewerAgent) attachTCP(conn net.Conn) {
-	v.tcpMu.Lock()
+func (v *ViewerAgent) attachTCP(conn net.Conn) bool {
 	send := carrier.NewFrameWriter(conn)
 	stop := make(chan struct{})
+
+	// Commit the path switch and the fallback decision under the same lock.
+	// Otherwise a relay timeout can win after the punch handshake but before
+	// this link is published, letting the viewer switch back to TCP after QUIC
+	// has already retransmitted on the relay.
+	v.mu.Lock()
+	if v.ctx.Err() != nil || v.directLost || v.fellBack || v.directOK.Load() || v.carrierMode {
+		v.mu.Unlock()
+		return false
+	}
+	v.tcpMu.Lock()
 	v.tcpConn = conn
 	v.tcpSend = send
 	v.tcpStop = stop
 	v.tcpMu.Unlock()
 
-	v.mu.Lock()
 	v.tcpRemote = conn.RemoteAddr().String()
 	v.tcpActive.Store(true)
 	v.directOK.Store(true)
-	v.directTrying.Store(false)
 	v.latched = true
 	if v.timer != nil {
 		v.timer.Stop()
-		v.timerArmed = true
 	}
 	remote := v.tcpRemote
 	v.mu.Unlock()
 
+	v.stopDirectAttempts()
+	v.recordDirectResult(false)
 	v.log.Info("TCP direct path established", "host", remote)
 	v.reportPath()
 	go v.tcpKeepalive(conn, send, stop)
+	return true
 }
 
 func (v *ViewerAgent) detachTCP(conn net.Conn) {
+	v.mu.Lock()
 	v.tcpMu.Lock()
 	if v.tcpConn == conn {
 		v.tcpConn = nil
@@ -271,14 +281,17 @@ func (v *ViewerAgent) detachTCP(conn net.Conn) {
 	}
 	v.tcpMu.Unlock()
 	v.tcpActive.Store(false)
-	v.mu.Lock()
+	v.directLost = true
 	v.tcpRemote = ""
+	v.remote = nil
 	// The TCP link was the direct path, so a relay fallback must be allowed
 	// again. UDP confirmation never races this: it is ignored while TCP owns
 	// the path.
-	v.latched = false
-	v.mu.Unlock()
+	if !v.fellBack {
+		v.latched = false
+	}
 	v.directOK.Store(false)
+	v.mu.Unlock()
 	conn.Close()
 	v.log.Warn("TCP direct path lost")
 	v.reportPath()
@@ -335,7 +348,11 @@ func (v *ViewerAgent) writeTCP(payload []byte) {
 
 // startTCPPunch deduplicates one coordination trigger and runs the host half
 // off the read loop.
-func (h *HostAgent) startTCPPunch(nonce string) {
+func (h *HostAgent) startTCPPunch(nonce, candidate, peerNAT string, localPeer bool) {
+	peer := resolveTCP(candidate)
+	if peer == nil || len(nonce) < 8 || len(nonce) > 64 {
+		return
+	}
 	endpoint := h.getTCPPunch()
 	if endpoint == nil {
 		return
@@ -350,19 +367,24 @@ func (h *HostAgent) startTCPPunch(nonce string) {
 			delete(h.tcpPunches, key)
 		}
 	}
-	if _, busy := h.tcpPunches[nonce]; busy || len(h.tcpPunches) >= tcpPunchMaxRunning {
+	if _, busy := h.tcpPunches[nonce]; busy || h.tcpPunchRunning >= tcpPunchMaxRunning || len(h.tcpPunches) >= 1024 {
 		h.mu.Unlock()
 		return
 	}
 	h.tcpPunches[nonce] = now.Add(tcpPunchNonceTTL)
+	h.tcpPunchRunning++
 	h.mu.Unlock()
 	go func() {
 		defer func() {
 			h.mu.Lock()
-			delete(h.tcpPunches, nonce)
+			h.tcpPunchRunning--
 			h.mu.Unlock()
 		}()
-		h.runTCPPunch(nonce, endpoint)
+		if h.cfg.Proxy != nil || (!localPeer && (h.getNATType() == NATSymmetric || peerNAT == NATSymmetric)) {
+			h.declineTCPPunch(nonce, endpoint)
+			return
+		}
+		h.runTCPPunch(nonce, endpoint, peer, localPeer)
 	}()
 }
 
@@ -376,174 +398,75 @@ func (h *HostAgent) getTCPPunch() *net.TCPAddr {
 	return &out
 }
 
-// runTCPPunch announces the host half, pre-punches the viewer from the
-// announced socket's local port, then hands that port to a listener. RustDesk
-// does the same: the mapping the host's own SYN opened is what lets the
-// viewer's SYN back in.
-func (h *HostAgent) runTCPPunch(nonce string, endpoint *net.TCPAddr) {
-	announce, err := tcpDialReuse(nil, endpoint, tcpPunchDialWait)
+func (h *HostAgent) declineTCPPunch(nonce string, endpoint *net.TCPAddr) {
+	ctx, cancel := context.WithTimeout(h.ctx, tcpPunchDialWait)
+	defer cancel()
+	conn, err := h.cfg.Proxy.DialContext(ctx, "tcp", endpoint.String())
 	if err != nil {
-		h.log.Debug("TCP punch coordination dial failed", "server", endpoint.String(), "error", err)
 		return
 	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	ts := time.Now().Unix()
+	reason := "host requires relay for IPv4 TCP"
+	_ = writeHandshake(conn, wire.Message{Type: wire.TypeTCPPunch, Role: wire.RoleHost,
+		HostID: h.cfg.ID, Nonce: nonce, Timestamp: ts, Error: reason,
+		Signature: identity.Sign(h.priv, identity.TCPPunchDeclineMessage(h.cfg.ID, nonce, reason, ts)),
+	})
+}
+
+// runTCPPunch follows RustDesk's handle_punch_hole: open the coordination
+// socket, pre-punch from its local port, then send the host report. Only this
+// report releases the viewer's response, so its SYN follows the pre-punch.
+func (h *HostAgent) runTCPPunch(nonce string, endpoint, peer *net.TCPAddr, localPeer bool) {
+	announce, err := tcpDialReuseContext(h.ctx, nil, endpoint, tcpPunchDialWait)
+	if err != nil {
+		return
+	}
+	defer announce.Close()
+	stopClose := context.AfterFunc(h.ctx, func() { announce.Close() })
+	defer stopClose()
 	local, ok := announce.LocalAddr().(*net.TCPAddr)
 	if !ok {
-		announce.Close()
 		return
+	}
+	if !localPeer {
+		if pc, err := tcpDialReuseContext(h.ctx, local, peer, tcpPrePunch); err == nil {
+			pc.Close()
+		}
 	}
 	ts := time.Now().Unix()
-	signature := identity.Sign(h.priv, identity.TCPPunchMessage(h.cfg.ID, nonce, wire.RoleHost, ts))
-	_ = announce.SetDeadline(time.Now().Add(tcpPunchReplyWait + time.Second))
+	_ = announce.SetWriteDeadline(time.Now().Add(tcpPunchReplyWait))
 	if err := writeHandshake(announce, wire.Message{
-		Type:      wire.TypeTCPPunch,
-		Role:      wire.RoleHost,
-		HostID:    h.cfg.ID,
-		Nonce:     nonce,
-		Timestamp: ts,
-		Signature: signature,
+		Type: wire.TypeTCPPunch, Role: wire.RoleHost, HostID: h.cfg.ID,
+		Nonce: nonce, Timestamp: ts, Candidate: local.String(),
+		Signature: identity.Sign(h.priv, identity.TCPPunchLocalMessage(h.cfg.ID, nonce, local.String(), ts)),
 	}); err != nil {
-		announce.Close()
 		return
-	}
-	reply, err := readHandshake(bufio.NewReader(announce))
-	if err != nil {
-		h.log.Debug("TCP punch announcement failed", "error", err)
-		announce.Close()
-		return
-	}
-	if !reply.OK {
-		h.log.Debug("TCP punch announcement refused", "error", reply.Error)
-		announce.Close()
-		return
-	}
-	peer := resolveTCP(reply.Candidate)
-	if peer == nil {
-		announce.Close()
-		return
-	}
-	// Not awaited past its 30ms budget: the SYN only has to leave, opening the
-	// gateway mapping before the controller's own SYN can arrive.
-	if pc, err := tcpDialReuse(local, peer, tcpPrePunch); err == nil {
-		pc.Close()
 	}
 	announce.Close()
 	h.runTCPPunchWindow(nonce, local, peer)
 }
 
 func (h *HostAgent) runTCPPunchWindow(nonce string, local, peer *net.TCPAddr) {
-	until := time.Now().Add(tcpPunchWindow)
 	listener, err := tcpListenReuse(local)
 	if err != nil {
-		// Not fatal: the dial half can still meet the controller's SYN.
-		h.log.Warn("TCP punch listener failed; dialing only", "local", local.String(), "error", err)
-	}
-	acceptCh := make(chan net.Conn)
-	if listener != nil {
-		go func() {
-			for {
-				left := time.Until(until)
-				if left <= 0 {
-					return
-				}
-				if tl, ok := listener.(*net.TCPListener); ok {
-					_ = tl.SetDeadline(time.Now().Add(left))
-				}
-				conn, err := listener.Accept()
-				if err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						return
-					}
-					// A timeout ends the window; a transient accept error would
-					// otherwise spin, so back off one deadline's worth.
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						return
-					}
-					select {
-					case <-h.ctx.Done():
-						return
-					case <-time.After(tcpPunchRetryWait):
-					}
-					continue
-				}
-				select {
-				case acceptCh <- conn:
-				default:
-					conn.Close()
-				}
-			}
-		}()
-	}
-	dialCh := make(chan net.Conn)
-	stopDial := make(chan struct{})
-	go func() {
-		gap := tcpPunchMinGap
-		for {
-			left := time.Until(until)
-			if left <= 0 {
-				return
-			}
-			conn, err := tcpDialReuse(local, peer, minDuration(tcpPunchDialTimeout, left))
-			if err == nil {
-				select {
-				case dialCh <- conn:
-				case <-stopDial:
-					conn.Close()
-				case <-h.ctx.Done():
-					conn.Close()
-				}
-				return
-			}
-			select {
-			case <-h.ctx.Done():
-				return
-			case <-stopDial:
-				return
-			case <-time.After(minDuration(gap, left)):
-			}
-			gap = nextTCPGap(gap)
-		}
-	}()
-	var conn net.Conn
-	timer := time.NewTimer(time.Until(until) + tcpPunchGrace)
-	defer timer.Stop()
-	select {
-	case conn = <-dialCh:
-	case conn = <-acceptCh:
-		// Prefer a crossing punch when both are ready: it is the one known to
-		// have met the viewer at the address the server observed.
-		select {
-		case crossed := <-dialCh:
-			conn.Close()
-			conn = crossed
-		default:
-		}
-	case <-timer.C:
-		conn = nil
-	case <-h.ctx.Done():
-		conn = nil
-	}
-	if listener != nil {
-		listener.Close()
-	}
-	if conn == nil {
-		close(stopDial)
-		h.log.Info("nothing connected to the TCP punch", "peer", peer.String())
+		h.log.Warn("TCP punch listener failed", "local", local.String(), "error", err)
 		return
 	}
-	select {
-	case extra := <-acceptCh:
-		extra.Close()
-	default:
+	defer listener.Close()
+	stopClose := context.AfterFunc(h.ctx, func() { listener.Close() })
+	defer stopClose()
+	if tl, ok := listener.(*net.TCPListener); ok {
+		_ = tl.SetDeadline(time.Now().Add(tcpPunchWindow))
 	}
-	select {
-	case extra := <-dialCh:
-		extra.Close()
-	default:
+	conn, err := listener.Accept()
+	if err != nil {
+		h.log.Debug("nothing connected to the TCP punch", "peer", peer.String(), "error", err)
+		return
 	}
-	// The dial half may still be connecting; the stop makes it drop its socket
-	// instead of leaving a blocked send while this link is served.
-	close(stopDial)
-	h.serveTCPViewer(conn, nonce)
+	go h.serveTCPViewer(conn, nonce)
 }
 
 // serveTCPViewer authenticates the punched socket and then carries framed
@@ -551,6 +474,8 @@ func (h *HostAgent) runTCPPunchWindow(nonce string, local, peer *net.TCPAddr) {
 // cannot redirect or revoke another viewer's path.
 func (h *HostAgent) serveTCPViewer(conn net.Conn, nonce string) {
 	defer conn.Close()
+	stopClose := context.AfterFunc(h.ctx, func() { conn.Close() })
+	defer stopClose()
 	remote := conn.RemoteAddr().String()
 	_ = conn.SetDeadline(time.Now().Add(tcpLinkHandshake))
 	ts := time.Now().Unix()
@@ -577,26 +502,18 @@ func (h *HostAgent) serveTCPViewer(conn net.Conn, nonce string) {
 	}
 	_ = conn.SetDeadline(time.Time{})
 	h.mu.Lock()
-	if h.tcpLinks == nil {
-		h.tcpLinks = make(map[net.Conn]struct{})
+	if !h.addTCPLinkLocked(conn, remote) {
+		h.mu.Unlock()
+		h.log.Warn("TCP viewer path refused", "from", remote, "reason", "link limit reached")
+		return
 	}
-	h.tcpLinks[conn] = struct{}{}
-	h.tcpViewer = remote
-	h.viewerTransport = "tcp"
 	h.mu.Unlock()
 	h.log.Info("TCP viewer path established", "from", remote)
 	h.reportInfo()
 	route := "tcp:" + remote
 	defer func() {
 		h.mu.Lock()
-		delete(h.tcpLinks, conn)
-		if h.tcpViewer == remote {
-			h.tcpViewer = ""
-			h.viewerTransport = ""
-			if h.viewer != nil {
-				h.viewerTransport = "udp"
-			}
-		}
+		h.removeTCPLinkLocked(conn, remote)
 		h.mu.Unlock()
 		h.routes.remove(route)
 		h.log.Info("TCP viewer path closed", "from", remote)
@@ -627,6 +544,40 @@ func (h *HostAgent) serveTCPViewer(conn net.Conn, nonce string) {
 			h.log.Warn("TCP viewer forward failed", "from", remote, "error", err)
 			return
 		}
+	}
+}
+
+func (h *HostAgent) addTCPLinkLocked(conn net.Conn, remote string) bool {
+	if len(h.tcpLinks) >= tcpLinkMax {
+		return false
+	}
+	if h.tcpLinks == nil {
+		h.tcpLinks = make(map[net.Conn]string)
+	}
+	h.tcpLinks[conn] = remote
+	if h.tcpViewer == "" {
+		h.tcpViewer = remote
+	}
+	h.viewerTransport = "tcp"
+	return true
+}
+
+func (h *HostAgent) removeTCPLinkLocked(conn net.Conn, remote string) {
+	delete(h.tcpLinks, conn)
+	if h.tcpViewer != remote {
+		return
+	}
+	h.tcpViewer = ""
+	for _, remaining := range h.tcpLinks {
+		h.tcpViewer = remaining
+		break
+	}
+	if h.tcpViewer != "" {
+		return
+	}
+	h.viewerTransport = ""
+	if h.viewer != nil {
+		h.viewerTransport = "udp"
 	}
 }
 

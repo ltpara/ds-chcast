@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include "chast/clipboard.h"
+#include "chast/clipboard_virtual.h"
 
 namespace chast {
 
@@ -13,6 +14,7 @@ struct ClipboardBackend {
     std::function<ClipboardReadState(std::vector<std::string>&)> read_files;
     std::function<bool(const ClipboardContent&)> write;
     std::function<bool(const std::vector<std::string>&)> write_files;
+    std::function<bool(std::shared_ptr<ClipboardVirtualFiles>)> write_virtual_files;
 };
 
 struct ClipboardSnapshot {
@@ -21,6 +23,7 @@ struct ClipboardSnapshot {
     ClipboardContent content;
     std::vector<ClipboardFileEntry> entries;
     std::vector<std::string> paths;
+    std::shared_ptr<ClipboardVirtualFiles> local_files;
     std::string error;
 };
 
@@ -29,7 +32,7 @@ struct ClipboardSnapshot {
 // queued work/results without joining an uninterruptible Windows read.
 class ClipboardWorker {
 public:
-    enum class Operation { Read, Write, WriteFiles };
+    enum class Operation { Read, Write, WriteFiles, WriteVirtualFiles };
     struct Result {
         Operation operation = Operation::Read;
         uint64_t epoch = 0;
@@ -43,6 +46,7 @@ public:
     bool Read(uint64_t epoch);
     bool Write(uint64_t epoch, const ClipboardContent& content);
     bool WriteFiles(uint64_t epoch, const std::vector<std::string>& paths);
+    bool WriteVirtualFiles(uint64_t epoch, std::shared_ptr<ClipboardVirtualFiles> files);
     bool Take(Result& result);
     void Cancel();
     void SetBackend(ClipboardBackend backend);
@@ -51,7 +55,7 @@ private:
     struct State;
     std::shared_ptr<State> state_;
     bool Submit(Operation operation, uint64_t epoch, const ClipboardContent& content,
-                const std::vector<std::string>& paths);
+                const std::vector<std::string>& paths, std::shared_ptr<ClipboardVirtualFiles> files = {});
 };
 
 } // namespace chast

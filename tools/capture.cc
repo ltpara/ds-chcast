@@ -8,6 +8,7 @@
 //
 //   chast-capture [--display N] [--seconds S] [--dump frame.bmp] [--nv12 out.yuv]
 //                 [--colorimetry bt601-limited|bt601-full|bt709-limited|bt709-full]
+//                 [--backend auto|dxgi|gdi]
 //                 [--cursor cur.bmp] [--no-hdr] [--no-cursor] [--quiet]
 //
 // The NV12 dump is a planar NV12 file (full Y plane, then interleaved UV),
@@ -70,6 +71,11 @@ bool parse_args(int argc, char** argv, Options& options) {
                 }
             } else if (arg == "--cursor" && i + 1 < argc) {
                 options.cursor_path = argv[++i];
+            } else if (arg == "--backend" && i + 1 < argc) {
+                if (!chast::parse_capture_backend(argv[++i], options.config.backend)) {
+                    std::fprintf(stderr, "unknown capture backend: %s\n", argv[i]);
+                    return false;
+                }
             } else if (arg == "--no-hdr") {
                 options.config.want_hdr = false;
             } else if (arg == "--no-cursor") {
@@ -308,6 +314,7 @@ int main(int argc, char** argv) {
                     display.device_name.c_str(), display.width, display.height, display.hdr,
                     display.advanced_color_sdr, display.sdr_white_level,
                     display.rotation_degrees);
+        std::printf("capture backend: %s\n", capturer->implementation());
         const chast::AdapterDevice adapter = capturer->adapter_device();
         std::printf("device: %p, vendor %04X, LUID %08lX:%08lX\n", static_cast<void*>(adapter.device),
                     adapter.vendor_id, static_cast<unsigned long>(adapter.luid.HighPart),

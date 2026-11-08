@@ -434,15 +434,22 @@ std::string generate_tunnel_id() {
 }
 
 HostSettingsLoad load_host_settings(const std::string& path) {
-    HostSettingsLoad result;
-    // The spool is per settings file, so a test config never mixes audit
-    // lines into the operator's real one.
-    result.settings.audit_spool = audit_spool_path_for(path);
     std::ifstream in(native_path(path), std::ios::binary);
     if (!in) {
-        return result;
+        HostSettingsLoad missing;
+        missing.settings.audit_spool = audit_spool_path_for(path);
+        return missing;
     }
+    std::ostringstream text;
+    text << in.rdbuf();
+    return parse_host_settings(text.str(), path);
+}
+
+HostSettingsLoad parse_host_settings(const std::string& contents, const std::string& path) {
+    HostSettingsLoad result;
+    result.settings.audit_spool = audit_spool_path_for(path);
     result.existed = true;
+    std::istringstream in(contents);
     bool auth_mode_seen = false;
     bool token_auth_seen = false;
     bool permissions_seen = false;
@@ -495,6 +502,15 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_clipboard)) {
                 warn(result.warning, "clipboard '" + value + "' is not a boolean");
             }
+        } else if (key == "clipboard_direction") {
+            if (value == "both") settings.clipboard_direction = ClipboardDirection::Both;
+            else if (value == "from_host") settings.clipboard_direction = ClipboardDirection::HostToViewer;
+            else if (value == "to_host") settings.clipboard_direction = ClipboardDirection::ViewerToHost;
+            else if (value == "disabled") settings.clipboard_direction = ClipboardDirection::Disabled;
+            else {
+                settings.clipboard_direction = ClipboardDirection::Disabled;
+                warn(result.warning, "clipboard_direction '" + value + "' is invalid; clipboard disabled");
+            }
         } else if (key == "file_transfer") {
             if (!parse_bool(value, settings.allow_file_transfer)) {
                 warn(result.warning, "file_transfer '" + value + "' is not a boolean");
@@ -521,6 +537,13 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             }
         } else if (key == "file_receive_dir") {
             settings.file_receive_directory = value;
+        } else if (key == "record_incoming") {
+            if (!parse_bool(value, settings.record_incoming)) {
+                settings.record_incoming = false;
+                warn(result.warning, "record_incoming must be a boolean");
+            }
+        } else if (key == "record_directory") {
+            settings.record_directory = value;
         } else if (key == "audio") {
             if (!parse_bool(value, settings.allow_audio)) {
                 warn(result.warning, "audio '" + value + "' is not a boolean");
@@ -567,6 +590,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.lock_after_session_end)) {
                 warn(result.warning,
                      "lock_after_session_end '" + value + "' is not a boolean");
+            }
+        } else if (key == "keep_awake") {
+            if (!parse_bool(value, settings.keep_awake)) {
+                warn(result.warning, "keep_awake '" + value + "' is not a boolean");
             }
         } else if (key == "auto_disconnect_minutes") {
             uint32_t minutes = 0;
@@ -850,6 +877,12 @@ HostSettingsLoad load_host_settings(const std::string& path) {
     }
 
     HostSettings& settings = result.settings;
+    if (settings.record_incoming && (settings.record_directory.empty() ||
+        settings.record_directory.find('\0') != std::string::npos ||
+        !native_path(settings.record_directory).is_absolute())) {
+        settings.record_incoming = false;
+        warn(result.warning, "record_incoming disabled: choose an absolute record_directory");
+    }
     if (auth_mode_seen) {
         settings.require_approval = settings.auth_mode != HostAuthMode::Password;
     } else {
@@ -879,16 +912,13 @@ HostSettingsLoad load_host_settings(const std::string& path) {
     return result;
 }
 
-bool save_host_settings(const std::string& path, const HostSettings& settings,
-                        std::string* error) {
-    const std::filesystem::path target = native_path(path);
-    std::error_code ec;
-    if (target.has_parent_path()) {
-        std::filesystem::create_directories(target.parent_path(), ec);
-        if (ec) {
-            *error = "could not create " + target.parent_path().string() + ": " + ec.message();
-            return false;
-        }
+bool serialize_host_settings(const std::string& path, const HostSettings& settings,
+                             std::string& output, std::string* error) {
+    if (settings.record_directory.find_first_of("\r\n") != std::string::npos ||
+        settings.record_directory.find('\0') != std::string::npos ||
+        (settings.record_incoming && !native_path(settings.record_directory).is_absolute())) {
+        if (error) *error = "Host recording requires an absolute directory without line breaks.";
+        return false;
     }
     const PermissionMask permissions =
         (settings.allow_input ? kPermissionInput : 0) |
@@ -923,12 +953,17 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "# the legacy switches stay for older builds\n"
          << "input=" << (settings.allow_input ? 1 : 0) << "\n"
          << "clipboard=" << (settings.allow_clipboard ? 1 : 0) << "\n"
+         << "clipboard_direction=" << (settings.clipboard_direction == ClipboardDirection::Both ? "both" :
+                settings.clipboard_direction == ClipboardDirection::HostToViewer ? "from_host" :
+                settings.clipboard_direction == ClipboardDirection::ViewerToHost ? "to_host" : "disabled") << "\n"
          << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
          << "port_forward=" << (settings.allow_port_forward ? 1 : 0) << "\n"
          << "terminal=" << (settings.allow_terminal ? 1 : 0) << "\n"
          << "terminal_persist=" << (settings.allow_terminal_persist ? 1 : 0) << "\n"
          << "camera=" << (settings.allow_camera ? 1 : 0) << "\n"
          << "record=" << (settings.allow_record ? 1 : 0) << "\n"
+         << "record_incoming=" << (settings.record_incoming ? 1 : 0) << "\n"
+         << "record_directory=" << settings.record_directory << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "audio_device=" << settings.audio_device << "\n"
@@ -944,6 +979,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "allow_remote_config=" << (settings.allow_remote_config ? 1 : 0) << "\n"
          << "lock_after_session_end=" << (settings.lock_after_session_end ? 1 : 0)
          << "\n"
+         << "keep_awake=" << (settings.keep_awake ? 1 : 0) << "\n"
          << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
          << "trusted_device_days=" << settings.trusted_device_days << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
@@ -978,6 +1014,23 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         text << "audit_spool=" << settings.audit_spool << "\n";
     }
 
+    output = text.str();
+    return true;
+}
+
+bool save_host_settings(const std::string& path, const HostSettings& settings,
+                        std::string* error) {
+    std::string data;
+    if (!serialize_host_settings(path, settings, data, error)) return false;
+    const std::filesystem::path target = native_path(path);
+    std::error_code ec;
+    if (target.has_parent_path()) {
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) {
+            *error = "could not create " + target.parent_path().string() + ": " + ec.message();
+            return false;
+        }
+    }
     std::filesystem::path temporary = target;
     temporary += L".tmp";
     {
@@ -986,7 +1039,6 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
             *error = "could not write " + path;
             return false;
         }
-        const std::string data = text.str();
         out.write(data.data(), static_cast<std::streamsize>(data.size()));
         if (!out) {
             *error = "could not write " + path;
@@ -1184,6 +1236,8 @@ const char* codec_setting_name(VideoCodec codec) {
             return "h264";
         case VideoCodec::Hevc:
             return "hevc";
+        case VideoCodec::Vp9:
+            return "vp9";
         case VideoCodec::Av1:
             return "av1";
     }
@@ -1200,6 +1254,7 @@ bool parse_codec_setting(const std::string& text, VideoCodec& codec) {
         codec = VideoCodec::Hevc;
         return true;
     }
+    if (value == "vp9") { codec = VideoCodec::Vp9; return true; }
     if (value == "av1") {
         codec = VideoCodec::Av1;
         return true;

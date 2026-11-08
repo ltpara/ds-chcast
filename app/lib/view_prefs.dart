@@ -19,6 +19,7 @@ class ViewPreferences {
     this.terminalFontSize = 13,
     this.reverseWheel = false,
     this.swapButtons = false,
+    this.keyboardMode = 'physical',
   });
 
   /// 0 = adaptive (fit the window), 1 = original pixels.
@@ -39,6 +40,7 @@ class ViewPreferences {
   /// buttons exchanged before events reach the host.
   final bool reverseWheel;
   final bool swapButtons;
+  final String keyboardMode;
 
   static const String _fitKey = 'view_fit';
   static const String _statsKey = 'view_stats';
@@ -76,6 +78,7 @@ class ViewPreferences {
           : 13,
       reverseWheel: rawReverseWheel is bool ? rawReverseWheel : false,
       swapButtons: rawSwapButtons is bool ? rawSwapButtons : false,
+      keyboardMode: map['view_keyboard_mode'] == 'local' ? 'local' : 'physical',
     );
   }
 
@@ -118,7 +121,10 @@ class ViewPreferences {
             ? prefs.terminalFontSize
             : 13
         ..[_reverseWheelKey] = prefs.reverseWheel
-        ..[_swapButtonsKey] = prefs.swapButtons;
+        ..[_swapButtonsKey] = prefs.swapButtons
+        ..['view_keyboard_mode'] = prefs.keyboardMode == 'local'
+            ? 'local'
+            : 'physical';
       try {
         file.parent.createSync(recursive: true);
         file.writeAsStringSync(jsonEncode(payload));

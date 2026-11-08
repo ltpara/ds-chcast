@@ -250,6 +250,28 @@ func TCPPunchMessage(id, nonce, role string, unix int64) []byte {
 	return fieldsMessage(DomainTCPPunch, id, nonce, role, strconv.FormatInt(unix, 10))
 }
 
+// RendezvousControlMessage binds the challenge to both peers' fresh nonces.
+// Separate roles prevent a server challenge being replayed as a host proof.
+func RendezvousControlMessage(role, id, clientNonce, serverNonce string) []byte {
+	return fieldsMessage("chast-rendezvous-control-v1", role, id, clientNonce, serverNonce)
+}
+
+func RendezvousTriggerMessage(id, connectionNonce, nonce, candidate, nat string, local bool, unix int64) []byte {
+	return fieldsMessage("chast-rendezvous-trigger-v1", id, connectionNonce, nonce, candidate, nat, strconv.FormatBool(local), strconv.FormatInt(unix, 10))
+}
+
+func TCPPunchDeclineMessage(id, nonce, reason string, unix int64) []byte {
+	return fieldsMessage("chast-tcp-decline-v1", id, nonce, reason, strconv.FormatInt(unix, 10))
+}
+
+func (s *Server) SignRendezvousChallenge(id, clientNonce, serverNonce string) string {
+	return Sign(s.priv, RendezvousControlMessage("server", id, clientNonce, serverNonce))
+}
+
+func (s *Server) SignRendezvousTrigger(id, connectionNonce, nonce, candidate, nat string, local bool, unix int64) string {
+	return Sign(s.priv, RendezvousTriggerMessage(id, connectionNonce, nonce, candidate, nat, local, unix))
+}
+
 // TCPDirectMessage binds the host hello a viewer checks on a punched TCP
 // socket. The nonce ties the socket to the punch that produced it.
 func TCPDirectMessage(id, nonce string, unix int64) []byte {
@@ -450,4 +472,9 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+// TCPPunchLocalMessage authenticates the private address returned on a LAN path.
+func TCPPunchLocalMessage(id, nonce, candidate string, unix int64) []byte {
+	return fieldsMessage("chast-tcp-local-v1", id, nonce, candidate, strconv.FormatInt(unix, 10))
 }

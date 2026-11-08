@@ -195,6 +195,7 @@ public:
         return implementation_;
     }
     bool shared_import() const noexcept override { return false; }
+    EncoderBackend backend() const noexcept override { return EncoderBackend::Ffmpeg; }
 
 private:
     Error open_device();

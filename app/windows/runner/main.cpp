@@ -45,14 +45,28 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // Dart entrypoint argument, so credentials never reach the process command
   // line or a temporary file.
   std::function<bool(const std::string&)> open_window;
-  open_window = [&windows, &open_window](const std::string& request) {
+  FlutterWindow::OpenDisplayWindow open_display;
+  open_display = [&windows](std::shared_ptr<chast_viewer::SharedViewerSession> session, uint32_t stream) {
+    if (windows.size() >= kMaxSessionWindows) return false;
+    flutter::DartProject display_project(L"data");
+    display_project.set_dart_entrypoint_arguments({"--display-window", std::to_string(stream)});
+    auto child = std::make_unique<FlutterWindow>(display_project,
+        std::function<bool(const std::string&)>{}, FlutterWindow::OpenDisplayWindow{}, std::move(session), stream);
+    const unsigned int offset = static_cast<unsigned int>(windows.size() % 8) * 28;
+    if (!child->Create(L"Chast - Display", Win32Window::Point(100 + offset, 80 + offset),
+                       Win32Window::Size(1120, 720))) return false;
+    child->SetQuitOnClose(false);
+    windows.push_back(std::move(child));
+    return true;
+  };
+  open_window = [&windows, &open_window, &open_display](const std::string& request) {
     if (windows.size() >= kMaxSessionWindows ||
         request.size() > kMaxSessionRequestBytes) {
       return false;
     }
     flutter::DartProject session_project(L"data");
     session_project.set_dart_entrypoint_arguments({"--session-window", request});
-    auto window = std::make_unique<FlutterWindow>(session_project, open_window);
+    auto window = std::make_unique<FlutterWindow>(session_project, open_window, open_display);
     const unsigned int offset =
         static_cast<unsigned int>(windows.size() % 8) * 28;
     Win32Window::Point origin(100 + offset, 80 + offset);
@@ -65,7 +79,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     return true;
   };
 
-  auto window = std::make_unique<FlutterWindow>(project, open_window);
+  auto window = std::make_unique<FlutterWindow>(project, open_window, open_display);
   Win32Window::Point origin(80, 60);
   Win32Window::Size size(1120, 720);
   if (!window->Create(L"Chast", origin, size)) {

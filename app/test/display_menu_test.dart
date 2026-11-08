@@ -34,6 +34,8 @@ void main() {
     required int active,
     required ValueChanged<int> onSelect,
     ValueChanged<int>? onOpenDisplayWindow,
+    VoidCallback? onIndependentDisplays,
+    bool independentDisplays = false,
     bool followCursor = false,
     bool followWindow = false,
     VoidCallback? onToggleFollowCursor,
@@ -148,6 +150,8 @@ void main() {
           onToggleFollowWindow: onToggleFollowWindow ?? () {},
           onSelectDisplay: onSelect,
           onOpenDisplayWindow: onOpenDisplayWindow,
+          onIndependentDisplays: onIndependentDisplays,
+          independentDisplays: independentDisplays,
           modes: modes,
           modeChangeAvailable: modeChangeAvailable,
           onSelectMode: onSelectMode ?? (_) {},
@@ -252,17 +256,17 @@ void main() {
     await tester.tap(find.byIcon(Icons.monitor_rounded));
     await tester.pumpAndSettle();
 
-    expect(find.text('全部显示器（合并）'), findsOneWidget);
+    expect(find.text('全部显示器（完整桌面）'), findsOneWidget);
     expect(find.text('3640×1920 · 2 块屏'), findsOneWidget);
     expect(
       find.descendant(
-        of: find.widgetWithText(PopupMenuItem<int>, '全部显示器（合并）'),
+        of: find.widgetWithText(PopupMenuItem<int>, '全部显示器（完整桌面）'),
         matching: find.byIcon(Icons.check_rounded),
       ),
       findsOneWidget,
     );
 
-    await tester.tap(find.text('全部显示器（合并）'));
+    await tester.tap(find.text('全部显示器（完整桌面）'));
     await tester.pumpAndSettle();
     expect(picked, kViewerDisplayAll);
   });
@@ -977,6 +981,27 @@ void main() {
     await tester.tap(find.text('在新窗口打开显示器 2'));
     await tester.pumpAndSettle();
     expect(opened, 1);
+  });
+
+  testWidgets('independent display action is separate from merge and disables automatic following',
+      (WidgetTester tester) async {
+    int opens = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: -3,
+      onSelect: (_) => fail('independent action must not send a legacy display index'),
+      onIndependentDisplays: () => opens++,
+      independentDisplays: true,
+    ));
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('全部显示器（完整桌面）'), findsOneWidget);
+    final follow = tester.widget<PopupMenuItem<int>>(
+      find.widgetWithText(PopupMenuItem<int>, '跟随远程光标'));
+    expect(follow.enabled, isFalse);
+    await tester.tap(find.text('全部显示器（独立画面）'));
+    await tester.pumpAndSettle();
+    expect(opens, 1);
   });
 
   testWidgets('per-display entries stay hidden without a window opener',

@@ -51,6 +51,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -Path (Join-Path $viewerDir "*") -Destination $stage -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $hostDir "chast-host.exe") -Destination $stage -Force
 Copy-Item -LiteralPath (Join-Path $hostDir "chast-service.exe") -Destination $stage -Force
+Copy-Item -LiteralPath (Join-Path $root "THIRD-PARTY-NOTICES.md") -Destination $stage -Force
 Get-ChildItem -LiteralPath $stage -Recurse -File |
     Where-Object { $_.Extension -in ".lib", ".pdb", ".exp" } |
     Remove-Item -Force

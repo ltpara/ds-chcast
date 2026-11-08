@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include "chast/host_server.h"
@@ -135,12 +136,61 @@ void worker_reconnect() {
               result.snapshot.state == chast::ClipboardReadState::Empty,
           "old connection result is discarded and new backend is used");
 }
+
+void local_file_lifetime() {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("chast-clipboard-source-" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    const auto path = root / "copied.bin", saved = root / "old.bin";
+    { std::ofstream output(path, std::ios::binary); output << "old"; }
+    std::vector<chast::ClipboardFileEntry> entries;
+    std::vector<std::string> paths;
+    std::string error;
+    auto u8 = path.u8string();
+    const bool collected = chast::collect_clipboard_files({std::string(u8.begin(), u8.end())}, entries, paths, &error);
+    auto source = collected ? chast::make_local_clipboard_files(entries, paths, &error) : nullptr;
+    check(source != nullptr, "copied file identities captured without reading bytes");
+    if (source) {
+        std::filesystem::rename(path, saved);
+        { std::ofstream output(path, std::ios::binary); output << "new"; }
+        std::vector<uint8_t> bytes;
+        check(source->Read(0, 0, 3, bytes, &error) && std::string(bytes.begin(), bytes.end()) == "old",
+              "replacing the path cannot make an old offer read the new file");
+        { std::ofstream output(saved, std::ios::binary); output << "changed"; }
+        check(!source->Read(0, 0, 3, bytes, &error) && bytes.empty(), "mutated copied file fails instead of returning mixed content");
+        source->Cancel();
+        check(!source->Read(0, 0, 1, bytes, &error) && bytes.empty(), "cancelled source returns no bytes");
+    }
+    source.reset();
+    std::filesystem::remove_all(root);
+}
+
+void cancelled_virtual_read() {
+    chast::ClipboardFileChannel channel;
+    auto files = channel.Receive(10, {{"waiting.bin", 12}});
+    std::atomic<bool> started{false}, finished{false};
+    bool success = true;
+    std::thread reader([&] {
+        std::vector<uint8_t> bytes;
+        started = true;
+        success = files->Read(0, 0, 12, bytes, nullptr);
+        finished = true;
+    });
+    wait_for([&] { return started.load(); });
+    std::this_thread::sleep_for(30ms);
+    channel.CancelRemote();
+    check(wait_for([&] { return finished.load(); }, 500ms), "cancel wakes a pending paste read without a network reply");
+    reader.join();
+    check(!success && !files->Active(), "old virtual offer remains invalid after cancellation");
+}
 } // namespace
 
 int main() {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
     worker_reconnect();
+    local_file_lifetime();
+    cancelled_virtual_read();
     Sink sink;
     if (!sink.create()) { std::puts("skip: no D3D desktop"); WSACleanup(); return 77; }
     auto local = std::make_shared<Clipboard>();

@@ -7,6 +7,20 @@
 class AutoReconnectPolicy {
   static const List<int> backoffSeconds = <int>[1, 2, 4, 8, 15];
   static const int limit = 5;
+  static const List<int> _hostRestartBackoffSeconds = <int>[
+    1,
+    2,
+    4,
+    8,
+    15,
+    15,
+    15,
+    15,
+  ];
+  bool _hostRestart = false;
+  List<int> get _delays =>
+      _hostRestart ? _hostRestartBackoffSeconds : backoffSeconds;
+  int get attemptLimit => _delays.length;
 
   int attempt = 0;
   bool waiting = false;
@@ -15,16 +29,27 @@ class AutoReconnectPolicy {
   /// is exhausted; [waiting] is cleared so the page shows the normal
   /// disconnected card instead of a spinner that will never advance.
   Duration? next() {
-    if (attempt >= limit) {
+    if (attempt >= attemptLimit) {
       waiting = false;
       return null;
     }
     attempt += 1;
     waiting = true;
-    return Duration(seconds: backoffSeconds[attempt - 1]);
+    return Duration(seconds: _delays[attempt - 1]);
   }
 
-  void reset() {
+  /// Lookup can fail before a native session exists to report a disconnect.
+  /// Continue only an already active series, and never reset its attempt cap.
+  Duration? afterStartupFailure({required bool retryable}) {
+    if (!retryable) {
+      reset();
+      return null;
+    }
+    return waiting && attempt > 0 ? next() : null;
+  }
+
+  void reset({bool hostRestart = false}) {
+    _hostRestart = hostRestart;
     attempt = 0;
     waiting = false;
   }

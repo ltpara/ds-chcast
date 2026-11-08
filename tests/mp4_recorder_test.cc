@@ -15,14 +15,29 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <condition_variable>
+#include <mutex>
+#include <chrono>
+#include <stdexcept>
 
 extern "C" {
 #include <libavformat/avformat.h>
 }
 
 #include "mp4_recorder.h"
+#include "../src/host/stream_recorder.h"
 
 namespace {
+
+// A complete 16x16 solid-color frame generated locally with Pillow/libavif.
+// Includes temporal delimiter, sequence header and frame OBUs (no NAL units).
+const uint8_t kAv1AccessUnit[] = {
+    0x12, 0x00, 0x0a, 0x09, 0x18, 0x0c, 0xff, 0xda, 0x20, 0x21,
+    0xa0, 0xd0, 0x80, 0x32, 0x19, 0x19, 0x47, 0x87, 0x86, 0x21,
+    0x87, 0x9e, 0x79, 0xe6, 0x80, 0x00, 0x00, 0x75, 0x86, 0x4d,
+    0xda, 0xe6, 0x5a, 0xc5, 0x61, 0x02, 0xb8, 0x6a, 0xf5, 0xd0,
+};
 
 // The first 528 bytes of a 2560x1440 H.264 key frame produced by the host
 // encoder: access unit delimiter, SPS, PPS and the start of the IDR slice.
@@ -209,6 +224,79 @@ bool check_segment(const std::string& path, chast::VideoCodec codec,
 
 }  // namespace
 
+bool check_host_recorder() {
+    using namespace chast;
+    namespace fs = std::filesystem;
+    using namespace std::chrono_literals;
+    const auto folder = fs::absolute("host-recording-test-" + std::to_string(GetCurrentProcessId()) +
+                                     "-" + std::to_string(GetTickCount64()));
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool started = false, resume = false;
+    std::vector<std::string> saved, errors;
+    HostRecordingOptions options{true, folder.string(), [&](const std::string& line) {
+        std::unique_lock lock(mutex);
+        const auto found = line.find(": saved ");
+        if (found != std::string::npos) saved.push_back(line.substr(found + 8));
+        if (line.find("ERROR:") != std::string::npos) errors.push_back(line);
+        if (!started && line.find(": started ") != std::string::npos) {
+            started = true; wake.notify_one();
+            wake.wait_for(lock, 10s, [&] { return resume; });
+        }
+    }};
+    const std::vector<uint8_t> key(std::begin(kKeyAccessUnit), std::end(kKeyAccessUnit));
+    const std::vector<uint8_t> delta(std::begin(kDeltaAccessUnit), std::end(kDeltaAccessUnit));
+    StreamRecorder recorder(options, L"display:test");
+    recorder.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 1000, true, true}});
+    {
+        std::unique_lock lock(mutex);
+        if (!wake.wait_for(lock, 5s, [&] { return started; })) return false;
+    }
+    // A blocked writer cannot stall the publisher. Saturating its bounded
+    // queue discards dependent deltas; the next IDR must start another MP4.
+    const auto begin = std::chrono::steady_clock::now();
+    for (uint64_t i = 0; i < 130; ++i)
+        recorder.submit(VideoCodec::H264, 2560, 1440, 1, {{delta, 1033 + i * 33, false, false}});
+    const bool requested_idr = recorder.needs_keyframe(5500);
+    recorder.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 6000, true, true}});
+    recorder.submit(VideoCodec::H264, 2560, 1440, 1, {{delta, 6033, false, false}});
+    // A new encoder with identical codec and dimensions still has a different
+    // generation; its first frame must not reuse the previous sample entry.
+    recorder.submit(VideoCodec::H264, 2560, 1440, 2, {{key, 7000, true, true}});
+    const bool bounded = std::chrono::steady_clock::now() - begin < 1s;
+    const bool periodic = recorder.needs_keyframe(7000 + 10 * 60 * 1000);
+    recorder.submit(VideoCodec::H264, 2560, 1440, 2, {{key, 607000, true, true}});
+    {
+        std::lock_guard lock(mutex); resume = true;
+    }
+    wake.notify_one();
+    recorder.finish(608000);
+    if (!requested_idr || !bounded || !periodic || !errors.empty() || saved.size() != 4) return false;
+    if (!check_segment(saved[0], VideoCodec::H264, {0}, 1) ||
+        !check_segment(saved[1], VideoCodec::H264, {0, 33}, 1) ||
+        !check_segment(saved[2], VideoCodec::H264, {0}, 1) ||
+        !check_segment(saved[3], VideoCodec::H264, {0}, 1)) return false;
+    StreamInfo still;
+    std::string error;
+    if (!inspect(saved.back(), &still, &error) || still.track_seconds < 0.999) return false;
+    // The same label and output root must allocate another directory, never
+    // replace the first recording when a viewer reconnects.
+    StreamRecorder reconnect(options, L"display:test");
+    reconnect.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 100, true, true}});
+    reconnect.finish(200);
+    if (saved.size() != 5 || fs::path(saved[0]).parent_path() == fs::path(saved[4]).parent_path()) return false;
+    // A file in place of the output directory is a real I/O failure. It must
+    // report an error, then stop requesting frames from the video source.
+    options.directory = saved[0];
+    StreamRecorder broken(options, L"display:test");
+    broken.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 100, true, true}});
+    broken.finish(200);
+    if (errors.size() != 1 || broken.needs_keyframe(999999)) return false;
+    fs::remove_all(folder);
+    std::puts("ok   async host recording: bounded backlog, IDR recovery, rebuild, rotation, still duration, reconnect and I/O failure");
+    return true;
+}
+
 int main() {
     // libavformat probes the stream by decoding the first sample, and the
     // fixture's IDR is deliberately truncated; its decode errors are expected
@@ -284,6 +372,38 @@ int main() {
         return 1;
     }
     std::printf("ok   a picture-size change opened a second segment on its key frame\n");
+    chast_tools::Mp4Recorder av1;
+    const std::string av1_path = "mp4_recorder_av1_test.mp4";
+    if (!av1.open(av1_path, chast::VideoCodec::Av1, 16, 16, &error)) return 1;
+    chast::FrameHeader av1_header;
+    av1_header.codec = chast::VideoCodec::Av1;
+    av1_header.width = av1_header.height = 16;
+    av1_header.keyframe = true;
+    av1_header.pts_ms = 5000;
+    av1.write(av1_header, kAv1AccessUnit, sizeof(kAv1AccessUnit));
+    av1_header.pts_ms = 5033;
+    av1.write(av1_header, kAv1AccessUnit, sizeof(kAv1AccessUnit));
+    av1.close(6000);
+    if (av1.failed() || !check_segment(av1_path, chast::VideoCodec::Av1, {0, 33}, 2)) {
+        std::fprintf(stderr, "FAIL AV1 recording: %s\n", av1.error().c_str()); return 1;
+    }
+    chast_tools::Mp4Recorder changing;
+    changing.open("mp4_recorder_codec_test.mp4", chast::VideoCodec::Av1, 16, 16, &error);
+    changing.write(av1_header, kAv1AccessUnit, sizeof(kAv1AccessUnit));
+    auto h264_header = av1_header;
+    h264_header.codec = chast::VideoCodec::H264;
+    h264_header.width = 2560; h264_header.height = 1440; h264_header.pts_ms += 33;
+    changing.write(h264_header, key.data(), key.size());
+    changing.close();
+    if (changing.failed() || changing.segments().size() != 2 ||
+        !check_segment(changing.segments()[0], chast::VideoCodec::Av1, {0}, 1) ||
+        !check_segment(changing.segments()[1], chast::VideoCodec::H264, {0}, 1)) return 1;
+    chast_tools::Mp4Recorder invalid;
+    invalid.open("mp4_recorder_invalid_test.mp4", chast::VideoCodec::Av1, 16, 16, &error);
+    const uint8_t truncated[] = {0x0a, 0xff};
+    invalid.write(av1_header, truncated, sizeof(truncated));
+    if (!invalid.failed() || invalid.error().empty()) return 1;
+    if (!check_host_recorder()) { std::fprintf(stderr, "FAIL async host recording\n"); return 1; }
     std::printf("MP4 recorder PASSED\n");
     return 0;
 }

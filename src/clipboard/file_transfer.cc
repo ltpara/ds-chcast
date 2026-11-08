@@ -476,6 +476,25 @@ bool sanitize_received_directory(const std::string& utf8_path, std::string& sani
     return !sanitized.empty() && sanitized.size() <= kMaxFileRelativePathBytes;
 }
 
+bool create_receive_directory(const std::string& root, const std::string& relative,
+                              std::string* error) {
+    std::string safe;
+    if (relative.empty() || !sanitize_received_directory(relative, safe) || safe != relative) {
+        if (error) *error = "the clipboard directory path is not usable";
+        return false;
+    }
+    const auto directory = absolute_path(utf8_to_wide(root));
+    const DWORD attributes = directory.empty() ? INVALID_FILE_ATTRIBUTES :
+        GetFileAttributesW(long_path(directory).c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        if (error) *error = "the clipboard staging root is not a plain directory";
+        return false;
+    }
+    std::wstring created;
+    return ensure_subdirectory_chain(directory, utf8_to_wide(safe), created, error);
+}
+
 std::string default_receive_directory() {
     PWSTR downloads = nullptr;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, KF_FLAG_DEFAULT, nullptr,
@@ -696,12 +715,23 @@ FileCode resolve_receive_path(const std::string& root, const std::string& relati
     return FileCode::Ok;
 }
 
+namespace { bool valid_operation_name(const std::string& name); }
+
 void list_receive_directory(const std::string& root, const std::string& relative,
-                            FileListResult& result) {
+                            FileListResult& result, std::string cursor) {
     result.entries.clear();
     result.truncated = false;
+    result.next_cursor.clear();
     result.code = FileCode::Ok;
     result.reason.clear();
+    if (!cursor.empty() && (cursor.size() <= 2 || (cursor[0] != 'd' && cursor[0] != 'f') ||
+        cursor[1] != ':' || !valid_operation_name(cursor.substr(2)))) {
+        result.code = FileCode::Refused;
+        result.reason = "invalid directory continuation cursor";
+        return;
+    }
+    FileListEntry after;
+    if (!cursor.empty()) { after.directory = cursor[0] == 'd'; after.name = cursor.substr(2); }
 
     std::string directory;
     bool is_directory = false;
@@ -732,8 +762,8 @@ void list_receive_directory(const std::string& root, const std::string& relative
         return;
     }
 
-    std::vector<FileListEntry> directories;
-    std::vector<FileListEntry> files;
+    auto& page = result.entries;
+    page.reserve(kMaxFileListEntries + 1);
     do {
         const std::wstring name = data.cFileName;
         if (name == L"." || name == L".." ||
@@ -743,12 +773,13 @@ void list_receive_directory(const std::string& root, const std::string& relative
         const std::string utf8_name = wide_to_utf8(name);
         // An entry the wire cannot carry would fail the whole answer, so it is
         // skipped like a reparse point.
-        if (utf8_name.empty() || utf8_name.size() > kMaxFileNameBytes) {
+        if (!valid_operation_name(utf8_name)) {
             continue;
         }
         FileListEntry entry;
         entry.name = utf8_name;
         entry.directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!cursor.empty() && !file_list_entry_less(after, entry)) continue;
         if (!entry.directory) {
             ULARGE_INTEGER size{};
             size.LowPart = data.nFileSizeLow;
@@ -761,31 +792,31 @@ void list_receive_directory(const std::string& root, const std::string& relative
         if (stamp.QuadPart >= kFileTimeUnixEpoch) {
             entry.modified_ms = (stamp.QuadPart - kFileTimeUnixEpoch) / 10000;
         }
-        (entry.directory ? directories : files).push_back(std::move(entry));
+        // Keep the smallest page plus one lookahead, regardless of the
+        // filesystem's enumeration order or the directory's total size.
+        if (page.size() < kMaxFileListEntries + 1) {
+            page.push_back(std::move(entry));
+            std::push_heap(page.begin(), page.end(), file_list_entry_less);
+        } else if (file_list_entry_less(entry, page.front())) {
+            std::pop_heap(page.begin(), page.end(), file_list_entry_less);
+            page.back() = std::move(entry);
+            std::push_heap(page.begin(), page.end(), file_list_entry_less);
+        }
     } while (FindNextFileW(find, &data));
+    const DWORD enumeration_error = GetLastError();
     FindClose(find);
-
-    auto by_name = [](const FileListEntry& left, const FileListEntry& right) {
-        return left.name < right.name;
-    };
-    std::sort(directories.begin(), directories.end(), by_name);
-    std::sort(files.begin(), files.end(), by_name);
-
-    const size_t total = directories.size() + files.size();
-    result.entries.reserve(std::min(total, kMaxFileListEntries));
-    for (FileListEntry& entry : directories) {
-        if (result.entries.size() == kMaxFileListEntries) {
-            break;
-        }
-        result.entries.push_back(std::move(entry));
+    if (enumeration_error != ERROR_NO_MORE_FILES) {
+        page.clear();
+        result.code = FileCode::IoError;
+        result.reason = "cannot finish listing the directory (error " + std::to_string(enumeration_error) + ")";
+        return;
     }
-    for (FileListEntry& entry : files) {
-        if (result.entries.size() == kMaxFileListEntries) {
-            break;
-        }
-        result.entries.push_back(std::move(entry));
+    std::sort_heap(page.begin(), page.end(), file_list_entry_less);
+    result.truncated = page.size() > kMaxFileListEntries;
+    if (result.truncated) {
+        page.pop_back();
+        result.next_cursor = file_list_cursor(page.back());
     }
-    result.truncated = total > kMaxFileListEntries;
 }
 
 namespace {

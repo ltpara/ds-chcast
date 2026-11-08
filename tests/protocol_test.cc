@@ -2,10 +2,13 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -30,6 +33,35 @@ void check(bool condition, const char* what) {
 // The parsers take the payload; the makers return the whole control message.
 std::vector<uint8_t> payload_of(const std::vector<uint8_t>& message) {
     return std::vector<uint8_t>(message.begin() + chast::kControlHeaderSize, message.end());
+}
+
+void test_elevation() {
+    using namespace chast;
+    uint32_t id = 0;
+    ElevationState state;
+    std::string error;
+    check(make_elevation_request(0).empty(), "elevation rejects zero request id");
+    auto bytes = payload_of(make_elevation_request(42));
+    check(parse_elevation_request(bytes, id, &error) && id == 42, "elevation request round trip");
+    bytes.push_back(0);
+    check(!parse_elevation_request(bytes, id, &error), "elevation request rejects trailing bytes");
+    for (const auto code : {ElevationCode::Available, ElevationCode::Elevated, ElevationCode::Pending,
+                            ElevationCode::Restarting, ElevationCode::Cancelled, ElevationCode::Denied,
+                            ElevationCode::Busy, ElevationCode::Failed}) {
+        bytes = payload_of(make_elevation_state({0, code, {}}));
+        check(parse_elevation_state(bytes, state, &error) && state.request_id == 0 && state.code == code,
+              "unsolicited elevation state allows an empty reason");
+    }
+    bytes = payload_of(make_elevation_state({42, ElevationCode::Failed, "本地取消"}));
+    check(parse_elevation_state(bytes, state, &error) && state.request_id == 42 && state.reason == "本地取消",
+          "elevation state preserves correlation and UTF-8");
+    bytes[4] = 255;
+    check(!parse_elevation_state(bytes, state, &error), "elevation rejects unknown states");
+    bytes = payload_of(make_elevation_state({42, ElevationCode::Failed, "x"}));
+    bytes.back() = 0;
+    check(!parse_elevation_state(bytes, state, &error), "elevation reason rejects NUL");
+    bytes.back() = 0xff;
+    check(!parse_elevation_state(bytes, state, &error), "elevation reason rejects invalid UTF-8");
 }
 
 void test_hello() {
@@ -108,7 +140,39 @@ void test_hello() {
               got.capabilities == chast::kClientCapabilityAudioDatagram,
           "Hello round-trips the v35 datagram-audio capability");
     sent.capabilities = 0;
+    sent.decoding_codecs = chast::kVideoCodecH264 | chast::kVideoCodecHevc;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+              got.decoding_codecs == sent.decoding_codecs,
+          "Hello carries the receiver's actual video decoding formats");
+    auto no_decoder = sent;
+    no_decoder.mode = chast::SessionMode::Desktop;
+    no_decoder.decoding_codecs = 0;
+    rejects_hello(payload_of(chast::make_hello(no_decoder)), "desktop Hello without a decoder is rejected");
+    no_decoder.mode = chast::SessionMode::FileTransfer;
+    check(parses_hello(payload_of(chast::make_hello(no_decoder)), got),
+          "file-only Hello does not require a video decoder");
+    no_decoder.decoding_codecs = 0x80;
+    rejects_hello(payload_of(chast::make_hello(no_decoder)), "unknown decoding capabilities are rejected");
+    sent.decoding_codecs = chast::kVideoCodecAll;
+    for (auto preference : {chast::StreamCodecPreference::Auto, chast::StreamCodecPreference::H264,
+                           chast::StreamCodecPreference::Hevc, chast::StreamCodecPreference::Av1, chast::StreamCodecPreference::Vp9}) {
+        sent.codec_preference = preference;
+        check(parses_hello(payload_of(chast::make_hello(sent)), got) && got.codec_preference == preference,
+              "Hello round-trips initial global codec preference");
+    }
+    sent.codec_preference = static_cast<chast::StreamCodecPreference>(5);
+    rejects_hello(payload_of(chast::make_hello(sent)), "unknown initial codec preference is rejected");
+    sent.codec_preference = chast::StreamCodecPreference::Auto;
 
+    sent.decoding_444 = chast::kVideoCodecVp9;
+    sent.prefer_chroma = chast::VideoChroma::Yuv444;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+          got.decoding_444 == chast::kVideoCodecVp9 && got.prefer_chroma == chast::VideoChroma::Yuv444,
+          "Hello carries independent full-chroma capability and preference");
+    auto invalid_chroma = sent;
+    invalid_chroma.decoding_codecs = chast::kVideoCodecH264;
+    rejects_hello(payload_of(chast::make_hello(invalid_chroma)), "444 must be a subset of decoder capabilities");
+    sent.decoding_444 = 0; sent.prefer_chroma = chast::VideoChroma::Yuv420;
     sent.access_token.clear();
     sent.password.clear();
     sent.device_key.clear();
@@ -183,10 +247,10 @@ void test_hello() {
     rejects_hello(payload_of(chast::make_hello(upper_ref)),
                   "Hello with a non-canonical audit reference is rejected");
     std::vector<uint8_t> unknown_mode = payload_of(chast::make_hello(sent));
-    unknown_mode[unknown_mode.size() - 2] = 7;
+    unknown_mode[unknown_mode.size() - 6] = 7;
     rejects_hello(unknown_mode, "Hello with an unknown session mode is rejected");
     std::vector<uint8_t> unknown_capability = payload_of(chast::make_hello(sent));
-    unknown_capability.back() = 0x80;
+    unknown_capability[unknown_capability.size() - 5] = 0x80;
     rejects_hello(unknown_capability, "Hello with an unknown client capability is rejected");
 
     chast::ClientHello long_name = sent;
@@ -310,6 +374,14 @@ void test_hello_ack() {
           "HelloAck keeps negative virtual-desktop origins");
     check(got.input_enabled, "HelloAck keeps the input flag");
     check(got.clipboard_enabled, "HelloAck keeps the clipboard flag");
+    for (auto direction : {chast::ClipboardDirection::Disabled, chast::ClipboardDirection::HostToViewer,
+                           chast::ClipboardDirection::ViewerToHost, chast::ClipboardDirection::Both}) {
+        auto directional = sent;
+        directional.clipboard_direction = direction;
+        chast::ServerInfo decoded;
+        check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(directional)), decoded, &error) &&
+                  decoded.clipboard_direction == direction, "HelloAck preserves clipboard direction independently of grants");
+    }
     check(got.file_transfer_enabled, "HelloAck keeps the file transfer flag");
     check(got.microphone_enabled, "HelloAck keeps the microphone flag");
     check(got.privacy_mode_enabled, "HelloAck keeps the privacy mode flag");
@@ -358,9 +430,9 @@ void test_hello_ack() {
           "HelloAck leaves datagram audio off when it is not announced");
 
     std::vector<uint8_t> nonzero_reserved = payload_of(chast::make_hello_ack(sent));
-    nonzero_reserved[1] = 1;  // codec(1), then the reserved byte
+    nonzero_reserved[1] = 4;  // v57 clipboard direction follows the codec
     check(!chast::parse_hello_ack(nonzero_reserved, got, &error),
-          "HelloAck with a non-zero reserved byte is rejected");
+          "HelloAck with an unknown clipboard direction is rejected");
     std::vector<uint8_t> trailing_ack = payload_of(chast::make_hello_ack(sent));
     trailing_ack.push_back(0);
     check(!chast::parse_hello_ack(trailing_ack, got, &error),
@@ -1246,7 +1318,7 @@ void test_stream_options() {
 
     std::vector<uint8_t> unknown_codec =
         payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
-    unknown_codec[0] = 4;
+    unknown_codec[0] = 5;
     check(!chast::parse_set_stream_options(unknown_codec, options, &error),
           "SetStreamOptions with an unknown codec is rejected");
     std::vector<uint8_t> unknown_quality =
@@ -1294,11 +1366,17 @@ void test_stream_options() {
               payload_of(chast::make_stream_options_result(sent)), result, &error) &&
               result.codec == chast::VideoCodec::Av1,
           "StreamOptionsResult carries AV1");
+    sent.codec = chast::VideoCodec::Vp9; sent.chroma = chast::VideoChroma::Yuv444;
+    check(chast::parse_stream_options_result(payload_of(chast::make_stream_options_result(sent)), result, &error) &&
+          result.codec == sent.codec && result.chroma == sent.chroma, "StreamOptionsResult carries VP9 I444");
     sent.codec = chast::VideoCodec::Hevc;
+    check(!chast::parse_stream_options_result(payload_of(chast::make_stream_options_result(sent)), result, &error),
+          "StreamOptionsResult rejects unsupported codec and chroma combinations");
+    sent.chroma = chast::VideoChroma::Yuv420;
 
     std::vector<uint8_t> unknown_result_codec =
         payload_of(chast::make_stream_options_result(sent));
-    unknown_result_codec[1] = 4;
+    unknown_result_codec[1] = 5;
     check(!chast::parse_stream_options_result(unknown_result_codec, result, &error),
           "StreamOptionsResult with an unknown codec is rejected");
     std::vector<uint8_t> unknown_result_quality =
@@ -1935,6 +2013,7 @@ void test_frame_header() {
     sent.keyframe = true;
     sent.idr = true;
     sent.capture_ms = 0x0000ABCDEF123456ull;
+    sent.stream_id = 0xAABBCCDD;
 
     uint8_t bytes[chast::kFrameHeaderSize]{};
     chast::encode_frame_header(sent, bytes);
@@ -1953,8 +2032,9 @@ void test_frame_header() {
               "FrameHeader keeps the picture description");
         check(got.capture_ms == sent.capture_ms,
               "FrameHeader round-trips the 48-bit capture time");
+        check(got.stream_id == sent.stream_id, "FrameHeader preserves the independent video stream ID");
     }
-    check(sizeof(bytes) == 48, "FrameHeader is still 48 bytes");
+    check(sizeof(bytes) == 52, "v54 FrameHeader is 52 bytes");
 
     sent.capture_ms = 0xFFFFFFFFFFFFull;
     chast::encode_frame_header(sent, bytes);
@@ -1968,6 +2048,10 @@ void test_frame_header() {
               got.codec == chast::VideoCodec::Av1,
           "FrameHeader carries AV1");
 
+    sent.codec = chast::VideoCodec::Vp9; sent.chroma = chast::VideoChroma::Yuv444;
+    chast::encode_frame_header(sent, bytes);
+    check(chast::decode_frame_header(bytes, sizeof(bytes), got, &error) &&
+          got.codec == sent.codec && got.chroma == sent.chroma, "FrameHeader carries VP9 I444");
     std::vector<uint8_t> old_version(bytes, bytes + sizeof(bytes));
     old_version[4] = static_cast<uint8_t>(chast::kProtocolVersion - 1);
     old_version[5] = 0;
@@ -1978,10 +2062,10 @@ void test_frame_header() {
     check(!chast::decode_frame_header(unknown_flags.data(), unknown_flags.size(), got, &error),
           "FrameHeader with unknown flags is rejected");
     std::vector<uint8_t> nonzero_reserved(bytes, bytes + sizeof(bytes));
-    nonzero_reserved.back() = 1;
+    nonzero_reserved[47] = 2;
     check(!chast::decode_frame_header(nonzero_reserved.data(), nonzero_reserved.size(), got,
                                       &error),
-          "FrameHeader with a non-zero reserved byte is rejected");
+          "FrameHeader with an unknown chroma is rejected");
     check(!chast::decode_frame_header(bytes, chast::kFrameHeaderSize - 1, got, &error),
           "a short FrameHeader is rejected");
 }
@@ -2265,6 +2349,17 @@ void test_audio_parser() {
 
 void test_latency_probe() {
     std::string error;
+    uint64_t sequence = 0;
+    const auto receipt = chast::make_video_receipt(0xfedcba9876543210ull);
+    check(receipt[6] == static_cast<uint8_t>(chast::ControlType::VideoReceipt) &&
+              chast::parse_video_receipt(payload_of(receipt), sequence, &error) &&
+              sequence == 0xfedcba9876543210ull,
+          "VideoReceipt carries its cumulative 64-bit sequence");
+    check(chast::parse_video_receipt(payload_of(chast::make_video_receipt(0)), sequence, &error) && sequence == 0,
+          "VideoReceipt accepts the first sequence zero");
+    check(!chast::parse_video_receipt(std::vector<uint8_t>(7), sequence, &error) &&
+              !chast::parse_video_receipt(std::vector<uint8_t>(9), sequence, &error),
+          "VideoReceipt rejects truncated and trailing bytes");
     uint64_t client_us = 0;
     check(chast::parse_latency_probe(
               payload_of(chast::make_latency_probe(0x1122334455667788ull)), client_us,
@@ -2298,6 +2393,20 @@ void test_latency_probe() {
 
 void test_clipboard() {
     std::string error;
+    chast::ClipboardFileRead range{17, 93, 2, 0x10000000full, 4096}, parsed_range;
+    check(chast::parse_clipboard_file_read(payload_of(chast::make_clipboard_file_read(range)), parsed_range, &error) &&
+          parsed_range.generation == 93 && parsed_range.index == 2 && parsed_range.offset == range.offset &&
+          parsed_range.length == 4096, "clipboard ranges preserve generation and 64-bit offsets");
+    range.length = chast::kMaxClipboardFileRead + 1;
+    check(chast::make_clipboard_file_read(range).empty(), "oversized clipboard ranges are refused");
+    range.length = 1; range.offset = UINT64_MAX;
+    check(chast::make_clipboard_file_read(range).empty(), "overflowing clipboard ranges are refused");
+    chast::ClipboardFileData reply{17, 93, true, {0, 1, 255}}, parsed_reply;
+    check(chast::parse_clipboard_file_data(payload_of(chast::make_clipboard_file_data(reply)), parsed_reply, &error) &&
+          parsed_reply.ok && parsed_reply.generation == 93 && parsed_reply.bytes == reply.bytes,
+          "clipboard file data round-trips binary bytes");
+    reply.ok = false;
+    check(chast::make_clipboard_file_data(reply).empty(), "failed clipboard read cannot carry bytes");
     const std::string text = "hello 剪贴板 😀";
     const std::vector<uint8_t> message = chast::make_clipboard_update(0x1122334455667788ull, text);
     check(message.size() == chast::kControlHeaderSize + 8 + text.size(),
@@ -2432,9 +2541,43 @@ void test_clipboard_files() {
           "a zero-entry file list is rejected");
     std::vector<uint8_t> bad_flags = payload;
     // Entry 0 header at offset 2: name length at +0, flags at +2.
-    bad_flags[4] = 0x02;
+    bad_flags[4] = 0x04;
     check(!chast::decode_clipboard_file_list(bad_flags, got, &error),
           "an unknown file-list flag is rejected");
+
+    const std::vector<chast::ClipboardFileEntry> folders = {
+        {"empty", 0, "", true}, {"leaf", 0, "tree/nested/leaf", true}, {"zero", 0, "", false}};
+    auto folder_payload = chast::encode_clipboard_file_list(folders);
+    check(chast::decode_clipboard_file_list(folder_payload, got, &error) && got.size() == 3 &&
+              got[0].directory && got[1].directory && !got[2].directory,
+          "directory metadata is distinct from zero-byte files");
+    auto changed_type = folders; changed_type[0].directory = false;
+    check(chast::clipboard_file_identity_hash(changed_type) != chast::clipboard_file_identity_hash(folders),
+          "echo identity distinguishes a directory from an empty file");
+    check(chast::encode_clipboard_file_list({{"dir", 1, "", true}}).empty(),
+          "directory entries cannot carry file bytes");
+    folder_payload[10] = 1;
+    check(!chast::decode_clipboard_file_list(folder_payload, got, &error),
+          "a directory with nonzero size is rejected on receipt");
+    check(chast::encode_clipboard_file_list({{"dir", 0, "tree/other", true}}).empty(),
+          "directory basename must agree with its path");
+
+    const auto root = std::filesystem::temp_directory_path() /
+        ("chast-clipboard-tree-" + std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::create_directories(root / "tree" / "empty" / "leaf", ec);
+    std::filesystem::create_directories(root / "standalone", ec);
+    { std::ofstream out(root / "tree" / "zero"); }
+    std::vector<chast::ClipboardFileEntry> collected;
+    std::vector<std::string> paths;
+    check(chast::collect_clipboard_files({(root / "tree").string(), (root / "standalone").string()}, collected, paths, &error) &&
+              collected.size() == 3 && paths.size() == 3 &&
+              std::count_if(collected.begin(), collected.end(), [](const auto& entry) { return entry.directory; }) == 2,
+          "collection retains standalone and nested empty directories without inventing file entries");
+    check(chast::collect_clipboard_files({(root / "standalone").string()}, collected, paths, &error) &&
+              collected.size() == 1 && collected[0].directory,
+          "an all-empty-directory copy is a valid clipboard item");
+    std::filesystem::remove_all(root, ec);
 }
 
 void test_chat() {
@@ -3055,6 +3198,40 @@ void test_cursor_update() {
     payload[10] = 9;  // hotspot_x past an 8-pixel-wide sprite
     check(!chast::parse_cursor_update(payload, got, &error),
           "a hotspot outside the sprite is rejected");
+
+    chast::DisplayCursorUpdate display{0xffffffffu, update}, display_got;
+    const auto display_message = chast::make_display_cursor_update(display);
+    payload = payload_of(display_message);
+    check(chast::parse_display_cursor_update(payload, display_got, &error) &&
+          display_got.stream_id == display.stream_id && display_got.cursor.sprite == update.sprite &&
+          display_got.cursor.y == -40 && display_got.cursor.hotspot_y == 5,
+          "display cursor preserves stream identity, source coordinates and shape");
+    bool truncations_rejected = true;
+    for (size_t length = 0; length < payload.size(); ++length)
+        truncations_rejected &= !chast::parse_display_cursor_update(
+            {payload.begin(), payload.begin() + length}, display_got, &error);
+    check(truncations_rejected, "display cursor rejects every truncated message");
+    payload.push_back(0);
+    check(!chast::parse_display_cursor_update(payload, display_got, &error),
+          "display cursor rejects trailing bytes");
+    payload = payload_of(message);
+    std::fill(payload.begin() + 14, payload.begin() + 22, 0);
+    check(!chast::parse_cursor_update(payload, got, &error), "incoming sprite requires a nonzero identity");
+
+    got = update;
+    chast::coalesce_cursor_update(got, moved);
+    check(got.x == moved.x && got.sprite == update.sprite,
+          "coalesced pointer motion retains an unread sprite");
+    moved.visible = false;
+    chast::coalesce_cursor_update(got, moved);
+    check(!got.visible && got.sprite == update.sprite, "hide preserves the unread matching shape");
+    moved.shape_id++;
+    chast::coalesce_cursor_update(got, moved);
+    check(got.sprite.empty(), "a different shape cannot inherit the old sprite");
+    got = update;
+    moved = update; moved.sprite.clear(); moved.width++;
+    chast::coalesce_cursor_update(got, moved);
+    check(got.sprite.empty(), "changed geometry cannot inherit the old sprite");
 }
 
 void test_stream_info() {
@@ -4003,11 +4180,12 @@ void test_file_browser() {
     file.size = 42;
     file.modified_ms = 1730000001000;
     result.entries = {folder, file};
+    result.next_cursor = chast::file_list_cursor(file);
     chast::FileListResult got_list;
     check(chast::parse_file_list_result(payload_of(chast::make_file_list_result(result)),
                                         got_list, &error) &&
               got_list.request_id == 9 && got_list.code == chast::FileCode::Ok &&
-              got_list.truncated && got_list.entries.size() == 2 &&
+              got_list.truncated && got_list.next_cursor == result.next_cursor && got_list.entries.size() == 2 &&
               got_list.entries[0].name == "photos" && got_list.entries[0].directory &&
               got_list.entries[0].modified_ms == 1730000000000 &&
               got_list.entries[1].name == file.name && !got_list.entries[1].directory &&
@@ -4069,7 +4247,7 @@ void test_file_browser() {
     rejects_list_result(std::move(slash_name),
                         "FileListResult with a separator in an entry name is rejected");
     std::vector<uint8_t> entry_flags = ok_list;
-    entry_flags.back() = 0x02;
+    entry_flags[entry_flags.size() - result.next_cursor.size() - 3] = 0x02;
     rejects_list_result(std::move(entry_flags),
                         "FileListResult with unknown entry flags is rejected");
     std::vector<uint8_t> trailing_list = ok_list;
@@ -4079,6 +4257,20 @@ void test_file_browser() {
     std::vector<uint8_t> cut_list = ok_list;
     cut_list.pop_back();
     rejects_list_result(std::move(cut_list), "a truncated FileListResult is rejected");
+
+    std::string continuation;
+    check(chast::parse_file_list_request(payload_of(chast::make_file_list_request(10, "docs", result.next_cursor)),
+              request_id, directory, &error, &continuation) && continuation == result.next_cursor,
+          "paged directory requests preserve the continuation key");
+    check(chast::make_file_list_request(10, "docs", "f:../escape").empty() &&
+              chast::make_file_list_request(10, "docs", "x:name").empty(),
+          "continuations cannot contain paths or unknown entry types");
+    auto invalid_page = result;
+    invalid_page.next_cursor = "f:other";
+    check(chast::make_file_list_result(invalid_page).empty(), "a page cursor must name its last entry");
+    invalid_page = result;
+    invalid_page.entries.push_back(file);
+    check(chast::make_file_list_result(invalid_page).empty(), "directory pages reject duplicate or unordered entries");
 
     uint32_t download_id = 0;
     std::string path;
@@ -4238,6 +4430,7 @@ void test_file_browser() {
 void test_clipboard_container() {
     std::string error;
     chast::ClipboardContent content;
+    content.seq = 0x123456789abcdef0ull;
     chast::ClipboardFormatData text;
     text.format = chast::ClipboardFormat::Text;
     const std::string hello = "hello \xE4\xB8\x96\xE7\x95\x8C";
@@ -4284,7 +4477,7 @@ void test_clipboard_container() {
     chast::ClipboardContent decoded;
     check(chast::decode_clipboard_stream(stream.data(), stream.size(), decoded, &error),
           "CCLB stream round-trips");
-    check(decoded.hash == hash && decoded.formats.size() == 4 &&
+    check(decoded.seq == content.seq && decoded.hash == hash && decoded.formats.size() == 4 &&
               decoded.formats[0].format == chast::ClipboardFormat::Text &&
               decoded.formats[1].format == chast::ClipboardFormat::Html &&
               decoded.formats[2].format == chast::ClipboardFormat::Rtf &&
@@ -4302,7 +4495,7 @@ void test_clipboard_container() {
               what);
     };
     alters(8, static_cast<uint8_t>(stream[8] ^ 0xFF), "a CCLB with a wrong hash is rejected");
-    alters(4, 2, "a CCLB with an unknown version is rejected");
+    alters(4, 3, "a CCLB with an unknown version is rejected");
     alters(5, 9, "a CCLB with too many formats is rejected");
     chast::ClipboardContent dropped;
     check(!chast::decode_clipboard_stream(stream.data(), stream.size() - 1, dropped, &error),
@@ -4391,6 +4584,7 @@ void test_clipboard_container() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    test_elevation();
     test_hello();
     test_access_denied();
     test_hello_ack();

@@ -79,9 +79,12 @@ public:
         // How long a remembered device stays usable, in seconds. 0 disables
         // expiry. The default mirrors kTrustedDeviceLifetimeSeconds.
         int64_t trusted_device_lifetime_seconds = kTrustedDeviceLifetimeSeconds;
-        // Service mode has no interactive operator: no approval, no temporary
-        // password, and no connection at all without a permanent password.
+        // Service mode never creates temporary passwords. Without a local
+        // approval channel it requires permanent-password authentication.
         bool service_mode = false;
+        // An authenticated local service manager can answer Click/Both.
+        // Temporary passwords remain unavailable in service mode.
+        bool service_approval = false;
         // Legacy access token, only for CLI/automation.
         bool token_auth = false;
         std::string access_token;

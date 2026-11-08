@@ -36,6 +36,12 @@ std::string sanitize_received_name(const std::string& utf8_name);
 // components, over-long paths or more than kMaxReceivePathDepth components.
 bool sanitize_received_directory(const std::string& utf8_path, std::string& sanitized);
 
+// Create a metadata-only directory below an existing receive root. Rejects
+// paths that would be renamed by sanitization, and reparse points in the
+// chain; useful for clipboard empty folders, which have no FileReceiver.
+bool create_receive_directory(const std::string& root, const std::string& relative,
+                              std::string* error);
+
 // %USERPROFILE%\Downloads\chast, or an empty string when the shell cannot name
 // the Downloads folder. Hosts use it when no receive directory is configured.
 std::string default_receive_directory();
@@ -112,14 +118,15 @@ FileCode resolve_receive_path(const std::string& root, const std::string& relati
                               std::string& full_path, bool& is_directory,
                               std::string& error);
 
-// Fills `result.entries`, `result.truncated`, `result.code` and
+// Fills `result.entries`, `result.truncated`, `result.next_cursor`, `result.code` and
 // `result.reason` for one browse request; the caller sets `request_id`.
 // Directories come first, then files, each sorted by name. Reparse points and
 // names too long or not representable as UTF-8 are skipped, and at most
 // kMaxFileListEntries entries are returned with `truncated` set when more
-// exist.
+// exist. `cursor` continues strictly after the previous page's final entry.
+// Enumeration keeps at most one page plus one lookahead entry in memory.
 void list_receive_directory(const std::string& root, const std::string& relative,
-                            FileListResult& result);
+                            FileListResult& result, std::string cursor = {});
 
 // Applies one viewer file operation below `root`: create a folder, rename an
 // entry inside its current folder, or remove a file / empty directory.

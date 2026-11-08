@@ -228,7 +228,8 @@ func runViewer(args []string) error {
 	id := fs.String("id", "", "host id to reach")
 	listen := fs.String("listen", "127.0.0.1:24434", "local UDP address for the QUIC client")
 	mode := fs.String("mode", agent.ModeAuto, "auto: direct, relay or carrier; direct; relay; carrier; tcp: punched TCP link only")
-	directTimeout := fs.Duration("direct-timeout", 3*time.Second, "how long auto waits for the direct path")
+	directTimeout := fs.Duration("direct-timeout", 0, "auto attempt limit including coordination; 0 uses RustDesk adaptive timing")
+	directHistory := fs.String("direct-history-dir", agent.DefaultDirectHistoryDir(), "directory for per-peer direct connection history; empty disables persistence")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
@@ -290,18 +291,19 @@ func runViewer(args []string) error {
 	}
 
 	v, err := agent.StartViewer(ctx, agent.ViewerConfig{
-		ServerURL:       *server,
-		Servers:         splitCSV(*rendezvousList),
-		ServerKey:       *serverKey,
-		ServerPublicKey: *serverPubKey,
-		Proxy:           proxy,
-		HostID:          *id,
-		ListenAddr:      *listen,
-		Mode:            *mode,
-		DirectTimeout:   *directTimeout,
-		UPnP:            *upnpEnabled,
-		TLS:             tlsConfig,
-		Logger:          log,
+		ServerURL:        *server,
+		Servers:          splitCSV(*rendezvousList),
+		ServerKey:        *serverKey,
+		ServerPublicKey:  *serverPubKey,
+		Proxy:            proxy,
+		HostID:           *id,
+		ListenAddr:       *listen,
+		Mode:             *mode,
+		DirectTimeout:    *directTimeout,
+		DirectHistoryDir: *directHistory,
+		UPnP:             *upnpEnabled,
+		TLS:              tlsConfig,
+		Logger:           log,
 		OnPath: func(info agent.PathInfo) {
 			emit(agentEvent{
 				Event:        "path",
@@ -318,6 +320,7 @@ func runViewer(args []string) error {
 		},
 	})
 	if err != nil {
+		emit(agentEvent{Event: "error", Error: err.Error(), Retryable: agent.IsRetryableStartError(err)})
 		return err
 	}
 	defer v.Close()
@@ -499,6 +502,8 @@ func splitCSV(value string) []string {
 
 type agentEvent struct {
 	Event        string `json:"event"`
+	Error        string `json:"error,omitempty"`
+	Retryable    bool   `json:"retryable,omitempty"`
 	Listen       string `json:"listen,omitempty"`
 	Host         string `json:"host,omitempty"`
 	Path         string `json:"path,omitempty"`

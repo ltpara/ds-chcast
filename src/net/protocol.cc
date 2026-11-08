@@ -197,6 +197,8 @@ uint8_t codec_wire(VideoCodec codec) {
             return 2;
         case VideoCodec::Av1:
             return 3;
+        case VideoCodec::Vp9:
+            return 4;
     }
     return 0;
 }
@@ -214,6 +216,7 @@ bool codec_from_wire(uint8_t value, VideoCodec& codec) {
         codec = VideoCodec::Av1;
         return true;
     }
+    if (value == 4) { codec = VideoCodec::Vp9; return true; }
     return false;
 }
 
@@ -287,7 +290,8 @@ void encode_frame_header(const FrameHeader& header, uint8_t out[kFrameHeaderSize
     for (int i = 0; i < 6; ++i) {
         put_u8(cursor, static_cast<uint8_t>(capture_ms >> (8 * i)));
     }
-    put_u8(cursor, 0);
+    put_u8(cursor, static_cast<uint8_t>(header.chroma));
+    put_u32(cursor, header.stream_id);
 }
 
 bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
@@ -343,9 +347,14 @@ bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
         }
         header.capture_ms |= static_cast<uint64_t>(byte) << (8 * i);
     }
-    uint8_t reserved = 0;
-    if (!reader.u8(reserved) || reserved != 0) {
-        set_error(error, "frame header has a malformed reserved byte");
+    uint8_t chroma = 0;
+    if (!reader.u8(chroma) || !valid_video_format(header.codec, static_cast<VideoChroma>(chroma))) {
+        set_error(error, "frame header has an invalid chroma format");
+        return false;
+    }
+    header.chroma = static_cast<VideoChroma>(chroma);
+    if (!reader.u32(header.stream_id)) {
+        set_error(error, "truncated video stream ID");
         return false;
     }
     return true;
@@ -563,7 +572,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
                                   : hello.audit_ref.size();
     std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 4 + 2 + key_size +
                                  1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
-                                 signature_size + 2 + totp_size + 2 + audit_size + 2);
+                                 signature_size + 2 + totp_size + 2 + audit_size + 6);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
     put_u16(cursor, hello.display);
@@ -606,6 +615,10 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     }
     put_u8(cursor, static_cast<uint8_t>(hello.mode));
     put_u8(cursor, hello.capabilities);
+    put_u8(cursor, hello.decoding_codecs);
+    put_u8(cursor, static_cast<uint8_t>(hello.codec_preference));
+    put_u8(cursor, hello.decoding_444);
+    put_u8(cursor, static_cast<uint8_t>(hello.prefer_chroma));
     return make_control(ControlType::Hello, payload);
 }
 
@@ -721,6 +734,24 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "Hello carries unknown client capabilities");
         return false;
     }
+    if (!reader.u8(hello.decoding_codecs) ||
+        (hello.decoding_codecs & ~kVideoCodecAll) != 0 ||
+        (hello.mode == SessionMode::Desktop && hello.decoding_codecs == 0)) {
+        set_error(error, "Hello carries invalid video decoding capabilities");
+        return false;
+    }
+    uint8_t preference = 0;
+    if (!reader.u8(preference) || preference > static_cast<uint8_t>(StreamCodecPreference::Vp9)) {
+        set_error(error, "Hello carries invalid codec preference");
+        return false;
+    }
+    hello.codec_preference = static_cast<StreamCodecPreference>(preference);
+    uint8_t chroma = 0;
+    if (!reader.u8(hello.decoding_444) || (hello.decoding_444 & ~kVideoCodecVp9) != 0 ||
+        (hello.decoding_444 & ~hello.decoding_codecs) != 0 || !reader.u8(chroma) || chroma > 1) {
+        set_error(error, "Hello carries invalid chroma capabilities or preference"); return false;
+    }
+    hello.prefer_chroma = static_cast<VideoChroma>(chroma);
     if (!reader.at_end()) {
         set_error(error, "Hello carries trailing bytes");
         return false;
@@ -812,7 +843,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     std::vector<uint8_t> payload(size);
     uint8_t* cursor = payload.data();
     put_u8(cursor, codec_wire(info.codec));
-    put_u8(cursor, 0);
+    put_u8(cursor, static_cast<uint8_t>(info.clipboard_direction));
     put_u16(cursor, info.width);
     put_u16(cursor, info.height);
     put_u16(cursor, info.framerate);
@@ -821,6 +852,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     put_u32(cursor, static_cast<uint32_t>(info.origin_y));
     put_u16(cursor, static_cast<uint16_t>(
                         (info.input_enabled ? kServerInfoInputEnabled : 0) |
+                        (info.chroma == VideoChroma::Yuv444 ? kServerInfoYuv444 : 0) |
                         (info.clipboard_enabled ? kServerInfoClipboardEnabled : 0) |
                         (info.audio.enabled ? kServerInfoAudioEnabled : 0) |
                         (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0) |
@@ -930,22 +962,23 @@ std::vector<uint8_t> make_stream_info(const ServerInfo& info) {
 bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std::string* error) {
     Reader reader(payload.data(), payload.size());
     uint8_t codec = 0;
-    uint8_t reserved = 0;
+    uint8_t direction = 0;
     uint32_t origin_x = 0;
     uint32_t origin_y = 0;
     uint16_t flags = 0;
     uint16_t name_size = 0;
-    if (!reader.u8(codec) || !reader.u8(reserved) || !reader.u16(info.width) ||
+    if (!reader.u8(codec) || !reader.u8(direction) || !reader.u16(info.width) ||
         !reader.u16(info.height) || !reader.u16(info.framerate) || !reader.u32(info.bitrate) ||
         !reader.u32(origin_x) || !reader.u32(origin_y) || !reader.u16(flags) ||
         !reader.u16(name_size)) {
         set_error(error, "truncated HelloAck");
         return false;
     }
-    if (reserved != 0) {
-        set_error(error, "HelloAck carries a non-zero reserved byte");
+    if (direction > static_cast<uint8_t>(ClipboardDirection::Both)) {
+        set_error(error, "HelloAck carries an unknown clipboard direction");
         return false;
     }
+    info.clipboard_direction = static_cast<ClipboardDirection>(direction);
     info.origin_x = static_cast<int32_t>(origin_x);
     info.origin_y = static_cast<int32_t>(origin_y);
     if ((flags & ~kServerInfoKnownFlags) != 0) {
@@ -953,6 +986,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         return false;
     }
     info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
+    info.chroma = (flags & kServerInfoYuv444) ? VideoChroma::Yuv444 : VideoChroma::Yuv420;
     info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
     info.merged = (flags & kServerInfoMergedLayout) != 0;
     info.files_only = (flags & kServerInfoFileTransferOnly) != 0;
@@ -967,6 +1001,9 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
+    }
+    if (!valid_video_format(info.codec, info.chroma)) {
+        set_error(error, "HelloAck names an invalid chroma format"); return false;
     }
     if ((info.files_only || info.control_only) && info.merged) {
         set_error(error, "HelloAck is control-only and merged at once");
@@ -1227,6 +1264,148 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     return true;
 }
 
+std::vector<uint8_t> make_capture_displays(const CaptureDisplaysRequest& request) {
+    if (request.add.size() > kMaxDisplayCount || request.sub.size() > kMaxDisplayCount ||
+        request.set.size() > kMaxDisplayCount) return {};
+    std::vector<uint8_t> payload(10 + 2 * (request.add.size() + request.sub.size() + request.set.size()));
+    auto cursor = payload.data();
+    put_u32(cursor, request.request_id);
+    for (const auto* indices : {&request.add, &request.sub, &request.set}) {
+        put_u16(cursor, static_cast<uint16_t>(indices->size()));
+        for (auto index : *indices) put_u16(cursor, index);
+    }
+    return make_control(ControlType::CaptureDisplays, payload);
+}
+
+bool parse_capture_displays(const std::vector<uint8_t>& payload,
+                            CaptureDisplaysRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    CaptureDisplaysRequest parsed;
+    if (!reader.u32(parsed.request_id)) { set_error(error, "truncated display request ID"); return false; }
+    for (auto* indices : {&parsed.add, &parsed.sub, &parsed.set}) {
+        uint16_t count = 0;
+        if (!reader.u16(count) || count > kMaxDisplayCount) {
+            set_error(error, "invalid display subscription count"); return false;
+        }
+        for (uint16_t i = 0; i < count; ++i) {
+            uint16_t index = 0;
+            if (!reader.u16(index)) { set_error(error, "truncated display indices"); return false; }
+            indices->push_back(index); // unavailable indices are ignored by the host, like RustDesk
+        }
+    }
+    if (!reader.at_end()) { set_error(error, "display request carries trailing bytes"); return false; }
+    request = std::move(parsed);
+    return true;
+}
+
+namespace {
+std::vector<uint8_t> build_display_stream(const DisplayStreamInfo& stream) {
+    auto info = build_server_info(stream.info);
+    std::vector<uint8_t> payload(10 + info.size());
+    auto cursor = payload.data();
+    put_u32(cursor, stream.stream_id);
+    put_u16(cursor, stream.display_index);
+    put_u32(cursor, static_cast<uint32_t>(info.size()));
+    std::memcpy(cursor, info.data(), info.size());
+    return payload;
+}
+bool read_display_stream(Reader& reader, DisplayStreamInfo& stream, std::string* error) {
+    uint32_t size = 0;
+    std::vector<uint8_t> description;
+    if (!reader.u32(stream.stream_id) || !reader.u16(stream.display_index) ||
+        !reader.u32(size) || size > kMaxControlPayload || !reader.bytes(description, size)) {
+        set_error(error, "truncated display stream description"); return false;
+    }
+    if (!parse_hello_ack(description, stream.info, error)) return false;
+    if (stream.info.mode != SessionMode::Desktop || stream.info.files_only || stream.info.control_only ||
+        (stream.display_index >= kMaxDisplayCount && stream.display_index != kDisplayAll) ||
+        stream.info.merged != (stream.display_index == kDisplayAll)) {
+        set_error(error, "display stream does not describe a desktop subscription"); return false;
+    }
+    return true;
+}
+} // namespace
+
+std::vector<uint8_t> make_display_stream_info(const DisplayStreamInfo& stream) {
+    auto payload = build_display_stream(stream);
+    DisplayStreamInfo validated;
+    if (payload.size() > kMaxControlPayload || !parse_display_stream_info(payload, validated, nullptr)) return {};
+    return make_control(ControlType::DisplayStreamInfo, payload);
+}
+
+bool parse_display_stream_info(const std::vector<uint8_t>& payload,
+                               DisplayStreamInfo& stream, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    DisplayStreamInfo parsed;
+    if (!read_display_stream(reader, parsed, error)) return false;
+    if (!reader.at_end()) { set_error(error, "display stream carries trailing bytes"); return false; }
+    stream = std::move(parsed);
+    return true;
+}
+
+std::vector<uint8_t> make_capture_displays_result(const CaptureDisplaysResult& result) {
+    if (result.streams.size() > kMaxDisplayCount) return {};
+    const auto reason = truncate_utf8_reason(result.reason, kMaxDisplaySwitchReason);
+    std::vector<uint8_t> payload(9 + reason.size());
+    auto cursor = payload.data();
+    put_u32(cursor, result.request_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    std::memcpy(cursor, reason.data(), reason.size());
+    cursor += reason.size();
+    put_u16(cursor, static_cast<uint16_t>(result.streams.size()));
+    for (const auto& stream : result.streams) {
+        auto description = build_display_stream(stream);
+        if (payload.size() + description.size() > kMaxControlPayload) return {};
+        payload.insert(payload.end(), description.begin(), description.end());
+    }
+    CaptureDisplaysResult validated;
+    if (!parse_capture_displays_result(payload, validated, nullptr)) return {};
+    return make_control(ControlType::CaptureDisplaysResult, payload);
+}
+
+bool parse_capture_displays_result(const std::vector<uint8_t>& payload,
+                                   CaptureDisplaysResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    CaptureDisplaysResult parsed;
+    uint8_t code = 0;
+    uint16_t reason_size = 0, count = 0;
+    if (!reader.u32(parsed.request_id) || !reader.u8(code) || code > static_cast<uint8_t>(DisplaySwitchCode::Busy) ||
+        !reader.u16(reason_size) || reason_size > kMaxDisplaySwitchReason ||
+        !reader.string(parsed.reason, reason_size) || !valid_utf8(parsed.reason) ||
+        !reader.u16(count) || count > kMaxDisplayCount) {
+        set_error(error, "invalid display subscription result"); return false;
+    }
+    parsed.code = static_cast<DisplaySwitchCode>(code);
+    for (uint16_t i = 0; i < count; ++i) {
+        DisplayStreamInfo stream;
+        if (!read_display_stream(reader, stream, error)) return false;
+        for (const auto& previous : parsed.streams)
+            if (previous.stream_id == stream.stream_id || previous.display_index == stream.display_index) {
+                set_error(error, "duplicate display subscription"); return false;
+            }
+        parsed.streams.push_back(std::move(stream));
+    }
+    if (!reader.at_end()) { set_error(error, "display result carries trailing bytes"); return false; }
+    result = std::move(parsed);
+    return true;
+}
+
+std::vector<uint8_t> make_display_keyframe_request(uint32_t stream_id) {
+    std::vector<uint8_t> payload(4);
+    auto cursor = payload.data();
+    put_u32(cursor, stream_id);
+    return make_control(ControlType::DisplayKeyframeRequest, payload);
+}
+bool parse_display_keyframe_request(const std::vector<uint8_t>& payload,
+                                    uint32_t& stream_id, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(stream_id) || !reader.at_end()) {
+        set_error(error, "invalid display keyframe request"); return false;
+    }
+    return true;
+}
+
 std::vector<uint8_t> make_stats(const ClientStats& stats) {
     std::vector<uint8_t> payload(48);
     uint8_t* cursor = payload.data();
@@ -1256,6 +1435,23 @@ std::vector<uint8_t> make_latency_probe(uint64_t client_us) {
     uint8_t* cursor = payload.data();
     put_u64(cursor, client_us);
     return make_control(ControlType::LatencyProbe, payload);
+}
+
+std::vector<uint8_t> make_video_receipt(uint64_t sequence) {
+    std::vector<uint8_t> payload(8);
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, sequence);
+    return make_control(ControlType::VideoReceipt, payload);
+}
+
+bool parse_video_receipt(const std::vector<uint8_t>& payload, uint64_t& sequence,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u64(sequence) || !reader.at_end()) {
+        set_error(error, "malformed VideoReceipt");
+        return false;
+    }
+    return true;
 }
 
 bool parse_latency_probe(const std::vector<uint8_t>& payload, uint64_t& client_us,
@@ -1554,6 +1750,52 @@ bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate
         set_error(error, "ClipboardUpdate carries invalid clipboard text");
         return false;
     }
+    return true;
+}
+
+std::vector<uint8_t> make_clipboard_file_read(const ClipboardFileRead& request) {
+    if (!request.request_id || !request.generation || request.index >= 256 ||
+        !request.length || request.length > kMaxClipboardFileRead ||
+        request.offset > UINT64_MAX - request.length) return {};
+    std::vector<uint8_t> payload(28);
+    auto* out = payload.data();
+    put_u32(out, request.request_id); put_u64(out, request.generation);
+    put_u32(out, request.index); put_u64(out, request.offset); put_u32(out, request.length);
+    return make_control(ControlType::ClipboardFileRead, payload);
+}
+
+bool parse_clipboard_file_read(const std::vector<uint8_t>& payload, ClipboardFileRead& request, std::string* error) {
+    request = {};
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(request.request_id) || !reader.u64(request.generation) || !reader.u32(request.index) ||
+        !reader.u64(request.offset) || !reader.u32(request.length) || !reader.at_end() ||
+        !request.request_id || !request.generation || request.index >= 256 || !request.length ||
+        request.length > kMaxClipboardFileRead || request.offset > UINT64_MAX - request.length) {
+        set_error(error, "invalid clipboard file range"); return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_clipboard_file_data(const ClipboardFileData& response) {
+    if (!response.request_id || !response.generation || response.bytes.size() > kMaxClipboardFileRead ||
+        (!response.ok && !response.bytes.empty())) return {};
+    std::vector<uint8_t> payload(13 + response.bytes.size());
+    auto* out = payload.data();
+    put_u32(out, response.request_id); put_u64(out, response.generation); put_u8(out, response.ok ? 1 : 0);
+    std::copy(response.bytes.begin(), response.bytes.end(), out);
+    return make_control(ControlType::ClipboardFileData, payload);
+}
+
+bool parse_clipboard_file_data(const std::vector<uint8_t>& payload, ClipboardFileData& response, std::string* error) {
+    response = {};
+    Reader reader(payload.data(), payload.size());
+    uint8_t ok = 0;
+    if (!reader.u32(response.request_id) || !reader.u64(response.generation) || !reader.u8(ok) ||
+        !response.request_id || !response.generation || ok > 1 || reader.remaining() > kMaxClipboardFileRead ||
+        (!ok && reader.remaining() != 0) || !reader.bytes(response.bytes, reader.remaining())) {
+        set_error(error, "invalid clipboard file data"); return false;
+    }
+    response.ok = ok != 0;
     return true;
 }
 
@@ -2594,6 +2836,47 @@ bool valid_host_action_value(HostAction action, uint8_t value) {
 
 }  // namespace
 
+std::vector<uint8_t> make_elevation_request(uint32_t request_id) {
+    if (!request_id) return {};
+    std::vector<uint8_t> payload(4);
+    auto* cursor = payload.data();
+    put_u32(cursor, request_id);
+    return make_control(ControlType::ElevationRequest, payload);
+}
+bool parse_elevation_request(const std::vector<uint8_t>& payload, uint32_t& request_id, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(request_id) || !request_id || !reader.at_end()) {
+        set_error(error, "malformed ElevationRequest"); return false;
+    }
+    return true;
+}
+std::vector<uint8_t> make_elevation_state(const ElevationState& state) {
+    if (static_cast<uint8_t>(state.code) > static_cast<uint8_t>(ElevationCode::Failed)) return {};
+    const auto reason = truncate_utf8_reason(state.reason, kMaxHostActionReason);
+    if (reason.find('\0') != std::string::npos) return {};
+    std::vector<uint8_t> payload(7 + reason.size());
+    auto* cursor = payload.data();
+    put_u32(cursor, state.request_id);
+    put_u8(cursor, static_cast<uint8_t>(state.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) std::memcpy(cursor, reason.data(), reason.size());
+    return make_control(ControlType::ElevationState, payload);
+}
+bool parse_elevation_state(const std::vector<uint8_t>& payload, ElevationState& state, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t code = 0;
+    uint16_t size = 0;
+    state = {};
+    if (!reader.u32(state.request_id) || !reader.u8(code) || !reader.u16(size) ||
+        size > kMaxHostActionReason || !reader.string(state.reason, size) || !reader.at_end() ||
+        code > static_cast<uint8_t>(ElevationCode::Failed) || !valid_utf8(state.reason) ||
+        state.reason.find('\0') != std::string::npos) {
+        set_error(error, "malformed ElevationState"); return false;
+    }
+    state.code = static_cast<ElevationCode>(code);
+    return true;
+}
+
 std::vector<uint8_t> make_host_action_request(const HostControlRequest& request) {
     if (!valid_host_action(request.action)) {
         return {};
@@ -3076,7 +3359,7 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
     update.height = height;
     const size_t pixels = static_cast<size_t>(width) * height;
     if ((shape_flags & 1u) != 0) {
-        if (pixels == 0 || !reader.bytes(update.sprite, pixels * 4u)) {
+        if (shape_id == 0 || pixels == 0 || !reader.bytes(update.sprite, pixels * 4u)) {
             set_error(error, "CursorUpdate sprite is truncated");
             return false;
         }
@@ -3096,6 +3379,36 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
         return false;
     }
     return true;
+}
+
+void coalesce_cursor_update(CursorUpdate& pending, CursorUpdate update) {
+    if (update.sprite.empty() && update.shape_id != 0 &&
+        update.shape_id == pending.shape_id && update.width == pending.width &&
+        update.height == pending.height) {
+        update.sprite = std::move(pending.sprite);
+    }
+    pending = std::move(update);
+}
+
+std::vector<uint8_t> make_display_cursor_update(const DisplayCursorUpdate& update) {
+    const auto cursor = make_cursor_update(update.cursor);
+    if (cursor.empty()) return {};
+    std::vector<uint8_t> payload(4 + cursor.size() - kControlHeaderSize);
+    uint8_t* out = payload.data();
+    put_u32(out, update.stream_id);
+    std::memcpy(out, cursor.data() + kControlHeaderSize, cursor.size() - kControlHeaderSize);
+    return make_control(ControlType::DisplayCursorUpdate, payload);
+}
+
+bool parse_display_cursor_update(const std::vector<uint8_t>& payload,
+                                 DisplayCursorUpdate& update, std::string* error) {
+    update = {};
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(update.stream_id)) {
+        set_error(error, "truncated DisplayCursorUpdate");
+        return false;
+    }
+    return parse_cursor_update({payload.begin() + 4, payload.end()}, update.cursor, error);
 }
 
 std::vector<uint8_t> make_permission_update(PermissionMask permissions) {
@@ -3795,11 +4108,12 @@ bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
 }
 
 std::vector<uint8_t> make_set_stream_options(const StreamOptions& options) {
-    std::vector<uint8_t> payload(4);
+    std::vector<uint8_t> payload(5);
     uint8_t* cursor = payload.data();
     put_u8(cursor, static_cast<uint8_t>(options.codec));
     put_u16(cursor, options.max_fps);
     put_u8(cursor, static_cast<uint8_t>(options.quality));
+    put_u8(cursor, static_cast<uint8_t>(options.chroma));
     return make_control(ControlType::SetStreamOptions, payload);
 }
 
@@ -3808,12 +4122,13 @@ bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions
     Reader reader(payload.data(), payload.size());
     uint8_t raw_codec = 0;
     uint8_t raw_quality = 0;
+    uint8_t chroma = 0;
     if (!reader.u8(raw_codec) || !reader.u16(options.max_fps) ||
-        !reader.u8(raw_quality) || !reader.at_end()) {
+        !reader.u8(raw_quality) || !reader.u8(chroma) || chroma > 1 || !reader.at_end()) {
         set_error(error, "malformed SetStreamOptions");
         return false;
     }
-    if (raw_codec > static_cast<uint8_t>(StreamCodecPreference::Av1)) {
+    if (raw_codec > static_cast<uint8_t>(StreamCodecPreference::Vp9)) {
         set_error(error, "unknown stream codec preference " + std::to_string(raw_codec));
         return false;
     }
@@ -3828,17 +4143,19 @@ bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions
     }
     options.codec = static_cast<StreamCodecPreference>(raw_codec);
     options.quality = static_cast<StreamQuality>(raw_quality);
+    options.chroma = static_cast<VideoChroma>(chroma);
     return true;
 }
 
 std::vector<uint8_t> make_stream_options_result(const StreamOptionsResult& result) {
     const std::string text = truncate_utf8_reason(result.reason, kMaxStreamOptionReason);
-    std::vector<uint8_t> payload(7 + text.size());
+    std::vector<uint8_t> payload(8 + text.size());
     uint8_t* cursor = payload.data();
     put_u8(cursor, static_cast<uint8_t>(result.code));
     put_u8(cursor, codec_wire(result.codec));
     put_u16(cursor, result.fps);
     put_u8(cursor, static_cast<uint8_t>(result.quality));
+    put_u8(cursor, static_cast<uint8_t>(result.chroma));
     put_u16(cursor, static_cast<uint16_t>(text.size()));
     if (!text.empty()) {
         std::memcpy(cursor, text.data(), text.size());
@@ -3852,9 +4169,10 @@ bool parse_stream_options_result(const std::vector<uint8_t>& payload,
     uint8_t raw_code = 0;
     uint8_t raw_codec = 0;
     uint8_t raw_quality = 0;
+    uint8_t chroma = 0;
     uint16_t reason_size = 0;
     if (!reader.u8(raw_code) || !reader.u8(raw_codec) || !reader.u16(result.fps) ||
-        !reader.u8(raw_quality) || !reader.u16(reason_size) ||
+        !reader.u8(raw_quality) || !reader.u8(chroma) || chroma > 1 || !reader.u16(reason_size) ||
         !reader.string(result.reason, reason_size) || !reader.at_end()) {
         set_error(error, "malformed StreamOptionsResult");
         return false;
@@ -3866,6 +4184,10 @@ bool parse_stream_options_result(const std::vector<uint8_t>& payload,
     if (!codec_from_wire(raw_codec, result.codec)) {
         set_error(error, "unknown stream options codec " + std::to_string(raw_codec));
         return false;
+    }
+    result.chroma = static_cast<VideoChroma>(chroma);
+    if (!valid_video_format(result.codec, result.chroma)) {
+        set_error(error, "StreamOptionsResult carries an invalid chroma format"); return false;
     }
     if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
         set_error(error, "unknown stream quality " + std::to_string(raw_quality));
@@ -4295,27 +4617,38 @@ bool valid_file_browser_name(const std::string& name) {
            name != "." && name != "..";
 }
 
+bool valid_file_list_cursor(const std::string& cursor) {
+    return cursor.empty() || (cursor.size() > 2 && (cursor[0] == 'd' || cursor[0] == 'f') &&
+        cursor[1] == ':' && valid_file_browser_name(cursor.substr(2)));
+}
+
 std::vector<uint8_t> make_file_list_request(uint32_t request_id,
-                                            const std::string& directory) {
-    if (request_id == 0 || !valid_file_browser_path(directory)) {
+                                            const std::string& directory,
+                                            const std::string& after) {
+    if (request_id == 0 || !valid_file_browser_path(directory) || !valid_file_list_cursor(after)) {
         return {};
     }
-    std::vector<uint8_t> payload(4 + 2 + directory.size());
+    std::vector<uint8_t> payload(4 + 2 + directory.size() + 2 + after.size());
     uint8_t* cursor = payload.data();
     put_u32(cursor, request_id);
     put_u16(cursor, static_cast<uint16_t>(directory.size()));
     if (!directory.empty()) {
         std::memcpy(cursor, directory.data(), directory.size());
+        cursor += directory.size();
     }
+    put_u16(cursor, static_cast<uint16_t>(after.size()));
+    if (!after.empty()) std::memcpy(cursor, after.data(), after.size());
     return make_control(ControlType::FileListRequest, payload);
 }
 
 bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
-                             std::string& directory, std::string* error) {
+                             std::string& directory, std::string* error, std::string* cursor) {
     Reader reader(payload.data(), payload.size());
     uint16_t size = 0;
+    std::string after;
     if (!reader.u32(request_id) || !reader.u16(size) ||
-        !reader.string(directory, size) || !reader.at_end()) {
+        !reader.string(directory, size) || !reader.u16(size) ||
+        !reader.string(after, size) || !reader.at_end()) {
         set_error(error, "malformed FileListRequest");
         return false;
     }
@@ -4323,10 +4656,11 @@ bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& requ
         set_error(error, "FileListRequest has a zero request id");
         return false;
     }
-    if (!valid_file_browser_path(directory)) {
+    if (!valid_file_browser_path(directory) || !valid_file_list_cursor(after)) {
         set_error(error, "FileListRequest path is not a plain relative directory");
         return false;
     }
+    if (cursor) *cursor = std::move(after);
     return true;
 }
 
@@ -4336,18 +4670,23 @@ std::vector<uint8_t> make_file_list_result(const FileListResult& result) {
         result.entries.size() > kMaxFileListEntries) {
         return {};
     }
-    if (result.code != FileCode::Ok && (!result.entries.empty() || result.truncated)) {
+    if (result.code != FileCode::Ok && (!result.entries.empty() || result.truncated || !result.next_cursor.empty())) {
         return {};
     }
+    if (!valid_file_list_cursor(result.next_cursor) ||
+        result.truncated != !result.next_cursor.empty() ||
+        (result.truncated && (result.entries.empty() || result.next_cursor != file_list_cursor(result.entries.back())))) return {};
     size_t entries_size = 0;
+    const FileListEntry* previous = nullptr;
     for (const FileListEntry& entry : result.entries) {
-        if (!valid_list_entry_name(entry.name)) {
+        if (!valid_list_entry_name(entry.name) || (previous && !file_list_entry_less(*previous, entry))) {
             return {};
         }
+        previous = &entry;
         entries_size += 2 + entry.name.size() + 8 + 8 + 1;
     }
     const std::string reason = truncate_utf8_reason(result.reason, kMaxFileBrowserReasonBytes);
-    std::vector<uint8_t> payload(4 + 1 + 1 + 2 + reason.size() + 2 + entries_size);
+    std::vector<uint8_t> payload(4 + 1 + 1 + 2 + reason.size() + 2 + entries_size + 2 + result.next_cursor.size());
     uint8_t* cursor = payload.data();
     put_u32(cursor, result.request_id);
     put_u8(cursor, static_cast<uint8_t>(result.code));
@@ -4366,6 +4705,8 @@ std::vector<uint8_t> make_file_list_result(const FileListResult& result) {
         put_u64(cursor, entry.modified_ms);
         put_u8(cursor, entry.directory ? kFileEntryFlagDirectory : 0);
     }
+    put_u16(cursor, static_cast<uint16_t>(result.next_cursor.size()));
+    if (!result.next_cursor.empty()) std::memcpy(cursor, result.next_cursor.data(), result.next_cursor.size());
     return make_control(ControlType::FileListResult, payload);
 }
 
@@ -4425,7 +4766,18 @@ bool parse_file_list_result(const std::vector<uint8_t>& payload, FileListResult&
             return false;
         }
         entry.directory = (entry_flags & kFileEntryFlagDirectory) != 0;
+        if (!result.entries.empty() && !file_list_entry_less(result.entries.back(), entry)) {
+            set_error(error, "FileListResult entries are not strictly ordered");
+            return false;
+        }
         result.entries.push_back(std::move(entry));
+    }
+    uint16_t cursor_size = 0;
+    if (!reader.u16(cursor_size) || !reader.string(result.next_cursor, cursor_size) ||
+        !valid_file_list_cursor(result.next_cursor) || result.truncated != !result.next_cursor.empty() ||
+        (result.truncated && (result.entries.empty() || result.next_cursor != file_list_cursor(result.entries.back())))) {
+        set_error(error, "FileListResult carries an invalid continuation cursor");
+        return false;
     }
     if (!reader.at_end()) {
         set_error(error, "FileListResult carries trailing bytes");

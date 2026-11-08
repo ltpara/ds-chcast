@@ -5,18 +5,13 @@ import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../viewer_bridge.dart';
 import 'remote_view.dart';
+import 'keyboard_mode_button.dart';
 import 'package:chast_viewer/l10n.dart';
 
 /// A system shortcut the toolbar can ask the host to inject. The key chords
 /// travel as ordinary HID events; [sas] is the exception because Windows only
 /// accepts Ctrl+Alt+Del through SendSAS, which the host's service can call.
-enum RemoteSpecialAction {
-  win,
-  altTab,
-  altF4,
-  taskManager,
-  sas,
-}
+enum RemoteSpecialAction { win, altTab, altF4, taskManager, sas }
 
 /// The two microphone processing switches the long-press menu exposes above
 /// the device list.
@@ -34,6 +29,7 @@ class RemoteToolbar extends StatelessWidget {
     required this.inputAvailable,
     required this.clipboardEnabled,
     required this.clipboardAvailable,
+    this.clipboardDirection = 3,
     required this.fileAvailable,
     required this.fileActive,
     required this.audioAvailable,
@@ -68,6 +64,10 @@ class RemoteToolbar extends StatelessWidget {
     this.onOsLogin,
     this.sessionSelectAvailable = false,
     this.onSessionSelect,
+    this.elevationAvailable = false,
+    this.elevationPending = false,
+    this.elevated = false,
+    this.onElevation,
     this.remoteConfigAvailable = false,
     this.onRemoteConfig,
     required this.portForwardAvailable,
@@ -77,6 +77,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.activeDisplay,
     required this.onSelectDisplay,
     this.onOpenDisplayWindow,
+    this.onIndependentDisplays,
+    this.independentDisplays = false,
     required this.followCursor,
     required this.followWindow,
     required this.onToggleFollowCursor,
@@ -86,12 +88,17 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSelectMode,
     required this.streamOptionsAvailable,
     required this.streamCodec,
+    this.streamFullColor = false,
+    this.streamActualFormat = '',
+    this.onSelectStreamFullColor,
     required this.streamQuality,
     required this.streamMaxFps,
     required this.onSelectStreamCodec,
     required this.onSelectStreamQuality,
     required this.onSelectStreamFps,
     required this.onToggleControl,
+    this.keyboardMode = ViewerKeyboardMode.physical,
+    this.onKeyboardMode,
     this.reverseWheel = false,
     this.swapButtons = false,
     this.onToggleReverseWheel,
@@ -145,6 +152,7 @@ class RemoteToolbar extends StatelessWidget {
   final bool inputAvailable;
   final bool clipboardEnabled;
   final bool clipboardAvailable;
+  final int clipboardDirection;
   final bool fileAvailable;
   final bool fileActive;
   final bool audioAvailable;
@@ -169,7 +177,8 @@ class RemoteToolbar extends StatelessWidget {
   final bool audioNoiseSuppression;
   final Future<List<ViewerMicrophoneDevice>> Function() onLoadMicrophones;
   final Future<void> Function(String deviceId) onSelectMicrophone;
-  final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
+  final Future<void> Function(bool aec, bool noiseSuppression)
+  onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
   final bool displayControlAvailable;
@@ -191,6 +200,10 @@ class RemoteToolbar extends StatelessWidget {
   /// The host's service backend lets the viewer list and switch the Windows
   /// session it streams from. The page owns the picker and the requests.
   final bool sessionSelectAvailable;
+  final bool elevationAvailable;
+  final bool elevationPending;
+  final bool elevated;
+  final VoidCallback? onElevation;
   final VoidCallback? onSessionSelect;
 
   /// The host lets this viewer read and change its exposed policy switches
@@ -216,6 +229,8 @@ class RemoteToolbar extends StatelessWidget {
   /// Starts a second session window fixed to one output; null hides the
   /// per-display entries.
   final ValueChanged<int>? onOpenDisplayWindow;
+  final VoidCallback? onIndependentDisplays;
+  final bool independentDisplays;
 
   /// The host switched output to the display under the remote pointer (or
   /// the window with foreground focus) on its own.
@@ -228,6 +243,9 @@ class RemoteToolbar extends StatelessWidget {
   final ValueChanged<ViewerDisplayMode> onSelectMode;
   final bool streamOptionsAvailable;
   final ViewerStreamCodec streamCodec;
+  final bool streamFullColor;
+  final String streamActualFormat;
+  final ValueChanged<bool>? onSelectStreamFullColor;
   final ViewerStreamQuality streamQuality;
   final int streamMaxFps;
   final ValueChanged<ViewerStreamCodec> onSelectStreamCodec;
@@ -247,11 +265,14 @@ class RemoteToolbar extends StatelessWidget {
   /// pointer the user did not ask for.
   final bool relativeMouse;
   final VoidCallback? onToggleRelativeMouse;
+
   /// True while remote control is on, so a shortcut would actually reach the
   /// host. The button stays visible but disabled otherwise.
   final bool specialKeysAvailable;
   final ValueChanged<RemoteSpecialAction> onSpecialAction;
   final VoidCallback onSendText;
+  final ViewerKeyboardMode keyboardMode;
+  final ValueChanged<ViewerKeyboardMode>? onKeyboardMode;
 
   /// Viewer-side screenshot: the engine reads the newest decoded picture back
   /// from the GPU and writes a PNG on this machine. Optional so tests and
@@ -281,6 +302,7 @@ class RemoteToolbar extends StatelessWidget {
   /// to the host and nothing is uploaded. The switch is optional so tests and
   /// hosts without a session can keep the toolbar unchanged.
   final bool recordingAvailable;
+
   /// The session is live but the host did not grant recording consent, which
   /// calls for a different tooltip than "connect first".
   final bool recordingDenied;
@@ -319,8 +341,11 @@ class RemoteToolbar extends StatelessWidget {
       items: <PopupMenuEntry<String>>[
         _audioOutputItem('', tr('系统默认输出'), tr('跟随 Windows 默认设备')),
         for (final ViewerAudioOutput device in devices)
-          _audioOutputItem(device.id, device.label,
-              device.isDefault ? tr('系统默认设备') : tr('输出设备')),
+          _audioOutputItem(
+            device.id,
+            device.label,
+            device.isDefault ? tr('系统默认设备') : tr('输出设备'),
+          ),
       ],
     );
     if (selected != null && selected != audioDevice) {
@@ -328,7 +353,11 @@ class RemoteToolbar extends StatelessWidget {
     }
   }
 
-  PopupMenuItem<String> _audioOutputItem(String id, String title, String detail) {
+  PopupMenuItem<String> _audioOutputItem(
+    String id,
+    String title,
+    String detail,
+  ) {
     final bool selected = id == audioDevice;
     return PopupMenuItem<String>(
       value: id,
@@ -364,7 +393,8 @@ class RemoteToolbar extends StatelessWidget {
               ],
             ),
           ),
-          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+          if (selected)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );
@@ -394,20 +424,34 @@ class RemoteToolbar extends StatelessWidget {
       color: const Color(0xFF24252B),
       elevation: 8,
       items: <PopupMenuEntry<Object>>[
-        _processingItem(_MicSetting.aec, tr('回声消除'), tr('用本机播放的系统声音作参考'), audioAec),
-        _processingItem(_MicSetting.noiseSuppression, tr('噪声抑制'), tr('抑制平稳底噪，语音优先'),
-            audioNoiseSuppression),
+        _processingItem(
+          _MicSetting.aec,
+          tr('回声消除'),
+          tr('用本机播放的系统声音作参考'),
+          audioAec,
+        ),
+        _processingItem(
+          _MicSetting.noiseSuppression,
+          tr('噪声抑制'),
+          tr('抑制平稳底噪，语音优先'),
+          audioNoiseSuppression,
+        ),
         const PopupMenuDivider(),
         _microphoneItem('', tr('系统默认麦克风'), tr('跟随默认通信设备')),
         for (final ViewerMicrophoneDevice device in devices)
-          _microphoneItem(device.id, device.label,
-              device.isDefault ? tr('系统默认设备') : tr('输入设备')),
+          _microphoneItem(
+            device.id,
+            device.label,
+            device.isDefault ? tr('系统默认设备') : tr('输入设备'),
+          ),
       ],
     );
     if (selected is _MicSetting) {
       await onSetAudioProcessing(
         selected == _MicSetting.aec ? !audioAec : audioAec,
-        selected == _MicSetting.noiseSuppression ? !audioNoiseSuppression : audioNoiseSuppression,
+        selected == _MicSetting.noiseSuppression
+            ? !audioNoiseSuppression
+            : audioNoiseSuppression,
       );
     } else if (selected is String && selected != microphoneDevice) {
       await onSelectMicrophone(selected);
@@ -415,14 +459,20 @@ class RemoteToolbar extends StatelessWidget {
   }
 
   PopupMenuItem<Object> _processingItem(
-      _MicSetting setting, String title, String detail, bool enabled) {
+    _MicSetting setting,
+    String title,
+    String detail,
+    bool enabled,
+  ) {
     return PopupMenuItem<Object>(
       value: setting,
       height: 44,
       child: Row(
         children: <Widget>[
           Icon(
-            enabled ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+            enabled
+                ? Icons.check_box_rounded
+                : Icons.check_box_outline_blank_rounded,
             size: 16,
             color: enabled ? kAccentBright : Colors.white54,
           ),
@@ -455,7 +505,11 @@ class RemoteToolbar extends StatelessWidget {
     );
   }
 
-  PopupMenuItem<Object> _microphoneItem(String id, String title, String detail) {
+  PopupMenuItem<Object> _microphoneItem(
+    String id,
+    String title,
+    String detail,
+  ) {
     final bool selected = id == microphoneDevice;
     return PopupMenuItem<Object>(
       value: id,
@@ -491,7 +545,8 @@ class RemoteToolbar extends StatelessWidget {
               ],
             ),
           ),
-          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+          if (selected)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );
@@ -538,6 +593,8 @@ class RemoteToolbar extends StatelessWidget {
                 inputAvailable: inputAvailable,
                 onSelected: onSelectDisplay,
                 onOpenWindow: onOpenDisplayWindow,
+                onIndependent: onIndependentDisplays,
+                independent: independentDisplays,
                 onToggleFollowCursor: onToggleFollowCursor,
                 onToggleFollowWindow: onToggleFollowWindow,
               ),
@@ -550,6 +607,9 @@ class RemoteToolbar extends StatelessWidget {
               _StreamOptionsButton(
                 available: streamOptionsAvailable,
                 codec: streamCodec,
+                fullColor: streamFullColor,
+                actualFormat: streamActualFormat,
+                onSelectFullColor: onSelectStreamFullColor,
                 quality: streamQuality,
                 maxFps: streamMaxFps,
                 onSelectCodec: onSelectStreamCodec,
@@ -570,8 +630,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !inputAvailable
                     ? tr('服务端未开放输入')
                     : controlEnabled
-                        ? tr('关闭远程键鼠')
-                        : tr('开启远程键鼠'),
+                    ? tr('关闭远程键鼠')
+                    : tr('开启远程键鼠'),
                 disabled: !inputAvailable,
                 active: controlEnabled,
                 onTap: onToggleControl,
@@ -580,11 +640,11 @@ class RemoteToolbar extends StatelessWidget {
                 available: specialKeysAvailable,
                 onSelected: onSpecialAction,
               ),
+              if (onKeyboardMode != null)
+                KeyboardModeButton(mode: keyboardMode, onChanged: onKeyboardMode),
               _BarButton(
                 icon: Icons.text_fields_rounded,
-                tooltip: specialKeysAvailable
-                    ? tr('发送文本')
-                    : tr('需要远程键鼠控制'),
+                tooltip: specialKeysAvailable ? tr('发送文本') : tr('需要远程键鼠控制'),
                 disabled: !specialKeysAvailable,
                 onTap: onSendText,
               ),
@@ -602,9 +662,12 @@ class RemoteToolbar extends StatelessWidget {
                     : Icons.content_paste_off_rounded,
                 tooltip: !clipboardAvailable
                     ? tr('服务端未开放剪贴板')
-                    : clipboardEnabled
-                        ? tr('暂停剪贴板同步')
-                        : tr('恢复剪贴板同步'),
+                    : (clipboardEnabled ? tr('暂停剪贴板同步') : tr('恢复剪贴板同步')) +
+                          (clipboardDirection == 1
+                              ? '\n${tr('仅主机 → 查看端（含文件剪贴板）')}'
+                              : clipboardDirection == 2
+                              ? '\n${tr('仅查看端 → 主机（含文件剪贴板）')}'
+                              : ''),
                 disabled: !clipboardAvailable,
                 active: clipboardAvailable && clipboardEnabled,
                 onTap: onToggleClipboard,
@@ -614,8 +677,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !fileAvailable
                     ? tr('服务端未开放文件传输')
                     : fileActive
-                        ? tr('文件正在发送')
-                        : tr('发送文件到主机'),
+                    ? tr('文件正在发送')
+                    : tr('发送文件到主机'),
                 disabled: !fileAvailable || fileActive,
                 active: fileActive,
                 onTap: onSendFile,
@@ -627,8 +690,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !fileAvailable
                     ? tr('服务端未开放文件传输')
                     : fileBrowseOpen
-                        ? tr('关闭主机文件浏览')
-                        : tr('浏览主机共享文件夹'),
+                    ? tr('关闭主机文件浏览')
+                    : tr('浏览主机共享文件夹'),
                 disabled: !fileAvailable,
                 active: fileBrowseOpen,
                 onTap: onToggleFileBrowse,
@@ -644,8 +707,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !terminalAvailable
                     ? tr('服务端未开放远程终端')
                     : terminalOpen
-                        ? tr('关闭远程终端')
-                        : tr('远程终端'),
+                    ? tr('关闭远程终端')
+                    : tr('远程终端'),
                 disabled: !terminalAvailable,
                 active: terminalOpen,
                 onTap: onToggleTerminal,
@@ -657,19 +720,21 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !cameraAvailable
                     ? tr('服务端未开放摄像头')
                     : cameraOpen
-                        ? tr('关闭远程摄像头')
-                        : tr('查看主机摄像头'),
+                    ? tr('关闭远程摄像头')
+                    : tr('查看主机摄像头'),
                 disabled: !cameraAvailable,
                 active: cameraOpen,
                 onTap: onToggleCamera,
               ),
               _BarButton(
-                icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                icon: audioMuted
+                    ? Icons.volume_off_rounded
+                    : Icons.volume_up_rounded,
                 tooltip: !audioAvailable
                     ? tr('服务端未启用声音')
                     : audioMuted
-                        ? tr('取消静音（长按选择输出设备）')
-                        : tr('静音（长按选择输出设备）'),
+                    ? tr('取消静音（长按选择输出设备）')
+                    : tr('静音（长按选择输出设备）'),
                 disabled: !audioAvailable,
                 active: audioAvailable && !audioMuted,
                 onTap: onToggleAudio,
@@ -677,12 +742,14 @@ class RemoteToolbar extends StatelessWidget {
                     unawaited(_openAudioOutputMenu(context)),
               ),
               _BarButton(
-                icon: microphoneEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
+                icon: microphoneEnabled
+                    ? Icons.mic_rounded
+                    : Icons.mic_off_rounded,
                 tooltip: !microphoneAvailable
                     ? tr('服务端未开放麦克风')
                     : microphoneEnabled
-                        ? tr('关闭麦克风（长按选择设备）')
-                        : tr('开启麦克风（长按选择设备）'),
+                    ? tr('关闭麦克风（长按选择设备）')
+                    : tr('开启麦克风（长按选择设备）'),
                 disabled: !microphoneAvailable,
                 active: microphoneEnabled,
                 onTap: onToggleMicrophone,
@@ -696,10 +763,10 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !voiceAvailable
                     ? tr('服务端未开放语音通话')
                     : voicePending
-                        ? tr('正在接通主机麦克风…')
-                        : voiceEnabled
-                            ? tr('结束语音通话')
-                            : tr('收听主机麦克风'),
+                    ? tr('正在接通主机麦克风…')
+                    : voiceEnabled
+                    ? tr('结束语音通话')
+                    : tr('收听主机麦克风'),
                 disabled: !voiceAvailable || voicePending,
                 active: voiceEnabled,
                 onTap: onToggleVoiceCall,
@@ -716,8 +783,10 @@ class RemoteToolbar extends StatelessWidget {
                 ),
                 onSelected: (int choice) {
                   if (choice >= 100) {
-                    onToggleVirtualDisplay
-                        ?.call((choice - 100) ~/ 2, (choice - 100).isOdd);
+                    onToggleVirtualDisplay?.call(
+                      (choice - 100) ~/ 2,
+                      (choice - 100).isOdd,
+                    );
                   } else if (choice == 20) {
                     onControlDisplays?.call(2, 0);
                   } else if (choice == 21) {
@@ -737,13 +806,13 @@ class RemoteToolbar extends StatelessWidget {
                     CheckedPopupMenuItem<int>(
                       value: count,
                       checked: displayControlCount == count,
-                      enabled: displayControlSupported &&
+                      enabled:
+                          displayControlSupported &&
                           inputAvailable &&
                           privacyAvailable &&
                           !privacyEnabled,
                       child: Text(
-                        tr('启用 {p1} 个虚拟屏',
-                            <String, Object?>{'p1': count}),
+                        tr('启用 {p1} 个虚拟屏', <String, Object?>{'p1': count}),
                       ),
                     ),
                   if (displayControlOutputs.isNotEmpty)
@@ -752,13 +821,13 @@ class RemoteToolbar extends StatelessWidget {
                     CheckedPopupMenuItem<int>(
                       value: 100 + output.id * 2 + (output.active ? 0 : 1),
                       checked: output.active,
-                      enabled: displayControlSupported &&
+                      enabled:
+                          displayControlSupported &&
                           inputAvailable &&
                           privacyAvailable &&
                           !privacyEnabled,
                       child: Text(
-                        tr('虚拟屏 {p1}',
-                            <String, Object?>{'p1': output.id}),
+                        tr('虚拟屏 {p1}', <String, Object?>{'p1': output.id}),
                       ),
                     ),
                   PopupMenuItem<int>(
@@ -770,7 +839,8 @@ class RemoteToolbar extends StatelessWidget {
                   CheckedPopupMenuItem<int>(
                     value: 10,
                     checked: displayControlPrivacy == 0,
-                    enabled: privacyAvailable &&
+                    enabled:
+                        privacyAvailable &&
                         !privacyEnabled &&
                         !displayControlManaged,
                     child: Text(tr('隐私方式：遮罩')),
@@ -778,16 +848,14 @@ class RemoteToolbar extends StatelessWidget {
                   CheckedPopupMenuItem<int>(
                     value: 11,
                     checked: displayControlPrivacy == 1,
-                    enabled: privacyAvailable &&
+                    enabled:
+                        privacyAvailable &&
                         displayControlSupported &&
                         !privacyEnabled &&
                         !displayControlManaged,
                     child: Text(tr('隐私方式：虚拟屏')),
                   ),
-                  PopupMenuItem<int>(
-                    value: 21,
-                    child: Text(tr('刷新显示状态')),
-                  ),
+                  PopupMenuItem<int>(value: 21, child: Text(tr('刷新显示状态'))),
                 ],
               ),
               _BarButton(
@@ -797,8 +865,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !privacyAvailable
                     ? tr('服务端未开放隐私模式')
                     : privacyEnabled
-                        ? tr('关闭隐私模式（恢复主机本地画面）')
-                        : tr('开启隐私模式（遮挡主机本地画面）'),
+                    ? tr('关闭隐私模式（恢复主机本地画面）')
+                    : tr('开启隐私模式（遮挡主机本地画面）'),
                 disabled: !privacyAvailable,
                 active: privacyEnabled,
                 onTap: onTogglePrivacy,
@@ -827,6 +895,17 @@ class RemoteToolbar extends StatelessWidget {
                 disabled: !remoteConfigAvailable,
                 onTap: onRemoteConfig,
               ),
+              _BarButton(
+                icon: Icons.admin_panel_settings_outlined,
+                tooltip: elevated
+                    ? tr('主机已取得管理员权限')
+                    : elevationPending
+                    ? tr('等待主机本地确认 UAC…')
+                    : tr('请求管理员权限'),
+                disabled: !elevationAvailable,
+                active: elevated || elevationPending,
+                onTap: onElevation,
+              ),
               _HostPowerButton(
                 restartAvailable: restartAvailable,
                 lockAvailable: lockAvailable,
@@ -841,8 +920,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !recordingAvailable
                     ? (recordingDenied ? tr('主机未开放录制') : tr('会话建立后可录制到本地'))
                     : recording
-                        ? tr('停止录制（保存为本地 MP4）')
-                        : tr('录制到本地（保存为 MP4）'),
+                    ? tr('停止录制（保存为本地 MP4）')
+                    : tr('录制到本地（保存为 MP4）'),
                 disabled: !recordingAvailable,
                 active: recording,
                 onTap: () => onToggleRecording?.call(),
@@ -854,8 +933,8 @@ class RemoteToolbar extends StatelessWidget {
                 tooltip: !portForwardAvailable
                     ? tr('服务端未开放端口转发')
                     : portForwardActive
-                        ? tr('端口转发进行中（点击查看或停止）')
-                        : tr('端口转发'),
+                    ? tr('端口转发进行中（点击查看或停止）')
+                    : tr('端口转发'),
                 disabled: !portForwardAvailable,
                 active: portForwardActive,
                 onTap: onOpenPortForward,
@@ -868,7 +947,9 @@ class RemoteToolbar extends StatelessWidget {
               ),
               const _BarSeparator(),
               _BarButton(
-                icon: fullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
+                icon: fullscreen
+                    ? Icons.fullscreen_exit_rounded
+                    : Icons.fullscreen_rounded,
                 tooltip: fullscreen ? tr('退出全屏') : tr('全屏'),
                 active: fullscreen,
                 onTap: onToggleFullscreen,
@@ -920,13 +1001,21 @@ class _CollapsedBar extends StatelessWidget {
         child: Row(
           children: <Widget>[
             const SizedBox(width: 6),
-            const Icon(Icons.drag_indicator_rounded, size: 12, color: Colors.white30),
+            const Icon(
+              Icons.drag_indicator_rounded,
+              size: 12,
+              color: Colors.white30,
+            ),
             Expanded(
               child: InkWell(
                 borderRadius: BorderRadius.circular(4),
                 onTap: onExpand,
                 child: const Center(
-                  child: Icon(Icons.expand_more_rounded, size: 15, color: Colors.grey),
+                  child: Icon(
+                    Icons.expand_more_rounded,
+                    size: 15,
+                    color: Colors.grey,
+                  ),
                 ),
               ),
             ),
@@ -936,7 +1025,9 @@ class _CollapsedBar extends StatelessWidget {
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
                 child: Icon(
-                  fullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
+                  fullscreen
+                      ? Icons.fullscreen_exit_rounded
+                      : Icons.fullscreen_rounded,
                   size: 13,
                   color: Colors.grey,
                 ),
@@ -977,14 +1068,31 @@ class _SpecialKeysButton extends StatelessWidget {
       elevation: 8,
       items: <PopupMenuEntry<RemoteSpecialAction>>[
         _item(RemoteSpecialAction.win, Icons.window_rounded, 'Win', tr('开始菜单')),
-        _item(RemoteSpecialAction.altTab, Icons.swap_horiz_rounded, 'Alt+Tab',
-            tr('切换窗口')),
-        _item(RemoteSpecialAction.altF4, Icons.close_rounded, 'Alt+F4', tr('关闭当前窗口')),
-        _item(RemoteSpecialAction.taskManager, Icons.task_alt_rounded,
-            'Ctrl+Shift+Esc', tr('任务管理器')),
+        _item(
+          RemoteSpecialAction.altTab,
+          Icons.swap_horiz_rounded,
+          'Alt+Tab',
+          tr('切换窗口'),
+        ),
+        _item(
+          RemoteSpecialAction.altF4,
+          Icons.close_rounded,
+          'Alt+F4',
+          tr('关闭当前窗口'),
+        ),
+        _item(
+          RemoteSpecialAction.taskManager,
+          Icons.task_alt_rounded,
+          'Ctrl+Shift+Esc',
+          tr('任务管理器'),
+        ),
         const PopupMenuDivider(),
-        _item(RemoteSpecialAction.sas, Icons.lock_reset_rounded, 'Ctrl+Alt+Del',
-            tr('安全注意序列（需主机以服务方式运行）')),
+        _item(
+          RemoteSpecialAction.sas,
+          Icons.lock_reset_rounded,
+          'Ctrl+Alt+Del',
+          tr('安全注意序列（需主机以服务方式运行）'),
+        ),
       ],
     );
     if (selected != null) {
@@ -993,7 +1101,11 @@ class _SpecialKeysButton extends StatelessWidget {
   }
 
   PopupMenuItem<RemoteSpecialAction> _item(
-      RemoteSpecialAction action, IconData icon, String title, String detail) {
+    RemoteSpecialAction action,
+    IconData icon,
+    String title,
+    String detail,
+  ) {
     return PopupMenuItem<RemoteSpecialAction>(
       value: action,
       height: 44,
@@ -1124,8 +1236,8 @@ class _HostPowerButton extends StatelessWidget {
             color: !enabled
                 ? Colors.white24
                 : danger
-                    ? Colors.redAccent
-                    : Colors.white54,
+                ? Colors.redAccent
+                : Colors.white54,
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -1193,10 +1305,10 @@ class _BarButton extends StatelessWidget {
     final Color color = disabled
         ? Colors.white24
         : danger
-            ? Colors.redAccent
-            : active
-                ? kAccentBright
-                : Colors.grey.shade300;
+        ? Colors.redAccent
+        : active
+        ? kAccentBright
+        : Colors.grey.shade300;
     return Tooltip(
       message: tooltip,
       waitDuration: const Duration(milliseconds: 450),
@@ -1210,8 +1322,9 @@ class _BarButton extends StatelessWidget {
             borderRadius: BorderRadius.circular(4),
             hoverColor: Colors.white.withValues(alpha: 0.08),
             onTap: disabled ? null : onTap,
-            onLongPress:
-                disabled || onLongPress == null ? null : () => onLongPress!(context),
+            onLongPress: disabled || onLongPress == null
+                ? null
+                : () => onLongPress!(context),
             child: Icon(icon, size: 18, color: color),
           ),
         ),
@@ -1247,7 +1360,9 @@ class _FitButton extends StatelessWidget {
           width: 32,
           height: 32,
           child: Icon(
-            fit == ViewFit.original ? Icons.crop_original_rounded : Icons.fit_screen_rounded,
+            fit == ViewFit.original
+                ? Icons.crop_original_rounded
+                : Icons.fit_screen_rounded,
             size: 18,
             color: Colors.grey.shade300,
           ),
@@ -1263,7 +1378,11 @@ class _FitButton extends StatelessWidget {
       height: 38,
       child: Row(
         children: <Widget>[
-          Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+          Icon(
+            icon,
+            size: 16,
+            color: selected ? kAccentBright : Colors.white54,
+          ),
           const SizedBox(width: 10),
           Text(
             label,
@@ -1273,7 +1392,8 @@ class _FitButton extends StatelessWidget {
             ),
           ),
           const Spacer(),
-          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+          if (selected)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );
@@ -1289,6 +1409,8 @@ class _DisplayButton extends StatelessWidget {
     required this.inputAvailable,
     required this.onSelected,
     this.onOpenWindow,
+    this.onIndependent,
+    this.independent = false,
     required this.onToggleFollowCursor,
     required this.onToggleFollowWindow,
   });
@@ -1300,6 +1422,8 @@ class _DisplayButton extends StatelessWidget {
   final bool inputAvailable;
   final ValueChanged<int> onSelected;
   final ValueChanged<int>? onOpenWindow;
+  final VoidCallback? onIndependent;
+  final bool independent;
   final VoidCallback onToggleFollowCursor;
   final VoidCallback onToggleFollowWindow;
 
@@ -1308,16 +1432,19 @@ class _DisplayButton extends StatelessWidget {
   // sit far below them so their count never collides with the toggles.
   static const int _followCursorItem = -1;
   static const int _followWindowItem = -2;
+  static const int _independentItem = -3;
   static const int _openWindowItemBase = -1000;
 
   @override
   Widget build(BuildContext context) {
     final bool available = displays.isNotEmpty;
-    final bool followAvailable = available && inputAvailable && active != kViewerDisplayAll;
+    final bool followAvailable =
+        available &&
+        inputAvailable &&
+        active != kViewerDisplayAll &&
+        !independent;
     return Tooltip(
-      message: available
-          ? tr('切换显示器')
-          : tr('服务端尚未公布显示器列表'),
+      message: available ? tr('切换显示器') : tr('服务端尚未公布显示器列表'),
       waitDuration: const Duration(milliseconds: 450),
       child: PopupMenuButton<int>(
         enabled: available,
@@ -1327,7 +1454,9 @@ class _DisplayButton extends StatelessWidget {
         padding: EdgeInsets.zero,
         constraints: const BoxConstraints(minWidth: 210, maxWidth: 300),
         onSelected: (int value) {
-          if (value == _followCursorItem) {
+          if (value == _independentItem) {
+            onIndependent?.call();
+          } else if (value == _followCursorItem) {
             onToggleFollowCursor();
           } else if (value == _followWindowItem) {
             onToggleFollowWindow();
@@ -1339,14 +1468,31 @@ class _DisplayButton extends StatelessWidget {
         },
         itemBuilder: (BuildContext context) {
           return <PopupMenuEntry<int>>[
-            _displayItem(kViewerDisplayAuto, tr('服务端默认'), tr('由服务端选择输出'),
-                Icons.auto_mode_rounded),
-            _displayItem(kViewerDisplayAll, tr('全部显示器（合并）'),
-                _mergedDetail(displays), Icons.grid_view_rounded),
+            _displayItem(
+              kViewerDisplayAuto,
+              tr('服务端默认'),
+              tr('由服务端选择输出'),
+              Icons.auto_mode_rounded,
+            ),
+            _displayItem(
+              kViewerDisplayAll,
+              tr('全部显示器（完整桌面）'),
+              _mergedDetail(displays),
+              Icons.grid_view_rounded,
+            ),
+            if (onIndependent != null)
+              _displayItem(
+                _independentItem,
+                tr('全部显示器（独立画面）'),
+                tr('每屏独立解码，可单独关闭'),
+                Icons.view_quilt_outlined,
+              ),
             for (final ViewerDisplay display in displays)
               _displayItem(
                 display.index,
-                display.label.isEmpty ? tr('显示器 {p1}', <String, Object?>{'p1': display.index}) : display.label,
+                display.label.isEmpty
+                    ? tr('显示器 {p1}', <String, Object?>{'p1': display.index})
+                    : display.label,
                 _detail(display),
                 Icons.monitor_rounded,
               ),
@@ -1393,7 +1539,9 @@ class _DisplayButton extends StatelessWidget {
   }
 
   static String _detail(ViewerDisplay display) {
-    final StringBuffer text = StringBuffer('${display.width}×${display.height}');
+    final StringBuffer text = StringBuffer(
+      '${display.width}×${display.height}',
+    );
     if (display.primary) {
       text.write(tr(' · 主屏'));
     }
@@ -1403,8 +1551,8 @@ class _DisplayButton extends StatelessWidget {
     return text.toString();
   }
 
-  /// The merged stream's canvas covers the union of every listed output, so
-  /// the subtitle reports that union instead of one display's size.
+  /// The local desktop canvas covers the union of every listed output, so the
+  /// subtitle reports that union instead of one display's size.
   static String _mergedDetail(List<ViewerDisplay> displays) {
     final ViewerDisplay first = displays.first;
     int left = first.left;
@@ -1425,17 +1573,30 @@ class _DisplayButton extends StatelessWidget {
         bottom = display.bottom;
       }
     }
-    return tr('{p5}×{p6} · {p7} 块屏', <String, Object?>{'p5': right - left, 'p6': bottom - top, 'p7': displays.length});
+    return tr('{p5}×{p6} · {p7} 块屏', <String, Object?>{
+      'p5': right - left,
+      'p6': bottom - top,
+      'p7': displays.length,
+    });
   }
 
-  PopupMenuItem<int> _displayItem(int value, String title, String detail, IconData icon) {
+  PopupMenuItem<int> _displayItem(
+    int value,
+    String title,
+    String detail,
+    IconData icon,
+  ) {
     final bool selected = value == active;
     return PopupMenuItem<int>(
       value: value,
       height: 46,
       child: Row(
         children: <Widget>[
-          Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+          Icon(
+            icon,
+            size: 16,
+            color: selected ? kAccentBright : Colors.white54,
+          ),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -1460,7 +1621,8 @@ class _DisplayButton extends StatelessWidget {
               ],
             ),
           ),
-          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+          if (selected)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );
@@ -1479,8 +1641,8 @@ class _DisplayButton extends StatelessWidget {
     final Color color = !availableFlag
         ? Colors.white24
         : enabledFlag
-            ? kAccentBright
-            : Colors.white70;
+        ? kAccentBright
+        : Colors.white70;
     return PopupMenuItem<int>(
       value: value,
       height: 40,
@@ -1522,8 +1684,8 @@ class _ResolutionButton extends StatelessWidget {
     final String tooltip = !available
         ? tr('服务端未开放输入，无法修改分辨率')
         : modes.isEmpty
-            ? tr('正在读取主机的显示模式')
-            : tr('修改分辨率（会话内生效，断开后恢复）');
+        ? tr('正在读取主机的显示模式')
+        : tr('修改分辨率（会话内生效，断开后恢复）');
     return Tooltip(
       message: tooltip,
       waitDuration: const Duration(milliseconds: 450),
@@ -1561,7 +1723,11 @@ class _ResolutionButton extends StatelessWidget {
                       ),
                     ),
                     if (mode.current)
-                      const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+                      const Icon(
+                        Icons.check_rounded,
+                        size: 15,
+                        color: kAccentBright,
+                      ),
                   ],
                 ),
               ),
@@ -1595,6 +1761,11 @@ class _CodecChoice extends _StreamChoice {
   final ViewerStreamCodec value;
 }
 
+class _ColorChoice extends _StreamChoice {
+  const _ColorChoice(this.value);
+  final bool value;
+}
+
 class _FpsChoice extends _StreamChoice {
   const _FpsChoice(this.value);
   final int value;
@@ -1607,6 +1778,9 @@ class _StreamOptionsButton extends StatelessWidget {
   const _StreamOptionsButton({
     required this.available,
     required this.codec,
+    required this.fullColor,
+    required this.actualFormat,
+    this.onSelectFullColor,
     required this.quality,
     required this.maxFps,
     required this.onSelectCodec,
@@ -1616,6 +1790,9 @@ class _StreamOptionsButton extends StatelessWidget {
 
   final bool available;
   final ViewerStreamCodec codec;
+  final bool fullColor;
+  final String actualFormat;
+  final ValueChanged<bool>? onSelectFullColor;
   final ViewerStreamQuality quality;
   final int maxFps;
   final ValueChanged<ViewerStreamCodec> onSelectCodec;
@@ -1641,31 +1818,88 @@ class _StreamOptionsButton extends StatelessWidget {
             onSelectQuality(choice.value);
           } else if (choice is _CodecChoice) {
             onSelectCodec(choice.value);
+          } else if (choice is _ColorChoice) {
+            onSelectFullColor?.call(choice.value);
           } else if (choice is _FpsChoice) {
             onSelectFps(choice.value);
           }
         },
         itemBuilder: (BuildContext context) {
           return <PopupMenuEntry<_StreamChoice>>[
+            if (actualFormat.isNotEmpty) _section(tr('实际格式：{format}', {'format': actualFormat})),
             _section(tr('画质')),
-            _item(_QualityChoice(ViewerStreamQuality.high), tr('高清'), tr('细节优先，占用最高带宽'),
-                Icons.high_quality_rounded, quality == ViewerStreamQuality.high),
-            _item(_QualityChoice(ViewerStreamQuality.balanced), tr('均衡'), tr('默认，细节与带宽兼顾'),
-                Icons.balance_rounded, quality == ViewerStreamQuality.balanced),
-            _item(_QualityChoice(ViewerStreamQuality.smooth), tr('流畅'), tr('带宽最低，优先帧率与延迟'),
-                Icons.speed_rounded, quality == ViewerStreamQuality.smooth),
+            _item(
+              _QualityChoice(ViewerStreamQuality.high),
+              tr('高清'),
+              tr('细节优先，占用最高带宽'),
+              Icons.high_quality_rounded,
+              quality == ViewerStreamQuality.high,
+            ),
+            _item(
+              _QualityChoice(ViewerStreamQuality.balanced),
+              tr('均衡'),
+              tr('默认，细节与带宽兼顾'),
+              Icons.balance_rounded,
+              quality == ViewerStreamQuality.balanced,
+            ),
+            _item(
+              _QualityChoice(ViewerStreamQuality.smooth),
+              tr('流畅'),
+              tr('带宽最低，优先帧率与延迟'),
+              Icons.speed_rounded,
+              quality == ViewerStreamQuality.smooth,
+            ),
             _section(tr('帧率上限')),
             _fpsItem(0, tr('自动'), tr('跟随主机设置')),
-            for (final int cap in _fpsCaps) _fpsItem(cap, '$cap fps', tr('最高 {cap} 帧/秒', <String, Object?>{'cap': cap})),
+            for (final int cap in _fpsCaps)
+              _fpsItem(
+                cap,
+                '$cap fps',
+                tr('最高 {cap} 帧/秒', <String, Object?>{'cap': cap}),
+              ),
             _section(tr('编码器')),
-            _item(_CodecChoice(ViewerStreamCodec.auto), tr('自动'), tr('由主机选择，优先 HEVC'),
-                Icons.auto_awesome_rounded, codec == ViewerStreamCodec.auto),
-            _item(_CodecChoice(ViewerStreamCodec.h264), 'H.264', tr('兼容性最好'),
-                Icons.movie_outlined, codec == ViewerStreamCodec.h264),
-            _item(_CodecChoice(ViewerStreamCodec.hevc), 'HEVC', tr('同画质更省带宽'),
-                Icons.hd_outlined, codec == ViewerStreamCodec.hevc),
-            _item(_CodecChoice(ViewerStreamCodec.av1), 'AV1', tr('压缩率更高，需要 AV1 硬件'),
-                Icons.auto_awesome_motion_outlined, codec == ViewerStreamCodec.av1),
+            _item(
+              _CodecChoice(ViewerStreamCodec.auto),
+              tr('自动'),
+              tr('由主机选择，优先 HEVC'),
+              Icons.auto_awesome_rounded,
+              codec == ViewerStreamCodec.auto,
+            ),
+            _item(
+              _CodecChoice(ViewerStreamCodec.h264),
+              'H.264',
+              tr('兼容性最好'),
+              Icons.movie_outlined,
+              codec == ViewerStreamCodec.h264,
+            ),
+            _item(
+              _CodecChoice(ViewerStreamCodec.hevc),
+              'HEVC',
+              tr('同画质更省带宽'),
+              Icons.hd_outlined,
+              codec == ViewerStreamCodec.hevc,
+            ),
+            _item(
+              _CodecChoice(ViewerStreamCodec.av1),
+              'AV1',
+              tr('压缩率更高，需要 AV1 硬件'),
+              Icons.auto_awesome_motion_outlined,
+              codec == ViewerStreamCodec.av1,
+            ),
+            _item(
+              _CodecChoice(ViewerStreamCodec.vp9),
+              'VP9',
+              tr('软件编码，支持完整色彩'),
+              Icons.palette_outlined,
+              codec == ViewerStreamCodec.vp9,
+            ),
+            if (onSelectFullColor != null) ...[
+              _section(tr('色彩细节')),
+              _item(const _ColorChoice(false), tr('标准色彩 4:2:0'),
+                tr('兼顾性能与带宽'), Icons.speed_rounded, !fullColor),
+              _item(const _ColorChoice(true), tr('完整色彩 4:4:4'),
+                tr('使用 VP9；所有观看端支持时生效'), Icons.palette_outlined, fullColor),
+            ],
           ];
         },
         child: SizedBox(
@@ -1687,23 +1921,42 @@ class _StreamOptionsButton extends StatelessWidget {
       height: 28,
       child: Text(
         title,
-        style: const TextStyle(fontSize: 10, color: Colors.white38, letterSpacing: 0.6),
+        style: const TextStyle(
+          fontSize: 10,
+          color: Colors.white38,
+          letterSpacing: 0.6,
+        ),
       ),
     );
   }
 
   PopupMenuItem<_StreamChoice> _fpsItem(int cap, String title, String detail) {
-    return _item(_FpsChoice(cap), title, detail, Icons.timer_outlined, maxFps == cap);
+    return _item(
+      _FpsChoice(cap),
+      title,
+      detail,
+      Icons.timer_outlined,
+      maxFps == cap,
+    );
   }
 
-  PopupMenuItem<_StreamChoice> _item(_StreamChoice choice, String title, String detail,
-      IconData icon, bool selected) {
+  PopupMenuItem<_StreamChoice> _item(
+    _StreamChoice choice,
+    String title,
+    String detail,
+    IconData icon,
+    bool selected,
+  ) {
     return PopupMenuItem<_StreamChoice>(
       value: choice,
       height: 42,
       child: Row(
         children: <Widget>[
-          Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+          Icon(
+            icon,
+            size: 16,
+            color: selected ? kAccentBright : Colors.white54,
+          ),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -1728,7 +1981,8 @@ class _StreamOptionsButton extends StatelessWidget {
               ],
             ),
           ),
-          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+          if (selected)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );
@@ -1821,7 +2075,11 @@ class _MouseOptionsButton extends StatelessWidget {
         child: SizedBox(
           width: 32,
           height: 32,
-          child: Icon(Icons.mouse_rounded, size: 18, color: Colors.grey.shade300),
+          child: Icon(
+            Icons.mouse_rounded,
+            size: 18,
+            color: Colors.grey.shade300,
+          ),
         ),
       ),
     );
@@ -1841,7 +2099,11 @@ class _MouseOptionsButton extends StatelessWidget {
       height: 42,
       child: Row(
         children: <Widget>[
-          Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+          Icon(
+            icon,
+            size: 16,
+            color: selected ? kAccentBright : Colors.white54,
+          ),
           const SizedBox(width: 10),
           Expanded(
             child: Column(

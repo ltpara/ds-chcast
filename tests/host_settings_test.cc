@@ -13,6 +13,8 @@
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
 #include "chast/quic.h"
+#include "service_settings.h"
+#include "windows_sessions.h"
 
 namespace {
 
@@ -74,9 +76,11 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
            a.max_viewers == b.max_viewers &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
+           a.clipboard_direction == b.clipboard_direction &&
            a.allow_file_transfer == b.allow_file_transfer &&
            a.allow_port_forward == b.allow_port_forward &&
            a.allow_terminal == b.allow_terminal && a.allow_record == b.allow_record &&
+           a.record_incoming == b.record_incoming && a.record_directory == b.record_directory &&
            a.allow_terminal_persist == b.allow_terminal_persist &&
            a.file_receive_directory == b.file_receive_directory &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
@@ -87,6 +91,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_session_select == b.allow_session_select && a.auth_mode == b.auth_mode &&
            a.allow_remote_config == b.allow_remote_config &&
            a.lock_after_session_end == b.lock_after_session_end &&
+           a.keep_awake == b.keep_awake &&
            a.auto_disconnect_minutes == b.auto_disconnect_minutes &&
            a.trusted_device_days == b.trusted_device_days &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
@@ -117,11 +122,14 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.max_viewers = 3;
     settings.allow_input = false;
     settings.allow_clipboard = false;
+    settings.clipboard_direction = chast::ClipboardDirection::ViewerToHost;
     settings.allow_file_transfer = false;
     settings.allow_port_forward = true;
     settings.allow_terminal = true;
     settings.allow_terminal_persist = true;
     settings.allow_record = false;
+    settings.record_incoming = true;
+    settings.record_directory = "D:\\录像 存档\\chast";
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
     settings.allow_microphone = true;
@@ -133,6 +141,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_session_select = true;
     settings.allow_remote_config = true;
     settings.lock_after_session_end = true;
+    settings.keep_awake = false;
     settings.auto_disconnect_minutes = 30;
     settings.trusted_device_days = 30;
     settings.auth_mode = chast::HostAuthMode::Password;
@@ -203,6 +212,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.allow_input && loaded.settings.require_approval,
           "a fresh host accepts input behind an approval");
     check(loaded.settings.allow_clipboard, "a fresh host syncs the clipboard");
+    check(loaded.settings.clipboard_direction == chast::ClipboardDirection::Both,
+          "a fresh host uses both clipboard directions");
     check(loaded.settings.allow_file_transfer, "a fresh host accepts files");
     check(loaded.settings.file_receive_directory.empty(),
           "a fresh host uses the default receive directory");
@@ -226,6 +237,9 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.auto_disconnect_minutes == 0,
           "a fresh host keeps an idle session open");
     check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
+    check(!loaded.settings.record_incoming && loaded.settings.record_directory.empty(),
+          "host recording requires local opt-in and an explicit output folder");
+    check(loaded.settings.keep_awake, "a fresh host keeps authenticated remote connections awake");
     check(loaded.settings.virtual_display == chast::VirtualDisplayPolicy::Off,
           "a fresh host never creates a virtual display on its own");
     check(loaded.settings.virtual_display_monitors == 1 &&
@@ -266,8 +280,11 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "audio_silence_gate_ms=99999\n"
                "microphone=perhaps\n"
                "privacy_mode=perhaps\n"
+               "keep_awake=invalid\n"
+               "clipboard_direction=typo\n"
                "auto_disconnect_minutes=20000\n"
                "record=perhaps\n"
+               "record_incoming=perhaps\n"
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
@@ -296,6 +313,9 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.port == 4433, "an out-of-range port falls back");
     check(settings.allow_input, "an unparsable boolean keeps the default");
     check(settings.allow_clipboard, "an unparsable clipboard toggle keeps the default");
+    check(settings.clipboard_direction == chast::ClipboardDirection::Disabled &&
+              loaded.warning.find("clipboard_direction") != std::string::npos,
+          "an invalid clipboard direction fails closed with a warning");
     check(settings.allow_file_transfer, "an unparsable file toggle keeps the default");
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
     check(settings.max_viewers == 2, "an out-of-range viewer cap falls back");
@@ -310,6 +330,10 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.auto_disconnect_minutes == 0,
           "an out-of-range idle timeout stays off");
     check(settings.allow_record, "an unparsable record toggle keeps the consent default");
+    check(!settings.record_incoming && loaded.warning.find("record_incoming") != std::string::npos,
+          "invalid host recording opt-in stays off and reports the problem");
+    check(settings.keep_awake && loaded.warning.find("keep_awake") != std::string::npos,
+          "an invalid keep-awake toggle retains its default and reports the problem");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -351,6 +375,18 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "unknown keys are accepted silently");
     check(loaded.warning.find("without '='") != std::string::npos,
           "a line without '=' is reported");
+    write_text(path, "record_incoming=1\nrecord_directory=relative-folder\n");
+    const auto relative = chast::load_host_settings(path.string());
+    check(!relative.settings.record_incoming && !relative.warning.empty(),
+          "host recording with a relative folder is disabled visibly");
+    chast::HostSettings recording;
+    recording.record_incoming = true;
+    std::string error;
+    check(!chast::save_host_settings(path.string(), recording, &error),
+          "host recording cannot be saved enabled without a folder");
+    recording.record_directory = "D:\\recordings\ninput=1";
+    check(!chast::save_host_settings(path.string(), recording, &error),
+          "recording folder cannot inject another configuration key");
 }
 
 void test_audio_settings(const std::filesystem::path& dir) {
@@ -821,6 +857,106 @@ void test_trusted_device_lifetime_settings(const std::filesystem::path& dir) {
           "a saved trusted-device lifetime survives a reload");
 }
 
+void test_windows_session_selection() {
+    using namespace chast::host;
+    std::vector<WindowsSession> sessions{{5, 105, "rdp-b"}, {3, 103, "rdp-a"}};
+    WindowsSessionTarget selected;
+    check(choose_windows_session(sessions, UINT32_MAX, 0, selected).id == 3,
+          "RDP-only host starts in an active user session without a physical console");
+    check(choose_windows_session(sessions, UINT32_MAX, 5, selected).id == 5,
+          "an existing RDP worker survives enumeration reordering and another user logging in");
+    sessions.push_back({1, 101, "console"});
+    check(choose_windows_session(sessions, 1, 5, selected).id == 1,
+          "an active console takes automatic priority");
+    selected = {5, 105};
+    check(choose_windows_session(sessions, 1, 3, selected).id == 5,
+          "explicit selection outranks the console while that logon remains active");
+    sessions[0].logon_id = 205;
+    check(choose_windows_session(sessions, 1, 5, selected).id == 1 && selected.id == 0,
+          "reused Windows session IDs cannot inherit the previous user's explicit selection");
+    sessions.erase(sessions.begin() + 2);
+    selected = {1, 101};
+    const auto replacement = choose_windows_session(sessions, 1, 5, selected);
+    check(replacement.id == 5 && replacement.logon_id == 205 && !selected.id,
+          "lost console selection falls back to RDP with the new logon identity for worker replacement");
+    sessions = {{0, 100, "system"}, {UINT32_MAX, 102, "invalid"}, {1, 0, "unknown"}, {2, 104, ""}};
+    check(!choose_windows_session(sessions, 1, 2, selected).id,
+          "no worker starts for system, invalid, unknown-identity or logged-out sessions");
+    SessionSwitchRequest request;
+    check(parse_session_switch(" \r\n1:101:42:18446744073709551614\t", request) && request.session_id == 42 &&
+              request.worker_pid == 101 && request.logon_id == UINT64_MAX - 1,
+          "session switch retains the worker and full-width target logon identity");
+    bool rejected = true;
+    for (const auto* invalid : {"42", "2:101:42:103", "1:0:42:103", "1:101:0:103", "1:101:4294967295:103",
+            "1:101:4294967297:103", "1:101:42:18446744073709551617", "1:101:4 2:103", "1:101:42:103x", ""})
+        rejected &= !parse_session_switch(invalid, request) && request.session_id == 42 && request.logon_id == UINT64_MAX - 1;
+    check(rejected, "legacy, overflow, reserved and malformed switch requests are rejected atomically");
+}
+
+void test_service_settings_merge() {
+    using chast::host::merge_service_settings;
+    using chast::host::ServiceSettingsPage;
+    chast::HostSettings original;
+    original.password_hash = "original-password-hash";
+    original.access_token = "original-token";
+    chast::TrustedDevice kept, revoked, admitted;
+    kept.public_key = {1}; kept.last_seen_unix_seconds = 10;
+    revoked.public_key = {2}; admitted.public_key = {3};
+    original.trusted_devices = {kept, revoked};
+    auto edited = original;
+    edited.allow_clipboard = false;
+    edited.clipboard_direction = chast::ClipboardDirection::HostToViewer;
+    edited.record_incoming = true;
+    edited.record_directory = "D:\\host-recordings";
+    edited.trusted_devices = {kept};
+    auto current = original;
+    current.access_token = "rotated-token";
+    current.tunnel_id = "new-device-id";
+    current.trusted_devices[0].last_seen_unix_seconds = 20;
+    current.trusted_devices.push_back(admitted);
+    chast::HostSettings merged;
+    std::string error;
+    check(merge_service_settings(original, edited, current, ServiceSettingsPage::Security, merged, &error) &&
+              !merged.allow_clipboard && merged.clipboard_direction == chast::ClipboardDirection::HostToViewer &&
+              merged.record_incoming && merged.record_directory == edited.record_directory &&
+              merged.access_token == current.access_token && merged.tunnel_id == current.tunnel_id &&
+              merged.trusted_devices.size() == 2 && merged.trusted_devices[0].last_seen_unix_seconds == 20 &&
+              merged.trusted_devices[1].public_key == admitted.public_key,
+          "service edits preserve rotated tokens, identity, fresh trust and timestamps while applying revocations");
+
+    edited.auto_disconnect_minutes = 20;
+    edited.keep_awake = false;
+    current.auto_disconnect_minutes = 30;
+    const auto unchanged = merged;
+    check(!merge_service_settings(original, edited, current, ServiceSettingsPage::Security, merged, &error) &&
+              same(merged, unchanged) && error.find("auto_disconnect_minutes") != std::string::npos,
+          "concurrent same-field edits report a conflict without partial output");
+    current.auto_disconnect_minutes = 20;
+    check(merge_service_settings(original, edited, current, ServiceSettingsPage::Security, merged, &error) && !merged.keep_awake,
+          "identical simultaneous edits are compatible");
+    edited.password_hash = "new-password-hash";
+    check(merge_service_settings(original, edited, current, ServiceSettingsPage::Security, merged, &error) &&
+              merged.trusted_devices.empty(), "changing the service password clears all trust including newly admitted devices");
+
+    edited = original;
+    edited.proxy = "socks5://127.0.0.1:10808";
+    current.allow_input = false;
+    current.password_hash = "externally-changed-password";
+    check(merge_service_settings(original, edited, current, ServiceSettingsPage::Connection, merged, &error) &&
+              merged.proxy == edited.proxy && !merged.allow_input && merged.password_hash == current.password_hash &&
+              merged.access_token == current.access_token && same_devices(merged.trusted_devices, current.trusted_devices),
+          "connection settings preserve concurrent security changes");
+
+    edited = original;
+    edited.auth_mode = chast::HostAuthMode::Password;
+    edited.password_hash.clear();
+    check(!merge_service_settings(original, edited, original, ServiceSettingsPage::Security, merged, &error),
+          "password-only service settings cannot be saved without a permanent password");
+    edited.auth_mode = chast::HostAuthMode::Click;
+    check(merge_service_settings(original, edited, original, ServiceSettingsPage::Security, merged, &error) &&
+              merged.require_approval, "Click service mode remains available without a password");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -836,6 +972,26 @@ void test_unicode_path(const std::filesystem::path& dir) {
     const chast::HostSettingsLoad loaded = chast::load_host_settings(path);
     check(loaded.existed && loaded.settings.port == 5000 && loaded.warning.empty(),
           "a non-ASCII path loads back");
+}
+
+void test_memory_snapshot(const std::filesystem::path& dir) {
+    const std::string path = (dir / "handoff.ini").string();
+    chast::HostSettings settings;
+    settings.access_token = "ABCDEFGH";
+    settings.password_hash =
+        "pbkdf2-sha256$210000$00112233445566778899aabbccddeeff$"
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    settings.tunnel_id = "original-host";
+    settings.tunnel_key = "original-key";
+    settings.audit_spool = chast::audit_spool_path_for(path);
+    std::string contents, error;
+    check(chast::serialize_host_settings(path, settings, contents, &error), "serialize settings without a handoff file");
+    const auto loaded = chast::parse_host_settings(contents, path);
+    check(loaded.warning.empty() && loaded.settings.access_token == settings.access_token &&
+          loaded.settings.password_hash == settings.password_hash && loaded.settings.tunnel_id == settings.tunnel_id &&
+          loaded.settings.tunnel_key == settings.tunnel_key && loaded.settings.audit_spool == settings.audit_spool,
+          "memory handoff retains credentials, device registration, and original path defaults");
+    check(!std::filesystem::exists(path), "memory snapshot does not write secrets to disk");
 }
 
 }  // namespace
@@ -861,6 +1017,9 @@ int main() {
     test_identity_defaults();
     test_audit_spool(dir);
     test_unicode_path(dir);
+    test_memory_snapshot(dir);
+    test_service_settings_merge();
+    test_windows_session_selection();
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     if (failures != 0) {

@@ -1,4 +1,5 @@
 #include "keyboard_capture.h"
+#include "local_text_input.h"
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -90,6 +91,40 @@ int main() {
     check(event.key.hid_usage == 0x15, "next independent R is forwarded");
 
     INPUT input{};
+    {
+        chast_viewer::KeyboardState translated;
+        auto local_key = [&](DWORD vk, DWORD scan, bool down, bool composing = false, DWORD flags = 0) {
+            KBDLLHOOKSTRUCT data{};
+            data.vkCode = vk; data.scanCode = scan; data.flags = flags;
+            return translated.Handle(data, down, 0, false, event, escape, true, composing);
+        };
+        check(!local_key('A', 0x1e, true) && event.kind != chast::InputKind::Key,
+              "local layout owns printable key down");
+        check(!local_key('A', 0x1e, false) && event.kind != chast::InputKind::Key,
+              "text key up cannot leak a physical key");
+        check(local_key(VK_RETURN, 0x1c, true) && event.key.hid_usage == 0x28,
+              "Enter outside composition is remote");
+        local_key(VK_RETURN, 0x1c, false);
+        check(!local_key(VK_RETURN, 0x1c, true, true), "IME owns candidate confirmation");
+        check(!local_key(VK_RETURN, 0x1c, false, false), "IME confirmation up stays local after composition ends");
+        check(local_key(VK_BACK, 0x0e, true), "Backspace outside composition is remote");
+        local_key(VK_BACK, 0x0e, false);
+        check(!local_key(VK_BACK, 0x0e, true, true), "IME owns editing the preedit");
+        local_key(VK_BACK, 0x0e, false);
+        check(!local_key(VK_LCONTROL, 0x1d, true), "Ctrl remains visible to the local IME");
+        check(local_key('C', 0x2e, true) && event.modifiers == chast::kModifierLeftCtrl,
+              "Ctrl+C is still a remote shortcut");
+        check(!local_key(VK_LCONTROL, 0x1d, false) && event.kind == chast::InputKind::Key,
+              "remote shortcut modifier is released while local Ctrl also lifts");
+        check(local_key('C', 0x2e, false) && event.key.action == chast::KeyAction::Up,
+              "shortcut up retains routing after Ctrl lifts");
+        local_key(VK_LCONTROL, 0x1d, true);
+        check(!local_key(VK_SPACE, 0x39, true), "Ctrl+Space can toggle local IME");
+        local_key(VK_SPACE, 0x39, false); local_key(VK_LCONTROL, 0x1d, false);
+        check(!local_key(VK_LCONTROL, 0x21d, true), "synthetic AltGr Ctrl reaches the local layout");
+        local_key(VK_RMENU, 0x38, true, false, LLKHF_EXTENDED);
+        check(!local_key('Q', 0x10, true), "AltGr character remains local text");
+    }
     check(chast::make_keyboard_input(0x55, true, input) && input.ki.wScan == 0x37 &&
           (input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) == 0, "multiply is not PrintScreen");
     check(chast::make_keyboard_input(0x46, true, input) &&

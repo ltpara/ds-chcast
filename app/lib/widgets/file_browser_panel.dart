@@ -51,7 +51,7 @@ class FileBrowserPanel extends StatefulWidget {
   // file-transfer-only session gives the browser most of the window.
   final double width;
   final double height;
-  final Future<bool> Function(String directory) onRequestList;
+  final Future<bool> Function(String directory, [String cursor]) onRequestList;
   final Future<bool> Function(String path) onRequestDownload;
   final Future<ViewerFileListing?> Function() onTakeList;
   // Queues the recursive download of one folder; false means the viewer could
@@ -111,6 +111,11 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   List<ViewerFileEntry> _entries = const <ViewerFileEntry>[];
   bool _loading = true;
   bool _truncated = false;
+  String _nextCursor = '';
+  String _requestedDirectory = '';
+  String _requestedCursor = '';
+  String _retryCursor = '';
+  int _requestEpoch = 0;
   String? _error;
   int _takenListAnswers = 0;
   int _takenDownloadAnswers = 0;
@@ -369,24 +374,33 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     });
   }
 
-  Future<void> _request(String directory) async {
+  Future<void> _request(String directory, [String cursor = '']) async {
+    if (cursor.isNotEmpty &&
+        (_loading || directory != _directory || cursor != _nextCursor)) {
+      return;
+    }
+    final int epoch = ++_requestEpoch;
+    _requestedDirectory = directory;
+    _requestedCursor = cursor;
+    _retryCursor = '';
     setState(() {
       _loading = true;
       _error = null;
     });
     bool queued = false;
     try {
-      queued = await widget.onRequestList(directory);
+      queued = await widget.onRequestList(directory, cursor);
     } on PlatformException {
       queued = false;
     } on MissingPluginException {
       queued = false;
     }
-    if (!mounted) {
+    if (!mounted || epoch != _requestEpoch) {
       return;
     }
     if (!queued) {
       setState(() {
+        _retryCursor = cursor;
         _loading = false;
         _error = tr('请求无法发送：会话未就绪或主机未授权文件传输');
       });
@@ -395,6 +409,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
 
   Future<void> _takeAnswer() async {
     _takenListAnswers = widget.status.fileListAnswers;
+    final int epoch = _requestEpoch;
     ViewerFileListing? listing;
     try {
       listing = await widget.onTakeList();
@@ -403,14 +418,19 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     } on MissingPluginException {
       listing = null;
     }
-    if (!mounted) {
+    if (!mounted || epoch != _requestEpoch) {
       return;
     }
     if (listing == null) {
-      setState(() => _loading = false);
       return;
     }
     final ViewerFileListing answer = listing;
+    if (answer.directory != _requestedDirectory ||
+        answer.cursor != _requestedCursor) {
+      return;
+    }
+    final bool append =
+        answer.cursor.isNotEmpty && answer.directory == _directory;
     final bool directoryChanged = answer.directory != _directory;
     bool retryRoot = false;
     setState(() {
@@ -422,7 +442,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
           _filterController.clear();
           widget.onDirectoryChanged?.call(_directory);
           _selected.clear();
-        } else {
+        } else if (!append) {
           // Uploads, renames and the refresh button re-request the same
           // directory; a pending batch selection should survive that, but a
           // name that vanished from the new listing must not linger.
@@ -430,8 +450,19 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
             answer.entries.map((ViewerFileEntry entry) => entry.name),
           );
         }
-        _entries = answer.entries;
+        if (append) {
+          final Map<String, ViewerFileEntry> combined =
+              <String, ViewerFileEntry>{
+                for (final ViewerFileEntry entry in _entries) entry.name: entry,
+                for (final ViewerFileEntry entry in answer.entries)
+                  entry.name: entry,
+              };
+          _entries = combined.values.toList();
+        } else {
+          _entries = answer.entries;
+        }
         _truncated = answer.truncated;
+        _nextCursor = answer.nextCursor;
         _error = null;
       } else if (_directory.isEmpty &&
           widget.initialDirectory.isNotEmpty &&
@@ -443,6 +474,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         _error = null;
         _loading = true;
       } else {
+        _retryCursor = append ? answer.cursor : '';
         _error = answer.reason.isEmpty ? tr('主机拒绝列出这个目录') : answer.reason;
       }
     });
@@ -1097,7 +1129,8 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
                         minimumSize: const Size(0, 26),
                         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       ),
-                      onPressed: () => unawaited(_request(_directory)),
+                      onPressed: () =>
+                          unawaited(_request(_directory, _retryCursor)),
                       child: Text(
                         tr('重试'),
                         style: const TextStyle(fontSize: 11),
@@ -1202,7 +1235,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
               decoration: InputDecoration(
                 isDense: true,
                 border: InputBorder.none,
-                hintText: tr('筛选当前文件夹'),
+                hintText: tr(_truncated ? '筛选已加载的条目' : '筛选当前文件夹'),
                 hintStyle: const TextStyle(color: Colors.white24, fontSize: 11),
               ),
               onChanged: (String value) => setState(() => _filter = value),
@@ -1452,7 +1485,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         ),
       );
     }
-    if (rows.isEmpty) {
+    if (rows.isEmpty && !_truncated) {
       final bool filtering = _filter.isNotEmpty && _entries.isNotEmpty;
       return Center(
         child: Text(
@@ -1478,9 +1511,17 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         if (_truncated)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-            child: Text(
-              tr('条目太多，主机只返回了前一部分'),
-              style: const TextStyle(color: Colors.white38, fontSize: 10.5),
+            child: TextButton(
+              onPressed: _loading || _nextCursor.isEmpty
+                  ? null
+                  : () => unawaited(_request(_directory, _nextCursor)),
+              child: Text(
+                _loading
+                    ? tr('正在读取目录…')
+                    : tr('加载更多（已显示 {n} 项）', <String, Object?>{
+                        'n': _entries.length,
+                      }),
+              ),
             ),
           ),
       ],

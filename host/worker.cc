@@ -6,11 +6,13 @@
 // long as that session is active and stops both when the service signals.
 
 #include "service.h"
+#include "windows_sessions.h"
 
 #include <windows.h>
 #include <wtsapi32.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -24,6 +26,7 @@
 #include "chast/virtual_display.h"
 #include "platform.h"
 #include "service_log.h"
+#include "service_control.h"
 #include "tunnel.h"
 
 namespace chast::host {
@@ -157,65 +160,42 @@ void log_tunnel_event(const TunnelEvent& event) {
 // and the name is what the viewer shows. `current` marks this worker's own
 // session so the UI can leave it out of the switch choices.
 bool list_active_sessions(std::vector<RemoteSession>& sessions, std::string* error) {
-    PWTS_SESSION_INFOW entries = nullptr;
-    DWORD count = 0;
-    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &entries, &count)) {
-        *error = "cannot enumerate the Windows sessions (error " +
-                 std::to_string(GetLastError()) + ")";
-        return false;
-    }
+    std::vector<WindowsSession> active;
+    if (!read_windows_sessions(active, error)) return false;
     DWORD current = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &current);
     sessions.clear();
-    for (DWORD i = 0; i < count && sessions.size() < kMaxRemoteSessions; ++i) {
-        const WTS_SESSION_INFOW& entry = entries[i];
-        if (entry.SessionId == 0 || entry.SessionId == 0xFFFFFFFF) {
-            continue;
-        }
-        if (entry.State != WTSActive) {
-            continue;
-        }
-        LPWSTR name = nullptr;
-        DWORD bytes = 0;
-        if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, entry.SessionId,
-                                         WTSUserName, &name, &bytes)) {
-            continue;
-        }
-        std::string user = name != nullptr ? narrow(name) : std::string();
-        WTSFreeMemory(name);
+    // Keep this worker in bounded replies even on a host with many RDP users.
+    std::stable_sort(active.begin(), active.end(), [current](const auto& a, const auto& b) {
+        return (a.id == current) > (b.id == current);
+    });
+    for (const auto& entry : active) {
+        if (sessions.size() == kMaxRemoteSessions) break;
         RemoteSession session;
-        session.id = entry.SessionId;
-        session.user = std::move(user);
-        session.active = true;
-        session.current = entry.SessionId == current;
+        session.id = entry.id; session.user = entry.user;
+        session.active = true; session.current = entry.id == current;
         sessions.push_back(std::move(session));
     }
-    WTSFreeMemory(entries);
     return true;
 }
 
-// Re-validates the target, writes the id-only switch request and wakes the
-// service. The file is replaced atomically and the event is signalled only
-// after the write, so the service never reads a partial id.
+// Re-validates the target, binds it to its logon and this worker, and wakes
+// the service. Atomic replacement prevents a partially written request.
 bool request_session_switch(uint32_t session_id, std::string* error) {
-    std::vector<RemoteSession> sessions;
+    std::vector<WindowsSession> sessions;
     std::string list_error;
-    if (!list_active_sessions(sessions, &list_error)) {
+    if (!read_windows_sessions(sessions, &list_error)) {
         *error = list_error;
         return false;
     }
-    const RemoteSession* target = nullptr;
-    for (const RemoteSession& entry : sessions) {
-        if (entry.id == session_id) {
-            target = &entry;
-            break;
-        }
-    }
+    const auto* target = find_windows_session(sessions, session_id);
     if (target == nullptr) {
         *error = "the session is not active any more";
         return false;
     }
-    if (target->current) {
+    DWORD current = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &current);
+    if (target->id == current) {
         return true;
     }
     HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kWorkerSwitchEvent);
@@ -239,7 +219,7 @@ bool request_session_switch(uint32_t session_id, std::string* error) {
                  std::to_string(GetLastError()) + ")";
         return false;
     }
-    const std::string text = std::to_string(session_id);
+    const std::string text = format_session_switch({GetCurrentProcessId(), session_id, target->logon_id});
     DWORD written = 0;
     const BOOL wrote = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written,
                                  nullptr);
@@ -358,9 +338,6 @@ int run_worker(std::string* error) {
     if (settings.password_hash.empty()) {
         worker_event("auth.password_missing");
     }
-    if (settings.auth_mode != HostAuthMode::Password) {
-        worker_event("auth.click_approval_ignored");
-    }
     if (settings.token_auth) {
         worker_event("auth.token_enabled");
     }
@@ -380,17 +357,20 @@ int run_worker(std::string* error) {
         return 1;
     }
 
+    ServiceControlServer control;
     HostServerConfig config;
     config.settings = settings;
     config.audio_silence_gate_ms = settings.audio_silence_gate_ms;
     config.identity_scope = IdentityScope::LocalMachine;
-    // No interactive operator: the policy forces password-only mode, keeps no
-    // temporary password and never asks for click approval.
+    // Click/Both waits for an authenticated operator in this Windows session.
+    // The service never creates temporary passwords or bypasses missing approval.
     config.service_mode = true;
+    config.service_approval = true;
     // A locked desktop makes capture fail; the worker has to keep retrying
     // until the user unlocks instead of ending the service.
     config.max_consecutive_failures = 0;
-    config.approve_client = nullptr;
+    config.approve_client = [&control](const ClientRequest& request) { return control.approve(request); };
+    config.viewer_chat_message = [&control](uint64_t id, const std::string& text) { control.receive_chat(id, text); };
     config.log = worker_log;
     config.token_changed = save_rotated_token;
     config.trusted_devices_changed = save_trusted_devices;
@@ -420,6 +400,12 @@ int run_worker(std::string* error) {
         g_worker = nullptr;
         return 1;
     }
+    std::string control_error;
+    if (!control.start(*server, &control_error, [&context] {
+        std::lock_guard lock(context.settings_mutex);
+        return ServiceRegistrationInfo{context.settings.tunnel_id, context.settings.tunnel};
+    })) worker_event("control.unavailable", {{"error", control_error}});
+    else worker_event("control.ready");
     server->start();
     const HostStatus status = server->status();
     if (!status.fingerprint.empty()) {
@@ -475,6 +461,7 @@ int run_worker(std::string* error) {
 
     worker_event("worker.stopping");
     tunnel.stop();
+    control.stop();
     server->stop();
     CloseHandle(stop);
     worker_event("worker.stopped");

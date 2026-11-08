@@ -3,6 +3,45 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:chast_viewer/reconnect_policy.dart';
 
 void main() {
+  test('planned elevation covers rollback but still stops on auth failure', () {
+    final policy = AutoReconnectPolicy()..reset(hostRestart: true);
+    expect(policy.attemptLimit, 8);
+    var seconds = 0;
+    for (var i = 0; i < policy.attemptLimit; i++) {
+      seconds += policy.next()!.inSeconds;
+    }
+    expect(seconds, greaterThan(60));
+    expect(policy.next(), isNull);
+    policy.reset(hostRestart: true);
+    policy.next();
+    expect(policy.afterStartupFailure(retryable: false), isNull);
+    expect(policy.attemptLimit, AutoReconnectPolicy.limit);
+    expect(policy.waiting, isFalse);
+  });
+  test('temporary startup failures continue the existing bounded series', () {
+    final AutoReconnectPolicy policy = AutoReconnectPolicy();
+    expect(policy.afterStartupFailure(retryable: true), isNull);
+    expect(policy.attempt, 0);
+    expect(policy.next(), const Duration(seconds: 1));
+    for (final int seconds in <int>[2, 4, 8, 15]) {
+      expect(
+        policy.afterStartupFailure(retryable: true),
+        Duration(seconds: seconds),
+      );
+    }
+    expect(policy.afterStartupFailure(retryable: true), isNull);
+    expect(policy.waiting, isFalse);
+    expect(policy.attempt, 5);
+    expect(policy.afterStartupFailure(retryable: true), isNull);
+  });
+
+  test('identity or authentication failure stops an active series', () {
+    final AutoReconnectPolicy policy = AutoReconnectPolicy()..next();
+    expect(policy.afterStartupFailure(retryable: false), isNull);
+    expect(policy.waiting, isFalse);
+    expect(policy.afterStartupFailure(retryable: true), isNull);
+  });
+
   test('the ladder is 1/2/4/8/15 seconds and stops at five', () {
     final AutoReconnectPolicy policy = AutoReconnectPolicy();
     expect(policy.attempt, 0);

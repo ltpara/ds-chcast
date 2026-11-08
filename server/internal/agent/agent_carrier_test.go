@@ -278,10 +278,10 @@ func TestCarrierKeepsHostOnlineWithoutRendezvous(t *testing.T) {
 		t.Fatalf("viewer did not accept the carrier-only host: %v", err)
 	}
 	t.Cleanup(viewer.Close)
+	viewerRoundTrip(t, viewer, []byte("quic-datagram-carrier-fallback"))
 	if info := viewer.PathInfo(); info.Path != "carrier" || info.Candidates != 0 {
 		t.Fatalf("carrier fallback path info: %+v", info)
 	}
-	viewerRoundTrip(t, viewer, []byte("quic-datagram-carrier-fallback"))
 }
 
 // TestViewerCarrierIPv6Fallback opens the shared carrier over IPv6 when the

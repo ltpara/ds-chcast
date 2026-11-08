@@ -28,6 +28,7 @@
 
 #include "chast/encoder.h"
 #include "chast/protocol.h"
+#include "display_video_receiver.h"
 
 struct ID3D11Device;
 struct ID3D11Texture2D;
@@ -35,6 +36,7 @@ struct ID3D11Texture2D;
 namespace chast {
 struct ClipboardContent;
 class ClipboardWorker;
+class ClipboardVirtualFiles;
 class DeviceIdentity;
 class FileReceiver;
 class PortForwardClient;
@@ -47,6 +49,8 @@ public:
     virtual ~FrameSink() = default;
     // The D3D11 device shared with the decoder and the renderer.
     virtual ID3D11Device* device() = 0;
+    virtual chast::VideoCodecMask DecodingCodecs() { return chast::supported_decoder_codecs(device()); }
+    virtual chast::VideoCodecMask Decoding444Codecs() { return 0; }
     // Called on the session thread with the decoder's NV12 texture and the
     // array slice that holds the picture. Returns true when the frame was
     // published to Flutter, false when it was dropped. Fatal display failures
@@ -171,6 +175,8 @@ struct ViewerPortForwardRule {
 };
 
 struct ViewerStatus {
+    chast::ElevationState elevation;
+    uint64_t elevation_updates = 0;
     ViewerState state = ViewerState::kIdle;
     std::string error;
     std::string host;
@@ -182,6 +188,7 @@ struct ViewerStatus {
     std::string transport = "quic";
     std::string transport_error;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    chast::VideoChroma chroma = chast::VideoChroma::Yuv420;
     // The encoded picture size, which is what the decoder produces and the
     // texture holds. `source_width`/`source_height` are the captured desktop
     // size; pointer positions and input events travel in that space, so the
@@ -254,6 +261,7 @@ struct ViewerStatus {
     // rich item exchanged this session. `clipboard_*_formats` is a bitmask of
     // chast::ClipboardFormat (1 << id) for the most recent item each way.
     bool clipboard_enabled = false;
+    chast::ClipboardDirection clipboard_direction = chast::ClipboardDirection::Both;
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
@@ -518,6 +526,12 @@ struct ViewerStatus {
     // means the picture is the union of every listed display, so no entry
     // describes the streamed surface and per-display mode changes are off.
     std::vector<chast::DisplayDescription> displays;
+    bool multiple_displays = false;
+    std::optional<uint32_t> focused_display;
+    uint64_t display_subscription_results = 0;
+    uint32_t display_subscription_request = 0;
+    std::string display_subscription_error;
+    std::vector<DisplayVideoStatus> display_streams;
     bool merged_layout = false;
     // Display switches the host accepted (including a request for the output
     // already streaming) and the refusals this engine learned about, plus the
@@ -668,7 +682,8 @@ public:
     // publishes the shared camera. The camera decodes on its own sink because
     // it is an independent stream with its own size and timeline, and both
     // sinks may render at the same time.
-    explicit ViewerEngine(FrameSink* sink, FrameSink* camera_sink = nullptr);
+    explicit ViewerEngine(FrameSink* sink, FrameSink* camera_sink = nullptr,
+                          DisplayVideoReceiver::DecoderFactory decoder_factory = chast::create_decoder);
     ~ViewerEngine();
 
     ViewerEngine(const ViewerEngine&) = delete;
@@ -719,12 +734,15 @@ public:
     // the events above, so releases the UI already sent land first.
     bool ReleaseInput();
     // Queues a mid-session switch to another announced display. Returns false
-    // when no session is streaming, the host did not grant input (a view-only
-    // session cannot move the host's picture), or no such display is in the
+    // when no desktop session is streaming, or no such display is in the
     // announced list. The answer arrives through ViewerStatus: display_switches
     // on success and display_switch_error on refusal. The new geometry travels
     // in the StreamInfo the host sends after an accepted switch.
     bool SwitchDisplay(uint16_t display);
+    bool CaptureDisplays(chast::CaptureDisplaysRequest request);
+    bool BindDisplay(uint32_t stream_id, std::shared_ptr<FrameSink> sink);
+    bool FocusDisplay(uint32_t stream_id);
+    bool TakeDisplayCursor(chast::DisplayCursorUpdate& update);
     // Asks the host for the modes of one announced display. Returns false
     // when no session is streaming or the display is not in the announced
     // list. The answer arrives through ViewerStatus::display_modes, which
@@ -755,7 +773,7 @@ public:
     // actually runs in codec/framerate/stream_quality (so a refusal also
     // returns the menus to reality). No input permission is required.
     bool SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
-                          chast::StreamQuality quality);
+                          chast::StreamQuality quality, chast::VideoChroma chroma = chast::VideoChroma::Yuv420);
     // Pauses or resumes the native rich-clipboard bridge. While paused neither
     // direction touches the local clipboard; resuming starts from a fresh
     // baseline, so whatever changed in between is not flushed to the host.
@@ -773,6 +791,10 @@ public:
     // clipboard; returning false reports a failed write.
     void SetClipboardFileSink(
         std::function<bool(const std::vector<std::string>&)> sink);
+    // Captures the native virtual-file offer before a paste reads its bytes.
+    // Takes precedence over the legacy staged-file sink. Install before Start.
+    void SetClipboardVirtualSink(
+        std::function<bool(std::shared_ptr<chast::ClipboardVirtualFiles>)> sink);
     // Test hook for the reverse direction: when set, this callback supplies the
     // local file list (the CF_HDROP items) the viewer announces to the host.
     // Unset reads the Windows clipboard; the loopback probe uses it so an
@@ -798,11 +820,13 @@ public:
 
     // Asks the host to list one directory below its shared receive root.
     // `directory` is a '/'-separated relative path; empty lists the root.
+    // A nonempty cursor continues after the last returned page. Only the
+    // newest manual browse request may replace the UI's current answer.
     // Returns false when no session is streaming, the host did not grant file
     // transfer, or the request queue is full. The newest answer is taken
     // through TakeFileList(); counters and the last refusal arrive in
     // ViewerStatus::file_list_*.
-    bool RequestFileList(std::string directory);
+    bool RequestFileList(std::string directory, std::string cursor = {});
     // Asks the host to send one regular file from the shared root. The host
     // answers through ViewerStatus::file_download_*; on Ok the offer then
     // arrives like any host download and lands in the viewer's receive
@@ -817,6 +841,7 @@ public:
     // for (the host echoes no path, so the engine remembers the request).
     struct FileListAnswer {
         std::string directory;
+        std::string cursor;
         chast::FileListResult result;
     };
     // Copies the newest listing the host sent, once per answer. Returns false
@@ -989,6 +1014,7 @@ public:
     // ViewerStatus::sessions/session_list_code/session_list_error, and
     // session_list_updates pairs one answer with one poll.
     bool RequestSessionList();
+    bool RequestElevation();
     // Queues a switch to the given Windows session. Returns false when the
     // session is not streaming, the permission is missing or the id is out of
     // range. The answer arrives through ViewerStatus::session_select_*; an
@@ -1099,15 +1125,19 @@ private:
     // a picture was published, because the sink's readback and the decoder
     // share one D3D11 device.
     void ProcessScreenshot();
+    void SaveScreenshotFromSink(FrameSink* sink, const std::string& directory);
 
     FrameSink* sink_;
     // The camera picture goes to its own Flutter texture; null means no
     // camera can be started (the command-line tools only display the desktop).
     FrameSink* camera_sink_;
+    DisplayVideoReceiver::DecoderFactory decoder_factory_;
     // Kept alive for the whole session because QuicClientConfig borrows it.
     std::shared_ptr<chast::DeviceIdentity> device_identity_;
     mutable std::mutex mutex_;
     ViewerStatus status_;
+    std::atomic<uint32_t> pending_elevation_{0};
+    uint32_t next_elevation_id_ = 0; // guarded by mutex_
     std::chrono::steady_clock::time_point started_at_;
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
@@ -1137,12 +1167,15 @@ private:
     std::atomic<bool> keyframe_wanted_{false};
     mutable std::mutex record_mutex_;
     std::string record_dir_;
+    std::optional<uint32_t> record_stream_;
+    std::optional<uint32_t> pending_record_keyframe_;
 
     // Newest screenshot request; the session thread consumes it after the next
     // published picture. A slot rather than a queue keeps a burst of taps from
     // turning into a burst of full-resolution reads and PNG writes.
     mutable std::mutex screenshot_mutex_;
     std::optional<std::string> pending_screenshot_;
+    std::optional<uint32_t> pending_screenshot_stream_;
 
     // Newest privacy request, for the same reason as the display switch: the
     // operator wants the state they picked last, not a replay of every toggle.
@@ -1190,9 +1223,6 @@ private:
     mutable std::mutex chat_mutex_;
     std::deque<std::string> pending_chat_;
     std::deque<std::string> received_chat_;
-    // Composed text shares the mutex but not the queue: unlike chat it is
-    // input, so it is queued only while the host grants input control.
-    std::deque<std::string> pending_text_;
 
     // Each remote console crosses in both directions on its own slot.
     // Commands keep their order: typing, resizes and the close must reach the
@@ -1259,6 +1289,8 @@ private:
     struct PendingInput {
         bool release = false;
         chast::InputEvent event;
+        // Text commits and physical keys retain their enqueue order.
+        std::string text;
     };
     std::deque<PendingInput> pending_input_;
     bool input_enabled_ = false;
@@ -1272,6 +1304,7 @@ private:
     std::function<bool(chast::ClipboardContent&)> clipboard_source_;
     std::function<bool(const chast::ClipboardContent&)> clipboard_sink_;
     std::function<bool(const std::vector<std::string>&)> clipboard_file_sink_;
+    std::function<bool(std::shared_ptr<chast::ClipboardVirtualFiles>)> clipboard_virtual_sink_;
     std::function<bool(std::vector<std::string>&)> clipboard_file_source_;
 
     // Uploads wait in one queue. The session thread works on the front while
@@ -1342,6 +1375,7 @@ private:
         chast::FileOperation operation = chast::FileOperation::MakeDirectory;
         std::string path;
         std::string new_name;
+        std::string cursor;
     };
     // One walk of a remote folder. The session thread owns every field; the UI
     // threads only queue a request and set `cancel`, all under browse_mutex_.
@@ -1367,12 +1401,14 @@ private:
         std::string root;
         std::string name;
         std::string destination;
-        std::deque<std::string> directories;
+        // Directory path and continuation cursor for the next page.
+        std::deque<std::pair<std::string, std::string>> directories;
         std::deque<std::pair<std::string, std::string>> files;
         // Entries announced for the root being walked; caps the walk.
         uint64_t walk_entries = 0;
         uint32_t listing_id = 0;
         std::string listing_path;
+        std::string listing_cursor;
         uint32_t download_id = 0;
         std::string download_path;
         std::string download_directory;
@@ -1389,6 +1425,7 @@ private:
     mutable std::mutex browse_mutex_;
     std::deque<BrowseCommand> pending_browse_;
     std::map<uint32_t, std::string> browse_paths_;
+    std::optional<chast::FileListRequest> latest_list_request_;
     std::optional<FileListAnswer> newest_file_list_;
     uint32_t next_browse_id_ = 1;
     // Set by RequestBatchDownload/RequestDirectoryDownload, consumed by the
@@ -1432,6 +1469,7 @@ private:
     // a viewer that falls behind wants where the pointer is now, not a replay.
     mutable std::mutex cursor_mutex_;
     std::optional<chast::CursorUpdate> pending_cursor_;
+    std::map<uint32_t, chast::CursorUpdate> pending_display_cursors_;
     uint64_t cursor_updates_ = 0;
 
     // A switch is a single newest target, for the same reason: the viewer
@@ -1439,6 +1477,9 @@ private:
     // through.
     mutable std::mutex switch_mutex_;
     std::optional<uint16_t> pending_switch_;
+    std::mutex displays_mutex_;
+    std::deque<chast::CaptureDisplaysRequest> pending_displays_;
+    std::map<uint32_t, std::shared_ptr<FrameSink>> pending_display_sinks_;
 
     // Mode requests use the same newest-wins slots: a list answer for a
     // display the picker left is useless, and an unsent mode change is

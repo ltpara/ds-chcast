@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include "chast/clipboard.h"
+#include "chast/clipboard_virtual.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -339,6 +340,9 @@ ClipboardReadState read_clipboard_files_state(std::vector<std::string>& paths,
     struct Closer {
         ~Closer() { CloseClipboard(); }
     } closer;
+    // Do not force a remote virtual file to render while polling our own
+    // clipboard, including from another connection in this process.
+    if (is_virtual_clipboard()) return ClipboardReadState::Failed;
     if (!IsClipboardFormatAvailable(CF_HDROP)) return ClipboardReadState::Empty;
     const HANDLE handle = GetClipboardData(CF_HDROP);
     if (!handle) {

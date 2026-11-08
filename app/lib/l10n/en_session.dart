@@ -1,5 +1,28 @@
 /// English for the session page, toolbar, camera, chat, stats and terminal.
 const Map<String, String> kEnglishSession = <String, String>{
+  '请求管理员权限': 'Request administrator access',
+  '主机已取得管理员权限': 'The host has administrator access',
+  '等待主机本地确认 UAC…': 'Waiting for local UAC approval on the host…',
+  '主机正在取得管理员权限，即将重新连接…': 'The host is elevating; reconnecting shortly…',
+  '主机本地取消了提权请求': 'The local elevation request was cancelled',
+  '提权需要远程键鼠控制权限': 'Elevation requires remote input control',
+  '主机已有提权请求，请稍后重试':
+      'An elevation request is already pending on the host. Try again later.',
+  '提权失败：{reason}': 'Elevation failed: {reason}',
+  '提权未完成，已重新连接到原主机':
+      'Elevation did not complete. Reconnected to the original host.',
+  '主机本地需要确认 Windows UAC。确认后连接会短暂中断并自动重连，其他查看者也会断开。':
+      'Someone at the host must approve Windows UAC. After approval, this connection will briefly disconnect and reconnect automatically. Other viewers will also disconnect.',
+  '提权请求未发送，请确认连接和控制权限':
+      'Elevation request was not sent. Check the connection and input permission.',
+  '仅主机 → 查看端（含文件剪贴板）': 'Host to viewer only (including copied files)',
+  '仅查看端 → 主机（含文件剪贴板）': 'Viewer to host only (including copied files)',
+  '全部显示器（独立画面）': 'All displays (separate streams)',
+  '全部显示器（完整桌面）': 'All displays (full desktop)',
+  '每屏独立解码，可单独关闭': 'Decode each display independently; close any display',
+  '关闭此屏画面': 'Close this display',
+  '等待此屏画面': 'Waiting for this display',
+  '未选择显示器，请从显示器菜单添加': 'No displays selected. Add one from the display menu.',
   ' · 异常 {anomalies}': ' · {anomalies} anomalies',
   '6 位验证码': '6-digit code',
   '已请求主机发送 Ctrl+Alt+Del（Windows 不回报是否成功）':
@@ -181,7 +204,6 @@ const Map<String, String> kEnglishSession = <String, String>{
   '停止录制（保存为本地 MP4）': 'Stop recording (save as local MP4)',
   '先开启远程键鼠': 'Enable remote input first',
   '全屏': 'Fullscreen',
-  '全部显示器（合并）': 'All displays (combined)',
   '关闭会话聊天': 'Close session chat',
   '关闭当前窗口': 'Close current window',
   '关闭远程摄像头': 'Close remote camera',
@@ -415,6 +437,8 @@ const Map<String, String> kEnglishSession = <String, String>{
   '关闭主机文件浏览': 'Close host file browser',
   '返回上一级': 'Up one level',
   '正在读取目录…': 'Reading directory…',
+  '加载更多（已显示 {n} 项）': 'Load more ({n} items loaded)',
+  '筛选已加载的条目': 'Filter loaded entries',
   '这个文件夹是空的': 'This folder is empty',
   '条目太多，主机只返回了前一部分': 'Too many entries; the host returned only the first part',
   '下载到本机': 'Download to this computer',
@@ -491,8 +515,7 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The remote picture stays visible; signing back in needs credentials',
   '阻止主机本地输入': 'Block local input at the host',
   '恢复主机本地输入': 'Restore local input at the host',
-  '需要主机同时开放键鼠与阻止输入':
-      'The host must allow input and block-input together',
+  '需要主机同时开放键鼠与阻止输入': 'The host must allow input and block-input together',
   '重启主机…': 'Restart the host…',
   '会中断本次会话，确认后立即重启':
       'This ends the session; the host restarts after confirmation',
@@ -517,15 +540,12 @@ const Map<String, String> kEnglishSession = <String, String>{
   '另一查看者正在控制主机': 'Another viewer is controlling the host',
   '主机执行失败': 'The host failed to perform the action',
   '主机拒绝了该操作': 'The host refused this action',
-  '在主机登录或锁屏界面输入密码':
-      'Type a password at the host logon or lock screen',
+  '在主机登录或锁屏界面输入密码': 'Type a password at the host logon or lock screen',
   '服务端未开放系统登录': 'The host has not enabled OS login',
-  '已在主机登录/锁屏界面输入密码':
-      'The password was typed at the host logon or lock screen',
+  '已在主机登录/锁屏界面输入密码': 'The password was typed at the host logon or lock screen',
   '系统登录失败：{detail}': 'OS login failed: {detail}',
   '主机未授权系统登录': 'The host did not authorize OS login',
-  '主机当前不在登录或锁屏界面':
-      'The host is not at a logon or lock screen right now',
+  '主机当前不在登录或锁屏界面': 'The host is not at a logon or lock screen right now',
   '主机无法输入密码': 'The host could not type the password',
   '主机拒绝了系统登录': 'The host refused OS login',
   '输入主机登录密码': 'Enter the host password',
@@ -540,8 +560,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '服务端未开放会话切换': 'The host has not enabled session switching',
   '正在读取主机会话…': 'Reading the host sessions…',
   '读取会话列表失败：{detail}': 'Could not read the session list: {detail}',
-  '主机上没有可切换的已登录会话。':
-      'The host has no other signed-in session to switch to.',
+  '主机上没有可切换的已登录会话。': 'The host has no other signed-in session to switch to.',
   '当前会话': 'Current session',
   '切换到该会话会结束当前连接，并在目标会话继续。':
       'Switching ends this connection and continues in the target session.',
@@ -551,26 +570,22 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The session list could not be queued: check the host permissions and session state',
   '无法读取主机会话': 'Cannot read the host sessions',
   '主机未授权读取会话列表': 'The host did not authorize reading its session list',
-  '主机不支持读取 Windows 会话':
-      'The host does not support reading Windows sessions',
+  '主机不支持读取 Windows 会话': 'The host does not support reading Windows sessions',
   '主机无法读取会话列表': 'The host could not read its session list',
   '主机拒绝了会话列表': 'The host refused the session list',
   '目标会话已不活跃': 'The target session is no longer active',
   '主机未授权会话切换': 'The host did not authorize session switching',
-  '主机不支持切换 Windows 会话':
-      'The host does not support switching Windows sessions',
+  '主机不支持切换 Windows 会话': 'The host does not support switching Windows sessions',
   '主机无法切换会话': 'The host could not switch sessions',
   '主机拒绝了会话切换': 'The host refused the session switch',
   '远程会话': 'Remote session',
   '配置端口转发': 'Set up port forwarding',
   '打开摄像头': 'Open camera',
-  '连接已建立，可以打开主机摄像头。':
-      'The session is live; you can open the host camera.',
+  '连接已建立，可以打开主机摄像头。': 'The session is live; you can open the host camera.',
   '面板准备好后会自动列出主机上的摄像头。':
       'The host cameras are listed as soon as the panel is ready.',
   '修改主机设置': 'Change host settings',
-  '服务端未开放远程配置':
-      'The host has not enabled remote configuration',
+  '服务端未开放远程配置': 'The host has not enabled remote configuration',
   '主机设置': 'Host settings',
   '主机设置未能读取：请确认主机权限与会话状态':
       'The host settings could not be read: check the host permissions and session state',
@@ -601,8 +616,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '已启动远程桌面：127.0.0.1:{port}': 'Opened Remote Desktop at 127.0.0.1:{port}',
   '无法启动远程桌面：{error}': 'Could not open Remote Desktop: {error}',
   '鼠标': 'Mouse',
-  '鼠标：反向滚轮、左右键互换、相对鼠标':
-      'Mouse: reverse wheel, swap buttons, relative mouse',
+  '鼠标：反向滚轮、左右键互换、相对鼠标': 'Mouse: reverse wheel, swap buttons, relative mouse',
   '反向滚轮': 'Reverse wheel',
   '滚轮方向与主机相反': 'Flip the wheel direction',
   '交换左右键': 'Swap left and right buttons',
@@ -611,4 +625,24 @@ const Map<String, String> kEnglishSession = <String, String>{
   '锁定指针并发送相对移动（Ctrl+Alt+Shift+R 退出）':
       'Lock the pointer and send relative motion (Ctrl+Alt+Shift+R to exit)',
   '开启远程键鼠后可用': 'Available once remote input is on',
+  '显示器窗口': 'Display window',
+  '键盘模式': 'Keyboard mode',
+  '物理按键': 'Physical keys',
+  '本地输入法': 'Local input method',
+  '按键位置交给远端布局和输入法处理': 'Use the remote keyboard layout and input method',
+  '使用本机布局与输入法，确认后发送文字': 'Use the local layout and input method; send committed text',
+  '文字未发送，请检查控制权限或连接状态': 'Text was not sent. Check input permission and connection status.',
+  '无法切换键盘模式': 'Could not switch keyboard mode',
+  '本地输入法未启用，请重新聚焦画面或切换物理按键':
+      'Local input is unavailable. Refocus the display or select physical keys.',
+  '显示器 {n}': 'Display {n}',
+  '关闭窗口': 'Close window',
+  '缩放': 'Zoom',
+  '实际格式：{format}': 'Active format: {format}',
+  '软件编码，支持完整色彩': 'Software encoding with full color support',
+  '色彩细节': 'Color detail',
+  '标准色彩 4:2:0': 'Standard color 4:2:0',
+  '完整色彩 4:4:4': 'Full color 4:4:4',
+  '兼顾性能与带宽': 'Balance performance and bandwidth',
+  '使用 VP9；所有观看端支持时生效': 'Uses VP9 when all viewers support full color',
 };

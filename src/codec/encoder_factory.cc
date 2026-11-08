@@ -1,9 +1,10 @@
-// Encoder backend selection: oneVPL first, FFmpeg's vendor encoders second.
+// Encoder backend selection: oneVPL, FFmpeg vendor encoders, then OpenH264.
 //
 // The public API lives in chast/encoder.h; this file is the only place that
-// knows both backends exist. Auto keeps the long-standing oneVPL behaviour on
+// knows all backends exist. Auto keeps the long-standing oneVPL behaviour on
 // Intel and gives NVIDIA/AMD adapters a hardware path through FFmpeg. A pinned
-// backend never falls back, and no path here can reach a software encoder.
+// backend never falls back. Auto reaches OpenH264 only after both hardware
+// families fail.
 
 #include "chast/encoder.h"
 
@@ -20,6 +21,8 @@ const char* encoder_backend_name(EncoderBackend backend) {
             return "vpl";
         case EncoderBackend::Ffmpeg:
             return "ffmpeg";
+        case EncoderBackend::Software:
+            return "software";
         case EncoderBackend::Auto:
         default:
             return "auto";
@@ -39,11 +42,19 @@ bool parse_encoder_backend(std::string_view text, EncoderBackend& backend) {
         backend = EncoderBackend::Ffmpeg;
         return true;
     }
+    if (text == "software") {
+        backend = EncoderBackend::Software;
+        return true;
+    }
     return false;
 }
 
 bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device,
                                 EncoderBackend backend) {
+    if (codec == VideoCodec::Vp9) return false;
+    if (backend == EncoderBackend::Software) {
+        return false;
+    }
     if (backend == EncoderBackend::Vpl) {
         return vpl_encoder_available(codec, device);
     }
@@ -57,6 +68,19 @@ bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device,
 std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device,
                                               const EncoderConfig& config,
                                               std::string* error) {
+    if (config.codec == VideoCodec::Vp9) {
+        if (config.backend == EncoderBackend::Auto || config.backend == EncoderBackend::Software)
+            return create_vpx_encoder(device, config, error);
+        if (error) *error = "VP9 is available through the software backend";
+        return nullptr;
+    }
+    if (config.chroma != VideoChroma::Yuv420) {
+        if (error) *error = "this encoder supports 4:2:0 only";
+        return nullptr;
+    }
+    if (config.backend == EncoderBackend::Software) {
+        return create_openh264_encoder(device, config, error);
+    }
     if (config.backend != EncoderBackend::Ffmpeg) {
         std::string vpl_error;
         if (auto encoder = create_vpl_encoder(device, config, &vpl_error)) {
@@ -72,8 +96,13 @@ std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device,
         if (auto encoder = create_ffmpeg_encoder(device, config, &ffmpeg_error)) {
             return encoder;
         }
+        std::string software_error;
+        if (auto encoder = create_openh264_encoder(device, config, &software_error)) {
+            return encoder;
+        }
         if (error) {
-            *error = "oneVPL: " + vpl_error + "; FFmpeg: " + ffmpeg_error;
+            *error = "oneVPL: " + vpl_error + "; FFmpeg: " + ffmpeg_error +
+                     "; software: " + software_error;
         }
         return nullptr;
     }

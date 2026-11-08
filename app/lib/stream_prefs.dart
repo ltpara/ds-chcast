@@ -14,19 +14,21 @@ class StreamPreferences {
     this.codec = 0,
     this.quality = 0,
     this.maxFps = 0,
+    this.fullColor = false,
   });
 
   final int codec;
   final int quality;
   final int maxFps;
+  final bool fullColor;
 
   static const String _codecKey = 'stream_codec';
   static const String _qualityKey = 'stream_quality';
   static const String _maxFpsKey = 'stream_max_fps';
   static const Set<int> _fpsCaps = <int>{0, 15, 30, 60};
-  // Highest value of the matching preference enum: auto, h264, hevc, av1;
+  // Highest value of the matching preference enum: auto, h264, hevc, av1, vp9;
   // quality is high, balanced, smooth.
-  static const int _codecValues = 3;
+  static const int _codecValues = 4;
   static const int _qualityValues = 2;
 
   /// Redirects the settings file away from the real user profile in tests.
@@ -42,6 +44,7 @@ class StreamPreferences {
       codec: _choice(map[_codecKey], _codecValues),
       quality: _choice(map[_qualityKey], _qualityValues),
       maxFps: _fps(map[_maxFpsKey]),
+      fullColor: map['stream_full_color'] == true,
     );
   }
 
@@ -56,7 +59,8 @@ class StreamPreferences {
       final Map<String, Object?> payload = _readMap()
         ..[_codecKey] = _choice(prefs.codec, _codecValues)
         ..[_qualityKey] = _choice(prefs.quality, _qualityValues)
-        ..[_maxFpsKey] = _fps(prefs.maxFps);
+        ..[_maxFpsKey] = _fps(prefs.maxFps)
+        ..['stream_full_color'] = prefs.fullColor;
       try {
         file.parent.createSync(recursive: true);
         file.writeAsStringSync(jsonEncode(payload));

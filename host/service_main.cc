@@ -15,7 +15,7 @@ namespace {
 void print_usage() {
     std::printf(
         "chast-service — chast 主机服务\n\n"
-        "  --install     创建并启动服务，写入机器设置和防火墙规则（需要管理员）\n"
+        "  --install     创建并启动服务，写入机器设置和防火墙规则；登录后自动启动连接管理（需要管理员）\n"
         "  --uninstall   停止并删除服务，移除防火墙规则（需要管理员）\n"
         "  --token       打印机器设置中的当前访问令牌\n"
         "  --run         SCM 入口，由服务管理器调用\n"

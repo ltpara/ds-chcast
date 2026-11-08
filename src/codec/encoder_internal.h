@@ -21,4 +21,9 @@ std::unique_ptr<IVideoEncoder> create_ffmpeg_encoder(ID3D11Device* device,
                                                      std::string* error);
 bool ffmpeg_encoder_available(VideoCodec codec, ID3D11Device* device);
 
+std::unique_ptr<IVideoEncoder> create_openh264_encoder(
+    ID3D11Device* device, const EncoderConfig& config, std::string* error);
+std::unique_ptr<IVideoEncoder> create_vpx_encoder(
+    ID3D11Device* device, const EncoderConfig& config, std::string* error);
+
 }  // namespace chast

@@ -113,6 +113,33 @@ chast::ServerInfo desktop_server_info() {
 // message fails here instead of silently shrinking the fuzzed surface.
 std::vector<Target> make_targets() {
     std::vector<Target> targets;
+    chast::CaptureDisplaysRequest capture;
+    capture.request_id = 1;
+    capture.add = {0, 1}; capture.sub = {1}; capture.set = {0};
+    targets.push_back(message_target("capture_displays", chast::make_capture_displays(capture),
+        [](const std::vector<uint8_t>& payload) {
+            chast::CaptureDisplaysRequest value;
+            return chast::parse_capture_displays(payload, value, &parse_error);
+        }));
+    chast::DisplayStreamInfo display{7, 0, desktop_server_info()};
+    targets.push_back(message_target("display_stream_info", chast::make_display_stream_info(display),
+        [](const std::vector<uint8_t>& payload) {
+            chast::DisplayStreamInfo value;
+            return chast::parse_display_stream_info(payload, value, &parse_error);
+        }));
+    chast::CaptureDisplaysResult capture_result;
+    capture_result.request_id = 1;
+    capture_result.streams.push_back(display);
+    targets.push_back(message_target("capture_displays_result", chast::make_capture_displays_result(capture_result),
+        [](const std::vector<uint8_t>& payload) {
+            chast::CaptureDisplaysResult value;
+            return chast::parse_capture_displays_result(payload, value, &parse_error);
+        }));
+    targets.push_back(message_target("display_keyframe_request", chast::make_display_keyframe_request(7),
+        [](const std::vector<uint8_t>& payload) {
+            uint32_t id = 0;
+            return chast::parse_display_keyframe_request(payload, id, &parse_error);
+        }));
 
     targets.push_back(message_target(
         "hello", chast::make_hello(chast::ClientHello{}),
@@ -152,6 +179,12 @@ std::vector<Target> make_targets() {
             return chast::parse_latency_probe(payload, client_us, &parse_error);
         }));
     targets.push_back(message_target(
+        "video_receipt", chast::make_video_receipt(0xfedcba9876543210ull),
+        [](const std::vector<uint8_t>& payload) {
+            uint64_t sequence = 0;
+            return chast::parse_video_receipt(payload, sequence, &parse_error);
+        }));
+    targets.push_back(message_target(
         "latency_reply", chast::make_latency_reply(1, 2, 3),
         [](const std::vector<uint8_t>& payload) {
             uint64_t client_us = 0;
@@ -171,6 +204,18 @@ std::vector<Target> make_targets() {
         [](const std::vector<uint8_t>& payload) {
             chast::ClipboardUpdate update;
             return chast::parse_clipboard_update(payload, update, &parse_error);
+        }));
+    targets.push_back(message_target(
+        "clipboard_file_read", chast::make_clipboard_file_read({1, 7, 2, 9, 4096}),
+        [](const std::vector<uint8_t>& payload) {
+            chast::ClipboardFileRead request;
+            return chast::parse_clipboard_file_read(payload, request, &parse_error);
+        }));
+    targets.push_back(message_target(
+        "clipboard_file_data", chast::make_clipboard_file_data({1, 7, true, {0, 1, 255}}),
+        [](const std::vector<uint8_t>& payload) {
+            chast::ClipboardFileData response;
+            return chast::parse_clipboard_file_data(payload, response, &parse_error);
         }));
     targets.push_back(message_target(
         "chat_message", chast::make_chat_message("hello"),
@@ -229,6 +274,18 @@ std::vector<Target> make_targets() {
         [](const std::vector<uint8_t>& payload) {
             chast::TerminalResult result;
             return chast::parse_terminal_result(payload, result, &parse_error);
+        }));
+    targets.push_back(message_target(
+        "elevation_request", chast::make_elevation_request(42),
+        [](const std::vector<uint8_t>& payload) {
+            uint32_t id = 0;
+            return chast::parse_elevation_request(payload, id, &parse_error);
+        }));
+    targets.push_back(message_target(
+        "elevation_state", chast::make_elevation_state({42, chast::ElevationCode::Failed, "cancelled"}),
+        [](const std::vector<uint8_t>& payload) {
+            chast::ElevationState state;
+            return chast::parse_elevation_state(payload, state, &parse_error);
         }));
     chast::TerminalStop terminal_stop;
     terminal_stop.terminal_id = 1;
@@ -368,6 +425,15 @@ std::vector<Target> make_targets() {
     cursor.visible = true;
     cursor.x = 10;
     cursor.y = 20;
+    cursor.shape_id = 17;
+    cursor.width = cursor.height = 2;
+    cursor.sprite.assign(16, 0x80);
+    targets.push_back(message_target(
+        "display_cursor_update", chast::make_display_cursor_update({0xffffffffu, cursor}),
+        [](const std::vector<uint8_t>& payload) {
+            chast::DisplayCursorUpdate update;
+            return chast::parse_display_cursor_update(payload, update, &parse_error);
+        }));
     targets.push_back(message_target(
         "cursor_update", chast::make_cursor_update(cursor),
         [](const std::vector<uint8_t>& payload) {

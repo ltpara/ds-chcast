@@ -39,6 +39,7 @@ void main() {
     expect(prefs.terminalFontSize, 13);
     expect(prefs.reverseWheel, isFalse);
     expect(prefs.swapButtons, isFalse);
+    expect(prefs.keyboardMode, 'physical');
   });
 
   test('saves and loads the choices', () {
@@ -52,6 +53,7 @@ void main() {
         terminalFontSize: 17,
         reverseWheel: true,
         swapButtons: true,
+        keyboardMode: 'local',
       ),
     );
     final ViewPreferences prefs = ViewPreferences.load();
@@ -63,6 +65,7 @@ void main() {
     expect(prefs.terminalFontSize, 17);
     expect(prefs.reverseWheel, isTrue);
     expect(prefs.swapButtons, isTrue);
+    expect(prefs.keyboardMode, 'local');
     expect(readFile(), <String, Object?>{
       'view_fit': 1,
       'view_stats': true,
@@ -72,6 +75,7 @@ void main() {
       'terminal_font_size': 17,
       'view_reverse_wheel': true,
       'view_swap_buttons': true,
+      'view_keyboard_mode': 'local',
     });
   });
 
@@ -137,6 +141,7 @@ void main() {
       'terminal_font_size': 13,
       'view_reverse_wheel': false,
       'view_swap_buttons': false,
+      'view_keyboard_mode': 'physical',
     });
   });
 

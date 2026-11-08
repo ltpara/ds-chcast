@@ -69,6 +69,8 @@ type Config struct {
 	// leaves the TCP fallback unavailable; looking up a host through a
 	// relay-only server also omits it.
 	TCPPunchAddr string
+	// HostControlLinked reports an authenticated TCP rendezvous connection.
+	HostControlLinked func(string) bool
 	// Hostname or IP advertised for relay ports.
 	RelayHost string
 	ServerKey string
@@ -752,6 +754,9 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 	if live && carrierLinked {
 		// The shared carrier proves the host is up even when UDP keepalives
 		// cannot leave its network, matching hbbs's TCP/WS rendezvous fallback.
+		online = true
+	}
+	if live && s.cfg.HostControlLinked != nil && s.cfg.HostControlLinked(id) {
 		online = true
 	}
 	resp := lookupResponse{

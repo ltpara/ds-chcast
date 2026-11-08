@@ -77,6 +77,7 @@ class RemoteView extends StatefulWidget {
     this.onDevicePointer,
     this.onDeviceCancel,
     this.onFocusRequested,
+    this.overlayBuilder,
   });
 
   final int textureId;
@@ -119,6 +120,7 @@ class RemoteView extends StatefulWidget {
   final FrameDeviceHandler? onDevicePointer;
   final FrameDeviceHandler? onDeviceCancel;
   final VoidCallback? onFocusRequested;
+  final Widget Function(Size drawn)? overlayBuilder;
 
   @override
   State<RemoteView> createState() => _RemoteViewState();
@@ -273,12 +275,18 @@ class _RemoteViewState extends State<RemoteView> {
 
   Widget _layer(Size box) {
     _reportScale(box);
-    final Widget texture = Texture(
+    Widget texture = Texture(
       textureId: widget.textureId,
       filterQuality: widget.fit == ViewFit.original ? FilterQuality.none : FilterQuality.low,
     );
+    if (widget.overlayBuilder != null) {
+      texture = ClipRect(child: Stack(fit: StackFit.expand, children: [
+        texture,
+        IgnorePointer(child: widget.overlayBuilder!(box)),
+      ]));
+    }
     if (!widget.captureInput) {
-      return texture;
+      return Listener(onPointerDown: (_) => widget.onFocusRequested?.call(), child: texture);
     }
     return MouseRegion(
       cursor: widget.hideCursor ? SystemMouseCursors.none : MouseCursor.defer,

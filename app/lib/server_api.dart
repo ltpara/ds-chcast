@@ -869,10 +869,18 @@ class SharedAddressBook {
 }
 
 class ServerApiException implements Exception {
-  const ServerApiException(this.message, {this.statusCode, this.code = ''});
+  const ServerApiException(this.message,
+      {this.statusCode, this.code = '', this.transient = false});
 
   final String message;
   final int? statusCode;
+  final bool transient;
+
+  bool get retryable =>
+      transient ||
+      statusCode == HttpStatus.requestTimeout ||
+      statusCode == HttpStatus.tooManyRequests ||
+      (statusCode != null && statusCode! >= 500);
 
   /// Machine-readable reason from the server, such as `totp_required`.
   final String code;
@@ -3983,17 +3991,19 @@ class ServerApi {
     } on ServerApiException {
       rethrow;
     } on TimeoutException {
-      throw ServerApiException(tr('连接服务超时'));
+      throw ServerApiException(tr('连接服务超时'), transient: true);
     } on SocketException catch (error) {
       final String detail = error.message.trim();
       throw ServerApiException(
         detail.isEmpty
             ? tr('无法连接连接服务')
             : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
+        transient: true,
       );
     } on HttpException catch (error) {
       throw ServerApiException(
         tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}),
+        transient: true,
       );
     } catch (error) {
       throw ServerApiException(

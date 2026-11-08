@@ -4,7 +4,15 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <numeric>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "chast/protocol.h"
 #include "chast/security.h"
@@ -281,6 +289,7 @@ constexpr size_t kFileEntryHeaderSize = 16;
 constexpr size_t kClipboardFileNameBytes = 255;
 constexpr size_t kClipboardRelPathBytes = 1024;
 constexpr uint16_t kFileEntryHasRelPath = 1;
+constexpr uint16_t kFileEntryDirectory = 2;
 
 void append_u16(std::vector<uint8_t>& out, uint16_t value) {
     out.push_back(static_cast<uint8_t>(value));
@@ -308,6 +317,16 @@ uint64_t read_u64_at(const std::vector<uint8_t>& data, size_t offset) {
 
 bool has_nul(const std::string& text) {
     return std::find(text.begin(), text.end(), '\0') != text.end();
+}
+
+bool valid_file_entry(const ClipboardFileEntry& file) {
+    if (!valid_clipboard_file_name(file.name) || !valid_clipboard_rel_path(file.rel_path) ||
+        (file.directory && file.size != 0)) return false;
+    if (!file.rel_path.empty()) {
+        const auto slash = file.rel_path.rfind('/');
+        if (file.rel_path.substr(slash == std::string::npos ? 0 : slash + 1) != file.name) return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -359,8 +378,7 @@ std::vector<uint8_t> encode_clipboard_file_list(const std::vector<ClipboardFileE
     out.reserve(kMaxClipboardFileListBytes / 4);
     append_u16(out, static_cast<uint16_t>(files.size()));
     for (const ClipboardFileEntry& file : files) {
-        if (!valid_clipboard_file_name(file.name) ||
-            !valid_clipboard_rel_path(file.rel_path)) {
+        if (!valid_file_entry(file)) {
             return {};
         }
         if (out.size() + kFileEntryHeaderSize + file.name.size() +
@@ -369,7 +387,8 @@ std::vector<uint8_t> encode_clipboard_file_list(const std::vector<ClipboardFileE
             return {};
         }
         append_u16(out, static_cast<uint16_t>(file.name.size()));
-        append_u16(out, file.rel_path.empty() ? 0 : kFileEntryHasRelPath);
+        append_u16(out, (file.rel_path.empty() ? 0 : kFileEntryHasRelPath) |
+                       (file.directory ? kFileEntryDirectory : 0));
         append_u16(out, static_cast<uint16_t>(file.rel_path.size()));
         append_u16(out, 0);
         append_u64(out, file.size);
@@ -383,7 +402,7 @@ bool decode_clipboard_file_list(const std::vector<uint8_t>& payload,
                                 std::vector<ClipboardFileEntry>& files,
                                 std::string* error) {
     files.clear();
-    if (payload.size() < 2) {
+    if (payload.size() < 2 || payload.size() > kMaxClipboardFileListBytes) {
         if (error) {
             *error = "clipboard file list is truncated";
         }
@@ -412,8 +431,9 @@ bool decode_clipboard_file_list(const std::vector<uint8_t>& payload,
         const uint16_t rel_length = read_u16_at(payload, offset + 4);
         const uint16_t reserved = read_u16_at(payload, offset + 6);
         file.size = read_u64_at(payload, offset + 8);
+        file.directory = (flags & kFileEntryDirectory) != 0;
         offset += kFileEntryHeaderSize;
-        if (reserved != 0 || (flags & ~kFileEntryHasRelPath) != 0 ||
+        if (reserved != 0 || (flags & ~(kFileEntryHasRelPath | kFileEntryDirectory)) != 0 ||
             (rel_length != 0) != ((flags & kFileEntryHasRelPath) != 0) ||
             offset + name_length + rel_length > payload.size()) {
             if (error) {
@@ -429,8 +449,7 @@ bool decode_clipboard_file_list(const std::vector<uint8_t>& payload,
                              payload.begin() +
                                  static_cast<std::ptrdiff_t>(offset + rel_length));
         offset += rel_length;
-        if (!valid_clipboard_file_name(file.name) ||
-            !valid_clipboard_rel_path(file.rel_path)) {
+        if (!valid_file_entry(file)) {
             if (error) {
                 *error = "clipboard file list names an unusable path";
             }
@@ -455,6 +474,8 @@ uint64_t clipboard_file_identity_hash(const std::vector<ClipboardFileEntry>& fil
         return 0;
     }
     for (const ClipboardFileEntry& file : files) {
+        const uint8_t type = file.directory ? 1 : 0;
+        if (!hash.update(&type, sizeof(type))) return 0;
         const uint32_t length = static_cast<uint32_t>(file.name.size());
         const uint8_t prefix[4] = {
             static_cast<uint8_t>(length),
@@ -525,111 +546,75 @@ bool collect_clipboard_files(const std::vector<std::string>& top_level_paths,
         return base + "/" + name;
     };
     auto add_entry = [&](const std::filesystem::path& physical,
-                         const std::string& utf8_path, const std::string& rel_dir) {
+                         const std::string& utf8_path, const std::string& rel_dir, bool directory) {
         std::error_code file_error;
-        const uint64_t size = std::filesystem::file_size(physical, file_error);
-        if (file_error || !std::filesystem::is_regular_file(physical, file_error)) {
-            return;
-        }
-        const std::u8string u8name = physical.filename().u8string();
+        const uint64_t size = directory ? 0 : std::filesystem::file_size(physical, file_error);
+        if (file_error) { refused = true; return; }
+        const auto u8name = physical.filename().u8string();
         ClipboardFileEntry entry;
         entry.name.assign(u8name.begin(), u8name.end());
         entry.size = size;
-        if (!valid_clipboard_file_name(entry.name)) {
-            return;
-        }
-        if (!rel_dir.empty()) {
-            entry.rel_path = rel_dir + "/" + entry.name;
-            if (!valid_clipboard_rel_path(entry.rel_path)) {
-                return;
-            }
-        }
-        if (collected.size() == kMaxClipboardFileEntries) {
+        entry.directory = directory;
+        if (!rel_dir.empty()) entry.rel_path = rel_dir + "/" + entry.name;
+        if (!valid_file_entry(entry) || collected.size() == kMaxClipboardFileEntries) {
             refused = true;
             return;
         }
         collected.push_back({std::move(entry), utf8_path});
     };
-    for (const std::string& path : top_level_paths) {
-        if (refused) {
-            break;
-        }
-        const std::filesystem::path physical = path_from_utf8(path);
-        std::error_code file_error;
-        const std::filesystem::file_status status =
-            std::filesystem::symlink_status(physical, file_error);
-        if (file_error || std::filesystem::is_symlink(status)) {
-            // A reparse point could loop or leave the copied tree.
-            continue;
-        }
+    auto is_reparse = [&](const std::filesystem::path& path, const std::filesystem::file_status& status) {
+#ifdef _WIN32
+        (void)status;
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) { refused = true; return true; }
+        return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+        return std::filesystem::is_symlink(status);
+#endif
+    };
+    // Emit only leaf directories: nonempty ancestors are reconstructed from
+    // rel_path. This keeps large shallow trees within the existing list cap.
+    std::function<void(const std::filesystem::path&, const std::string&, size_t)> collect;
+    collect = [&](const std::filesystem::path& physical, const std::string& rel_dir, size_t depth) {
+        if (refused) return;
+        std::error_code ec;
+        const auto status = std::filesystem::symlink_status(physical, ec);
+        if (ec) { refused = true; return; }
+        if (is_reparse(physical, status)) return;
+        if (depth > kMaxWalkDepth) { refused = true; return; }
+        const auto u8path = physical.u8string();
+        const std::string path(u8path.begin(), u8path.end());
         if (std::filesystem::is_regular_file(status)) {
-            add_entry(physical, path, {});
-            continue;
+            add_entry(physical, path, rel_dir, false);
+            return;
         }
-        if (!std::filesystem::is_directory(status)) {
-            continue;
+        if (!std::filesystem::is_directory(status)) return;
+        const auto u8name = physical.filename().u8string();
+        const std::string name(u8name.begin(), u8name.end());
+        const auto next_dir = join_utf8(rel_dir, name);
+        if (!valid_clipboard_file_name(name) || !valid_clipboard_rel_path(next_dir)) {
+            refused = true;
+            return;
         }
-        const std::u8string u8top = physical.filename().u8string();
-        const std::string top(u8top.begin(), u8top.end());
-        if (!valid_clipboard_file_name(top)) {
-            continue;
+        const size_t before = collected.size();
+        std::filesystem::directory_iterator it(physical, ec), end;
+        if (ec) { refused = true; return; }
+        for (; it != end && !refused; it.increment(ec)) {
+            if (ec) { refused = true; break; }
+            collect(it->path(), next_dir, depth + 1);
         }
-        std::filesystem::recursive_directory_iterator it(physical, file_error);
-        if (file_error) {
-            continue;
-        }
-        const std::filesystem::recursive_directory_iterator end;
-        for (; it != end; it.increment(file_error)) {
-            if (file_error) {
-                // An unreadable subfolder makes the tree unknown; a partial
-                // copy would be worse than none.
-                refused = true;
-                break;
-            }
-            if (refused) {
-                break;
-            }
-            if (it.depth() >= static_cast<int>(kMaxWalkDepth)) {
-                it.disable_recursion_pending();
-                refused = true;
-                break;
-            }
-            const std::filesystem::file_status entry_status = it->symlink_status(file_error);
-            if (file_error) {
-                refused = true;
-                break;
-            }
-            if (std::filesystem::is_symlink(entry_status)) {
-                continue;
-            }
-            if (!std::filesystem::is_regular_file(entry_status)) {
-                continue;
-            }
-            const std::filesystem::path rel = it->path().lexically_relative(physical);
-            std::string rel_dir = top;
-            std::string utf8_path = path;
-            for (const std::filesystem::path& part : rel.parent_path()) {
-                const std::u8string u8part = part.u8string();
-                if (u8part.empty()) {
-                    continue;
-                }
-                const std::string segment(u8part.begin(), u8part.end());
-                rel_dir = join_utf8(rel_dir, segment);
-                utf8_path = join_utf8(utf8_path, segment);
-            }
-            if (!valid_clipboard_rel_path(rel_dir)) {
-                continue;
-            }
-            const std::u8string u8name = it->path().filename().u8string();
-            utf8_path = join_utf8(utf8_path, std::string(u8name.begin(), u8name.end()));
-            add_entry(it->path(), utf8_path, rel_dir);
-        }
+        if (ec) refused = true;
+        if (!refused && collected.size() == before) add_entry(physical, path, rel_dir, true);
+    };
+    for (const auto& path : top_level_paths) {
+        collect(path_from_utf8(path), {}, 0);
+        if (refused) break;
     }
     if (refused) {
-        return fail("the copied files exceed the clipboard list limits");
+        return fail("the copied tree is unreadable or exceeds the clipboard list limits");
     }
     if (collected.empty()) {
-        return fail("the clipboard holds no regular files");
+        return fail("the clipboard holds no usable files or directories");
     }
     // A stable order is what lets the receiver hash its staged copy and match
     // the announced list even though the filesystem enumerated differently.
@@ -765,6 +750,9 @@ std::vector<uint8_t> encode_clipboard_stream(const ClipboardContent& content) {
     for (int i = 0; i < 8; ++i) {
         stream[cursor++] = static_cast<uint8_t>(total >> (8 * i));
     }
+    for (int i = 0; i < 8; ++i) {
+        stream[cursor++] = static_cast<uint8_t>(content.seq >> (8 * i));
+    }
     for (const ClipboardFormatData& entry : content.formats) {
         const uint32_t length = static_cast<uint32_t>(entry.data.size());
         stream.push_back(static_cast<uint8_t>(entry.format));
@@ -822,7 +810,7 @@ bool decode_clipboard_stream(const uint8_t* data, size_t size, ClipboardContent&
         }
         return false;
     }
-    content.seq = 0;
+    content.seq = read_u64(data + 24);
     content.formats.clear();
     content.formats.reserve(count);
     size_t cursor = kClipboardStreamHeaderSize;

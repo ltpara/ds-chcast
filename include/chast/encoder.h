@@ -1,31 +1,34 @@
 #pragma once
 
-// Hardware video encoder for the frames the capturer publishes.
+// Video encoders for the frames the capturer publishes.
 //
-// The encoder consumes FrameInfo::nv12_texture, the GPU-resident NV12 texture
-// the capture pipeline already produced, so no frame crosses into system
-// memory on the way in; only the compressed bitstream comes back out. That is
+// Hardware and 4:2:0 encoders consume FrameInfo::nv12_texture, the NV12 texture
+// the capture pipeline already produced. Hardware backends keep this image
+// in VRAM; only the compressed bitstream comes back out. That is
 // the same deal RustDesk's VRAM encoder strikes with its ffmpeg *_{qsv,nvenc,amf}
 // encoders and with oneVPL.
 //
-// Two backends implement this: oneVPL directly (the primary path on Intel
+// Two hardware backends implement this: oneVPL directly (the primary path on Intel
 // iGPUs) and FFmpeg's libavcodec encoders (nvenc on NVIDIA, amf on AMD, qsv on
 // Intel). The FFmpeg backend gives NVIDIA and AMD adapters a hardware path
 // without oneVPL; it copies the capture texture into an encoder-owned D3D11VA
 // frame pool on the GPU, so the frame still never reaches system memory.
 //
-// Like capture, this has no CPU fallback: a GPU the vendor runtime refuses to
-// encode on makes create_encoder() fail, it does not silently switch to a
-// software encoder.
+// Auto uses OpenH264 as a final CPU fallback when no vendor runtime can encode
+// on the capture adapter. That path stages NV12 through system memory and
+// converts it to I420; pinned Vpl and Ffmpeg backends remain hardware-only.
 //
-// The frame is handed over as a D3D11 texture in the capture device's video
-// memory, so the runtime never sees system memory. On oneVPL 2.10+ runtimes it
+// On oneVPL 2.10+ runtimes the D3D11 texture in capture device memory
 // either maps the texture (shared import) or GPU-copies it into its internal
 // surface pool (import by copy). Legacy Media SDK ABI 1.x runtimes (mfxhw64,
 // shipped for older Intel iGPUs) have no memory interface; there the texture is
 // wrapped by the encoder's own frame allocator and read in place. The FFmpeg
 // backend always GPU-copies into its own pool. None of these paths stages the
 // image through RAM or the CPU.
+//
+// VP9 uses libvpx on the CPU. Its 4:2:0 path reads NV12; 4:4:4 reads the
+// original FrameInfo::texture (BGRA), scales it if necessary, then converts
+// directly to I444. bgra_input() tells capture consumers which texture to use.
 
 #include <windows.h>
 #include <d3d11.h>
@@ -43,20 +46,38 @@ enum class VideoCodec {
     H264,
     Hevc,
     // AV1 is only produced by hardware encoders (oneVPL on AV1-capable Intel
-    // GPUs, the FFmpeg vendor encoders on Ada/RDNA3/Arc). There is deliberately
-    // no software path: a machine without an AV1 hardware encoder refuses the
-    // request instead of falling back to SVT-AV1/libaom.
+    // GPUs, the FFmpeg vendor encoders on Ada/RDNA3/Arc). Auto may fall back to
+    // HEVC/H.264, including OpenH264; it never produces software AV1.
     Av1,
+    Vp9,
 };
 
-// Which implementation create_encoder() may use. Auto tries oneVPL first and
-// falls back to FFmpeg's vendor encoder when no VPL implementation can be
-// opened on the capture adapter. Vpl and Ffmpeg pin one backend; neither ever
-// falls back to a software encoder.
+enum class VideoChroma : uint8_t { Yuv420 = 0, Yuv444 = 1 };
+inline constexpr bool valid_video_format(VideoCodec codec, VideoChroma chroma) {
+    return (codec == VideoCodec::H264 || codec == VideoCodec::Hevc || codec == VideoCodec::Av1 || codec == VideoCodec::Vp9) &&
+        (chroma == VideoChroma::Yuv420 || (chroma == VideoChroma::Yuv444 && codec == VideoCodec::Vp9));
+}
+
+using VideoCodecMask = uint8_t;
+inline constexpr VideoCodecMask kVideoCodecH264 = 0x01;
+inline constexpr VideoCodecMask kVideoCodecHevc = 0x02;
+inline constexpr VideoCodecMask kVideoCodecAv1 = 0x04;
+inline constexpr VideoCodecMask kVideoCodecVp9 = 0x08;
+inline constexpr VideoCodecMask kVideoCodecAll = kVideoCodecH264 | kVideoCodecHevc | kVideoCodecAv1 | kVideoCodecVp9;
+inline constexpr VideoCodecMask video_codec_bit(VideoCodec codec) {
+    return codec == VideoCodec::H264 ? kVideoCodecH264 :
+           codec == VideoCodec::Hevc ? kVideoCodecHevc :
+           codec == VideoCodec::Av1 ? kVideoCodecAv1 : codec == VideoCodec::Vp9 ? kVideoCodecVp9 : 0;
+}
+
+// Which implementation create_encoder() may use. Auto tries oneVPL, then
+// FFmpeg's vendor encoder, then OpenH264 software encoding.
+// Vpl and Ffmpeg pin hardware backends; Software forces the CPU fallback.
 enum class EncoderBackend {
     Auto,
     Vpl,
     Ffmpeg,
+    Software,
 };
 
 const char* encoder_backend_name(EncoderBackend backend);
@@ -73,15 +94,15 @@ struct EncoderConfig {
     // size and quality, which is what its VRAM encoder starts with.
     UINT bitrate = 0;
     UINT framerate = 30;
-    // In frames. 0 means "key frames only when asked": RustDesk passes
-    // i32::MAX for the same reason, a screen stream with no periodic IDR.
+    // In frames. 0 disables periodic IDRs. OpenH264 screen mode may still
+    // generate an IDR for a scene change; every backend honours explicit requests.
     UINT gop_size = 0;
     // RustDesk's Quality knob, applied on top of base_bitrate() only when
     // `bitrate` is zero: Best 1.5, Balanced 0.67, Low 0.5.
     float quality_ratio = 0.67f;
-    // Implementation family to create. Auto prefers oneVPL and falls back to
-    // FFmpeg; see EncoderBackend.
+    // Implementation family to create. See EncoderBackend.
     EncoderBackend backend = EncoderBackend::Auto;
+    VideoChroma chroma = VideoChroma::Yuv420;
 };
 
 // One compressed access unit.
@@ -92,13 +113,18 @@ struct EncodedPacket {
     bool idr = false;
 };
 
-// Abstract so the VPL implementation stays out of the capture library and so a
-// second backend (NVENC, AMF) can slot in without touching callers.
+// Backend-independent interface, kept separate from the capture library.
 class IVideoEncoder {
 public:
     virtual ~IVideoEncoder() = default;
+    // Actual implementation, including when an Auto request fell back.
+    virtual EncoderBackend backend() const noexcept = 0;
+    virtual VideoChroma chroma() const noexcept { return VideoChroma::Yuv420; }
+    // Full-chroma software encoders read the original BGRA capture; feeding
+    // NV12 here would irreversibly discard the colour detail first.
+    virtual bool bgra_input() const noexcept { return false; }
 
-    // Encodes one NV12 texture, which must live on the device the encoder was
+    // Encodes NV12, or original BGRA when bgra_input() is true. It must live on the device it was
     // created with and be at least EncoderConfig::width x height. Blocks until
     // the packets for this frame are ready and appends them to `out` (the
     // encoder has no reorder buffer, so that is normally exactly one packet).
@@ -127,9 +153,9 @@ public:
     //
     // `keyframe_required` reports whether the next frame has to be an IDR. A
     // bitrate-only change can continue the coded sequence (the encoder keeps
-    // its reference frames, so the viewer decodes on), while a frame-rate
-    // change, a sequence restart or an encoder reopen cannot. The caller must
-    // honour it: without the IDR a peer that lost the sequence never recovers,
+    // its reference frames, so the viewer decodes on). Some backends restart
+    // the sequence on a frame-rate change; OpenH264 updates it in place. The
+    // caller must honour this flag when a restart or reopen needs an IDR,
     // and forcing one anyway wastes a whole frame on every quality step.
     virtual Error set_rate(UINT bits_per_second, UINT framerate,
                            bool* keyframe_required = nullptr) = 0;
@@ -152,10 +178,9 @@ public:
     // How the most recent frame reached the encoder's internal surfaces: true
     // when the runtime mapped the application's texture directly (shared
     // import) or, on legacy runtimes, used it in place through the frame
-    // allocator; false when it GPU-copied it into its own pool. All of these
-    // keep the frame in VRAM; the flag exists so a driver that starts honouring
-    // shared import is visible instead of being assumed. Meaningful after the
-    // first encode().
+    // allocator; false for GPU copies and OpenH264's CPU readback. This flag
+    // alone does not distinguish GPU copies from software encoding.
+    // Meaningful after the first encode().
     virtual bool shared_import() const noexcept = 0;
 };
 
@@ -163,7 +188,8 @@ public:
 // step. True when a hardware implementation of `codec` (H.264, HEVC or AV1)
 // with D3D11 acceleration is available through `backend`: a oneVPL 2.10+
 // runtime or the legacy Media SDK runtime for Vpl, NVENC/AMF/QSV for Ffmpeg,
-// either for Auto.
+// either for Auto. Software always returns false; this query excludes CPU
+// availability and does not gate create_encoder().
 //
 // When `device` is given, implementations are restricted to the adapter that
 // device lives on, which is the adapter the frames come from. A non-H.264
@@ -182,11 +208,11 @@ UINT base_bitrate(UINT width, UINT height);
 // encoder is created with and what set_quality() switches to.
 UINT hardware_bitrate(UINT width, UINT height, float quality_ratio, bool h264);
 
-// Creates a hardware encoder for `config.width x config.height` on `device`.
+// Creates an encoder for `config.width x config.height` on `device`.
 // The device is the adapter selection: implementations on another DXGI LUID
-// are rejected, so encoding always stays on the card that captured and
-// converted the frame. With Auto, oneVPL is tried first and FFmpeg's vendor
-// encoder is the fallback; a pinned backend does not fall back at all.
+// are rejected for hardware backends. With Auto, oneVPL is tried first and FFmpeg's vendor
+// encoder is the hardware fallback and OpenH264 is the final software tier; a
+// pinned backend does not fall back at all.
 //
 // VPL encoding tiers are tried in order -- VDENC+HEVC, VDENC+AVC, VME+AVC --
 // and each tier must return a test frame before it is accepted, so a runtime

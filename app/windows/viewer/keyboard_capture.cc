@@ -25,18 +25,20 @@ uint16_t physical_modifiers() {
 
 void KeyboardState::Reset(uint16_t modifiers) {
     held_.fill(false);
+    forwarded_.fill(false);
     modifiers_ = modifiers & chast::kModifierMask;
     for (unsigned i = 0; i < 8; ++i) held_[0xE0 + i] = (modifiers_ & (1u << i)) != 0;
     escape_held_ = false;
 }
 
 bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks,
-                           bool relative, chast::InputEvent& event, bool& escape) {
+                           bool relative, chast::InputEvent& event, bool& escape,
+                           bool translated, bool composing) {
     escape = false;
     event = chast::InputEvent{};
     // The hook sees the special 0x21D provenance which Flutter HID events
     // discard. Do not infer AltGr from a real Ctrl+RightAlt combination.
-    if (key.scanCode == 0x021D) return true;
+    if (key.scanCode == 0x021D) return !translated;
     if (key.vkCode == VK_CAPITAL || key.vkCode == VK_NUMLOCK) return false;
     const uint16_t usage = chast::windows_key_to_hid(
         key.vkCode, key.scanCode, (key.flags & LLKHF_EXTENDED) != 0);
@@ -61,6 +63,39 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
             return true;
         }
     }
+    if (translated) {
+        if (modifier != 0) {
+            // Modifiers must reach the local layout/IME. A remote shortcut
+            // carries their bitmap; its modifier releases still reach the host.
+            const bool win = usage == 0xe3 || usage == 0xe7;
+            if (!down || win) {
+                event.kind = chast::InputKind::Key;
+                event.key = {down ? chast::KeyAction::Down : chast::KeyAction::Up, usage};
+                event.modifiers = modifiers_ | (locks & chast::kLockStateMask);
+            }
+            return win;
+        }
+        if (!down) {
+            if (!forwarded_[usage]) return false;
+            forwarded_[usage] = false;
+        } else if (!repeat) {
+            const bool altgr = (modifiers_ & chast::kModifierRightAlt) != 0;
+            const bool ctrl = (modifiers_ & (chast::kModifierLeftCtrl | chast::kModifierRightCtrl)) != 0;
+            const bool alt = (modifiers_ & chast::kModifierLeftAlt) != 0;
+            const bool win = (modifiers_ & (chast::kModifierLeftGui | chast::kModifierRightGui)) != 0;
+            const bool shift = (modifiers_ & (chast::kModifierLeftShift | chast::kModifierRightShift)) != 0;
+            const bool local_switch = key.vkCode == VK_SPACE && !win && (ctrl || shift);
+            const bool shortcut = (ctrl && !altgr) || alt || win;
+            // MAPVK_VK_TO_CHAR includes the high bit for dead keys. Do not
+            // call ToUnicode here: it would consume the layout's dead-key state.
+            const HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+            const UINT character = MapVirtualKeyExW(key.vkCode, MAPVK_VK_TO_CHAR, layout) & 0x7fffffffu;
+            const bool text = (character >= 0x20 && character != 0x7f) ||
+                              key.vkCode == VK_PACKET;
+            forwarded_[usage] = !composing && !local_switch && (shortcut || !text);
+        }
+        if (down && !forwarded_[usage]) return false;
+    }
     event.kind = chast::InputKind::Key;
     event.key.hid_usage = usage;
     event.key.action = down ? chast::KeyAction::Down : chast::KeyAction::Up;
@@ -70,9 +105,9 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
 
 KeyboardCapture::KeyboardCapture(HWND window,
     std::function<bool(const chast::InputEvent&)> send,
-    std::function<void()> release, std::function<void()> escape)
+    std::function<void()> release, std::function<void()> escape, LocalDispatch local_dispatch)
     : window_(window), send_(std::move(send)), release_(std::move(release)),
-      escape_(std::move(escape)) {
+      escape_(std::move(escape)), local_dispatch_(std::move(local_dispatch)) {
     locks_ = lock_bits();
     physical_modifiers_ = physical_modifiers();
     for (const int key : {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL}) {
@@ -163,6 +198,18 @@ void KeyboardCapture::set_relative(bool enabled) {
     relative_ = enabled;
 }
 
+void KeyboardCapture::SetTranslated(bool enabled) {
+    std::lock_guard lock(mutex_);
+    translated_ = enabled;
+    composing_ = false;
+    state_.Reset(physical_modifiers_);
+}
+
+void KeyboardCapture::SetComposing(bool composing) {
+    std::lock_guard lock(mutex_);
+    composing_ = composing;
+}
+
 uint16_t KeyboardCapture::InputState() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return (enabled_ ? state_.modifiers() : physical_modifiers_) | locks_;
@@ -218,15 +265,30 @@ bool KeyboardCapture::Handle(WPARAM message, const KBDLLHOOKSTRUCT& key) {
     }
     chast::InputEvent event;
     bool escape = false;
-    const bool consume = state_.Handle(key, down, locks_, relative_, event, escape);
-    if (!consume) return false;
+    bool consume = state_.Handle(key, down, locks_, relative_, event, escape,
+                                 translated_, composing_);
+    if (translated_ && local_dispatch_ && consume && event.kind == chast::InputKind::Key) {
+        // Ordinary keys go through IMM before the window decides whether they
+        // belong to composition. A fast Enter can precede STARTCOMPOSITION on
+        // this hook thread. Only OS shortcuts need to be suppressed here.
+        const auto mods = state_.modifiers();
+        const bool win = usage == 0xe3 || usage == 0xe7 ||
+            (mods & (chast::kModifierLeftGui | chast::kModifierRightGui)) != 0;
+        const bool alt = (mods & (chast::kModifierLeftAlt | chast::kModifierRightAlt)) != 0;
+        const bool ctrl = (mods & (chast::kModifierLeftCtrl | chast::kModifierRightCtrl)) != 0;
+        consume = win || (key.vkCode == VK_TAB && alt) ||
+            (key.vkCode == VK_ESCAPE && (alt || ctrl));
+    }
     if (escape) escape_();
-    if (event.kind == chast::InputKind::Key && !send_(event)) {
+    const bool accepted = translated_ && local_dispatch_
+        ? local_dispatch_(key, down, event, consume && down)
+        : event.kind != chast::InputKind::Key || send_(event);
+    if (!accepted) {
         // Queue saturation cannot leave an earlier down without its up.
         release_();
     }
     // RustDesk lets releases reach Windows, including keys pressed before
     // capture started. Otherwise local modifiers can remain logically down.
-    return down;
+    return consume && down;
 }
 }  // namespace chast_viewer
