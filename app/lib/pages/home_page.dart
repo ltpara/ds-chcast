@@ -642,6 +642,7 @@ class _HomePageState extends State<HomePage> {
             url: group.key,
             mode: _server.mode,
             key: _server.key,
+            linkKey: _server.linkKey,
           );
           try {
             final BatchLookupResult batch = await _lookupBatch(
@@ -768,6 +769,7 @@ class _HomePageState extends State<HomePage> {
         displayName: device.name,
         mode: _server.mode,
         serverKey: _server.key,
+        linkKey: _server.linkKey,
       );
     } else {
       target = parseConnectTarget(device.id, token: token);
@@ -6193,11 +6195,13 @@ class _ServerDialog extends StatefulWidget {
 class _ServerDialogState extends State<_ServerDialog> {
   late final TextEditingController _url;
   late final TextEditingController _key;
+  late final TextEditingController _linkKey;
   late final TextEditingController _proxy;
   late TunnelMode _mode;
   bool _useWebSocket = false;
   bool _testing = false;
   bool _showKey = false;
+  bool _showLinkKey = false;
   bool _showProxy = false;
   String _status = '';
   bool _statusOk = false;
@@ -6208,6 +6212,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     super.initState();
     _url = TextEditingController(text: widget.initial.url);
     _key = TextEditingController(text: widget.initial.key);
+    _linkKey = TextEditingController(text: widget.initial.linkKey);
     _proxy = TextEditingController(text: widget.initial.proxy);
     _mode = widget.initial.mode;
     _useWebSocket = widget.initial.useWebSocket;
@@ -6220,6 +6225,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     _url.removeListener(_loadPin);
     _url.dispose();
     _key.dispose();
+    _linkKey.dispose();
     _proxy.dispose();
     super.dispose();
   }
@@ -6268,7 +6274,12 @@ class _ServerDialogState extends State<_ServerDialog> {
     ServerApi.proxy = proxy;
     try {
       await ServerApi.check(
-        ServerSettings(url: url, mode: _mode, key: _key.text.trim()),
+        ServerSettings(
+          url: url,
+          mode: _mode,
+          key: _key.text.trim(),
+          linkKey: _linkKey.text.trim(),
+        ),
       );
       if (mounted) {
         setState(() {
@@ -6317,6 +6328,7 @@ class _ServerDialogState extends State<_ServerDialog> {
         url: url,
         mode: _mode,
         key: _key.text.trim(),
+        linkKey: _linkKey.text.trim(),
         proxy: proxy,
         useWebSocket: _useWebSocket,
       ),
@@ -6360,6 +6372,27 @@ class _ServerDialogState extends State<_ServerDialog> {
                       _showKey ? Icons.visibility_off : Icons.visibility,
                     ),
                     onPressed: () => setState(() => _showKey = !_showKey),
+                  ),
+                ),
+                onSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                key: const Key('server-link-key'),
+                controller: _linkKey,
+                obscureText: !_showLinkKey,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: tr('连接密钥（可选）'),
+                  hintText: tr('与 --link-key 相同；留空沿用服务端密钥'),
+                  suffixIcon: IconButton(
+                    tooltip: _showLinkKey ? tr('隐藏密钥') : tr('显示密钥'),
+                    icon: Icon(
+                      _showLinkKey ? Icons.visibility_off : Icons.visibility,
+                    ),
+                    onPressed: () =>
+                        setState(() => _showLinkKey = !_showLinkKey),
                   ),
                 ),
                 onSubmitted: (_) => _save(),

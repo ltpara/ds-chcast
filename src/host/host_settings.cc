@@ -816,6 +816,12 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
             } else {
                 settings.server_key = value;
             }
+        } else if (key == "host_key") {
+            if (!valid_server_key(value)) {
+                warn(result.warning, "host_key is not 256 bytes of printable text; clearing it");
+            } else {
+                settings.host_key = value;
+            }
         } else if (key == "proxy") {
             std::string normalized;
             if (!parse_proxy_url(value, normalized)) {
@@ -1002,6 +1008,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "tunnel=" << (settings.tunnel ? 1 : 0) << "\n"
          << "server_url=" << settings.server_url << "\n"
          << "server_key=" << settings.server_key << "\n"
+         << "host_key=" << settings.host_key << "\n"
          << "proxy=" << settings.proxy << "\n"
          << "tunnel_id=" << settings.tunnel_id << "\n"
          << "tunnel_old_id=" << settings.tunnel_old_id << "\n"

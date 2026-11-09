@@ -95,6 +95,30 @@ const unsigned char kDeltaAccessUnit[] = {
     0x00, 0x00, 0x03, 0x00, 0x80,
 };
 
+// Complete 64x64 solid-color VP9 key frames produced by libvpx: profile 0
+// (4:2:0) and profile 1 (4:4:4). The recorder derives vpcC from the pixel
+// format it was told, and FFmpeg's MP4 demuxer needs the first sample to be
+// decodable to learn the same pixel format back.
+const uint8_t kVp9Key420[] = {
+    0x82, 0x49, 0x83, 0x42, 0x00, 0x03, 0xf0, 0x03, 0xf6, 0x00, 0x38,
+    0x24, 0x1c, 0x18, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x41, 0x00,
+};
+const uint8_t kVp9Key444[] = {
+    0xa2, 0x49, 0x83, 0x42, 0x00, 0x00, 0x7e, 0x00, 0x7e, 0xc0, 0x07,
+    0x04, 0x83, 0x83, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x41, 0x00,
+};
+// The matching inter pictures. FFmpeg's VP9 parser reads the key-frame flag
+// from the uncompressed header, so a delta has to be a real inter frame; a
+// key frame payload sent as non-key would still demux as a key.
+const uint8_t kVp9Delta420[] = {
+    0x86, 0x00, 0x40, 0x92, 0x9c, 0x00, 0x54, 0x60, 0x00, 0x03, 0x20, 0x00,
+    0x00, 0x54, 0x70,
+};
+const uint8_t kVp9Delta444[] = {
+    0xa6, 0x00, 0x40, 0x92, 0x9c, 0x00, 0x54, 0x60, 0x00, 0x03, 0x20, 0x00,
+    0x00, 0x54, 0x70,
+};
+
 struct StreamInfo {
     int64_t first_dts = -1;
     std::vector<double> sample_ms;
@@ -147,6 +171,30 @@ bool inspect(const std::string& path, StreamInfo* info, std::string* error) {
     av_packet_free(&packet);
     avformat_close_input(&format);
     return info->frames > 0;
+}
+
+// FFmpeg's MP4 demuxer ignores the profile and chroma fields of vpcC, so read
+// the sample entry the muxer wrote instead. A 4:4:4 VP9 sample description has
+// profile 1 and subsampling 3 (ISO/IEC 14496-12 VPCodecConfigurationRecord).
+bool vp9_config(const std::string& path, int* profile, int* subsampling) {
+    std::FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "rb") != 0 || !file) return false;
+    std::fseek(file, 0, SEEK_END);
+    const long size = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    std::vector<uint8_t> bytes(size > 0 ? static_cast<size_t>(size) : 0);
+    const bool read = !bytes.empty() &&
+        std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    std::fclose(file);
+    if (!read) return false;
+    for (size_t i = 4; i + 11 < bytes.size(); ++i) {
+        if (std::memcmp(bytes.data() + i, "vpcC", 4) != 0) continue;
+        // version(1) + flags(3), profile, level, bitDepth|subsampling|range.
+        *profile = bytes[i + 8];
+        *subsampling = (bytes[i + 10] >> 1) & 3;
+        return true;
+    }
+    return false;
 }
 
 struct Write {
@@ -403,6 +451,60 @@ int main() {
     const uint8_t truncated[] = {0x0a, 0xff};
     invalid.write(av1_header, truncated, sizeof(truncated));
     if (!invalid.failed() || invalid.error().empty()) return 1;
+    // A camera joining a full-color session makes the host renegotiate VP9
+    // from profile 1 to profile 0; each profile needs its own sample entry, so
+    // the recording rolls over. A later 4:4:4 key frame opens a third file.
+    // Samples with the new chroma before its key frame are dropped.
+    chast_tools::Mp4Recorder full_color;
+    const std::string full_color_path = "mp4_recorder_vp9_full_color_test.mp4";
+    if (!full_color.open(full_color_path, chast::VideoCodec::Vp9, 64, 64, &error)) return 1;
+    chast::FrameHeader vp9;
+    vp9.codec = chast::VideoCodec::Vp9;
+    vp9.width = vp9.height = 64;
+    vp9.chroma = chast::VideoChroma::Yuv444;
+    vp9.pts_ms = 5000;
+    vp9.keyframe = true;
+    full_color.write(vp9, kVp9Key444, sizeof(kVp9Key444));
+    vp9.pts_ms = 5033;
+    vp9.keyframe = false;
+    full_color.write(vp9, kVp9Delta444, sizeof(kVp9Delta444));
+    vp9.chroma = chast::VideoChroma::Yuv420;
+    vp9.pts_ms = 5066;
+    full_color.write(vp9, kVp9Delta420, sizeof(kVp9Delta420));
+    vp9.keyframe = true;
+    vp9.pts_ms = 5099;
+    full_color.write(vp9, kVp9Key420, sizeof(kVp9Key420));
+    vp9.keyframe = false;
+    vp9.pts_ms = 5132;
+    full_color.write(vp9, kVp9Delta420, sizeof(kVp9Delta420));
+    vp9.chroma = chast::VideoChroma::Yuv444;
+    vp9.keyframe = true;
+    vp9.pts_ms = 5165;
+    full_color.write(vp9, kVp9Key444, sizeof(kVp9Key444));
+    vp9.keyframe = false;
+    vp9.pts_ms = 5198;
+    full_color.write(vp9, kVp9Delta444, sizeof(kVp9Delta444));
+    full_color.close(6000);
+    const std::vector<std::string>& color_segments = full_color.segments();
+    if (full_color.failed() || color_segments.size() != 3 || full_color.skipped() != 1) {
+        std::fprintf(stderr, "FAIL VP9 chroma rollover: %s\n", full_color.error().c_str());
+        return 1;
+    }
+    const int want_profile[] = {1, 0, 1};
+    const int want_subsampling[] = {3, 0, 3};
+    for (size_t i = 0; i < color_segments.size(); ++i) {
+        if (!check_segment(color_segments[i], chast::VideoCodec::Vp9, {0, 33}, 1)) return 1;
+        int profile = -1, subsampling = -1;
+        if (!vp9_config(color_segments[i], &profile, &subsampling) ||
+            profile != want_profile[i] || subsampling != want_subsampling[i]) {
+            std::fprintf(stderr,
+                         "FAIL %s describes VP9 profile %d/%d, expected %d/%d\n",
+                         color_segments[i].c_str(), profile, subsampling,
+                         want_profile[i], want_subsampling[i]);
+            return 1;
+        }
+    }
+    std::printf("ok   a VP9 chroma change opened a segment per sample description\n");
     if (!check_host_recorder()) { std::fprintf(stderr, "FAIL async host recording\n"); return 1; }
     std::printf("MP4 recorder PASSED\n");
     return 0;

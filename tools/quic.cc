@@ -835,6 +835,11 @@ struct Options {
     size_t display = 0;
     bool display_set = false;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    // connect/verify: the chroma to vote for in Hello. The tool's decoders can
+    // always decode 4:4:4 VP9, so the capability is advertised separately and
+    // only the preference follows this option.
+    chast::VideoChroma chroma = chast::VideoChroma::Yuv420;
+    bool chroma_set = false;
     // serve/verify: pin the hardware encoder family instead of Auto's
     // oneVPL-then-FFmpeg order.
     chast::EncoderBackend encoder = chast::EncoderBackend::Auto;
@@ -1143,10 +1148,23 @@ bool parse_args(int argc, char** argv, Options& options) {
                     options.codec = chast::VideoCodec::Hevc;
                 } else if (value == "av1") {
                     options.codec = chast::VideoCodec::Av1;
+                } else if (value == "vp9") {
+                    options.codec = chast::VideoCodec::Vp9;
                 } else {
                     std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                     return false;
                 }
+            } else if (arg == "--chroma" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                if (value == "420" || value == "4:2:0" || value == "yuv420") {
+                    options.chroma = chast::VideoChroma::Yuv420;
+                } else if (value == "444" || value == "4:4:4" || value == "yuv444") {
+                    options.chroma = chast::VideoChroma::Yuv444;
+                } else {
+                    std::fprintf(stderr, "--chroma wants 420 or 444\n");
+                    return false;
+                }
+                options.chroma_set = true;
             } else if (arg == "--encoder" && i + 1 < argc) {
                 if (!chast::parse_encoder_backend(argv[++i], options.encoder)) {
                     std::fprintf(stderr,
@@ -1621,6 +1639,17 @@ bool parse_args(int argc, char** argv, Options& options) {
                      chast::auth_mode_name(options.auth_mode));
         return false;
     }
+    if (options.chroma_set && options.mode == "serve") {
+        std::fprintf(stderr,
+                     "--chroma is the viewer's preference; pass it to connect or verify\n");
+        return false;
+    }
+    if (options.chroma == chast::VideoChroma::Yuv444 &&
+        options.codec != chast::VideoCodec::Vp9) {
+        std::fprintf(stderr,
+                     "--chroma 444 needs --codec vp9; the other encoders are 4:2:0 only\n");
+        return false;
+    }
     return true;
 }
 
@@ -1668,6 +1697,7 @@ struct SenderStats {
     int32_t origin_x = 0;
     int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    chast::VideoChroma chroma = chast::VideoChroma::Yuv420;
     std::string encoder;
     std::string save_path;
     // Files the host finalized (digest verified, renamed into place), in the
@@ -1799,6 +1829,11 @@ struct ReceiverStats {
     int32_t origin_x = 0;
     int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    chast::VideoChroma chroma = chast::VideoChroma::Yuv420;
+    // verify replays the received access units with a fresh decoder. VP9 has
+    // no Annex B delimiter, so the receiver keeps the units it saw instead of
+    // re-splitting the saved file.
+    std::vector<chast_tools::AccessUnit> replay_units;
     std::string decoder;
     // "udp" for a direct QUIC session, otherwise the carrier that tunneled it.
     std::string transport = "udp";
@@ -2368,8 +2403,11 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.quality = options.quality;
     // This probe asserts exact manual rates and keyframe cost. Network-driven
     // QoS has separate trace and multi-viewer tests and must not move those
-    // rates while the probe is measuring a codec change.
-    if (options.stream_options) config.adaptive_bitrate = false;
+    // rates while the probe is measuring a codec change. The plain loopback
+    // makes the same promise, so it opts out too; --netem is the probe whose
+    // purpose is to drive the adaptive controller.
+    if (options.stream_options || (options.mode == "verify" && !options.netem))
+        config.adaptive_bitrate = false;
     if (options.display_set) {
         config.settings.display = static_cast<uint16_t>(options.display);
     }
@@ -2540,6 +2578,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.display_index = status.display_index;
     stats.display_merged = status.display_merged;
     stats.codec = status.stream.codec;
+    stats.chroma = status.stream.chroma;
     stats.width = status.stream.width;
     stats.height = status.stream.height;
     stats.source_width = status.stream.source_width;
@@ -2791,7 +2830,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     client_config.audit_ref = options.audit_ref;
     client_config.audio_datagram = !options.audio_stream;
     client_config.codec_preference = options.codec == chast::VideoCodec::Hevc ? chast::StreamCodecPreference::Hevc :
-        options.codec == chast::VideoCodec::Av1 ? chast::StreamCodecPreference::Av1 : chast::StreamCodecPreference::H264;
+        options.codec == chast::VideoCodec::Av1 ? chast::StreamCodecPreference::Av1 :
+        options.codec == chast::VideoCodec::Vp9 ? chast::StreamCodecPreference::Vp9 :
+        chast::StreamCodecPreference::H264;
+    // The tool decoder is libvpx, which handles both VP9 profiles; advertise
+    // that capability and let --chroma decide only what this session votes for.
+    client_config.decoding_444 = chast::kVideoCodecVp9;
+    client_config.prefer_chroma = options.chroma;
     if (client_config.totp.empty() && !options.totp_secret.empty()) {
         // Computed right before the Hello so the 30 s window is fresh.
         std::vector<uint8_t> key;
@@ -2829,6 +2874,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         return fail("handshake: " + handshaken.to_string());
     }
     stats.codec = info.codec;
+    stats.chroma = info.chroma;
     stats.width = info.width;
     stats.height = info.height;
     stats.source_width = info.source_width;
@@ -2848,8 +2894,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.audio_datagram = info.audio_datagram;
     stats.microphone_announced = info.microphone_enabled;
     if (!options.quiet) {
-        std::printf("quic: connected, server streams %s %ux%u from %ux%u at %u kbps (%s)\n",
-                    chast_tools::codec_name(info.codec), info.width, info.height,
+        std::printf("quic: connected, server streams %s%s %ux%u from %ux%u at %u kbps (%s)\n",
+                    chast_tools::codec_name(info.codec),
+                    info.chroma == chast::VideoChroma::Yuv444 ? " 4:4:4" : " 4:2:0",
+                    info.width, info.height,
                     info.source_width, info.source_height, info.bitrate / 1000u,
                     info.encoder.c_str());
         if (!options.token.empty()) {
@@ -4603,12 +4651,18 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
 
     chast::DecoderConfig decoder_config;
     decoder_config.codec = info.codec;
+    decoder_config.chroma = info.chroma;
     std::unique_ptr<chast::IVideoDecoder> decoder =
         chast::create_decoder(decoder_config, &error);
     if (!decoder) {
         return fail("decoder creation failed: " + error);
     }
     stats.decoder = decoder->implementation();
+
+    // VP9 has no Annex B delimiter, so verify's offline replay cannot re-split
+    // the saved file; it replays the access units exactly as they arrived.
+    const bool keep_replay_units =
+        options.mode == "verify" && info.codec == chast::VideoCodec::Vp9;
 
     FILE* sink = nullptr;
     if (!options.save.empty() &&
@@ -4681,16 +4735,19 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     // frame header that got here first can rebuild it, and the announcement
     // that follows then finds it already current.
     chast::VideoCodec decoder_codec = info.codec;
+    chast::VideoChroma decoder_chroma = info.chroma;
     uint32_t decoder_width = info.width;
     uint32_t decoder_height = info.height;
-    auto rebuild_decoder = [&](chast::VideoCodec codec, uint32_t width,
-                               uint32_t height) -> bool {
-        if (decoder_codec == codec && decoder_width == width && decoder_height == height) {
+    auto rebuild_decoder = [&](chast::VideoCodec codec, chast::VideoChroma chroma,
+                               uint32_t width, uint32_t height) -> bool {
+        if (decoder_codec == codec && decoder_chroma == chroma &&
+            decoder_width == width && decoder_height == height) {
             return true;
         }
         decoder.reset();
         chast::DecoderConfig updated_decoder;
         updated_decoder.codec = codec;
+        updated_decoder.chroma = chroma;
         decoder = chast::create_decoder(updated_decoder, &error);
         if (!decoder) {
             stats.error = "decoder recreation failed: " + error;
@@ -4698,6 +4755,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         stats.decoder = decoder->implementation();
         decoder_codec = codec;
+        decoder_chroma = chroma;
         decoder_width = width;
         decoder_height = height;
         last_keyframe_request = start - std::chrono::seconds(10);
@@ -4711,11 +4769,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         while (session->take_stream_update(update)) {
             ++stats.stream_updates;
             const bool reconfigure = update.codec != decoder_codec ||
+                                     update.chroma != decoder_chroma ||
                                      update.width != decoder_width ||
                                      update.height != decoder_height;
             info = update;
             stats.last_update = update;
             stats.codec = info.codec;
+            stats.chroma = info.chroma;
             stats.width = info.width;
             stats.height = info.height;
             stats.source_width = info.source_width;
@@ -4733,12 +4793,15 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             if (!ensure_audio_decoder(info.audio)) {
                 return false;
             }
-            if (reconfigure && !rebuild_decoder(info.codec, info.width, info.height)) {
+            if (reconfigure &&
+                !rebuild_decoder(info.codec, info.chroma, info.width, info.height)) {
                 return false;
             }
             if (!options.quiet) {
-                std::printf("quic: stream description updated: %s %ux%u from %ux%u at %d,%d\n",
-                            chast_tools::codec_name(info.codec), info.width, info.height,
+                std::printf("quic: stream description updated: %s%s %ux%u from %ux%u at %d,%d\n",
+                            chast_tools::codec_name(info.codec),
+                            info.chroma == chast::VideoChroma::Yuv444 ? " 4:4:4" : " 4:2:0",
+                            info.width, info.height,
                             info.source_width, info.source_height, info.origin_x,
                             info.origin_y);
             }
@@ -5463,9 +5526,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         static_cast<uint16_t>(options.framerate == 0 ? 30 : options.framerate);
     const uint16_t capped_fps = (std::min)(host_fps, probe_fps);
     const chast::VideoCodec stream_base_codec = info.codec;
-    const chast::VideoCodec stream_alt_codec = stream_base_codec == chast::VideoCodec::Hevc
-                                                   ? chast::VideoCodec::H264
-                                                   : chast::VideoCodec::Hevc;
+    // The other family must be one the host can actually produce as a base
+    // comparison; H.264 is always available through OpenH264, while HEVC and
+    // AV1 may not be. VP9 itself is software-only.
+    const chast::VideoCodec stream_alt_codec = stream_base_codec == chast::VideoCodec::H264
+                                                   ? chast::VideoCodec::Hevc
+                                                   : chast::VideoCodec::H264;
     stats.stream_option_base_codec = stream_base_codec;
     auto stream_next_send = start + std::chrono::milliseconds(3200);
     uint64_t stream_updates_before = 0;
@@ -5485,15 +5551,19 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 return chast::StreamCodecPreference::Hevc;
             case chast::VideoCodec::Av1:
                 return chast::StreamCodecPreference::Av1;
+            case chast::VideoCodec::Vp9:
+                return chast::StreamCodecPreference::Vp9;
         }
         return chast::StreamCodecPreference::Auto;
     };
     auto send_stream_options = [&](chast::StreamCodecPreference codec, uint16_t max_fps,
-                                   chast::StreamQuality quality) -> bool {
+                                   chast::StreamQuality quality,
+                                   chast::VideoChroma chroma) -> bool {
         chast::StreamOptions request;
         request.codec = codec;
         request.max_fps = max_fps;
         request.quality = quality;
+        request.chroma = chroma;
         if (chast::Error sent = session->request_stream_options(request); !sent.ok()) {
             stats.error = "request_stream_options: " + sent.to_string();
             return false;
@@ -5501,14 +5571,21 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         stream_updates_before = stats.stream_updates;
         return true;
     };
-    auto stream_answer_matches = [](const chast::StreamOptionsResult& result,
-                                    chast::VideoCodec codec, uint16_t fps,
-                                    chast::StreamQuality quality) {
-        return result.codec == codec && result.fps == fps && result.quality == quality;
+    auto stream_answer_matches = [&](const chast::StreamOptionsResult& result,
+                                     chast::VideoCodec codec, uint16_t fps,
+                                     chast::StreamQuality quality) {
+        // The base family is expected to keep the session's chroma preference;
+        // the alternative family is requested as 4:2:0 because only VP9 has a
+        // 4:4:4 encoder.
+        const chast::VideoChroma chroma =
+            codec == stream_base_codec ? options.chroma : chast::VideoChroma::Yuv420;
+        return result.codec == codec && result.fps == fps && result.quality == quality &&
+               result.chroma == chroma;
     };
     auto stream_answer_detail = [](const chast::StreamOptionsResult& result) {
-        std::string detail = std::string(chast_tools::codec_name(result.codec)) + " at " +
-                             std::to_string(result.fps) + " fps, quality " +
+        std::string detail = std::string(chast_tools::codec_name(result.codec)) +
+                             (result.chroma == chast::VideoChroma::Yuv444 ? " 4:4:4" : " 4:2:0") +
+                             " at " + std::to_string(result.fps) + " fps, quality " +
                              std::to_string(static_cast<unsigned>(result.quality));
         if (!result.reason.empty()) {
             detail += ": " + result.reason;
@@ -5550,7 +5627,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         return false;
                     }
                     if (!send_stream_options(stream_preference(stream_base_codec), probe_fps,
-                                             chast::StreamQuality::Balanced)) {
+                                             chast::StreamQuality::Balanced, options.chroma)) {
                         return false;
                     }
                     stream_step = StreamOptionStep::WaitChange;
@@ -5677,7 +5754,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         if (stream_step == StreamOptionStep::WaitStart && now >= stream_next_send) {
             if (!send_stream_options(stream_preference(stream_base_codec), 0,
-                                     chast::StreamQuality::High)) {
+                                     chast::StreamQuality::High, options.chroma)) {
                 return false;
             }
             stream_step = StreamOptionStep::WaitSameCodec;
@@ -5693,7 +5770,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             stats.stream_option_change_update_seen = true;
             if (!send_stream_options(stream_preference(stream_base_codec), 0,
-                                     chast::StreamQuality::High)) {
+                                     chast::StreamQuality::High, options.chroma)) {
                 return false;
             }
             stream_step = StreamOptionStep::WaitRestore;
@@ -5719,7 +5796,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                    now >= stream_settle_at && stats.received >= stream_settle_frames) {
             stream_rate_keyframes_before = stats.keyframes;
             if (!send_stream_options(stream_preference(stream_base_codec), 0,
-                                     chast::StreamQuality::Balanced)) {
+                                     chast::StreamQuality::Balanced, options.chroma)) {
                 return false;
             }
             stream_step = StreamOptionStep::WaitRateOnly;
@@ -5747,7 +5824,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.stream_option_rate_keyframes =
                 stats.keyframes - stream_rate_keyframes_before;
             if (!send_stream_options(stream_preference(stream_base_codec), 0,
-                                     chast::StreamQuality::High)) {
+                                     chast::StreamQuality::High, options.chroma)) {
                 return false;
             }
             stream_step = StreamOptionStep::WaitRateOnlyRestore;
@@ -5763,7 +5840,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 return false;
             }
             if (!send_stream_options(stream_preference(stream_alt_codec), 0,
-                                     chast::StreamQuality::High)) {
+                                     chast::StreamQuality::High,
+                                     chast::VideoChroma::Yuv420)) {
                 return false;
             }
             stream_step = StreamOptionStep::WaitAlt;
@@ -5781,7 +5859,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         } else if (stream_step == StreamOptionStep::WaitAltRestore &&
                    now >= stream_next_send) {
             if (!send_stream_options(stream_preference(stream_base_codec), 0,
-                                     chast::StreamQuality::High)) {
+                                     chast::StreamQuality::High, options.chroma)) {
                 return false;
             }
             stream_step = StreamOptionStep::WaitAltRestoreAnswer;
@@ -6056,25 +6134,27 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         expected_seq = header.seq + 1;
 
-        if (header.codec != info.codec || header.width != info.width ||
-            header.height != info.height) {
+        if (header.codec != info.codec || header.chroma != info.chroma ||
+            header.width != info.width || header.height != info.height) {
             // Look for the announcement that belongs to this picture before
             // treating the disagreement as a violation.
             if (!drain_stream_updates()) {
                 return fail(stats.error);
             }
         }
-        if (header.codec != info.codec || header.width != info.width ||
-            header.height != info.height) {
+        if (header.codec != info.codec || header.chroma != info.chroma ||
+            header.width != info.width || header.height != info.height) {
             // The announcement still lost the race. The frame header names the
             // new stream precisely, so rebuild for it and decode this unit; the
             // StreamInfo that follows will find the decoder current.
-            if (!rebuild_decoder(header.codec, header.width, header.height)) {
+            if (!rebuild_decoder(header.codec, header.chroma, header.width, header.height)) {
                 return fail(stats.error);
             }
             if (!options.quiet) {
-                std::printf("quic: stream is %s %ux%u before its announcement\n",
-                            chast_tools::codec_name(header.codec), header.width, header.height);
+                std::printf("quic: stream is %s%s %ux%u before its announcement\n",
+                            chast_tools::codec_name(header.codec),
+                            header.chroma == chast::VideoChroma::Yuv444 ? " 4:4:4" : " 4:2:0",
+                            header.width, header.height);
             }
         }
         if (chast::crc32(payload.data(), payload.size()) != header.payload_crc32) {
@@ -6087,6 +6167,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         if (sink) {
             fwrite(payload.data(), 1, payload.size(), sink);
+        }
+        if (keep_replay_units) {
+            chast_tools::AccessUnit unit;
+            unit.bytes.assign(payload.begin(), payload.end());
+            unit.keyframe = header.keyframe;
+            stats.replay_units.push_back(std::move(unit));
         }
         if (!options.record.empty()) {
             recorder.write(header, payload.data(), payload.size());
@@ -6679,33 +6765,12 @@ struct StreamDigest {
     std::string error;
 };
 
-// Replays a saved elementary stream the way chast-decode does: split at AUDs,
-// decode each access unit, fold the picture hashes in order.
-StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec codec) {
+// Decodes access units that are already separated and folds the picture
+// hashes in order. The live receiver uses this for VP9, whose frames carry no
+// delimiter that an offline split could find.
+StreamDigest digest_unit_list(const std::vector<chast_tools::AccessUnit>& units,
+                              chast::VideoCodec codec, chast::VideoChroma chroma) {
     StreamDigest result;
-    if (codec == chast::VideoCodec::Av1) {
-        result.error = "AV1 is OBU-framed and has no Annex B split; saved-stream replay "
-                       "supports H.264 and HEVC only";
-        return result;
-    }
-    FILE* input = nullptr;
-    if (fopen_s(&input, path.c_str(), "rb") != 0 || !input) {
-        result.error = "cannot open " + path;
-        return result;
-    }
-    std::vector<uint8_t> data;
-    uint8_t chunk[64 * 1024];
-    for (;;) {
-        const size_t got = fread(chunk, 1, sizeof(chunk), input);
-        data.insert(data.end(), chunk, chunk + got);
-        if (got != sizeof(chunk)) {
-            break;
-        }
-    }
-    fclose(input);
-
-    const std::vector<chast_tools::AccessUnit> units =
-        chast_tools::split_access_units(data, codec);
     result.units = units.size();
     if (units.empty()) {
         result.error = "the saved stream has no access units";
@@ -6714,6 +6779,7 @@ StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec code
 
     chast::DecoderConfig config;
     config.codec = codec;
+    config.chroma = chroma;
     std::string error;
     std::unique_ptr<chast::IVideoDecoder> decoder = chast::create_decoder(config, &error);
     if (!decoder) {
@@ -6763,6 +6829,38 @@ StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec code
         }
     }
     return result;
+}
+
+// Replays a saved elementary stream the way chast-decode does: split at AUDs,
+// decode each access unit, fold the picture hashes in order. VP9 and AV1 have
+// no Annex B framing, so a raw saved file cannot be replayed this way; the
+// caller must keep the received unit boundaries (verify does).
+StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec codec) {
+    StreamDigest result;
+    if (codec == chast::VideoCodec::Av1 || codec == chast::VideoCodec::Vp9) {
+        result.error = std::string(chast_tools::codec_name(codec)) +
+                       " has no Annex B delimiter; saved-stream replay supports H.264 and "
+                       "HEVC only";
+        return result;
+    }
+    FILE* input = nullptr;
+    if (fopen_s(&input, path.c_str(), "rb") != 0 || !input) {
+        result.error = "cannot open " + path;
+        return result;
+    }
+    std::vector<uint8_t> data;
+    uint8_t chunk[64 * 1024];
+    for (;;) {
+        const size_t got = fread(chunk, 1, sizeof(chunk), input);
+        data.insert(data.end(), chunk, chunk + got);
+        if (got != sizeof(chunk)) {
+            break;
+        }
+    }
+    fclose(input);
+
+    return digest_unit_list(chast_tools::split_access_units(data, codec), codec,
+                            chast::VideoChroma::Yuv420);
 }
 
 // Starts a second server and connects to it with a deliberately wrong pin.
@@ -9920,13 +10018,16 @@ int run_verify(const Options& options) {
     // The single-codec replay below cannot read that by design; the plain
     // loopback (no --stream-options) keeps the check.
     if (!local.stream_options) {
-        const StreamDigest replay = digest_saved_stream(path, sent.codec);
+        const StreamDigest replay =
+            sent.codec == chast::VideoCodec::Vp9
+                ? digest_unit_list(received.replay_units, sent.codec, sent.chroma)
+                : digest_saved_stream(path, sent.codec);
         if (!replay.error.empty()) {
             std::printf("     replay: %s\n", replay.error.c_str());
         }
         check(replay.error.empty(), "the sent stream can be replayed offline");
         check(replay.units == sent.encoded,
-              "the saved stream splits into the sent access units");
+              "offline replay covers the sent access units");
         check(replay.decoded == received.decoded,
               "offline decode produces the same frame count");
         check(replay.digest == received.digest,
@@ -10200,13 +10301,16 @@ int run_weak_network(const Options& options) {
     // can arrive before the new key frame and are counted as skipped, not as
     // errors. The offline replay only has to prove the saved stream itself is
     // well formed and complete.
-    const StreamDigest replay = digest_saved_stream(path, sent.codec);
+    const StreamDigest replay =
+        sent.codec == chast::VideoCodec::Vp9
+            ? digest_unit_list(received.replay_units, sent.codec, sent.chroma)
+            : digest_saved_stream(path, sent.codec);
     if (!replay.error.empty()) {
         std::printf("     replay: %s\n", replay.error.c_str());
     }
     check(replay.error.empty(), "the sent stream can be replayed offline");
     check(replay.units == sent.encoded,
-          "the saved stream splits into the sent access units");
+          "offline replay covers the sent access units");
     check(replay.decoded > 0, "offline decode produced pictures");
 
     if (audio_probe) {

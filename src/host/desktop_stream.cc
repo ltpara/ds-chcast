@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <type_traits>
+#include <timeapi.h>
 
 namespace chast {
 namespace {
@@ -75,6 +76,13 @@ struct DesktopStreamPool::Source {
     bool fatal = false;
     bool keyframe = true;
     bool have_input = false;
+    // RustDesk static_refresh: a bounded burst of repeats lets the rate
+    // control refine a static picture. Counters restart on every new frame
+    // and refinements must not count as motion for the shared QoS.
+    Clock::time_point last_encode = Clock::now();
+    unsigned repeat_outputs = 0, repeat_no_outputs = 0, repeat_failures = 0;
+    bool source_ready = false;
+    float policy_ratio = 0.67f;
     unsigned encode_failures = 0;
     bool software_fallback = false;
     UINT initial_bitrate = 0;
@@ -154,12 +162,19 @@ struct DesktopStreamPool::Source {
     }
     void run() {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        // Frame pacing matches the announced framerate; the default ~15.6 ms
+        // wait granularity rounds a 30 fps tick up by another full frame.
+        timeBeginPeriod(1);
         for (;;) {
             std::deque<std::function<void()>> pending;
             {
                 std::unique_lock<std::mutex> lock(command_mutex);
+                // Wait until the next tick instead of polling: a 5 ms cap made
+                // every scheduled tick land up to one poll late. With no
+                // pending tick (no capture yet) keep the idle poll.
+                const auto now = Clock::now();
                 auto delay = std::chrono::duration_cast<Clock::duration>(std::chrono::milliseconds(5));
-                if (due > Clock::now()) delay = std::min(delay, due - Clock::now());
+                if (due > now) delay = due - now;
                 wake.wait_for(lock, delay, [&] { return stopping || !commands.empty(); });
                 pending.swap(commands);
                 if (stopping && pending.empty()) break;
@@ -181,6 +196,7 @@ struct DesktopStreamPool::Source {
         capture.reset();
         if (recorder) recorder->finish(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count()));
+        timeEndPeriod(1);
         if (SUCCEEDED(initialized)) CoUninitialize();
     }
     bool follow(std::string* failure) {
@@ -199,10 +215,12 @@ struct DesktopStreamPool::Source {
         // The connection may ask again while its first IDR is waiting to be
         // consumed. Coalesce that request instead of encoding another IDR on
         // the next tick after the first one has already been delivered.
-        if (sub.current && !sub.consumed && sub.current->generation == generation && sub.current->idr) return;
+        if (sub.current && !sub.consumed && sub.current->generation == generation && sub.current->idr)
+            return;
         if (std::any_of(sub.queue.begin(), sub.queue.end(), [&](const auto& picture) {
                 return picture->generation == generation && picture->idr;
-            })) return;
+            }))
+            return;
         keyframe = true;
     }
     void invalidate() {
@@ -239,6 +257,30 @@ struct DesktopStreamPool::Source {
             if (auto sub = weak.lock()) additional &= sub->decoding_codecs;
         return additional;
     }
+    bool has_subscribers() const {
+        return std::any_of(subscribers.begin(), subscribers.end(),
+                           [](const auto& weak) { return !weak.expired(); });
+    }
+    bool static_refresh_due(Clock::time_point now) const {
+        if (!encoder || !image || !configured || !have_input || !source_ready || fatal || lost)
+            return false;
+        if (!has_subscribers()) return false;
+        const auto codec = encoder->codec();
+        if (codec == VideoCodec::Av1) return false;
+        if (repeat_no_outputs >= 100) return false;
+        // VP9 may legitimately drop a repeat frame without an encoding error.
+        if (repeat_failures >= 3 && codec != VideoCodec::Vp9) return false;
+        const auto budget = static_refresh_budget(codec, policy_ratio, encoder->backend(),
+                                                  encoder->implementation());
+        if (repeat_outputs >= budget) return false;
+        const auto fps = std::max(1u, encoder->framerate());
+        const auto step = std::max(std::chrono::microseconds(1000000 / fps),
+                                   std::chrono::microseconds(1000000 / 30));
+        const bool first = repeat_outputs == 0 && repeat_no_outputs == 0;
+        const auto interval = codec == VideoCodec::Vp9 || first
+            ? std::max(step, std::chrono::microseconds(100000)) : step;
+        return now - last_encode >= interval;
+    }
     UINT quality_bitrate(UINT width, UINT height, VideoCodec codec, float ratio,
                          const EncoderConfig& base) const {
         const auto rate = base.bitrate
@@ -253,6 +295,7 @@ struct DesktopStreamPool::Source {
     Error apply_qos() {
         if (!qos || !encoder || !configured || Clock::now() < rate_retry) return Error::success();
         const auto policy = qos->state(now_ms());
+        policy_ratio = policy.ratio;
         const auto fps = source_fps(policy.fps);
         const auto rate = quality_bitrate(encoder->width(), encoder->height(), encoder->codec(), policy.ratio, base_config);
         // Drivers round bitrates. Compare requests, not a rounded readback,
@@ -281,6 +324,7 @@ struct DesktopStreamPool::Source {
         wanted.width = image->frame.nv12_width;
         wanted.height = image->frame.nv12_height;
         const auto base = configured ? base_config : wanted;
+        policy_ratio = base.quality_ratio;
         const auto common = common_codecs(additional);
         if (!common || (strict_codec && !(common & video_codec_bit(wanted.codec)))) {
             *failure = "the requested codec is not supported by every display subscriber";
@@ -299,6 +343,7 @@ struct DesktopStreamPool::Source {
             if (!valid_video_format(codec, wanted.chroma)) wanted.chroma = VideoChroma::Yuv420;
             if (qos) {
                 const auto policy = qos->state(now_ms());
+                policy_ratio = policy.ratio;
                 wanted.framerate = policy.fps;
                 wanted.quality_ratio = policy.ratio;
                 wanted.bitrate = quality_bitrate(wanted.width, wanted.height, codec, policy.ratio, base);
@@ -448,7 +493,18 @@ struct DesktopStreamPool::Source {
                 sub->waiting_idr = true;
                 keyframe = true;
             }
-            if (sub->waiting_idr && !picture->idr) { keyframe = true; continue; }
+            if (sub->waiting_idr && !picture->idr) {
+                keyframe = true;
+                continue;
+            }
+            // An IDR decodes on its own and makes every queued reference
+            // obsolete. Pushing it behind pending refinements would leave a
+            // waiting viewer with nothing usable for as long as the static
+            // refresh keeps refilling the queue.
+            if (picture->idr && !sub->queue.empty()) {
+                sub->queue.clear();
+                sub->queued_bytes = 0;
+            }
             sub->waiting_idr = false;
             sub->queue.push_back(picture);
             sub->queued_bytes += picture->bytes;
@@ -476,6 +532,12 @@ struct DesktopStreamPool::Source {
         Error result = Error::success();
         auto* input = encoder->bgra_input() ? next->bgra.get() : next->nv12.get();
         const bool updated = encoder->bgra_input() ? next->frame.desktop_updated : next->frame.nv12_updated;
+        if (repeat) {
+            // Refinement republishes the cached picture; it is not a new
+            // desktop image for any subscriber.
+            next->frame.nv12_updated = false;
+            next->frame.desktop_updated = false;
+        }
         if ((repeat || !updated) && have_input) {
             result = encoder->encode_repeat(pts, keyframe, next->packets);
             if (!result.ok() && result.status() != Status::DeviceRemoved &&
@@ -488,6 +550,10 @@ struct DesktopStreamPool::Source {
             result = encoder->encode(input, pts, keyframe, next->packets);
         }
         if (!result.ok()) {
+            if (repeat) {
+                ++repeat_no_outputs;
+                ++repeat_failures;
+            }
             error = result;
             if (result.status() == Status::DeviceRemoved || result.status() == Status::DeviceReset) {
                 // A software readback still needs a live capture device.
@@ -524,17 +590,35 @@ struct DesktopStreamPool::Source {
         encode_failures = 0;
         error = Error::success();
         have_input = true;
+        last_encode = Clock::now();
+        const bool delivered = !next->packets.empty();
+        const bool vpx = next->codec == VideoCodec::Vp9;
+        const bool sent = (delivered || vpx) && has_subscribers();
         for (const auto& packet : next->packets) {
             next->bytes += packet.data.size();
             next->idr = next->idr || packet.idr;
         }
         if (next->idr) keyframe = false;
+        if (repeat) {
+            if (delivered) {
+                ++repeat_outputs;
+                repeat_failures = 0;
+                source_ready = sent;
+            } else {
+                ++repeat_no_outputs;
+            }
+        } else {
+            // RustDesk on_encoded(true) clears the failure count for a real
+            // frame as well, so a later idle burst starts clean.
+            repeat_failures = 0;
+            source_ready = sent;
+        }
         if (!next->packets.empty()) {
             publish(next);
-            if (qos) qos->display(reinterpret_cast<uintptr_t>(this), 1, encoder->bitrate() / 1000,
-                                  variable_quality, now_ms());
+            // Static refinement must not count as motion for adaptive bitrate.
+            if (qos && !repeat) qos->display(reinterpret_cast<uintptr_t>(this), 1, encoder->bitrate() / 1000,
+                                             variable_quality, now_ms());
         }
-        due = Clock::now() + std::chrono::microseconds(1000000 / std::max(1u, encoder->framerate()));
         return true;
     }
     bool pop(Subscription& sub) {
@@ -564,7 +648,8 @@ struct DesktopStreamPool::Source {
         return CaptureResult::NoNewFrame;
     }
     void pump() {
-        if (negotiating || needs_group_rebuild || !capture || fatal || lost || (!configured && image)) return;
+        if (negotiating || needs_group_rebuild) return;
+        if (!capture || fatal || lost || (!configured && image)) return;
         apply_qos();
         if (Clock::now() < due) return;
         if (recorder && recorder->needs_keyframe(static_cast<uint64_t>(
@@ -582,7 +667,23 @@ struct DesktopStreamPool::Source {
                 build(wanted, &ignored);
             }
         }
-        const auto result = capture->capture(std::chrono::milliseconds(5));
+        // Schedule the next tick from this one: adding the interval after
+        // encoding made every frame take interval + processing time, so a
+        // 30 fps request delivered roughly half of it on real hardware.
+        const auto tick = Clock::now();
+        const UINT tick_fps = encoder ? encoder->framerate() : config.framerate;
+        const auto interval = std::chrono::microseconds(1000000 / std::max(1u, tick_fps));
+        due += interval;
+        // An encoder slower than the interval must skip a beat instead of
+        // bursting two frames back to back to catch up.
+        if (due <= tick) due = tick + interval;
+        // Wait up to the next tick for a desktop change. A short fixed timeout
+        // samples the present stream with a low duty cycle: when its cadence
+        // and the tick cadence share a phase, whole intervals report no new
+        // frame while others carry two. The target framerate is the cap.
+        const auto capture_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::clamp<Clock::duration>(due - Clock::now(), std::chrono::milliseconds(1), interval));
+        const auto result = capture->capture(capture_timeout);
         if (result == CaptureResult::ReinitNeeded || result == CaptureResult::FatalError) {
             error = capture->last_error();
             invalidate();
@@ -600,6 +701,13 @@ struct DesktopStreamPool::Source {
             }
             missing_nv12 = 0;
             remember();
+            // Every changed desktop restarts RustDesk's static-refresh budget;
+            // a cursor-only sample must not keep the refinement alive.
+            if (image->frame.nv12_updated || image->frame.desktop_updated) {
+                repeat_outputs = 0;
+                repeat_no_outputs = 0;
+                source_ready = false;
+            }
             if (global_codec && (!encoder || encoder->width() != image->frame.nv12_width ||
                                  encoder->height() != image->frame.nv12_height)) {
                 needs_group_rebuild = true;
@@ -607,6 +715,8 @@ struct DesktopStreamPool::Source {
             }
             if (configured) encode(false);
         } else if (keyframe && image && configured) {
+            encode(true);
+        } else if (static_refresh_due(Clock::now())) {
             encode(true);
         }
     }
@@ -1143,6 +1253,54 @@ void DesktopStreamPool::discard_backlog(IDxgiCapturer& capturer) {
 
 uint64_t DesktopStreamPool::capture_time(const IDxgiCapturer& capturer) {
     return dynamic_cast<const Capture&>(capturer).sub->delivered_capture_ms;
+}
+
+unsigned DesktopStreamPool::static_refresh_budget(VideoCodec codec, float quality,
+                                                  EncoderBackend backend,
+                                                  const std::string& implementation) {
+    // RustDesk video_service/static_refresh.rs max_repeat_frames(): measured
+    // per codec and hardware backend. AV1 has no static refinement.
+    enum class Vendor { Nvenc, Qsv, Amf, Other };
+    auto vendor = [&] {
+        if (backend == EncoderBackend::Vpl) return Vendor::Qsv;
+        if (backend == EncoderBackend::Ffmpeg) {
+            auto named = [&](const char* name) {
+                return implementation.find(name) != std::string::npos;
+            };
+            if (named("nvenc")) return Vendor::Nvenc;
+            if (named("amf")) return Vendor::Amf;
+            if (named("qsv")) return Vendor::Qsv;
+        }
+        return Vendor::Other;
+    }();
+    unsigned low = 0, low_to_balanced = 0, balanced_to_best = 0, best = 0;
+    switch (codec) {
+    case VideoCodec::Vp9:
+        low = 40; low_to_balanced = 20; balanced_to_best = 20; best = 20;
+        break;
+    case VideoCodec::H264:
+        switch (vendor) {
+        case Vendor::Nvenc: low = 80; low_to_balanced = 50; balanced_to_best = 60; best = 30; break;
+        case Vendor::Qsv: low = 80; low_to_balanced = 70; balanced_to_best = 130; best = 110; break;
+        case Vendor::Amf: low = 150; low_to_balanced = 150; balanced_to_best = 170; best = 110; break;
+        case Vendor::Other: low = 90; low_to_balanced = 60; balanced_to_best = 60; best = 30; break;
+        }
+        break;
+    case VideoCodec::Hevc:
+        switch (vendor) {
+        case Vendor::Nvenc: low = 160; low_to_balanced = 90; balanced_to_best = 60; best = 30; break;
+        case Vendor::Qsv: low = 150; low_to_balanced = 30; balanced_to_best = 30; best = 30; break;
+        case Vendor::Amf: low = 200; low_to_balanced = 200; balanced_to_best = 200; best = 120; break;
+        case Vendor::Other: low = 90; low_to_balanced = 60; balanced_to_best = 60; best = 30; break;
+        }
+        break;
+    case VideoCodec::Av1:
+        return 0;
+    }
+    if (quality >= 1.5f) return best;
+    if (quality >= 0.67f) return balanced_to_best;
+    if (quality >= 0.5f) return low_to_balanced;
+    return low;
 }
 
 DesktopStreamPool::QualityPeer::QualityPeer(std::shared_ptr<VideoQos> policy, uint64_t id)

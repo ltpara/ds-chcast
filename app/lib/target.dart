@@ -10,6 +10,7 @@ class ConnectTarget {
     this.displayName = '',
     this.mode = TunnelMode.auto,
     this.serverKey = '',
+    this.linkKey = '',
   });
 
   final String host;
@@ -27,6 +28,10 @@ class ConnectTarget {
   final String displayName;
   final TunnelMode mode;
   final String serverKey;
+
+  /// Connection key for lookup and punch proofs; empty when the deployment
+  /// issues only the shared server key.
+  final String linkKey;
 
   bool get viaServer => server.isNotEmpty;
 
@@ -78,6 +83,7 @@ ConnectTarget? parseConnectInput(
       hostId: text,
       mode: server.mode,
       serverKey: server.key,
+      linkKey: server.linkKey,
     );
   }
   return parseConnectTarget(text, token: key);

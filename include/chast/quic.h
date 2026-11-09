@@ -494,6 +494,10 @@ public:
     // A host that shares one encoded stream between viewers uses this so a
     // slow viewer cannot stall the capture loop.
     Error send_frame_nowait(FrameHeader header, const uint8_t* payload, size_t size);
+    // A static-desktop refinement: best effort like RustDesk's per-subscriber
+    // repeat send. It claims no delivery-window credit, so refinements never
+    // look like a stalled viewer and never pause the shared capture loop.
+    Error send_frame_best_effort(FrameHeader header, const uint8_t* payload, size_t size);
     // Advisory: bounded video delivery window and transport capacity. A
     // refused nowait send consumes neither a frame nor a sequence number.
     bool video_send_ready() const;
@@ -1350,7 +1354,8 @@ public:
 private:
     QuicSession() = default;
 
-    Error send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size, bool wait);
+    Error send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size, bool wait,
+                          bool track = true);
     Error set_permissions_impl(PermissionMask permissions, bool policy_change);
 
     struct Impl;

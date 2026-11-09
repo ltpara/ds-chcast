@@ -56,6 +56,14 @@ Get-ChildItem -LiteralPath $stage -Recurse -File |
     Where-Object { $_.Extension -in ".lib", ".pdb", ".exp" } |
     Remove-Item -Force
 
+# The viewer Release directory is a build tree: acceptance probes and other
+# temporary tools may be dropped next to the app while testing. Only the four
+# product executables belong in the installer.
+$productExes = @("chast_viewer.exe", "chast-tunnel.exe", "chast-host.exe", "chast-service.exe")
+Get-ChildItem -LiteralPath $stage -File -Filter *.exe |
+    Where-Object { $_.Name -notin $productExes } |
+    Remove-Item -Force
+
 $driverSource = $VirtualDisplayPackageDir
 if (-not $driverSource) {
     $defaultDriverSource = Join-Path $root "drivers\usbmmidd_v2"

@@ -18,12 +18,29 @@ void main(List<String> args) {
     ChastApp(
       initialConnection: parseLaunchArguments(args),
       sessionWindow: SessionWindowRequest.fromArguments(args),
-      displayWindow: args.length == 2 && args.first == '--display-window'
-          ? int.tryParse(args[1])
-          : null,
+      displayWindow: _displayWindowLaunch(args),
     ),
   );
   _markUpdateHealthy();
+}
+
+/// Display windows add the peer ID after the stream so the child engine can
+/// read the same per-device preferences as the session that opened it.
+({int stream, String peerId})? _displayWindowLaunch(List<String> args) {
+  if (args.length < 2 || args.first != '--display-window') {
+    return null;
+  }
+  final int? stream = int.tryParse(args[1]);
+  if (stream == null) {
+    return null;
+  }
+  if (args.length == 2) {
+    return (stream: stream, peerId: '');
+  }
+  if (args.length == 4 && args[2] == '--peer-id') {
+    return (stream: stream, peerId: args[3]);
+  }
+  return null;
 }
 
 /// The update helper keeps the previous executable until this marker exists.
@@ -52,7 +69,7 @@ class ChastApp extends StatelessWidget {
     this.sessionWindow,
     this.displayWindow,
   });
-  final int? displayWindow;
+  final ({int stream, String peerId})? displayWindow;
 
   final DeepLinkRequest? initialConnection;
 
@@ -79,7 +96,10 @@ class ChastApp extends StatelessWidget {
           darkTheme: buildChastTheme(Brightness.dark),
           themeMode: ThemeMode.system,
           home: displayWindow != null
-              ? DisplayWindowPage(streamId: displayWindow!)
+              ? DisplayWindowPage(
+                  streamId: displayWindow!.stream,
+                  peerId: displayWindow!.peerId,
+                )
               : sessionWindow != null
               ? SessionPage(
                   target: sessionWindow!.target,

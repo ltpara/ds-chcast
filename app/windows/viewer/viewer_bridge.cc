@@ -412,9 +412,16 @@ void ViewerBridge::HandleMethodCall(
     }
 
     if (method == "openDisplayWindow") {
-        const auto* id = std::get_if<int64_t>(call.arguments());
-        const auto* id32 = std::get_if<int32_t>(call.arguments());
-        const int64_t value = id ? *id : id32 ? *id32 : -1;
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t value = -1;
+        std::string peer_id;
+        if (args != nullptr) {
+            map_int(*args, "stream", &value);
+            if (map_string(*args, "peerId", &peer_id) && peer_id.size() > 256) {
+                result->Error("peer_id", "The peer ID is too long");
+                return;
+            }
+        }
         const auto status = viewer_->Snapshot();
         if (value < 0 || value > UINT32_MAX || status.state != ViewerState::kStreaming ||
             !status.multiple_displays || std::none_of(status.display_streams.begin(),
@@ -428,7 +435,7 @@ void ViewerBridge::HandleMethodCall(
             SetForegroundWindow(it->second);
             result->Success(flutter::EncodableValue(true)); return;
         }
-        result->Success(flutter::EncodableValue(open_display_window && open_display_window(session_, stream)));
+        result->Success(flutter::EncodableValue(open_display_window && open_display_window(session_, stream, peer_id)));
         return;
     }
 

@@ -65,6 +65,24 @@ func newAPIClient(base, serverKey string, tlsConfig *tls.Config, proxy *netproxy
 	}
 }
 
+// hostAPIKey picks the registration credential, falling back to the
+// management key when the deployment does not split them.
+func hostAPIKey(cfg HostConfig) string {
+	if cfg.HostKey != "" {
+		return cfg.HostKey
+	}
+	return cfg.ServerKey
+}
+
+// viewerAPIKey picks the lookup credential, falling back to the management key
+// when the deployment does not split them.
+func viewerAPIKey(cfg ViewerConfig) string {
+	if cfg.LinkKey != "" {
+		return cfg.LinkKey
+	}
+	return cfg.ServerKey
+}
+
 // setBase points the client at another rendezvous server after a failover.
 // In-flight requests keep the base they already read.
 func (c *apiClient) setBase(base string) {

@@ -163,6 +163,7 @@ class ServerSettings {
     this.url = '',
     this.mode = TunnelMode.auto,
     this.key = '',
+    this.linkKey = '',
     this.proxy = '',
     this.uploadRecordings = false,
     this.useWebSocket = false,
@@ -172,9 +173,18 @@ class ServerSettings {
   final TunnelMode mode;
 
   /// Bearer key for the connection service; empty when the service runs
-  /// without `--server-key`. The viewer now needs it to resolve a host and to
-  /// prove its punch requests, so it belongs with the service, not a device.
+  /// without `--server-key`. It is the management credential and is only sent
+  /// when the service does not split connection from management access.
   final String key;
+
+  /// Connection key ordinary viewers use for host lookup and punch proofs.
+  /// Empty keeps the single-key behavior and sends [key] instead. This value
+  /// is never sent to registration, console or audit endpoints.
+  final String linkKey;
+
+  /// The credential the viewer actually uses: the connection key when the
+  /// deployment issues one, otherwise the shared server key.
+  String get connectionKey => linkKey.isNotEmpty ? linkKey : key;
 
   /// Outbound http(s)/socks5 proxy for the control plane and the TCP carrier.
   /// UDP paths are not proxied; the agent forces the carrier when this is set.
@@ -197,6 +207,7 @@ class ServerSettings {
     String? url,
     TunnelMode? mode,
     String? key,
+    String? linkKey,
     String? proxy,
     bool? uploadRecordings,
     bool? useWebSocket,
@@ -205,6 +216,7 @@ class ServerSettings {
       url: url ?? this.url,
       mode: mode ?? this.mode,
       key: key ?? this.key,
+      linkKey: linkKey ?? this.linkKey,
       proxy: proxy ?? this.proxy,
       uploadRecordings: uploadRecordings ?? this.uploadRecordings,
       useWebSocket: useWebSocket ?? this.useWebSocket,
@@ -215,6 +227,7 @@ class ServerSettings {
         'url': url,
         'mode': mode.name,
         'key': key,
+        'link_key': linkKey,
         'proxy': proxy,
         'upload_recordings': uploadRecordings,
         'use_websocket': useWebSocket,
@@ -229,6 +242,7 @@ class ServerSettings {
       url: url,
       mode: TunnelModeName.parse(value['mode']),
       key: value['key']?.toString().trim() ?? '',
+      linkKey: value['link_key']?.toString().trim() ?? '',
       // Keep an invalid stored value instead of dropping it: it must fail
       // loudly when used, never silently turn into a direct connection.
       proxy: value['proxy']?.toString().trim() ?? '',
@@ -286,7 +300,9 @@ class ServerSettingsStore {
           );
         }
         final ServerSettings settings = ServerSettings.fromJson(decoded);
-        if ((settings.key.isNotEmpty || settings.proxy.isNotEmpty) &&
+        if ((settings.key.isNotEmpty ||
+                settings.linkKey.isNotEmpty ||
+                settings.proxy.isNotEmpty) &&
             _protector != null) {
           // Replace a legacy plaintext secret with its protected envelope.
           await save(settings);
@@ -307,7 +323,9 @@ class ServerSettingsStore {
       String text = jsonEncode(settings.toJson());
       final ServerKeyProtector? protect = _protector;
       if (protect != null &&
-          (settings.key.isNotEmpty || settings.proxy.isNotEmpty)) {
+          (settings.key.isNotEmpty ||
+              settings.linkKey.isNotEmpty ||
+              settings.proxy.isNotEmpty)) {
         try {
           final String blob = await protect(text);
           text =
@@ -320,6 +338,7 @@ class ServerSettingsStore {
             settings
                 .copyWith(
                   key: '',
+                  linkKey: '',
                   proxy: proxyHasCredentials ? '' : settings.proxy,
                 )
                 .toJson(),

@@ -3062,9 +3062,13 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     // Duplicate, stale and future receipts cannot erase the
-                    // outstanding window or manufacture a delay sample.
+                    // outstanding window or manufacture a delay sample. The
+                    // newest send may be an untracked refinement, so the bound
+                    // is the last sequence handed out, not the last windowed
+                    // entry: stream order still proves everything older was
+                    // delivered.
                     if (pending_video.empty() || sequence < pending_video.front().sequence ||
-                        sequence > pending_video.back().sequence) break;
+                        sequence >= next_seq.load()) break;
                     const auto now = steady_us();
                     while (!pending_video.empty() && pending_video.front().sequence <= sequence) {
                         latency.video_delay_us = now - pending_video.front().capture_us;
@@ -7219,13 +7223,17 @@ Error QuicSession::send_frame_nowait(FrameHeader header, const uint8_t* payload,
     return send_frame_impl(header, payload, size, false);
 }
 
+Error QuicSession::send_frame_best_effort(FrameHeader header, const uint8_t* payload, size_t size) {
+    return send_frame_impl(header, payload, size, false, false);
+}
+
 bool QuicSession::video_send_ready() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->video_capacity_locked() && impl_->has_send_capacity(1);
 }
 
 Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size,
-                                   bool wait) {
+                                   bool wait, bool track) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "send_frame is a server operation");
@@ -7248,7 +7256,13 @@ Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, s
             !(impl.decoding_codecs & video_codec_bit(header.codec)) ||
             (header.chroma == VideoChroma::Yuv444 && !(impl.decoding_444 & video_codec_bit(header.codec))))
             return Error(Status::Unsupported, "the viewer cannot decode this video format");
-        const auto ready = [&] { return impl.video_capacity_locked(bytes_needed) || impl.transport_down.load(); };
+        // Refinements carry no new content: they neither claim delivery-window
+        // credit nor wait for a stalled viewer. Transport send capacity still
+        // bounds them below, so a frozen display cannot grow the queue.
+        const auto ready = [&] {
+            if (!track && !wait) return true;
+            return impl.video_capacity_locked(bytes_needed) || impl.transport_down.load();
+        };
         if (wait) {
             if (!impl.cv.wait_for(lock, kSendCapacityTimeout, ready))
                 return Error(Status::WaitTimeout, "video delivery window did not drain");
@@ -7263,7 +7277,7 @@ Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, s
     std::vector<uint8_t> bytes(kFrameHeaderSize + size);
     encode_frame_header(header, bytes.data());
     std::memcpy(bytes.data() + kFrameHeaderSize, payload, size);
-    {
+    if (track) {
         std::lock_guard<std::mutex> lock(impl.mutex);
         const auto now = steady_us();
         const auto captured = header.capture_ms && header.capture_ms <= now / 1000 ? header.capture_ms * 1000 : now;
@@ -7273,7 +7287,7 @@ Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, s
     auto sent = impl.send_bytes_impl(video, std::move(bytes), QUIC_SEND_FLAG_NONE, wait);
     if (sent.ok()) {
         ++impl.next_seq;
-    } else {
+    } else if (track) {
         std::lock_guard<std::mutex> lock(impl.mutex);
         if (!impl.pending_video.empty() && impl.pending_video.back().sequence == header.seq) {
             impl.pending_video_bytes -= impl.pending_video.back().bytes;

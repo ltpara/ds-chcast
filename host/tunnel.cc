@@ -226,7 +226,11 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
         add(L"--carrier",
             carrier_host + L":" + std::to_wstring(static_cast<unsigned>(local_port) + 1));
     }
-    if (!settings.server_key.empty()) {
+    // Registration and signed audit uploads use the host role key. The
+    // management key is only sent when no separate host key is configured.
+    if (!settings.host_key.empty()) {
+        add(L"--host-key", widen(settings.host_key));
+    } else if (!settings.server_key.empty()) {
         add(L"--server-key", widen(settings.server_key));
     }
     if (!settings.proxy.empty()) {
@@ -268,6 +272,9 @@ bool validate_tunnel_settings(const HostSettings& settings, std::string* error) 
     }
     if (!valid_server_key(settings.server_key)) {
         return fail("服务器密钥需要最多 256 个可打印字符，且不能包含引号或反斜杠");
+    }
+    if (!valid_server_key(settings.host_key)) {
+        return fail("主机密钥需要最多 256 个可打印字符，且不能包含引号或反斜杠");
     }
     if (!parse_proxy_url(settings.proxy, normalized)) {
         return fail("出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口");

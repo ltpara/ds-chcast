@@ -1,14 +1,15 @@
-import 'dart:convert';
-import 'dart:io';
-
 import 'package:flutter/foundation.dart';
 
-import 'store_lock.dart';
+import 'prefs_store.dart';
 
 /// View state the viewer remembers across launches: how the picture is fitted
 /// (RustDesk's view style), whether the stats overlay is shown, how the file
-/// browser sorts, and the local mouse remapping. All live in `ui.json` next to
-/// the language and picture preferences.
+/// browser sorts, and the local mouse and keyboard handling. All live in
+/// `ui.json` next to the language and picture preferences.
+///
+/// The picture fit, stats overlay, mouse remapping and keyboard mode follow
+/// the device, like RustDesk's per-peer PeerConfig. The file browser and
+/// terminal font describe this viewer's local panels and stay shared.
 class ViewPreferences {
   const ViewPreferences({
     this.fit = 0,
@@ -50,15 +51,20 @@ class ViewPreferences {
   static const String _terminalFontSizeKey = 'terminal_font_size';
   static const String _reverseWheelKey = 'view_reverse_wheel';
   static const String _swapButtonsKey = 'view_swap_buttons';
+  static const String _keyboardModeKey = 'view_keyboard_mode';
 
-  /// Redirects the settings file away from the real user profile in tests.
+  /// Kept here so existing tests can redirect the shared settings file.
   @visibleForTesting
-  static String? configPathOverride;
+  static String? get configPathOverride => PrefsStore.configPathOverride;
+
+  @visibleForTesting
+  static set configPathOverride(String? value) =>
+      PrefsStore.configPathOverride = value;
 
   /// A missing, unreadable or corrupt file yields the session defaults.
   /// Each key is validated alone, so one bad value does not discard the other.
-  static ViewPreferences load() {
-    final Map<String, Object?> map = _readMap();
+  static ViewPreferences load({String peerId = ''}) {
+    final Map<String, Object?> map = PrefsStore.readMerged(peerId);
     final Object? rawFit = map[_fitKey];
     final Object? rawStats = map[_statsKey];
     final Object? rawSort = map[_fileSortKey];
@@ -78,7 +84,7 @@ class ViewPreferences {
           : 13,
       reverseWheel: rawReverseWheel is bool ? rawReverseWheel : false,
       swapButtons: rawSwapButtons is bool ? rawSwapButtons : false,
-      keyboardMode: map['view_keyboard_mode'] == 'local' ? 'local' : 'physical',
+      keyboardMode: map[_keyboardModeKey] == 'local' ? 'local' : 'physical',
     );
   }
 
@@ -101,69 +107,41 @@ class ViewPreferences {
   }
 
   /// Merges into `ui.json` instead of replacing it, because the language and
-  /// picture choices live in the same file.
-  static void save(ViewPreferences prefs) {
-    final File? file = _file();
-    if (file == null) {
+  /// picture choices live in the same file. With [peerId] the device-scoped
+  /// values go to that device and the shared defaults stay unchanged.
+  static void save(ViewPreferences prefs, {String peerId = ''}) {
+    final Map<String, Object?> shared = <String, Object?>{
+      _fileSortKey: prefs.fileSort >= 0 && prefs.fileSort <= 2
+          ? prefs.fileSort
+          : 0,
+      _fileSortAscendingKey: prefs.fileSortAscending,
+      _browserDirectoryKey: normalizeDirectory(prefs.browserDirectory),
+      _terminalFontSizeKey:
+          prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
+          ? prefs.terminalFontSize
+          : 13,
+    };
+    final Map<String, Object?> scoped = <String, Object?>{
+      _fitKey: prefs.fit == 1 ? 1 : 0,
+      _statsKey: prefs.stats,
+      _reverseWheelKey: prefs.reverseWheel,
+      _swapButtonsKey: prefs.swapButtons,
+      _keyboardModeKey: prefs.keyboardMode == 'local' ? 'local' : 'physical',
+    };
+    if (peerId.isEmpty) {
+      PrefsStore.update(
+        (Map<String, Object?> root) => root
+          ..addAll(shared)
+          ..addAll(scoped),
+      );
       return;
     }
-    withStoreLockSync(file, () {
-      final Map<String, Object?> payload = _readMap()
-        ..[_fitKey] = prefs.fit == 1 ? 1 : 0
-        ..[_statsKey] = prefs.stats
-        ..[_fileSortKey] = prefs.fileSort >= 0 && prefs.fileSort <= 2
-            ? prefs.fileSort
-            : 0
-        ..[_fileSortAscendingKey] = prefs.fileSortAscending
-        ..[_browserDirectoryKey] = normalizeDirectory(prefs.browserDirectory)
-        ..[_terminalFontSizeKey] =
-            prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
-            ? prefs.terminalFontSize
-            : 13
-        ..[_reverseWheelKey] = prefs.reverseWheel
-        ..[_swapButtonsKey] = prefs.swapButtons
-        ..['view_keyboard_mode'] = prefs.keyboardMode == 'local'
-            ? 'local'
-            : 'physical';
-      try {
-        file.parent.createSync(recursive: true);
-        file.writeAsStringSync(jsonEncode(payload));
-      } catch (_) {
-        // A view preference; failing to persist it is not fatal.
-      }
-    }, onFileError: () {});
-  }
-
-  static Map<String, Object?> _readMap() {
-    final File? file = _file();
-    if (file == null) {
-      return <String, Object?>{};
-    }
-    return withStoreLockSync(file, () {
-      try {
-        if (!file.existsSync()) {
-          return <String, Object?>{};
-        }
-        final Object? decoded = jsonDecode(file.readAsStringSync());
-        if (decoded is Map<String, Object?>) {
-          return Map<String, Object?>.of(decoded);
-        }
-      } catch (_) {
-        // A corrupt settings file must not stop the viewer from starting.
-      }
-      return <String, Object?>{};
-    }, onFileError: () => <String, Object?>{});
-  }
-
-  static File? _file() {
-    final String? override = configPathOverride;
-    if (override != null && override.isNotEmpty) {
-      return File(override);
-    }
-    final String? appData = Platform.environment['APPDATA'];
-    if (appData == null || appData.isEmpty) {
-      return null;
-    }
-    return File('$appData\\chast\\ui.json');
+    PrefsStore.update(
+      (Map<String, Object?> root) => root.addAll(shared),
+    );
+    PrefsStore.updatePeer(
+      peerId,
+      (Map<String, Object?> peer) => peer.addAll(scoped),
+    );
   }
 }

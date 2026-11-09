@@ -70,8 +70,10 @@ float3 linear_to_srgb(float3 c) {
 }
 
 float4 main(float4 pos : SV_Position) : SV_Target {
-    float3 linear = saturate(source.Load(int3(pos.xy, 0)).rgb * inv_sdr_white);
-    return float4(linear_to_srgb(linear), 1.0);
+    // `linear` is a reserved interpolation modifier in HLSL; naming the
+    // variable that breaks the whole pass at compile time.
+    float3 rgb = saturate(source.Load(int3(pos.xy, 0)).rgb * inv_sdr_white);
+    return float4(linear_to_srgb(rgb), 1.0);
 }
 )";
 

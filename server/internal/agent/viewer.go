@@ -39,6 +39,9 @@ type ViewerConfig struct {
 	// Servers seeds the failover list before the first lookup.
 	Servers   []string
 	ServerKey string
+	// LinkKey is the lookup and punch credential ordinary viewers hold. Empty
+	// reuses ServerKey.
+	LinkKey string
 	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
 	// client certificate for mTLS, or both. Nil uses the system roots.
 	TLS *tls.Config
@@ -270,7 +273,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cfg:     cfg,
 		conn:    conn,
 		out:     out,
-		api:     newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS, cfg.Proxy),
+		api:     newAPIClient(servers.Current(), viewerAPIKey(cfg), cfg.TLS, cfg.Proxy),
 		servers: servers,
 		log:     cfg.Logger.With("agent", "viewer", "id", cfg.HostID),
 		ctx:     ctx,
@@ -634,9 +637,9 @@ func (v *ViewerAgent) sendPunchRequest() {
 	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce,
 		UpnpPort: v.upnpPort, NATType: ownNAT, SelfV6: v.selfV6,
 		LocalAddrs: v.localAddrs, LocalAddrsV6: v.localAddrsV6}
-	if v.cfg.ServerKey != "" {
+	if key := viewerAPIKey(v.cfg); key != "" {
 		msg.Timestamp = time.Now().Unix()
-		msg.Auth = identity.PunchAuth(v.cfg.ServerKey, v.cfg.HostID, v.nonce, msg.Timestamp)
+		msg.Auth = identity.PunchAuth(key, v.cfg.HostID, v.nonce, msg.Timestamp)
 	}
 	encoded := wire.Encode(msg)
 	if v.punch != nil {

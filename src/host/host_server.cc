@@ -19,6 +19,7 @@
 #include "chast/audio.h"
 #include "chast/audit_spool.h"
 #include "chast/camera_relay.h"
+#include "chast/clipboard_listener.h"
 #include "chast/capture.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
@@ -955,6 +956,10 @@ void HostServer::stop() {
     stopping_ = true;
     if (thread_.joinable()) {
         thread_.join();
+    }
+    if (clipboard_listener_ != 0) {
+        ClipboardListener::Unsubscribe(clipboard_listener_);
+        clipboard_listener_ = 0;
     }
     if (clipboard_worker_) clipboard_worker_->Cancel();
     if (carrier_) {
@@ -3606,7 +3611,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         packets.clear();
         Error err = Error::success();
-        if ((idle || !frame.nv12_updated) && have_input) {
+        // A refinement repeats the cached picture; it carries no new desktop
+        // content and must not count as motion or as delivery-window backlog.
+        const bool refine = (idle || !frame.nv12_updated) && have_input;
+        if (refine) {
             err = encoder->encode_repeat(pts_ms, force_keyframe, packets);
             if (err.ok()) {
                 ++stats.repeats;
@@ -3647,7 +3655,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             header.idr = packet.idr;
             // Preserve service capture time through a slow subscriber's queue.
             header.capture_ms = DesktopStreamPool::capture_time(*capturer) & 0xFFFFFFFFFFFFull;
-            Error sent = session_->send_frame_nowait(header, packet.data.data(), packet.data.size());
+            Error sent = refine
+                ? session_->send_frame_best_effort(header, packet.data.data(), packet.data.size())
+                : session_->send_frame_nowait(header, packet.data.data(), packet.data.size());
             if (!sent.ok()) {
                 if (sent.status() == Status::WaitTimeout) {
                     // The compressed reference chain may now have a hole.
@@ -7476,7 +7486,7 @@ bool HostServer::clipboard_allowed() const {
            (session_->permissions() & kPermissionClipboard) != 0;
 }
 
-void HostServer::request_local_clipboard() {
+bool HostServer::request_local_clipboard() {
     if (!clipboard_channel_) clipboard_channel_ = std::make_unique<ClipboardFileChannel>();
     if (!clipboard_worker_) {
         ClipboardBackend backend;
@@ -7496,7 +7506,19 @@ void HostServer::request_local_clipboard() {
         backend.write_virtual_files = config_.clipboard_write_virtual_files;
         clipboard_worker_ = std::make_unique<ClipboardWorker>(std::move(backend));
     }
-    if (clipboard_from_host(settings_.clipboard_direction)) clipboard_worker_->Read(clipboard_epoch_);
+    if (clipboard_native() && clipboard_listener_ == 0) {
+        clipboard_listener_ = ClipboardListener::Subscribe();
+    }
+    if (!clipboard_from_host(settings_.clipboard_direction)) return false;
+    const uint64_t generation = ClipboardListener::Generation();
+    if (!clipboard_worker_->Read(clipboard_epoch_)) return false;
+    clipboard_seen_generation_ = generation;
+    return true;
+}
+
+std::chrono::milliseconds HostServer::clipboard_poll_interval() const {
+    return clipboard_native() && ClipboardListener::Running()
+        ? std::chrono::milliseconds(5000) : std::chrono::milliseconds(500);
 }
 
 void HostServer::cancel_clipboard_work() {
@@ -7596,7 +7618,7 @@ void HostServer::drain_peer(HostServerStats& stats) {
     if (!clipboard_was_allowed_) {
         clipboard_was_allowed_ = true;
         remember_local_clipboard();
-        next_clipboard_poll_ = Clock::now() + std::chrono::milliseconds(500);
+        next_clipboard_poll_ = Clock::now() + clipboard_poll_interval();
     }
     ClipboardContent content;
     while (session_->take_clipboard_content(content)) {
@@ -7630,7 +7652,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     if (!clipboard_was_allowed_) {
         clipboard_was_allowed_ = true;
         remember_local_clipboard();
-        next_clipboard_poll_ = now + std::chrono::milliseconds(500);
+        next_clipboard_poll_ = now + clipboard_poll_interval();
         return;
     }
     ClipboardWorker::Result result;
@@ -7682,11 +7704,15 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     if (!clipboard_from_host(settings_.clipboard_direction)) return;
     if (!have_read) {
-        if (now >= next_clipboard_poll_) request_local_clipboard();
+        const uint64_t change = ClipboardListener::Generation();
+        if (now >= next_clipboard_poll_ ||
+            (clipboard_listener_ != 0 && change != clipboard_seen_generation_)) {
+            request_local_clipboard();
+        }
         return;
     }
     ClipboardSnapshot snapshot = std::move(result.snapshot);
-    next_clipboard_poll_ = now + std::chrono::milliseconds(500);
+    next_clipboard_poll_ = now + clipboard_poll_interval();
     if (snapshot.state == ClipboardReadState::Failed) return;
     const bool has_content = snapshot.state == ClipboardReadState::Content && !snapshot.has_files;
     if (clipboard_baseline_pending_) {

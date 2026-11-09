@@ -114,13 +114,23 @@ void full_color_voting() {
     EncoderConfig config; config.codec = VideoCodec::Vp9;
     auto encoder = DesktopStreamPool::encoder(*capture, config, &error);
     auto expect = [&](VideoChroma chroma) {
-        DesktopStreamPool::request_keyframe(*capture);
-        frame(*capture);
-        encoder = DesktopStreamPool::encoder(*capture, config, &error);
-        check(encoder && encoder->chroma() == chroma, "source adopts the negotiated chroma");
-        std::vector<EncodedPacket> packets;
-        check(encoder->encode(nullptr, 1, false, packets).ok() && !packets.empty() && packets.front().idr,
-              "chroma change supplies an independently decodable picture");
+        // Static refinement may leave repeats queued ahead of the requested
+        // IDR; keep consuming until the delivered picture is decodable alone.
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        bool format = false, idr = false;
+        while (!idr && std::chrono::steady_clock::now() < deadline) {
+            DesktopStreamPool::request_keyframe(*capture);
+            frame(*capture);
+            encoder = DesktopStreamPool::encoder(*capture, config, &error);
+            if (!encoder) break;
+            format = encoder->chroma() == chroma;
+            if (!format) break;
+            std::vector<EncodedPacket> packets;
+            idr = encoder->encode(nullptr, 1, false, packets).ok() && !packets.empty() &&
+                  packets.front().idr;
+        }
+        check(encoder && format, "source adopts the negotiated chroma");
+        check(idr, "chroma change supplies an independently decodable picture");
     };
     expect(VideoChroma::Yuv444);
     auto b = pool.connect_codecs(kVideoCodecVp9, VideoCodec::Vp9);
@@ -142,6 +152,69 @@ void full_color_voting() {
     check(!DesktopStreamPool::vote_peer(*b, VideoCodec::Vp9, &error), "failed candidate refuses the preference transaction");
     check(encoder->chroma() == VideoChroma::Yuv444, "failed negotiation keeps the old format");
     state->fail_encode_codecs = 0;
+}
+
+void multi_display_full_color() {
+    DesktopStreamPool pool;
+    auto left = std::make_shared<host_test::MediaState>();
+    auto right = std::make_shared<host_test::MediaState>();
+    left->original_bgra = true;
+    right->original_bgra = true;
+    std::string error;
+    EncoderConfig config;
+    config.codec = VideoCodec::Vp9;
+    auto a = pool.connect_codecs(kVideoCodecVp9, VideoCodec::Vp9, kVideoCodecVp9, VideoChroma::Yuv444);
+    auto open = [&](const wchar_t* key, const std::shared_ptr<host_test::MediaState>& media) {
+        auto capture = pool.subscribe(key, [media](std::string*) {
+            return std::make_unique<host_test::Capture>(media);
+        }, [media](ID3D11Device*, const EncoderConfig& cfg, std::string*) {
+            return std::make_unique<host_test::Encoder>(media, cfg);
+        }, &error, {}, kVideoCodecVp9, a);
+        check(capture != nullptr, "subscribe display to the shared full-color session");
+        frame(*capture);
+        return capture;
+    };
+    auto l = open(L"full-left", left);
+    auto r = open(L"full-right", right);
+    auto await_idr = [&](IDxgiCapturer& display, VideoChroma chroma) {
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            DesktopStreamPool::request_keyframe(display);
+            frame(display);
+            auto e = DesktopStreamPool::encoder(display, config, &error);
+            std::vector<EncodedPacket> packets;
+            if (e && e->chroma() == chroma && e->encode(nullptr, 1, false, packets).ok() &&
+                !packets.empty() && packets.front().idr) return true;
+        }
+        return false;
+    };
+    auto both = [&](VideoChroma chroma, const char* message) {
+        check(await_idr(*l, chroma) && await_idr(*r, chroma), message);
+    };
+    both(VideoChroma::Yuv444, "both displays start in full color");
+    auto b = pool.connect_codecs(kVideoCodecVp9, VideoCodec::Vp9);
+    check(DesktopStreamPool::vote_peer(*b, VideoCodec::Vp9, &error),
+          "one 4:2:0 viewer restricts the shared session");
+    both(VideoChroma::Yuv420, "the 4:2:0 restriction renegotiates every display");
+    // The 4:4:4 proof of the right display fails while the left one can
+    // produce it. Nothing may commit full color for only part of the session.
+    right->fail_444 = true;
+    b.reset();
+    both(VideoChroma::Yuv420, "a failing display keeps every source in 4:2:0 on peer removal");
+    check(DesktopStreamPool::vote_peer(*a, VideoCodec::Vp9, &error, VideoChroma::Yuv444),
+          "a failed full-color proof falls back to the same codec in 4:2:0");
+    both(VideoChroma::Yuv420, "explicit full color stays all-or-nothing across displays");
+    right->fail_444 = false;
+    check(DesktopStreamPool::vote_peer(*a, VideoCodec::Vp9, &error, VideoChroma::Yuv444),
+          "full color returns when every display can prove it again");
+    both(VideoChroma::Yuv444, "both displays commit full color together");
+    l.reset();
+    r.reset();
+    check(left->capture_destroyed == 1 && right->capture_destroyed == 1 &&
+          left->encoder_created == left->encoder_destroyed &&
+          right->encoder_created == right->encoder_destroyed &&
+          left->wrong_thread == 0 && right->wrong_thread == 0,
+          "shared full-color negotiation releases both pipelines on their service threads");
 }
 
 void global_codec_voting() {
@@ -403,12 +476,72 @@ void runtime_encoder_recovery() {
     }
 }
 
+void static_refresh_budget() {
+    // RustDesk video_service/static_refresh.rs max_repeat_frames() table.
+    check(DesktopStreamPool::static_refresh_budget(VideoCodec::H264, 0.67f, EncoderBackend::Vpl) == 130,
+          "balanced QSV H.264 gets the RustDesk static-refresh budget");
+    check(DesktopStreamPool::static_refresh_budget(VideoCodec::H264, 0.67f, EncoderBackend::Ffmpeg,
+                                                   "FFmpeg 7 h264_nvenc (NVIDIA, D3D11)") == 60,
+          "an FFmpeg NVENC implementation selects its own budget");
+    check(DesktopStreamPool::static_refresh_budget(VideoCodec::Hevc, 0.5f, EncoderBackend::Ffmpeg,
+                                                   "FFmpeg 7 hevc_qsv (Intel, D3D11)") == 30,
+          "backend and quality band both drive the budget");
+    check(DesktopStreamPool::static_refresh_budget(VideoCodec::Vp9, 0.1f, EncoderBackend::Software) == 40,
+          "software VP9 uses the low-quality band");
+    check(DesktopStreamPool::static_refresh_budget(VideoCodec::Av1, 0.67f, EncoderBackend::Vpl) == 0,
+          "AV1 disables static refinement");
+
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    std::string error;
+    auto display = pool.subscribe(L"static", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(display != nullptr, "subscribe to a static desktop");
+    frame(*display);
+    EncoderConfig config;
+    config.codec = VideoCodec::Vp9;
+    config.width = 640; config.height = 480;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*display, config, &error);
+    check(encoder != nullptr, "start the static-refresh encoder");
+
+    // 100 ms VP9 interval quantized by the 16 ms service tick: allow for
+    // ~116 ms per refinement instead of assuming an exact 100 ms cadence.
+    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    while (state->repeats < 20 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(5ms);
+    check(state->repeats == 20, "idle desktop refines the cached picture up to the VP9 budget");
+    const unsigned encodes = state->encodes;
+    std::this_thread::sleep_for(300ms);
+    check(state->repeats == 20 && state->encodes == encodes,
+          "an exhausted static-refresh budget stops repeating without new captures");
+
+    state->moving = true;
+    const auto moving_deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (state->encodes < encodes + 2 && std::chrono::steady_clock::now() < moving_deadline)
+        std::this_thread::sleep_for(5ms);
+    check(state->encodes >= encodes + 2, "new desktop frames resume after the burst");
+    state->moving = false;
+    const auto restart = std::chrono::steady_clock::now() + 1500ms;
+    while (state->repeats == 20 && std::chrono::steady_clock::now() < restart)
+        std::this_thread::sleep_for(5ms);
+    check(state->repeats > 20, "a new captured frame restarts the static-refresh budget");
+
+    encoder.reset();
+    display.reset();
+}
+
 int main() {
     try {
         runtime_encoder_recovery();
         recovery_preserves_display_identity();
         full_color_voting();
+        multi_display_full_color();
         global_codec_voting();
+        static_refresh_budget();
         {
             DesktopStreamPool quality_pool;
             auto a = quality_pool.connect_quality(60, 0.67f, false);
@@ -484,18 +617,23 @@ int main() {
         auto slow_encoder = DesktopStreamPool::encoder(*slow, config, &error);
         check(slow_encoder != nullptr, "late viewer attaches to encoder");
         frame(*first);
-        const auto encoded_before_delivery = state->encodes + state->repeats;
+        // Static refinement repeats are not picture encodes; only a new
+        // capture would make the service encode this image again.
+        const auto encoded_before_delivery = state->encodes.load();
         encode(*encoder, *first);
         encode(*slow_encoder, *slow);
-        check(state->encodes + state->repeats == encoded_before_delivery,
+        check(state->encodes == encoded_before_delivery,
               "subscriber delivery never encodes the same image twice");
+        // Start from a subscriber that is explicitly waiting for a fresh IDR,
+        // so queued refinement repeats cannot stand in for the request.
+        DesktopStreamPool::discard_backlog(*first);
         DesktopStreamPool::request_keyframe(*first);
         frame(*first);
-        const auto requested_idr_count = state->encodes + state->repeats;
+        const auto requested_idr_count = state->idrs.load();
         DesktopStreamPool::request_keyframe(*first);
         DesktopStreamPool::request_keyframe(*first);
         std::this_thread::sleep_for(80ms);
-        check(state->encodes + state->repeats == requested_idr_count,
+        check(state->idrs == requested_idr_count,
               "repeated requests coalesce while the requested IDR awaits delivery");
         encode(*encoder, *first);
         state->moving = true;

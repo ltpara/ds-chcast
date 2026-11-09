@@ -1,14 +1,14 @@
-import 'dart:convert';
-import 'dart:io';
-
 import 'package:flutter/foundation.dart';
 
-import 'store_lock.dart';
+import 'prefs_store.dart';
 
-/// Picture choices the viewer remembers across launches, the same way
-/// RustDesk keeps its image quality and codec selection. Values are the
-/// `code` fields of [ViewerStreamCodec] and [ViewerStreamQuality]; the frame
-/// cap is one of 0 (uncapped), 15, 30 and 60.
+/// Picture choices the viewer remembers, the same way RustDesk keeps its
+/// image quality and codec selection. Values are the `code` fields of
+/// [ViewerStreamCodec] and [ViewerStreamQuality]; the frame cap is one of 0
+/// (uncapped), 15, 30 and 60.
+///
+/// Root `ui.json` keys are the default for devices that have no saved
+/// choice; a non-empty [peerId] reads and writes that device's override.
 class StreamPreferences {
   const StreamPreferences({
     this.codec = 0,
@@ -31,15 +31,19 @@ class StreamPreferences {
   static const int _codecValues = 4;
   static const int _qualityValues = 2;
 
-  /// Redirects the settings file away from the real user profile in tests.
+  /// Kept here so existing tests can redirect the shared settings file.
   @visibleForTesting
-  static String? configPathOverride;
+  static String? get configPathOverride => PrefsStore.configPathOverride;
+
+  @visibleForTesting
+  static set configPathOverride(String? value) =>
+      PrefsStore.configPathOverride = value;
 
   /// A missing, unreadable or corrupt file yields the session defaults that
   /// the page already used before preferences were remembered. Each key is
   /// validated alone, so one bad value does not discard the others.
-  static StreamPreferences load() {
-    final Map<String, Object?> map = _readMap();
+  static StreamPreferences load({String peerId = ''}) {
+    final Map<String, Object?> map = PrefsStore.readMerged(peerId);
     return StreamPreferences(
       codec: _choice(map[_codecKey], _codecValues),
       quality: _choice(map[_qualityKey], _qualityValues),
@@ -49,25 +53,23 @@ class StreamPreferences {
   }
 
   /// Merges into `ui.json` instead of replacing it, because the language
-  /// choice lives in the same file.
-  static void save(StreamPreferences prefs) {
-    final File? file = _file();
-    if (file == null) {
-      return;
+  /// choice lives in the same file. With [peerId] the choice belongs to that
+  /// device and the shared defaults stay as they were.
+  static void save(StreamPreferences prefs, {String peerId = ''}) {
+    final Map<String, Object?> values = <String, Object?>{
+      _codecKey: _choice(prefs.codec, _codecValues),
+      _qualityKey: _choice(prefs.quality, _qualityValues),
+      _maxFpsKey: _fps(prefs.maxFps),
+      'stream_full_color': prefs.fullColor,
+    };
+    if (peerId.isEmpty) {
+      PrefsStore.update((Map<String, Object?> root) => root.addAll(values));
+    } else {
+      PrefsStore.updatePeer(
+        peerId,
+        (Map<String, Object?> peer) => peer.addAll(values),
+      );
     }
-    withStoreLockSync(file, () {
-      final Map<String, Object?> payload = _readMap()
-        ..[_codecKey] = _choice(prefs.codec, _codecValues)
-        ..[_qualityKey] = _choice(prefs.quality, _qualityValues)
-        ..[_maxFpsKey] = _fps(prefs.maxFps)
-        ..['stream_full_color'] = prefs.fullColor;
-      try {
-        file.parent.createSync(recursive: true);
-        file.writeAsStringSync(jsonEncode(payload));
-      } catch (_) {
-        // A picture preference; failing to persist it is not fatal.
-      }
-    }, onFileError: () {});
   }
 
   static int _choice(Object? raw, int max) {
@@ -82,38 +84,5 @@ class StreamPreferences {
       return raw;
     }
     return 0;
-  }
-
-  static Map<String, Object?> _readMap() {
-    final File? file = _file();
-    if (file == null) {
-      return <String, Object?>{};
-    }
-    return withStoreLockSync(file, () {
-      try {
-        if (!file.existsSync()) {
-          return <String, Object?>{};
-        }
-        final Object? decoded = jsonDecode(file.readAsStringSync());
-        if (decoded is Map<String, Object?>) {
-          return Map<String, Object?>.of(decoded);
-        }
-      } catch (_) {
-        // A corrupt settings file must not stop the viewer from starting.
-      }
-      return <String, Object?>{};
-    }, onFileError: () => <String, Object?>{});
-  }
-
-  static File? _file() {
-    final String? override = configPathOverride;
-    if (override != null && override.isNotEmpty) {
-      return File(override);
-    }
-    final String? appData = Platform.environment['APPDATA'];
-    if (appData == null || appData.isEmpty) {
-      return null;
-    }
-    return File('$appData\\chast\\ui.json');
   }
 }

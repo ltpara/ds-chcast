@@ -10,7 +10,7 @@ namespace chast {
 
 // Host-wide video policy, shared by every display service. Time is supplied
 // by callers so the same delay traces can be verified without real sleeps.
-// Rules follow rustdesk-ref/src/server/video_qos.rs (7423dced).
+// Rules follow rustdesk-ref/src/server/video_qos.rs.
 class VideoQos {
 public:
     enum class Quality { High, Balanced, Smooth };
@@ -32,25 +32,55 @@ public:
     static float quality_ratio(Quality quality);
 
 private:
+    struct RttCalculator {
+        static constexpr size_t kWindowSamples = 20;
+        static constexpr uint32_t kMaxIncreaseMs = 50;
+        std::deque<uint32_t> samples;
+        std::optional<uint32_t> baseline;
+        void update(uint32_t delay);
+        std::optional<uint32_t> rtt() const { return baseline; }
+    };
     struct Delay {
-        std::deque<uint32_t> samples, recent;
-        std::optional<uint32_t> minimum, smoothed, fps;
+        // The reference keeps the last two replies and subtracts the learned
+        // path baseline from their average.
+        std::deque<uint32_t> history;
+        std::optional<uint32_t> fps;
+        RttCalculator rtt;
         uint32_t quick_increase = 0, increase = 0;
-        bool pending = false;
+        uint8_t consecutive_bad = 0, fps_bad = 0, good = 0;
+        std::optional<uint8_t> replies_after_bitrate_reduction;
+        std::optional<uint32_t> fps_before_congestion;
+        std::optional<uint8_t> samples_since_restore;
+        std::optional<uint32_t> stall_reference_fps;
+        uint8_t stall_ticks = 0;
+        uint32_t last_stall_second = 0;
+        uint8_t startup_good = 0; // u8::MAX permanently ends startup acceleration
         void add(uint32_t value);
         uint32_t average() const;
+        uint32_t limit_fps_change(uint32_t current, uint32_t proposed, uint32_t delay,
+                                  bool bitrate_first, bool braked);
+        uint32_t recover(uint32_t current, uint32_t proposed);
+        uint32_t accelerate_startup(uint32_t current, uint32_t proposed, uint32_t cap,
+                                    uint32_t delay, bool braked);
+        void on_reduction(uint32_t current);
+        bool needs_bitrate_reduction() const;
+        std::optional<float> ratio_reduction() const;
     };
     struct User {
         uint32_t fps = 0;
         std::optional<Quality> quality;
         uint64_t quality_order = 0;
+        uint64_t joined_at = 0;
         Delay delay;
     };
     struct Display { uint32_t encoded = 0; bool variable = true; };
+    uint32_t fps_cap(const User& user) const;
     uint32_t highest_fps() const;
     std::optional<Quality> latest_quality() const;
     float target_ratio() const;
+    float min_ratio() const;
     bool variable() const;
+    bool can_reduce_bitrate() const;
     void adjust_fps(uint64_t now_ms);
     void adjust_ratio(bool dynamic, uint64_t now_ms);
     void tick(uint64_t now_ms);
@@ -60,6 +90,6 @@ private:
     uint32_t max_fps_, fps_, bitrate_kbps_ = 0;
     float default_ratio_, ratio_;
     bool adaptive_;
-    uint64_t latest_open_ = 0, last_ratio_ = 0, quality_order_ = 0;
+    uint64_t last_ratio_ = 0, quality_order_ = 0;
 };
 } // namespace chast

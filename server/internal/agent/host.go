@@ -38,6 +38,9 @@ type HostConfig struct {
 	// server's pushed list replaces it after a successful reply.
 	Servers   []string
 	ServerKey string
+	// HostKey is the registration and host-audit credential installed on
+	// controlled machines. Empty reuses ServerKey.
+	HostKey string
 	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
 	// client certificate for mTLS, or both. Nil uses the system roots.
 	TLS *tls.Config
@@ -303,7 +306,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		cfg:            cfg,
 		conn:           conn,
 		localOut:       localOut,
-		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS, cfg.Proxy),
+		api:            newAPIClient(servers.Current(), hostAPIKey(cfg), cfg.TLS, cfg.Proxy),
 		servers:        servers,
 		log:            cfg.Logger.With("agent", "host", "id", cfg.ID),
 		local:          local,

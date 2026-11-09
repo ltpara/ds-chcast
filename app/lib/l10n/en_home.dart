@@ -14,6 +14,8 @@ const Map<String, String> kEnglishHome = <String, String>{
   '下载地址': 'Download URL',
   '下载地址已复制': 'Download URL copied',
   '下载并安装': 'Download and install',
+  '与 --link-key 相同；留空沿用服务端密钥':
+      'Same as --link-key; leave empty to use the server key',
   '与 --server-key 相同': 'Same as --server-key',
   '两步验证': 'Two-factor authentication',
   '两步验证码': 'Two-factor code',
@@ -243,6 +245,7 @@ const Map<String, String> kEnglishHome = <String, String>{
       'No groups yet; create one from Groups in the My Devices header.',
   '远程桌面': 'Remote desktop',
   '连接': 'Connect',
+  '连接密钥（可选）': 'Connection key (optional)',
   '连接服务': 'Connection service',
   '连接过的设备会出现在这里，保存后进入我的设备':
       'Connected devices appear here; save them to My Devices',

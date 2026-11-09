@@ -331,6 +331,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool get _inputActive =>
       !_keyboardChanging && _controlEnabled && _status.acceptsInput && _startError == null;
 
+  /// Per-device preference key: the server-assigned host ID, or the entered
+  /// address for direct connections. Session reports use the same identity.
+  String get _prefsPeerId {
+    final String hostId = widget.target.hostId.trim();
+    return hostId.isNotEmpty ? hostId : widget.target.label.trim();
+  }
+
   /// Physical cursor pixels per captured pixel. The native side needs this to
   /// size the host's sprite the way the frame is being drawn, so a stream
   /// shown at half size gets a half-size pointer.
@@ -352,7 +359,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (widget.windowSession) {
       unawaited(ViewerBridge.setWindowCloseHandler(_closeNativeWindow));
     }
-    final StreamPreferences prefs = StreamPreferences.load();
+    final StreamPreferences prefs = StreamPreferences.load(
+      peerId: _prefsPeerId,
+    );
     _streamCodec = _streamCodecFor(prefs.codec);
     _streamFullColor = prefs.fullColor;
     _streamQuality = _streamQualityFor(prefs.quality);
@@ -362,7 +371,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr('文字未发送，请检查控制权限或连接状态'))));
       }
     });
-    final ViewPreferences viewPrefs = ViewPreferences.load();
+    final ViewPreferences viewPrefs = ViewPreferences.load(
+      peerId: _prefsPeerId,
+    );
     _keyboardMode = viewPrefs.keyboardMode == 'local' ? ViewerKeyboardMode.local : ViewerKeyboardMode.physical;
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _statsVisible = viewPrefs.stats;
@@ -699,6 +710,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       url: widget.target.server,
       mode: widget.target.mode,
       key: widget.target.serverKey,
+      linkKey: widget.target.linkKey,
       proxy: widget.settings.proxy,
     );
     // Server identity, audit reports and recording uploads use the same
@@ -1843,6 +1855,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         swapButtons: _mouse.swapButtons,
         keyboardMode: _keyboardMode.name,
       ),
+      peerId: _prefsPeerId,
     );
   }
 
@@ -3307,7 +3320,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         await controller.refresh();
         if (!mounted || _closing || _reconnecting || controller != _displayStreams) return;
         final stream = controller.state.streams.where((s) => s.displayIndex == display).firstOrNull;
-        if (stream != null && await DisplayStreamBridge.openWindow(stream.streamId)) return;
+        if (stream != null && await DisplayStreamBridge.openWindow(stream.streamId, peerId: _prefsPeerId)) return;
         if (!controller.busy || DateTime.now().isAfter(deadline)) break;
         await Future<void>.delayed(const Duration(milliseconds: 100));
       }
@@ -3478,6 +3491,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         fullColor: _streamFullColor,
         maxFps: _streamMaxFps,
       ),
+      peerId: _prefsPeerId,
     );
   }
 

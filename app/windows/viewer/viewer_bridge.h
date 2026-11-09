@@ -51,7 +51,7 @@ public:
     // SessionWindowRequest. False means the caller should fall back to an
     // in-process page.
     std::function<bool(const std::string&)> open_session_window;
-    std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t)> open_display_window;
+    std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t, const std::string&)> open_display_window;
 
 private:
     bool QueueInput(const chast::InputEvent& event);

@@ -113,4 +113,54 @@ void main() {
     AppLanguage.load();
     expect(AppLanguage.code, kLanguageEnglish);
   });
+
+  test('each device remembers its own picture choices', () {
+    StreamPreferences.save(
+      const StreamPreferences(codec: 1, quality: 2, maxFps: 60),
+      peerId: '111111111',
+    );
+    StreamPreferences.save(
+      const StreamPreferences(codec: 4, fullColor: true),
+      peerId: '222222222',
+    );
+    final StreamPreferences first =
+        StreamPreferences.load(peerId: '111111111');
+    expect(first.codec, 1);
+    expect(first.quality, 2);
+    expect(first.maxFps, 60);
+    final StreamPreferences second =
+        StreamPreferences.load(peerId: '222222222');
+    expect(second.codec, 4);
+    expect(second.fullColor, isTrue);
+    expect(second.quality, 0);
+    // A device choice must not become the default for every other host.
+    expect(StreamPreferences.load().codec, 0);
+    expect(readFile().containsKey('stream_codec'), isFalse);
+  });
+
+  test('a device without overrides starts from the shared defaults', () {
+    StreamPreferences.save(
+        const StreamPreferences(codec: 2, quality: 1, maxFps: 30));
+    expect(StreamPreferences.load(peerId: '333333333').maxFps, 30);
+    StreamPreferences.save(
+      const StreamPreferences(codec: 3, quality: 1, maxFps: 15),
+      peerId: '333333333',
+    );
+    expect(StreamPreferences.load(peerId: '333333333').codec, 3);
+    expect(StreamPreferences.load(peerId: '444444444').codec, 2);
+    expect(StreamPreferences.load().codec, 2);
+  });
+
+  test('a malformed device section falls back per key', () {
+    File(path).writeAsStringSync(jsonEncode(<String, Object?>{
+      'stream_codec': 2,
+      'peers': <String, Object?>{
+        '111111111': 'broken',
+        '222222222': <String, Object?>{'stream_codec': 99},
+      },
+    }));
+    expect(StreamPreferences.load(peerId: '111111111').codec, 2);
+    expect(StreamPreferences.load(peerId: '222222222').codec, 0);
+    expect(StreamPreferences.load(peerId: '333333333').codec, 2);
+  });
 }

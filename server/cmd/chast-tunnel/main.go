@@ -55,8 +55,10 @@ func run(args []string) error {
 func runHost(args []string) error {
 	fs := flag.NewFlagSet("host", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
-	serverKey := fs.String("server-key", "", "server key required by the API (visible in the process command line; prefer --server-key-stdin)")
+	serverKey := fs.String("server-key", "", "management server key (visible in the process command line; prefer --server-key-stdin)")
 	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the server key from the first line of stdin; overrides --server-key")
+	hostKey := fs.String("host-key", "", "host registration key installed by the operator; empty reuses --server-key (visible in the process command line; prefer --host-key-stdin)")
+	hostKeyStdin := fs.Bool("host-key-stdin", false, "read the host key from stdin instead of --host-key")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id registered with the service")
@@ -84,6 +86,9 @@ func runHost(args []string) error {
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
+	if *hostKeyStdin && *serverKeyStdin {
+		return fmt.Errorf("--host-key-stdin and --server-key-stdin cannot be combined")
+	}
 	if *serverKeyStdin {
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		key := strings.TrimRight(line, "\r\n")
@@ -94,6 +99,17 @@ func runHost(args []string) error {
 			return fmt.Errorf("read server key from stdin: empty key")
 		}
 		*serverKey = key
+	}
+	if *hostKeyStdin {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		key := strings.TrimRight(line, "\r\n")
+		if key == "" {
+			if err != nil {
+				return fmt.Errorf("read host key from stdin: %w", err)
+			}
+			return fmt.Errorf("read host key from stdin: empty key")
+		}
+		*hostKey = key
 	}
 	proxy, err := resolveProxy(*proxyURL)
 	if err != nil {
@@ -136,6 +152,7 @@ func runHost(args []string) error {
 		ServerURL:                 *server,
 		Servers:                   splitCSV(*rendezvousList),
 		ServerKey:                 *serverKey,
+		HostKey:                   *hostKey,
 		ServerPublicKey:           *serverPubKey,
 		Proxy:                     proxy,
 		ID:                        *id,
@@ -221,8 +238,10 @@ func runHost(args []string) error {
 func runViewer(args []string) error {
 	fs := flag.NewFlagSet("viewer", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
-	serverKey := fs.String("server-key", "", "server key required by the API (visible in the process command line; prefer --server-key-stdin)")
+	serverKey := fs.String("server-key", "", "management server key (visible in the process command line; prefer --server-key-stdin)")
 	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the server key from the first line of stdin; overrides --server-key")
+	linkKey := fs.String("link-key", "", "connection key ordinary viewers use for lookup and punch; empty reuses --server-key (visible in the process command line; prefer --link-key-stdin)")
+	linkKeyStdin := fs.Bool("link-key-stdin", false, "read the link key from stdin before the proxy; overrides --link-key")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id to reach")
@@ -239,10 +258,25 @@ func runViewer(args []string) error {
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
-	// Stdin order matches the embedding client: server key first, then proxy.
+	// Stdin order matches the embedding client: the connection credential
+	// first, then the proxy. --server-key-stdin stays for older callers.
 	var stdin *bufio.Reader
-	if *serverKeyStdin || *proxyStdin {
+	if *linkKeyStdin || *serverKeyStdin || *proxyStdin {
 		stdin = bufio.NewReader(os.Stdin)
+	}
+	if *linkKeyStdin && *serverKeyStdin {
+		return fmt.Errorf("--link-key-stdin and --server-key-stdin cannot be combined")
+	}
+	if *linkKeyStdin {
+		line, err := stdin.ReadString('\n')
+		key := strings.TrimRight(line, "\r\n")
+		if key == "" {
+			if err != nil {
+				return fmt.Errorf("read link key from stdin: %w", err)
+			}
+			return fmt.Errorf("read link key from stdin: empty key")
+		}
+		*linkKey = key
 	}
 	if *serverKeyStdin {
 		line, err := stdin.ReadString('\n')
@@ -294,6 +328,7 @@ func runViewer(args []string) error {
 		ServerURL:        *server,
 		Servers:          splitCSV(*rendezvousList),
 		ServerKey:        *serverKey,
+		LinkKey:          *linkKey,
 		ServerPublicKey:  *serverPubKey,
 		Proxy:            proxy,
 		HostID:           *id,

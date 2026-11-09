@@ -77,7 +77,9 @@ func run() error {
 		relayNodeCert    = flag.String("relay-node-client-cert", "", "client certificate presented to relay nodes requiring mTLS")
 		relayNodeKeyID   = flag.String("relay-node-client-key", "", "private key for --relay-node-client-cert")
 		relayHealth      = flag.Duration("relay-node-health", 10*time.Second, "how often standalone relay nodes are probed")
-		serverKey        = flag.String("server-key", "", "shared secret required for registration, lookup, management and rendezvous proofs; empty refuses to start")
+		serverKey        = flag.String("server-key", "", "management secret for the console, metrics and fallback authentication; empty refuses to start")
+		linkKey          = flag.String("link-key", "", "connection secret ordinary viewers use for lookup and punch proofs; empty keeps --server-key semantics")
+		hostKey          = flag.String("host-key", "", "secret controlled hosts use for registration and host audit; empty keeps --server-key semantics")
 		insecureNoKey    = flag.Bool("insecure-no-server-key", false, "run without --server-key; the HTTP API is then limited to a loopback --http-listen and every other listener stays unauthenticated")
 		softwareVer      = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
 		softwareURL      = flag.String("software-url", "", "download URL advertised with --software-version")
@@ -208,6 +210,11 @@ func run() error {
 		return err
 	}
 	*serverKey = key
+	*linkKey = strings.TrimSpace(*linkKey)
+	*hostKey = strings.TrimSpace(*hostKey)
+	if err := checkRoleKeys(*serverKey, *linkKey, *hostKey); err != nil {
+		return err
+	}
 	wakeRelays, err := loadWakeRelayPolicy(*wakeRelayPolicy)
 	if err != nil {
 		return fmt.Errorf("--wake-relay-policy: %w", err)
@@ -739,6 +746,7 @@ func run() error {
 		rendezvous.WithPunchRateMax(*punchRateMax),
 		rendezvous.WithKeepaliveRateMax(*keepaliveRate),
 		rendezvous.WithServerKey(*serverKey),
+		rendezvous.WithLinkKey(*linkKey),
 		rendezvous.WithTracer(tracer),
 		rendezvous.WithRelayOnly(func() bool { return relayOnlyFlag.Load() }),
 		rendezvous.WithHostCarrierLinked(func(id string) bool {
@@ -1033,6 +1041,8 @@ func run() error {
 		HostControlLinked: meet.HostControlLinked,
 		RelayHost:         advertised,
 		ServerKey:         *serverKey,
+		LinkKey:           *linkKey,
+		HostKey:           *hostKey,
 		WakeRelays:        wakeRelays,
 		TTL:               *hostTTL,
 		RelayOnly:         relayOnlyFlag,
@@ -1119,6 +1129,8 @@ func run() error {
 		"relay_ports", *portRange,
 		"carrier", relayManager.CarrierAddr(),
 		"server_key", *serverKey != "",
+		"link_key", *linkKey != "",
+		"host_key", *hostKey != "",
 		"tls", tlsConfig != nil,
 		"acme", acmeDomainsRaw,
 		"acme_http", acmeHTTPAddr,
@@ -1216,6 +1228,28 @@ func expireLoop(ctx context.Context, reg *registry.Registry, relayManager *relay
 	}
 }
 
+// checkRoleKeys keeps the role credentials genuinely separate: a deployment
+// that splits them must still hold a management key, and none of the three may
+// reuse another's value.
+func checkRoleKeys(serverKey, linkKey, hostKey string) error {
+	if linkKey == "" && hostKey == "" {
+		return nil
+	}
+	if serverKey == "" {
+		return errors.New("--link-key and --host-key require --server-key")
+	}
+	if linkKey != "" && linkKey == serverKey {
+		return errors.New("--link-key must differ from --server-key")
+	}
+	if hostKey != "" && hostKey == serverKey {
+		return errors.New("--host-key must differ from --server-key")
+	}
+	if linkKey != "" && hostKey != "" && linkKey == hostKey {
+		return errors.New("--link-key must differ from --host-key")
+	}
+	return nil
+}
+
 // checkServerKey keeps the default deployment authenticated. An empty key is
 // only accepted with the explicit insecure switch, and that mode must not
 // expose the unauthenticated HTTP API beyond the local machine.
@@ -1239,8 +1273,7 @@ func checkServerKey(key string, insecure bool, httpListen string) error {
 	return nil
 }
 
-func isLoopbackHost(host string) bool {
-	host = strings.Trim(host, "[]")
+func isLoopbackHost(host string) bool {	host = strings.Trim(host, "[]")
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}

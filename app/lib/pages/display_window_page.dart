@@ -17,8 +17,12 @@ import '../widgets/remote_view.dart';
 /// The runner supplies the existing session. This engine owns only its texture
 /// and local input state; authentication and reconnect stay in the parent.
 class DisplayWindowPage extends StatefulWidget {
-  const DisplayWindowPage({super.key, required this.streamId});
+  const DisplayWindowPage({super.key, required this.streamId, this.peerId = ''});
   final int streamId;
+
+  /// Owner's per-device preference key, passed by the window that opened this
+  /// one so input handling matches the main session.
+  final String peerId;
 
   @override
   State<DisplayWindowPage> createState() => _DisplayWindowPageState();
@@ -56,7 +60,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   @override
   void initState() {
     super.initState();
-    _keyboardMode = ViewPreferences.load().keyboardMode == 'local'
+    _keyboardMode = ViewPreferences.load(peerId: widget.peerId).keyboardMode == 'local'
         ? ViewerKeyboardMode.local
         : ViewerKeyboardMode.physical;
     ViewerBridge.setKeyboardTextRejectedHandler(() {

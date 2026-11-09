@@ -13,7 +13,7 @@
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
  public:
-  using OpenDisplayWindow = std::function<bool(std::shared_ptr<chast_viewer::SharedViewerSession>, uint32_t)>;
+  using OpenDisplayWindow = std::function<bool(std::shared_ptr<chast_viewer::SharedViewerSession>, uint32_t, const std::string&)>;
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project,
                          std::function<bool(const std::string&)> open_window = {},

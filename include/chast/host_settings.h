@@ -238,7 +238,14 @@ struct HostSettings {
     // host serves the LAN directly and does not register anywhere.
     bool tunnel = true;
     std::string server_url;
+    // Management secret: console, groups, wake, metrics and recording
+    // administration. It is also accepted for registration while host_key is
+    // empty, so a deployment that never separates roles keeps working.
     std::string server_key;
+    // Registration secret proved to the rendezvous service when this host
+    // registers or uploads signed inbound audit records. Empty falls back to
+    // server_key. It must never be handed to viewers.
+    std::string host_key;
     // Device identity registered with the service. The key is never uploaded;
     // the server stores only its SHA-256 digest.
     std::string tunnel_id;

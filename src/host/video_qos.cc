@@ -6,6 +6,19 @@
 #include <numeric>
 
 namespace chast {
+namespace {
+constexpr uint32_t kInitFps = 15;
+constexpr uint32_t kMinAutoFps = 5;
+constexpr uint32_t kDelayThresholdMs = 150;
+constexpr uint8_t kRestoreGuardSamples = 5;
+constexpr uint8_t kStartupEnded = 255;
+
+float clamp_ratio(float value, float low, float high) {
+    if (low > high) std::swap(low, high);
+    return std::clamp(value, low, high);
+}
+} // namespace
+
 VideoQos::VideoQos(uint32_t max_fps, float default_ratio, bool adaptive)
     : max_fps_(std::clamp(max_fps ? max_fps : 30u, 1u, 120u)), fps_(max_fps_),
       default_ratio_(std::clamp(default_ratio, 0.1f, 40.f)), ratio_(default_ratio_),
@@ -19,27 +32,144 @@ float VideoQos::quality_ratio(Quality quality) {
     }
     return 0.67f;
 }
-void VideoQos::Delay::add(uint32_t value) {
-    minimum = minimum ? std::min(*minimum, value) : value;
-    if (samples.size() >= 60) samples.pop_front();
-    samples.push_back(value);
-    if (samples.size() == 60)
-        smoothed = static_cast<uint32_t>((static_cast<uint64_t>(*minimum) +
-                    *std::min_element(samples.begin(), samples.end())) / 2);
-    // The reference retains three recent samples (it removes when len > 2).
-    if (recent.size() > 2) recent.pop_front();
-    recent.push_back(value);
+
+void VideoQos::RttCalculator::update(uint32_t delay) {
+    if (samples.size() >= kWindowSamples) samples.pop_front();
+    samples.push_back(delay);
+    baseline = baseline ? std::min(*baseline, delay) : delay;
+    if (samples.size() < kWindowSamples) return;
+    const size_t half = kWindowSamples / 2;
+    const uint32_t older = *std::min_element(samples.begin(), samples.begin() + half);
+    const uint32_t recent = *std::min_element(samples.begin() + half, samples.end());
+    // A rising floor can be a growing queue. Allow 10 ms of probe granularity,
+    // but wait for it to settle before forgetting the old baseline.
+    if (recent > older + 10) return;
+    const uint32_t rise = std::min(older, recent) - std::min(*baseline, std::min(older, recent));
+    if (rise > 0)
+        baseline = *baseline + std::clamp(rise / 2, 1u, kMaxIncreaseMs);
 }
+
+void VideoQos::Delay::add(uint32_t value) {
+    if (history.size() >= 2) history.pop_front();
+    history.push_back(value);
+}
+
 uint32_t VideoQos::Delay::average() const {
-    if (recent.empty()) return 150;
-    const auto average = static_cast<uint32_t>(
-        std::accumulate(recent.begin(), recent.end(), uint64_t{0}) / recent.size());
-    const auto rtt = smoothed ? smoothed : samples.size() >= 10 ? minimum : std::nullopt;
-    return rtt && average > *rtt ? average - *rtt : average;
+    if (history.empty()) return kDelayThresholdMs;
+    const auto sum = std::accumulate(history.begin(), history.end(), uint64_t{0});
+    const auto average = static_cast<uint32_t>(sum / history.size());
+    const auto base = rtt.rtt().value_or(0);
+    return average > base ? average - base : 0;
+}
+
+uint32_t VideoQos::Delay::limit_fps_change(uint32_t current, uint32_t proposed, uint32_t delay,
+                                           bool bitrate_first, bool braked) {
+    const auto base = rtt.rtt().value_or(0);
+    const uint32_t excess = delay > base ? delay - base : 0;
+    // A spike stays in the average for several samples; confirm congestion with fresh samples.
+    if (samples_since_restore)
+        *samples_since_restore = static_cast<uint8_t>(
+            std::min<unsigned>(*samples_since_restore + 1, 255));
+    if (excess < kDelayThresholdMs) {
+        consecutive_bad = 0;
+        fps_bad = 0;
+        replies_after_bitrate_reduction.reset();
+        good = std::min<uint8_t>(good + 1, 3);
+        return recover(current, proposed);
+    }
+    consecutive_bad = std::min<uint8_t>(consecutive_bad + 1, 3);
+    fps_bad = std::min<uint8_t>(fps_bad + 1, 3);
+    if (replies_after_bitrate_reduction)
+        *replies_after_bitrate_reduction = std::min<uint8_t>(
+            *replies_after_bitrate_reduction + 1, 2);
+    const bool guarded = samples_since_restore && *samples_since_restore <= kRestoreGuardSamples;
+    const bool failed_restore = excess >= 600 && guarded;
+    // A level that congests right after being restored is not the level to return to.
+    if (guarded && (failed_restore || consecutive_bad >= 3)) {
+        fps_before_congestion = current > current / 4 ? current - current / 4 : 1;
+        samples_since_restore.reset();
+    }
+    // The timeout brake already reduced for the probe this reply answers.
+    if (proposed >= current || braked) return current;
+    // An extra second of delay cannot wait for another confirmation.
+    if (!failed_restore && excess < 1000 &&
+        (fps_bad < 3 ||
+         (bitrate_first && replies_after_bitrate_reduction.value_or(0) < 2)))
+        return current;
+    // A fast restore probes capacity. Roll it back promptly if the queue grows
+    // again, rather than waiting through another ordinary confirmation window.
+    const uint32_t divisor = excess >= 1000 || failed_restore ? 2 : 5;
+    on_reduction(current);
+    const uint32_t step = std::max(current / divisor, 1u);
+    return std::max(proposed, current - step);
+}
+
+uint32_t VideoQos::Delay::recover(uint32_t current, uint32_t proposed) {
+    // Fresh low-delay replies permit recovery even while the average contains a
+    // spike: a little at first, then back to the level held before congestion.
+    const uint32_t gradual = current + std::max(current / 10, 1u);
+    const bool has_level = fps_before_congestion && *fps_before_congestion > current;
+    if ((good == 2 || good == 3) && has_level) {
+        const uint32_t level = *fps_before_congestion;
+        fps_before_congestion.reset();
+        samples_since_restore = static_cast<uint8_t>(0);
+        return std::max(proposed, level);
+    }
+    if (good == 3 && !has_level) {
+        fps_before_congestion.reset();
+        return std::max(proposed, current + std::max(current / 5, 2u));
+    }
+    return gradual;
+}
+
+uint32_t VideoQos::Delay::accelerate_startup(uint32_t current, uint32_t proposed, uint32_t cap,
+                                             uint32_t delay, bool braked) {
+    if (startup_good == kStartupEnded) return proposed;
+    const auto base = rtt.rtt().value_or(0);
+    const uint32_t excess = delay > base ? delay - base : 0;
+    // A low-load sample does not establish capacity: require two clean replies
+    // per step and abandon startup probing on the first sign of queue growth.
+    if (braked || excess >= 50 || current >= cap) {
+        startup_good = kStartupEnded;
+        return proposed;
+    }
+    ++startup_good;
+    if (startup_good < 2) return proposed;
+    startup_good = 0;
+    const uint32_t doubled = static_cast<uint32_t>(
+        std::min<uint64_t>(static_cast<uint64_t>(current) * 2, cap));
+    const uint32_t accelerated = std::max(proposed, doubled);
+    if (accelerated >= cap) startup_good = kStartupEnded;
+    return accelerated;
+}
+
+void VideoQos::Delay::on_reduction(uint32_t current) {
+    startup_good = kStartupEnded;
+    good = 0;
+    fps_bad = 0;
+    if (!fps_before_congestion) fps_before_congestion = current;
+}
+
+bool VideoQos::Delay::needs_bitrate_reduction() const {
+    return consecutive_bad >= 2 || stall_ticks >= 2;
+}
+
+std::optional<float> VideoQos::Delay::ratio_reduction() const {
+    if (!needs_bitrate_reduction()) return std::nullopt;
+    const auto excess = average();
+    const bool confirmed = consecutive_bad >= 3;
+    if (excess < 200) return 0.95f;
+    if (excess < 300) return 0.9f;
+    if (excess < 500) return confirmed ? 0.7f : 0.85f;
+    return confirmed ? 0.5f : 0.8f;
+}
+
+uint32_t VideoQos::fps_cap(const User& user) const {
+    return user.fps ? user.fps : max_fps_;
 }
 uint32_t VideoQos::highest_fps() const {
     auto fps = max_fps_;
-    for (const auto& [id, user] : users_) if (user.fps) fps = std::min(fps, user.fps);
+    for (const auto& [id, user] : users_) fps = std::min(fps, fps_cap(user));
     return std::clamp(fps, 1u, 120u);
 }
 std::optional<VideoQos::Quality> VideoQos::latest_quality() const {
@@ -55,15 +185,38 @@ float VideoQos::target_ratio() const {
     auto quality = latest_quality();
     return quality ? quality_ratio(*quality) : default_ratio_;
 }
+float VideoQos::min_ratio() const {
+    const auto quality = latest_quality();
+    const auto target = target_ratio();
+    float minimum = 0.1f;
+    float floor = 0.1f;
+    // Presets keep a usable floor; a custom ratio keeps only the high-resolution
+    // guard, as the reference does for Quality::Custom.
+    if ((quality && *quality == Quality::High) || (!quality && target == 1.5f)) {
+        minimum = 0.6f;
+        floor = 0.2f;
+    } else if ((quality && *quality == Quality::Balanced) || (!quality && target == 0.67f)) {
+        minimum = 0.335f;
+    }
+    if (bitrate_kbps_) {
+        const auto one_mbps = std::max(ratio_ * 1000.0f / bitrate_kbps_, 0.1f);
+        minimum = std::min(minimum, one_mbps);
+    }
+    return std::max(minimum, floor);
+}
 bool VideoQos::variable() const {
     return adaptive_ && std::all_of(displays_.begin(), displays_.end(),
         [](const auto& entry) { return entry.second.variable; });
 }
+bool VideoQos::can_reduce_bitrate() const {
+    return variable() && !displays_.empty() && ratio_ > min_ratio() * 1.02f;
+}
 void VideoQos::open(uint64_t id, uint64_t now) {
     std::lock_guard lock(mutex_);
     if (users_.empty()) last_ratio_ = now;
-    users_.try_emplace(id);
-    latest_open_ = now;
+    User user;
+    user.joined_at = now;
+    users_.try_emplace(id, user);
     adjust_fps(now);
 }
 void VideoQos::close(uint64_t id, uint64_t now) {
@@ -92,93 +245,184 @@ void VideoQos::options(uint64_t id, uint32_t fps, std::optional<Quality> quality
     adjust_fps(now);
 }
 void VideoQos::adjust_fps(uint64_t now) {
-    auto fps = highest_fps();
-    if (adaptive_) {
-        for (const auto& [id, user] : users_) {
-            fps = std::min(fps, user.delay.fps.value_or(15));
-            if (user.delay.pending) fps = std::min(fps, 2u);
-        }
-        if (now - latest_open_ < 1000) fps = std::min(fps, 15u);
+    if (!adaptive_) {
+        // adaptive_bitrate=false keeps the documented semantics: only explicit
+        // viewer requests are aggregated, without automatic FPS adaptation.
+        fps_ = highest_fps();
+        return;
     }
+    if (users_.empty()) {
+        fps_ = max_fps_;
+        return;
+    }
+    uint32_t fps = std::numeric_limits<uint32_t>::max();
+    for (const auto& [id, user] : users_)
+        fps = std::min(fps, user.delay.fps.value_or(kInitFps));
+    // Every viewer inside its first second keeps the stream at INIT_FPS to
+    // ensure stability; each viewer carries its own start-up clock.
+    for (const auto& [id, user] : users_)
+        if (now - user.joined_at < 1000) {
+            fps = std::min(fps, kInitFps);
+            break;
+        }
     fps_ = std::clamp(fps, 1u, highest_fps());
 }
 void VideoQos::delay(uint64_t id, uint32_t value, uint64_t now) {
     std::lock_guard lock(mutex_);
     auto found = users_.find(id);
     if (found == users_.end() || !adaptive_) return;
-    auto& delay = found->second.delay;
-    const auto old = delay.average();
-    delay.add(std::max(value, 10u));
-    delay.pending = false;
-    const auto average = std::max(delay.average(), 10u);
+    auto& user = found->second;
+    auto& delay = user.delay;
     const auto target = target_ratio();
-    const uint32_t minimum = target >= 1.5f ? 8 : target >= 0.67f ? 10 : 12;
-    const uint32_t normal = minimum * 2;
-    auto fps = fps_;
+    const uint32_t min_fps = target >= 1.5f ? 8 : target >= 0.67f ? 10 : 12;
+    const uint32_t normal_fps = min_fps * 2;
+    const bool bitrate_first = can_reduce_bitrate();
+    const uint32_t sample = std::max(value, 10u);
+    // The reply closes the outstanding probe, braked or not.
+    delay.stall_ticks = 0;
+    delay.last_stall_second = 0;
+    const bool braked = delay.stall_reference_fps.has_value();
+    delay.stall_reference_fps.reset();
+    const auto old_average = delay.average();
+    if (!braked) delay.rtt.update(sample);
+    delay.add(sample);
+    const auto average = std::max(delay.average(), 10u);
+    const uint32_t cap = fps_cap(user);
+    const uint32_t current = delay.fps.value_or(std::min<uint32_t>(kInitFps, cap));
+    uint32_t fps = current;
     if (average < 50) {
-        auto step = fps < normal ? 1u : 0u;
+        auto step = fps < normal_fps ? 1u : 0u;
         if (++delay.quick_increase >= 3) { delay.quick_increase = 0; step = 5; }
-        fps = std::max(minimum, fps + step);
+        fps = std::max(min_fps, fps + step);
     } else if (average < 100) {
-        fps = std::max(minimum, fps + (average < old && fps < normal ? 1u : 0u));
-    } else if (average < 150) {
-        fps = std::max(minimum, fps);
+        fps = std::max(min_fps, fps + (average < old_average && fps < normal_fps ? 1u : 0u));
+    } else if (average < kDelayThresholdMs) {
+        fps = std::max(min_fps, fps);
     } else {
-        const auto divided = static_cast<uint32_t>(std::ceil(fps * 150.0 / average));
-        if (average < 200) fps = std::max(minimum, divided);
-        else if (average < 300) fps = std::min(minimum, divided);
-        else if (average < 600) fps = 150 * minimum / average;
-        else fps = std::min(150 * minimum / average, divided);
+        const auto divided = static_cast<uint32_t>(
+            std::ceil(fps / (average / static_cast<float>(kDelayThresholdMs))));
+        if (average < 200) fps = std::max(min_fps, divided);
+        else if (average < 300) fps = std::min(min_fps, divided);
+        else if (average < 600) fps = kDelayThresholdMs * min_fps / average;
+        else fps = std::min(kDelayThresholdMs * min_fps / average, divided);
     }
-    delay.increase = average < 150 ? delay.increase + 1 : 0;
+    delay.increase = average < kDelayThresholdMs ? delay.increase + 1 : 0;
     if (delay.increase >= 3) { delay.increase = 0; ++fps; }
     if (average > 50) delay.quick_increase = 0;
+    // While the bitrate can still come down, the frame rate keeps its floor:
+    // bitrate-targeted encoders do not send fewer bytes at fewer frames.
+    if (bitrate_first) fps = std::max(fps, min_fps);
+    fps = std::max(fps, std::min(kMinAutoFps, cap));
+    fps = delay.limit_fps_change(current, fps, sample, bitrate_first, braked);
+    fps = delay.accelerate_startup(current, fps, cap, sample, braked);
+    const bool reduce_bitrate = bitrate_first && delay.needs_bitrate_reduction() &&
+                                !delay.replies_after_bitrate_reduction;
+    fps = std::clamp(fps, 1u, cap);
     const bool first = !delay.fps;
-    delay.fps = std::clamp(fps, 1u, highest_fps());
+    delay.fps = fps;
     adjust_fps(now);
-    if (first) adjust_ratio(false, now);
+    // A viewer's first reply is one more trigger of the periodic adjustment and
+    // keeps its cooldown: a viewer joining right after a cut must not spend the
+    // other viewers' evidence a second time.
+    if (first && now - last_ratio_ >= 3000) adjust_ratio(false, now);
+    if (reduce_bitrate && now - last_ratio_ >= 3000) adjust_ratio(false, now);
 }
 void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
     std::lock_guard lock(mutex_);
     auto found = users_.find(id);
     if (found == users_.end() || !adaptive_) return;
-    auto& delay = found->second.delay;
-    delay.pending = elapsed > 2000;
-    if (delay.pending) delay.add(static_cast<uint32_t>(std::min<uint64_t>(elapsed, UINT32_MAX)));
+    auto& user = found->second;
+    auto& delay = user.delay;
+    if (elapsed <= 2000) {
+        delay.last_stall_second = 0;
+        return;
+    }
+    // The caller samples every 500 ms; the reference ticks once per second.
+    const auto second = static_cast<uint32_t>(
+        std::min<uint64_t>(elapsed / 1000, std::numeric_limits<uint32_t>::max()));
+    if (second <= delay.last_stall_second) return;
+    delay.last_stall_second = second;
+    delay.stall_ticks = static_cast<uint8_t>(std::min<unsigned>(delay.stall_ticks + 1, 255));
+    delay.add(static_cast<uint32_t>(std::min<uint64_t>(elapsed, UINT32_MAX)));
+    const uint32_t cap = fps_cap(user);
+    uint32_t reference;
+    if (delay.stall_reference_fps) {
+        reference = *delay.stall_reference_fps;
+    } else {
+        reference = delay.fps.value_or(std::min<uint32_t>(kInitFps, cap));
+        delay.stall_reference_fps = reference;
+        delay.on_reduction(reference);
+    }
+    // Halve for every second the probe stays out beyond the first: two seconds
+    // halve, three quarter, and so on down to the floor.
+    const uint32_t divisor = 1u << std::min<uint32_t>(second > 0 ? second - 1 : 0, 5);
+    const uint32_t current = delay.fps.value_or(reference);
+    const uint32_t floor = std::min(kMinAutoFps, cap);
+    // The floor is a floor, not a lift: a target already below it stays.
+    uint32_t fps = std::clamp(reference / divisor, floor, cap);
+    fps = std::min(fps, current);
+    delay.fps = fps;
     adjust_fps(now);
 }
 void VideoQos::adjust_ratio(bool dynamic, uint64_t now) {
     if (!variable() || users_.empty()) return;
     uint32_t maximum_delay = 0;
     for (const auto& [id, user] : users_) maximum_delay = std::max(maximum_delay, user.delay.average());
-    float minimum = 0.1f;
-    const auto quality = latest_quality();
-    const auto target = target_ratio();
-    if ((quality && *quality == Quality::High) || (!quality && target == 1.5f)) minimum = 0.6f;
-    else if ((quality && *quality == Quality::Balanced) || (!quality && target == 0.67f)) minimum = 0.335f;
-    const auto floor = minimum == 0.6f ? 0.2f : 0.1f;
-    if (bitrate_kbps_) minimum = std::min(minimum, std::max(ratio_ * 1000 / bitrate_kbps_, 0.1f));
-    minimum = std::max(minimum, floor);
-    float next = ratio_;
-    if (maximum_delay < 150) {
-        if (dynamic) next *= maximum_delay < 50 ? 1.15f : maximum_delay < 100 ? 1.1f : 1.05f;
-    } else {
-        next *= maximum_delay < 200 ? 0.95f : maximum_delay < 300 ? 0.9f : maximum_delay < 500 ? 0.85f : 0.8f;
+    // Each viewer judges its own delay; the stream takes the most conservative
+    // step any viewer asks for.
+    std::optional<float> reduction;
+    for (const auto& [id, user] : users_) {
+        const auto step = user.delay.ratio_reduction();
+        if (step) reduction = reduction ? std::min(*reduction, *step) : *step;
     }
-    if (bitrate_kbps_ && ratio_ >= 0.5f)
-        next = std::min(next, ratio_ * (1.0f + 150.0f / bitrate_kbps_));
-    ratio_ = std::clamp(next, std::min(minimum, target), target);
+    if (!reduction && maximum_delay >= kDelayThresholdMs) {
+        // Elevated but unconfirmed: no change, and no cooldown either, so a
+        // confirmation on the next reply is acted on at once.
+        for (auto& [id, display] : displays_) display.encoded = 0;
+        return;
+    }
+    const auto target = target_ratio();
+    const auto current = ratio_;
+    std::optional<float> add_150kbps;
+    if (bitrate_kbps_)
+        add_150kbps = (bitrate_kbps_ + 150.0f) * current / bitrate_kbps_;
+    const auto minimum = min_ratio();
+    const auto maximum = target;
+    float next = current;
+    if (reduction) {
+        next = current * *reduction;
+    } else if (maximum_delay < 50) {
+        if (dynamic) next = current * 1.15f;
+    } else if (maximum_delay < 100) {
+        if (dynamic) next = current * 1.1f;
+    } else if (dynamic) {
+        next = current * 1.05f;
+    }
+    // Limit quality increase rate for better stability.
+    if (add_150kbps && next > *add_150kbps && *add_150kbps > current && current >= 0.5f)
+        next = *add_150kbps;
+    if (reduction) {
+        for (auto& [id, user] : users_) {
+            if (user.delay.needs_bitrate_reduction() && !user.delay.replies_after_bitrate_reduction) {
+                // One outstanding probe may have started before the bitrate change.
+                user.delay.replies_after_bitrate_reduction = static_cast<uint8_t>(
+                    clamp_ratio(next, minimum, maximum) < current ? 0 : 2);
+            }
+        }
+    }
+    ratio_ = clamp_ratio(next, minimum, maximum);
+    for (auto& [id, display] : displays_) display.encoded = 0;
     last_ratio_ = now;
 }
 void VideoQos::tick(uint64_t now) {
     adjust_fps(now);
-    if (!variable()) { ratio_ = target_ratio(); return; }
+    if (!variable()) {
+        ratio_ = target_ratio();
+        return;
+    }
     if (now - last_ratio_ < 3000) return;
     bool dynamic = false;
-    for (auto& [id, display] : displays_) {
-        dynamic = dynamic || display.encoded >= 6;
-        display.encoded = 0;
-    }
+    for (const auto& [id, display] : displays_) dynamic = dynamic || display.encoded >= 6;
     adjust_ratio(dynamic, now);
 }
 void VideoQos::display(uint64_t id, uint32_t encoded, uint32_t bitrate, bool variable_rate, uint64_t now) {

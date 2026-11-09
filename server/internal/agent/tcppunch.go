@@ -147,8 +147,8 @@ func (v *ViewerAgent) tcpPunchRound(ctx context.Context) (net.Conn, *bufio.Reade
 	v.mu.Unlock()
 	msg := wire.Message{Type: wire.TypeTCPPunch, Role: wire.RoleViewer,
 		HostID: v.cfg.HostID, Nonce: nonce, Timestamp: ts, NATType: ownNAT}
-	if v.cfg.ServerKey != "" {
-		msg.Auth = identity.PunchAuth(v.cfg.ServerKey, v.cfg.HostID, nonce, ts)
+	if key := viewerAPIKey(v.cfg); key != "" {
+		msg.Auth = identity.PunchAuth(key, v.cfg.HostID, nonce, ts)
 	}
 	reply, err := coordinateTCP(ctx, announce, msg, punchRequestStep)
 	if err != nil || !reply.OK || reply.Type != wire.TypeTCPPunch || reply.Nonce != nonce {

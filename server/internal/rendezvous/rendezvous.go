@@ -44,6 +44,7 @@ type options struct {
 	rateMax          int
 	keepaliveRateMax int
 	serverKey        string
+	linkKey          string
 	tracer           *tracing.Tracer
 	// tcpPunchListenSet distinguishes "derive from the UDP bind" from an
 	// explicit value; an explicitly empty value disables the listener.
@@ -76,9 +77,16 @@ func WithKeepaliveRateMax(max int) Option {
 }
 
 // WithServerKey requires viewers to prove knowledge of the server key before a
-// punch is coordinated. An empty key keeps public rendezvous behavior.
+// punch is coordinated. An empty key keeps public rendezvous behavior unless a
+// link key is configured.
 func WithServerKey(key string) Option {
 	return func(o *options) { o.serverKey = key }
+}
+
+// WithLinkKey lets ordinary viewers punch with the deployment's connection
+// credential instead of the management key. The server key remains accepted.
+func WithLinkKey(key string) Option {
+	return func(o *options) { o.linkKey = key }
 }
 
 // WithTracer records one span per punch request. Spans join the trace derived
@@ -131,6 +139,7 @@ type Server struct {
 	// port cannot be used as a reflector.
 	natProbeLimiter   *limiter
 	serverKey         string
+	linkKey           string
 	tracer            *tracing.Tracer
 	readBuffer        int
 	relayOnly         func() bool
@@ -173,6 +182,7 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		keepaliveLimiter:  newLimiter(cfg.keepaliveRateMax, defaultRateSpan),
 		natProbeLimiter:   newLimiter(DefaultNatProbeRateMax, defaultRateSpan),
 		serverKey:         cfg.serverKey,
+		linkKey:           cfg.linkKey,
 		tracer:            cfg.tracer,
 		readBuffer:        readBuffer,
 		relayOnly:         cfg.relayOnly,
@@ -375,14 +385,28 @@ func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	s.reply(src, ack)
 }
 
-func (s *Server) relayFor(host registry.Host) string {
-	if host.RelayPort == 0 {
+func (s *Server) relayFor(host registry.Host) string {	if host.RelayPort == 0 {
 		return ""
 	}
 	if host.RelayHost != "" {
 		return net.JoinHostPort(host.RelayHost, strconv.Itoa(host.RelayPort))
 	}
 	return s.relayAddr(host.RelayPort)
+}
+
+// checkViewerPunch verifies the viewer half of a punch. Ordinary viewers hold
+// the link key; the management key remains accepted for operators and older
+// clients. With neither key configured, coordination stays public.
+func (s *Server) checkViewerPunch(id, nonce, auth string, stamp int64, now time.Time) bool {
+	if s.linkKey != "" &&
+		identity.CheckPunchAuth(s.linkKey, id, nonce, auth, stamp, now, punchAuthWindow) {
+		return true
+	}
+	if s.serverKey != "" &&
+		identity.CheckPunchAuth(s.serverKey, id, nonce, auth, stamp, now, punchAuthWindow) {
+		return true
+	}
+	return s.linkKey == "" && s.serverKey == ""
 }
 
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
@@ -422,8 +446,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
-	if !identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth,
-		msg.Timestamp, time.Now(), punchAuthWindow) {
+	if !s.checkViewerPunch(msg.HostID, msg.Nonce, msg.Auth, msg.Timestamp, time.Now()) {
 		result = "auth_failed"
 		reply.Error = "punch authentication failed"
 		s.reply(src, reply)

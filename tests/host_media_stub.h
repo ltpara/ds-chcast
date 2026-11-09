@@ -26,6 +26,7 @@ struct MediaState {
     std::atomic<unsigned> wrong_thread{0};
     std::atomic<DWORD> capture_thread{0}, encoder_thread{0};
     std::atomic<unsigned> encodes{0};
+    std::atomic<unsigned> idrs{0};
     std::atomic<unsigned> encode_delay_ms{0};
     std::atomic<bool> encoding_delayed{false};
     std::atomic<unsigned> repeats{0};
@@ -200,6 +201,7 @@ public:
             return Error(Status::Unavailable, "simulated encoder failure");
         if (state_->silent_codecs & video_codec_bit(config_.codec)) return Error::success();
         have_input_ = true;
+        if (key) ++state_->idrs;
         out.push_back({{0, 0, 0, 1, 0x65, static_cast<uint8_t>(width() / 16)}, pts, key, key});
         return Error::success();
     }
@@ -210,6 +212,7 @@ public:
         }
         ++state_->repeats;
         if (auto error = hardware_failure(); !error.ok()) return error;
+        if (key) ++state_->idrs;
         out.push_back({{0, 0, 0, 1, 0x65, static_cast<uint8_t>(width() / 16)}, pts, key, key});
         return Error::success();
     }

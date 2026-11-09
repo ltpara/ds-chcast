@@ -46,11 +46,11 @@
 | 依赖 | 本机安装版本 | 用途 |
 | --- | --- | --- |
 | OpenH264 | 2.6.0#4 | 软件 H.264 兜底 |
-| libvpx | 1.16.0#1 | VP9 软件编解码 |
+| libvpx | 1.16.0 | VP9 软件编解码 |
 | libyuv | 1916；source `d98915a654d3564e4802a0004add46221c4e4348` | BGRA / I444 转换及缩放 |
-| libjpeg-turbo | 3.1.4.1 | libyuv 构建依赖 |
+| libjpeg-turbo | 3.1.3 | libyuv 构建依赖 |
 
-这些包已在 `D:/vcpkg/installed/x64-windows-static-md` 安装，使用静态库、动态 CRT。CMake 的 `OPENH264_ROOT` / `VPX_ROOT` 指向该前缀，并链接 `unofficial::libvpx::libvpx`、`yuv`。第三方声明见根目录 `THIRD-PARTY-NOTICES.md`。
+这些包已在 `D:/vcpkg/installed/x64-windows-static-md` 安装，使用静态库、动态 CRT。CMake 的 `OPENH264_ROOT` / `VPX_ROOT` 指向该前缀，并链接 `unofficial::libvpx::libvpx`、`yuv`。第三方声明见根目录 `THIRD-PARTY-NOTICES.md`。完整依赖表和 vcpkg 提交参照见 [开发检查点](development-checkpoint-2026-11-09.md) 第 6 节。
 
 仅新环境缺少这些包时执行安装；此命令本身不锁定上述版本，严格复现还需要固定 vcpkg registry/baseline，这是后续打包工作的一部分：
 
@@ -79,10 +79,10 @@ MSVC 构建的 libyuv 提示没有其 SIMD 加速，不据此预估实测帧率�
 - 原生集成构建、Flutter Release 和 bundle 均成功，日志及本次回归总结果见 [检查点验证记录](development-checkpoint-2026-11-09.md#3-本检查点的验证记录)。
 - `build/vpx-live-acceptance3.log`：真实库对 320×180 红蓝条纹的两种格式各编码/解码 8 帧；重复帧、码率/FPS 更新、强制关键帧和 GPU 上传全部通过。平均 RGB 误差 88.957（420）及 1.497（444）；只说明该样本色度保留效果。
 - 同专项重新解码 profile 0/1 MP4 的全部样本并核验实际 `vpcC` 字节。本机 FFmpeg mov demux 没有完整暴露其中 profile/chroma，所以不能只根据 demux 输出的默认字段判定编码错误。
-- 保存前现有原生回归 **7/8 通过**。`desktop_stream` 已包含 `request_keyframe()` / `frame()` 修正并复测通过；`host_settings` 仍有 3 条把 VP9 当未知格式的旧断言失败，必须收尾。详细逐项结果见检查点记录。
+- 2026-11-09 恢复环境后原生回归 **8/8 通过**：`host_settings` 的旧断言已改为 `vp10` 未知样本，并新增 VP9 解析、写名和保存/读取往返；`host_parity` 本机 148.13 秒，CTest 超时上限已从 120 秒调到 240 秒。保存时的 7/8 历史记录见检查点记录。
 - 44 项 Flutter 测试及静态分析是此前阶段结果；最后的菜单/状态修改后尚未完整重跑，不冒充最终全绿。
-- 未完成真实 DXGI → VP9 → QUIC → GPU → 双 Flutter 窗口验收；临时验收源码在本机 `build/`，需要用最终库重链。不要用之前的 OpenH264 双窗口结果代替 VP9 验收。
+- 2026-11-09 P0-2 已用最终库重链本机临时程序 `build/vpx_acceptance.cc`：真实 DXGI 图案窗 → VP9 编码 → QUIC 回环 → 两个真实 `ViewerEngine` 的 GPU 回读。444 的 MAE 为 1.664/1.844/2.161，420 为 77.668/77.647/77.646；第二观看端加入/退出及 444→420→444 均收敛，主机统计 sessions≥2、codec VP9、最终 chroma 444。两个真实 `chast_viewer.exe` 窗口也完成加入/退出与 1→0→1 色度收敛；窗口缩放下 1 像素色度不可判别，像素级结论来自 GPU 回读。详见检查点记录。
 - 尚待覆盖真实多人能力变化、多源失败回滚、摄像头导致的色度回退、主机/观看端实际 VP9 录屏、缩放/旋转/HDR/多屏输入和 1080p 性能。
 - 原始流 CLI 的 VP9 离线回放尚未完整支持；不能沿用 H.264/HEVC Annex-B 拆包假设。软件 AV1 与 VP8 未实现。
 
-下一步先使现有回归与 v61 语义一致，再进行真实会话、性能和打包验收。完成前不将该检查点标记为完整色彩功能发布版。
+下一步进入 P0-3：验证多源 prepare 失败不部分提交、摄像头/Camera-only 导致 420 回退时桌面仍正确、主机与观看端在格式切换后的实际录屏；随后做 1080p 性能和打包收尾。完成前不将该检查点标记为完整色彩功能发布版。

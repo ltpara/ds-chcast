@@ -19,6 +19,7 @@
 #include "chast/audio.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
+#include "chast/clipboard_listener.h"
 #include "chast/clipboard_worker.h"
 #include "chast/clipboard_channel.h"
 #include "chast/decoder.h"
@@ -3354,6 +3355,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 uint64_t last_peer_clipboard_seq = 0;
                 bool clipboard_has_files = false;
                 auto next_clipboard_poll = Clock::now();
+                uint64_t clipboard_seen_generation = chast::ClipboardListener::Generation();
                 std::optional<chast::ClipboardSnapshot> clipboard_snapshot;
                 chast::ClipboardFileChannel clipboard_channel;
                 bool virtual_clipboard_files = true;
@@ -3367,9 +3369,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     std::shared_ptr<chast::ClipboardVirtualFiles> virtual_files;
                     Clock::time_point retry{};
                 } pending_clipboard;
+                bool clipboard_native = false;
                 {
                     chast::ClipboardBackend backend;
                     std::lock_guard lock(clipboard_sink_mutex_);
+                    clipboard_native = !clipboard_source_ && !clipboard_file_source_;
                     if (clipboard_source_) {
                         backend.read = [source = clipboard_source_](chast::ClipboardContent& content) {
                             if (!source(content)) return chast::ClipboardReadState::Failed;
@@ -3393,6 +3397,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         clipboard_worker_->SetBackend(std::move(backend));
                     }
                 }
+                // The native clipboard is change-driven: one shared listener
+                // serves every window, and the timer below is only a fallback
+                // for missed notifications. A synthetic backend cannot emit
+                // WM_CLIPBOARDUPDATE, so it keeps the old cadence.
+                struct ClipboardSubscription {
+                    uint64_t id = 0;
+                    ~ClipboardSubscription() {
+                        if (id != 0) chast::ClipboardListener::Unsubscribe(id);
+                    }
+                } clipboard_listener;
+                if (clipboard_native) clipboard_listener.id = chast::ClipboardListener::Subscribe();
+                const auto clipboard_poll_interval =
+                    clipboard_listener.id != 0 ? std::chrono::seconds(5) : kClipboardPollInterval;
                 struct ClipboardCancel {
                     chast::ClipboardWorker* worker;
                     ~ClipboardCancel() { worker->Cancel(); }
@@ -3903,7 +3920,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     clipboard_snapshot = std::move(result.snapshot);
                                 }
                             }
-                            next_clipboard_poll = now + kClipboardPollInterval;
+                            next_clipboard_poll = now + clipboard_poll_interval;
                         } else if (pending_clipboard.active) {
                             pending_clipboard.inflight = false;
                             if (result.written) {
@@ -3941,8 +3958,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 ? clipboard_worker_->WriteFiles(clipboard_epoch, pending_clipboard.paths)
                                 : clipboard_worker_->Write(clipboard_epoch, pending_clipboard.content);
                         }
-                    } else if (clipboard_send_allowed() && now >= next_clipboard_poll) {
-                        clipboard_worker_->Read(clipboard_epoch);
+                    } else if (clipboard_send_allowed()) {
+                        const uint64_t change = chast::ClipboardListener::Generation();
+                        if (now >= next_clipboard_poll ||
+                            (clipboard_listener.id != 0 && change != clipboard_seen_generation)) {
+                            if (clipboard_worker_->Read(clipboard_epoch)) {
+                                clipboard_seen_generation = change;
+                            }
+                        }
                     }
                 };
                 auto poll_local_clipboard_files = [&] {

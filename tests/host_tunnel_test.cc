@@ -144,8 +144,19 @@ void test_command_line() {
     check(contains(command, L"--listen 0.0.0.0:14434"), "the tunnel listener is passed");
     check(contains(command, L"--server-key \"server secret\""),
           "a server key with spaces is quoted");
+    check(!contains(command, L"--host-key"),
+          "without a host key the management key is sent for registration");
     check(contains(command, L"--proxy socks5://127.0.0.1:10808"),
           "the outbound proxy is passed");
+
+    settings.host_key = "host register secret";
+    const std::wstring with_host_key = chast::host::tunnel_command_line(
+        L"chast-tunnel.exe", settings, 4433, "");
+    check(contains(with_host_key, L"--host-key \"host register secret\""),
+          "a configured host key is passed for registration");
+    check(!contains(with_host_key, L"--server-key"),
+          "the management key is not leaked once a host key is configured");
+    settings.host_key.clear();
     check(contains(command, L"--fingerprint AA:BB:CC"), "the certificate fingerprint is passed");
 
     settings.server_key.clear();
@@ -214,6 +225,13 @@ void test_validation() {
     check(!chast::host::validate_tunnel_settings(settings, &error) &&
               error.find("服务器密钥") != std::string::npos,
           "an oversized server key is rejected");
+
+    settings = valid_settings();
+    settings.host_key = std::string(300, 'h');
+    error.clear();
+    check(!chast::host::validate_tunnel_settings(settings, &error) &&
+              error.find("主机密钥") != std::string::npos,
+          "an oversized host key is rejected");
 
     settings = valid_settings();
     settings.proxy = "127.0.0.1:10808";

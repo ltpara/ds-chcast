@@ -311,7 +311,7 @@ int main() {
     check(take_privacy_state(*second, enabled, privacy_code, reason,
                              std::chrono::seconds(5)) &&
               !enabled && privacy_code == chast::PrivacyModeCode::Denied &&
-              reason == "privacy mode is controlled by the viewer that owns the shared stream",
+              reason == "another viewer controls this host",
           "privacy is refused with the shared-stream reason");
 
     check(second->request_host_action(chast::HostAction::Restart).ok(),
@@ -319,8 +319,7 @@ int main() {
     chast::HostControlResult action_result;
     check(take_host_action(*second, chast::HostAction::Restart, action_result) &&
               action_result.code == chast::HostActionCode::Busy &&
-              action_result.reason ==
-                  "host actions are controlled by the viewer that owns the stream",
+              action_result.reason == "another viewer controls this host",
           "host actions are refused with the shared-stream reason");
 
     check(host->send_chat("only-focused"), "the operator sends a chat line");

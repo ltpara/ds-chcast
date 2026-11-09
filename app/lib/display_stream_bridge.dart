@@ -94,8 +94,12 @@ class DisplayPointer {
 /// identify decoder lifetimes; display indices are only selection arguments.
 class DisplayStreamBridge {
   static const MethodChannel _channel = MethodChannel('chast/viewer');
-  static Future<bool> openWindow(int streamId) async =>
-      await _channel.invokeMethod<bool>('openDisplayWindow', streamId) ?? false;
+  static Future<bool> openWindow(int streamId, {String peerId = ''}) async =>
+      await _channel.invokeMethod<bool>('openDisplayWindow', <String, Object>{
+        'stream': streamId,
+        'peerId': peerId,
+      }) ??
+      false;
 
   static Future<bool> focus(int streamId) async =>
       await _channel.invokeMethod<bool>('focusDisplay', streamId) ?? false;

@@ -1439,6 +1439,7 @@ constexpr wchar_t kTunnelDialogClass[] = L"ChastTunnelSettingsWindow";
 enum TunnelDialogId {
     kDialogUrl = 2000,
     kDialogServerKey,
+    kDialogHostKey,
     kDialogId,
     kDialogKey,
     kDialogListen,
@@ -1450,6 +1451,7 @@ struct TunnelDialogState {
     HWND window = nullptr;
     HWND url = nullptr;
     HWND server_key = nullptr;
+    HWND host_key = nullptr;
     HWND id = nullptr;
     HWND key = nullptr;
     HWND listen = nullptr;
@@ -1496,6 +1498,15 @@ bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, s
         return false;
     }
     updated.server_key = server_key;
+
+    // Registration and signed audit uploads use this role key; empty keeps the
+    // legacy behavior where the management key is sent instead.
+    const std::string host_key = trim_ascii(narrow(control_text(dialog.host_key)));
+    if (!valid_server_key(host_key)) {
+        error = "主机密钥需要最多 256 个可打印字符，且不能包含引号或反斜杠";
+        return false;
+    }
+    updated.host_key = host_key;
 
     const std::string id = trim_ascii(narrow(control_text(dialog.id)));
     if (id.empty()) {
@@ -1627,7 +1638,7 @@ bool edit_tunnel_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 660 : 540;
     const int tunnel_content = dialog_width - 40;
-    RECT frame{0, 0, px(dialog_width), px(530)};
+    RECT frame{0, 0, px(dialog_width), px(588)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -1666,37 +1677,42 @@ bool edit_tunnel_settings(HostSettings& result) {
     add(L"STATIC", tr(L"服务器密钥（可选）"), SS_LEFT, 0, 20, 122, 400, 20, 0, nullptr);
     dialog.server_key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20,
                             144, tunnel_content, 26, kDialogServerKey, nullptr);
-    add(L"STATIC", tr(L"设备 ID（会合服务中的名称）"), SS_LEFT, 0, 20, 180, 400, 20, 0, nullptr);
-    dialog.id = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 202,
+    add(L"STATIC", tr(L"主机密钥（可选，注册与审计用；留空则使用服务器密钥）"), SS_LEFT, 0, 20,
+        180, tunnel_content, 20, 0, nullptr);
+    dialog.host_key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 202,
+                          tunnel_content, 26, kDialogHostKey, nullptr);
+    add(L"STATIC", tr(L"设备 ID（会合服务中的名称）"), SS_LEFT, 0, 20, 238, 400, 20, 0, nullptr);
+    dialog.id = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 260,
                     tunnel_content, 26, kDialogId, nullptr);
-    add(L"STATIC", tr(L"设备密钥（8 个字符以上，不会被上传）"), SS_LEFT, 0, 20, 238, 400, 20, 0,
+    add(L"STATIC", tr(L"设备密钥（8 个字符以上，不会被上传）"), SS_LEFT, 0, 20, 296, 400, 20, 0,
         nullptr);
-    dialog.key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 260,
+    dialog.key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 318,
                      tunnel_content, 26, kDialogKey, nullptr);
-    add(L"STATIC", tr(L"隧道监听地址（UDP）"), SS_LEFT, 0, 20, 296, 240, 20, 0, nullptr);
-    dialog.listen = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 318,
+    add(L"STATIC", tr(L"隧道监听地址（UDP）"), SS_LEFT, 0, 20, 354, 240, 20, 0, nullptr);
+    dialog.listen = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 376,
                         240, 26, kDialogListen, nullptr);
     const std::wstring port_hint =
         tr(L"主机 QUIC 端口：") + std::to_wstring(g_app->settings.port) +
         tr(L"\n隧道端口必须不同，例如 0.0.0.0:14434");
-    add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 316, dialog_width - 20 - 276, 40, 0,
+    add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 374, dialog_width - 20 - 276, 40, 0,
         nullptr);
     add(L"STATIC", tr(L"出站代理（可选，http://、https://、socks5:// 或 socks5h://，含端口）"),
-        SS_LEFT, 0, 20, 356, tunnel_content, 20, 0, nullptr);
-    dialog.proxy = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 378,
+        SS_LEFT, 0, 20, 414, tunnel_content, 20, 0, nullptr);
+    dialog.proxy = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 436,
                        tunnel_content, 26, kDialogProxy, nullptr);
     const wchar_t* enable_text = tr(L"启用连接服务（注册到会合服务器）");
-    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 414,
+    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 472,
                          std::max(400, check_px(enable_text)), 24, kDialogEnabled, nullptr);
     const int tunnel_cancel_left = dialog_width - 20 - 100;
     const int tunnel_save_width = g_app->machine_settings_editor ? 220 : 100;
     add(L"BUTTON", tr(g_app->machine_settings_editor ? L"保存并重启服务" : L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0,
-        tunnel_cancel_left - 10 - tunnel_save_width, 456, tunnel_save_width, 32, IDOK, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 456, 100, 32,
+        tunnel_cancel_left - 10 - tunnel_save_width, 514, tunnel_save_width, 32, IDOK, nullptr);
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 514, 100, 32,
         IDCANCEL, nullptr);
 
     set_text(dialog.url, widen(g_app->settings.server_url));
     set_text(dialog.server_key, widen(g_app->settings.server_key));
+    set_text(dialog.host_key, widen(g_app->settings.host_key));
     set_text(dialog.id, widen(g_app->settings.tunnel_id));
     set_text(dialog.key, widen(g_app->settings.tunnel_key));
     set_text(dialog.listen, widen(g_app->settings.tunnel_listen));

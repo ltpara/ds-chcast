@@ -972,7 +972,8 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded = await _getJson(uri, timeout, key: settings.key);
+    final Object? decoded =
+        await _getJson(uri, timeout, key: settings.connectionKey);
     if (decoded is! Map) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
@@ -1031,7 +1032,8 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded = await _getJson(uri, timeout, key: settings.key);
+    final Object? decoded =
+        await _getJson(uri, timeout, key: settings.connectionKey);
     final Object? rawHosts = decoded is Map ? decoded['hosts'] : null;
     if (rawHosts is! List) {
       throw ServerApiException(tr('连接服务返回了无效数据'));

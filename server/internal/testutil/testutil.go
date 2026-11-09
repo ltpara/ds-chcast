@@ -111,6 +111,10 @@ type Options struct {
 	RegistryOfflineAfter time.Duration
 	// Tracer exports request spans. Nil disables tracing.
 	Tracer *tracing.Tracer
+	// LinkKey and HostKey split viewer lookups and host registration from the
+	// management ServerKey. Empty keeps the legacy single-key behavior.
+	LinkKey string
+	HostKey string
 }
 
 type Server struct {
@@ -214,6 +218,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 	var pool *relaypool.Pool
 	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log,
 		rendezvous.WithServerKey(ServerKey),
+		rendezvous.WithLinkKey(opts.LinkKey),
 		rendezvous.WithRelayOnly(relayOnly.Load),
 		rendezvous.WithHostCarrierLinked(func(id string) bool {
 			host, ok := reg.Lookup(id)
@@ -307,6 +312,8 @@ func StartWith(t testing.TB, opts Options) *Server {
 		HostControlLinked:          meet.HostControlLinked,
 		RelayHost:                  "127.0.0.1",
 		ServerKey:                  ServerKey,
+		LinkKey:                    opts.LinkKey,
+		HostKey:                    opts.HostKey,
 		WakeRelays:                 opts.WakeRelays,
 		TTL:                        60 * time.Second,
 		Logger:                     log,

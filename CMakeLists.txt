@@ -243,6 +243,7 @@ add_library(chast.clipboard STATIC
     src/clipboard/clipboard_worker.cc
     src/clipboard/clipboard_virtual.cc
     src/clipboard/clipboard_local.cc
+    src/clipboard/clipboard_listener.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32 ole32 uuid shlwapi)
@@ -308,7 +309,7 @@ target_link_libraries(chast.host PUBLIC "${FFMPEG_ROOT}/lib/avformat.lib" secur3
 # Media Foundation supplies camera enumeration and capture; mf holds the
 # device-source helpers and mfuuid the format GUIDs. SetupAPI and CfgMgr
 # identify virtual display adapters and their monitor children.
-target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt)
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt winmm)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from
@@ -455,6 +456,13 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-shared-capturer-test tests/shared_capturer_test.cc)
     target_link_libraries(chast-shared-capturer-test PRIVATE chast.dxgi)
 
+    # GPU color and geometry stages against known textures: HDR scRGB ->
+    # sRGB, video-processor rotation and the BGRA -> NV12 downscale. Runs on
+    # the real adapter and skips stages the device cannot provide.
+    add_executable(chast-capture-transform-test tests/capture_transform_test.cc)
+    target_include_directories(chast-capture-transform-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-capture-transform-test PRIVATE chast.dxgi)
+
     # PNG writing for screenshots: signature, decoded pixels and alpha forcing
     # through WIC. No GPU, no network.
     add_executable(chast-png-writer-test tests/png_writer_test.cc)
@@ -547,6 +555,12 @@ if(CHAST_BUILD_TESTS)
     add_custom_command(TARGET chast-clipboard-async-test POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-clipboard-async-test>)
+
+    # The shared clipboard listener: real WM_CLIPBOARDUPDATE on a private
+    # window station, multiple subscribers, generation and unsubscribe. Skips
+    # itself when the process cannot own a private window station.
+    add_executable(chast-clipboard-listener-test tests/clipboard_listener_test.cc)
+    target_link_libraries(chast-clipboard-listener-test PRIVATE chast.clipboard)
 
     # OS login: the password request over loopback QUIC, the permission and
     # logon-state gates, the exact text handed to a synthetic injector, and the
@@ -665,6 +679,7 @@ if(CHAST_BUILD_TESTS)
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME shared_capture COMMAND chast-shared-capturer-test)
+    add_test(NAME capture_transform COMMAND chast-capture-transform-test)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
@@ -687,13 +702,15 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(display_subscriptions PROPERTIES TIMEOUT 30)
     add_test(NAME video_qos COMMAND chast-video-qos-test)
     set_tests_properties(desktop_stream PROPERTIES TIMEOUT 30)
-    set_tests_properties(host_parity PROPERTIES TIMEOUT 120)
+    set_tests_properties(host_parity PROPERTIES TIMEOUT 240)
     add_test(NAME host_voice COMMAND chast-host-voice-test)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)
     add_test(NAME host_control COMMAND chast-host-control-test)
     set_tests_properties(host_control PROPERTIES TIMEOUT 180)
     add_test(NAME clipboard_async COMMAND chast-clipboard-async-test)
     set_tests_properties(clipboard_async PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME clipboard_listener COMMAND chast-clipboard-listener-test)
+    set_tests_properties(clipboard_listener PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     add_test(NAME host_login COMMAND chast-host-login-test)
     set_tests_properties(host_login PROPERTIES TIMEOUT 180)
     add_test(NAME block_input COMMAND chast-block-input-test)
@@ -714,6 +731,12 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
     add_test(NAME carrier COMMAND chast-carrier-test)
     add_test(NAME decoder_padding COMMAND chast-decoder-padding-test)
+    # Raw-stream tooling must not guess Annex B framing for VP9.
+    add_test(NAME decode_rejects_vp9
+        COMMAND ${CMAKE_COMMAND}
+                -DDECODE=$<TARGET_FILE:chast-decode>
+                -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/tools/annexb.h
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/decode_rejects_vp9.cmake)
     add_test(NAME mp4_recorder COMMAND chast-mp4-recorder-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture

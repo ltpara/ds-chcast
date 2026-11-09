@@ -74,7 +74,7 @@ void main() {
           case 'openSessionWindow':
             fail('A display window must not create a second session');
           case 'openDisplayWindow':
-            windowStreams.add(call.arguments as int);
+            windowStreams.add((call.arguments as Map)['stream'] as int);
             return true;
           case 'setKeyboardMode':
             keyboardModes.add(call.arguments as String);
@@ -207,7 +207,8 @@ void main() {
       await poll();
       expect(toolbar().keyboardMode, ViewerKeyboardMode.local);
       expect(keyboardModes, contains('local'));
-      expect(ViewPreferences.load().keyboardMode, 'local');
+      expect(ViewPreferences.load(peerId: '127.0.0.1:1').keyboardMode, 'local');
+      expect(ViewPreferences.load().keyboardMode, 'physical');
       toolbar().onKeyboardMode!(ViewerKeyboardMode.physical);
       await poll();
       toolbar().onSelectDisplay(kViewerDisplayAll);

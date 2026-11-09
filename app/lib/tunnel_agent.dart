@@ -185,6 +185,7 @@ class TunnelAgent {
     required String hostId,
     required TunnelMode mode,
     String key = '',
+    String linkKey = '',
     String serverPublicKey = '',
     String proxy = '',
   }) {
@@ -200,8 +201,12 @@ class TunnelAgent {
       mode.name,
       // The key and the proxy URL (which may carry credentials) travel over
       // stdin, never argv: any process of this user, EDR and audit logs can
-      // read a child's command line.
-      if (key.isNotEmpty) '--server-key-stdin',
+      // read a child's command line. The connection key replaces the
+      // management key when the deployment issues one.
+      if (linkKey.isNotEmpty)
+        '--link-key-stdin'
+      else if (key.isNotEmpty)
+        '--server-key-stdin',
       if (proxy.isNotEmpty) '--proxy-stdin',
       if (serverPublicKey.isNotEmpty) ...<String>[
         '--server-pubkey',
@@ -230,6 +235,7 @@ class TunnelAgent {
           hostId: hostId,
           mode: server.mode,
           key: server.key,
+          linkKey: server.linkKey,
           serverPublicKey: serverPublicKey,
           proxy: server.proxy,
         );
@@ -241,11 +247,13 @@ class TunnelAgent {
         tr('无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。', <String, Object?>{'exe': exe, 'p2': error.message}),
       );
     }
-    if (server.key.isNotEmpty || server.proxy.isNotEmpty) {
+    final String credential =
+        server.linkKey.isNotEmpty ? server.linkKey : server.key;
+    if (credential.isNotEmpty || server.proxy.isNotEmpty) {
       try {
-        // Order matches the helper: server key first, then the proxy URL.
-        if (server.key.isNotEmpty) {
-          process.stdin.write('${server.key}\n');
+        // Order matches the helper: connection credential first, then proxy.
+        if (credential.isNotEmpty) {
+          process.stdin.write('$credential\n');
         }
         if (server.proxy.isNotEmpty) {
           process.stdin.write('${server.proxy}\n');

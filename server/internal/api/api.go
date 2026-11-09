@@ -73,8 +73,19 @@ type Config struct {
 	HostControlLinked func(string) bool
 	// Hostname or IP advertised for relay ports.
 	RelayHost string
+	// ServerKey is the deployment's management credential: it signs hosts in to
+	// the console, authorizes registration and host audit, and is accepted as
+	// the fallback for the two role keys below.
 	ServerKey string
-	TTL       time.Duration
+	// LinkKey authorizes viewer lookups only. It is the credential an operator
+	// hands to ordinary users, so it must never open registration, host audit,
+	// the console or metrics. Empty keeps the old server-key behavior.
+	LinkKey string
+	// HostKey authorizes host registration and host-signed audit reports. It is
+	// kept on controlled machines instead of the management key. Empty keeps
+	// the old server-key behavior.
+	HostKey string
+	TTL     time.Duration
 	// RelayOnly hides direct candidates from lookups, mirroring RustDesk's
 	// ALWAYS_USE_RELAY: viewers can still reach the host through the relay or
 	// the shared carrier, but never punch. The admin console flips it at
@@ -469,7 +480,7 @@ type batchLookupResponse struct {
 }
 
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.hostAuthorized(r) {
 		writeError(w, http.StatusUnauthorized, "server key was not accepted")
 		return
 	}
@@ -651,7 +662,7 @@ func (s *server) punchV6(r *http.Request) string {
 }
 
 func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.linkAuthorized(r) {
 		writeError(w, http.StatusUnauthorized, "server key was not accepted")
 		return
 	}
@@ -675,7 +686,7 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 // are reported separately instead of failing the request, so a viewer can
 // render the peers it does know about while flagging stale entries.
 func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !s.linkAuthorized(r) {
 		writeError(w, http.StatusUnauthorized, "server key was not accepted")
 		return
 	}
@@ -1540,31 +1551,50 @@ func boolFloat(v bool) float64 {
 	return 0
 }
 
+// bearerMatches reports whether the request presents stored as its Bearer
+// token. An empty stored credential never matches.
+func bearerMatches(stored string, r *http.Request) bool {
+	if stored == "" {
+		return false
+	}
+	header := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	got := strings.TrimSpace(header[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(stored)) == 1
+}
+
 func (s *server) authorized(r *http.Request) bool {
 	if s.cfg.ServerKey == "" {
 		return true
 	}
-	header := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
-		return false
-	}
-	got := strings.TrimSpace(header[len(prefix):])
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.ServerKey)) == 1
+	return bearerMatches(s.cfg.ServerKey, r)
 }
 
 // Open registration does not grant operator privileges.
 func (s *server) serverKeyAuthorized(r *http.Request) bool {
-	if s.cfg.ServerKey == "" {
-		return false
+	return bearerMatches(s.cfg.ServerKey, r)
+}
+
+// linkAuthorized accepts the connection credential handed to ordinary viewers.
+// The management key remains a superset so a deployment can run both with one
+// secret. When no link key is configured the old server-key rule stands.
+func (s *server) linkAuthorized(r *http.Request) bool {
+	if s.cfg.LinkKey == "" {
+		return s.authorized(r)
 	}
-	header := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
-		return false
+	return bearerMatches(s.cfg.LinkKey, r) || s.serverKeyAuthorized(r)
+}
+
+// hostAuthorized accepts the credential installed on controlled machines.
+// A link key must never reach registration or host audit.
+func (s *server) hostAuthorized(r *http.Request) bool {
+	if s.cfg.HostKey == "" {
+		return s.authorized(r)
 	}
-	got := strings.TrimSpace(header[len(prefix):])
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.ServerKey)) == 1
+	return bearerMatches(s.cfg.HostKey, r) || s.serverKeyAuthorized(r)
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {

@@ -614,7 +614,11 @@ private:
     bool stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left);
     // Each worker owns its viewer's clipboard and microphone state.
     bool clipboard_allowed() const;
-    void request_local_clipboard();
+    bool request_local_clipboard();
+    bool clipboard_native() const {
+        return !config_.clipboard_read && !config_.clipboard_read_files;
+    }
+    std::chrono::milliseconds clipboard_poll_interval() const;
     void cancel_clipboard_work();
     void remember_local_clipboard();
     void apply_peer_clipboard(ClipboardContent content, HostServerStats& stats);
@@ -947,6 +951,8 @@ private:
     uint64_t last_clipboard_hash_ = 0;
     uint64_t clipboard_seq_ = 1;
     std::chrono::steady_clock::time_point next_clipboard_poll_{};
+    uint64_t clipboard_listener_ = 0;
+    uint64_t clipboard_seen_generation_ = 0;
     std::unique_ptr<IAudioDecoder> microphone_decoder_;
     std::unique_ptr<IAudioPlayer> microphone_player_;
     AudioInfo microphone_info_;

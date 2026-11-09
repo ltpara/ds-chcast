@@ -8,6 +8,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <set>
+#include <string>
 #include "chast/security.h"
 #include "chast/decoder.h"
 #include "clipboard_stub.h"
@@ -107,7 +108,9 @@ struct Fixture {
             PermissionMask mask = kPermissionAll, std::string ref = {},
             uint16_t display = kDisplayAuto, ServerInfo* description = nullptr,
             VideoCodecMask decoders = kVideoCodecAll,
-            std::optional<StreamCodecPreference> preference = {}) {
+            std::optional<StreamCodecPreference> preference = {},
+            VideoCodecMask decoders_444 = 0,
+            VideoChroma prefer_chroma = VideoChroma::Yuv420) {
         QuicClientConfig cfg;
         cfg.host = "127.0.0.1";
         cfg.port = port;
@@ -116,6 +119,8 @@ struct Fixture {
         cfg.requested_permissions = mask;
         cfg.session_mode = mode;
         cfg.decoding_codecs = decoders;
+        cfg.decoding_444 = decoders_444;
+        cfg.prefer_chroma = prefer_chroma;
         cfg.codec_preference = preference.value_or(config.settings.codec == VideoCodec::Hevc ?
             StreamCodecPreference::Hevc : config.settings.codec == VideoCodec::Av1 ?
             StreamCodecPreference::Av1 : StreamCodecPreference::H264);
@@ -631,7 +636,10 @@ void static_desktop_and_followers() {
             "repeat-unsupported encoder imports retained GPU surface");
     const unsigned calls = f.media->encodes + f.media->repeats;
     std::this_thread::sleep_for(160ms);
-    require(f.media->encodes + f.media->repeats == calls, "idle desktop does not encode without a request");
+    // RustDesk static_refresh repeats an idle monitor in a bounded burst
+    // (at most 30 fps) so rate control can refine the last picture.
+    const unsigned refined = f.media->encodes + f.media->repeats - calls;
+    require(refined <= 6, "idle desktop refinement is capped at 30 fps");
 
     f.media->hold_frames = true;
     f.media->reset_requested = true;
@@ -1680,6 +1688,72 @@ void shared_camera_service() {
     finish(desktop);
 }
 
+// A camera opens on the desktop connection and shares its codec group. A
+// camera that can only supply 4:2:0 must renegotiate the desktop instead of
+// leaving one source at 4:4:4; closing the camera restores full color.
+void shared_camera_full_color() {
+    Fixture f;
+    f.media->moving = true;
+    f.media->original_bgra = true;
+    f.config.settings.allow_camera = true;
+    f.config.settings.codec = VideoCodec::Vp9;
+    auto camera_media = std::make_shared<host_test::MediaState>();
+    camera_media->moving = true;
+    camera_media->capture_fps = 12;
+    f.config.cameras = [] { return std::vector<CameraDevice>{{1, "test camera", "test-camera-link", true}}; };
+    f.config.camera_capture_factory = [camera_media](const CameraDevice&, LUID, uint32_t, std::string*) {
+        auto info = host_test::display();
+        info.device_name = L"test-camera-link";
+        info.width = 320; info.height = 240; info.rect = {0, 0, 320, 240};
+        return std::make_unique<host_test::Capture>(camera_media, info);
+    };
+    f.config.encoder_factory = [camera_media, desktop = f.media](ID3D11Device*, const EncoderConfig& cfg, std::string*) {
+        return std::make_unique<host_test::Encoder>(cfg.width == 320 ? camera_media : desktop, cfg);
+    };
+    const auto desktop_frame = [](QuicSession& viewer, VideoChroma chroma) {
+        return until([&] {
+            FrameHeader header;
+            std::vector<uint8_t> bytes;
+            if (!viewer.receive_frame(header, bytes, 50ms).ok()) return false;
+            return !bytes.empty() && header.codec == VideoCodec::Vp9 && header.chroma == chroma;
+        });
+    };
+    const auto camera_frame = [](QuicSession& viewer, VideoChroma chroma) {
+        return until([&] {
+            FrameHeader header;
+            std::vector<uint8_t> bytes;
+            if (!viewer.receive_camera_frame(header, bytes, 30ms).ok()) return false;
+            return !bytes.empty() && header.codec == VideoCodec::Vp9 && header.width == 320 &&
+                header.chroma == chroma;
+        });
+    };
+    f.start();
+    auto desktop = f.connect(SessionMode::Desktop, kPermissionAll, {}, kDisplayAuto, nullptr,
+        kVideoCodecAll, StreamCodecPreference::Vp9, kVideoCodecVp9, VideoChroma::Yuv444);
+    require(desktop_frame(*desktop, VideoChroma::Yuv444),
+            "a full-color VP9 connection receives 4:4:4");
+    require(desktop->request_camera_list().ok(), "request camera list");
+    CameraList list;
+    require(until([&] { return desktop->take_camera_list(list); }) && list.cameras.size() == 1,
+            "camera enumeration is announced");
+    require(desktop->request_camera_start(list.cameras.front().id).ok(),
+            "start the 4:2:0-only camera");
+    CameraResult started;
+    require(until([&] { return desktop->take_camera_result(started); }, 5s) &&
+                started.code == CameraCode::Ok,
+            "camera start renegotiates the shared format");
+    require(camera_frame(*desktop, VideoChroma::Yuv420) &&
+                desktop_frame(*desktop, VideoChroma::Yuv420),
+            "camera and desktop both stream 4:2:0 while the camera is open");
+    require(desktop->request_camera_stop().ok(), "stop the 4:2:0-only camera");
+    require(desktop_frame(*desktop, VideoChroma::Yuv444),
+            "closing the camera restores the desktop's full-color format");
+    finish(desktop);
+    require(until([&] { return camera_media->capture_destroyed == 1 &&
+                camera_media->encoder_created == camera_media->encoder_destroyed; }),
+            "the camera pipeline is released on its service thread");
+}
+
 void operator_connection_management() {
     Fixture f;
     f.config.settings.max_viewers = 4;
@@ -1934,6 +2008,9 @@ void application_latency() {
             "host measures authenticated application round trips");
     require(until([&] { return viewer->take_stream_update(info) && info.framerate > 15; }),
             "good application replies raise shared FPS on a static desktop");
+    const auto idle = f.host->status().stats;
+    require(idle.repeats > 0 && idle.video_pending_frames == 0,
+            "static refinements are best effort and claim no delivery-window credit");
     finish(viewer);
 }
 
@@ -1947,7 +2024,7 @@ void video_backpressure() {
     require(keyframe(*viewer), "moving video begins with an IDR");
     require(until([&] {
         const auto stats = f.host->status().stats;
-        return stats.qos_probe_replies >= 4 && stats.video_pending_ms > 2000 && stats.framerate <= 2;
+        return stats.qos_probe_replies >= 4 && stats.video_pending_ms > 2000 && stats.framerate <= 5;
     }, 7s), "unconsumed video throttles shared QoS while control probes still return");
     const auto blocked = f.host->status().stats;
     require(blocked.video_pending_frames > 0 && blocked.video_pending_frames <= 60 && blocked.encoded < 60,
@@ -1967,7 +2044,7 @@ void video_backpressure() {
         }
         const auto stats = f.host->status().stats;
         return fresh_idr && pictures > blocked.video_pending_frames && stats.video_receipts > blocked.video_receipts &&
-               stats.video_pending_ms < 500 && stats.framerate > 2;
+               stats.video_pending_ms < 500 && stats.framerate > 5;
     }, 12s), "consumption resumes at a fresh IDR and shared FPS recovers");
     require(f.media->capture_created == 1 && f.media->encoder_created == 1,
             "network recovery preserves the shared capture and encoder");
@@ -2165,6 +2242,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--camera") {
         run("shared camera service and codec negotiation", shared_camera_service);
+        run("camera 4:2:0 fallback on a full-color desktop", shared_camera_full_color);
         WSACleanup();
         return failures ? 1 : 0;
     }
@@ -2214,6 +2292,7 @@ int main(int argc, char** argv) {
     run("global codec preference voting", global_codec_preferences);
     run("runtime hardware to software recovery", runtime_software_recovery);
     run("shared camera service and codec negotiation", shared_camera_service);
+    run("camera 4:2:0 fallback on a full-color desktop", shared_camera_full_color);
     run("operator connection management", operator_connection_management);
     run("authenticated service connection management", service_connection_management);
     run("host application latency probes", application_latency);

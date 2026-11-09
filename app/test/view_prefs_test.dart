@@ -206,4 +206,80 @@ void main() {
     expect(readFile()['file_sort_asc'], false);
     expect(readFile()['browser_dir'], 'photos');
   });
+
+  test('view, mouse and keyboard choices follow the device', () {
+    ViewPreferences.save(
+      const ViewPreferences(fit: 0, stats: false),
+      peerId: '222222222',
+    );
+    ViewPreferences.save(
+      const ViewPreferences(
+        fit: 1,
+        stats: true,
+        fileSort: 2,
+        fileSortAscending: false,
+        browserDirectory: 'photos',
+        terminalFontSize: 17,
+        reverseWheel: true,
+        swapButtons: true,
+        keyboardMode: 'local',
+      ),
+      peerId: '111111111',
+    );
+    final ViewPreferences first =
+        ViewPreferences.load(peerId: '111111111');
+    expect(first.fit, 1);
+    expect(first.stats, isTrue);
+    expect(first.reverseWheel, isTrue);
+    expect(first.swapButtons, isTrue);
+    expect(first.keyboardMode, 'local');
+    final ViewPreferences second =
+        ViewPreferences.load(peerId: '222222222');
+    expect(second.fit, 0);
+    expect(second.stats, isFalse);
+    expect(second.keyboardMode, 'physical');
+    // Local browser and terminal state stays shared.
+    expect(second.browserDirectory, 'photos');
+    expect(second.fileSort, 2);
+    expect(second.terminalFontSize, 17);
+    // A device choice must not become every other host's default.
+    expect(readFile().containsKey('view_fit'), isFalse);
+  });
+
+  test('device overrides stay independent of each other', () {
+    ViewPreferences.save(
+      const ViewPreferences(fit: 1),
+      peerId: '111111111',
+    );
+    StreamPreferences.save(
+      const StreamPreferences(codec: 3),
+      peerId: '111111111',
+    );
+    ViewPreferences.save(
+      const ViewPreferences(fit: 1, stats: true),
+      peerId: '111111111',
+    );
+    ViewPreferences.save(
+      const ViewPreferences(fit: 0),
+      peerId: '222222222',
+    );
+    final ViewPreferences first =
+        ViewPreferences.load(peerId: '111111111');
+    expect(first.fit, 1);
+    expect(first.stats, isTrue);
+    expect(StreamPreferences.load(peerId: '111111111').codec, 3);
+    expect(ViewPreferences.load(peerId: '222222222').fit, 0);
+    expect(ViewPreferences.load(peerId: '222222222').stats, isFalse);
+  });
+
+  test('a device without overrides uses the shared defaults', () {
+    ViewPreferences.save(
+      const ViewPreferences(fit: 1, stats: true, keyboardMode: 'local'),
+    );
+    final ViewPreferences fallback =
+        ViewPreferences.load(peerId: '333333333');
+    expect(fallback.fit, 1);
+    expect(fallback.stats, isTrue);
+    expect(fallback.keyboardMode, 'local');
+  });
 }

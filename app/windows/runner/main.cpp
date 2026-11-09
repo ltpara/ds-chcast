@@ -46,10 +46,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // line or a temporary file.
   std::function<bool(const std::string&)> open_window;
   FlutterWindow::OpenDisplayWindow open_display;
-  open_display = [&windows](std::shared_ptr<chast_viewer::SharedViewerSession> session, uint32_t stream) {
+  open_display = [&windows](std::shared_ptr<chast_viewer::SharedViewerSession> session, uint32_t stream,
+                            const std::string& peer_id) {
     if (windows.size() >= kMaxSessionWindows) return false;
     flutter::DartProject display_project(L"data");
-    display_project.set_dart_entrypoint_arguments({"--display-window", std::to_string(stream)});
+    display_project.set_dart_entrypoint_arguments(
+        {"--display-window", std::to_string(stream), "--peer-id", peer_id});
     auto child = std::make_unique<FlutterWindow>(display_project,
         std::function<bool(const std::string&)>{}, FlutterWindow::OpenDisplayWindow{}, std::move(session), stream);
     const unsigned int offset = static_cast<unsigned int>(windows.size() % 8) * 28;

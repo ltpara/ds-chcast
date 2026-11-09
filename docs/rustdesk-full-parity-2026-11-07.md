@@ -67,14 +67,14 @@
 | C22 | Legacy / Translate 模式 | 桌面菜单提供 Map、Legacy、Translate；Translate 标注 beta（C `flutter/lib/desktop/widgets/remote_toolbar.dart:2615`） | **缺失**：无模式切换与字符转换路径；跨布局直接输入体验不完全一致。Auto 仅协议/内部出现，不单列产品缺口 | `app/windows/viewer/keyboard_capture.cc:41`、`include/chast/protocol.h` 的 `KeyEvent` |
 | C23 | 中文 / IME / 发送文本 | 依模式和平台处理字符输入（C） | **部分**：有 Unicode“发送文本”对话框；这不是本地 IME 组合输入自动进入远程画面的 Translate 体验 | `app/lib/widgets/send_text_dialog.dart:10`、`src/win/input.cc` |
 | C24 | 鼠标、相对模式、触摸/笔、触控板 | 相应输入能力，平台有差异（C） | **已具备 / 待验**：相对鼠标、左右键互换、滚轮反向、多触点、压感、Pan/Zoom；实际触控板、笔和双机布局仍待验 | `app/lib/remote_pointer.dart`、`src/win/input.cc`、协议 v43/v48 |
-| C25 | 每设备会话偏好 | `PeerConfig::load(id)` 保存对端设置（C `src/client.rs:3043`） | **部分**：画质/FPS/视图/鼠标偏好写入全局 `ui.json`，不能为不同主机独立记忆；不包括已有按设备保存的密码和指纹 | `app/lib/stream_prefs.dart:23`、`app/lib/view_prefs.dart:43` |
+| C25 | 每设备会话偏好 | `PeerConfig::load(id)` 保存对端设置（C `src/client.rs:3043`） | **已具备**：`ui.json` 根键保留全局默认，新增 `peers.<id>` 覆盖画质/编码/FPS/全色、适配/统计/滚轮/左右键/键盘模式；设备键为服务器 host ID 或直连地址，独立显示窗口同样按该键加载。文件浏览器排序/目录与终端字号仍为全局，属本地面板状态 | `app/lib/prefs_store.dart:36`、`app/lib/stream_prefs.dart:45`、`app/lib/view_prefs.dart:66`、`app/lib/pages/session_page.dart:336` |
 
 ### 剪贴板、文件与录制
 
 | ID | 能力 | RustDesk 基线 | 本项目现状及缺口 | 本地依据 |
 | --- | --- | --- | --- | --- |
 | C26 | 文本、HTML、RTF、图片剪贴板 | 多格式同步（C `src/clipboard.rs`） | **已具备**：异步读写、失败重试、基线、撤权取消已修复；系统原生调用的取消边界仍存在 | `src/clipboard/clipboard_worker.cc`、`docs/clipboard-async-fix-2026-11-07.md` |
-| C27 | 共享事件驱动剪贴板 | 全局监听器、多订阅者（C `src/clipboard.rs:889`） | **部分**：每端点执行器，仍每 500 ms 轮询；缺进程级共享监听、跨会话来源/路由协调 | `app/windows/viewer/viewer_engine.cc:55`、`src/host/host_server.cc:7761` |
+| C27 | 共享事件驱动剪贴板 | 全局监听器、多订阅者（C `src/clipboard.rs:889`） | **已具备 / 待验**：进程级单监听（消息窗口 + `AddClipboardFormatListener`、原子代次、订阅者按 id 注册，首订阅启动/末退订停止）；原生后端由 `WM_CLIPBOARDUPDATE` 代次驱动并保留 5 s 兜底，合成后端或监听不可用时仍 500 ms 轮询；多窗口/多主机复制的人工复核待做 | `include/chast/clipboard_listener.h`、`src/clipboard/clipboard_listener.cc`、`app/windows/viewer/viewer_engine.cc`、`src/host/host_server.cc`、`tests/clipboard_listener_test.cc` |
 | C28 | 文件复制粘贴 | Windows cliprdr 提供延迟请求文件内容（C `libs/clipboard/src/windows/wf_cliprdr.c`） | **部分**：收到列表就启动暂存下载，完成后写本地 CF_HDROP；最多 256 文件，FileList 只表示普通文件，不能保留纯空目录 | `include/chast/clipboard.h:45`、`src/clipboard/clipboard.cc:495`、`app/windows/viewer/viewer_engine.cc:3349` |
 | C29 | 单向剪贴板 / 单向文件 | 有阻止被控端→控制端的独立策略（D11） | **缺失**：Clipboard/FileTransfer 各只有总权限位，无法做到“可上传但不可下载”或“只允许向主机粘贴” | `include/chast/protocol.h:1016`、`include/chast/host_settings.h:70` |
 | C30 | 初始剪贴板同步选择 | 可选择连接时同步控制端已有内容（D11 `sync-init-clipboard`） | **缺失选项 / 取舍**：当前首次有效快照只建基线，默认保护历史内容；可增加明确的单次或持久化选择 | `docs/clipboard-async-fix-2026-11-07.md` |
@@ -117,7 +117,7 @@
 | S09 | 2FA、找回、安全密钥 | Pro 文档列 Email/TOTP；本项目另有 WebAuthn（D02） | **已具备 / 部分待验**：TOTP、恢复码、Email/SMS、WebAuthn；不把 WebAuthn 反向推断为 RustDesk 也有 | `server/internal/webauthn/`、`app/lib/security_key.dart`、相关 account/API |
 | S10 | OIDC 单点登录 | Pro（D02） | **已具备**：授权码+PKCE/JWKS、浏览器登录、身份链接；部署为一个 Provider 配置 | `server/internal/oidc/`、`server/internal/api/oidc.go`、`app/lib/server_api.dart` |
 | S11 | LDAP / AD 直连认证 | Pro LDAP；官方文档明确尚不支持 LDAP 组同步（D07） | **缺失**：仅 OIDC 等认证，无 LDAP bind/search/首次登录建号。经外部 IdP 对接 AD 可作为现有替代，不等于内建 LDAP | `server/internal/oidc/`、`server/internal/api/api.go`、`server/cmd/chast-server/main.go` |
-| S12 | 普通连接凭据与管理凭据隔离 | Pro 区分普通账号、Admin Role、API Token（D03/D06/D10） | **重要缺口**：私服查看器用于 lookup/punch 的 server-key 同时是后台最高权限凭据；普通客户端拿到它就能通过管理 API 鉴权 | `app/lib/server_settings.dart:174`、`server/internal/api/api.go:644`、`:1526`、`server/internal/api/console.go:35` |
+| S12 | 普通连接凭据与管理凭据隔离 | Pro 区分普通账号、Admin Role、API Token（D03/D06/D10） | **已实现角色密钥分离（G01）**：新增部署级 link/host 角色密钥；lookup/lookupBatch 与 UDP/TCP punch 只认 link key，注册与主机签名审计只认 host key，管理台/metrics/console 等仍只认 server key；角色 key 为空时回退旧 server-key 语义，管理 key 始终可作根凭据。回环与测试证据见 G01 | `server/internal/api/api.go`、`server/internal/api/console.go`、`server/internal/rendezvous/`、`app/lib/server_settings.dart`、`host/tunnel.cc` |
 | S13 | 用户/用户组→设备连接 ACL | Pro Access Control（D03） | **缺失**：账号组仅约束后台操作/审计；lookup/punch 未按登录账号和设备组判定。移出组/封禁账号不是桌面连接资格撤销 | `server/internal/account/groups.go:13`、`server/internal/api/groups.go:114`、`server/internal/rendezvous/rendezvous.go:69` |
 | S14 | 用户级会话操作角色 | Pro Control Role，区别于连接 ACL（D04） | **缺失**：主机本地权限和审批存在，但 Hello 无账号角色凭证；不能集中规定“甲可看、乙可传文件、丙可开终端” | `include/chast/protocol.h:1335`、`src/host/host_security.cc` |
 | S15 | 批量配置策略 / 下发 | Pro Strategy（D05） | **缺失**：会话内远程改 14 项开关已做，但没有设备/用户/组策略对象、版本、分配、状态及批量同步 | `include/chast/protocol.h:2103`、`server/internal/configpush/configpush.go:22` |
@@ -140,7 +140,7 @@
 
 | 编号 | 优先级 | 问题与影响 | 建议的完成标准 |
 | --- | --- | --- | --- |
-| G01 | **P0（配置私服并向普通用户发连接密钥时）** | **连接密钥可同时管理服务器**：S12 的 server-key 被 lookup、punch 和后台共用，违背普通使用者与管理员分离 | 普通账号/短期设备连接凭证可 lookup/punch；注册凭据、连接凭据、管理凭据独立；普通查看器凭据对建号、重置身份、审计/录制越权操作返回拒绝。覆盖 HTTP、UDP、TCP/WS 与续期 |
+| G01 | **P0（配置私服并向普通用户发连接密钥时）** | **连接密钥可同时管理服务器**：S12 的 server-key 被 lookup、punch 和后台共用，违背普通使用者与管理员分离。**2026-11-09 已实现角色密钥分离**（见下文状态） | 普通账号/短期设备连接凭证可 lookup/punch；注册凭据、连接凭据、管理凭据独立；普通查看器凭据对建号、重置身份、审计/录制越权操作返回拒绝。覆盖 HTTP、UDP、TCP/WS 与续期 |
 | G02 | **P1，企业准入前必做** | **连接 ACL 未落到连接链路**：S13 的组管理不能限制谁连谁，账号封禁也不是主机本地密码失效 | 账号/组→设备策略，禁用设备/账号、移组、过期票据均可拒绝；直连和经服务器两条路径明确受管/非受管策略，不允许回退绕过 |
 | G03 | P1 | **账号级会话权限角色缺失**：S14 只有主机本地授权 | 服务端签名、绑定用户/主机/有效期的权限凭证；主机独立验证并按明确规则与本地同意合成；覆盖所有敏感操作和撤权。不需要让中继解密桌面数据 |
 | G04 | P1 | **集中策略缺失**：S15 的“配置下发”目前仅会合地址列表；会话内改单机设置不能代替设备管理 | 策略对象、分配范围、优先级、版本、同步确认和失败可见；用户设置与策略的冲突行为有明确定义。RustDesk Strategy 本身也不等于所有值永久强制锁定 |
@@ -148,13 +148,13 @@
 | G06 | P1 | **AV1 与录制不可组合**（C37） | 增加 AV1 合法封装，或先提供明确的编码协商/选项互斥；覆盖开始录制、录制中切 AV1、回切及分段文件可读验证，不改变零拷贝采集 |
 | G07 | P1 | **大目录条目不可达**（C32） | 加分页/游标或流式列举；10,000 项目录能逐页访问且递归下载完整；测试目录在分页期间变化的行为 |
 | G08 | P1 | **文件剪贴板体验不等价**（C28） | 先保留空目录、展示数量/大小限制；若追求 RustDesk 体验，再实现按粘贴/读取请求传内容，避免仅复制即全量下载；覆盖取消、断线、覆盖源文件 |
-| G09 | P1 | **剪贴板仍按会话轮询**（C27） | 进程级系统变更通知与订阅者管理；保持已有异步读写和基线规则；多窗口/多主机复制时验证不回环、不串会话、不增加阻塞线程 |
+| G09 | P1 | **剪贴板仍按会话轮询**（C27；进程级监听已补齐） | 已实现进程级系统变更通知与订阅者管理：原生后端事件驱动、5 s 兜底，合成后端保持 500 ms；既有异步读写与基线规则不变。剩余：多窗口/多主机复制的真实 GUI 复核，不回环、不串会话、不额外阻塞线程 |
 | G10 | P1 | **键盘缺 Translate / Legacy 选择**（C22/C23） | Map 保持默认；补 Translate 并验证非 US 布局、AltGr、死键、Unicode/IME 与快捷键混合。Legacy 是否需要可随目标旧系统决定；不能把 Auto 枚举当作额外菜单承诺 |
 | G11 | P1 | **自动录制链路缺失**（C38） | 分别实现入站主机/出站查看器自动录制、存储容量/失败提示/保留策略；如要求集中留档，应由受管主机负责并报告失败，不能只看可选上传 |
 | G12 | P1 | **多人管理权限颗粒度和自动化凭据不足**（S16/S17） | 资源/动作 scope、组范围、独立机器令牌的创建/到期/撤销/审计；控制台委派与普通连接权限分开 |
 | G13 | P2（跨地区部署可升 P1） | **无就近中继**（S06） | 在现有健康/黏性基础上按区域或两端实测延迟选择；节点失效回退；用真实多地区网络验收收益 |
 | G14 | P2（AD 用户可升 P1） | **LDAP 认证缺失**（S11） | LDAP/LDAPS 连接测试、过滤、登录、首次建号、账号停用语义；不把 RustDesk 文档也未支持的 LDAP 组同步当作必须对齐项 |
-| G15 | P2 | **全局偏好和固定画质选项**（C14/C25） | 按服务器身份+设备身份存储偏好，保留全局默认；支持自定义 FPS/质量及显示器窗口布局恢复 |
+| G15 | P2 | **固定画质选项和显示器窗口布局**（C14/C25；按设备偏好已补齐） | 已按设备身份存储偏好并保留全局默认；剩余：自定义 FPS/质量数值入口及显示器窗口布局恢复 |
 | G16 | P2 | **地址簿高级协作不全**（S20/S21） | 先补备注、回收站和组织组共享；云端密码同步另做密钥/撤销设计，不直接上传现有 DPAPI 密文或明文 |
 | G17 | P2 | **临时支持流程不全**（C06/C09/C45） | 分别设计便携提权、角色交接、OS 登录便利功能；要求本地同意、内存凭据传递和可恢复的交接，不沿用“不装服务就绝对做不到”的假设 |
 | G18 | P2 | **完整文件管理范围和操作**（C31/C34） | 可授权多个共享根/盘符、隐藏文件选项、递归删除确认、可协商压缩；保留根目录和重解析点防护 |
@@ -171,6 +171,8 @@
 4. `server/internal/api/accounts.go` 的账号管理也走这套后台授权。
 
 因此，**当管理员把该密钥发给普通连接者时，实际上也发出了管理能力**。这并不意味着匿名用户已经能直接控制任意桌面：主机端仍有自己的密码/令牌、审批、2FA 和权限检查。建议修复的是服务端信任边界及凭据用途，而不是否定现有主机认证。
+
+**2026-11-09 状态：已实现。** `chast-server` 新增 `--link-key` 与 `--host-key`（要求同时设置 `--server-key`，三者互不相同；未设置角色密钥时保持旧单密钥语义）。API 层用 `linkAuthorized`/`hostAuthorized`/`serverKeyAuthorized` 分别守护 lookup/lookupBatch、注册/主机签名审计、管理入口（console/groups/wake/metrics/审计查询/录制管理），Bearer 比较为常量时间；UDP punch 与 TCP punch 的证明校验接受 link key 或管理 key，拒绝 host key 与错误 key。查看器 `ServerSettings.linkKey`（`connectionKey` 在为空时回退 server key）贯穿单条/批量 lookup、`chast-tunnel viewer --link-key-stdin` 与打洞；主机 `host_key` 经 ini、服务模式合并、`chast-tunnel host --host-key`/`--host-key-stdin` 覆盖注册、保活续期与审计转发，托盘连接服务对话框可编辑。验证：`go test ./...`（服务端全量）与 Flutter `analyze` 无问题、684 项测试通过；`chast-host-settings-test`、`chast-host-tunnel-test` 通过。角色密钥测试覆盖 lookup/批量 lookup、注册、主机审计、建号、身份重置与标签、管理录制列表、WOL、组、metrics、console 审计查询，以及真实 UDP/TCP punch 配对。真实 `chast-server` 回环验收：host key 注册、保活与签名审计（审计行写入成功、spool 消费后删除），link key lookup 并完成 UDP punch→TCP 直连，host key 被 viewer lookup 拒绝，link key 对注册/审计/metrics/groups 均返回 401，管理 key 可 lookup/metrics/审计查询。证据边界：回环不等于公网或真实代理路径；旧 `--server-key` 单密钥部署仍兼容，未做强制迁移。
 
 ## 四、环境验收与发布工程
 

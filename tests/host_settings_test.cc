@@ -107,7 +107,8 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.virtual_display_resolution == b.virtual_display_resolution &&
            a.virtual_display_provider == b.virtual_display_provider &&
            a.tunnel == b.tunnel && a.server_url == b.server_url &&
-           a.server_key == b.server_key && a.proxy == b.proxy && a.tunnel_id == b.tunnel_id &&
+           a.server_key == b.server_key && a.host_key == b.host_key &&
+           a.proxy == b.proxy && a.tunnel_id == b.tunnel_id &&
            a.tunnel_old_id == b.tunnel_old_id &&
            a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen &&
            a.audit_spool == b.audit_spool;
@@ -181,6 +182,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.tunnel = false;
     settings.server_url = "https://rendezvous.example.com/chast";
     settings.server_key = "server secret";
+    settings.host_key = "host register secret";
     settings.proxy = "socks5://127.0.0.1:10808";
     settings.tunnel_id = "devbox.office";
     settings.tunnel_old_id = "devbox.home";
@@ -196,6 +198,13 @@ void test_round_trip(const std::filesystem::path& dir) {
     check(loaded.existed, "saved settings are found again");
     check(loaded.warning.empty(), "a saved file loads without warnings");
     check(same(loaded.settings, settings), "every setting round-trips");
+
+    settings.codec = chast::VideoCodec::Vp9;
+    const std::string vp9_path = (dir / L"round-trip" / L"vp9.ini").string();
+    check(chast::save_host_settings(vp9_path, settings, &error), "vp9 settings save");
+    const chast::HostSettingsLoad vp9_loaded = chast::load_host_settings(vp9_path);
+    check(vp9_loaded.settings.codec == chast::VideoCodec::Vp9 && vp9_loaded.warning.empty(),
+          "vp9 round-trips without a warning");
 }
 
 void test_missing_file(const std::filesystem::path& dir) {
@@ -288,7 +297,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
-               "codec=vp9\n"
+               "codec=vp10\n"
                "bitrate_kbps=fast\n"
                "framerate=0\n"
                "quality=2\n"
@@ -300,6 +309,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "tunnel=perhaps\n"
                "server_url=ftp://example.com\n"
                "server_key=" + std::string(300, 's') + "\n"
+               "host_key=" + std::string(300, 'h') + "\n"
                "proxy=ftp://example.com:21\n"
                "tunnel_id=bad id\n"
                "tunnel_key=short\n"
@@ -352,6 +362,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel, "an unparsable tunnel toggle keeps the default");
     check(settings.server_url.empty(), "a non-http service URL is dropped");
     check(settings.server_key.empty(), "an oversized server key is dropped");
+    check(settings.host_key.empty(), "an oversized host key is dropped");
     check(settings.proxy.empty(), "a non-proxy URL is dropped");
     check(settings.tunnel_id.empty(), "an invalid device id is dropped");
     check(settings.tunnel_key.empty(), "a short device key is dropped");
@@ -366,8 +377,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
                             "framerate",
                             "quality", "display", "virtual_display", "virtual_display_monitors",
                             "virtual_display_resolution", "virtual_display_provider", "tunnel",
-                            "server_url", "server_key", "proxy", "tunnel_id", "tunnel_key",
-                            "tunnel_listen"}) {
+                            "server_url", "server_key", "host_key", "proxy", "tunnel_id",
+                            "tunnel_key", "tunnel_listen"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
     }
@@ -531,9 +542,13 @@ void test_codec_names() {
           "avc is an accepted alias");
     check(chast::parse_codec_setting("AV1", codec) && codec == chast::VideoCodec::Av1,
           "AV1 is accepted in any case");
-    check(!chast::parse_codec_setting("vp9", codec), "an unknown codec is rejected");
+    check(chast::parse_codec_setting("vp9", codec) && codec == chast::VideoCodec::Vp9,
+          "vp9 is accepted");
+    check(!chast::parse_codec_setting("vp10", codec), "an unknown codec is rejected");
     check(std::string(chast::codec_setting_name(chast::VideoCodec::Hevc)) == "hevc",
           "HEVC is written as hevc");
+    check(std::string(chast::codec_setting_name(chast::VideoCodec::Vp9)) == "vp9",
+          "VP9 is written as vp9");
     check(std::string(chast::codec_setting_name(chast::VideoCodec::Av1)) == "av1",
           "AV1 is written as av1");
 }

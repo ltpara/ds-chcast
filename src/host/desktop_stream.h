@@ -93,6 +93,12 @@ public:
     // Resume this subscriber at a fresh IDR after network backpressure.
     static void discard_backlog(IDxgiCapturer& capture);
     static uint64_t capture_time(const IDxgiCapturer& capture);
+    // RustDesk static_refresh::max_repeat_frames: how many times an idle
+    // monitor may repeat its last picture so rate control can refine it.
+    // 0 disables static refinement for that format.
+    static unsigned static_refresh_budget(VideoCodec codec, float quality,
+                                          EncoderBackend backend,
+                                          const std::string& implementation = {});
     // Latest pointer state, independent of this subscriber's video backlog.
     static std::shared_ptr<const CursorInfo> cursor_snapshot(const IDxgiCapturer& capture);
     // Reconcile a source with a fresh OS enumeration once for all subscribers.

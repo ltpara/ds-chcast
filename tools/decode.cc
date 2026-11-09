@@ -3,6 +3,9 @@
 //
 //   chast-decode --in capture.h264 [--codec h264|hevc] [--dump-yuv out.yuv] [--quiet]
 //
+// VP9 and AV1 have no Annex B framing and cannot be split from a raw file;
+// naming them is an explicit error rather than a mis-parse.
+//
 // The file is split into access units at AUD NAL units, the same units the
 // encoder emits and the QUIC sender puts on the wire, so this exercises exactly
 // the per-access-unit path the receiver uses.
@@ -39,6 +42,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.codec = chast::VideoCodec::Hevc;
             } else if (value == "av1") {
                 options.codec = chast::VideoCodec::Av1;
+            } else if (value == "vp9") {
+                options.codec = chast::VideoCodec::Vp9;
             } else {
                 std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                 return false;
@@ -53,7 +58,7 @@ bool parse_args(int argc, char** argv, Options& options) {
         }
     }
     if (options.in_path.empty()) {
-        std::fprintf(stderr, "usage: chast-decode --in FILE [--codec h264|hevc] "
+        std::fprintf(stderr, "usage: chast-decode --in FILE [--codec h264|hevc|av1|vp9] "
                              "[--dump-yuv FILE] [--quiet]\n");
         return false;
     }
@@ -89,17 +94,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (options.codec == chast::VideoCodec::Av1 ||
+        options.codec == chast::VideoCodec::Vp9) {
+        std::fprintf(stderr,
+                     "%s has no Annex B framing; this tool replays H.264 and HEVC "
+                     "elementary streams only\n",
+                     chast_tools::codec_name(options.codec));
+        return 1;
+    }
     const std::vector<chast_tools::AccessUnit> units =
-        options.codec == chast::VideoCodec::Av1
-            ? std::vector<chast_tools::AccessUnit>()
-            : chast_tools::split_access_units(data, options.codec);
+        chast_tools::split_access_units(data, options.codec);
     if (units.empty()) {
-        if (options.codec == chast::VideoCodec::Av1) {
-            std::fprintf(stderr,
-                         "AV1 is OBU-framed and has no Annex B split; this tool replays "
-                         "H.264 and HEVC elementary streams only\n");
-            return 1;
-        }
         std::fprintf(stderr, "no NAL units found; is this an Annex B %s stream?\n",
                      chast_tools::codec_name(options.codec));
         return 1;
