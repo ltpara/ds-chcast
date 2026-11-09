@@ -71,12 +71,13 @@ class PrefsStore {
     }, onFileError: () {});
   }
 
-  /// Updates only [peerId]'s section, keeping the other peer overrides and the
-  /// root defaults untouched.
+  /// Updates [peerId]'s section and optional shared panel fields in one lock,
+  /// keeping the other peer overrides and unspecified root keys untouched.
   static void updatePeer(
     String peerId,
-    void Function(Map<String, Object?> peer) change,
-  ) {
+    void Function(Map<String, Object?> peer) change, {
+    Map<String, Object?> shared = const <String, Object?>{},
+  }) {
     if (!_validPeerId(peerId)) {
       return;
     }
@@ -84,14 +85,14 @@ class PrefsStore {
       final Map<String, Object?> peers = _peers(root);
       final Map<String, Object?> section = _section(peers, peerId);
       change(section);
+      root.addAll(shared);
       peers[peerId] = section;
       root[peersKey] = peers;
     });
   }
 
-  /// Host IDs are server-assigned; direct connections fall back to the entered
-  /// address. The length guard keeps a pasted label from growing the file
-  /// without bound.
+  /// ConnectTarget namespaces server IDs and normalizes direct addresses.
+  /// The length guard also matches the native child-window argument limit.
   static bool _validPeerId(String peerId) =>
       peerId.isNotEmpty && peerId.length <= _maxPeerId;
 

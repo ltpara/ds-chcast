@@ -324,6 +324,10 @@ inline constexpr char kBrowseNestedText[] = "chast browse nested file\n";
 // way the file browser's "upload here" button does.
 inline constexpr char kBrowseUploadName[] = "chast-verify-browse-upload.txt";
 inline constexpr char kBrowseUploadText[] = "uploaded into the browsed folder\n";
+// The browse probe also seeds a hidden file at the root. The default listing
+// must omit it and the show-hidden view must carry it, like RustDesk.
+inline constexpr char kBrowseHiddenName[] = "chast-verify-hidden.bin";
+inline constexpr char kBrowseHiddenText[] = "hidden\n";
 
 // The port-forward probe's payload crosses several CPFW chunks in each
 // direction, and its last chunk is short.
@@ -1896,6 +1900,7 @@ struct ReceiverStats {
     bool browse_probe = false;
     uint64_t browse_root_entries = 0;
     uint64_t browse_nested_entries = 0;
+    bool browse_hidden_ok = false;
     bool browse_list_ok = false;
     bool browse_negative_ok = false;
     bool browse_download_ok = false;
@@ -3336,6 +3341,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.browse_probe = options.file_browse;
     enum class BrowseStep {
         ListRoot,
+        HiddenView,
         ListNested,
         Escapes,
         Missing,
@@ -3347,6 +3353,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         ReList,
         MakeFolder,
         MakeFolderAnswer,
+        MakeChild,
+        MakeChildAnswer,
         FolderList,
         Rename,
         RenameAnswer,
@@ -3411,12 +3419,15 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!stats.browse_probe || browse_step == BrowseStep::Done) {
             return true;
         }
-        if (browse_step == BrowseStep::ListRoot || browse_step == BrowseStep::ListNested) {
+        if (browse_step == BrowseStep::ListRoot || browse_step == BrowseStep::HiddenView ||
+            browse_step == BrowseStep::ListNested) {
             const bool root = browse_step == BrowseStep::ListRoot;
+            const bool hidden_view = browse_step == BrowseStep::HiddenView;
+            const bool at_root = root || hidden_view;
             if (browse_wait_id == 0) {
                 browse_wait_id = ++browse_request_id;
-                const chast::Error asked =
-                    session->request_file_list(browse_wait_id, root ? "" : "nested");
+                const chast::Error asked = session->request_file_list(
+                    browse_wait_id, at_root ? "" : "nested", {}, hidden_view);
                 if (!asked.ok()) {
                     stats.browse_error = "request_file_list: " + asked.to_string();
                     return false;
@@ -3431,27 +3442,32 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             if (result.code != chast::FileCode::Ok) {
                 stats.browse_error =
                     std::string("the host refused to list ") +
-                    (root ? "." : "nested") + ": " + result.reason;
+                    (at_root ? "." : "nested") + ": " + result.reason;
                 return false;
             }
             bool seeded_file = false;
             bool seeded_dir = false;
+            bool hidden_file = false;
             for (const chast::FileListEntry& entry : result.entries) {
                 if (entry.name.empty() ||
                     entry.name.find_first_of("/\\") != std::string::npos) {
                     stats.browse_error = "a listed name was empty or carried a separator";
                     return false;
                 }
-                if (root && entry.name == "chast-verify-browse.bin" && !entry.directory &&
+                if (at_root && entry.name == "chast-verify-browse.bin" && !entry.directory &&
                     entry.size == kFileProbeBytes) {
                     seeded_file = true;
                 }
-                if (root && entry.name == "nested" && entry.directory) {
+                if (at_root && entry.name == "nested" && entry.directory) {
                     seeded_dir = true;
                 }
-                if (!root && entry.name == "inner.txt" && !entry.directory &&
+                if (!at_root && entry.name == "inner.txt" && !entry.directory &&
                     entry.size == sizeof(kBrowseNestedText) - 1) {
                     seeded_file = true;
+                }
+                if (entry.name == kBrowseHiddenName && !entry.directory &&
+                    entry.size == sizeof(kBrowseHiddenText) - 1) {
+                    hidden_file = true;
                 }
             }
             if (result.truncated) {
@@ -3465,6 +3481,18 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         "the root listing did not carry the seeded file and folder";
                     return false;
                 }
+                if (hidden_file) {
+                    stats.browse_error = "the default listing carried the hidden file";
+                    return false;
+                }
+                browse_step = BrowseStep::HiddenView;
+            } else if (hidden_view) {
+                if (!seeded_file || !seeded_dir || !hidden_file) {
+                    stats.browse_error =
+                        "the hidden view did not carry the seeded hidden file";
+                    return false;
+                }
+                stats.browse_hidden_ok = true;
                 browse_step = BrowseStep::ListNested;
             } else {
                 stats.browse_nested_entries = result.entries.size();
@@ -3734,10 +3762,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             return true;
         }
-        // File management below the browsed subfolder: create one folder,
-        // rename it, then remove it, checking a fresh listing after each
-        // answer. The names are unique to this run and cleaned up even on a
-        // failure because the last step removes whatever survived.
+        // File management below the browsed subfolder: create one folder and
+        // a child inside it, rename the parent, then remove the non-empty
+        // parent with the recursive operation, checking a fresh listing after
+        // each answer. The names are unique to this run and cleaned up even on
+        // a failure because the last step removes whatever survived.
         if (browse_step == BrowseStep::MakeFolder) {
             browse_wait_id = ++browse_request_id;
             const chast::Error asked =
@@ -3761,6 +3790,32 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 return false;
             }
             stats.browse_folder_ok = true;
+            browse_step = BrowseStep::MakeChild;
+            return true;
+        }
+        if (browse_step == BrowseStep::MakeChild) {
+            browse_wait_id = ++browse_request_id;
+            const chast::Error asked =
+                session->request_file_op(browse_wait_id, chast::FileOperation::MakeDirectory,
+                                         "nested/probe-folder/child", "");
+            if (!asked.ok()) {
+                stats.browse_error = "request_file_op: " + asked.to_string();
+                return false;
+            }
+            browse_step = BrowseStep::MakeChildAnswer;
+            return true;
+        }
+        if (browse_step == BrowseStep::MakeChildAnswer) {
+            chast::FileOpResult answer;
+            if (!take_browse_op(browse_wait_id, answer)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (answer.code != chast::FileCode::Ok) {
+                stats.browse_error =
+                    "the host refused to create the child folder: " + answer.reason;
+                return false;
+            }
             browse_step = BrowseStep::FolderList;
             return true;
         }
@@ -3809,7 +3864,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             browse_step = BrowseStep::Done;
             if (!options.quiet) {
-                std::printf("quic: created, renamed and removed a folder below the browsed one\n");
+                std::printf("quic: created, renamed and recursively removed a folder below the "
+                            "browsed one\n");
             }
             return true;
         }
@@ -3842,7 +3898,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (browse_step == BrowseStep::Remove) {
             browse_wait_id = ++browse_request_id;
             const chast::Error asked =
-                session->request_file_op(browse_wait_id, chast::FileOperation::Remove,
+                session->request_file_op(browse_wait_id, chast::FileOperation::RemoveTree,
                                          "nested/probe-renamed", "");
             if (!asked.ok()) {
                 stats.browse_error = "request_file_op: " + asked.to_string();
@@ -8878,8 +8934,9 @@ int run_verify(const Options& options) {
     }
     if (local.file_browse) {
         // The browse probe needs a deterministic tree below the host's
-        // receive directory: one 300 KiB file at the root and a subfolder
-        // with a small text file. It is rebuilt from scratch every run.
+        // receive directory: one 300 KiB file and one hidden file at the
+        // root, plus a subfolder with a small text file. It is rebuilt from
+        // scratch every run.
         if (local.seconds < 6.0) {
             local.seconds = 6.0;
         }
@@ -8919,6 +8976,25 @@ int run_verify(const Options& options) {
                 if (!inner) {
                     ec = std::make_error_code(std::errc::io_error);
                 }
+            }
+        }
+        if (!ec) {
+            std::ofstream hidden(dir / kBrowseHiddenName,
+                                 std::ios::binary | std::ios::trunc);
+            if (!hidden) {
+                ec = std::make_error_code(std::errc::io_error);
+            } else {
+                hidden.write(kBrowseHiddenText,
+                             static_cast<std::streamsize>(sizeof(kBrowseHiddenText) - 1));
+                hidden.close();
+                if (!hidden) {
+                    ec = std::make_error_code(std::errc::io_error);
+                }
+            }
+            if (!ec &&
+                !SetFileAttributesW((dir / kBrowseHiddenName).c_str(),
+                                    FILE_ATTRIBUTE_HIDDEN)) {
+                ec = std::make_error_code(std::errc::io_error);
             }
         }
         if (ec) {
@@ -9793,6 +9869,8 @@ int run_verify(const Options& options) {
         check(received.browse_probe, "the viewer ran the shared-folder browse probe");
         check(received.browse_list_ok,
               "the viewer listed the shared folder and its subfolder");
+        check(received.browse_hidden_ok,
+              "the hidden file appeared only when the viewer asked for hidden entries");
         check(received.browse_root_entries == 2 && received.browse_nested_entries == 1,
               "both listings carried exactly the seeded entries");
         check(received.browse_negative_ok,

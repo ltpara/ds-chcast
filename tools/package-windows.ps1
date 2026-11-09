@@ -22,11 +22,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'package-payload.ps1')
+if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
+    throw 'version must contain only letters, numbers, dots, underscores and hyphens'
+}
 $root = Split-Path -Parent $PSScriptRoot
 $viewerDir = Join-Path $root "app\build\windows\x64\runner\Release"
 $hostDir = Join-Path $root "build\$Configuration"
 $serverDir = Join-Path $root "server"
-$stage = Join-Path $root "build\package\chast-$Version"
+$stage = Join-Path $root "build\package\chast-$Version-$([Guid]::NewGuid().ToString('N'))"
 $zip = Join-Path $root "build\package\chast-$Version.zip"
 $stub = Join-Path $root "build\package\chast-setup-$Version.exe"
 $out = Join-Path $root "$OutDir\chast-$Version-setup.exe"
@@ -44,25 +48,11 @@ Require-File (Join-Path $hostDir "chast-service.exe") "build the service with: c
 Require-File (Join-Path $viewerDir "data\app.so") "the viewer release tree is incomplete"
 
 Write-Host "staging chast $Version"
-if (Test-Path -LiteralPath $stage) {
-    Remove-Item -LiteralPath $stage -Recurse -Force
-}
-New-Item -ItemType Directory -Path $stage -Force | Out-Null
-Copy-Item -Path (Join-Path $viewerDir "*") -Destination $stage -Recurse -Force
+New-Item -ItemType Directory -Path $stage | Out-Null
+Copy-PayloadFiles $viewerDir $stage $ViewerPayloadFiles
 Copy-Item -LiteralPath (Join-Path $hostDir "chast-host.exe") -Destination $stage -Force
 Copy-Item -LiteralPath (Join-Path $hostDir "chast-service.exe") -Destination $stage -Force
 Copy-Item -LiteralPath (Join-Path $root "THIRD-PARTY-NOTICES.md") -Destination $stage -Force
-Get-ChildItem -LiteralPath $stage -Recurse -File |
-    Where-Object { $_.Extension -in ".lib", ".pdb", ".exp" } |
-    Remove-Item -Force
-
-# The viewer Release directory is a build tree: acceptance probes and other
-# temporary tools may be dropped next to the app while testing. Only the four
-# product executables belong in the installer.
-$productExes = @("chast_viewer.exe", "chast-tunnel.exe", "chast-host.exe", "chast-service.exe")
-Get-ChildItem -LiteralPath $stage -File -Filter *.exe |
-    Where-Object { $_.Name -notin $productExes } |
-    Remove-Item -Force
 
 $driverSource = $VirtualDisplayPackageDir
 if (-not $driverSource) {
@@ -72,16 +62,8 @@ if (-not $driverSource) {
     }
 }
 if ($driverSource) {
-    $driverFiles = @(
-        "deviceinstaller64.exe", "usbmmidd.inf", "usbmmidd.cat",
-        "x64\usbmmidd.dll", "win32\usbmmidd.dll", "License.txt", "manifest.sha256"
-    )
-    foreach ($name in $driverFiles) {
-        Require-File (Join-Path $driverSource $name) "the virtual display package is incomplete"
-    }
     $driverStage = Join-Path $stage "drivers\usbmmidd_v2"
-    New-Item -ItemType Directory -Path $driverStage -Force | Out-Null
-    Copy-Item -Path (Join-Path $driverSource "*") -Destination $driverStage -Recurse -Force
+    Copy-DriverPayload $driverSource $driverStage
     Write-Host "bundled the usbmmidd virtual display driver"
 }
 else {

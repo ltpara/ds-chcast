@@ -267,6 +267,30 @@ struct HostSettings {
     // in automatically. The agent removes lines only after the service stored
     // them, so a short outage loses nothing.
     std::string audit_spool;
+    // Machine file chast-tunnel uses to cache the server's device policy and
+    // the host reads as its managed marker. Derived from the settings path as
+    // <stem>.policy.json; it is not stored in host.ini.
+    std::string policy_state;
+    // Machine file the host writes after it accepted a policy version, read
+    // back by chast-tunnel to sign the server receipt. Derived from the
+    // settings path as <stem>.policy-ack.json; not stored in host.ini.
+    std::string policy_ack;
+    // Access-ticket issuer pin installed by the deployment. All three values
+    // are required before a managed host admits a ticket; an incomplete or
+    // invalid set keeps it fail-closed. The key is the issuer's public
+    // Ed25519 key in base64url, so it is safe to keep in host.ini.
+    std::string access_issuer;
+    std::string access_kid;
+    std::string access_public_key;
+    // Additional issuer keys trusted during a rotation overlap. The primary
+    // pin above stays authoritative for the old host.ini layout; each entry
+    // here adds one kid without removing the primary. Serialized as
+    // access_key=<kid>:<base64url public key>.
+    struct AccessKeyPin {
+        std::string kid;
+        std::string public_key;
+    };
+    std::vector<AccessKeyPin> access_keys;
 };
 
 struct HostSettingsLoad {
@@ -345,6 +369,38 @@ bool tunnel_listen_port(const std::string& listen, uint16_t& port);
 // Spool next to a settings file: <dir>/<stem>.audit.jsonl. Empty for an empty
 // settings path.
 std::string audit_spool_path_for(const std::string& settings_path);
+// Managed-policy cache next to a settings file: <dir>/<stem>.policy.json.
+// Shared by chast-tunnel (writer) and the host gate (reader); empty for an
+// empty settings path.
+std::string policy_state_path_for(const std::string& settings_path);
+// Acknowledgement cache next to a settings file: <dir>/<stem>.policy-ack.json.
+// Written by the host and read by chast-tunnel; empty for an empty settings
+// path.
+std::string policy_ack_path_for(const std::string& settings_path);
+// The managed marker inside <stem>.policy.json. A missing file reports
+// unmanaged; a file that exists but cannot be parsed reports readable=false so
+// the host can refuse new sessions instead of falling back to open. A managed
+// marker must carry the mode and policy version it stands for, because the
+// host copies them into the acknowledgement.
+struct ManagedPolicyState {
+    bool managed = false;
+    bool readable = true;
+    std::string mode;
+    uint32_t policy_version = 0;
+    // The server's permission ceiling for this device. Zero means no capability
+    // is granted; the host intersects it with local policy once tickets arrive.
+    uint32_t permission_ceiling = 0;
+    int64_t updated_at_ms = 0;
+};
+ManagedPolicyState read_managed_policy_state(const std::string& path);
+// Writes <stem>.policy-ack.json after confirming that the shared marker
+// already names the same mode and version. The agent requires this file
+// before it signs a policy receipt, so a stale or lagging marker can never be
+// reported as applied. Returns false with a Chinese-free diagnostic.
+bool write_managed_policy_ack(const std::string& ack_path, const std::string& state_path,
+                              const std::string& mode, uint32_t version,
+                              uint32_t permission_ceiling, int64_t updated_at_ms,
+                              std::string* error);
 // Machine name normalized to the device-id alphabet, for a fresh host.
 std::string generate_tunnel_id();
 

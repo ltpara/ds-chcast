@@ -9,6 +9,58 @@ import 'server_settings.dart';
 import 'tunnel_proxy.dart';
 import 'package:chast_viewer/l10n.dart';
 
+/// The short-lived credential a managed host requires at Hello (v62).
+///
+/// The server mints it during lookup when the request names the viewer's
+/// ephemeral Ed25519 public key. `expiresAtMs` is the signed deadline; the
+/// host closes the session there unless a renewal moved it.
+class HostAccessTicket {
+  const HostAccessTicket({
+    required this.ticket,
+    this.issuedAtMs = 0,
+    this.expiresAtMs = 0,
+    this.expiresInMs = 0,
+    this.policyVersion = 0,
+    this.permissions = 0,
+    this.issuer = '',
+    this.kid = '',
+    this.subject = '',
+  });
+
+  final String ticket;
+  final int issuedAtMs;
+  final int expiresAtMs;
+  final int expiresInMs;
+  final int policyVersion;
+  final int permissions;
+  final String issuer;
+  final String kid;
+  final String subject;
+
+  static HostAccessTicket? fromJson(Object? value) {
+    if (value is! Map) {
+      return null;
+    }
+    String text(Object? raw) => raw?.toString() ?? '';
+    int number(Object? raw) => (raw as num?)?.toInt() ?? 0;
+    final String ticket = text(value['ticket']).trim();
+    if (ticket.isEmpty) {
+      return null;
+    }
+    return HostAccessTicket(
+      ticket: ticket,
+      issuedAtMs: number(value['issued_at_ms']),
+      expiresAtMs: number(value['expires_at_ms']),
+      expiresInMs: number(value['expires_in_ms']),
+      policyVersion: number(value['policy_version']),
+      permissions: number(value['permissions']),
+      issuer: text(value['issuer']),
+      kid: text(value['kid']),
+      subject: text(value['subject']),
+    );
+  }
+}
+
 /// One host as reported by `GET /v1/hosts/{id}`.
 class HostInfo {
   const HostInfo({
@@ -23,6 +75,7 @@ class HostInfo {
     this.tags = const <String>[],
     this.lastSeenMs = 0,
     this.expiresInMs = 0,
+    this.accessTicket,
   });
 
   final String id;
@@ -44,6 +97,10 @@ class HostInfo {
   final List<String> tags;
   final int lastSeenMs;
   final int expiresInMs;
+
+  /// Present only when the lookup carried the viewer's client public key and
+  /// the account is allowed to reach this managed device.
+  final HostAccessTicket? accessTicket;
 
   bool get hasRelay => relay.isNotEmpty;
   bool get hasDirectCandidate => candidate.isNotEmpty;
@@ -68,6 +125,7 @@ class HostInfo {
       ],
       lastSeenMs: number(map['last_seen_ms']),
       expiresInMs: number(map['expires_in_ms']),
+      accessTicket: HostAccessTicket.fromJson(map['access_ticket']),
     );
   }
 }
@@ -954,10 +1012,16 @@ class ServerApi {
   /// silently falling back to a direct connection.
   static String proxy = '';
 
+  /// Looks one host up. [accountToken] authenticates an account; when it is
+  /// combined with [clientPublicKey], a managed device's lookup also returns
+  /// the short-lived access ticket bound to that key. An unmanaged host simply
+  /// answers without one, so callers keep the local-auth path.
   static Future<HostInfo> lookup(
     ServerSettings settings,
     String hostId, {
     Duration timeout = const Duration(seconds: 6),
+    String accountToken = '',
+    String clientPublicKey = '',
   }) async {
     if (!settings.configured) {
       throw ServerApiException(tr('未配置连接服务'));
@@ -966,14 +1030,24 @@ class ServerApi {
     if (id.isEmpty) {
       throw ServerApiException(tr('设备 ID 为空'));
     }
-    final Uri uri;
+    final Uri base;
     try {
-      uri = Uri.parse('${settings.url}/v1/hosts/${Uri.encodeComponent(id)}');
+      base = Uri.parse('${settings.url}/v1/hosts/${Uri.encodeComponent(id)}');
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded =
-        await _getJson(uri, timeout, key: settings.connectionKey);
+    final Map<String, String> query = <String, String>{
+      if (clientPublicKey.isNotEmpty) 'client_public_key': clientPublicKey,
+    };
+    final Uri uri = query.isEmpty
+        ? base
+        : base.replace(queryParameters: query);
+    final Object? decoded = await _getJson(
+      uri,
+      timeout,
+      key: settings.connectionKey,
+      accountToken: accountToken,
+    );
     if (decoded is! Map) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
@@ -3895,8 +3969,10 @@ class ServerApi {
     Uri uri,
     Duration timeout, {
     String key = '',
+    String accountToken = '',
   }) {
-    return _requestJson('GET', uri, timeout, key: key);
+    return _requestJson('GET', uri, timeout, key: key,
+        accountToken: accountToken);
   }
 
   static Future<Object?> _requestJson(

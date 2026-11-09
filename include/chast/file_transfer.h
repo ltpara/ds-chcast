@@ -124,9 +124,12 @@ FileCode resolve_receive_path(const std::string& root, const std::string& relati
 // names too long or not representable as UTF-8 are skipped, and at most
 // kMaxFileListEntries entries are returned with `truncated` set when more
 // exist. `cursor` continues strictly after the previous page's final entry.
+// Entries with FILE_ATTRIBUTE_HIDDEN are skipped unless `show_hidden`, before
+// paging, so a cursor names an entry of the same visible order.
 // Enumeration keeps at most one page plus one lookahead entry in memory.
 void list_receive_directory(const std::string& root, const std::string& relative,
-                            FileListResult& result, std::string cursor = {});
+                            FileListResult& result, std::string cursor = {},
+                            bool show_hidden = false);
 
 // Applies one viewer file operation below `root`: create a folder, rename an
 // entry inside its current folder, or remove a file / empty directory.

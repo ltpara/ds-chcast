@@ -21,8 +21,76 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	}
 	list[7].Apply = applyAccountPostgresBaseline
 	list[8].Apply = applyHostAuditIdentityPostgres
+	list[9].Apply = applyDevicePoliciesPostgres
+	list[10].Apply = applyAPITokensPostgres
 	return list
 }()
+
+func applyAPITokensPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id            TEXT PRIMARY KEY,
+			token_hash    TEXT NOT NULL UNIQUE,
+			user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name          TEXT NOT NULL,
+			role          TEXT NOT NULL,
+			resources     TEXT NOT NULL DEFAULT '',
+			group_id      TEXT NOT NULL DEFAULT '',
+			created_at    BIGINT NOT NULL,
+			expires_at    BIGINT NOT NULL,
+			revoked_at    BIGINT NOT NULL DEFAULT 0,
+			last_used_at  BIGINT NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens(user_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS api_tokens_expiry ON api_tokens(expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL API token schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyDevicePoliciesPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS device_policies (
+			peer_id            TEXT PRIMARY KEY,
+			mode               TEXT NOT NULL DEFAULT 'open',
+			permission_ceiling BIGINT NOT NULL DEFAULT 0,
+			policy_version     BIGINT NOT NULL DEFAULT 1,
+			updated_at         BIGINT NOT NULL,
+			updated_by         TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS device_policy_users (
+			peer_id    TEXT NOT NULL REFERENCES device_policies(peer_id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (peer_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS device_policy_users_user
+			ON device_policy_users(user_id)`,
+		`CREATE TABLE IF NOT EXISTS device_policy_groups (
+			peer_id    TEXT NOT NULL REFERENCES device_policies(peer_id) ON DELETE CASCADE,
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (peer_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS device_policy_groups_group
+			ON device_policy_groups(group_id)`,
+		`CREATE TABLE IF NOT EXISTS device_policy_receipts (
+			peer_id        TEXT PRIMARY KEY REFERENCES device_policies(peer_id) ON DELETE CASCADE,
+			policy_version BIGINT NOT NULL,
+			applied        BOOLEAN NOT NULL,
+			detail         TEXT NOT NULL DEFAULT '',
+			reported_at    BIGINT NOT NULL
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("migrate PostgreSQL device policies: %w", err)
+		}
+	}
+	return nil
+}
 
 func applyHostAuditIdentityPostgres(db *sql.DB) error {
 	for _, statement := range []string{

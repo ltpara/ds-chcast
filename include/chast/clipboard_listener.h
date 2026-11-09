@@ -14,7 +14,9 @@ class ClipboardListener {
 public:
     // Starts the shared listener on first use. Returns 0 when this process
     // cannot own a clipboard listener (for example a service without an
-    // interactive window station); callers keep their timer fallback then.
+    // interactive window station), or startup exceeds two seconds. Callers
+    // keep their timer fallback then. A delayed worker is cancelled and reaped
+    // on a later Subscribe; repeated retries never create additional workers.
     static uint64_t Subscribe(std::function<void()> changed = {});
     static void Unsubscribe(uint64_t subscription);
 

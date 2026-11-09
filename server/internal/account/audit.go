@@ -44,6 +44,9 @@ const (
 	// the host and refusal.
 	AuditHostDenied = "host_denied"
 
+	// AuditAccessTicket records one successful short-lived ticket issuance.
+	AuditAccessTicket = "access_ticket"
+
 	AuditGroupCreate       = "group_create"
 	AuditGroupUpdate       = "group_update"
 	AuditGroupDelete       = "group_delete"
@@ -52,6 +55,13 @@ const (
 	AuditGroupMemberRemove = "group_member_remove"
 	AuditGroupDeviceAdd    = "group_device_add"
 	AuditGroupDeviceRemove = "group_device_remove"
+
+	AuditDevicePolicyUpdate  = "device_policy_update"
+	AuditDevicePolicyDelete  = "device_policy_delete"
+	AuditDevicePolicyReceipt = "device_policy_receipt"
+
+	AuditAPITokenCreate = "api_token_create"
+	AuditAPITokenRevoke = "api_token_revoke"
 )
 
 // auditRetention keeps the table bounded without an external maintenance job.

@@ -1173,6 +1173,15 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
     config.token_auth = settings_.token_auth;
     config.access_token = settings_.access_token;
     config.host_fingerprint = fingerprint;
+    config.policy_state = settings_.policy_state;
+    config.device_id = settings_.tunnel_id;
+    config.access_issuer = settings_.access_issuer;
+    config.access_kid = settings_.access_kid;
+    config.access_public_key = settings_.access_public_key;
+    config.access_keys.clear();
+    for (const HostSettings::AccessKeyPin& pin : settings_.access_keys) {
+        config.access_keys.push_back({pin.kid, pin.public_key});
+    }
     // Once the policy exists it is the authority: the operator may have
     // revoked a device since the settings were loaded.
     config.trusted_devices = security_ ? security_->config().trusted_devices
@@ -1192,7 +1201,25 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
         auth.reason = "the host security policy is not ready";
         return auth;
     }
-    pending_security_ = security_->evaluate(request.hello, request.peer_address, unix_now());
+    HostSecurity::TicketRequest ticket;
+    const HostSecurity::TicketRequest* ticket_request = nullptr;
+    if (!request.hello.access_ticket.empty()) {
+        ticket.signed_ticket = request.hello.access_ticket;
+        ticket.host_nonce = request.host_nonce;
+        ticket.proof = request.hello.ticket_proof;
+        ticket_request = &ticket;
+    }
+    pending_security_ =
+        security_->evaluate(request.hello, request.peer_address, unix_now(), ticket_request);
+    // Remember what a later renewal has to re-prove. Cleared for a session
+    // without a ticket so a previous viewer's binding cannot leak into this
+    // one on a reused single-session host.
+    ticket_host_nonce_ = request.host_nonce;
+    ticket_client_nonce_.assign(request.hello.nonce.begin(), request.hello.nonce.end());
+    ticket_client_key_ = pending_security_.via_access_ticket
+                             ? pending_security_.ticket_client_key
+                             : std::array<uint8_t, kTicketClientKeySize>{};
+    ticket_renew_failed_ = false;
     const std::string from =
         request.peer_address.empty() ? std::string("an unknown address") : request.peer_address;
     auth.permissions = pending_security_.permissions;
@@ -1716,8 +1743,81 @@ void HostServer::run_single() {
     running_ = false;
 }
 
-Clock::duration HostServer::idle_disconnect_timeout() const {
-    if (config_.auto_disconnect_ms != 0) {
+bool HostServer::ticket_lease_expired(const Clock::time_point& now) {
+    if (ticket_deadline_ == Clock::time_point::max() || now < ticket_deadline_) {
+        return false;
+    }
+    ticket_deadline_ = Clock::time_point::max();
+    log("the access ticket expired; closing the session");
+    ticket_expired_ = true;
+    return true;
+}
+
+bool HostServer::apply_ticket_renewals(std::string* error) {
+    TicketRenewRequest request;
+    while (session_->take_ticket_renew(request)) {
+        if (!pending_security_.via_access_ticket || !security_) {
+            *error = "the viewer renewed a ticket on a session that has none";
+            return false;
+        }
+        HostSecurity::TicketRenewal renewal;
+        renewal.signed_ticket = std::move(request.signed_ticket);
+        renewal.proof = std::move(request.proof);
+        const HostSecurity::RenewalResult result = security_->renew_ticket(
+            renewal, session_->client_address(), ticket_host_nonce_, ticket_client_nonce_,
+            ticket_client_key_, pending_security_.ticket_subject, unix_now());
+        TicketRenewResult answer;
+        if (!result.accepted) {
+            answer.code = TicketRenewCode::Refused;
+            answer.reason = result.reason;
+            log("the ticket renewal was refused: " + result.reason);
+            // The answer goes out before the close so the viewer can explain
+            // the end instead of reporting a bare transport drop.
+            session_->send_ticket_renew_result(answer);
+            ticket_renew_failed_ = true;
+            error->clear();
+            return false;
+        }
+        // A new ticket can only narrow what is already in force: the operator
+        // approved a mask at connect time, and a later policy edit cannot
+        // widen it behind their back.
+        const PermissionMask current = session_->permissions();
+        const PermissionMask next = current & result.permissions;
+        if (next != current) {
+            session_->revoke_policy_permissions(current & ~next);
+            const Error applied = session_->apply_permission_policy();
+            if (!applied.ok()) {
+                log("the ticket renewal could not narrow the session: " +
+                    applied.to_string());
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.session_permissions = session_->permissions();
+        }
+        // The wall clock is sampled per renewal; the deadline itself stays on
+        // the monotonic clock, so a clock jump cannot move it afterwards.
+        const int64_t remaining = result.expires_at - unix_now();
+        ticket_deadline_ =
+            Clock::now() + std::chrono::seconds((std::max)(int64_t{0}, remaining));
+        pending_security_.ticket_expires_at = result.expires_at;
+        pending_security_.ticket_id = result.ticket_id;
+        answer.code = TicketRenewCode::Accepted;
+        answer.expires_at = result.expires_at;
+        answer.permissions = session_->permissions();
+        const Error sent = session_->send_ticket_renew_result(answer);
+        if (!sent.ok()) {
+            *error = "ticket_renew_result: " + sent.to_string();
+            return false;
+        }
+        log("the access ticket was renewed until " +
+            std::to_string(result.expires_at));
+    }
+    return true;
+}
+
+
+Clock::duration HostServer::idle_disconnect_timeout() const {    if (config_.auto_disconnect_ms != 0) {
         return std::chrono::duration_cast<Clock::duration>(
             std::chrono::milliseconds(config_.auto_disconnect_ms));
     }
@@ -1747,6 +1847,17 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
     // A new viewer starts with a fresh idle clock; the time it spent waiting
     // for approval or a first frame is not idleness.
     touch_viewer_activity();
+    // v62: a ticket-admitted session lives only until the signed expiry. The
+    // wall clock is sampled once here; the deadline itself runs on the
+    // monotonic clock, so later clock changes cannot extend or shorten it.
+    ticket_deadline_ = Clock::time_point::max();
+    ticket_expired_ = false;
+    ticket_renew_failed_ = false;
+    if (pending_security_.via_access_ticket && pending_security_.ticket_expires_at > 0) {
+        const int64_t remaining = pending_security_.ticket_expires_at - unix_now();
+        ticket_deadline_ =
+            Clock::now() + std::chrono::seconds((std::max)(int64_t{0}, remaining));
+    }
     ++stats.sessions;
     stats.client_connected = true;
     const std::string peer = session_->client_address();
@@ -1830,8 +1941,10 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
     ClientStats peer_stats;
     bool stats_received = false;
     const auto finish_timeout = std::chrono::milliseconds(
-        operator_disconnected ? std::min<uint32_t>(config_.finish_timeout_ms, 500) :
-        ok ? config_.finish_timeout_ms : std::min<uint32_t>(config_.finish_timeout_ms, 2000));
+        operator_disconnected || ticket_expired_ || ticket_renew_failed_
+            ? std::min<uint32_t>(config_.finish_timeout_ms, 500)
+            : ok ? config_.finish_timeout_ms
+                 : std::min<uint32_t>(config_.finish_timeout_ms, 2000));
     Error finished = session_->finish_server(finish_timeout, peer_stats, stats_received);
     stats.peer_left = *peer_left;
     stats.stats_received = stats_received;
@@ -5271,6 +5384,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     const Clock::duration idle_timeout = idle_disconnect_timeout();
     while (!stopping_.load() && !disconnect_requested_.load()) {
         const auto now = Clock::now();
+        if (!apply_ticket_renewals(error)) return false;
+        if (ticket_lease_expired(now)) {
+            drain_peer(stats);
+            return error->empty();
+        }
         if (!handle_elevation_requests(error)) return false;
         if (now >= next_desktop_check) {
             next_desktop_check = now + std::chrono::seconds(1);
@@ -6299,7 +6417,8 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
     uint32_t request_id = 0;
     std::string directory;
     std::string cursor;
-    while (session_->take_file_list_request(request_id, directory, &cursor)) {
+    bool show_hidden = false;
+    while (session_->take_file_list_request(request_id, directory, &cursor, &show_hidden)) {
         FileListResult result;
         result.request_id = request_id;
         if (!file_transfer_allowed()) {
@@ -6309,7 +6428,7 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
             result.code = FileCode::Refused;
             result.reason = "the host has no receive directory";
         } else {
-            list_receive_directory(file_receive_directory_, directory, result, cursor);
+            list_receive_directory(file_receive_directory_, directory, result, cursor, show_hidden);
         }
         const Error sent = session_->send_file_list_result(result);
         if (!sent.ok()) {
@@ -7044,6 +7163,8 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
 
     while (!stopping_.load() && !disconnect_requested_.load()) {
         apply_pending_permissions();
+        if (!apply_ticket_renewals(error)) return false;
+        if (ticket_lease_expired(Clock::now())) return true;
         if (!handle_elevation_requests(error)) return false;
         if (!drain_chat(stats, error)) return false;
         if (!reject_desktop_requests(error)) {
@@ -7296,6 +7417,8 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
 
     while (!stopping_.load() && !disconnect_requested_.load()) {
         apply_pending_permissions();
+        if (!apply_ticket_renewals(error)) return false;
+        if (ticket_lease_expired(Clock::now())) return true;
         if (!handle_elevation_requests(error)) return false;
         if (!drain_chat(stats, error)) return false;
         if (!reject_desktop_requests(error, mode == SessionMode::Camera)) {

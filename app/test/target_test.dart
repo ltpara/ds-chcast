@@ -4,6 +4,72 @@ import 'package:chast_viewer/server_settings.dart';
 import 'package:chast_viewer/target.dart';
 
 void main() {
+  test(
+    'preference identity includes canonical server and case-sensitive host id',
+    () {
+      const a = ConnectTarget(
+        '',
+        0,
+        server: 'https://SERVER.example:443/api/',
+        hostId: 'desk',
+      );
+      const equivalent = ConnectTarget(
+        '',
+        0,
+        server: 'https://server.example/api',
+        hostId: 'desk',
+        displayName: 'renamed',
+      );
+      const other = ConnectTarget(
+        '',
+        0,
+        server: 'https://other.example/api',
+        hostId: 'desk',
+      );
+      const otherPath = ConnectTarget(
+        '',
+        0,
+        server: 'https://server.example/other',
+        hostId: 'desk',
+      );
+      const otherId = ConnectTarget(
+        '',
+        0,
+        server: 'https://server.example/api',
+        hostId: 'Desk',
+      );
+      expect(a.preferencesKey, equivalent.preferencesKey);
+      expect(a.preferencesKey, isNot(other.preferencesKey));
+      expect(a.preferencesKey, isNot(otherPath.preferencesKey));
+      expect(a.preferencesKey, isNot(otherId.preferencesKey));
+      final longServer = ConnectTarget(
+        '',
+        0,
+        server: 'https://example.com/${'path/' * 200}',
+        hostId: 'x' * 64,
+      );
+      expect(longServer.preferencesKey.length, lessThanOrEqualTo(256));
+    },
+  );
+
+  test('direct preference identity normalizes host case and IPv6 spelling', () {
+    expect(
+      const ConnectTarget('DESK.example', 4433).preferencesKey,
+      const ConnectTarget('desk.example', 4433).preferencesKey,
+    );
+    expect(
+      const ConnectTarget('::1', 4433).preferencesKey,
+      const ConnectTarget('0:0:0:0:0:0:0:1', 4433).preferencesKey,
+    );
+    expect(
+      const ConnectTarget('127.0.0.1', 4433).preferencesKey,
+      '127.0.0.1:4433',
+    );
+    expect(
+      const ConnectTarget('fe80::1%3', 4433).preferencesKey,
+      isNot(const ConnectTarget('fe80::1%4', 4433).preferencesKey),
+    );
+  });
   const ServerSettings configured = ServerSettings(
     url: 'http://chast.example:8443',
     mode: TunnelMode.relay,
@@ -11,7 +77,11 @@ void main() {
   );
 
   test('a bare id goes through the configured service', () {
-    final ConnectTarget? target = parseConnectInput('devbox', token: ' t ', server: configured);
+    final ConnectTarget? target = parseConnectInput(
+      'devbox',
+      token: ' t ',
+      server: configured,
+    );
     expect(target, isNotNull);
     expect(target!.viaServer, isTrue);
     expect(target.server, 'http://chast.example:8443');
@@ -24,8 +94,11 @@ void main() {
   });
 
   test('an explicit address is direct even with a service configured', () {
-    final ConnectTarget? target =
-        parseConnectInput('10.0.0.2:5555', token: '', server: configured);
+    final ConnectTarget? target = parseConnectInput(
+      '10.0.0.2:5555',
+      token: '',
+      server: configured,
+    );
     expect(target, isNotNull);
     expect(target!.viaServer, isFalse);
     expect(target.host, '10.0.0.2');
@@ -35,8 +108,11 @@ void main() {
   });
 
   test('without a service, a bare name keeps the old direct default', () {
-    final ConnectTarget? target =
-        parseConnectInput('devbox', token: '', server: const ServerSettings());
+    final ConnectTarget? target = parseConnectInput(
+      'devbox',
+      token: '',
+      server: const ServerSettings(),
+    );
     expect(target, isNotNull);
     expect(target!.viaServer, isFalse);
     expect(target.host, 'devbox');

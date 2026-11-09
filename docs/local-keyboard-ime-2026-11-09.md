@@ -34,4 +34,4 @@
 
 日志：`build/local-ime-flutter-test.log`、`build/local-ime-analyze.log`、`build/local-ime-native-build.log`、`build/local-ime-native-regression.log`、`build/local-ime-native.log`、`build/local-ime-flutter-native.log`、`build/local-ime-viewer-build.log`、`build/local-ime-bundle.log`。
 
-原生集成验收通过生产 bridge 启用模式；菜单点击和偏好由 widget 检查覆盖。主机使用 `dry_run_input`，确认消息进入实际主机而不向本机其他应用注入；不能据此宣称已完成双机目标应用的输入效果验收。其他输入法、其他键盘布局/dead keys、混合 DPI 下候选位置、跨网络及安全桌面仍需实测。本轮提供两个明确模式，不等同于 RustDesk 全平台 Legacy/Translate/Map 行为。
+原生集成验收通过生产 bridge 启用模式；菜单点击和偏好由 widget 检查覆盖。主机使用 `dry_run_input`，确认消息进入实际主机而不向本机其他应用注入；不能据此宣称已完成双机目标应用的输入效果验收。其他输入法、其他键盘布局/dead keys、混合 DPI 下候选位置、跨网络及安全桌面仍需实测。本轮提供两个明确模式，不等同于 RustDesk 全平台 Legacy/Translate/Map 行为；后续 v63 已补 Legacy 模式，见 [键盘 Legacy 模式](keyboard-legacy-mode-2026-11-10.md)。

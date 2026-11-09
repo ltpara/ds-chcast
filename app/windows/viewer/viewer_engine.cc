@@ -16,6 +16,7 @@
 
 #include "mp4_recorder.h"
 
+#include "chast/access_ticket.h"
 #include "chast/audio.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
@@ -133,6 +134,17 @@ std::string default_record_directory() {
 // How long one receive-loop pass may spend writing an upload, so a large file
 // cannot starve video, audio and input.
 constexpr auto kFileSendBudget = std::chrono::milliseconds(8);
+// A local recording must not fill the system disk: it only starts with room
+// for a useful segment and stops before the volume is exhausted. An unreadable
+// free-space query stays permissive so recording is not blocked by a quirk.
+constexpr uint64_t kRecordStartFreeBytes = 512ull * 1024 * 1024;
+constexpr uint64_t kRecordStopFreeBytes = 64ull * 1024 * 1024;
+bool recording_space(const std::string& directory, uint64_t minimum) {
+    std::error_code error;
+    const std::filesystem::space_info space =
+        std::filesystem::space(std::filesystem::path(directory), error);
+    return error || space.available >= minimum;
+}
 // A bulk upload is paced far below the loopback ceiling: unpaced, a 1 GiB file
 // fills the 32 MiB send queue and the viewer loop stalls on it, which costs the
 // video stream almost all of its frames. The burst lets one pass move a few
@@ -437,7 +449,9 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                          bool trust_device, ViewerTransport transport,
                          std::string carrier_host, uint16_t carrier_port,
                          std::string carrier_host_id, std::string carrier_token,
-                         bool file_transfer_only, chast::SessionMode session_mode) {
+                         bool file_transfer_only, chast::SessionMode session_mode,
+                         std::vector<uint8_t> access_ticket,
+                         std::vector<uint8_t> access_ticket_seed) {
     if (running_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -614,6 +628,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_screenshot_.reset(); pending_screenshot_stream_.reset();
     }
     stop_requested_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(ticket_mutex_);
+        pending_ticket_renew_.reset();
+    }
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
                           std::move(pinned_fingerprint), allow_unverified,
@@ -621,7 +639,24 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                           std::move(totp), trust_device, transport,
                           std::move(carrier_host), carrier_port,
                           std::move(carrier_host_id), std::move(carrier_token),
-                          std::move(audit_ref), file_transfer_only, session_mode);
+                          std::move(audit_ref), file_transfer_only, session_mode,
+                          std::move(access_ticket), std::move(access_ticket_seed));
+    return true;
+}
+
+bool ViewerEngine::RenewAccessTicket(std::vector<uint8_t> signed_ticket) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (signed_ticket.size() <= chast::kTicketSignatureSize ||
+        signed_ticket.size() > chast::kTicketMaxSigned) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ticket_mutex_);
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    pending_ticket_renew_ = std::move(signed_ticket);
     return true;
 }
 
@@ -919,7 +954,8 @@ constexpr size_t kMaxFolderWalkDepth = 64;
 
 }  // namespace
 
-bool ViewerEngine::RequestFileList(std::string directory, std::string cursor) {
+bool ViewerEngine::RequestFileList(std::string directory, std::string cursor,
+                                   bool show_hidden) {
     if (!running_.load(std::memory_order_acquire) ||
         !chast::valid_file_browser_path(directory) || !chast::valid_file_list_cursor(cursor)) {
         return false;
@@ -939,7 +975,9 @@ bool ViewerEngine::RequestFileList(std::string directory, std::string cursor) {
     command.request_id = next_browse_id_++;
     command.path = std::move(directory);
     command.cursor = std::move(cursor);
-    latest_list_request_ = chast::FileListRequest{command.request_id, command.path, command.cursor};
+    command.show_hidden = show_hidden;
+    latest_list_request_ = chast::FileListRequest{command.request_id, command.path,
+                                                  command.cursor, command.show_hidden};
     newest_file_list_.reset();
     pending_browse_.push_back(std::move(command));
     return true;
@@ -981,7 +1019,8 @@ bool ViewerEngine::RequestFileOperation(chast::FileOperation op, std::string pat
             return false;
         }
     } else if (op != chast::FileOperation::MakeDirectory &&
-               op != chast::FileOperation::Remove) {
+               op != chast::FileOperation::Remove &&
+               op != chast::FileOperation::RemoveTree) {
         return false;
     } else if (!new_name.empty()) {
         return false;
@@ -1008,20 +1047,21 @@ bool ViewerEngine::RequestFileOperation(chast::FileOperation op, std::string pat
     return true;
 }
 
-bool ViewerEngine::RequestBatchDownload(std::vector<DownloadRoot> roots) {
-    return QueueDownload(std::move(roots), true);
+bool ViewerEngine::RequestBatchDownload(std::vector<DownloadRoot> roots, bool show_hidden) {
+    return QueueDownload(std::move(roots), true, show_hidden);
 }
 
-bool ViewerEngine::RequestDirectoryDownload(std::string path) {
+bool ViewerEngine::RequestDirectoryDownload(std::string path, bool show_hidden) {
     std::vector<DownloadRoot> roots;
     DownloadRoot root;
     root.path = std::move(path);
     root.directory = true;
     roots.push_back(std::move(root));
-    return QueueDownload(std::move(roots), false);
+    return QueueDownload(std::move(roots), false, show_hidden);
 }
 
-bool ViewerEngine::QueueDownload(std::vector<DownloadRoot> roots, bool batch) {
+bool ViewerEngine::QueueDownload(std::vector<DownloadRoot> roots, bool batch,
+                                 bool show_hidden) {
     if (!running_.load(std::memory_order_acquire) || roots.empty() ||
         roots.size() > kMaxBatchDownloadRoots) {
         return false;
@@ -1043,7 +1083,7 @@ bool ViewerEngine::QueueDownload(std::vector<DownloadRoot> roots, bool batch) {
         folder_.stage == FolderDownload::Stage::kDownloading) {
         return false;
     }
-    folder_request_ = FolderRequest{std::move(roots), batch};
+    folder_request_ = FolderRequest{std::move(roots), batch, show_hidden};
     return true;
 }
 
@@ -2070,7 +2110,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string carrier_host, uint16_t carrier_port,
                        std::string carrier_host_id, std::string carrier_token,
                        std::string audit_ref, bool file_transfer_only,
-                       chast::SessionMode session_mode) {
+                       chast::SessionMode session_mode,
+                       std::vector<uint8_t> access_ticket,
+                       std::vector<uint8_t> access_ticket_seed) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -2321,6 +2363,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool multiple_displays = false;
     uint64_t window_multi_published = 0;
 
+    std::string record_directory;
+    auto next_record_space_check = Clock::now();
     auto record_picture = [&](const chast::FrameHeader& header, const std::vector<uint8_t>& payload,
                               const chast::ServerInfo& picture_info) {
         const bool record_wanted =
@@ -2336,20 +2380,39 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             }
             std::error_code dir_ec;
             std::filesystem::create_directories(directory, dir_ec);
-            std::string open_error;
-            auto fresh = std::make_unique<chast_tools::Mp4Recorder>();
-            if (!fresh->open(record_file_path(directory), picture_info.codec, picture_info.width,
-                             picture_info.height, &open_error)) {
-                record_error = open_error;
+            if (!recording_space(directory, kRecordStartFreeBytes)) {
+                record_error =
+                    "not enough free space in the recording folder (512 MiB required)";
                 record_wanted_.store(false, std::memory_order_relaxed);
             } else {
-                record_error.clear();
-                std::fprintf(stderr, "viewer: recording started\n");
-                recorder = std::move(fresh);
+                std::string open_error;
+                auto fresh = std::make_unique<chast_tools::Mp4Recorder>();
+                if (!fresh->open(record_file_path(directory), picture_info.codec,
+                                 picture_info.width, picture_info.height, &open_error)) {
+                    record_error = open_error;
+                    record_wanted_.store(false, std::memory_order_relaxed);
+                } else {
+                    record_error.clear();
+                    record_directory = directory;
+                    next_record_space_check = Clock::now() + std::chrono::seconds(2);
+                    std::fprintf(stderr, "viewer: recording started\n");
+                    recorder = std::move(fresh);
+                }
             }
         } else if (!record_wanted && recorder) {
             close_recording();
             std::fprintf(stderr, "viewer: recording stopped\n");
+        }
+        if (recorder) {
+            const auto now = Clock::now();
+            if (now >= next_record_space_check) {
+                next_record_space_check = now + std::chrono::seconds(2);
+                if (!recording_space(record_directory, kRecordStopFreeBytes)) {
+                    record_error = "recording stopped: the recording disk is almost full";
+                    close_recording();
+                    record_wanted_.store(false, std::memory_order_relaxed);
+                }
+            }
         }
         if (recorder) {
             recorder->write(header, payload.data(), payload.size());
@@ -2755,6 +2818,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         client_config.pinned_fingerprint = pinned_fingerprint;
         client_config.allow_any_certificate = allow_unverified;
         client_config.access_token = access_token;
+        client_config.access_ticket = access_ticket;
+        client_config.access_ticket_key = access_ticket_seed;
         client_config.password = password;
         client_config.totp = totp;
         client_config.device_identity = device_identity_.get();
@@ -4931,7 +4996,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             : command.kind == BrowseCommand::Kind::kOperation
                                 ? session->request_file_op(command.request_id, command.operation,
                                                            command.path, command.new_name)
-                                : session->request_file_list(command.request_id, command.path, command.cursor);
+                                : session->request_file_list(command.request_id, command.path,
+                                                             command.cursor, command.show_hidden);
                         if (sent.ok()) {
                             continue;
                         }
@@ -4943,6 +5009,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 newest_file_list_ = FileListAnswer{};
                                 newest_file_list_->directory = command.path;
                                 newest_file_list_->cursor = command.cursor;
+                                newest_file_list_->show_hidden = command.show_hidden;
                                 newest_file_list_->result.code = chast::FileCode::IoError;
                                 newest_file_list_->result.reason = "request: " + sent.to_string();
                                 latest_list_request_.reset();
@@ -5083,6 +5150,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             newest_file_list_ = FileListAnswer{};
                             newest_file_list_->directory = directory;
                             newest_file_list_->cursor = latest_list_request_->cursor;
+                            newest_file_list_->show_hidden = latest_list_request_->show_hidden;
                             if (!latest_list_request_->cursor.empty() && !list.entries.empty() &&
                                 chast::file_list_cursor(list.entries.front()) <= latest_list_request_->cursor) {
                                 list.entries.clear(); list.truncated = false; list.next_cursor.clear();
@@ -5287,6 +5355,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     {
                         std::vector<DownloadRoot> roots;
                         bool batch = false;
+                        bool show_hidden = false;
                         bool start = false;
                         {
                             std::lock_guard<std::mutex> lock(browse_mutex_);
@@ -5295,6 +5364,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 folder_.stage != FolderDownload::Stage::kDownloading) {
                                 roots = std::move(folder_request_->roots);
                                 batch = folder_request_->batch;
+                                show_hidden = folder_request_->show_hidden;
                                 folder_request_.reset();
                                 start = true;
                             }
@@ -5310,6 +5380,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 folder_ = FolderDownload{};
                                 folder_.batch_total = static_cast<uint32_t>(roots.size());
                                 folder_.batch = batch;
+                                folder_.show_hidden = show_hidden;
                                 folder_.roots.assign(std::make_move_iterator(roots.begin()),
                                                      std::make_move_iterator(roots.end()));
                                 folder_.retry_after = now;
@@ -5486,11 +5557,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         uint32_t request_id = 0;
                         std::string path;
                         std::string cursor;
+                        bool show_hidden = false;
                         bool listed_all = false;
                         bool advanced = false;
                         std::string timed_out;
                         {
                             std::lock_guard<std::mutex> lock(browse_mutex_);
+                            show_hidden = folder_.show_hidden;
                             if (folder_.listing_id != 0) {
                                 if (now > folder_.transfer_deadline) {
                                     timed_out = folder_.listing_path;
@@ -5527,7 +5600,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             publish_folder_progress();
                             return;
                         }
-                        chast::Error sent = session->request_file_list(request_id, path, cursor);
+                        chast::Error sent =
+                            session->request_file_list(request_id, path, cursor, show_hidden);
                         if (!sent.ok()) {
                             finish_folder_download(1, "listing '" + path + "': " + sent.to_string());
                         }
@@ -7880,7 +7954,30 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     return true;
                 };
 
+                // The UI fetches tickets, but only this thread may talk to the
+                // QUIC client. A refusal is final at the host, which closes the
+                // session; a transport failure is left to the lease deadline.
+                auto drain_ticket_renew = [&] {
+                    std::optional<std::vector<uint8_t>> pending;
+                    {
+                        std::lock_guard<std::mutex> lock(ticket_mutex_);
+                        pending.swap(pending_ticket_renew_);
+                    }
+                    if (!pending || pending->empty()) {
+                        return;
+                    }
+                    const chast::Error renewed = session->renew_access_ticket(
+                        *pending, std::chrono::seconds(3));
+                    if (renewed.ok()) {
+                        std::fprintf(stderr, "viewer: access ticket renewed\n");
+                    } else {
+                        std::fprintf(stderr, "viewer: access ticket renewal failed: %s\n",
+                                     renewed.to_string().c_str());
+                    }
+                };
+
                 while (!stop_requested_.load(std::memory_order_acquire)) {
+                    drain_ticket_renew();
                     if (!poll_displays()) break;
                     if (!apply_stream_updates()) {
                         break;

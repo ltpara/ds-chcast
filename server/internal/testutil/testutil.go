@@ -15,6 +15,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/configpush"
@@ -115,6 +116,8 @@ type Options struct {
 	// management ServerKey. Empty keeps the legacy single-key behavior.
 	LinkKey string
 	HostKey string
+	// AccessIssuer signs short-lived access tickets. Nil disables the endpoint.
+	AccessIssuer *acl.Issuer
 }
 
 type Server struct {
@@ -314,6 +317,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		ServerKey:                  ServerKey,
 		LinkKey:                    opts.LinkKey,
 		HostKey:                    opts.HostKey,
+		AccessIssuer:               opts.AccessIssuer,
 		WakeRelays:                 opts.WakeRelays,
 		TTL:                        60 * time.Second,
 		Logger:                     log,

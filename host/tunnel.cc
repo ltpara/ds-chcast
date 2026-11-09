@@ -157,6 +157,111 @@ std::string json_string_field(const std::string& json, const std::string& name) 
     return {};
 }
 
+bool json_object_field(const std::string& json, const std::string& name, std::string& object) {
+    const std::string needle = "\"" + name + "\"";
+    size_t search = 0;
+    while (search < json.size()) {
+        const size_t pos = json.find(needle, search);
+        if (pos == std::string::npos) {
+            return false;
+        }
+        search = pos + needle.size();
+        size_t before = pos;
+        while (before > 0 && (json[before - 1] == ' ' || json[before - 1] == '\t')) {
+            --before;
+        }
+        if (before == 0 || (json[before - 1] != '{' && json[before - 1] != ',')) {
+            continue;
+        }
+        size_t cursor = pos + needle.size();
+        while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t')) {
+            ++cursor;
+        }
+        if (cursor >= json.size() || json[cursor] != ':') {
+            continue;
+        }
+        ++cursor;
+        while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t')) {
+            ++cursor;
+        }
+        if (cursor >= json.size() || json[cursor] != '{') {
+            return false;
+        }
+        const size_t begin = cursor;
+        int depth = 0;
+        bool in_string = false;
+        while (cursor < json.size()) {
+            const char c = json[cursor++];
+            if (in_string) {
+                if (c == '\\') {
+                    ++cursor;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (--depth == 0) {
+                    object = json.substr(begin, cursor - begin);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+long long json_integer_field(const std::string& json, const std::string& name) {
+    const std::string needle = "\"" + name + "\"";
+    size_t search = 0;
+    while (search < json.size()) {
+        const size_t pos = json.find(needle, search);
+        if (pos == std::string::npos) {
+            return -1;
+        }
+        search = pos + needle.size();
+        size_t before = pos;
+        while (before > 0 && (json[before - 1] == ' ' || json[before - 1] == '\t')) {
+            --before;
+        }
+        if (before == 0 || (json[before - 1] != '{' && json[before - 1] != ',')) {
+            continue;
+        }
+        size_t cursor = pos + needle.size();
+        while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t')) {
+            ++cursor;
+        }
+        if (cursor >= json.size() || json[cursor] != ':') {
+            continue;
+        }
+        ++cursor;
+        while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t')) {
+            ++cursor;
+        }
+        bool negative = false;
+        if (cursor < json.size() && json[cursor] == '-') {
+            negative = true;
+            ++cursor;
+        }
+        const size_t digits = cursor;
+        long long value = 0;
+        while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') {
+            value = value * 10 + (json[cursor] - '0');
+            ++cursor;
+        }
+        if (cursor == digits) {
+            return -1;
+        }
+        return negative ? -value : value;
+    }
+    return -1;
+}
+
 bool parse_tunnel_event(const std::string& line, TunnelEvent& event) {
     size_t begin = 0;
     while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin]))) {
@@ -177,6 +282,23 @@ bool parse_tunnel_event(const std::string& line, TunnelEvent& event) {
     event.punch = json_string_field(line, "punch");
     event.relay = json_string_field(line, "relay");
     event.migrated_from = json_string_field(line, "migrated_from");
+    std::string policy_object;
+    if (json_object_field(line, "device_policy", policy_object)) {
+        event.has_policy = true;
+        event.policy.mode = json_string_field(policy_object, "mode");
+        const long long ceiling = json_integer_field(policy_object, "permission_ceiling");
+        if (ceiling >= 0 && ceiling <= 0xFFFFFFFFLL) {
+            event.policy.permission_ceiling = static_cast<uint32_t>(ceiling);
+        }
+        const long long version = json_integer_field(policy_object, "policy_version");
+        if (version > 0 && version <= 0xFFFFFFFFLL) {
+            event.policy.policy_version = static_cast<uint32_t>(version);
+        }
+        const long long updated = json_integer_field(policy_object, "updated_at_ms");
+        if (updated >= 0) {
+            event.policy.updated_at_ms = updated;
+        }
+    }
     return true;
 }
 
@@ -212,7 +334,7 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     if (!settings.tunnel_old_id.empty()) {
         add(L"--old-id", widen(settings.tunnel_old_id));
     }
-    add(L"--key", widen(settings.tunnel_key));
+    command += L" --key-stdin";
     add(L"--local", L"127.0.0.1:" + std::to_wstring(local_port));
     add(L"--listen", widen(settings.tunnel_listen));
     if (settings.carrier && local_port != 0 && local_port < 65535) {
@@ -229,17 +351,27 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     // Registration and signed audit uploads use the host role key. The
     // management key is only sent when no separate host key is configured.
     if (!settings.host_key.empty()) {
-        add(L"--host-key", widen(settings.host_key));
+        command += L" --host-key-stdin";
     } else if (!settings.server_key.empty()) {
-        add(L"--server-key", widen(settings.server_key));
+        command += L" --server-key-stdin";
     }
     if (!settings.proxy.empty()) {
-        add(L"--proxy", widen(settings.proxy));
+        command += L" --proxy-stdin";
     }
     if (!settings.audit_spool.empty()) {
         // The agent signs and forwards the host's inbound audit records from
         // this spool; the path is shared with the host process, not a secret.
         add(L"--audit-spool", widen(settings.audit_spool));
+    }
+    if (!settings.policy_state.empty()) {
+        // The agent caches the server's device policy there; the host reads
+        // the same file as its managed marker.
+        add(L"--policy-state", widen(settings.policy_state));
+    }
+    if (!settings.policy_ack.empty()) {
+        // The host writes this after it accepted the current policy version;
+        // the agent signs the server receipt only when the contents match.
+        add(L"--policy-ack", widen(settings.policy_ack));
     }
     if (!fingerprint.empty()) {
         add(L"--fingerprint", widen(fingerprint));
@@ -319,6 +451,23 @@ bool TunnelProcess::start(const HostSettings& settings, uint16_t local_port,
     const std::wstring command =
         tunnel_command_line(executable, settings, local_port, fingerprint);
 
+    // Stdin wire order matches runHost: registration credential, device key,
+    // proxy, omitting fields without a corresponding *-stdin flag.
+    std::string credentials;
+    const auto append_secret = [&credentials](const std::string& value) {
+        if (value.find_first_of("\r\n") != std::string::npos ||
+            value.find('\0') != std::string::npos) return false;
+        credentials += value + '\n';
+        return true;
+    };
+    const auto& role_key = settings.host_key.empty() ? settings.server_key : settings.host_key;
+    if ((!role_key.empty() && !append_secret(role_key)) ||
+        !append_secret(settings.tunnel_key) ||
+        (!settings.proxy.empty() && !append_secret(settings.proxy)) || credentials.size() > 1024) {
+        if (error) *error = "隧道代理凭据格式无效";
+        return false;
+    }
+
     SECURITY_ATTRIBUTES attributes{};
     attributes.nLength = sizeof(attributes);
     attributes.bInheritHandle = TRUE;
@@ -326,29 +475,44 @@ bool TunnelProcess::start(const HostSettings& settings, uint16_t local_port,
     HANDLE stdout_write = nullptr;
     HANDLE stderr_read = nullptr;
     HANDLE stderr_write = nullptr;
+    HANDLE stdin_read = nullptr;
+    HANDLE stdin_write = nullptr;
+    const auto close_pipes = [&] {
+        for (HANDLE handle : {stdout_read, stdout_write, stderr_read, stderr_write,
+                              stdin_read, stdin_write}) {
+            if (handle != nullptr) CloseHandle(handle);
+        }
+    };
     if (!CreatePipe(&stdout_read, &stdout_write, &attributes, 0) ||
-        !CreatePipe(&stderr_read, &stderr_write, &attributes, 0)) {
-        if (stdout_read != nullptr) {
-            CloseHandle(stdout_read);
-        }
-        if (stdout_write != nullptr) {
-            CloseHandle(stdout_write);
-        }
-        if (stderr_read != nullptr) {
-            CloseHandle(stderr_read);
-        }
-        if (stderr_write != nullptr) {
-            CloseHandle(stderr_write);
-        }
+        !CreatePipe(&stderr_read, &stderr_write, &attributes, 0) ||
+        !CreatePipe(&stdin_read, &stdin_write, &attributes, 4096)) {
+        const DWORD code = GetLastError();
+        close_pipes();
         if (error != nullptr) {
-            *error = "无法创建隧道代理管道（Windows 错误 " + std::to_string(GetLastError()) + "）";
+            *error = "无法创建隧道代理管道（Windows 错误 " + std::to_string(code) + "）";
         }
         return false;
     }
-    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
+    DWORD capacity = 0;
+    DWORD written = 0;
+    // Pre-fill one bounded message before launch. Check actual buffer capacity
+    // so even a child that never reads stdin cannot block host startup.
+    if (!SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0) ||
+        !GetNamedPipeInfo(stdin_write, nullptr, &capacity, nullptr, nullptr) ||
+        capacity < credentials.size() ||
+        !WriteFile(stdin_write, credentials.data(), static_cast<DWORD>(credentials.size()),
+                   &written, nullptr) || written != credentials.size()) {
+        close_pipes();
+        if (error) *error = "无法向隧道代理传递凭据";
+        return false;
+    }
+    SecureZeroMemory(credentials.data(), credentials.size());
+    CloseHandle(stdin_write);
+    stdin_write = nullptr;
 
-    // Only the two pipe handles may cross the process boundary. Inheriting
+    // Only the three pipe handles may cross the process boundary. Inheriting
     // every inheritable handle would also hand the agent the host's QUIC
     // socket, which then keeps port 4433 bound after the host process dies.
     SIZE_T attribute_size = 0;
@@ -356,13 +520,7 @@ bool TunnelProcess::start(const HostSettings& settings, uint16_t local_port,
     std::vector<BYTE> attribute_storage(attribute_size);
     auto* attribute_list =
         reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
-    HANDLE inherited[] = {stdout_write, stderr_write};
-    const auto close_pipes = [&] {
-        CloseHandle(stdout_read);
-        CloseHandle(stdout_write);
-        CloseHandle(stderr_read);
-        CloseHandle(stderr_write);
-    };
+    HANDLE inherited[] = {stdout_write, stderr_write, stdin_read};
     if (!InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_size)) {
         const DWORD code = GetLastError();
         close_pipes();
@@ -388,7 +546,7 @@ bool TunnelProcess::start(const HostSettings& settings, uint16_t local_port,
     startup.StartupInfo.wShowWindow = SW_HIDE;
     startup.StartupInfo.hStdOutput = stdout_write;
     startup.StartupInfo.hStdError = stderr_write;
-    startup.StartupInfo.hStdInput = nullptr;
+    startup.StartupInfo.hStdInput = stdin_read;
     startup.lpAttributeList = attribute_list;
     PROCESS_INFORMATION process{};
     std::vector<wchar_t> command_buffer(command.begin(), command.end());
@@ -433,9 +591,19 @@ bool TunnelProcess::start(const HostSettings& settings, uint16_t local_port,
         }
         return false;
     }
-    ResumeThread(process.hThread);
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 5000);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        close_pipes();
+        if (error) *error = "无法恢复隧道代理线程";
+        return false;
+    }
     CloseHandle(stdout_write);
     CloseHandle(stderr_write);
+    CloseHandle(stdin_read);
     CloseHandle(process.hThread);
 
     process_ = process.hProcess;

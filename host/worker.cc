@@ -153,6 +153,24 @@ void log_tunnel_event(const TunnelEvent& event) {
     } else if (event.event == "relay") {
         worker_event("tunnel.relay", {{"relay", event.relay}});
     }
+    if (event.has_policy && event.event != "viewer") {
+        std::string ack_path;
+        std::string state_path;
+        {
+            std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
+            ack_path = g_worker->settings.policy_ack;
+            state_path = g_worker->settings.policy_state;
+        }
+        if (!ack_path.empty() && !state_path.empty()) {
+            std::string error;
+            if (!write_managed_policy_ack(ack_path, state_path, event.policy.mode,
+                                          event.policy.policy_version,
+                                          event.policy.permission_ceiling,
+                                          event.policy.updated_at_ms, &error)) {
+                worker_event("tunnel.policy_ack_failed", {{"error", error}});
+            }
+        }
+    }
 }
 
 // Lists the sessions a viewer may switch to. Only WTSActive sessions with a

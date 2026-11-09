@@ -410,6 +410,25 @@ void test_browser(const std::filesystem::path& directory) {
               list.entries[2].size == 4,
           "directories come first, then files sorted by name with sizes and mtimes");
 
+    {
+        std::ofstream(root / "hidden.txt", std::ios::binary) << "hide";
+        std::filesystem::create_directories(root / "hidden-dir", ignored);
+        check(SetFileAttributesW((root / "hidden.txt").c_str(), FILE_ATTRIBUTE_HIDDEN) != 0 &&
+                  SetFileAttributesW((root / "hidden-dir").c_str(), FILE_ATTRIBUTE_HIDDEN) != 0,
+              "the test can mark entries hidden");
+    }
+    chast::list_receive_directory(root.string(), "", list);
+    check(list.code == chast::FileCode::Ok && list.entries.size() == 3 &&
+              list.entries[0].name == "sub" && list.entries[1].name == "alpha.txt" &&
+              list.entries[2].name == "beta.bin",
+          "hidden entries are not listed by default");
+    chast::list_receive_directory(root.string(), "", list, {}, true);
+    check(list.code == chast::FileCode::Ok && list.entries.size() == 5 &&
+              list.entries[0].name == "hidden-dir" && list.entries[0].directory &&
+              list.entries[1].name == "sub" && list.entries[4].name == "hidden.txt" &&
+              list.entries[4].size == 4,
+          "the hidden-entry view lists them in the same order");
+
     chast::list_receive_directory(root.string(), "sub", list);
     check(list.code == chast::FileCode::Ok && list.entries.size() == 1 &&
               list.entries[0].name == "inner.txt" && list.entries[0].size == 5,
@@ -477,6 +496,69 @@ void test_browser(const std::filesystem::path& directory) {
                                           "missing.txt", "", error) ==
                   chast::FileCode::NotFound,
           "operations cannot leave the root and report missing paths");
+
+    std::filesystem::create_directories(root / "tree" / "nested" / "deeper");
+    {
+        std::ofstream(root / "tree" / "one.txt") << "one";
+        std::ofstream(root / "tree" / "nested" / "two.txt") << "two";
+        std::ofstream(root / "tree" / "nested" / "deeper" / "three.txt") << "three";
+    }
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Remove, "tree", "",
+                                      error) == chast::FileCode::Refused,
+          "a non-empty folder still refuses the single-entry removal");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::RemoveTree, "tree", "",
+                                      error) == chast::FileCode::Ok &&
+              !std::filesystem::exists(root / "tree"),
+          "a recursive removal deletes files and empty folders bottom-up");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::RemoveTree,
+                                      "missing-tree", "", error) == chast::FileCode::NotFound,
+          "a recursive removal of a missing path reports NotFound");
+
+    std::filesystem::create_directories(root / "locked");
+    {
+        std::ofstream(root / "locked" / "held.txt") << "held";
+    }
+    const std::filesystem::path held = root / "locked" / "held.txt";
+    SetFileAttributesW(held.c_str(), FILE_ATTRIBUTE_READONLY);
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::RemoveTree, "locked",
+                                      "", error) == chast::FileCode::Refused &&
+              std::filesystem::exists(root / "locked") && std::filesystem::exists(held),
+          "a read-only entry refuses the tree before anything is deleted");
+    SetFileAttributesW(held.c_str(), FILE_ATTRIBUTE_NORMAL);
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::RemoveTree, "locked",
+                                      "", error) == chast::FileCode::Ok &&
+              !std::filesystem::exists(root / "locked"),
+          "the same tree is removed once the read-only attribute is cleared");
+
+    {
+        std::ofstream(root / "single.txt") << "single";
+    }
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::RemoveTree,
+                                      "single.txt", "", error) == chast::FileCode::Refused &&
+              std::filesystem::exists(root / "single.txt"),
+          "a recursive removal refuses a plain file");
+
+    const std::filesystem::path link_target = directory / "link-target";
+    const std::filesystem::path tree_link = root / "linked" / "escape";
+    std::filesystem::create_directories(link_target);
+    {
+        std::ofstream(link_target / "keep.txt") << "keep";
+    }
+    std::filesystem::create_directories(root / "linked");
+    if (CreateSymbolicLinkW(tree_link.c_str(), link_target.c_str(),
+                            SYMBOLIC_LINK_FLAG_DIRECTORY | kAllowUnprivilegedCreate)) {
+        check(chast::apply_file_operation(root.string(), chast::FileOperation::RemoveTree,
+                                          "linked", "", error) == chast::FileCode::Refused &&
+                  std::filesystem::exists(link_target / "keep.txt") &&
+                  std::filesystem::exists(tree_link),
+              "a reparse point inside the tree refuses the removal and keeps its target");
+        std::filesystem::remove(tree_link, ignored);
+        std::filesystem::remove(root / "linked", ignored);
+    } else {
+        std::filesystem::remove(root / "linked", ignored);
+        std::printf("skip recursive reparse checks: cannot create a link here\n");
+    }
+    std::filesystem::remove_all(link_target, ignored);
 }
 
 void test_directory_pages(const std::filesystem::path& directory) {

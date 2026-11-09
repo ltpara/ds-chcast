@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -116,6 +117,9 @@ type registerResult struct {
 	Software          *softwareInfo `json:"software"`
 	ConfigSerial      int64         `json:"config_serial"`
 	RendezvousServers []string      `json:"rendezvous_servers"`
+	// DevicePolicy is the managed-device statement. Nil keeps the unmanaged
+	// local-authentication behavior.
+	DevicePolicy *DevicePolicy `json:"device_policy"`
 	// Wake carries cross-subnet Wake-on-LAN jobs queued since the previous
 	// registration. Only agents started with the relay enabled act on them.
 	Wake []wake.Job `json:"wake"`
@@ -209,6 +213,18 @@ func (c *apiClient) lookup(ctx context.Context, id string) (lookupResult, error)
 
 func (c *apiClient) unregister(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/hosts/"+id, nil, nil)
+}
+
+// reportDevicePolicyReceipt posts the host-key-signed application result. The
+// request goes to the same server that delivered the policy; a failed POST is
+// retried by a later registration rather than blocking the read loop.
+func (c *apiClient) reportDevicePolicyReceipt(ctx context.Context, peerID string, req policyReceiptRequest) error {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost,
+		"/v1/device-policies/"+url.PathEscape(peerID)+"/receipt", data, nil)
 }
 
 func (c *apiClient) do(ctx context.Context, method, path string, body []byte, out any) error {

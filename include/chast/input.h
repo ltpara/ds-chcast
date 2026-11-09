@@ -45,11 +45,19 @@ bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended);
 // is identified by virtual key because its E1 sequence is not a set-1 key.
 uint16_t windows_key_to_hid(uint32_t virtual_key, uint32_t scan_code, bool extended);
 bool make_keyboard_input(uint16_t usage, bool down, INPUT& input);
+// Legacy keyboard mode injects a named virtual key instead of a scan code.
+// Windows resolves it against the host layout; extended keys keep their
+// navigation behavior. VK_PACKET and VK_PROCESSKEY are rejected because they
+// only make sense with data this path does not carry.
+bool make_legacy_keyboard_input(uint16_t virtual_key, bool down, INPUT& input);
 inline constexpr ULONG_PTR kInputInjectionTag = 0x43484153u;
 
 // Modifier bit (see chast/protocol.h) for a HID usage, or 0 when the usage is
 // not one of the eight modifier keys.
 uint16_t modifier_bit_for_usage(uint16_t hid_usage);
+// The same bitmap for a Windows virtual key, including the side-less
+// VK_SHIFT/VK_CONTROL/VK_MENU forms a hook can report.
+uint16_t modifier_bit_for_vk(uint16_t virtual_key);
 
 struct InputStats {
     uint64_t applied = 0;
@@ -110,13 +118,16 @@ private:
     // is injected with KEYEVENTF_UNICODE, surrogates paired as one character.
     void apply_text(const std::string& text);
     // Brings held modifiers in line with the bitmap the peer reported.
-    void sync_modifiers(uint16_t reported);
+    // `legacy` selects the injection mechanism for modifiers it has to press;
+    // a held modifier is always lifted the way it was pressed.
+    void sync_modifiers(uint16_t reported, bool legacy = false);
     // Temporarily reconciles the selected lock bits. Returns bits changed,
     // so apply() can restore the host's state after the key was injected.
     uint16_t sync_locks(uint16_t reported, uint16_t mask);
     bool lock_state(uint16_t bit);
     void apply_mouse(const MouseEvent& event);
     void apply_key(const KeyEvent& event);
+    void apply_legacy_key(const LegacyKeyEvent& event);
     // Touch goes through Windows' touch injection, which takes a frame
     // containing every active contact; the injector keeps the active set and
     // rebuilds the frame on each event. When touch injection cannot start
@@ -166,6 +177,7 @@ private:
     uint16_t held_buttons_ = 0;
     struct HeldKey {
         uint16_t usage = 0;
+        bool legacy = false;
         std::chrono::steady_clock::time_point last_down;
     };
     // Keys currently down, in press order, so release_all lifts them in

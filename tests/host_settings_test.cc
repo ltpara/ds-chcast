@@ -72,6 +72,19 @@ bool same_devices(const std::vector<chast::TrustedDevice>& a,
     return true;
 }
 
+bool same_access_keys(const std::vector<chast::HostSettings::AccessKeyPin>& a,
+                      const std::vector<chast::HostSettings::AccessKeyPin>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].kid != b[i].kid || a[i].public_key != b[i].public_key) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
            a.max_viewers == b.max_viewers &&
@@ -111,7 +124,10 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.proxy == b.proxy && a.tunnel_id == b.tunnel_id &&
            a.tunnel_old_id == b.tunnel_old_id &&
            a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen &&
-           a.audit_spool == b.audit_spool;
+           a.audit_spool == b.audit_spool &&
+           a.access_issuer == b.access_issuer && a.access_kid == b.access_kid &&
+           a.access_public_key == b.access_public_key &&
+           same_access_keys(a.access_keys, b.access_keys);
 }
 
 void test_round_trip(const std::filesystem::path& dir) {
@@ -189,6 +205,11 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.tunnel_key = "host secret 123";
     settings.tunnel_listen = "127.0.0.1:46000";
     settings.audit_spool = "D:\\审计\\host.audit.jsonl";
+    settings.access_issuer = "chast.example";
+    settings.access_kid = "kid-2026-11";
+    settings.access_public_key = "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
+    settings.access_keys.push_back(
+        {"kid-2027-01", "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"});
 
     std::string error;
     check(chast::save_host_settings(path, settings, &error), "settings save");
@@ -314,6 +335,11 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "tunnel_id=bad id\n"
                "tunnel_key=short\n"
                "tunnel_listen=127.0.0.1:0\n"
+               "access_issuer=" + std::string(200, 'i') + "\n"
+               "access_kid=" + std::string(100, 'k') + "\n"
+               "access_public_key=not-a-key\n"
+               "access_key=missing-colon\n"
+               "access_key=kid-2027-01:not-a-key\n"
                "unknown_key=whatever\n"
                "this line has no equals\n");
     const chast::HostSettingsLoad loaded = chast::load_host_settings(path.string());
@@ -367,6 +393,12 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_id.empty(), "an invalid device id is dropped");
     check(settings.tunnel_key.empty(), "a short device key is dropped");
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
+    check(settings.access_issuer.empty(), "an oversized access issuer is dropped");
+    check(settings.access_kid.empty(), "an oversized access key id is dropped");
+    check(settings.access_public_key.empty(), "a malformed access public key is dropped");
+    check(settings.access_keys.empty() &&
+              loaded.warning.find("access_key") != std::string::npos,
+          "malformed rotation pins are dropped with a warning");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
                             "audio_device", "audio_aec", "audio_silence_gate_ms",
@@ -378,7 +410,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
                             "quality", "display", "virtual_display", "virtual_display_monitors",
                             "virtual_display_resolution", "virtual_display_provider", "tunnel",
                             "server_url", "server_key", "host_key", "proxy", "tunnel_id",
-                            "tunnel_key", "tunnel_listen"}) {
+                            "tunnel_key", "tunnel_listen", "access_issuer", "access_kid",
+                            "access_public_key"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
     }
@@ -724,8 +757,20 @@ void test_audit_spool(const std::filesystem::path& dir) {
           "the spool sits next to the settings file");
     check(chast::audit_spool_path_for("").empty(), "an empty settings path has no spool");
 
+    const std::string policy_path = (folder / L"host.policy.json").string();
+    check(chast::policy_state_path_for(settings_path) == policy_path,
+          "the policy cache sits next to the settings file");
+    check(chast::policy_state_path_for("").empty(), "an empty settings path has no policy cache");
+    const std::string ack_path = (folder / L"host.policy-ack.json").string();
+    check(chast::policy_ack_path_for(settings_path) == ack_path,
+          "the policy acknowledgement sits next to the settings file");
+    check(chast::policy_ack_path_for("").empty(),
+          "an empty settings path has no policy acknowledgement");
+
     const chast::HostSettingsLoad loaded = chast::load_host_settings(settings_path);
     check(loaded.settings.audit_spool == derived, "loading derives the spool path");
+    check(loaded.settings.policy_state == policy_path, "loading derives the policy cache path");
+    check(loaded.settings.policy_ack == ack_path, "loading derives the acknowledgement path");
 
     chast::HostSettings settings = loaded.settings;
     settings.audit_spool = (folder / L"custom-audit.jsonl").string();
@@ -972,6 +1017,65 @@ void test_service_settings_merge() {
               merged.require_approval, "Click service mode remains available without a password");
 }
 
+void test_managed_policy_ack(const std::filesystem::path& dir) {
+    const std::filesystem::path folder = dir / L"policy-ack";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    const std::string settings_path = (folder / L"host.ini").string();
+    const std::string state_path = chast::policy_state_path_for(settings_path);
+    const std::string ack_path = chast::policy_ack_path_for(settings_path);
+
+    write_text(folder / L"host.policy.json",
+               "{\n  \"managed\": true,\n  \"mode\": \"restricted\",\n"
+               "  \"permission_ceiling\": 15,\n  \"policy_version\": 3,\n"
+               "  \"updated_at_ms\": 1000\n}\n");
+    chast::ManagedPolicyState state = chast::read_managed_policy_state(state_path);
+    check(state.readable && state.managed, "a managed marker is readable");
+    check(state.mode == "restricted" && state.policy_version == 3 &&
+              state.permission_ceiling == 15 && state.updated_at_ms == 1000,
+          "the marker keeps its mode, version, ceiling and update time");
+
+    std::string error;
+    check(!chast::write_managed_policy_ack(ack_path, state_path, "restricted", 2, 15, 1000,
+                                           &error),
+          "a mismatched version is not acknowledged");
+    check(!error.empty(), "the refusal explains itself");
+    check(!std::filesystem::exists(ack_path), "a refused acknowledgement writes nothing");
+    check(!chast::write_managed_policy_ack(ack_path, state_path, "restricted", 3, 7, 1000,
+                                           &error),
+          "a mismatched permission ceiling is not acknowledged");
+
+    check(chast::write_managed_policy_ack(ack_path, state_path, "restricted", 3, 15, 1000,
+                                          &error),
+          "the applied version is acknowledged");
+    std::ifstream in(ack_path, std::ios::binary);
+    const std::string ack((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    check(ack.find("\"policy_version\": 3") != std::string::npos,
+          "the acknowledgement records the version");
+    check(ack.find("\"mode\": \"restricted\"") != std::string::npos,
+          "the acknowledgement records the mode");
+    check(ack.find("\"permission_ceiling\": 15") != std::string::npos,
+          "the acknowledgement records the permission ceiling");
+    check(ack.find("\"updated_at_ms\": 1000") != std::string::npos,
+          "the acknowledgement records the policy update time");
+    check(ack.find("\"applied\": true") != std::string::npos,
+          "the acknowledgement records success");
+
+    write_text(folder / L"host.policy.json", "{\"managed\":false}");
+    check(!chast::write_managed_policy_ack(ack_path, state_path, "restricted", 3, 15, 1000,
+                                           &error),
+          "an unmanaged marker is not acknowledged");
+
+    write_text(folder / L"host.policy.json",
+               "{\"managed\":true,\"mode\":\"restricted\",\"policy_version\":3");
+    check(!chast::read_managed_policy_state(state_path).readable,
+          "an incomplete managed marker is unreadable");
+    write_text(folder / L"host.policy.json", "{\"managed\":true,\"mode\":\"restricted\"}");
+    check(!chast::read_managed_policy_state(state_path).readable,
+          "a managed marker without a version is unreadable");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -1031,6 +1135,7 @@ int main() {
     test_portable_path();
     test_identity_defaults();
     test_audit_spool(dir);
+    test_managed_policy_ack(dir);
     test_unicode_path(dir);
     test_memory_snapshot(dir);
     test_service_settings_merge();

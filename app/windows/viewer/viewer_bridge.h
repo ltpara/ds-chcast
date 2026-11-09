@@ -56,7 +56,7 @@ public:
 private:
     bool QueueInput(const chast::InputEvent& event);
     bool ReleaseInput();
-    bool SetKeyboardMode(bool local);
+    bool SetKeyboardMode(const std::string& mode);
     bool PostLocalKey(const chast::InputEvent& event, bool release = false);
     bool QueueLocalKey(const KBDLLHOOKSTRUCT& key, bool down,
                        const chast::InputEvent& event, bool consumed);
@@ -111,6 +111,7 @@ private:
     std::unique_ptr<KeyboardCapture> keyboard_capture_;
     std::unique_ptr<LocalTextInput> local_text_input_;
     std::atomic<bool> local_keyboard_{false};
+    std::atomic<bool> legacy_keyboard_{false};
     struct LocalKey {
         chast::InputEvent event;
         bool release = false;

@@ -60,6 +60,22 @@ void test_json_field() {
                "a\"b\\c", "quotes and backslashes are unescaped");
     check_text(chast::host::json_string_field(R"({"host":"\u4e2d\u6587"})", "host"),
                "\xE4\xB8\xAD\xE6\x96\x87", "unicode escapes become UTF-8");
+    std::string object;
+    check(chast::host::json_object_field(
+              R"({"event":"ready","device_policy":{"mode":"restricted","policy_version":3}})",
+              "device_policy", object),
+          "a nested policy object is read");
+    check_text(chast::host::json_string_field(object, "mode"), "restricted",
+               "the nested mode is read");
+    check(chast::host::json_integer_field(object, "policy_version") == 3,
+          "the nested version is read");
+    check(!chast::host::json_object_field(R"({"device_policy":null})", "device_policy", object),
+          "a null policy is not an object");
+    check(chast::host::json_integer_field(R"({"policy_version":"3"})", "policy_version") == -1,
+          "a quoted number is not an integer");
+    check(chast::host::json_object_field(R"({"a":"}","o":{"x":1}})", "o", object) &&
+              object == R"({"x":1})",
+          "a brace inside a string does not end the object");
 }
 
 void test_event_parse() {
@@ -90,6 +106,30 @@ void test_event_parse() {
     check(chast::host::parse_tunnel_event(R"({"event":"relay","relay":"9.9.9.9:9"})", event),
           "a relay event parses");
     check_text(event.relay, "9.9.9.9:9", "a refreshed relay address is kept");
+    check(!event.has_policy, "an unmanaged event carries no policy");
+
+    check(chast::host::parse_tunnel_event(
+              R"({"event":"ready","host":"devbox","device_policy":{"mode":"restricted",)"
+              R"("permission_ceiling":15,"policy_version":4,"updated_at_ms":123}})",
+              event),
+          "a ready event with a managed policy parses");
+    check(event.has_policy, "the managed policy is flagged");
+    check_text(event.policy.mode, "restricted", "the policy mode is kept");
+    check(event.policy.permission_ceiling == 15, "the permission ceiling is kept");
+    check(event.policy.policy_version == 4, "the policy version is kept");
+    check(event.policy.updated_at_ms == 123, "the policy update time is kept");
+
+    check(chast::host::parse_tunnel_event(
+              R"({"event":"ready","device_policy":{"mode":"open","permission_ceiling":"15",)"
+              R"("policy_version":5}})",
+              event),
+          "a managed policy with a malformed ceiling still parses");
+    check(event.has_policy && event.policy.permission_ceiling == 0,
+          "a malformed ceiling falls back to zero");
+
+    check(chast::host::parse_tunnel_event(R"({"event":"ready","device_policy":null})", event),
+          "a null policy keeps the event usable");
+    check(!event.has_policy, "a null policy means unmanaged");
 }
 
 void test_executable_paths() {
@@ -125,7 +165,7 @@ chast::HostSettings valid_settings() {
 void test_command_line() {
     chast::HostSettings settings = valid_settings();
     settings.server_key = "server secret";
-    settings.proxy = "socks5://127.0.0.1:10808";
+    settings.proxy = "socks5://proxy-user:proxy-secret@127.0.0.1:10808";
     settings.tunnel_old_id = "devbox.home";
     const std::wstring command = chast::host::tunnel_command_line(
         L"C:\\Program Files\\chast\\chast-tunnel.exe", settings, 4433, "AA:BB:CC");
@@ -137,23 +177,23 @@ void test_command_line() {
     check(contains(command, L"--server https://rendezvous.example.com"),
           "the service URL is passed");
     check(contains(command, L"--id devbox.office"), "the device id is passed");
-    check(contains(command, L"--key \"host secret 123\""),
-          "a device key with spaces is quoted");
+    check(contains(command, L"--key-stdin") && !contains(command, L"host secret 123"),
+          "device key travels over stdin, never argv");
     check(contains(command, L"--local 127.0.0.1:4433"),
           "the local listen port is the host QUIC port");
     check(contains(command, L"--listen 0.0.0.0:14434"), "the tunnel listener is passed");
-    check(contains(command, L"--server-key \"server secret\""),
-          "a server key with spaces is quoted");
+    check(contains(command, L"--server-key-stdin") && !contains(command, L"server secret"),
+          "server key travels over stdin, never argv");
     check(!contains(command, L"--host-key"),
           "without a host key the management key is sent for registration");
-    check(contains(command, L"--proxy socks5://127.0.0.1:10808"),
-          "the outbound proxy is passed");
+    check(contains(command, L"--proxy-stdin") && !contains(command, L"proxy-secret"),
+          "proxy credentials travel over stdin, never argv");
 
     settings.host_key = "host register secret";
     const std::wstring with_host_key = chast::host::tunnel_command_line(
         L"chast-tunnel.exe", settings, 4433, "");
-    check(contains(with_host_key, L"--host-key \"host register secret\""),
-          "a configured host key is passed for registration");
+    check(contains(with_host_key, L"--host-key-stdin") && !contains(with_host_key, L"host register secret"),
+          "configured host key travels over stdin, never argv");
     check(!contains(with_host_key, L"--server-key"),
           "the management key is not leaked once a host key is configured");
     settings.host_key.clear();
@@ -170,12 +210,28 @@ void test_command_line() {
           "an empty fingerprint leaves out the flag");
     check(!contains(without_optional, L"--audit-spool"),
           "an empty audit spool leaves out the flag");
+    check(!contains(without_optional, L"--policy-state"),
+          "an empty policy cache leaves out the flag");
+    check(!contains(without_optional, L"--policy-ack"),
+          "an empty policy acknowledgement leaves out the flag");
 
     settings.audit_spool = "C:\\ProgramData\\chast\\host.audit.jsonl";
     const std::wstring with_spool =
         chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
     check(contains(with_spool, L"--audit-spool C:\\ProgramData\\chast\\host.audit.jsonl"),
           "the audit spool is passed for the agent to forward");
+
+    settings.policy_state = "C:\\ProgramData\\chast\\host.policy.json";
+    const std::wstring with_policy =
+        chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
+    check(contains(with_policy, L"--policy-state C:\\ProgramData\\chast\\host.policy.json"),
+          "the shared policy cache is passed to the agent");
+
+    settings.policy_ack = "C:\\ProgramData\\chast\\host.policy-ack.json";
+    const std::wstring with_ack =
+        chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
+    check(contains(with_ack, L"--policy-ack C:\\ProgramData\\chast\\host.policy-ack.json"),
+          "the acknowledgement path is passed to the agent");
 
     const std::wstring quote_test = chast::host::tunnel_command_line(
         L"chast-tunnel.exe", settings, 4433, "a\"b");
@@ -266,6 +322,21 @@ void test_validation() {
 }
 
 int fake_agent() {
+    const std::wstring command = GetCommandLineW();
+    if (contains(command, L"secret") || !contains(command, L"--key-stdin")) return 90;
+    std::string payload;
+    char bytes[256];
+    DWORD count = 0;
+    while (ReadFile(GetStdHandle(STD_INPUT_HANDLE), bytes, sizeof(bytes), &count, nullptr) && count) {
+        payload.append(bytes, count);
+        if (payload.size() > 1024) return 91;
+    }
+    std::string expected;
+    if (contains(command, L"--host-key-stdin")) expected = "host register secret\n";
+    else if (contains(command, L"--server-key-stdin")) expected = "server secret\n";
+    expected += "host secret 123\n";
+    if (contains(command, L"--proxy-stdin")) expected += "socks5://proxy-user:proxy-secret@127.0.0.1:10808\n";
+    if (payload != expected) return 92;
     std::fputs(
         "{\"event\":\"ready\",\"listen\":\"0.0.0.0:14434\",\"host\":\"fake\","
         "\"punch\":\"127.0.0.1:5000\",\"relay\":\"127.0.0.1:5001\"}\n",
@@ -295,12 +366,16 @@ void test_process_lifecycle() {
     SetEnvironmentVariableW(L"CHAST_TUNNEL", own_executable().c_str());
     SetEnvironmentVariableW(L"CHAST_TEST_TUNNEL_HOLD", nullptr);
 
-    {
+    for (int role = 0; role < 3; ++role) {
         Recorded recorded;
         chast::host::TunnelProcess process;
         std::string error;
+        auto settings = valid_settings();
+        if (role >= 1) settings.server_key = "server secret";
+        if (role == 2) settings.host_key = "host register secret";
+        settings.proxy = "socks5://proxy-user:proxy-secret@127.0.0.1:10808";
         const bool started = process.start(
-            valid_settings(), 4433, "AA:BB",
+            settings, 4433, "AA:BB",
             [&recorded](const chast::host::TunnelEvent& event) {
                 std::lock_guard<std::mutex> lock(recorded.mutex);
                 recorded.events.push_back(event);

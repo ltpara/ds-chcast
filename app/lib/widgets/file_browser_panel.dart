@@ -41,7 +41,9 @@ class FileBrowserPanel extends StatefulWidget {
     this.initialDirectory = '',
     this.initialSort = FileBrowserSort.name,
     this.initialSortAscending = true,
+    this.initialShowHidden = false,
     this.onSortChanged,
+    this.onShowHiddenChanged,
     this.width = 460,
     this.height = 480,
   });
@@ -51,17 +53,27 @@ class FileBrowserPanel extends StatefulWidget {
   // file-transfer-only session gives the browser most of the window.
   final double width;
   final double height;
-  final Future<bool> Function(String directory, [String cursor]) onRequestList;
+  final Future<bool> Function(
+    String directory, [
+    String cursor,
+    bool showHidden,
+  ])
+  onRequestList;
   final Future<bool> Function(String path) onRequestDownload;
   final Future<ViewerFileListing?> Function() onTakeList;
   // Queues the recursive download of one folder; false means the viewer could
   // not accept it (no session, permission revoked or another walk running).
-  final Future<bool> Function(String path) onDownloadFolder;
+  // The walk lists the same hidden-entry view the browser currently shows.
+  final Future<bool> Function(String path, [bool showHidden])
+  onDownloadFolder;
   // Queues one walk over the selected entries: folders mirror below their own
   // names, files land at the top of the receive directory. False means the
   // viewer could not accept it (no session, permission revoked or another
-  // walk running).
-  final Future<bool> Function(List<ViewerFileSelection> entries)
+  // walk running). The walk lists the same hidden-entry view as the browser.
+  final Future<bool> Function(
+    List<ViewerFileSelection> entries, [
+    bool showHidden,
+  ])
   onDownloadEntries;
   final Future<void> Function() onCancelFolderDownload;
   // Drops the ordinary uploads still queued or in flight; clipboard uploads
@@ -86,7 +98,11 @@ class FileBrowserPanel extends StatefulWidget {
   // reopening keeps it; `onSortChanged` updates that memory.
   final FileBrowserSort initialSort;
   final bool initialSortAscending;
+  // Whether hidden entries are listed. The session page passes the last
+  // choice so reopening keeps it; `onShowHiddenChanged` updates that memory.
+  final bool initialShowHidden;
   final FileBrowserSortChanged? onSortChanged;
+  final ValueChanged<bool>? onShowHiddenChanged;
   // Opens the local file picker and queues the chosen files into the shared
   // directory argument. Returns how many roots were queued; null means the
   // picker was cancelled.
@@ -114,6 +130,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   String _nextCursor = '';
   String _requestedDirectory = '';
   String _requestedCursor = '';
+  bool _requestedShowHidden = false;
   String _retryCursor = '';
   int _requestEpoch = 0;
   String? _error;
@@ -154,7 +171,9 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   int _batchTotal = 0;
   int _batchFailures = 0;
   String _batchFirstError = '';
-  final List<String> _deleteQueue = <String>[];
+  // Each entry keeps whether it is a folder, because a folder is removed
+  // together with its contents on the host.
+  final List<MapEntry<String, bool>> _deleteQueue = <MapEntry<String, bool>>[];
 
   // Client-side name filter over the current listing. Cleared when the
   // accepted listing names a different directory, so entering a folder never
@@ -168,6 +187,9 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   // first by name, and this only reshuffles what the page shows.
   FileBrowserSort _sort = FileBrowserSort.name;
   bool _sortAscending = true;
+  // Hidden entries are omitted by default, like RustDesk's remote browser.
+  // The toggle reloads the current folder from its first page.
+  bool _showHidden = false;
 
   List<ViewerFileEntry> get _visibleEntries {
     final String needle = _filter.toLowerCase();
@@ -227,6 +249,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     _takenFolderAnswers = widget.status.folderDownloadAnswers;
     _sort = widget.initialSort;
     _sortAscending = widget.initialSortAscending;
+    _showHidden = widget.initialShowHidden;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         unawaited(_request(widget.initialDirectory));
@@ -382,6 +405,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     final int epoch = ++_requestEpoch;
     _requestedDirectory = directory;
     _requestedCursor = cursor;
+    _requestedShowHidden = _showHidden;
     _retryCursor = '';
     setState(() {
       _loading = true;
@@ -389,7 +413,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     });
     bool queued = false;
     try {
-      queued = await widget.onRequestList(directory, cursor);
+      queued = await widget.onRequestList(directory, cursor, _showHidden);
     } on PlatformException {
       queued = false;
     } on MissingPluginException {
@@ -426,7 +450,8 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     }
     final ViewerFileListing answer = listing;
     if (answer.directory != _requestedDirectory ||
-        answer.cursor != _requestedCursor) {
+        answer.cursor != _requestedCursor ||
+        answer.showHidden != _requestedShowHidden) {
       return;
     }
     final bool append =
@@ -513,7 +538,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   Future<void> _downloadFolder(ViewerFileEntry entry) async {
     bool queued = false;
     try {
-      queued = await widget.onDownloadFolder(_join(entry.name));
+      queued = await widget.onDownloadFolder(_join(entry.name), _showHidden);
     } on PlatformException {
       queued = false;
     } on MissingPluginException {
@@ -696,7 +721,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     }
     bool queued = false;
     try {
-      queued = await widget.onDownloadEntries(entries);
+      queued = await widget.onDownloadEntries(entries, _showHidden);
     } on PlatformException {
       queued = false;
     } on MissingPluginException {
@@ -717,23 +742,27 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   }
 
   Future<void> _deleteSelected() async {
-    final List<String> paths = <String>[
+    final List<MapEntry<String, bool>> targets = <MapEntry<String, bool>>[
       for (final ViewerFileEntry entry in _entries)
-        if (_selected.contains(entry.name)) _join(entry.name),
+        if (_selected.contains(entry.name))
+          MapEntry<String, bool>(_join(entry.name), entry.directory),
     ];
-    if (paths.isEmpty || _batchDeleting) {
+    if (targets.isEmpty || _batchDeleting) {
       return;
     }
+    final bool hasFolder = targets.any(
+      (MapEntry<String, bool> target) => target.value,
+    );
     final bool? confirmed = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
         backgroundColor: kPanelDark,
         title: Text(
-          tr('删除选中的 {n} 项？', <String, Object?>{'n': paths.length}),
+          tr('删除选中的 {n} 项？', <String, Object?>{'n': targets.length}),
           style: const TextStyle(fontSize: 13.5),
         ),
         content: Text(
-          tr('文件夹必须为空才能删除，此操作不可撤销。'),
+          hasFolder ? tr('选中的文件夹及其内容将被删除，此操作不可撤销。') : tr('此操作不可撤销。'),
           style: const TextStyle(fontSize: 11.5),
         ),
         actions: <Widget>[
@@ -753,16 +782,16 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     }
     setState(() {
       _batchDeleting = true;
-      _batchTotal = paths.length;
+      _batchTotal = targets.length;
       _batchFailures = 0;
       _batchFirstError = '';
       _opResult = null;
       _opResultFailed = false;
       _deleteQueue
         ..clear()
-        ..addAll(paths.skip(1));
+        ..addAll(targets.skip(1));
     });
-    final bool queued = await _sendRemove(paths.first);
+    final bool queued = await _sendRemove(targets.first);
     if (!mounted || !_batchDeleting) {
       return;
     }
@@ -774,9 +803,15 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     }
   }
 
-  Future<bool> _sendRemove(String path) async {
+  Future<bool> _sendRemove(MapEntry<String, bool> target) async {
     try {
-      return await widget.onFileOperation(ViewerFileOperation.remove, path, '');
+      return await widget.onFileOperation(
+        target.value
+            ? ViewerFileOperation.removeTree
+            : ViewerFileOperation.remove,
+        target.key,
+        '',
+      );
     } on PlatformException {
       return false;
     } on MissingPluginException {
@@ -789,9 +824,9 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
       _finishBatchDelete();
       return;
     }
-    final String path = _deleteQueue.removeAt(0);
+    final MapEntry<String, bool> target = _deleteQueue.removeAt(0);
     unawaited(
-      _sendRemove(path).then((bool queued) {
+      _sendRemove(target).then((bool queued) {
         if (!mounted || !_batchDeleting) {
           return;
         }
@@ -931,7 +966,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
           style: const TextStyle(fontSize: 13.5),
         ),
         content: Text(
-          entry.directory ? tr('文件夹必须为空才能删除，此操作不可撤销。') : tr('此操作不可撤销。'),
+          entry.directory ? tr('文件夹及其内容将被删除，此操作不可撤销。') : tr('此操作不可撤销。'),
           style: const TextStyle(fontSize: 11.5),
         ),
         actions: <Widget>[
@@ -949,7 +984,12 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     if (confirmed != true || !mounted) {
       return;
     }
-    await _operate(ViewerFileOperation.remove, _join(entry.name));
+    await _operate(
+      entry.directory
+          ? ViewerFileOperation.removeTree
+          : ViewerFileOperation.remove,
+      _join(entry.name),
+    );
   }
 
   Future<String?> _promptName({
@@ -1070,6 +1110,32 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
                       onPressed: _batchDeleting
                           ? null
                           : () => unawaited(_upload()),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 30,
+                    height: 30,
+                    child: IconButton(
+                      key: const ValueKey<String>('file-show-hidden'),
+                      padding: EdgeInsets.zero,
+                      tooltip: _showHidden
+                          ? tr('不显示隐藏文件')
+                          : tr('显示隐藏文件'),
+                      icon: Icon(
+                        _showHidden
+                            ? Icons.visibility_rounded
+                            : Icons.visibility_off_outlined,
+                        size: 16,
+                      ),
+                      color: _showHidden ? kAccentBright : Colors.white54,
+                      onPressed: () {
+                        setState(() {
+                          _showHidden = !_showHidden;
+                          _selected.clear();
+                        });
+                        widget.onShowHiddenChanged?.call(_showHidden);
+                        unawaited(_request(_directory));
+                      },
                     ),
                   ),
                   SizedBox(

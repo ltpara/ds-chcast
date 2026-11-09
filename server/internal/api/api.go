@@ -26,6 +26,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/configpush"
 	"github.com/ltpara/ds-chcast/server/internal/dbmetric"
@@ -85,7 +86,11 @@ type Config struct {
 	// kept on controlled machines instead of the management key. Empty keeps
 	// the old server-key behavior.
 	HostKey string
-	TTL     time.Duration
+	// AccessIssuer signs short-lived device access tickets. It is deliberately
+	// separate from the management and host keys so a compromised console
+	// credential cannot mint host access. Nil disables the ticket endpoint.
+	AccessIssuer *acl.Issuer
+	TTL          time.Duration
 	// RelayOnly hides direct candidates from lookups, mirroring RustDesk's
 	// ALWAYS_USE_RELAY: viewers can still reach the host through the relay or
 	// the shared carrier, but never punch. The admin console flips it at
@@ -207,6 +212,9 @@ type server struct {
 	oidcMu      sync.Mutex
 	oidcPending map[string]*oidcLoginState
 
+	accessIssuer *acl.Issuer
+	ticketReplay *acl.ReplayGuard
+
 	wake *wake.Broker
 }
 
@@ -239,6 +247,10 @@ func New(cfg Config) http.Handler {
 		durationBuckets: make(map[string][]uint64),
 		recoveryLast:    make(map[string]time.Time),
 		wake:            wake.New(wake.DefaultTTL, wake.DefaultCooldown, wake.DefaultMaxJobs),
+	}
+	if cfg.AccessIssuer != nil {
+		s.accessIssuer = cfg.AccessIssuer
+		s.ticketReplay = acl.NewReplayGuard(4096)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/hosts", s.register)
@@ -323,6 +335,9 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
 	mux.HandleFunc("POST /v1/hosts/{id}/wake", s.wakeHost)
+	mux.HandleFunc("GET /v1/api-tokens", s.listAPITokens)
+	mux.HandleFunc("POST /v1/api-tokens", s.createAPIToken)
+	mux.HandleFunc("DELETE /v1/api-tokens/{id}", s.revokeAPIToken)
 	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /v1/accounts", s.adminCreateAccount)
 	mux.HandleFunc("PATCH /v1/accounts/{username}", s.adminUpdateAccount)
@@ -346,6 +361,12 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/groups/{id}/devices", s.accountGroupDevices)
 	mux.HandleFunc("POST /v1/groups/{id}/devices", s.addAccountGroupDevice)
 	mux.HandleFunc("DELETE /v1/groups/{id}/devices/{peer}", s.removeAccountGroupDevice)
+	mux.HandleFunc("GET /v1/device-policies", s.listDevicePolicies)
+	mux.HandleFunc("GET /v1/device-policies/{peer}", s.devicePolicyDetail)
+	mux.HandleFunc("PUT /v1/device-policies/{peer}", s.setDevicePolicy)
+	mux.HandleFunc("DELETE /v1/device-policies/{peer}", s.deleteDevicePolicy)
+	mux.HandleFunc("POST /v1/device-policies/{peer}/receipt", s.reportDevicePolicyReceipt)
+	mux.HandleFunc("POST /v1/access-tickets", s.issueAccessTicket)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return s.instrument(mux)
 }
@@ -404,6 +425,19 @@ type registerResponse struct {
 	// Wake carries cross-subnet Wake-on-LAN jobs for this agent to broadcast on
 	// its own link. Agents without the relay enabled never receive one.
 	Wake []wake.Job `json:"wake,omitempty"`
+	// DevicePolicy tells a managed host which policy version to enforce. It is
+	// absent for unmanaged hosts, which keep the local-authentication behavior.
+	// The account allow list is applied at ticket issuance and deliberately not
+	// sent: a host only enforces "managed" and the signed ticket.
+	DevicePolicy *hostDevicePolicy `json:"device_policy,omitempty"`
+}
+
+// hostDevicePolicy is the server's policy statement for one managed host.
+type hostDevicePolicy struct {
+	Mode              string `json:"mode"`
+	PermissionCeiling uint32 `json:"permission_ceiling,omitempty"`
+	PolicyVersion     uint32 `json:"policy_version"`
+	UpdatedAtMS       int64  `json:"updated_at_ms"`
 }
 
 // softwareInfo mirrors RustDesk's SoftwareUpdate reply: the newest version and
@@ -467,16 +501,24 @@ type lookupResponse struct {
 	Software  *softwareInfo `json:"software,omitempty"`
 	// ConfigSerial and RendezvousServers mirror the registration reply so a
 	// viewer that only performs lookups still learns about failover servers.
-	ConfigSerial      int64    `json:"config_serial,omitempty"`
-	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
+	// AccessTicket is present only when the lookup carried the connection's
+	// ephemeral client_public_key, the caller authenticated as an account and
+	// the device is managed. The viewer presents it, with the matching proof,
+	// on the connection it opens; unmanaged devices need no ticket.
+	AccessTicket      *lookupAccessTicket `json:"access_ticket,omitempty"`
+	ConfigSerial      int64               `json:"config_serial,omitempty"`
+	RendezvousServers []string            `json:"rendezvous_servers,omitempty"`
 }
 
 type batchLookupResponse struct {
-	Hosts             []lookupResponse `json:"hosts"`
-	Missing           []string         `json:"missing,omitempty"`
-	Software          *softwareInfo    `json:"software,omitempty"`
-	ConfigSerial      int64            `json:"config_serial,omitempty"`
-	RendezvousServers []string         `json:"rendezvous_servers,omitempty"`
+	Hosts   []lookupResponse `json:"hosts"`
+	Missing []string         `json:"missing,omitempty"`
+	// Denied lists ids whose device policy refused this caller. They are
+	// separate from missing so a client can distinguish "gone" from "no access".
+	Denied            []string      `json:"denied,omitempty"`
+	Software          *softwareInfo `json:"software,omitempty"`
+	ConfigSerial      int64         `json:"config_serial,omitempty"`
+	RendezvousServers []string      `json:"rendezvous_servers,omitempty"`
 }
 
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
@@ -615,6 +657,15 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Software:        s.software(),
 	}
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
+	policy, err := s.hostDevicePolicy(req.ID)
+	if err != nil {
+		// Returning no policy would make a managed host treat itself as
+		// unmanaged, so an unreadable policy refuses the renewal instead.
+		s.cfg.Logger.Error("read device policy for registration", "id", req.ID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "device policy is unavailable")
+		return
+	}
+	resp.DevicePolicy = policy
 	// Match jobs against the persisted report so a relay agent that omits the
 	// field on a renewal still uses the link it registered earlier.
 	effectiveTargets := wakeTargets
@@ -662,7 +713,8 @@ func (s *server) punchV6(r *http.Request) string {
 }
 
 func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
-	if !s.linkAuthorized(r) {
+	subject, ok := s.resolveLookupSubject(r)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "server key was not accepted")
 		return
 	}
@@ -676,6 +728,17 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return
 	}
+	if allowed, reason, err := s.lookupAdmission(id, subject); err != nil {
+		s.cfg.Logger.Error("lookup device policy", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not check the device policy")
+		return
+	} else if !allowed {
+		writeError(w, http.StatusForbidden, reason)
+		return
+	}
+	if !s.attachLookupTicket(w, r, subject, id, resp.Fingerprint, &resp) {
+		return
+	}
 	resp.Software = s.software()
 	resp.PunchV6 = s.punchV6(r)
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
@@ -686,7 +749,8 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 // are reported separately instead of failing the request, so a viewer can
 // render the peers it does know about while flagging stale entries.
 func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
-	if !s.linkAuthorized(r) {
+	subject, ok := s.resolveLookupSubject(r)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "server key was not accepted")
 		return
 	}
@@ -706,6 +770,16 @@ func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
 		host, ok := s.hostLookup(id, now, relayOnly)
 		if !ok {
 			resp.Missing = append(resp.Missing, id)
+			continue
+		}
+		allowed, _, err := s.lookupAdmission(id, subject)
+		if err != nil {
+			s.cfg.Logger.Error("batch lookup device policy", "id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "could not check the device policy")
+			return
+		}
+		if !allowed {
+			resp.Denied = append(resp.Denied, id)
 			continue
 		}
 		host.PunchV6 = s.punchV6(r)
@@ -844,7 +918,7 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 }
 
 func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleWrite)
+	_, actor, ok := s.consoleActor(w, r, consoleWrite, account.TokenResourceDevices)
 	if !ok {
 		return
 	}
@@ -874,7 +948,7 @@ func (s *server) releaseLease(id string, host registry.Host) {
 // resetIdentity is the administrative escape hatch for a lost host key. It
 // removes the permanent binding as well as any live lease.
 func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleWrite)
+	_, actor, ok := s.consoleActor(w, r, consoleWrite, account.TokenResourceDevices)
 	if !ok {
 		return
 	}
@@ -909,7 +983,7 @@ type identityLabelsResponse struct {
 // metadata, these survive host renewals and are never accepted from the host
 // registration body.
 func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleWrite)
+	_, actor, ok := s.consoleActor(w, r, consoleWrite, account.TokenResourceDevices)
 	if !ok {
 		return
 	}
@@ -1009,7 +1083,7 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) stats(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+	if _, _, ok := s.consoleActor(w, r, consoleRead, account.TokenResourceOps); !ok {
 		return
 	}
 	out := map[string]any{
@@ -1576,16 +1650,6 @@ func (s *server) authorized(r *http.Request) bool {
 // Open registration does not grant operator privileges.
 func (s *server) serverKeyAuthorized(r *http.Request) bool {
 	return bearerMatches(s.cfg.ServerKey, r)
-}
-
-// linkAuthorized accepts the connection credential handed to ordinary viewers.
-// The management key remains a superset so a deployment can run both with one
-// secret. When no link key is configured the old server-key rule stands.
-func (s *server) linkAuthorized(r *http.Request) bool {
-	if s.cfg.LinkKey == "" {
-		return s.authorized(r)
-	}
-	return bearerMatches(s.cfg.LinkKey, r) || s.serverKeyAuthorized(r)
 }
 
 // hostAuthorized accepts the credential installed on controlled machines.

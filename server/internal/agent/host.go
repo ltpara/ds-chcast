@@ -89,6 +89,15 @@ type HostConfig struct {
 	// UpdateDir is where the installer is staged. Empty uses an "updates"
 	// directory beside the agent executable, which inherits its ACL.
 	UpdateDir string
+	// PolicyState is the machine file that caches the last registration
+	// policy. The host process reads the same file as its managed marker, so
+	// it must outlive the agent and be writable by both. Empty keeps the
+	// policy in memory only.
+	PolicyState string
+	// PolicyAck is the machine file the host writes after it accepted the
+	// current policy version. The agent signs the server receipt only when
+	// this file names the same policy instance. Empty disables receipts.
+	PolicyAck string
 	// WakeRelay makes this agent a cross-subnet Wake-on-LAN proxy: the server
 	// may hand it jobs for targets whose last reported link shares an endpoint
 	// with this machine's link. It is opt-in because it sends packets to
@@ -128,6 +137,9 @@ type HostInfo struct {
 	// MigratedFrom is the old id the service moved to ID during this start.
 	// Empty on ordinary registrations and renewals.
 	MigratedFrom string `json:"migrated_from,omitempty"`
+	// Policy is the managed-device statement from the latest registration.
+	// Nil means the device is unmanaged and local authentication remains.
+	Policy *DevicePolicy `json:"policy,omitempty"`
 }
 
 type HostAgent struct {
@@ -186,6 +198,19 @@ type HostAgent struct {
 	// softwareSeen remembers the last advertised update version so a renewal
 	// every few seconds does not repeat the same notice.
 	softwareSeen string
+	// policy is the last managed-device statement from a registration reply.
+	// Nil means unmanaged; only the embedding host can enforce it.
+	policy *DevicePolicy
+	// policySaved reports whether PolicyState already matches policy. A failed
+	// write stays unsaved so the next registration retries instead of
+	// pretending the managed marker is durable.
+	policySaved bool
+	// receiptVersion is the policy version whose receipt the server accepted.
+	// Zero means none; a new policy version triggers another report.
+	receiptVersion uint32
+	// receiptTried is the version a receipt is in flight for, so a rapid
+	// renewal cannot post the same acknowledgement twice.
+	receiptTried uint32
 	// updatesTried keeps the versions this process already staged or
 	// rejected, so a flapping server cannot loop the download.
 	updatesTried map[string]bool
@@ -325,6 +350,25 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		carrierReady:   make(chan struct{}),
 		controlReady:   make(chan struct{}),
 	}
+	if cfg.PolicyState != "" {
+		// Seed the managed marker before the first registration so a policy
+		// removed while the agent was down is recognized and overwritten,
+		// instead of leaving a stale managed file beside the host.
+		policy, exists, stateErr := loadPolicyState(cfg.PolicyState)
+		if stateErr != nil {
+			h.log.Warn("device policy state is unreadable; a managed device must stay managed",
+				"path", cfg.PolicyState, "error", stateErr)
+		} else if exists {
+			h.policy = policy
+			h.policySaved = true
+			if policy != nil {
+				h.log.Info("previous device policy loaded", "path", cfg.PolicyState,
+					"mode", policy.Mode, "version", policy.PolicyVersion)
+			}
+		} else {
+			h.policySaved = true
+		}
+	}
 	reg, err := h.registerWithFailover(ctx)
 	if err != nil {
 		conn.Close()
@@ -431,14 +475,19 @@ func (h *HostAgent) infoLocked() HostInfo {
 		NAT:          h.natType,
 		UPnPPort:     h.upnpPort,
 		MigratedFrom: h.migratedFrom,
+		Policy:       h.policy,
 	}
 }
 
 func (h *HostAgent) reportInfo() {
 	h.mu.Lock()
 	info := h.infoLocked()
+	policyKey := ""
+	if info.Policy != nil {
+		policyKey = fmt.Sprintf("%s:%d:%d", info.Policy.Mode, info.Policy.PolicyVersion, info.Policy.PermissionCeiling)
+	}
 	key := info.Relay + "|" + info.Viewer + "|" + info.Path + "|" + info.Transport + "|" +
-		info.NAT + "|" + info.MigratedFrom
+		info.NAT + "|" + info.MigratedFrom + "|" + policyKey
 	changed := key != h.lastInfo
 	h.lastInfo = key
 	h.mu.Unlock()
@@ -584,7 +633,12 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		endpoints = []string{reg.Relay}
 	}
 	relaySet := resolveUDPAll(endpoints)
+	policy := cloneDevicePolicy(reg.DevicePolicy)
 	h.mu.Lock()
+	policyChanged := !sameDevicePolicy(h.policy, policy)
+	if policyChanged {
+		h.policy = policy
+	}
 	if punch != nil {
 		h.punch = punch
 	}
@@ -635,7 +689,37 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	} else {
 		h.softwareSeen = ""
 	}
+	needPolicySave := policyChanged || !h.policySaved
 	h.mu.Unlock()
+	if needPolicySave && h.cfg.PolicyState != "" {
+		if err := savePolicyState(h.cfg.PolicyState, policy, time.Now()); err != nil {
+			h.log.Error("cannot persist device policy", "path", h.cfg.PolicyState, "error", err)
+		} else {
+			h.mu.Lock()
+			h.policySaved = true
+			h.mu.Unlock()
+		}
+	}
+	if policyChanged {
+		if policy == nil {
+			h.log.Info("device is unmanaged; local authentication remains in effect")
+		} else {
+			h.log.Info("device policy received", "mode", policy.Mode,
+				"version", policy.PolicyVersion, "permission_ceiling", policy.PermissionCeiling)
+			if !policy.Valid() {
+				h.log.Warn("unknown device policy mode; the host must keep this device managed",
+					"mode", policy.Mode, "version", policy.PolicyVersion)
+			}
+		}
+	}
+	if policy == nil {
+		h.mu.Lock()
+		h.receiptVersion = 0
+		h.receiptTried = 0
+		h.mu.Unlock()
+	} else {
+		h.maybeReportPolicyReceipt(policy)
+	}
 	h.relayWakeJobs(reg.Wake)
 	if notice != nil {
 		h.log.Info("software update available",
@@ -643,6 +727,65 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.startUpdate(*notice)
 	}
 	h.reportInfo()
+}
+
+// maybeReportPolicyReceipt reports a policy version after the host confirmed
+// it in the shared acknowledgement file. The POST runs off the read loop: a
+// slow management API must never stall keepalives. A missing or stale
+// acknowledgement leaves the receipt unsent and a later registration retries.
+func (h *HostAgent) maybeReportPolicyReceipt(policy *DevicePolicy) {
+	if policy == nil || h.cfg.PolicyAck == "" {
+		return
+	}
+	h.mu.Lock()
+	if h.receiptVersion == policy.PolicyVersion || h.receiptTried == policy.PolicyVersion {
+		h.mu.Unlock()
+		return
+	}
+	ackPath := h.cfg.PolicyAck
+	h.mu.Unlock()
+	ack, ok := readPolicyAck(ackPath)
+	if !ok || !ack.confirms(policy) {
+		return
+	}
+	h.mu.Lock()
+	h.receiptTried = policy.PolicyVersion
+	h.mu.Unlock()
+	detail := ack.Detail
+	if detail == "" {
+		detail = "host applied policy version " +
+			strconv.FormatUint(uint64(policy.PolicyVersion), 10)
+	}
+	version := policy.PolicyVersion
+	applied := ack.Applied
+	go func() {
+		timestamp := time.Now().Unix()
+		req := policyReceiptRequest{
+			PolicyVersion: version,
+			Applied:       applied,
+			Detail:        detail,
+			Timestamp:     timestamp,
+			Signature: identity.Sign(h.priv, identity.HostDevicePolicyReceiptMessage(
+				h.cfg.ID, version, applied, detail, timestamp)),
+		}
+		ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+		defer cancel()
+		if err := h.api.reportDevicePolicyReceipt(ctx, h.cfg.ID, req); err != nil {
+			h.log.Warn("cannot report device policy receipt", "version", version, "error", err)
+			h.mu.Lock()
+			if h.receiptTried == version {
+				h.receiptTried = 0
+			}
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Lock()
+		if h.policy != nil && h.policy.PolicyVersion == version {
+			h.receiptVersion = version
+		}
+		h.mu.Unlock()
+		h.log.Info("device policy receipt accepted", "version", version, "applied", applied)
+	}()
 }
 
 // startUpdate stages the advertised release at most once per version. The

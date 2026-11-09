@@ -28,6 +28,10 @@
     groupsLoaded: false,
     groupsLoading: false,
     groupEditing: null,
+    policies: [],
+    policiesLoaded: false,
+    policiesLoading: false,
+    policyEditing: null,
   };
 
   class ApiError extends Error {
@@ -428,6 +432,7 @@
     const visibility = {
       overview: read && !restricted,
       devices: read && !restricted,
+      policies: admin,
       accounts: admin,
       groups: true,
       recordings: read && !restricted,
@@ -463,10 +468,16 @@
     state.groups = [];
     state.groupsLoaded = false;
     state.groupEditing = null;
+    state.policies = [];
+    state.policiesLoaded = false;
+    state.policyEditing = null;
     clear($('group-rows'));
+    clear($('policy-rows'));
     clear($('audit-group'));
     const dialog = $('device-dialog');
     if (dialog.open) dialog.close();
+    const policyDialog = $('policy-dialog');
+    if (policyDialog.open) policyDialog.close();
     const groupDialog = $('group-dialog');
     if (groupDialog.open) groupDialog.close();
     clearSession();
@@ -488,6 +499,8 @@
         refreshOverview().catch(() => {});
       } else if (state.tab === 'devices') {
         loadDevices(true).catch(() => {});
+      } else if (state.tab === 'policies') {
+        loadPolicies(true).catch(() => {});
       } else if (state.tab === 'groups') {
         loadGroups(true).catch(() => {});
       }
@@ -513,6 +526,7 @@
     });
     if (tab === 'overview') refreshOverview().catch(reportError);
     else if (tab === 'devices') loadDevices().catch(reportError);
+    else if (tab === 'policies') loadPolicies().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
     else if (tab === 'groups') loadGroups().catch(reportError);
     else if (tab === 'recordings') loadRecordings(true).catch(reportError);
@@ -837,6 +851,237 @@
     state.editing = null;
     toast('已保存 ' + peer.id);
     await loadDevices();
+  }
+
+  // ---------- device policies ----------
+
+  const PERMISSION_LABELS = [
+    [0x0001, '输入'],
+    [0x0002, '剪贴板'],
+    [0x0004, '音频'],
+    [0x0008, '文件传输'],
+    [0x0010, '麦克风'],
+    [0x0020, '隐私模式'],
+    [0x0080, '端口转发'],
+    [0x0100, '终端'],
+    [0x0200, '录制'],
+    [0x0400, '摄像头'],
+    [0x0800, '重启'],
+    [0x1000, '阻断输入'],
+    [0x2000, '系统登录'],
+    [0x4000, '会话切换'],
+    [0x8000, '远程配置'],
+  ];
+
+  function fmtCeiling(mask) {
+    const value = Number(mask) >>> 0;
+    const names = PERMISSION_LABELS.filter(([bit]) => (value & bit) !== 0).map(([, name]) => name);
+    const known = PERMISSION_LABELS.reduce((bits, [bit]) => bits | bit, 0);
+    const unknown = value & ~known;
+    if (unknown) names.push('未知位 0x' + unknown.toString(16).toUpperCase());
+    return names.length ? names.join('、') : '不限';
+  }
+
+  function ceilingCell(mask) {
+    const value = Number(mask) >>> 0;
+    if (!value) return '不限';
+    const node = el('span', '', fmtCeiling(value));
+    node.title = '0x' + value.toString(16).toUpperCase();
+    return node;
+  }
+
+  // receiptState reports what the console knows about a host applying the
+  // current policy. "已应用" needs a signed receipt whose version matches the
+  // policy; an older success or a failure never counts as the current version.
+  function receiptState(policy) {
+    const receipt = policy.receipt;
+    if (!receipt) {
+      return { label: '待应用', kind: 'warn', detail: '主机尚未上报该策略。' };
+    }
+    if (receipt.policy_version !== policy.policy_version) {
+      return {
+        label: '待应用',
+        kind: 'warn',
+        detail: '主机上报版本 v' + receipt.policy_version + '（' +
+          (receipt.applied ? '已应用' : '应用失败') + '），当前版本 v' + policy.policy_version +
+          ' 尚未确认。' + (receipt.detail ? ' ' + receipt.detail : ''),
+      };
+    }
+    if (!receipt.applied) {
+      return { label: '应用失败', kind: 'bad', detail: receipt.detail || '主机未能应用该版本。' };
+    }
+    return {
+      label: '已应用版本 ' + receipt.policy_version,
+      kind: 'ok',
+      detail: (receipt.detail ? receipt.detail + ' · ' : '') + '上报于 ' + fmtTime(receipt.reported_at_ms),
+    };
+  }
+
+  async function loadPolicies(silent) {
+    if (state.policiesLoading) return;
+    state.policiesLoading = true;
+    try {
+      const data = await api('/v1/device-policies') || {};
+      state.policies = Array.isArray(data.policies) ? data.policies : [];
+      state.policiesLoaded = true;
+      renderPolicies();
+    } catch (err) {
+      if (err && err.status === 503) {
+        state.policies = [];
+        state.policiesLoaded = true;
+        renderPolicies();
+        $('policy-summary').textContent = '服务端未启用账号库（缺少 --accounts-db），设备策略不可用。';
+        return;
+      }
+      if (!silent) throw err;
+    } finally {
+      state.policiesLoading = false;
+    }
+  }
+
+  function renderPolicies() {
+    const body = $('policy-rows');
+    clear(body);
+    state.policies.forEach((policy) => body.appendChild(policyRow(policy)));
+    $('policy-empty').classList.toggle('hidden', state.policies.length > 0);
+    $('policy-readonly').classList.toggle('hidden', can('admin'));
+    const applied = state.policies.filter((policy) => {
+      const receipt = policy.receipt;
+      return Boolean(receipt && receipt.applied && receipt.policy_version === policy.policy_version);
+    }).length;
+    $('policy-summary').textContent = '受管设备 ' + state.policies.length +
+      ' 台，主机已确认当前版本 ' + applied + ' 台。';
+  }
+
+  function policyRow(policy) {
+    const tr = document.createElement('tr');
+    const peer = cell(policy.peer_id);
+    peer.className = 'mono';
+    tr.appendChild(peer);
+    tr.appendChild(cell(pill(policy.mode === 'restricted' ? '受限' : '受管开放',
+      policy.mode === 'restricted' ? 'warn' : 'ok')));
+    tr.appendChild(cell(ceilingCell(policy.permission_ceiling)));
+
+    const allow = (list, placeholder) => {
+      if (policy.mode !== 'restricted') return '不适用';
+      return Array.isArray(list) && list.length ? list.join(', ') : placeholder;
+    };
+    tr.appendChild(cell(allow(policy.allowed_users, '无（仅分组）')));
+    tr.appendChild(cell(allow(policy.allowed_groups, '无（仅用户）')));
+    tr.appendChild(cell('v' + policy.policy_version));
+
+    const receipt = receiptState(policy);
+    const receiptBox = el('div', 'stack');
+    const badge = pill(receipt.label, receipt.kind);
+    badge.title = receipt.detail;
+    receiptBox.appendChild(badge);
+    receiptBox.appendChild(el('span', 'muted', receipt.detail));
+    const receiptCell = document.createElement('td');
+    receiptCell.className = 'wrap';
+    receiptCell.appendChild(receiptBox);
+    tr.appendChild(receiptCell);
+
+    tr.appendChild(cell(fmtTime(policy.updated_at_ms)));
+
+    const actions = el('div', 'actions-wrap');
+    const edit = button('编辑', 'small');
+    edit.addEventListener('click', () => openPolicyDialog(policy));
+    actions.appendChild(edit);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function splitNames(value) {
+    return value.split(',').map((item) => item.trim()).filter((item) => item.length > 0);
+  }
+
+  function syncPolicyMode() {
+    const restricted = $('policy-mode').value === 'restricted';
+    $('policy-users').disabled = !restricted;
+    $('policy-groups').disabled = !restricted;
+    $('policy-mode-hint').textContent = restricted
+      ? '只有下列用户与分组能获得接入票据；两列都为空时无人可连。当前主机版本对所有新会话失败关闭。'
+      : 'open 允许所有未被封禁的账号获得接入票据，允许列表不生效。当前主机版本对所有新会话失败关闭。';
+  }
+
+  function syncPolicyCeiling() {
+    const value = Number($('policy-ceiling').value || 0);
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      $('policy-ceiling-hint').textContent = '请输入 0..4294967295 之间的整数。';
+      return;
+    }
+    $('policy-ceiling-hint').textContent = value === 0
+      ? '0 表示不限制权限。'
+      : '上限包含：' + fmtCeiling(value);
+  }
+
+  function openPolicyDialog(policy) {
+    state.policyEditing = policy || null;
+    const editing = Boolean(policy);
+    $('policy-dialog-title').textContent = editing ? '设备策略 · ' + policy.peer_id : '新建设备策略';
+    const peer = $('policy-peer');
+    peer.value = editing ? policy.peer_id : '';
+    peer.readOnly = editing;
+    $('policy-mode').value = editing ? policy.mode : 'open';
+    $('policy-ceiling').value = editing ? String(policy.permission_ceiling) : '0';
+    $('policy-users').value = editing && Array.isArray(policy.allowed_users)
+      ? policy.allowed_users.join(', ') : '';
+    $('policy-groups').value = editing && Array.isArray(policy.allowed_groups)
+      ? policy.allowed_groups.join(', ') : '';
+    $('policy-delete').classList.toggle('hidden', !editing);
+    if (editing) {
+      const current = receiptState(policy);
+      $('policy-dialog-receipt').textContent = '当前版本 v' + policy.policy_version + '：' +
+        current.label + '。' + current.detail;
+    } else {
+      $('policy-dialog-receipt').textContent =
+        '保存后主机在下次注册时收到策略；在签名回执确认相同版本前，控制台显示“待应用”。';
+    }
+    syncPolicyMode();
+    syncPolicyCeiling();
+    $('policy-dialog').showModal();
+    if (!editing) peer.focus();
+  }
+
+  async function savePolicy() {
+    const peer = $('policy-peer').value.trim();
+    if (!peer) {
+      toast('请填写设备 ID', true);
+      return;
+    }
+    const ceiling = Number($('policy-ceiling').value || 0);
+    if (!Number.isInteger(ceiling) || ceiling < 0 || ceiling > 0xffffffff) {
+      toast('权限上限必须是 0..4294967295 的整数', true);
+      return;
+    }
+    const submit = $('policy-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      const reply = await api('/v1/device-policies/' + encodeURIComponent(peer), {
+        method: 'PUT',
+        body: {
+          mode: $('policy-mode').value,
+          permission_ceiling: ceiling,
+          allowed_users: splitNames($('policy-users').value),
+          allowed_groups: splitNames($('policy-groups').value),
+        },
+      });
+      const version = reply && reply.policy ? reply.policy.policy_version : 0;
+      $('policy-dialog').close();
+      state.policyEditing = null;
+      toast('已保存 ' + peer + (version ? '（版本 v' + version + '，待主机确认）' : ''));
+      await loadPolicies();
+    });
+  }
+
+  async function deletePolicy() {
+    const policy = state.policyEditing;
+    if (!policy) return;
+    if (!window.confirm('删除设备 ' + policy.peer_id + ' 的策略？\n设备会回到未受管状态，连接恢复本机认证；此操作会写入审计。')) return;
+    await api('/v1/device-policies/' + encodeURIComponent(policy.peer_id), { method: 'DELETE' });
+    $('policy-dialog').close();
+    state.policyEditing = null;
+    toast('已删除策略 ' + policy.peer_id);
+    await loadPolicies();
   }
 
   // ---------- accounts ----------
@@ -1658,6 +1903,23 @@
       state.editing = null;
     });
 
+    $('policy-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadPolicies();
+      toast('已刷新');
+    }));
+    $('policy-create').addEventListener('click', () => openPolicyDialog(null));
+    $('policy-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      savePolicy();
+    });
+    $('policy-mode').addEventListener('change', syncPolicyMode);
+    $('policy-ceiling').addEventListener('input', syncPolicyCeiling);
+    $('policy-cancel').addEventListener('click', () => $('policy-dialog').close());
+    $('policy-delete').addEventListener('click', (event) => withButton(event.currentTarget, deletePolicy));
+    $('policy-dialog').addEventListener('close', () => {
+      state.policyEditing = null;
+    });
+
     $('account-create').addEventListener('submit', (event) => {
       event.preventDefault();
       createAccount();
@@ -1733,6 +1995,7 @@
       if ($('workspace').classList.contains('hidden')) return;
       if (state.tab === 'overview') refreshOverview().catch(() => {});
       else if (state.tab === 'devices') loadDevices(true).catch(() => {});
+      else if (state.tab === 'policies') loadPolicies(true).catch(() => {});
       else if (state.tab === 'groups') loadGroups(true).catch(() => {});
     });
   }

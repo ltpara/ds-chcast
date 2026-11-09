@@ -17,7 +17,11 @@ import '../widgets/remote_view.dart';
 /// The runner supplies the existing session. This engine owns only its texture
 /// and local input state; authentication and reconnect stay in the parent.
 class DisplayWindowPage extends StatefulWidget {
-  const DisplayWindowPage({super.key, required this.streamId, this.peerId = ''});
+  const DisplayWindowPage({
+    super.key,
+    required this.streamId,
+    this.peerId = '',
+  });
   final int streamId;
 
   /// Owner's per-device preference key, passed by the window that opened this
@@ -43,6 +47,8 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   ViewerKeyboardMode _keyboardMode = ViewerKeyboardMode.physical;
   bool _keyboardChanging = false;
   ViewFit _fit = ViewFit.adaptive;
+  MouseMapping _mouseMapping = const MouseMapping();
+  final Map<int, int> _remoteButtons = <int, int>{};
   String _error = '';
   double _wheelX = 0, _wheelY = 0;
   int _buttons = 0;
@@ -60,9 +66,13 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   @override
   void initState() {
     super.initState();
-    _keyboardMode = ViewPreferences.load(peerId: widget.peerId).keyboardMode == 'local'
-        ? ViewerKeyboardMode.local
-        : ViewerKeyboardMode.physical;
+    final prefs = ViewPreferences.load(peerId: widget.peerId);
+    _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+    _mouseMapping = MouseMapping(
+      reverseWheel: prefs.reverseWheel,
+      swapButtons: prefs.swapButtons,
+    );
+    _keyboardMode = viewerKeyboardModeFromName(prefs.keyboardMode);
     ViewerBridge.setKeyboardTextRejectedHandler(() {
       if (mounted && !_closing) {
         setState(() => _error = tr('文字未发送，请检查控制权限或连接状态'));
@@ -70,7 +80,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     });
     WidgetsBinding.instance.addObserver(this);
     _displays.addListener(_changed);
-    _focus.addListener(_syncCapture);
+    _focus.addListener(_onFocusChanged);
     _timer = Timer.periodic(const Duration(milliseconds: 200), (_) => _poll());
     unawaited(_poll());
   }
@@ -123,19 +133,43 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     _contacts.clear();
     _pen = null;
     _buttons = 0;
+    _remoteButtons.clear();
     _wheelX = _wheelY = 0;
     unawaited(_quiet(ViewerBridge.releaseInput()));
   }
 
   void _syncCapture() {
     final lifecycle = WidgetsBinding.instance.lifecycleState;
-    final enabled = _input && _focus.hasPrimaryFocus &&
+    final enabled =
+        _input &&
+        _focus.hasPrimaryFocus &&
         (lifecycle == null || lifecycle == AppLifecycleState.resumed);
     if (_capture == enabled) return;
     _capture = enabled;
     if (!enabled) _release();
     if (!enabled) _nativeKeys = false;
     unawaited(_setCapture(enabled, ++_captureGeneration));
+  }
+
+  void _onFocusChanged() {
+    if (_focus.hasPrimaryFocus) _reloadPreferences();
+    _syncCapture();
+  }
+
+  void _reloadPreferences() {
+    if (!mounted || _closing) return;
+    final prefs = ViewPreferences.load(peerId: widget.peerId);
+    setState(() {
+      _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+      _mouseMapping = MouseMapping(
+        reverseWheel: prefs.reverseWheel,
+        swapButtons: prefs.swapButtons,
+      );
+    });
+    final mode = viewerKeyboardModeFromName(prefs.keyboardMode);
+    if (mode != _keyboardMode) {
+      unawaited(_changeKeyboardMode(mode, persist: false));
+    }
   }
 
   Future<void> _setCapture(bool enabled, int generation) async {
@@ -154,23 +188,34 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     if (enabled && _keyboardMode == ViewerKeyboardMode.local && !captured) {
       if (!_localKeyboardUnavailable) {
         _localKeyboardUnavailable = true;
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('本地输入法未启用，请重新聚焦画面或切换物理按键')),
-        ));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(tr('本地输入法未启用，请重新聚焦画面或切换物理按键'))));
       }
-    } else if (captured || _keyboardMode == ViewerKeyboardMode.physical) {
+    } else if (captured || _keyboardMode != ViewerKeyboardMode.local) {
       _localKeyboardUnavailable = false;
     }
   }
 
-  Future<void> _changeKeyboardMode(ViewerKeyboardMode mode) async {
+  Future<void> _changeKeyboardMode(
+    ViewerKeyboardMode mode, {
+    bool persist = true,
+  }) async {
     if (_keyboardChanging || mode == _keyboardMode) return;
     _keyboardChanging = true;
     _release();
     _syncCapture();
     try {
       await ViewerBridge.setKeyboardMode(mode);
-      if (mounted && !_closing) setState(() => _keyboardMode = mode);
+      if (mounted && !_closing) {
+        setState(() => _keyboardMode = mode);
+        if (persist) {
+          ViewPreferences.update(
+            peerId: widget.peerId,
+            keyboardMode: mode.name,
+          );
+        }
+      }
     } on PlatformException catch (error) {
       if (mounted && !_closing) {
         setState(() => _error = error.message ?? tr('无法切换键盘模式'));
@@ -187,6 +232,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) _release();
+    if (state == AppLifecycleState.resumed) _reloadPreferences();
     _syncCapture();
   }
 
@@ -212,7 +258,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     ViewerBridge.setKeyboardTextRejectedHandler(null);
     WidgetsBinding.instance.removeObserver(this);
     _displays.removeListener(_changed);
-    _focus.removeListener(_syncCapture);
+    _focus.removeListener(_onFocusChanged);
     _focus.dispose();
     unawaited(_quiet(ViewerBridge.setKeyCapture(false)));
     _release();
@@ -273,23 +319,38 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   void _move(Offset p, int buttons) {
     if (!_input) return;
     final (x, y) = _point(p);
-    _mouse(ViewerMouse.move, buttons: buttons, x: x, y: y);
+    var mapped = 0;
+    for (var bit = 1; bit <= ViewerMouse.forward; bit <<= 1) {
+      if (buttons & bit != 0) {
+        mapped |= _remoteButtons[bit] ?? _mouseMapping.buttons(bit);
+      }
+    }
+    _mouse(ViewerMouse.move, buttons: mapped, x: x, y: y);
   }
 
   void _button(Offset p, int button, bool down) {
+    if (!_input) return;
     _move(p, _buttons);
+    final mapped = down
+        ? _remoteButtons.putIfAbsent(
+            button,
+            () => _mouseMapping.buttons(button),
+          )
+        : _remoteButtons.remove(button);
     if (down) {
       _buttons |= button;
     } else {
       _buttons &= ~button;
     }
+    if (mapped == null) return;
     _mouse(
       down ? ViewerMouse.buttonDown : ViewerMouse.buttonUp,
-      buttons: button,
+      buttons: mapped,
     );
   }
 
   void _scroll(Offset p, Offset delta) {
+    if (!_input) return;
     _move(p, _buttons);
     _wheelX += delta.dx;
     _wheelY += delta.dy;
@@ -297,8 +358,18 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     final y = (_wheelY / kViewerScrollPixelsPerNotch).truncate().clamp(-10, 10);
     _wheelX -= x * kViewerScrollPixelsPerNotch;
     _wheelY -= y * kViewerScrollPixelsPerNotch;
-    if (x != 0) _mouse(ViewerMouse.wheelHorizontal, x: x * kViewerWheelDelta);
-    if (y != 0) _mouse(ViewerMouse.wheel, y: -y * kViewerWheelDelta);
+    if (x != 0) {
+      _mouse(
+        ViewerMouse.wheelHorizontal,
+        x: _mouseMapping.wheelX(x * kViewerWheelDelta),
+      );
+    }
+    if (y != 0) {
+      _mouse(
+        ViewerMouse.wheel,
+        y: _mouseMapping.wheelY(-y * kViewerWheelDelta),
+      );
+    }
   }
 
   void _gesture(Offset p, bool zoom, int x, int y) {
@@ -398,11 +469,17 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
           IconButton(
             tooltip: tr('缩放'),
             icon: const Icon(Icons.fit_screen),
-            onPressed: () => setState(
-              () => _fit = _fit == ViewFit.adaptive
-                  ? ViewFit.original
-                  : ViewFit.adaptive,
-            ),
+            onPressed: () {
+              setState(
+                () => _fit = _fit == ViewFit.adaptive
+                    ? ViewFit.original
+                    : ViewFit.adaptive,
+              );
+              ViewPreferences.update(
+                peerId: widget.peerId,
+                fit: _fit == ViewFit.original ? 1 : 0,
+              );
+            },
           ),
           IconButton(
             tooltip: tr('全屏'),

@@ -24,6 +24,22 @@ bool is_key(const INPUT& input, WORD scan, bool down, bool extended = false) {
         ((input.ki.dwFlags & KEYEVENTF_KEYUP) == 0) == down &&
         ((input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0) == extended;
 }
+
+bool is_virtual_key(const INPUT& input, WORD vk, bool down, bool extended = false) {
+    return input.type == INPUT_KEYBOARD && input.ki.wVk == vk &&
+        (input.ki.dwFlags & KEYEVENTF_SCANCODE) == 0 &&
+        ((input.ki.dwFlags & KEYEVENTF_KEYUP) == 0) == down &&
+        ((input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0) == extended &&
+        input.ki.dwExtraInfo == chast::kInputInjectionTag;
+}
+
+chast::InputEvent legacy_key(uint16_t vk, bool down, uint16_t modifiers = 0) {
+    chast::InputEvent event;
+    event.kind = chast::InputKind::LegacyKey;
+    event.legacy_key = {down ? chast::KeyAction::Down : chast::KeyAction::Up, vk};
+    event.modifiers = modifiers;
+    return event;
+}
 }
 
 int main() {
@@ -71,6 +87,34 @@ int main() {
     state.Reset();
     check(!key(VK_CAPITAL, 0x3A, true) && !key(VK_NUMLOCK, 0x45, true),
           "Caps and Num remain local for lock-state tracking");
+    state.SetLegacy(true);
+    check(!key(VK_CAPITAL, 0x3A, true), "Caps stays local in legacy mode too");
+    check(key('A', 0x1E, true) && event.kind == chast::InputKind::LegacyKey &&
+          event.legacy_key.virtual_key == 'A' &&
+          event.legacy_key.action == chast::KeyAction::Down,
+          "legacy mode sends the hook's virtual key");
+    check(key('A', 0x1E, true) && event.kind == chast::InputKind::LegacyKey,
+          "legacy repeats keep the virtual key");
+    check(key('A', 0x1E, false) && event.legacy_key.action == chast::KeyAction::Up,
+          "legacy release keeps the virtual key");
+    check(key(VK_VOLUME_MUTE, 0x20, true, LLKHF_EXTENDED) &&
+          event.kind == chast::InputKind::LegacyKey &&
+          event.legacy_key.virtual_key == VK_VOLUME_MUTE,
+          "legacy forwards named keys without a HID usage");
+    check(key(VK_LSHIFT, 0x2A, true) && event.kind == chast::InputKind::LegacyKey &&
+          event.legacy_key.virtual_key == VK_LSHIFT &&
+          state.modifiers() == chast::kModifierLeftShift,
+          "legacy modifiers update the input-state bitmap");
+    check(key(VK_LSHIFT, 0x2A, true) && event.kind != chast::InputKind::LegacyKey,
+          "legacy modifier repeats are filtered");
+    key(VK_LSHIFT, 0x2A, false);
+    check(state.modifiers() == 0, "legacy modifier release clears the bitmap");
+    state.SetLegacy(false);
+    state.Reset();
+    check(!key(VK_VOLUME_MUTE, 0x20, true, LLKHF_EXTENDED),
+          "map mode still drops keys without a HID usage");
+    check(key('A', 0x1E, true) && event.kind == chast::InputKind::Key,
+          "leaving legacy mode restores HID events");
     key(VK_LWIN, 0x5B, true, LLKHF_EXTENDED);
     check(event.key.hid_usage == 0xE3 && event.modifiers == chast::kModifierLeftGui,
           "Win is captured");
@@ -133,6 +177,16 @@ int main() {
           (input.ki.dwFlags & KEYEVENTF_SCANCODE) == 0, "Pause uses virtual-key fallback");
     check(chast::make_keyboard_input(0x48, false, input) &&
           (input.ki.dwFlags & KEYEVENTF_KEYUP) != 0, "Pause releases correctly");
+    check(chast::make_legacy_keyboard_input('A', true, input) &&
+          is_virtual_key(input, 'A', true) && !(input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY),
+          "legacy letters inject by virtual key");
+    check(chast::make_legacy_keyboard_input(VK_LEFT, false, input) &&
+          is_virtual_key(input, VK_LEFT, false, true),
+          "legacy arrows keep the extended flag");
+    check(!chast::make_legacy_keyboard_input(VK_PACKET, true, input),
+          "legacy mode rejects VK_PACKET");
+    check(!chast::make_legacy_keyboard_input(0, true, input),
+          "legacy mode rejects an empty virtual key");
     for (uint16_t usage = 0x68; usage <= 0x73; ++usage) {
         check(chast::make_keyboard_input(usage, true, input) &&
               chast::windows_key_to_hid(VK_F13 + usage - 0x68, input.ki.wScan, false) == usage,
@@ -163,6 +217,26 @@ int main() {
                 is_key(injected[4], 0x38, false, true) &&
                 is_key(injected[5], 0x1D, false),
                 "real Ctrl stays held throughout RightAlt+A, not folded into AltGr");
+        }
+    }
+    {
+        std::vector<INPUT> injected;
+        auto injector = chast::InputInjector::create(true, &error,
+            [&](const INPUT& value) { injected.push_back(value); });
+        check(injector != nullptr, "legacy sequence observer starts");
+        if (injector) {
+            const uint16_t ctrl = chast::kModifierLeftCtrl;
+            injector->submit(legacy_key(VK_LCONTROL, true, ctrl));
+            injector->submit(legacy_key('C', true, ctrl));
+            injector->submit(legacy_key('C', false, ctrl));
+            injector->submit(legacy_key(VK_LCONTROL, false));
+            injector->stop();
+            check(injected.size() == 4 &&
+                is_virtual_key(injected[0], VK_LCONTROL, true) &&
+                is_virtual_key(injected[1], 'C', true) &&
+                is_virtual_key(injected[2], 'C', false) &&
+                is_virtual_key(injected[3], VK_LCONTROL, false),
+                "legacy Ctrl+C keeps its chord through the shared modifier bitmap");
         }
     }
     {
@@ -227,6 +301,25 @@ int main() {
                 is_key(injected[0], 0x1E, true) && is_key(injected[1], 0x1E, false) &&
                 injector->stats().dropped == 1024,
                 "a full queue still releases the key already held on the host");
+        }
+    }
+    {
+        std::vector<INPUT> injected;
+        auto injector = chast::InputInjector::create(true, &error,
+            [&](const INPUT& value) { injected.push_back(value); });
+        check(injector != nullptr, "legacy lock collision observer starts");
+        if (injector) {
+            // 0x39 is both VK_9 and the Caps Lock HID usage. Hold the legacy
+            // key, then force a Caps tap through a second legacy key; the tap
+            // must not consume or untrack the held VK_9.
+            injector->submit(legacy_key(0x39, true));
+            injector->submit(legacy_key('A', true, chast::kLockCaps));
+            injector->submit(legacy_key('A', false, chast::kLockCaps));
+            injector->release_held();
+            injector->stop();
+            check(!injected.empty() &&
+                  is_virtual_key(injected.back(), 0x39, false),
+                  "lock synchronization leaves the same-numbered legacy key intact");
         }
     }
     std::cout << "keyboard failures=" << failures << '\n';

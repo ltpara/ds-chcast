@@ -97,6 +97,13 @@ void main() {
     void Function(int action, int value)? onControlDisplays,
     void Function(int target, bool enabled)? onToggleVirtualDisplay,
     bool privacyAvailable = true,
+    bool recordingAvailable = true,
+    bool recording = false,
+    VoidCallback? onToggleRecording,
+    bool autoRecord = false,
+    int recordKeep = 0,
+    ValueChanged<bool>? onAutoRecordChanged,
+    ValueChanged<int>? onRecordKeepChanged,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -194,6 +201,13 @@ void main() {
           onHostAction: onHostAction ?? (_) {},
           remoteConfigAvailable: remoteConfigAvailable,
           onRemoteConfig: onRemoteConfig,
+          recordingAvailable: recordingAvailable,
+          recording: recording,
+          onToggleRecording: onToggleRecording,
+          autoRecord: autoRecord,
+          recordKeep: recordKeep,
+          onAutoRecordChanged: onAutoRecordChanged,
+          onRecordKeepChanged: onRecordKeepChanged,
           onToggleAudio: () {},
           onToggleMicrophone: () {},
           onTogglePrivacy: () {},
@@ -1016,5 +1030,48 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('在新窗口打开显示器 1'), findsNothing);
     expect(find.text('在新窗口打开显示器 2'), findsNothing);
+  });
+
+  testWidgets('long press on record edits auto-record and retention',
+      (WidgetTester tester) async {
+    bool? auto;
+    int? keep;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      autoRecord: true,
+      recordKeep: 10,
+      onAutoRecordChanged: (bool value) => auto = value,
+      onRecordKeepChanged: (int value) => keep = value,
+    ));
+
+    await tester.longPress(find.byIcon(Icons.fiber_manual_record_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('保留最近 10 个录制'), findsOneWidget);
+    expect(find.text('保留最近 30 个录制'), findsOneWidget);
+
+    await tester.tap(find.text('每次会话自动录制'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+    expect(auto, isFalse);
+
+    await tester.longPress(find.byIcon(Icons.fiber_manual_record_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('保留最近 30 个录制'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+    expect(keep, 30);
+  });
+
+  testWidgets('the recording menu stays closed without callbacks',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+    ));
+
+    await tester.longPress(find.byIcon(Icons.fiber_manual_record_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('每次会话自动录制'), findsNothing);
   });
 }

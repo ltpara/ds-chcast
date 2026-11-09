@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -13,6 +15,7 @@
 #include <string_view>
 
 #include "chast/security.h"
+#include "chast/access_ticket.h"
 
 namespace chast {
 
@@ -403,6 +406,324 @@ std::string audit_spool_path_for(const std::string& settings_path) {
     return to_utf8(path.wstring());
 }
 
+std::string policy_state_path_for(const std::string& settings_path) {
+    if (settings_path.empty()) {
+        return {};
+    }
+    std::filesystem::path path = native_path(settings_path);
+    std::filesystem::path name = path.stem();
+    name += L".policy.json";
+    path.replace_filename(name);
+    return to_utf8(path.wstring());
+}
+
+std::string policy_ack_path_for(const std::string& settings_path) {
+    if (settings_path.empty()) {
+        return {};
+    }
+    std::filesystem::path path = native_path(settings_path);
+    std::filesystem::path name = path.stem();
+    name += L".policy-ack.json";
+    path.replace_filename(name);
+    return to_utf8(path.wstring());
+}
+
+namespace {
+
+// The device policy state is a machine file written by chast-tunnel, so these
+// readers only cover the JSON subset json.MarshalIndent emits. A key is looked
+// up as an exact quoted token; values the agent never writes (arrays, nested
+// objects, unicode escapes) make the state unreadable instead of being
+// guessed at.
+bool json_object_complete(const std::string& body) {
+    size_t cursor = 0;
+    while (cursor < body.size() && (body[cursor] == ' ' || body[cursor] == '\t' ||
+                                    body[cursor] == '\r' || body[cursor] == '\n')) {
+        ++cursor;
+    }
+    if (cursor >= body.size() || body[cursor] != '{') {
+        return false;
+    }
+    int depth = 0;
+    bool in_string = false;
+    for (; cursor < body.size(); ++cursor) {
+        const char c = body[cursor];
+        if (in_string) {
+            if (c == '\\') {
+                ++cursor;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}' && --depth == 0) {
+            for (++cursor; cursor < body.size(); ++cursor) {
+                const char tail = body[cursor];
+                if (tail != ' ' && tail != '\t' && tail != '\r' && tail != '\n') {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool json_key_cursor(const std::string& body, const std::string& name, size_t& cursor) {
+    const std::string key = "\"" + name + "\"";
+    const size_t at = body.find(key);
+    if (at == std::string::npos) {
+        return false;
+    }
+    cursor = at + key.size();
+    const auto skip_space = [&body, &cursor] {
+        while (cursor < body.size() && (body[cursor] == ' ' || body[cursor] == '\t' ||
+                                        body[cursor] == '\r' || body[cursor] == '\n')) {
+            ++cursor;
+        }
+    };
+    skip_space();
+    if (cursor >= body.size() || body[cursor] != ':') {
+        return false;
+    }
+    ++cursor;
+    skip_space();
+    return true;
+}
+
+bool json_bool_at(const std::string& body, size_t cursor, bool& value) {    if (body.compare(cursor, 4, "true") == 0) {
+        value = true;
+        return true;
+    }
+    if (body.compare(cursor, 5, "false") == 0) {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+bool json_string_at(const std::string& body, size_t cursor, std::string& value) {
+    if (cursor >= body.size() || body[cursor] != '"') {
+        return false;
+    }
+    ++cursor;
+    std::string out;
+    while (cursor < body.size()) {
+        const char c = body[cursor++];
+        if (c == '"') {
+            value = std::move(out);
+            return true;
+        }
+        if (c != '\\') {
+            out.push_back(c);
+            continue;
+        }
+        if (cursor >= body.size()) {
+            return false;
+        }
+        switch (body[cursor++]) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+bool json_int_at(const std::string& body, size_t cursor, int64_t& value) {
+    bool negative = false;
+    if (cursor < body.size() && body[cursor] == '-') {
+        negative = true;
+        ++cursor;
+    }
+    const size_t digits = cursor;
+    int64_t parsed = 0;
+    while (cursor < body.size() && body[cursor] >= '0' && body[cursor] <= '9') {
+        if (parsed > (INT64_MAX - 9) / 10) {
+            return false;
+        }
+        parsed = parsed * 10 + (body[cursor] - '0');
+        ++cursor;
+    }
+    if (cursor == digits) {
+        return false;
+    }
+    value = negative ? -parsed : parsed;
+    return true;
+}
+
+std::string json_quote(const std::string& text) {
+    std::string out = "\"";
+    for (unsigned char c : text) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buffer[7]{};
+                    std::snprintf(buffer, sizeof(buffer), "\\u%04x", c);
+                    out += buffer;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    out += '"';
+    return out;
+}
+
+}  // namespace
+
+ManagedPolicyState read_managed_policy_state(const std::string& path) {
+    ManagedPolicyState state;
+    if (path.empty()) {
+        return state;
+    }
+    std::ifstream in(native_path(path), std::ios::binary);
+    if (!in) {
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(native_path(path), ec);
+        if (ec || exists) {
+            state.readable = false;
+        }
+        return state;
+    }
+    std::ostringstream text;
+    text << in.rdbuf();
+    const std::string body = text.str();
+    if (!json_object_complete(body)) {
+        state.readable = false;
+        return state;
+    }
+    size_t cursor = 0;
+    bool managed = false;
+    if (!json_key_cursor(body, "managed", cursor) || !json_bool_at(body, cursor, managed)) {
+        state.readable = false;
+        return state;
+    }
+    if (!managed) {
+        return state;
+    }
+    std::string mode;
+    if (!json_key_cursor(body, "mode", cursor) || !json_string_at(body, cursor, mode) ||
+        mode.empty()) {
+        state.readable = false;
+        return state;
+    }
+    int64_t version = 0;
+    if (!json_key_cursor(body, "policy_version", cursor) || !json_int_at(body, cursor, version) ||
+        version <= 0 || version > 0xFFFFFFFFLL) {
+        state.readable = false;
+        return state;
+    }
+    state.managed = true;
+    state.mode = std::move(mode);
+    state.policy_version = static_cast<uint32_t>(version);
+    int64_t ceiling = 0;
+    if (json_key_cursor(body, "permission_ceiling", cursor) &&
+        json_int_at(body, cursor, ceiling) && ceiling >= 0 && ceiling <= 0xFFFFFFFFLL) {
+        state.permission_ceiling = static_cast<uint32_t>(ceiling);
+    }
+    int64_t updated_at_ms = 0;
+    if (json_key_cursor(body, "updated_at_ms", cursor) &&
+        json_int_at(body, cursor, updated_at_ms) && updated_at_ms >= 0) {
+        state.updated_at_ms = updated_at_ms;
+    }
+    return state;
+}
+
+bool write_managed_policy_ack(const std::string& ack_path, const std::string& state_path,
+                              const std::string& mode, uint32_t version,
+                              uint32_t permission_ceiling, int64_t updated_at_ms,
+                              std::string* error) {
+    const auto fail = [error](std::string message) {
+        if (error != nullptr) {
+            *error = std::move(message);
+        }
+        return false;
+    };
+    if (ack_path.empty() || state_path.empty()) {
+        return fail("the managed policy acknowledgement path is not configured");
+    }
+    const ManagedPolicyState marker = read_managed_policy_state(state_path);
+    if (!marker.readable) {
+        return fail("the managed policy state cannot be read");
+    }
+    if (!marker.managed) {
+        return fail("the managed policy state is not managed");
+    }
+    if (marker.mode != mode || marker.policy_version != version) {
+        return fail("the managed policy state does not name version " +
+                    std::to_string(version));
+    }
+    if (marker.permission_ceiling != permission_ceiling) {
+        return fail("the managed policy state grants a different permission ceiling");
+    }
+    if (updated_at_ms != 0 && marker.updated_at_ms != updated_at_ms) {
+        return fail("the managed policy state has a different update time");
+    }
+    const int64_t recorded_updated = updated_at_ms != 0 ? updated_at_ms : marker.updated_at_ms;
+    const int64_t applied_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+    const std::string detail =
+        (mode == "open" || mode == "restricted")
+            ? "managed fail-closed: access tickets are not implemented (v62)"
+            : "unknown managed mode enforced fail-closed: access tickets are not implemented (v62)";
+    std::string body = "{\n  \"policy_version\": " + std::to_string(version) +
+                       ",\n  \"mode\": " + json_quote(mode) +
+                       ",\n  \"permission_ceiling\": " + std::to_string(permission_ceiling) +
+                       ",\n  \"updated_at_ms\": " + std::to_string(recorded_updated) +
+                       ",\n  \"applied\": true,\n  \"applied_at_ms\": " +
+                       std::to_string(applied_at_ms) + ",\n  \"detail\": " + json_quote(detail) +
+                       "\n}\n";
+    const std::filesystem::path target = native_path(ack_path);
+    const std::filesystem::path parent = target.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    std::filesystem::path temp = target;
+    temp += L".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return fail("cannot write " + ack_path);
+        }
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        out.flush();
+        if (!out) {
+            out.close();
+            std::error_code ec;
+            std::filesystem::remove(temp, ec);
+            return fail("cannot write " + ack_path);
+        }
+    }
+    if (!MoveFileExW(temp.c_str(), target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::error_code ec;
+        std::filesystem::remove(temp, ec);
+        return fail("cannot replace " + ack_path);
+    }
+    return true;
+}
+
 std::string generate_tunnel_id() {
     wchar_t buffer[256]{};
     DWORD length = static_cast<DWORD>(std::size(buffer));
@@ -438,6 +759,8 @@ HostSettingsLoad load_host_settings(const std::string& path) {
     if (!in) {
         HostSettingsLoad missing;
         missing.settings.audit_spool = audit_spool_path_for(path);
+        missing.settings.policy_state = policy_state_path_for(path);
+        missing.settings.policy_ack = policy_ack_path_for(path);
         return missing;
     }
     std::ostringstream text;
@@ -448,6 +771,8 @@ HostSettingsLoad load_host_settings(const std::string& path) {
 HostSettingsLoad parse_host_settings(const std::string& contents, const std::string& path) {
     HostSettingsLoad result;
     result.settings.audit_spool = audit_spool_path_for(path);
+    result.settings.policy_state = policy_state_path_for(path);
+    result.settings.policy_ack = policy_ack_path_for(path);
     result.existed = true;
     std::istringstream in(contents);
     bool auth_mode_seen = false;
@@ -871,6 +1196,59 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
             } else {
                 settings.tunnel_listen = normalized;
             }
+        } else if (key == "access_issuer") {
+            if (value.empty()) {
+                settings.access_issuer.clear();
+            } else if (value.size() > 128 ||
+                       value.find_first_of("\r\n") != std::string::npos ||
+                       value.find('\0') != std::string::npos) {
+                warn(result.warning, "access_issuer must be at most 128 characters");
+            } else {
+                settings.access_issuer = value;
+            }
+        } else if (key == "access_kid") {
+            if (value.empty()) {
+                settings.access_kid.clear();
+            } else if (value.size() > 64 ||
+                       value.find_first_of("\r\n") != std::string::npos ||
+                       value.find('\0') != std::string::npos) {
+                warn(result.warning, "access_kid must be at most 64 characters");
+            } else {
+                settings.access_kid = value;
+            }
+        } else if (key == "access_public_key") {
+            if (value.empty()) {
+                settings.access_public_key.clear();
+            } else {
+                std::vector<uint8_t> decoded;
+                if (!decode_ticket_base64url(value, &decoded) || decoded.size() != 32) {
+                    warn(result.warning,
+                         "access_public_key is not a base64url Ed25519 public key");
+                } else {
+                    settings.access_public_key = value;
+                }
+            }
+        } else if (key == "access_key") {
+            // <kid>:<base64url public key>. Repeating the line trusts several
+            // issuer kids at once so a rotation can overlap.
+            const size_t colon = value.find(':');
+            std::vector<uint8_t> decoded;
+            const std::string kid =
+                colon == std::string::npos ? std::string() : value.substr(0, colon);
+            if (colon == std::string::npos || colon == 0 ||
+                colon + 1 >= value.size() || kid.size() > 64 ||
+                kid.find_first_of("\r\n") != std::string::npos ||
+                kid.find('\0') != std::string::npos ||
+                !decode_ticket_base64url(value.substr(colon + 1), &decoded) ||
+                decoded.size() != 32) {
+                warn(result.warning,
+                     "access_key is not <kid>:<base64url Ed25519 public key>");
+            } else if (settings.access_keys.size() >= 8) {
+                warn(result.warning, "at most 8 additional access keys are kept");
+            } else {
+                settings.access_keys.push_back(
+                    {kid, value.substr(colon + 1)});
+            }
         } else if (key == "audit_spool") {
             // Empty keeps the file next to host.ini; there is no separate
             // switch, because a host that forwards nothing writes nothing.
@@ -1013,7 +1391,13 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "tunnel_id=" << settings.tunnel_id << "\n"
          << "tunnel_old_id=" << settings.tunnel_old_id << "\n"
          << "tunnel_key=" << settings.tunnel_key << "\n"
-         << "tunnel_listen=" << settings.tunnel_listen << "\n";
+         << "tunnel_listen=" << settings.tunnel_listen << "\n"
+         << "access_issuer=" << settings.access_issuer << "\n"
+         << "access_kid=" << settings.access_kid << "\n"
+         << "access_public_key=" << settings.access_public_key << "\n";
+    for (const HostSettings::AccessKeyPin& pin : settings.access_keys) {
+        text << "access_key=" << pin.kid << ":" << pin.public_key << "\n";
+    }
     // Only a custom spool is written; the derived default would otherwise
     // pin a machine-specific path into a file that may be copied elsewhere.
     const std::string default_spool = audit_spool_path_for(path);

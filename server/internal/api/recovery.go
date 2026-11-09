@@ -340,7 +340,7 @@ func (s *server) completeSMSPasswordRecovery(w http.ResponseWriter, r *http.Requ
 // adminSetAccountPhone attaches or clears a recovery number without the user's
 // password. Any code issued for the previous number is retired by the store.
 func (s *server) adminSetAccountPhone(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -367,7 +367,7 @@ func (s *server) adminSetAccountPhone(w http.ResponseWriter, r *http.Request) {
 // adminSendAccountSMSCode mints a reset code and hands it to the gateway. The
 // code itself never appears in the response or the audit log.
 func (s *server) adminSendAccountSMSCode(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -396,7 +396,7 @@ func (s *server) adminSendAccountSMSCode(w http.ResponseWriter, r *http.Request)
 // creating the account or later without the user's password. A failed set
 // leaves the previous address untouched.
 func (s *server) adminSetAccountEmail(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}

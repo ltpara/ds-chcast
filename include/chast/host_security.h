@@ -30,11 +30,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "chast/access_ticket.h"
 #include "chast/host_settings.h"
 #include "chast/protocol.h"
 #include "chast/security.h"
@@ -92,6 +94,28 @@ public:
         // Hellos bind to it, so a proof cannot be replayed against another
         // host.
         std::string host_fingerprint;
+        // Machine policy state written by chast-tunnel (<stem>.policy.json).
+        // Empty keeps the host unmanaged. A managed statement refuses every
+        // new session until a verified access ticket arrives; an unreadable
+        // state file also refuses, so a managed host cannot fall back to
+        // local-only authentication by corrupting its marker.
+        std::string policy_state;
+        // The device id this host answers to. Tickets carry audience
+        // "device:<id>", so a ticket issued for another device is refused.
+        std::string device_id;
+        // Access-ticket issuer pins installed by the administrator. The
+        // primary triple is required unless access_keys supplies pins on its
+        // own; an incomplete primary or an invalid extra pin leaves a managed
+        // host fail-closed. Extra pins exist so two issuer keys overlap while
+        // the server rotates to a new kid.
+        std::string access_issuer;
+        std::string access_kid;
+        std::string access_public_key;
+        struct AccessKeyPin {
+            std::string kid;
+            std::string public_key;
+        };
+        std::vector<AccessKeyPin> access_keys;
     };
 
     struct Result {
@@ -108,6 +132,18 @@ public:
         // The Hello carried a valid device signature and asked to be trusted.
         // note_connected() adds it, so a denial must not commit the Result.
         bool request_trust = false;
+        // Set when a managed session was admitted through a verified access
+        // ticket. The ticket's id, subject and deadline belong in the audit
+        // record and bound how long this session may stay connected.
+        bool via_access_ticket = false;
+        std::string ticket_subject;
+        std::string ticket_id;
+        int64_t ticket_expires_at = 0;
+        uint32_t ticket_policy_version = 0;
+        // The key the admitted ticket names. A mid-session renewal must
+        // present a ticket for this same key; another key belongs to another
+        // viewer and cannot extend this session.
+        std::array<uint8_t, kTicketClientKeySize> ticket_client_key{};
         std::string peer_address;  // "ip:port" as reported by the transport
         std::string peer_ip;       // for allow-list and lockout accounting
         std::string device_name;
@@ -125,11 +161,54 @@ public:
     void set_default_permissions(PermissionMask permissions);
     Config config() const;
 
+    // What a managed Hello brought besides its credentials. The client nonce is
+    // not repeated here: the proof is built from the Hello's own nonce, so a
+    // caller cannot pair a proof with a different Hello.
+    struct TicketRequest {
+        // The v62 envelope plus signature, exactly as the viewer sent it.
+        std::vector<uint8_t> signed_ticket;
+        // The per-connection challenge the host issued before the Hello.
+        std::array<uint8_t, kTicketProofHostNonceSize> host_nonce{};
+        // Ed25519 signature by the ticket's client key over
+        // access_ticket_proof_message().
+        std::vector<uint8_t> proof;
+    };
+
     // Decides one parsed Hello. `peer_address` is the transport's "ip:port";
     // an unparsable value only disables allow-list matching and uses the whole
-    // string as the lockout key.
+    // string as the lockout key. `ticket` is required on a managed host: the
+    // ticket must verify, carry the current policy version and prove possession
+    // of the client key on this connection. Local credentials and approval
+    // still apply after the ticket is accepted.
     Result evaluate(const ClientHello& hello, const std::string& peer_address,
-                    int64_t now_unix);
+                    int64_t now_unix, const TicketRequest* ticket = nullptr);
+
+    // One mid-session renewal: a freshly issued ticket for the same device
+    // plus a possession proof over this session's Hello nonce and the host
+    // challenge. The caller passes what it admitted at connect time; a
+    // renewal cannot switch subject or client key. `permissions` is the
+    // ticket's ceiling intersected with the local defaults only; the caller
+    // intersects it with the mask already in force so a renewal can narrow
+    // but never widen what the operator approved.
+    struct TicketRenewal {
+        std::vector<uint8_t> signed_ticket;
+        std::vector<uint8_t> proof;
+    };
+
+    struct RenewalResult {
+        bool accepted = false;
+        std::string reason;
+        PermissionMask permissions = 0;
+        int64_t expires_at = 0;
+        std::string subject;
+        std::string ticket_id;
+    };
+
+    RenewalResult renew_ticket(const TicketRenewal& renewal, const std::string& peer_address,
+                               const std::array<uint8_t, kTicketProofHostNonceSize>& host_nonce,
+                               const std::vector<uint8_t>& client_nonce,
+                               const std::array<uint8_t, kTicketClientKeySize>& session_key,
+                               const std::string& session_subject, int64_t now_unix);
 
     // Commits an accepted Result. Must be called exactly once for a connection
     // that proceeds, including one the operator approved; never for a denial.
@@ -211,6 +290,9 @@ private:
     uint64_t last_totp_step_ = 0;
     std::map<std::string, AddressFailures> failures_;
     std::vector<std::pair<std::array<uint8_t, kHelloNonceBytes>, int64_t>> nonces_;
+    // Built from the administrator pins. Null until all three values decode;
+    // a managed host without it refuses every session.
+    std::unique_ptr<AccessTicketVerifier> tickets_;
 };
 
 // Parses one comma-separated CIDR list of either family. Empty or blank text

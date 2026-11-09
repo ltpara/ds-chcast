@@ -247,11 +247,33 @@ void test_hello() {
     rejects_hello(payload_of(chast::make_hello(upper_ref)),
                   "Hello with a non-canonical audit reference is rejected");
     std::vector<uint8_t> unknown_mode = payload_of(chast::make_hello(sent));
-    unknown_mode[unknown_mode.size() - 6] = 7;
+    unknown_mode[unknown_mode.size() - 10] = 7;
     rejects_hello(unknown_mode, "Hello with an unknown session mode is rejected");
     std::vector<uint8_t> unknown_capability = payload_of(chast::make_hello(sent));
-    unknown_capability[unknown_capability.size() - 5] = 0x80;
+    unknown_capability[unknown_capability.size() - 9] = 0x80;
     rejects_hello(unknown_capability, "Hello with an unknown client capability is rejected");
+
+    chast::ClientHello ticket_hello = sent;
+    ticket_hello.access_ticket.assign(200, 0x5a);
+    ticket_hello.ticket_proof.assign(chast::kTicketProofSize, 0x6b);
+    check(parses_hello(payload_of(chast::make_hello(ticket_hello)), got) &&
+              got.access_ticket == ticket_hello.access_ticket &&
+              got.ticket_proof == ticket_hello.ticket_proof,
+          "Hello round-trips the v62 access ticket and possession proof");
+    chast::ClientHello ticket_only = sent;
+    ticket_only.access_ticket.assign(10, 1);
+    rejects_hello(payload_of(chast::make_hello(ticket_only)),
+                  "Hello with a ticket but no possession proof is rejected");
+    chast::ClientHello proof_only = sent;
+    proof_only.ticket_proof.assign(chast::kTicketProofSize, 1);
+    rejects_hello(payload_of(chast::make_hello(proof_only)),
+                  "Hello with a possession proof but no ticket is rejected");
+    chast::ClientHello long_proof = sent;
+    long_proof.access_ticket.assign(16, 0x11);
+    long_proof.ticket_proof.assign(chast::kTicketProofSize + 16, 0x22);
+    check(parses_hello(payload_of(chast::make_hello(long_proof)), got) &&
+              got.ticket_proof.size() == chast::kTicketProofSize,
+          "Hello truncates an over-long possession proof");
 
     chast::ClientHello long_name = sent;
     long_name.device_name.assign(chast::kMaxDeviceNameLength - 1, 'a');
@@ -264,6 +286,24 @@ void test_hello() {
     check(parses_hello(payload_of(chast::make_hello(invalid_name)), got) &&
               got.device_name.empty(),
           "Hello drops a device name that is not UTF-8 instead of emitting it");
+}
+
+void test_auth_challenge() {
+    std::array<uint8_t, chast::kTicketProofHostNonceSize> nonce{};
+    for (size_t i = 0; i < nonce.size(); ++i) {
+        nonce[i] = static_cast<uint8_t>(i * 3 + 1);
+    }
+    const std::vector<uint8_t> payload = payload_of(chast::make_auth_challenge(nonce));
+    check(payload.size() == chast::kTicketProofHostNonceSize,
+          "AuthChallenge carries exactly 32 bytes");
+    std::array<uint8_t, chast::kTicketProofHostNonceSize> got{};
+    std::string error;
+    check(chast::parse_auth_challenge(payload, got, &error) && got == nonce,
+          "AuthChallenge round-trips the host nonce");
+    check(!chast::parse_auth_challenge(std::vector<uint8_t>(31, 0), got, &error),
+          "AuthChallenge of 31 bytes is rejected");
+    check(!chast::parse_auth_challenge(std::vector<uint8_t>(33, 0), got, &error),
+          "AuthChallenge of 33 bytes is rejected");
 }
 
 void test_access_denied() {
@@ -310,6 +350,70 @@ void test_access_denied() {
               code, reason, &error) &&
               reason.empty(),
           "the AccessDenied maker drops a reason that is not UTF-8");
+}
+
+void test_ticket_renew() {
+    std::vector<uint8_t> ticket(300, 0x2a);
+    std::vector<uint8_t> proof(chast::kTicketProofSize, 0x3b);
+    chast::TicketRenewRequest request;
+    std::string error;
+    const std::vector<uint8_t> payload =
+        payload_of(chast::make_ticket_renew(ticket, proof));
+    check(chast::parse_ticket_renew(payload, request, &error) &&
+              request.signed_ticket == ticket && request.proof == proof,
+          "TicketRenew round-trips its ticket and proof");
+    check(!chast::parse_ticket_renew({}, request, &error),
+          "an empty TicketRenew is rejected");
+    check(!chast::parse_ticket_renew(payload_of(chast::make_ticket_renew(ticket, {})),
+                                     request, &error),
+          "TicketRenew without a full possession proof is rejected");
+    check(!chast::parse_ticket_renew(payload_of(chast::make_ticket_renew({}, proof)),
+                                     request, &error),
+          "TicketRenew without a ticket is rejected");
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    check(!chast::parse_ticket_renew(trailing, request, &error),
+          "TicketRenew with trailing bytes is rejected");
+
+    chast::TicketRenewResult sent;
+    sent.code = chast::TicketRenewCode::Accepted;
+    sent.expires_at = 1893456000;
+    sent.permissions = chast::kPermissionFileTransfer | chast::kPermissionInput;
+    sent.reason = "renewed";
+    chast::TicketRenewResult got;
+    check(chast::parse_ticket_renew_result(
+              payload_of(chast::make_ticket_renew_result(sent)), got, &error) &&
+              got.code == sent.code && got.expires_at == sent.expires_at &&
+              got.permissions == sent.permissions && got.reason == sent.reason,
+          "TicketRenewResult round-trips its lease");
+
+    chast::TicketRenewResult refused;
+    refused.code = chast::TicketRenewCode::Refused;
+    refused.reason = "the account was disabled";
+    // The maker clears lease fields on a refusal.
+    refused.expires_at = 1893456000;
+    refused.permissions = chast::kPermissionAll;
+    check(chast::parse_ticket_renew_result(
+              payload_of(chast::make_ticket_renew_result(refused)), got, &error) &&
+              got.code == chast::TicketRenewCode::Refused && got.expires_at == 0 &&
+              got.permissions == 0 && got.reason == refused.reason,
+          "a refused TicketRenewResult carries no lease");
+
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_ticket_renew_result(sent));
+    unknown_code[0] = 2;
+    check(!chast::parse_ticket_renew_result(unknown_code, got, &error),
+          "TicketRenewResult with an unknown code is rejected");
+    std::vector<uint8_t> accepted_no_expiry =
+        payload_of(chast::make_ticket_renew_result(refused));
+    accepted_no_expiry[0] = 0;
+    check(!chast::parse_ticket_renew_result(accepted_no_expiry, got, &error),
+          "an accepted TicketRenewResult without an expiry is rejected");
+    std::vector<uint8_t> lease_on_refusal =
+        payload_of(chast::make_ticket_renew_result(sent));
+    lease_on_refusal[0] = 1;
+    check(!chast::parse_ticket_renew_result(lease_on_refusal, got, &error),
+          "a refused TicketRenewResult carrying a lease is rejected");
 }
 
 void test_hello_ack() {
@@ -3355,6 +3459,20 @@ void test_input_events() {
     check(got.key.hid_usage == 0xE6, "key event keeps the HID usage");
     check(got.modifiers == chast::kModifierRightAlt, "key event keeps the modifier bitmap");
 
+    chast::InputEvent legacy;
+    legacy.kind = chast::InputKind::LegacyKey;
+    legacy.legacy_key.action = chast::KeyAction::Down;
+    legacy.legacy_key.virtual_key = VK_RMENU;
+    legacy.modifiers = chast::kModifierRightAlt;
+    check(chast::parse_input_event(payload_of(chast::make_input_event(legacy)), got, &error),
+          "legacy key event round-trips");
+    check(got.kind == chast::InputKind::LegacyKey &&
+              got.legacy_key.action == chast::KeyAction::Down,
+          "legacy key event keeps kind and action");
+    check(got.legacy_key.virtual_key == VK_RMENU, "legacy key event keeps the virtual key");
+    check(got.modifiers == chast::kModifierRightAlt,
+          "legacy key event keeps the modifier bitmap");
+
     chast::InputEvent touch;
     touch.kind = chast::InputKind::Touch;
     touch.touch.action = chast::TouchAction::Move;
@@ -3437,6 +3555,21 @@ void test_input_events() {
     std::vector<uint8_t> no_usage = body;
     no_usage[0] = static_cast<uint8_t>(chast::InputKind::Key);
     rejects(no_usage, "key event without a HID usage is rejected");
+    const std::vector<uint8_t> legacy_body = payload_of(chast::make_input_event(legacy));
+    std::vector<uint8_t> no_virtual_key = legacy_body;
+    no_virtual_key[12] = 0;
+    no_virtual_key[13] = 0;
+    rejects(no_virtual_key, "legacy key event without a virtual key is rejected");
+    std::vector<uint8_t> wide_virtual_key = legacy_body;
+    wide_virtual_key[12] = 0x01;
+    wide_virtual_key[13] = 0x01;  // 257
+    rejects(wide_virtual_key, "legacy key event above the virtual-key range is rejected");
+    std::vector<uint8_t> legacy_action = legacy_body;
+    legacy_action[1] = 2;
+    rejects(legacy_action, "unknown legacy key action is rejected");
+    std::vector<uint8_t> legacy_buttons = legacy_body;
+    legacy_buttons[2] = 1;
+    rejects(legacy_buttons, "legacy key event with mouse buttons is rejected");
     std::vector<uint8_t> unknown_modifiers = body;
     unknown_modifiers[15] = 0x80;
     rejects(unknown_modifiers, "unknown input state bits are rejected");
@@ -4129,6 +4262,18 @@ void test_file_browser() {
               &error) &&
               request_id == 9 && directory.empty(),
           "FileListRequest round-trips the receive root");
+    bool show_hidden = false;
+    check(chast::parse_file_list_request(
+              payload_of(chast::make_file_list_request(9, "docs", "f:a.txt", true)),
+              request_id, directory, &error, nullptr, &show_hidden) &&
+              request_id == 9 && directory == "docs" && show_hidden,
+          "FileListRequest round-trips the hidden-entry flag");
+    show_hidden = true;
+    check(chast::parse_file_list_request(payload_of(chast::make_file_list_request(9, "")),
+                                         request_id, directory, &error, nullptr,
+                                         &show_hidden) &&
+              !show_hidden,
+          "FileListRequest defaults to omitting hidden entries");
 
     check(chast::make_file_list_request(0, "docs").empty() &&
               chast::make_file_list_request(9, "../secret").empty() &&
@@ -4167,6 +4312,10 @@ void test_file_browser() {
     trailing_request.push_back(0x55);
     rejects_list_request(std::move(trailing_request),
                          "FileListRequest with trailing bytes is rejected");
+    std::vector<uint8_t> unknown_flags = payload_of(list_message);
+    unknown_flags.back() = 0x02;
+    rejects_list_request(std::move(unknown_flags),
+                         "FileListRequest with unknown flags is rejected");
 
     chast::FileListResult result;
     result.request_id = 9;
@@ -4365,6 +4514,13 @@ void test_file_browser() {
               op_id == 13 && op == chast::FileOperation::MakeDirectory &&
               op_path == "docs/new" && op_name.empty(),
           "FileOpRequest round-trips a folder creation");
+    check(chast::parse_file_op_request(
+              payload_of(chast::make_file_op_request(
+                  13, chast::FileOperation::RemoveTree, "docs/tree", "")),
+              op_id, op, op_path, op_name, &error) &&
+              op_id == 13 && op == chast::FileOperation::RemoveTree &&
+              op_path == "docs/tree" && op_name.empty(),
+          "FileOpRequest round-trips a recursive folder removal");
     check(chast::make_file_op_request(0, chast::FileOperation::Remove, "a", "").empty() &&
               chast::make_file_op_request(13, chast::FileOperation::Remove, "", "").empty() &&
               chast::make_file_op_request(13, chast::FileOperation::Remove, "../a", "")
@@ -4391,10 +4547,10 @@ void test_file_browser() {
               what);
     };
     std::vector<uint8_t> unknown_op = payload_of(chast::make_file_op_request(
-        13, chast::FileOperation::Remove, "a", ""));
-    unknown_op[4] = 0xFF;
+        13, chast::FileOperation::RemoveTree, "a", ""));
+    unknown_op[4] = static_cast<uint8_t>(chast::FileOperation::RemoveTree) + 1;
     rejects_op_request(std::move(unknown_op),
-                       "FileOpRequest with an unknown operation is rejected");
+                       "FileOpRequest with an operation past RemoveTree is rejected");
     std::vector<uint8_t> trailing_op = payload_of(chast::make_file_op_request(
         13, chast::FileOperation::Remove, "a", ""));
     trailing_op.push_back(0x55);
@@ -4586,7 +4742,9 @@ void test_clipboard_container() {
 int main(int argc, char** argv) {
     test_elevation();
     test_hello();
+    test_auth_challenge();
     test_access_denied();
+    test_ticket_renew();
     test_hello_ack();
     test_files_only_hello_ack();
     test_control_only_hello_ack();

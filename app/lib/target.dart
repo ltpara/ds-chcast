@@ -1,3 +1,8 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:crypto/crypto.dart';
+
 import 'server_settings.dart';
 
 class ConnectTarget {
@@ -49,6 +54,36 @@ class ConnectTarget {
   /// address would forget the host every time; the logical server + id is the
   /// identity the user actually trusts.
   String get trustKey => viaServer ? 'server:$server/$hostId' : label;
+
+  /// Preferences must not cross deployment boundaries. Hashing the canonical
+  /// server URL keeps the key below the native child-window limit (256).
+  /// Legacy bare host IDs have no known server owner and are not inherited.
+  String get preferencesKey {
+    if (viaServer) {
+      final normalized = normalizeServerUrl(server);
+      final canonical = normalized.isEmpty ? server.trim() : normalized;
+      final namespace = sha256.convert(utf8.encode(canonical));
+      return 'server:v1:$namespace/${hostId.trim()}';
+    }
+    var address = host.trim().toLowerCase();
+    final zoneIndex = address.indexOf('%');
+    final zone = zoneIndex < 0 ? '' : address.substring(zoneIndex);
+    final ip = InternetAddress.tryParse(
+      zoneIndex < 0 ? address : address.substring(0, zoneIndex),
+    );
+    if (ip != null && ip.type == InternetAddressType.IPv6) {
+      final bytes = ip.rawAddress;
+      address = List.generate(
+        8,
+        (i) => ((bytes[i * 2] << 8) | bytes[i * 2 + 1]).toRadixString(16),
+      ).join(':');
+      address += zone;
+    }
+    final key = address.contains(':') ? '[$address]:$port' : '$address:$port';
+    return key.length <= 256
+        ? key
+        : 'direct:v1:${sha256.convert(utf8.encode(key))}';
+  }
 }
 
 /// Host ids share the server's registry rule, which also keeps a mistyped

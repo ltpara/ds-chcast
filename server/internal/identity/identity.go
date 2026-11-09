@@ -53,6 +53,10 @@ const (
 	// file. The host key that owns the id signs the canonical fields, so a
 	// leaked server key alone cannot fabricate host-side records.
 	DomainHostAudit = "chast-host-audit-v1"
+	// DomainDevicePolicy covers a host acknowledging the policy version it
+	// applied. The signature binds the receipt to the host id, so another
+	// machine holding the shared host key cannot report on its behalf.
+	DomainDevicePolicy = "chast-device-policy-v1"
 	// DomainSoftware covers the advertised software update: version, download
 	// URL, SHA-256 and size. Clients that pin the server key can reject a
 	// notice or binary swapped between the server and the download host.
@@ -157,6 +161,16 @@ func HostAuditDenialMessage(hostID, address string, denial, occurredAt int64,
 	detail string, timestamp int64) []byte {
 	return fieldsMessage(DomainHostAudit, "denial", hostID, address,
 		strconv.FormatInt(denial, 10), strconv.FormatInt(occurredAt, 10), detail,
+		strconv.FormatInt(timestamp, 10))
+}
+
+// HostDevicePolicyReceiptMessage binds the exact version a host applied. The
+// request timestamp is signed as well, so a captured success cannot be replayed
+// as an acknowledgement of a later policy.
+func HostDevicePolicyReceiptMessage(hostID string, version uint32, applied bool,
+	detail string, timestamp int64) []byte {
+	return fieldsMessage(DomainDevicePolicy, "receipt", hostID,
+		strconv.FormatUint(uint64(version), 10), boolText(applied), detail,
 		strconv.FormatInt(timestamp, 10))
 }
 

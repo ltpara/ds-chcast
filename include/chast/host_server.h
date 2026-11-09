@@ -580,6 +580,17 @@ private:
     // rotates the one-time token once no viewer is left.
     bool serve_current_session(HostServerStats& stats, bool rotate_token,
                                std::string* error, bool* peer_left);
+    // True once the ticket that admitted this session has reached its
+    // server-signed deadline. The session loops treat it like an idle end:
+    // the transport is drained and the worker exits without being restarted
+    // on the same connection. Traffic never moves the deadline.
+    bool ticket_lease_expired(const std::chrono::steady_clock::time_point& now);
+    // Applies every queued v62 ticket renewal. On acceptance the session mask
+    // is narrowed to the new ticket's ceiling and the lease moves to the new
+    // expiry; on refusal the viewer is told why and the session must end.
+    // Returns false when the session ends here; `error` stays empty for a
+    // deliberate refusal, which is not a transport failure.
+    bool apply_ticket_renewals(std::string* error);
     // Starts one worker for an accepted connection and makes it the focused
     // viewer for status() and the operator actions. `run_seconds_left` is what
     // remains of the listener's run budget (0 = unlimited): the worker ends its
@@ -762,6 +773,24 @@ private:
     std::chrono::steady_clock::time_point run_start_;
     std::chrono::steady_clock::time_point last_viewer_activity_ =
         std::chrono::steady_clock::now();
+    // v62: the monotonic deadline of the access ticket that admitted this
+    // session. Set once after admission from the server-signed expiry and
+    // never extended by traffic; max() means the session needs no ticket.
+    std::chrono::steady_clock::time_point ticket_deadline_ =
+        (std::chrono::steady_clock::time_point::max)();
+    // True once ticket_lease_expired() ended this session, so the finish step
+    // does not give the peer the usual stats grace: the lease, not the viewer,
+    // ended it and the transport must close promptly.
+    bool ticket_expired_ = false;
+    // What the admitted ticket bound to this connection: the host challenge,
+    // the Hello nonce and the client key. A renewal re-proves all three, so a
+    // ticket for another viewer cannot extend this session.
+    std::array<uint8_t, kTicketProofHostNonceSize> ticket_host_nonce_{};
+    std::vector<uint8_t> ticket_client_nonce_;
+    std::array<uint8_t, kTicketClientKeySize> ticket_client_key_{};
+    // True once a refused renewal ended the session; the finish step then
+    // skips the usual stats grace, like an expired lease.
+    bool ticket_renew_failed_ = false;
 
     // The operator download. Queued by the UI, hashed off the frame loop,
     // then offered and streamed from the host thread.

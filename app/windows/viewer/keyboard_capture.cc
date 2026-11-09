@@ -25,6 +25,7 @@ uint16_t physical_modifiers() {
 
 void KeyboardState::Reset(uint16_t modifiers) {
     held_.fill(false);
+    legacy_held_.fill(false);
     forwarded_.fill(false);
     modifiers_ = modifiers & chast::kModifierMask;
     for (unsigned i = 0; i < 8; ++i) held_[0xE0 + i] = (modifiers_ & (1u << i)) != 0;
@@ -42,10 +43,17 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
     if (key.vkCode == VK_CAPITAL || key.vkCode == VK_NUMLOCK) return false;
     const uint16_t usage = chast::windows_key_to_hid(
         key.vkCode, key.scanCode, (key.flags & LLKHF_EXTENDED) != 0);
-    if (usage == 0) return false;
-    const bool repeat = down && held_[usage];
-    held_[usage] = down;
-    const uint16_t modifier = chast::modifier_bit_for_usage(usage);
+    // Legacy mode forwards named virtual keys the HID table does not carry
+    // (media, OEM and IME keys); Map mode has nothing to send for them.
+    if (legacy_ ? (key.vkCode == 0 || key.vkCode > 0xFF) : (usage == 0)) return false;
+    const bool repeat = legacy_
+        ? (down && legacy_held_[key.vkCode & 0xFF])
+        : (down && held_[usage]);
+    if (legacy_) legacy_held_[key.vkCode & 0xFF] = down;
+    else held_[usage] = down;
+    const uint16_t modifier = legacy_
+        ? chast::modifier_bit_for_vk(static_cast<uint16_t>(key.vkCode))
+        : chast::modifier_bit_for_usage(usage);
     if (down) modifiers_ |= modifier;
     else modifiers_ &= static_cast<uint16_t>(~modifier);
     if (modifier != 0 && repeat) return true;
@@ -96,9 +104,15 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
         }
         if (down && !forwarded_[usage]) return false;
     }
-    event.kind = chast::InputKind::Key;
-    event.key.hid_usage = usage;
-    event.key.action = down ? chast::KeyAction::Down : chast::KeyAction::Up;
+    if (legacy_) {
+        event.kind = chast::InputKind::LegacyKey;
+        event.legacy_key.action = down ? chast::KeyAction::Down : chast::KeyAction::Up;
+        event.legacy_key.virtual_key = static_cast<uint16_t>(key.vkCode);
+    } else {
+        event.kind = chast::InputKind::Key;
+        event.key.hid_usage = usage;
+        event.key.action = down ? chast::KeyAction::Down : chast::KeyAction::Up;
+    }
     event.modifiers = modifiers_ | (locks & chast::kLockStateMask);
     return true;
 }
@@ -202,6 +216,14 @@ void KeyboardCapture::SetTranslated(bool enabled) {
     std::lock_guard lock(mutex_);
     translated_ = enabled;
     composing_ = false;
+    state_.Reset(physical_modifiers_);
+}
+
+void KeyboardCapture::SetLegacy(bool enabled) {
+    std::lock_guard lock(mutex_);
+    if (legacy_ == enabled) return;
+    legacy_ = enabled;
+    state_.SetLegacy(enabled);
     state_.Reset(physical_modifiers_);
 }
 

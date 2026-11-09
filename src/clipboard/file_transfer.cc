@@ -718,7 +718,7 @@ FileCode resolve_receive_path(const std::string& root, const std::string& relati
 namespace { bool valid_operation_name(const std::string& name); }
 
 void list_receive_directory(const std::string& root, const std::string& relative,
-                            FileListResult& result, std::string cursor) {
+                            FileListResult& result, std::string cursor, bool show_hidden) {
     result.entries.clear();
     result.truncated = false;
     result.next_cursor.clear();
@@ -767,7 +767,8 @@ void list_receive_directory(const std::string& root, const std::string& relative
     do {
         const std::wstring name = data.cFileName;
         if (name == L"." || name == L".." ||
-            (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            (!show_hidden && (data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0)) {
             continue;
         }
         const std::string utf8_name = wide_to_utf8(name);
@@ -852,6 +853,93 @@ FileCode map_operation_error(DWORD code, std::string& error) {
             error = "the host's file system failed (error " + std::to_string(code) + ")";
             return FileCode::IoError;
     }
+}
+
+// A viewer can request the removal of a directory tree, so the preflight pass
+// collects every entry first and refuses reparse points or read-only entries
+// before deleting anything. A failure after that pass (a file opened by a
+// local program, for example) can still leave the tree partially removed.
+constexpr size_t kMaxRemoveTreeEntries = 200000;
+
+FileCode remove_tree(const std::wstring& target, std::string& error) {
+    std::vector<std::wstring> pending{target};
+    std::vector<std::wstring> directories;
+    std::vector<std::wstring> files;
+    while (!pending.empty()) {
+        const std::wstring directory = std::move(pending.back());
+        pending.pop_back();
+        directories.push_back(directory);
+        const std::wstring pattern = join(directory, L"*");
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileW(long_path(pattern).c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND) {
+                continue;
+            }
+            error = "cannot list a folder for removal (error " + std::to_string(code) + ")";
+            return FileCode::IoError;
+        }
+        bool listed = true;
+        do {
+            const std::wstring name = data.cFileName;
+            if (name == L"." || name == L"..") {
+                continue;
+            }
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                error = "the folder contains a reparse point";
+                listed = false;
+                break;
+            }
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
+                error = "the folder contains a read-only entry";
+                listed = false;
+                break;
+            }
+            if (files.size() + directories.size() >= kMaxRemoveTreeEntries) {
+                error = "the folder holds too many entries to remove";
+                listed = false;
+                break;
+            }
+            std::wstring child = join(directory, name);
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                pending.push_back(std::move(child));
+            } else {
+                files.push_back(std::move(child));
+            }
+        } while (FindNextFileW(find, &data));
+        const DWORD enumeration_error = GetLastError();
+        FindClose(find);
+        if (!listed) {
+            return FileCode::Refused;
+        }
+        if (enumeration_error != ERROR_NO_MORE_FILES) {
+            error = "cannot finish listing a folder for removal (error " +
+                    std::to_string(enumeration_error) + ")";
+            return FileCode::IoError;
+        }
+    }
+    for (const std::wstring& file : files) {
+        if (DeleteFileW(long_path(file).c_str())) {
+            continue;
+        }
+        const DWORD code = GetLastError();
+        if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
+            return map_operation_error(code, error);
+        }
+    }
+    // Directories were discovered parent-first; removing them in reverse
+    // order empties every child before its parent is touched.
+    for (auto it = directories.rbegin(); it != directories.rend(); ++it) {
+        if (RemoveDirectoryW(long_path(*it).c_str())) {
+            continue;
+        }
+        const DWORD code = GetLastError();
+        if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
+            return map_operation_error(code, error);
+        }
+    }
+    return FileCode::Ok;
 }
 
 }  // namespace
@@ -944,6 +1032,25 @@ FileCode apply_file_operation(const std::string& root, FileOperation op,
                 return map_operation_error(GetLastError(), error);
             }
             return FileCode::Ok;
+        }
+        case FileOperation::RemoveTree: {
+            const DWORD attributes = GetFileAttributesW(long_path(target).c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                return map_operation_error(GetLastError(), error);
+            }
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                error = "the path is a reparse point";
+                return FileCode::Refused;
+            }
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                error = "the path is not a folder";
+                return FileCode::Refused;
+            }
+            if ((attributes & FILE_ATTRIBUTE_READONLY) != 0) {
+                error = "the entry is read-only";
+                return FileCode::Refused;
+            }
+            return remove_tree(target, error);
         }
     }
     error = "the operation is not supported";

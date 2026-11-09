@@ -108,6 +108,44 @@ func TestRejectsUnlistedRequests(t *testing.T) {
 	}
 }
 
+// TestConsoleExposesDevicePolicyReceipts keeps the policy page wired to the
+// admin API and the receipt rule: a version is only shown as applied when the
+// host-reported version matches the policy being displayed.
+func TestConsoleExposesDevicePolicyReceipts(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(index)
+	for _, want := range []string{
+		`data-tab="policies"`,
+		`id="panel-policies"`,
+		`id="policy-rows"`,
+		`id="policy-dialog"`,
+		`id="policy-ceiling"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html is missing %q", want)
+		}
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(script)
+	for _, want := range []string{
+		"/v1/device-policies",
+		"receipt.policy_version !== policy.policy_version",
+		"receipt.policy_version === policy.policy_version",
+		"'已应用版本 '",
+		"'待应用'",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing %q", want)
+		}
+	}
+}
+
 // TestAssetsStayCSPCompatible guards the policy that the console contains no
 // inline script or style and never assigns data through HTML parsing helpers.
 func TestAssetsStayCSPCompatible(t *testing.T) {

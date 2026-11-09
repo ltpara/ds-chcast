@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 
 // Minimal QUIC session built on MsQuic, carrying the chast protocol.
@@ -70,6 +71,10 @@ struct ClientRequest {
     // device proof. The signature has already been parsed but not verified:
     // only the policy knows which keys it trusts.
     ClientHello hello;
+    // v62: the per-connection challenge the transport sent on the control
+    // stream before this Hello. All zero when no challenge was sent. A managed
+    // policy verifies the ticket possession proof against it.
+    std::array<uint8_t, kTicketProofHostNonceSize> host_nonce{};
     // Authentication's permission ceiling: the host's defaults intersected
     // with what the viewer requested. The approval callback starts from this
     // mask and may only reduce it.
@@ -370,6 +375,13 @@ struct QuicClientConfig {
     StreamCodecPreference codec_preference = StreamCodecPreference::Auto;
     VideoCodecMask decoding_444 = 0;
     VideoChroma prefer_chroma = VideoChroma::Yuv420;
+    // v62 managed access: the signed access ticket (envelope plus Ed25519
+    // signature) and the 32-byte Ed25519 seed whose public key the ticket
+    // names. Both empty on unmanaged hosts. When set, handshake() waits for
+    // the host's AuthChallenge before sending Hello and attaches the
+    // possession proof; a managed host refuses a Hello without one.
+    std::vector<uint8_t> access_ticket;
+    std::vector<uint8_t> access_ticket_key;
 };
 
 class QuicSession {
@@ -466,6 +478,13 @@ public:
     // a token spent by the previous one becomes valid again under its new
     // value, which is how a host rotates a one-time token without rebinding.
     void set_access_token(std::string token);
+    // Server (v62 managed access): pops the newest ticket renewal the viewer
+    // sent. Verify it with HostSecurity::renew_ticket(); on acceptance the
+    // host extends its monotonic lease to RenewalResult::expires_at and
+    // narrows the session mask, and it answers with send_ticket_renew_result().
+    // A refused renewal must end the session after the answer is queued.
+    bool take_ticket_renew(TicketRenewRequest& request);
+    Error send_ticket_renew_result(const TicketRenewResult& result);
     // Closes the finished connection and clears the per-session state, leaving
     // the listener up. Call after finish_server() so wait_for_client() can
     // accept the next client.
@@ -719,6 +738,15 @@ public:
     // handshake() already carries the server's reason; the code lets a caller
     // choose its own wording without matching text.
     std::optional<AccessDenial> denial() const;
+    // Client (v62 managed access): presents a freshly issued ticket for this
+    // same connection and waits for the host's TicketRenewResult. The ticket
+    // must name the client key the handshake used; the proof covers this
+    // session's Hello nonce and the host challenge. Returns PermissionDenied
+    // (with the host's reason) when the renewal was refused; the host closes
+    // the session in that case. Requires a completed handshake that used a
+    // ticket.
+    Error renew_access_ticket(const std::vector<uint8_t>& signed_ticket,
+                              std::chrono::milliseconds timeout);
     // Pops the newest permission mask the host sent with PermissionUpdate.
     // permissions() already reflects it, so this is the "something changed"
     // edge for a UI that wants to explain the revocation.
@@ -1290,9 +1318,11 @@ public:
     // Every call requires the handshake and kPermissionFileTransfer, like
     // FileOffer.
 
-    // Server: pops the oldest browse request (the viewer's request id and a
-    // relative directory). The host answers with send_file_list_result().
-    bool take_file_list_request(uint32_t& request_id, std::string& directory, std::string* cursor = nullptr);
+    // Server: pops the oldest browse request (the viewer's request id, a
+    // relative directory and whether hidden entries were requested). The host
+    // answers with send_file_list_result().
+    bool take_file_list_request(uint32_t& request_id, std::string& directory,
+                                std::string* cursor = nullptr, bool* show_hidden = nullptr);
     // Server: answers one browse request on the control stream.
     Error send_file_list_result(const FileListResult& result);
     // Server: pops the oldest download request (the viewer's request id and a
@@ -1302,9 +1332,11 @@ public:
     // Server: answers one download request. Ok must name the transfer id the
     // host is about to offer; every other code must pass 0.
     Error send_file_download_result(const FileDownloadResult& result, bool clipboard = false);
-    // Client: asks for one directory listing. The answer arrives through
+    // Client: asks for one directory listing; `show_hidden` keeps entries
+    // with FILE_ATTRIBUTE_HIDDEN. The answer arrives through
     // take_file_list_result().
-    Error request_file_list(uint32_t request_id, const std::string& directory, const std::string& cursor = {});
+    Error request_file_list(uint32_t request_id, const std::string& directory,
+                            const std::string& cursor = {}, bool show_hidden = false);
     // Client: pops the oldest listing.
     bool take_file_list_result(FileListResult& result);
     // Client: asks the host to offer one file. The answer arrives through

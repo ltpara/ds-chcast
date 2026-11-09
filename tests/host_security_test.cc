@@ -3,10 +3,14 @@
 // memory and never writes it.
 
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "access_ticket_vector.h"
 #include "chast/host_security.h"
 #include "chast/security.h"
 
@@ -103,6 +107,52 @@ void test_modes() {
     config.mode = chast::HostAuthMode::Both;
     security.set_config(config);
     check(security.has_temporary_password(), "both mode publishes a temporary password");
+}
+
+void test_managed_policy() {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / L"chast-host-security-managed.json";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+
+    chast::HostSecurity::Config config;
+    config.mode = chast::HostAuthMode::Password;
+    config.password_hash = test_password_hash();
+    config.policy_state = path.string();
+    chast::HostSecurity security(config);
+    chast::ClientHello hello = hello_with(test_password());
+
+    auto result = security.evaluate(hello, "192.0.2.5:5000", 5000);
+    check(result.decision == Decision::Allow,
+          "a missing policy state keeps local authentication");
+
+    const auto write = [&path](const std::string& body) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << body;
+    };
+    write("{\n  \"managed\": false,\n  \"recorded_at_ms\": 1\n}\n");
+    result = security.evaluate(hello, "192.0.2.5:5000", 5001);
+    check(result.decision == Decision::Allow,
+          "an explicit unmanaged marker keeps local authentication");
+
+    write("{\n  \"managed\": true,\n  \"mode\": \"open\",\n  \"policy_version\": 3\n}\n");
+    result = security.evaluate(hello, "192.0.2.5:5001", 5002);
+    check(result.decision == Decision::Deny &&
+              result.reason.find("managed") != std::string::npos,
+          "a managed device refuses a valid password until access tickets exist");
+
+    write("not a policy file");
+    result = security.evaluate(hello, "192.0.2.5:5002", 5003);
+    check(result.decision == Decision::Deny &&
+              result.reason.find("cannot be read") != std::string::npos,
+          "a corrupt managed state refuses instead of falling back to open");
+
+    config.policy_state.clear();
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.5:5003", 5004);
+    check(result.decision == Decision::Allow,
+          "clearing the policy path keeps a purely local host unmanaged");
+    std::filesystem::remove(path, ignored);
 }
 
 void test_temporary_password() {
@@ -746,6 +796,276 @@ void test_file_transfer_mode() {
           "the token's files-only session carries only file transfer");
 }
 
+// Access-ticket constants. The issuer seed matches the frozen vector in
+// docs/access-control-design-2026-11-09.md section 6; the client key is derived
+// from a test seed so the possession proof can be signed here.
+constexpr const char* kTicketPublicKey = "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
+constexpr const char* kTicketIssuer = "chast.example";
+constexpr const char* kTicketKid = "kid-2026-11";
+constexpr const char* kTicketKidNext = "kid-2027-01";
+constexpr const char* kTicketHostID = "devbox";
+// The certificate digest as the host stores it; the ticket spells the same
+// value as "SHA256:" + this digest.
+constexpr const char* kTicketFingerprintHex =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+constexpr const char* kTicketFingerprint =
+    "SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+constexpr int64_t kTicketIssuedAt = 1794225600;
+constexpr int64_t kTicketExpiresAt = 1794225660;
+// The frozen envelope grants input, clipboard, audio and file transfer.
+constexpr uint32_t kTicketPermissions = 0x0000000f;
+constexpr uint8_t kTicketClientSeedFirst = 0x80;
+
+ticket_test::Seed ticket_client_seed() {
+    return ticket_test::sequential_seed(kTicketClientSeedFirst);
+}
+
+// Mints a ticket for the host above whose client key is derived from
+// ticket_client_seed(), so the test can also produce the possession proof.
+std::vector<uint8_t> minted_ticket(const std::string& kid = kTicketKid,
+                                   const std::string& jti = "jti-0001",
+                                   uint8_t issuer_seed = 0x00) {
+    chast::AccessTicket ticket;
+    ticket.issuer = kTicketIssuer;
+    ticket.audience = std::string("device:") + kTicketHostID;
+    ticket.key_id = kid;
+    ticket.host_id = kTicketHostID;
+    ticket.host_public_key_fingerprint = kTicketFingerprint;
+    ticket.subject = "alice";
+    ticket.permissions = kTicketPermissions;
+    ticket.policy_version = 2;
+    ticket.issued_at = kTicketIssuedAt;
+    ticket.not_before = kTicketIssuedAt;
+    ticket.expires_at = kTicketExpiresAt;
+    ticket.id = jti;
+    std::vector<uint8_t> client_key;
+    if (!ticket_test::ed25519_public_key(ticket_client_seed(), &client_key)) {
+        return {};
+    }
+    std::memcpy(ticket.client_public_key.data(), client_key.data(),
+                chast::kTicketClientKeySize);
+    return ticket_test::sign_ticket(ticket_test::sequential_seed(issuer_seed),
+                                    ticket_test::encode(ticket));
+}
+
+std::array<uint8_t, chast::kTicketProofHostNonceSize> host_challenge() {
+    std::array<uint8_t, chast::kTicketProofHostNonceSize> nonce{};
+    for (size_t i = 0; i < nonce.size(); ++i) {
+        nonce[i] = static_cast<uint8_t>(0x20 + i);
+    }
+    return nonce;
+}
+
+chast::HostSecurity::TicketRequest ticket_request(
+    const chast::ClientHello& hello, const std::vector<uint8_t>& signed_ticket,
+    const std::string& device_id, const std::string& fingerprint,
+    const std::array<uint8_t, chast::kTicketProofHostNonceSize>& host_nonce) {
+    chast::HostSecurity::TicketRequest request;
+    request.signed_ticket = signed_ticket;
+    request.host_nonce = host_nonce;
+    const std::vector<uint8_t> client_nonce(hello.nonce.begin(), hello.nonce.end());
+    const std::vector<uint8_t> message = chast::access_ticket_proof_message(
+        device_id, fingerprint, host_nonce, client_nonce, signed_ticket);
+    ticket_test::ed25519_sign(ticket_client_seed(), message, &request.proof);
+    return request;
+}
+
+void test_managed_ticket() {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / L"chast-host-security-ticket.json";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    const auto write_marker = [&path](uint32_t ceiling, uint32_t version) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "{\n  \"managed\": true,\n  \"mode\": \"restricted\",\n"
+            << "  \"permission_ceiling\": " << ceiling << ",\n"
+            << "  \"policy_version\": " << version << "\n}\n";
+    };
+
+    chast::HostSecurity::Config config;
+    config.mode = chast::HostAuthMode::Password;
+    config.password_hash = test_password_hash();
+    config.default_permissions = chast::kPermissionAll;
+    config.policy_state = path.string();
+    config.device_id = kTicketHostID;
+    config.access_issuer = kTicketIssuer;
+    config.access_kid = kTicketKid;
+    config.access_public_key = kTicketPublicKey;
+    config.host_fingerprint = kTicketFingerprintHex;
+    chast::ClientHello hello = hello_with(test_password());
+    hello.nonce = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const std::vector<uint8_t> ticket = minted_ticket();
+    check(!ticket.empty(), "the managed ticket is minted");
+    const std::array<uint8_t, chast::kTicketProofHostNonceSize> nonce = host_challenge();
+    chast::HostSecurity::TicketRequest request =
+        ticket_request(hello, ticket, kTicketHostID, kTicketFingerprintHex, nonce);
+
+    write_marker(kTicketPermissions, 2);
+    chast::HostSecurity security(config);
+    auto result = security.evaluate(hello, "192.0.2.6:5000", kTicketIssuedAt);
+    check(result.decision == Decision::Deny &&
+              result.reason.find("ticket is required") != std::string::npos,
+          "a managed host refuses a ticketless Hello even with the password");
+
+    {
+        chast::HostSecurity::TicketRequest broken = request;
+        broken.proof[0] ^= 0x01;
+        result = security.evaluate(hello, "192.0.2.6:5001", kTicketIssuedAt, &broken);
+        check(result.decision == Decision::Deny &&
+                  result.reason.find("possession proof") != std::string::npos,
+              "a broken possession proof is refused");
+    }
+    {
+        chast::HostSecurity::TicketRequest foreign = request;
+        const std::vector<uint8_t> client_nonce(hello.nonce.begin(), hello.nonce.end());
+        const std::vector<uint8_t> message = chast::access_ticket_proof_message(
+            kTicketHostID, kTicketFingerprintHex, nonce, client_nonce, ticket);
+        ticket_test::ed25519_sign(ticket_test::sequential_seed(0xa0), message,
+                                  &foreign.proof);
+        result = security.evaluate(hello, "192.0.2.6:5002", kTicketIssuedAt, &foreign);
+        check(result.decision == Decision::Deny &&
+                  result.reason.find("possession proof") != std::string::npos,
+              "a proof signed by another key is refused");
+    }
+    {
+        chast::HostSecurity::TicketRequest unchallenged = request;
+        unchallenged.host_nonce.fill(0);
+        result = security.evaluate(hello, "192.0.2.6:5003", kTicketIssuedAt, &unchallenged);
+        check(result.decision == Decision::Deny &&
+                  result.reason.find("host challenge") != std::string::npos,
+              "a request without a host challenge is refused");
+    }
+    {
+        chast::ClientHello other = hello;
+        other.nonce[0] ^= 0x01;
+        const chast::HostSecurity::TicketRequest stale =
+            ticket_request(other, ticket, kTicketHostID, kTicketFingerprintHex, nonce);
+        result = security.evaluate(hello, "192.0.2.6:5004", kTicketIssuedAt, &stale);
+        check(result.decision == Decision::Deny &&
+                  result.reason.find("possession proof") != std::string::npos,
+              "a proof bound to another Hello is refused");
+    }
+
+    result = security.evaluate(hello, "192.0.2.6:5005", kTicketIssuedAt, &request);
+    check(security.config().host_fingerprint.size() == 64,
+          "the host keeps the bare digest used for ticket binding");
+    check(result.decision == Decision::Allow && result.via_access_ticket,
+          "a failed proof does not consume the ticket, so a valid one still admits");
+    check(result.permissions == kTicketPermissions,
+          "ticket, ceiling and local default intersect to the ticket mask");
+    check(result.ticket_subject == "alice" && result.ticket_id == "jti-0001" &&
+              result.ticket_expires_at == kTicketExpiresAt &&
+              result.ticket_policy_version == 2,
+          "the accepted session carries the ticket identity and expiry");
+
+    result = security.evaluate(hello, "192.0.2.6:5006", kTicketIssuedAt + 1, &request);
+    check(result.decision == Decision::Deny, "a replayed access ticket is refused");
+    check(result.permissions == 0, "a refused ticket grants no permissions");
+
+    config.default_permissions = chast::kPermissionInput;
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5007", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Allow &&
+              result.permissions == chast::kPermissionInput,
+          "the local default narrows the ticket permissions");
+    config.default_permissions = chast::kPermissionAll;
+
+    hello.requested_permissions = chast::kPermissionClipboard;
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5008", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Allow &&
+              result.permissions == chast::kPermissionClipboard,
+          "the viewer request narrows the ticket permissions");
+    hello.requested_permissions = chast::kPermissionAll;
+
+    write_marker(chast::kPermissionInput | chast::kPermissionClipboard, 2);
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5009", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Allow &&
+              result.permissions ==
+                  (chast::kPermissionInput | chast::kPermissionClipboard),
+          "the device permission ceiling narrows the ticket permissions");
+
+    write_marker(kTicketPermissions, 3);
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5010", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Deny &&
+              result.reason.find("policy version") != std::string::npos,
+          "a ticket for an older policy version is refused");
+
+    write_marker(chast::kPermissionAll, 2);
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5011", kTicketExpiresAt + 6, &request);
+    check(result.decision == Decision::Deny, "an expired ticket is refused");
+
+    config.device_id = "otherhost";
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5012", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Deny,
+          "a ticket for another device id is refused");
+
+    config.device_id = kTicketHostID;
+    config.host_fingerprint = std::string(64, 'f');
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5013", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Deny,
+          "a ticket bound to another host fingerprint is refused");
+
+    config.host_fingerprint = kTicketFingerprintHex;
+    config.access_public_key.clear();
+    config.access_keys.clear();
+    security.set_config(config);
+    result = security.evaluate(hello, "192.0.2.6:5014", kTicketIssuedAt, &request);
+    check(result.decision == Decision::Deny &&
+              result.reason.find("no trusted access-ticket key") != std::string::npos,
+          "a managed host without a pinned key refuses every session");
+
+    // Rotation overlap: a second issuer kid admitted through access_keys
+    // carries tickets signed by the replacement key while the primary pin
+    // stays in force. Removing the primary afterwards must not resurrect it.
+    {
+        chast::HostSecurity::Config rotated = config;
+        rotated.access_kid = kTicketKid;
+        rotated.access_public_key = kTicketPublicKey;
+        std::vector<uint8_t> next_public;
+        const bool derived = ticket_test::ed25519_public_key(
+            ticket_test::sequential_seed(0x10), &next_public);
+        check(derived, "the replacement issuer key can be derived");
+        if (derived) {
+            rotated.access_keys.push_back(
+                {kTicketKidNext, chast::encode_ticket_base64url(next_public)});
+        }
+        security.set_config(rotated);
+        const std::vector<uint8_t> next_ticket =
+            minted_ticket(kTicketKidNext, "jti-next-1", 0x10);
+        const chast::HostSecurity::TicketRequest next_request =
+            ticket_request(hello, next_ticket, kTicketHostID, kTicketFingerprintHex, nonce);
+        result = security.evaluate(hello, "192.0.2.6:5015", kTicketIssuedAt, &next_request);
+        check(result.decision == Decision::Allow && result.ticket_id == "jti-next-1",
+              "a ticket signed by the overlapping rotation kid is admitted");
+
+        rotated.access_kid.clear();
+        rotated.access_public_key.clear();
+        security.set_config(rotated);
+        const std::vector<uint8_t> next_ticket2 =
+            minted_ticket(kTicketKidNext, "jti-next-2", 0x10);
+        const chast::HostSecurity::TicketRequest next_request2 =
+            ticket_request(hello, next_ticket2, kTicketHostID, kTicketFingerprintHex, nonce);
+        result = security.evaluate(hello, "192.0.2.6:5016", kTicketIssuedAt, &next_request2);
+        check(result.decision == Decision::Allow,
+              "the rotation kid keeps working after the primary pin is removed");
+        const std::vector<uint8_t> old_ticket =
+            minted_ticket(kTicketKid, "jti-old-1", 0x00);
+        const chast::HostSecurity::TicketRequest old_request =
+            ticket_request(hello, old_ticket, kTicketHostID, kTicketFingerprintHex, nonce);
+        result = security.evaluate(hello, "192.0.2.6:5017", kTicketIssuedAt, &old_request);
+        check(result.decision == Decision::Deny,
+              "the retired primary kid stops admitting tickets");
+    }
+
+    std::filesystem::remove(path, ignored);
+}
+
 void test_signature_message() {
     chast::ClientHello hello;
     hello.nonce = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -771,6 +1091,7 @@ void test_signature_message() {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_modes();
+    test_managed_policy();
     test_temporary_password();
     test_token_auth();
     test_two_factor();
@@ -783,6 +1104,7 @@ int main() {
     test_password_and_permissions();
     test_password_rehash();
     test_file_transfer_mode();
+    test_managed_ticket();
     test_signature_message();
     if (failures != 0) {
         std::printf("host security checks FAILED (%d)\n", failures);

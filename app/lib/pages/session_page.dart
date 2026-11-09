@@ -20,6 +20,7 @@ import '../target.dart';
 import '../theme.dart';
 import '../reconnect_policy.dart';
 import '../rdp.dart';
+import '../recording_retention.dart';
 import '../remote_key_sequence.dart';
 import '../remote_pointer.dart';
 import '../trust_store.dart';
@@ -115,6 +116,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Timer? _pollTimer;
   int _pollEpoch = 0;
   Timer? _hideTimer;
+  // Managed-host access tickets (v62). The signed ticket is fetched from the
+  // server before Start and refreshed every 20 seconds, because the host
+  // enforces the signed 60-second deadline on its own clock.
+  static const Duration _ticketRenewInterval = Duration(seconds: 20);
+  Timer? _ticketTimer;
+  bool _ticketRenewBusy = false;
+  String _ticketPublicKey = '';
+  // The account this page sees. A token refreshed here is written back to the
+  // shared store so ticket renewal and audit reports survive the 30-minute
+  // access-token lifetime.
+  AccountSession? _account;
+  Future<AccountSession?>? _accountRefresh;
   ViewerStatus _status = const ViewerStatus();
   // Local clipboard switch, independent of the host's gate: turning it off
   // stops both directions without asking the host to change permissions. The
@@ -132,6 +145,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   final Map<String, DateTime> _recordStartedAt = <String, DateTime>{};
   final List<_FinishedRecording> _recordingUploads = <_FinishedRecording>[];
   bool _uploadingRecordings = false;
+  // An upload holds its file open, so retention must not delete it.
+  String _activeUploadPath = '';
+  // Recording policy. Auto-record starts once per live session when the host
+  // grants recording; a manual stop suppresses it until the next session, and
+  // a refused start is not retried in the same one. Retention runs after a
+  // recording completes; 0 keeps everything.
+  bool _autoRecord = false;
+  int _recordKeep = 0;
+  bool _autoRecordAttempted = false;
+  bool _autoRecordSuppressed = false;
+  bool _wasLive = false;
+  String _recordErrorSeen = '';
   // Session chat. The page owns the transcript and the native transport; the
   // panel is a modeless overlay. While its input holds focus, physical keys
   // belong to the text field, so remote forwarding and the native key-capture
@@ -188,6 +213,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // open during this session.
   FileBrowserSort _fileBrowserSort = FileBrowserSort.name;
   bool _fileBrowserSortAscending = true;
+  // Whether the browser shows entries the host marked hidden; remembered per
+  // device like the sort, matching RustDesk's remote "show hidden" option.
+  bool _fileBrowserShowHidden = false;
   int _terminalFontSize = 13;
   // The last port-forward failure already shown, so a stable error text does
   // not pop a snack bar on every poll. Cleared when the engine clears it.
@@ -331,12 +359,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool get _inputActive =>
       !_keyboardChanging && _controlEnabled && _status.acceptsInput && _startError == null;
 
-  /// Per-device preference key: the server-assigned host ID, or the entered
-  /// address for direct connections. Session reports use the same identity.
-  String get _prefsPeerId {
-    final String hostId = widget.target.hostId.trim();
-    return hostId.isNotEmpty ? hostId : widget.target.label.trim();
-  }
+  String get _prefsPeerId => widget.target.preferencesKey;
 
   /// Physical cursor pixels per captured pixel. The native side needs this to
   /// size the host's sprite the way the frame is being drawn, so a stream
@@ -347,6 +370,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _account = widget.account;
     _display = widget.initialDisplay;
     WidgetsBinding.instance.addObserver(this);
     _chatInputFocus.addListener(_onChatFocusChanged);
@@ -374,12 +398,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final ViewPreferences viewPrefs = ViewPreferences.load(
       peerId: _prefsPeerId,
     );
-    _keyboardMode = viewPrefs.keyboardMode == 'local' ? ViewerKeyboardMode.local : ViewerKeyboardMode.physical;
+    _keyboardMode = viewerKeyboardModeFromName(viewPrefs.keyboardMode);
+    _autoRecord = viewPrefs.autoRecord;
+    _recordKeep = viewPrefs.recordKeep;
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _statsVisible = viewPrefs.stats;
     _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
     _fileBrowserSortAscending = viewPrefs.fileSortAscending;
     _fileBrowserDirectory = viewPrefs.browserDirectory;
+    _fileBrowserShowHidden = viewPrefs.browserShowHidden;
     _terminalFontSize = viewPrefs.terminalFontSize;
     _mouse = MouseMapping(
       reverseWheel: viewPrefs.reverseWheel,
@@ -400,6 +427,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(ViewerBridge.setWindowCloseHandler(null));
     }
     _stopPolling();
+    _ticketTimer?.cancel();
+    _ticketTimer = null;
     _hideTimer?.cancel();
     _autoTimer?.cancel();
     _chatInputFocus.removeListener(_onChatFocusChanged);
@@ -437,7 +466,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _reportFinishedSession(DateTime startedAt, String detail) async {
-    final AccountSession? account = widget.account;
+    final AccountSession? account = await _activeAccount();
     if (account == null || !account.isActiveAt(DateTime.now())) {
       return;
     }
@@ -476,7 +505,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (files.isEmpty) {
         return;
       }
-      final AccountSession? account = widget.account;
+      final AccountSession? account = await _activeAccount();
       if (account == null || !account.isActiveAt(DateTime.now())) {
         return;
       }
@@ -542,10 +571,101 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _recordedPaths.remove(path);
       _queueRecordingUpload(path, _recordStartedAt.remove(path));
     }
+    if (finished.isNotEmpty && !status.recording && _recordKeep > 0) {
+      unawaited(_pruneRecordings(finished.last));
+    }
+  }
+
+  /// Applies the opt-in retention policy after a recording ends. Files still
+  /// open or waiting to upload are protected, and only viewer-named recordings
+  /// are considered.
+  Future<void> _pruneRecordings(String completedPath) async {
+    if (_recordKeep < 1) {
+      return;
+    }
+    final String normalized = completedPath.replaceAll('/', '\\');
+    final int slash = normalized.lastIndexOf('\\');
+    if (slash <= 0) {
+      return;
+    }
+    final String directory = normalized.substring(0, slash);
+    final Set<String> protect = <String>{
+      ..._recordedPaths,
+      for (final _FinishedRecording job in _recordingUploads) job.path,
+      if (_activeUploadPath.isNotEmpty) _activeUploadPath,
+    };
+    try {
+      final int removed = await pruneRecordings(
+        directory,
+        _recordKeep,
+        protect: protect,
+      );
+      if (removed > 0) {
+        debugPrint('viewer: pruned $removed old recording file(s)');
+      }
+    } catch (_) {
+      // Retention is best effort; a locked file is retried next time.
+    }
+  }
+
+  /// Auto-record and the recording failure prompt. The engine reports the
+  /// newest failure until a recording starts successfully, so only a new text
+  /// is shown. Auto-record fires once per live span, after the first picture
+  /// and only with the host's recording consent.
+  void _watchRecording(ViewerStatus status) {
+    final bool live = status.isLive;
+    if (live && !_wasLive) {
+      _autoRecordAttempted = false;
+      _autoRecordSuppressed = false;
+    }
+    _wasLive = live;
+    final String error = status.recordError.trim();
+    if (error.isNotEmpty && error != _recordErrorSeen) {
+      _recordErrorSeen = error;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('录制失败：{error}', <String, Object?>{'error': error})),
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    } else if (error.isEmpty) {
+      _recordErrorSeen = '';
+    }
+    if (_autoRecord &&
+        live &&
+        !_reconnecting &&
+        !status.recording &&
+        !_autoRecordAttempted &&
+        !_autoRecordSuppressed &&
+        status.hasFrame &&
+        status.acceptsRecording) {
+      _autoRecordAttempted = true;
+      unawaited(_applyRecording(true));
+    }
+  }
+
+  void _setAutoRecord(bool enabled) {
+    setState(() => _autoRecord = enabled);
+    ViewPreferences.update(autoRecord: enabled);
+    if (!enabled) {
+      return;
+    }
+    _autoRecordSuppressed = false;
+    if (_status.acceptsRecording && !_status.recording && _status.hasFrame) {
+      _autoRecordAttempted = true;
+      unawaited(_applyRecording(true));
+    }
+  }
+
+  void _setRecordKeep(int keep) {
+    setState(() => _recordKeep = keep);
+    ViewPreferences.update(recordKeep: keep);
   }
 
   void _queueRecordingUpload(String path, DateTime? startedAt) {
-    final AccountSession? account = widget.account;
+    final AccountSession? account = _account;
     if (account == null ||
         !account.isActiveAt(DateTime.now()) ||
         !widget.settings.uploadRecordings) {
@@ -563,7 +683,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     try {
       while (_recordingUploads.isNotEmpty) {
         final _FinishedRecording job = _recordingUploads.removeAt(0);
-        final AccountSession? account = widget.account;
+        final AccountSession? account = await _activeAccount();
         if (account == null ||
             !account.isActiveAt(DateTime.now()) ||
             !widget.settings.uploadRecordings) {
@@ -587,6 +707,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           }
           final DateTime endedAt = DateTime.now();
           final DateTime startedAt = job.startedAt ?? endedAt;
+          _activeUploadPath = job.path;
           await ServerApi.uploadRecording(
             ServerSettings(url: account.server),
             account.token,
@@ -632,6 +753,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               ),
             );
           }
+        } finally {
+          _activeUploadPath = '';
         }
       }
     } finally {
@@ -670,6 +793,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         _cancelAutoReconnect();
         if (mounted) {
           setState(() => _startError = error.message ?? error.code);
+        }
+        return;
+      } on ServerApiException catch (error) {
+        _cancelAutoReconnect();
+        if (mounted) {
+          setState(
+            () => _startError = tr('无法获取访问票据：{p1}', <String, Object?>{
+              'p1': error.message,
+            }),
+          );
         }
         return;
       } on TunnelException catch (error) {
@@ -843,6 +976,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     try {
+      // A managed host refuses a Hello without a ticket, so the lookup is
+      // part of starting the session rather than an optional add-on. An
+      // unmanaged host answers without one and keeps local authentication.
+      final String accessTicket = await _fetchAccessTicket();
       // Direct connections fall back to the host's adjacent TCP port; a
       // tunnelled session prefers the server's shared carrier, which
       // multiplexes every host on one port and needs this host's token.
@@ -903,7 +1040,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         carrierToken: carrierToken,
         fileTransferOnly: widget.fileTransferOnly,
         sessionMode: widget.sessionMode,
+        accessTicket: accessTicket,
       );
+      _startTicketRenewal(accessTicket);
       // The native session starts with clipboard sync on; reapply this page's
       // switch before the first poll can show it as enabled.
       try {
@@ -959,6 +1098,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _teardownSession() async {
     _stopPolling();
+    _ticketTimer?.cancel();
+    _ticketTimer = null;
     final displays = _displayStreams;
     _displayStreams = null;
     displays?.removeListener(_displayStreamsChanged);
@@ -1000,6 +1141,165 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _startPolling() {
     _stopPolling();
     _pollTimer = Timer.periodic(_pollInterval, (_) => unawaited(_poll()));
+  }
+
+  /// The signed-in account with a token that still works. The page opens with
+  /// a snapshot, so once that token nears expiry it first reuses what another
+  /// window persisted (its proactive refresh rotates the token) and only then
+  /// renews with the refresh token itself, writing the result back.
+  Future<AccountSession?> _activeAccount() async {
+    final AccountSession? current = _account;
+    if (current == null) {
+      return null;
+    }
+    if (current.isActiveAt(
+      DateTime.now().toUtc().add(const Duration(minutes: 2)),
+    )) {
+      return current;
+    }
+    return _accountRefresh ??= _refreshAccount(current).whenComplete(() {
+      _accountRefresh = null;
+    });
+  }
+
+  Future<AccountSession?> _refreshAccount(AccountSession current) async {
+    final DateTime now = DateTime.now().toUtc();
+    final AccountSessionStore store = AccountSessionStore(
+      protectSecret: ViewerBridge.protectSecret,
+      unprotectSecret: ViewerBridge.unprotectSecret,
+    );
+    try {
+      final AccountSession? stored = await store.load();
+      if (stored != null &&
+          stored.server == current.server &&
+          stored.username == current.username &&
+          stored.isActiveAt(DateTime.now().toUtc())) {
+        _account = stored;
+        return stored;
+      }
+    } catch (_) {
+      // Fall through to renewing this page's copy.
+    }
+    if (!current.canRefreshAt(now)) {
+      return current.isActiveAt(DateTime.now().toUtc()) ? current : null;
+    }
+    try {
+      final AccountLoginResult renewed = await ServerApi.refresh(
+        ServerSettings(url: current.server),
+        current.refreshToken,
+      );
+      final DateTime issued = DateTime.now().toUtc();
+      final AccountSession session = current.copyWith(
+        token: renewed.token,
+        expiresAt: issued.add(Duration(milliseconds: renewed.expiresInMs)),
+        refreshToken: renewed.refreshToken.isEmpty
+            ? null
+            : renewed.refreshToken,
+        refreshExpiresAt: renewed.refreshToken.isEmpty
+            ? null
+            : issued.add(Duration(milliseconds: renewed.refreshExpiresInMs)),
+      );
+      _account = session;
+      unawaited(store.save(session));
+      return session;
+    } catch (_) {
+      // A transient failure leaves the current token in force until it expires.
+      return current.isActiveAt(DateTime.now().toUtc()) ? current : null;
+    }
+  }
+
+  /// Fetches the ticket a managed host requires. Empty when this session has
+  /// no account, no server-side host id, or the host is not managed; a
+  /// refusal from the server is surfaced instead of silently downgrading to
+  /// local authentication, which a managed host would reject anyway.
+  Future<String> _fetchAccessTicket() async {
+    final AccountSession? account = await _activeAccount();
+    if (account == null ||
+        !account.isActiveAt(DateTime.now()) ||
+        !widget.target.viaServer ||
+        widget.target.hostId.isEmpty) {
+      return '';
+    }
+    final String publicKey = await ViewerBridge.ticketIdentity();
+    if (publicKey.isEmpty) {
+      return '';
+    }
+    _ticketPublicKey = publicKey;
+    final HostInfo info = await ServerApi.lookup(
+      ServerSettings(url: account.server),
+      widget.target.hostId,
+      accountToken: account.token,
+      clientPublicKey: publicKey,
+    );
+    final HostAccessTicket? ticket = info.accessTicket;
+    if (ticket == null) {
+      return '';
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (ticket.expiresAtMs > 0 && ticket.expiresAtMs <= now) {
+      throw ServerApiException(tr('访问票据已过期'));
+    }
+    return ticket.ticket;
+  }
+
+  void _startTicketRenewal(String ticket) {
+    _ticketTimer?.cancel();
+    _ticketTimer = null;
+    if (ticket.isEmpty) {
+      return;
+    }
+    _ticketTimer = Timer.periodic(
+      _ticketRenewInterval,
+      (_) => unawaited(_renewAccessTicket()),
+    );
+  }
+
+  /// Refreshes the signed ticket before the host's lease ends. An explicit
+  /// refusal means the account or device authorization changed, so the
+  /// session stops at once rather than waiting for the deadline; a transient
+  /// failure leaves the existing deadline in force.
+  Future<void> _renewAccessTicket() async {
+    if (_ticketRenewBusy || !mounted || _closing) {
+      return;
+    }
+    final AccountSession? account = await _activeAccount();
+    if (account == null ||
+        !account.isActiveAt(DateTime.now()) ||
+        _ticketPublicKey.isEmpty) {
+      return;
+    }
+    _ticketRenewBusy = true;
+    try {
+      final HostInfo info = await ServerApi.lookup(
+        ServerSettings(url: account.server),
+        widget.target.hostId,
+        accountToken: account.token,
+        clientPublicKey: _ticketPublicKey,
+      );
+      final HostAccessTicket? ticket = info.accessTicket;
+      if (ticket == null) {
+        return;
+      }
+      await ViewerBridge.renewAccessTicket(ticket.ticket);
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.unauthorized ||
+          error.statusCode == HttpStatus.forbidden) {
+        _ticketTimer?.cancel();
+        _ticketTimer = null;
+        try {
+          await ViewerBridge.stop();
+        } catch (_) {
+          // The transport may already be gone; the poll reports the end.
+        }
+      }
+    } on MissingPluginException {
+      _ticketTimer?.cancel();
+      _ticketTimer = null;
+    } on PlatformException {
+      // The bridge rejected the ticket shape; the host closes at the lease.
+    } finally {
+      _ticketRenewBusy = false;
+    }
   }
 
   Future<void> _poll() async {
@@ -1055,6 +1355,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(_confirmFirstFingerprint(status.serverFingerprint));
     }
     _trackRecording(status);
+    _watchRecording(status);
     _syncPortForwardRules(status.portForwardRules);
     // Track each persistent console's service id while it is alive. An ending
     // or refusal leaves nothing to attach to, and a poll from a fresh engine
@@ -1694,6 +1995,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _toggleRecording() {
+    if (_status.recording) {
+      // Auto-record must not undo a deliberate stop in the same session.
+      _autoRecordSuppressed = true;
+    } else {
+      // A retry deserves a fresh prompt if it fails for the same reason.
+      _recordErrorSeen = '';
+    }
     unawaited(_applyRecording(!_status.recording));
   }
 
@@ -1839,24 +2147,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   void _setFit(ViewFit fit) {
     setState(() => _fit = fit);
-    _saveViewPreferences();
-  }
-
-  void _saveViewPreferences() {
-    ViewPreferences.save(
-      ViewPreferences(
-        fit: _fit == ViewFit.original ? 1 : 0,
-        stats: _statsVisible,
-        fileSort: _fileBrowserSort.index,
-        fileSortAscending: _fileBrowserSortAscending,
-        browserDirectory: _fileBrowserDirectory,
-        terminalFontSize: _terminalFontSize,
-        reverseWheel: _mouse.reverseWheel,
-        swapButtons: _mouse.swapButtons,
-        keyboardMode: _keyboardMode.name,
-      ),
-      peerId: _prefsPeerId,
-    );
+    ViewPreferences.update(peerId: _prefsPeerId, fit: fit == ViewFit.original ? 1 : 0);
   }
 
   void _toggleReverseWheel() {
@@ -1866,7 +2157,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         swapButtons: _mouse.swapButtons,
       ),
     );
-    _saveViewPreferences();
+    ViewPreferences.update(peerId: _prefsPeerId, reverseWheel: _mouse.reverseWheel);
   }
 
   void _toggleSwapButtons() {
@@ -1876,28 +2167,33 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         swapButtons: !_mouse.swapButtons,
       ),
     );
-    _saveViewPreferences();
+    ViewPreferences.update(peerId: _prefsPeerId, swapButtons: _mouse.swapButtons);
   }
 
   void _toggleStats() {
     setState(() => _statsVisible = !_statsVisible);
-    _saveViewPreferences();
+    ViewPreferences.update(peerId: _prefsPeerId, stats: _statsVisible);
   }
 
   void _rememberFileSort(FileBrowserSort sort, bool ascending) {
     _fileBrowserSort = sort;
     _fileBrowserSortAscending = ascending;
-    _saveViewPreferences();
+    ViewPreferences.update(peerId: _prefsPeerId, fileSort: sort.index, fileSortAscending: ascending);
   }
 
   void _rememberFileBrowserDirectory(String directory) {
     _fileBrowserDirectory = directory;
-    _saveViewPreferences();
+    ViewPreferences.update(peerId: _prefsPeerId, browserDirectory: directory);
+  }
+
+  void _rememberFileShowHidden(bool showHidden) {
+    _fileBrowserShowHidden = showHidden;
+    ViewPreferences.update(peerId: _prefsPeerId, browserShowHidden: showHidden);
   }
 
   void _rememberTerminalFontSize(int size) {
     _terminalFontSize = size;
-    _saveViewPreferences();
+    ViewPreferences.update(peerId: _prefsPeerId, terminalFontSize: size);
   }
 
   Future<void> _setFullscreen(bool enable) async {
@@ -4533,7 +4829,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _changeKeyboardMode(ViewerKeyboardMode mode) async {
+  Future<void> _changeKeyboardMode(ViewerKeyboardMode mode, {bool persist = true}) async {
     if (_keyboardChanging || mode == _keyboardMode) return;
     _keyboardChanging = true;
     _releaseRemoteInput();
@@ -4542,7 +4838,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       await ViewerBridge.setKeyboardMode(mode);
       if (!mounted || _closing) return;
       setState(() => _keyboardMode = mode);
-      _saveViewPreferences();
+      if (persist) ViewPreferences.update(peerId: _prefsPeerId, keyboardMode: mode.name);
     } on PlatformException catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -4593,13 +4889,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             content: Text(tr('本地输入法未启用，请重新聚焦画面或切换物理按键')),
           ));
         }
-      } else if (captured || _keyboardMode == ViewerKeyboardMode.physical) {
+      } else if (captured || _keyboardMode != ViewerKeyboardMode.local) {
         _localKeyboardUnavailable = false;
       }
     }
   }
 
   void _onKeyboardFocusChanged() {
+    if (_focus.hasPrimaryFocus && mounted && !_closing) {
+      final prefs = ViewPreferences.load(peerId: _prefsPeerId);
+      setState(() {
+        _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+        _statsVisible = prefs.stats;
+        _mouse = MouseMapping(reverseWheel: prefs.reverseWheel, swapButtons: prefs.swapButtons);
+      });
+      final mode = viewerKeyboardModeFromName(prefs.keyboardMode);
+      if (mode != _keyboardMode) unawaited(_changeKeyboardMode(mode, persist: false));
+    }
     if (!_focus.hasPrimaryFocus && _inputActive) _releaseRemoteInput();
     _setKeyCapture(_inputActive && _focus.hasPrimaryFocus);
   }
@@ -5451,6 +5757,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             _status.isLive && !_status.acceptsRecording,
                         recording: _status.recording,
                         onToggleRecording: _toggleRecording,
+                        autoRecord: _autoRecord,
+                        recordKeep: _recordKeep,
+                        onAutoRecordChanged: _setAutoRecord,
+                        onRecordKeepChanged: _setRecordKeep,
                         onTogglePin: _togglePin,
                         onToggleStats: _toggleStats,
                         onToggleFullscreen: _toggleFullscreen,
@@ -5721,7 +6031,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onDirectoryChanged: _rememberFileBrowserDirectory,
                       initialSort: _fileBrowserSort,
                       initialSortAscending: _fileBrowserSortAscending,
+                      initialShowHidden: _fileBrowserShowHidden,
                       onSortChanged: _rememberFileSort,
+                      onShowHiddenChanged: _rememberFileShowHidden,
                       onClose: _closeFileBrowser,
                     ),
                   ),
@@ -5868,7 +6180,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                                   initialSort: _fileBrowserSort,
                                   initialSortAscending:
                                       _fileBrowserSortAscending,
+                                  initialShowHidden: _fileBrowserShowHidden,
                                   onSortChanged: _rememberFileSort,
+                                  onShowHiddenChanged:
+                                      _rememberFileShowHidden,
                                   onClose: _leave,
                                 );
                               },

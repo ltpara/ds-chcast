@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 )
 
@@ -32,7 +33,7 @@ type identityListResponse struct {
 // identity, including offline peers, with a substring search and an optional
 // online filter. RustDesk's hbbs console lists the same peer-table view.
 func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+	if _, _, ok := s.consoleActor(w, r, consoleRead, account.TokenResourceDevices); !ok {
 		return
 	}
 	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))

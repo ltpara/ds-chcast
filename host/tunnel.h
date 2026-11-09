@@ -19,6 +19,15 @@
 
 namespace chast::host {
 
+// The managed-device statement carried by ready, relay and viewer events.
+// Absent means the device is unmanaged.
+struct TunnelPolicy {
+    std::string mode;
+    uint32_t permission_ceiling = 0;
+    uint32_t policy_version = 0;
+    int64_t updated_at_ms = 0;
+};
+
 struct TunnelEvent {
     std::string event;
     std::string listen;
@@ -29,12 +38,22 @@ struct TunnelEvent {
     std::string relay;
     // Set on ready when the service moved the durable identity from this id.
     std::string migrated_from;
+    bool has_policy = false;
+    TunnelPolicy policy;
 };
 
 // Reads a top-level string field from one flat JSON object. Empty when the
 // field is absent. The agent only emits addresses and identifiers, so this
-// deliberately does not implement nesting, numbers or arrays.
+// deliberately does not implement numbers or arrays.
 std::string json_string_field(const std::string& json, const std::string& name);
+
+// Reads one nested object field, returning false when the key is absent or
+// not followed by an object. Braces inside strings do not end the object.
+bool json_object_field(const std::string& json, const std::string& name, std::string& object);
+
+// Reads one non-negative integer field from a flat JSON object; -1 when the
+// field is absent or not a number.
+long long json_integer_field(const std::string& json, const std::string& name);
 
 // Parses one line from chast-tunnel stdout. False for logs, malformed lines
 // and event names this build does not know.
@@ -49,6 +68,7 @@ std::wstring tunnel_executable_for(const std::wstring& host_executable);
 std::wstring tunnel_executable();
 
 // Complete command line for host mode, with arguments quoted for CreateProcess.
+// Credentials use *-stdin flags; start() supplies their bounded pipe payload.
 std::wstring tunnel_command_line(const std::wstring& executable,
                                  const HostSettings& settings, uint16_t local_port,
                                  const std::string& fingerprint);

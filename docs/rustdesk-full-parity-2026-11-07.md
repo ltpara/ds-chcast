@@ -1,9 +1,6 @@
 # RustDesk 全功能对照：客户端、被控主机与服务端（2026-11-07）
 
-> 后续发射端深入复核见 [主机实现、效果与修复顺序](rustdesk-host-parity-2026-11-07.md)。
-> 下表保留首次审查快照；第一批主机 F01–F04 已修复，最新证据见主机报告第七节。
-> 多屏服务、QoS、按 ID 管理与编码协商仍待后续批次。
-> 当工作范围限定发射端时，以该报告的 F01–F08 和分批顺序为准；下文仍保留全产品视角。
+> **当前状态入口（2026-11-09 复核）**：本文件是协议 v49 基线的全产品审查快照。第一批主机 F01–F04 已完成；v50–v61 又关闭了多屏共享服务、全订阅者 QoS、按连接 ID 管理和编解码能力协商，并补齐单向权限、AV1 录制、大目录分页、空目录、按需文件剪贴板、进程级剪贴板监听、按设备偏好、防休眠、主机入站录制、VP9 4:4:4、远程提权和 G01 角色密钥分离。下表中 C06/C08/C11–C14/C22–C23/C27–C28/C31–C32/C37–C38/C48 等行和 G05–G08、G10、G11、G20 的“缺口”描述已不代表当前状态；**发射端功能矩阵以 [发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md) 为准，当前开发顺序以 [当前状态与计划](status-and-plan-2026-11-09.md) 为准**。本文件保留全产品视角的历史差异记录，剩余代码缺口为 G02/G03/G04、G13/G14、G18 的多共享根/压缩块、G19 的打印/角色互换/AV1 4:4:4 等；G10 Legacy 与 G11 查看端出站录制已于 2026-11-10 关闭，G12 管理权限颗粒度与自动化 API Token 主体也已落地（组范围暂只覆盖账号组与审计），G18 的分页、文件夹递归删除（v64）与隐藏项开关（v65）也已关闭。
 
 ## 结论与范围
 
@@ -43,9 +40,9 @@
 | C03 | Android / iOS | Android 可控制/被控；iOS 不能被远程控制（D01） | **缺失**：无移动端产品及宿主桥接 | `app/` 平台目录、`app/lib/main.dart` |
 | C04 | 浏览器控制端 | 有 Web；官方 V2 仍标注 Preview，自托管涉及 Pro 授权（D13） | **缺失**：Web 管理台存在，但没有浏览器远控；WS 载体不能替代浏览器客户端 | `server/internal/webadmin/`、`app/windows/viewer/` |
 | C05 | 安装、服务、自启动、更新 | 桌面安装、后台运行、更新（C） | **已具备**：安装器、主机服务、签名更新与启动回滚；不等同于所有发布包已完成签名验收 | `server/internal/setup/`、`server/internal/updater/`、`host/service.cc` |
-| C06 | 便携使用与会话中提权 | 便携启动提权、接受并提权、控制端请求提权（D12） | **部分 / 取舍**：有 `--portable`，没有会话内 Request Elevation；已安装 SYSTEM 服务不能替代临时支持场景 | `host/main.cc`、`host/platform.cc`、旧任务 DEV-27/DEV-08 |
+| C06 | 便携使用与会话中提权 | 便携启动提权、接受并提权、控制端请求提权（D12） | **已实现 / 待验**：v60 接入查看端请求、本地 UAC、父子进程校验、内存配置接管和重连；SYSTEM 便携辅助服务仍未实现，实际 UAC 与跨管理员账户待人工验收 | `host/elevation_handoff.cc`、`host/main.cc:781`、`src/net/quic.cc:3564` |
 | C07 | 企业安装包 / 定制客户端 | MSI、批量脚本、Pro 定制客户端生成（C `res/msi/`、D10/D14） | **部分**：有 Windows EXE 打包和安装参数；未找到 MSI、品牌/配置生成台、配置锁定模板 | `tools/package-windows.ps1`、`server/cmd/chast-package/` |
-| C08 | 多会话、多窗口 | 多连接与显示窗口（C） | **部分 / 有限额**：独立 Flutter engine、最多 16 个窗口；主机默认 2、上限 8 个查看者，但多个桌面会话共享首个会话的同一条画面流，不能由开窗能力推导独立选屏 | `app/lib/session_window.dart`、`include/chast/host_settings.h:61`、`src/host/host_server.cc:66` |
+| C08 | 多会话、多窗口 | 多连接与显示窗口（C） | **已实现 / 有限额**：独立 Flutter engine、最多 16 个窗口；主机默认 2、上限 8 个查看者，按显示源共享采集编码并支持每连接独立订阅/选屏；跨进程服务 worker 管理仍待验收 | `app/lib/session_window.dart`、`src/host/desktop_stream.h:18`、`src/host/host_server.cc:2388` |
 | C09 | 角色互换 Switch Sides | 双端角色交接（C `src/server/connection.rs`） | **缺失 / 取舍**：两套程序分离，缺反向可达性检查、进程交接及一次性授权 | `app/windows/viewer/`、`host/`；旧任务 DEV-14 |
 | C10 | 多语言、会话快捷操作 | 多种语言、键盘菜单、快捷操作（C/D11） | **部分**：查看器及主机中英双语，管理台主要为中文；已有常用快捷键，不能据此认定整个快捷键定制系统对齐 | `app/lib/l10n.dart:9`、`host/i18n*`、`server/internal/webadmin/assets/index.html:2` |
 
@@ -53,19 +50,19 @@
 
 | ID | 能力 | RustDesk 基线 | 本项目现状及缺口 | 本地依据 |
 | --- | --- | --- | --- | --- |
-| C11 | 多显示器、合并桌面、切屏 | 显示器选择与多屏查看（C） | **部分 / 待验**：单屏、合并采集有路径；跟随者不能独立选择或切换显示器，逐屏开窗尚不等同独立多屏；多 GPU、负坐标及高 DPI 待实测 | `src/capture/merged_capturer.cc`、`src/host/host_server.cc:2337`、`:2490` |
-| C12 | 跟随光标 / 前台窗口 | 对应会话选项（D11） | **部分**：生产会话有处理逻辑；跟随会话未消费 SetDisplayFollow 请求，可能等待超时 | `include/chast/protocol.h` 的 `DisplayFollow*`、`src/host/host_server.cc:2473`、`:5202` |
-| C13 | 远程分辨率、缩放和光标 | 分辨率、视图比例、光标缩放（C/D11） | **部分**：显示模式修改、适配/原始比例、原生光标已有；跟随会话的显示模式查询/修改返回 Busy；真机 DPI 待验 | `src/capture/display_mode.cc`、`src/host/host_server.cc:2502`、`app/windows/viewer/remote_cursor.*` |
-| C14 | 自定义画质和帧率 | 预设及自定义画质/FPS（D11） | **部分**：UI 为预设画质和默认/15/30/60 FPS；协议可到 240，缺任意数值入口；跟随者的画质修改被拒绝，所有观看者共享生产流 | `app/lib/widgets/remote_toolbar.dart:1625`、`app/lib/stream_prefs.dart:26`、`src/host/host_server.cc:2531` |
-| C15 | H.264 / HEVC / AV1 | 具备多种编解码能力（C `libs/base/protos/message.proto`） | **已具备 / 待验**：三种硬件路径和回退梯级；不能把硬件不可用时回退 H.264 当作 AV1 实机成功 | `src/codec/vpl_encoder.cc:255`、`src/codec/ffmpeg_encoder.cc`、`app/lib/viewer_bridge.dart:3148` |
-| C16 | VP8 / VP9 / 4:4:4 | VP8、VP9、I444 按端点能力使用（C `libs/scrap/src/common/codec.rs`） | **缺失 / 取舍**：当前 NV12 路径无 I444，也无 VP8/VP9 桌面编码；彩色小字的完整色度不是现有 NV12 所能表达 | `include/chast/capture.h:17`、`include/chast/encoder.h` |
-| C17 | 采集 / 编解码兼容性回退 | Windows 有 GDI 和软件编码等回退（C `src/server/video_service.rs:643`） | **部分 / 取舍**：正式桌面路径要求 GPU；DXGI/硬件不可用时无法提供同等覆盖。CLI 测量解码器可软件回退，不代表 GUI 支持 | `include/chast/capture.h:22`、`include/chast/decoder.h:7`、`src/codec/ffmpeg_decoder.cc:144` |
+| C11 | 多显示器、合并桌面、切屏 | 显示器选择与多屏查看（C） | **已实现 / 待验**：按显示源共享采集编码，连接可独立选屏/切屏，同屏复用；多 GPU、负坐标、旋转、高 DPI 与热插拔待实测 | `src/host/desktop_stream.h:18`、`src/host/desktop_stream.cc:1105`、`src/capture/merged_capturer.cc` |
+| C12 | 跟随光标 / 前台窗口 | 对应会话选项（D11） | **已实现 / 待验**：显示跟随请求由订阅处理并返回结果，逐屏光标与窗口焦点独立；真机多屏坐标映射待验 | `include/chast/protocol.h` 的 `DisplayFollow*`、`src/host/desktop_stream.cc` |
+| C13 | 远程分辨率、缩放和光标 | 分辨率、视图比例、光标缩放（C/D11） | **部分**：显示模式修改、适配/原始比例、原生光标已有；显示模式修改仍属主机级动作，真机 DPI 待验 | `src/capture/display_mode.cc`、`app/windows/viewer/remote_cursor.*` |
+| C14 | 自定义画质和帧率 | 预设及自定义画质/FPS（D11） | **部分**：UI 为预设画质和默认/15/30/60 FPS；协议可到 240，缺任意数值入口；各订阅连接参与全局 QoS，共享编码取交集与多数票 | `app/lib/widgets/remote_toolbar.dart:1625`、`app/lib/stream_prefs.dart:26`、`src/host/video_qos.h:14` |
+| C15 | H.264 / HEVC / AV1 | 具备多种编解码能力（C `libs/base/protos/message.proto`） | **已具备 / 待验**：三种硬件路径、VP9、OpenH264 软件回退和解码能力交集协商；不能把硬件不可用时回退当作 AV1 实机成功 | `src/codec/vpl_encoder.cc:255`、`src/codec/ffmpeg_encoder.cc`、`src/host/desktop_stream.cc:1105` |
+| C16 | VP8 / VP9 / 4:4:4 | VP8、VP9、I444 按端点能力使用（C `libs/scrap/src/common/codec.rs`） | **部分完成**：v61 已提供 VP9 profile 1（I444）与全局色度协商；仍无 VP8，AV1 4:4:4 缺失 | `src/codec/vp9_encoder.cc`、`include/chast/protocol.h:1041`、`:1496` |
+| C17 | 采集 / 编解码兼容性回退 | Windows 有 GDI 和软件编码等回退（C `src/server/video_service.rs:643`） | **已具备（方向一致）**：DXGI 失败切 GDI 上传路径，硬件编码连续失败回退 OpenH264；GDI 不是零拷贝路径，只作可用性兜底，驱动复位/RDP 进出仍待真机复验 | `src/capture/dxgi_capturer.cc:253`、`src/capture/detail.h:285`、`docs/software-encoder-2026-11-08.md` |
 | C18 | HDR 桌面处理 | 平台相关采集/色彩处理（C） | **已有有限实现**：FP16 采集后归一到 BGRA8/NV12；不宣称 HDR10 端到端或与所有显示器等效 | `include/chast/capture.h:106`、`src/capture/hdr_pass.cc` |
 | C19 | 隐私模式 / 阻止本地输入 | 隐私实现及输入控制（C） | **已具备 / 待验**：遮罩和虚拟屏方案、阻止输入、撤权/断线恢复；驱动拓扑仍待实机 | `src/win/privacy.cc`、`src/host/display_privacy.cc`、`tests/block_input_test.cc` |
 | C20 | 虚拟显示器 / 无头使用 | Windows 虚拟显示相关能力（C） | **部分 / 待验**：usbmmidd 集成、安装预检、显示守卫已做；不是“完全没有”。泛化 `vdd` provider 仍返回未实现，驱动包/许可/真机验收是边界 | `src/host/virtual_display.cc`、`src/host/host_server.cc:3699`、`tools/fetch-usbmmidd.ps1` |
 | C21 | 默认物理键、组合键、锁定键 | 支持的对端默认 Map；有原生键盘捕获（C `src/client.rs:3725`） | **已具备**：低级钩子、HID、AltGr 过滤、按键释放和锁定键同步；此前按默认模式对齐的方向正确 | `app/windows/viewer/keyboard_capture.cc`、`src/win/input.cc`、`tests/keyboard_test.cc` |
-| C22 | Legacy / Translate 模式 | 桌面菜单提供 Map、Legacy、Translate；Translate 标注 beta（C `flutter/lib/desktop/widgets/remote_toolbar.dart:2615`） | **缺失**：无模式切换与字符转换路径；跨布局直接输入体验不完全一致。Auto 仅协议/内部出现，不单列产品缺口 | `app/windows/viewer/keyboard_capture.cc:41`、`include/chast/protocol.h` 的 `KeyEvent` |
-| C23 | 中文 / IME / 发送文本 | 依模式和平台处理字符输入（C） | **部分**：有 Unicode“发送文本”对话框；这不是本地 IME 组合输入自动进入远程画面的 Translate 体验 | `app/lib/widgets/send_text_dialog.dart:10`、`src/win/input.cc` |
+| C22 | Legacy / Translate 模式 | 桌面菜单提供 Map、Legacy、Translate；Translate 标注 beta（C `flutter/lib/desktop/widgets/remote_toolbar.dart:2615`） | **已实现 / 待实测**：Map（默认）、本地输入法/Translate 方向（Unicode 提交）与 v63 Legacy（发送 Windows 虚拟键码，主机注入同名按键，由主机布局和输入法解释）均已接入；非 US 布局/AltGr/死键/其他 IME/安全桌面待验 | `app/windows/viewer/keyboard_capture.cc`、`src/win/input.cc`、`docs/local-keyboard-ime-2026-11-09.md`、`docs/keyboard-legacy-mode-2026-11-10.md` |
+| C23 | 中文 / IME / 发送文本 | 依模式和平台处理字符输入（C） | **已实现 / 待验**：本地 IME 组合输入经 TextInput 发送 Unicode，保留手动“发送文本”入口；微软拼音与双 Flutter 窗口/QUIC 已验证，其他输入法与双机目标应用待验 | `docs/local-keyboard-ime-2026-11-09.md`、`src/win/input.cc` |
 | C24 | 鼠标、相对模式、触摸/笔、触控板 | 相应输入能力，平台有差异（C） | **已具备 / 待验**：相对鼠标、左右键互换、滚轮反向、多触点、压感、Pan/Zoom；实际触控板、笔和双机布局仍待验 | `app/lib/remote_pointer.dart`、`src/win/input.cc`、协议 v43/v48 |
 | C25 | 每设备会话偏好 | `PeerConfig::load(id)` 保存对端设置（C `src/client.rs:3043`） | **已具备**：`ui.json` 根键保留全局默认，新增 `peers.<id>` 覆盖画质/编码/FPS/全色、适配/统计/滚轮/左右键/键盘模式；设备键为服务器 host ID 或直连地址，独立显示窗口同样按该键加载。文件浏览器排序/目录与终端字号仍为全局，属本地面板状态 | `app/lib/prefs_store.dart:36`、`app/lib/stream_prefs.dart:45`、`app/lib/view_prefs.dart:66`、`app/lib/pages/session_page.dart:336` |
 
@@ -75,32 +72,32 @@
 | --- | --- | --- | --- | --- |
 | C26 | 文本、HTML、RTF、图片剪贴板 | 多格式同步（C `src/clipboard.rs`） | **已具备**：异步读写、失败重试、基线、撤权取消已修复；系统原生调用的取消边界仍存在 | `src/clipboard/clipboard_worker.cc`、`docs/clipboard-async-fix-2026-11-07.md` |
 | C27 | 共享事件驱动剪贴板 | 全局监听器、多订阅者（C `src/clipboard.rs:889`） | **已具备 / 待验**：进程级单监听（消息窗口 + `AddClipboardFormatListener`、原子代次、订阅者按 id 注册，首订阅启动/末退订停止）；原生后端由 `WM_CLIPBOARDUPDATE` 代次驱动并保留 5 s 兜底，合成后端或监听不可用时仍 500 ms 轮询；多窗口/多主机复制的人工复核待做 | `include/chast/clipboard_listener.h`、`src/clipboard/clipboard_listener.cc`、`app/windows/viewer/viewer_engine.cc`、`src/host/host_server.cc`、`tests/clipboard_listener_test.cc` |
-| C28 | 文件复制粘贴 | Windows cliprdr 提供延迟请求文件内容（C `libs/clipboard/src/windows/wf_cliprdr.c`） | **部分**：收到列表就启动暂存下载，完成后写本地 CF_HDROP；最多 256 文件，FileList 只表示普通文件，不能保留纯空目录 | `include/chast/clipboard.h:45`、`src/clipboard/clipboard.cc:495`、`app/windows/viewer/viewer_engine.cc:3349` |
-| C29 | 单向剪贴板 / 单向文件 | 有阻止被控端→控制端的独立策略（D11） | **缺失**：Clipboard/FileTransfer 各只有总权限位，无法做到“可上传但不可下载”或“只允许向主机粘贴” | `include/chast/protocol.h:1016`、`include/chast/host_settings.h:70` |
+| C28 | 文件复制粘贴 | Windows cliprdr 提供延迟请求文件内容（C `libs/clipboard/src/windows/wf_cliprdr.c`） | **已实现 / 待验收**：v59 虚拟文件描述 + `IStream` 按需范围读取，v58 保留空目录，复制不再立即全量搬运；Explorer/Office 人工操作、其他虚拟文件来源和跨网吞吐待验 | `include/chast/clipboard.h`、`src/clipboard/file_transfer.cc`、`include/chast/protocol.h:435` |
+| C29 | 单向剪贴板 / 单向文件 | 有阻止被控端→控制端的独立策略（D11） | **已实现**（v57）：本地双向/单向/禁止策略覆盖文本、图片和文件剪贴板，禁止发送的一端停止本地读取；文件剪贴板权限独立于普通文件传输 | `src/host/host_server.cc`、`include/chast/protocol.h:1265`、`docs/clipboard-direction-2026-11-09.md` |
 | C30 | 初始剪贴板同步选择 | 可选择连接时同步控制端已有内容（D11 `sync-init-clipboard`） | **缺失选项 / 取舍**：当前首次有效快照只建基线，默认保护历史内容；可增加明确的单次或持久化选择 | `docs/clipboard-async-fix-2026-11-07.md` |
-| C31 | 完整远程文件系统浏览 | Windows 盘符枚举、目录浏览、隐藏文件选项（C `libs/base/src/fs.rs:53`） | **部分 / 取舍**：只能访问主机接收/共享根目录；没有盘符选择。不能简单移除路径校验，应增加明确授权的根目录集合 | `include/chast/protocol.h:705`、`src/clipboard/file_transfer.cc` |
-| C32 | 大目录浏览 | RustDesk 目录模型返回条目列表（C `libs/base/src/fs.rs`） | **明确缺口**：单目录超过 1024 项被截断，无分页游标和下一页请求；UI 提示截断无法取回其余项 | `include/chast/protocol.h:715`、`src/clipboard/file_transfer.cc:775`、`app/lib/widgets/file_browser_panel.dart:113` |
+| C31 | 完整远程文件系统浏览 | Windows 盘符枚举、目录浏览、隐藏文件选项（C `libs/base/src/fs.rs:53`） | **部分 / 取舍**：隐藏文件选项已由 v65 补齐（默认隐藏、按设备持久化、递归下载沿用视图）；仍只能访问主机接收/共享根目录，没有盘符选择。不能简单移除路径校验，应增加明确授权的根目录集合 | `include/chast/protocol.h:802`、`src/clipboard/file_transfer.cc`、`docs/hidden-files-2026-11-10.md` |
+| C32 | 大目录浏览 | RustDesk 目录模型返回条目列表（C `libs/base/src/fs.rs`） | **已实现**（v56）：游标分页、“加载更多”和同页重试，递归下载自动读取后续页；万条目录可分页访问 | `include/chast/protocol.h:267`、`:775`、`docs/file-pagination-2026-11-09.md` |
 | C33 | 上传下载、文件夹、批量、取消、断点续传 | 常规文件管理工作流（C） | **已具备 / 有限额**：已有目录队列、批量选择、续传/取消；单文件协议上限 16 GiB，主机可设更小限制 | `include/chast/protocol.h:637`、`app/lib/widgets/file_browser_panel.dart`、`src/clipboard/file_transfer.cc` |
-| C34 | 递归删除、文件压缩传输 | `FileRemoveDir`/递归文件读取、压缩块（C `libs/base/protos/message.proto:409`、`libs/base/src/fs.rs:1106`） | **部分**：创建/重命名/删除已做，但删除限文件或空目录；CFIL 无压缩标记及处理链路 | `include/chast/protocol.h:750`、`include/chast/file_transfer.h` |
+| C34 | 递归删除、文件压缩传输 | `FileRemoveDir`/递归文件读取、压缩块（C `libs/base/protos/message.proto:409`、`libs/base/src/fs.rs:1106`） | **部分（递归删除已完成 2026-11-10）**：v64 `FileOperation::RemoveTree` 预检整棵树，拒绝 reparse point/只读条目后自底向上删除；观看端文件夹删除与批量删除已接入确认和递归操作。真实 QUIC 回环覆盖父/子文件夹创建、重命名和递归删除。CFIL 仍无压缩标记及处理链路 | `include/chast/protocol.h`、`src/clipboard/file_transfer.cc`、`docs/recursive-remove-2026-11-10.md` |
 | C35 | 文件拖入和资源管理器衔接 | 桌面文件交互（C） | **已有部分**：WM_DROPFILES、本地上传选择、完成后打开/定位；不宣称等价于全部 OLE 双向拖放 | `app/windows/viewer/viewer_bridge.cc:2672`、`app/lib/widgets/file_browser_panel.dart` |
 | C36 | 手动录制、分段、归档 | 支持会话录制及多种码流（C） | **已具备**：H.264/HEVC 原码流 MP4、尺寸/编码切换分段、可选账号上传；上传和录制是两项独立能力 | `tools/mp4_recorder.h`、`app/lib/pages/session_page.dart:503`、`server/internal/api/recordings.go` |
-| C37 | AV1 录制 | AV1→WebM 录制路径（C `libs/scrap/src/common/record.rs:168`） | **缺失，且与已有选项冲突**：可选 AV1，但录制器拒绝该 codec；录制中切到 AV1 也不能继续按既有方式录制 | `tools/mp4_recorder.h:52`、`app/lib/widgets/remote_toolbar.dart:1667` |
-| C38 | 主机自动录制 / 查看器自动录制 | 入站自动录制、出站自动录制、隐藏停止按钮选项（C、D11） | **缺失**：仅查看器手动录制与自动上传，主机无录制器；不能依赖查看器点击保证每次会话留档 | `include/chast/host_settings.h:100`、`app/lib/server_settings.dart:183`、`tools/mp4_recorder.h` |
+| C37 | AV1 录制 | AV1→WebM 录制路径（C `libs/scrap/src/common/record.rs:168`） | **已实现**（G06）：录制器支持 AV1/VP9 合法封装，编码切换分段；`mp4_recorder_test` 与入站录制接线已覆盖 | `src/host/stream_recorder.h:20`、`tests/mp4_recorder_test.cc` |
+| C38 | 主机自动录制 / 查看器自动录制 | 入站自动录制、出站自动录制、隐藏停止按钮选项（C、D11） | **已完成主体**：入站 `record_incoming` 默认关闭，共享压缩数据异步写 MP4，同源多人只录一份；查看器出站自动录制默认关闭（对照 `allow-auto-record-outgoing`），含 512/64 MiB 容量守卫、失败提示和可选保留策略（默认保留全部）。`hide-recording-button` 是 RustDesk 受管客户端设置，归受管策略（G04）而非录制链路 | `include/chast/host_settings.h:108`、`src/host/host_server.cc:2402`、`docs/host-recording-2026-11-09.md`、`docs/viewer-auto-record-2026-11-10.md` |
 
 ### 主机控制、协作与专用会话
 
 | ID | 能力 | RustDesk 基线 | 本项目现状及缺口 | 本地依据 |
 | --- | --- | --- | --- | --- |
-| C39 | 系统声音、麦克风、语音通话 | 音频传输及通话协商（C） | **部分 / 待验**：Opus、QUIC DATAGRAM、AEC、呼叫状态已有；系统音频广播受生产会话的音频权限和发送成功与否影响；双机听感和热插拔未验 | `src/audio/`、`src/host/host_server.cc:3351`、`:3391`；主机报告 F04 |
+| C39 | 系统声音、麦克风、语音通话 | 音频传输及通话协商（C） | **已实现 / 待验**：注册表级 `SharedLoopback` 按连接订阅/权限/发送，发布者静音或拥塞不影响其他有权限者；Opus、QUIC DATAGRAM、AEC、呼叫状态已有；双机听感、热插拔和多人争用未验 | `src/host/host_server.cc:2689`、`src/audio/`、`docs/shared-video-qos-rustdesk-2026-11-08.md` |
 | C40 | 聊天与截图 | 客户端会话功能（C） | **已具备**：聊天 UI/协议、截图路径及权限 | `app/lib/widgets/chat_panel.dart`、`src/win/png_writer.cc`、`include/chast/protocol.h` |
 | C41 | 远程终端、持久终端 | 终端服务、重连、输出回放（C） | **已具备 / 有限额**：两标签，100 个持久服务、1 小时空闲回收、1 MiB 回放；持久化默认关闭 | `include/chast/protocol.h:1564`、`src/host/terminal_relay.cc`、`app/lib/widgets/terminal_tabs.dart` |
 | C42 | TCP 隧道 / RDP 入口 | TCP tunneling 与 RDP（C） | **已具备**：最多 8 规则及目标白名单、mstsc 启动；这不是通用 VPN/UDP 转发，也不把后者计为 RustDesk 缺口 | `include/chast/protocol.h:1483`、`src/net/port_forward_client.cc`、`app/lib/rdp.dart` |
 | C43 | 摄像头及独立会话类型 | 桌面、文件、终端、摄像头、隧道（C） | **已具备 / 待验**：独立模式无需桌面流；摄像头完整媒体链路仍需真实设备 | `include/chast/protocol.h:1061`、`src/host/camera_relay.cc`、`app/lib/widgets/camera_panel.dart` |
-| C44 | 重启、锁屏、Ctrl+Alt+Del、断开后锁定 | 主机操作（C） | **部分**：生产会话有授权和结果，跟随者的 HostAction 被拒绝；SAS 有单独处理，断开后锁定按最后观看者退出执行 | `src/win/sas.cc`、`src/host/host_server.cc:2572`、`:2578`、`:2202` |
+| C44 | 重启、锁屏、Ctrl+Alt+Del、断开后锁定 | 主机操作（C） | **已实现 / 待验**：桌面连接和跟随会话都消费主机动作请求并返回权限/结果；SAS 单独处理，断开后锁定按最后观看者退出执行；真实安全桌面动作待受控验收 | `src/win/sas.cc`、`src/host/host_server.cc:2202` |
 | C45 | OS 登录 / 自动登录 | 登录相关字段及自动登录逻辑（C `src/client.rs:3031`、`:4450`） | **部分**：用户手动提供密码，在登录/锁屏界面输入；没有完整账号选择、保存凭据和自动登录策略。不能把它整体标成自动登录完成 | `app/lib/pages/session_page.dart:2005`、`include/chast/protocol.h:1823` |
-| C46 | Windows 会话选择 | WTS/RDP 会话选择（C） | **部分 / 待验**：服务模式生产会话可列出/切换；跟随者未消费列表/选择请求；需要多会话环境验证 | `host/service.cc`、`src/host/host_server.cc:5365`、`:8539`；主机报告 F02 |
+| C46 | Windows 会话选择 | WTS/RDP 会话选择（C） | **已实现 / 待验**：RDP-only 主机和登录代次防 ID 复用已支持，切换请求绑定来源工作进程和目标登录；真实多用户切换仍需受控验收 | `host/service.cc`、`src/host/host_server.cc:331`、`docs/windows-session-selection-2026-11-09.md` |
 | C47 | 远程打印 | 打印服务和驱动适配（C `src/server/printer_service.rs`） | **缺失 / 平台前置**：无打印协议/客户端/主机链路，仍需驱动分发及签名方案 | 旧任务 PLAT-02；当前协议和主机模块清单 |
-| C48 | 活跃会话防休眠 | 入站/出站保持唤醒选项（D11） | **未找到实现**：代码未见相应设置或 Windows 电源请求；长时间观看且无输入时需确认睡眠策略影响 | 全树检索 `SetThreadExecutionState`、`PowerSetRequest`、`keep_awake`；`HostSettings`/查看器设置 |
+| C48 | 活跃会话防休眠 | 入站/出站保持唤醒选项（D11） | **已实现 / 待验**：默认开启本地 `keep_awake`，桌面连接请求系统+显示器、文件/终端只请求系统，按连接释放，待审批不持有；真实电源策略与长时间会话待验 | `include/chast/host_settings.h:191`、`src/win/power_request.cc:35`、`docs/session-power-2026-11-09.md` |
 
 ## 二、连接服务和企业管理矩阵
 
@@ -121,8 +118,8 @@
 | S13 | 用户/用户组→设备连接 ACL | Pro Access Control（D03） | **缺失**：账号组仅约束后台操作/审计；lookup/punch 未按登录账号和设备组判定。移出组/封禁账号不是桌面连接资格撤销 | `server/internal/account/groups.go:13`、`server/internal/api/groups.go:114`、`server/internal/rendezvous/rendezvous.go:69` |
 | S14 | 用户级会话操作角色 | Pro Control Role，区别于连接 ACL（D04） | **缺失**：主机本地权限和审批存在，但 Hello 无账号角色凭证；不能集中规定“甲可看、乙可传文件、丙可开终端” | `include/chast/protocol.h:1335`、`src/host/host_security.cc` |
 | S15 | 批量配置策略 / 下发 | Pro Strategy（D05） | **缺失**：会话内远程改 14 项开关已做，但没有设备/用户/组策略对象、版本、分配、状态及批量同步 | `include/chast/protocol.h:2103`、`server/internal/configpush/configpush.go:22` |
-| S16 | 细粒度后台角色 | Pro Admin Role，可按资源动作和范围授权（D06） | **部分**：readonly/operator/admin + 组范围；没有任意资源/动作权限组合及独立角色分配 | `server/internal/api/console.go:9`、`server/internal/account/groups.go:78` |
-| S17 | 自动化 API Token / 委派 | Pro 可选 Device/Audit/User/Group 等权限的 Token（D10） | **缺失**：现有 server-key 或账号会话令牌，没有独立可撤销、可定 scope 的机器令牌管理 | `server/internal/api/api.go`、`server/internal/api/console.go`、`server/internal/account/store.go` |
+| S16 | 细粒度后台角色 | Pro Admin Role，可按资源动作和范围授权（D06） | **已完成主体（G12，2026-11-10）**：readonly/operator/admin 动作阶梯 × devices/audit/accounts/groups/recordings/ops 资源集合，账号组范围叠加；没有自定义命名角色对象，组范围暂只覆盖账号组与组审计。见 [管理权限与 API Token](admin-api-tokens-2026-11-10.md) | `server/internal/api/console.go:59`、`server/internal/api/groups.go:116`、`server/internal/account/groups.go` |
+| S17 | 自动化 API Token / 委派 | Pro 可选 Device/Audit/User/Group 等权限的 Token（D10） | **已实现（G12，2026-11-10）**：独立 `chast_api_` 机器令牌，资源集合、组范围（组/审计）、1 分钟–365 天、每用户 20 个、即时撤销、owner 降级收窄、封禁拒绝、最近使用与创建/撤销审计。边界：无 webadmin 管理界面，设备/录制尚不支持组范围。见 [管理权限与 API Token](admin-api-tokens-2026-11-10.md) | `server/internal/account/api_tokens.go`、`server/internal/api/api_tokens.go`、`server/internal/api/api.go:338` |
 | S18 | 设备管理、别名、标签、离线资产 | Pro 控制台（D10） | **部分**：清单、搜索、分页、元数据、别名标签、重置已有；集中禁用设备和所有者连接授权随 S13 补齐 | `server/internal/api/identities.go`、`server/internal/registry/registry.go:49` |
 | S19 | 地址簿同步、分组、共享 | Pro（D08） | **已具备核心**：OCC、离线意图、嵌套组、逐账号共享/组范围；不要与账号组的连接权限混淆 | `server/internal/account/store.go`、`app/lib/address_book_sync.dart`、`app/lib/pages/shared_books_dialog.dart` |
 | S20 | 地址簿共享密码 / 云端凭据 | Pro 个人密码同步、条目/簿级共享密码（D08） | **缺失 / 取舍**：密码留在本机 DPAPI，服务器 Peer 无密码字段；换设备/共享给同事后不能获得相同免输入体验 | `server/internal/account/store.go:183`、`app/lib/viewer_bridge.dart:1880` |
@@ -141,25 +138,25 @@
 | 编号 | 优先级 | 问题与影响 | 建议的完成标准 |
 | --- | --- | --- | --- |
 | G01 | **P0（配置私服并向普通用户发连接密钥时）** | **连接密钥可同时管理服务器**：S12 的 server-key 被 lookup、punch 和后台共用，违背普通使用者与管理员分离。**2026-11-09 已实现角色密钥分离**（见下文状态） | 普通账号/短期设备连接凭证可 lookup/punch；注册凭据、连接凭据、管理凭据独立；普通查看器凭据对建号、重置身份、审计/录制越权操作返回拒绝。覆盖 HTTP、UDP、TCP/WS 与续期 |
-| G02 | **P1，企业准入前必做** | **连接 ACL 未落到连接链路**：S13 的组管理不能限制谁连谁，账号封禁也不是主机本地密码失效 | 账号/组→设备策略，禁用设备/账号、移组、过期票据均可拒绝；直连和经服务器两条路径明确受管/非受管策略，不允许回退绕过 |
-| G03 | P1 | **账号级会话权限角色缺失**：S14 只有主机本地授权 | 服务端签名、绑定用户/主机/有效期的权限凭证；主机独立验证并按明确规则与本地同意合成；覆盖所有敏感操作和撤权。不需要让中继解密桌面数据 |
+| G02 | **P1，企业准入前必做** | **连接 ACL 未落到连接链路**：S13 的组管理不能限制谁连谁，账号封禁也不是主机本地密码失效。服务端 v10 设备策略、签名回执、lookup 准入和账号换 60 秒票据端点已落地，管理台设备策略页按版本匹配显示回执，注册响应已下发策略且 Go 代理已解析并经 `HostInfo`/`chast-tunnel` 事件上报、落盘共享 `<stem>.policy.json`，C++ 对受管设备的新会话失败关闭，并已形成签名回执闭环（主机确认文件 + agent 设备密钥异步上报），C++ 票据校验库已通过冻结黄金向量与错误输入测试，并接入 `HostSecurity`：主机设置固定 issuer/kid/公钥与设备 ID 后，受管设备只接受验签通过、版本匹配且未重放的票据，权限取票据 ∩ 上限 ∩ 本机默认 ∩ 请求；v62 已让客户端在 Hello 携带票据、lookup 返回票据并支持 20 秒续租与运行中撤权；受管主机缺票据失败关闭，直连同样经 HostSecurity 守门；撤销推送和完整真实链路验收仍待完成，因此连接 ACL 的端到端结论仍需按 G02 验收矩阵执行 | 独立服务端签发、主机仅持公钥；账号/组→设备策略；最小受管同步/落盘/确认前置到 G02，所有入口共同守门。新 lookup、旧票据和存量会话均验证撤销，最长 65 秒；独立短期传输凭证，不允许回退绕过。见 [修订设计](access-control-design-2026-11-09.md) |
+| G03 | P1 | **账号级会话权限角色缺失**：S14 只有主机本地授权 | 沿用 G02 签发/租约；票据上限 ∩ 设备策略 ∩ 本地策略 ∩ 用户同意，覆盖所有敏感入口及正在运行操作的撤销；最多 65 秒失效。不需要让中继解密桌面数据 |
 | G04 | P1 | **集中策略缺失**：S15 的“配置下发”目前仅会合地址列表；会话内改单机设置不能代替设备管理 | 策略对象、分配范围、优先级、版本、同步确认和失败可见；用户设置与策略的冲突行为有明确定义。RustDesk Strategy 本身也不等于所有值永久强制锁定 |
-| G05 | P1 | **缺单向剪贴板/文件权限**（C29） | 分离每个方向；主机在普通下载、剪贴板文件、上传、暂停恢复等所有入口执行，不能仅禁用 UI |
-| G06 | P1 | **AV1 与录制不可组合**（C37） | 增加 AV1 合法封装，或先提供明确的编码协商/选项互斥；覆盖开始录制、录制中切 AV1、回切及分段文件可读验证，不改变零拷贝采集 |
-| G07 | P1 | **大目录条目不可达**（C32） | 加分页/游标或流式列举；10,000 项目录能逐页访问且递归下载完整；测试目录在分页期间变化的行为 |
-| G08 | P1 | **文件剪贴板体验不等价**（C28） | 先保留空目录、展示数量/大小限制；若追求 RustDesk 体验，再实现按粘贴/读取请求传内容，避免仅复制即全量下载；覆盖取消、断线、覆盖源文件 |
+| G05 | P1 | **缺单向剪贴板/文件权限**（C29）**2026-11-09 已实现**（v57） | 分离每个方向；主机在普通下载、剪贴板文件、上传、暂停恢复等所有入口执行，不能仅禁用 UI。验证：方向专项、完整会话回归、实际观看端双向文件收发 |
+| G06 | P1 | **AV1 与录制不可组合**（C37）**2026-11-09 已实现** | 增加 AV1 合法封装，或先提供明确的编码协商/选项互斥；覆盖开始录制、录制中切 AV1、回切及分段文件可读验证，不改变零拷贝采集。验证：`mp4_recorder_test` 与主机入站录制接线 |
+| G07 | P1 | **大目录条目不可达**（C32）**2026-11-09 已实现**（v56 分页） | 加分页/游标或流式列举；10,000 项目录能逐页访问且递归下载完整；测试目录在分页期间变化的行为。验证：真实 QUIC 两页 1030 项、1025 空目录 + 4 文件完整落盘 |
+| G08 | P1 | **文件剪贴板体验不等价**（C28）**2026-11-09 已实现**（v58/v59） | 先保留空目录、展示数量/大小限制；若追求 RustDesk 体验，再实现按粘贴/读取请求传内容，避免仅复制即全量下载；覆盖取消、断线、覆盖源文件。验证：空目录四种场景、虚拟文件 `IStream` 按需读取；Explorer 人工操作仍待验收 |
 | G09 | P1 | **剪贴板仍按会话轮询**（C27；进程级监听已补齐） | 已实现进程级系统变更通知与订阅者管理：原生后端事件驱动、5 s 兜底，合成后端保持 500 ms；既有异步读写与基线规则不变。剩余：多窗口/多主机复制的真实 GUI 复核，不回环、不串会话、不额外阻塞线程 |
-| G10 | P1 | **键盘缺 Translate / Legacy 选择**（C22/C23） | Map 保持默认；补 Translate 并验证非 US 布局、AltGr、死键、Unicode/IME 与快捷键混合。Legacy 是否需要可随目标旧系统决定；不能把 Auto 枚举当作额外菜单承诺 |
-| G11 | P1 | **自动录制链路缺失**（C38） | 分别实现入站主机/出站查看器自动录制、存储容量/失败提示/保留策略；如要求集中留档，应由受管主机负责并报告失败，不能只看可选上传 |
-| G12 | P1 | **多人管理权限颗粒度和自动化凭据不足**（S16/S17） | 资源/动作 scope、组范围、独立机器令牌的创建/到期/撤销/审计；控制台委派与普通连接权限分开 |
+| G10 | P1 | **键盘缺 Translate / Legacy 选择**（C22/C23）**2026-11-10 已实现（v63）** | Map 保持默认，本地输入法/Translate 方向已实现（主/子窗口模式切换、Unicode 发送、顺序/取消/回环过滤）；Legacy 模式经 `InputKind::LegacyKey` 发送虚拟键码，主机按 VK 注入并同步修饰键/锁定键。剩余：非 US 布局、AltGr、死键、其他 IME、安全桌面输入实测 |
+| G11 | P1 | **已完成（2026-11-10）** | 入站 `record_incoming` 默认关闭，共享压缩数据异步写 MP4，H.264/HEVC/AV1/VP9、分段与积压关键帧恢复；查看端出站自动录制默认关闭，含容量守卫、失败提示与可选保留策略；集中留档由受管主机负责并报告失败。真实会话与磁盘满场景待人工验证，见 [查看端自动录制](viewer-auto-record-2026-11-10.md) |
+| G12 | P1 | **已完成主体（2026-11-10）** | 资源/动作 scope、组范围（账号组与组审计）、独立机器令牌的创建/到期/撤销/最近使用/审计已实现；控制台委派与普通连接权限保持分离。剩余：设备/录制的组范围过滤、webadmin 令牌管理界面、真实部署与 Postgres 验收。见 [管理权限与 API Token](admin-api-tokens-2026-11-10.md) |
 | G13 | P2（跨地区部署可升 P1） | **无就近中继**（S06） | 在现有健康/黏性基础上按区域或两端实测延迟选择；节点失效回退；用真实多地区网络验收收益 |
 | G14 | P2（AD 用户可升 P1） | **LDAP 认证缺失**（S11） | LDAP/LDAPS 连接测试、过滤、登录、首次建号、账号停用语义；不把 RustDesk 文档也未支持的 LDAP 组同步当作必须对齐项 |
 | G15 | P2 | **固定画质选项和显示器窗口布局**（C14/C25；按设备偏好已补齐） | 已按设备身份存储偏好并保留全局默认；剩余：自定义 FPS/质量数值入口及显示器窗口布局恢复 |
 | G16 | P2 | **地址簿高级协作不全**（S20/S21） | 先补备注、回收站和组织组共享；云端密码同步另做密钥/撤销设计，不直接上传现有 DPAPI 密文或明文 |
 | G17 | P2 | **临时支持流程不全**（C06/C09/C45） | 分别设计便携提权、角色交接、OS 登录便利功能；要求本地同意、内存凭据传递和可恢复的交接，不沿用“不装服务就绝对做不到”的假设 |
-| G18 | P2 | **完整文件管理范围和操作**（C31/C34） | 可授权多个共享根/盘符、隐藏文件选项、递归删除确认、可协商压缩；保留根目录和重解析点防护 |
-| G19 | P2 | **平台和兼容性覆盖**（C02–04/C16–17/C47） | 分开评估 Web、Linux 查看器、移动端、其他主机平台、打印、4:4:4及软件回退；均为独立项目，不能靠 Flutter 或 WS 标签认定完成 |
-| G20 | P2 | **防休眠和界面入口一致性**（C10/C48/S24） | 明确入站/出站保持唤醒，退出恢复电源请求；管理台登录接已有认证后端，语言与错误状态一致 |
+| G18 | P2 | **完整文件管理范围和操作**（C31/C34）**分页已完成（v56），递归删除已完成（v64），隐藏项已完成（v65）** | v64 `RemoveTree` 先预检 reparse point/只读条目再自底向上删除，真实 QUIC 回环通过；v65 `FileListRequest` 增加 flags 字节，主机分页前过滤 `FILE_ATTRIBUTE_HIDDEN`，观看端开关按设备持久化、递归下载沿用视图。分页、续传和递归下载已完成。仍待开发：可授权多个共享根/盘符、可协商压缩；继续保留根目录和重解析点防护。见 [文件夹递归删除](recursive-remove-2026-11-10.md)、[隐藏文件浏览选项](hidden-files-2026-11-10.md) |
+| G19 | P2 | **平台和兼容性覆盖**（C02–04/C16–17/C47）**VP9 4:4:4 已完成（v61）** | 分开评估 Web、Linux 查看器、移动端、其他主机平台、打印、4:4:4及软件回退；均为独立项目。VP9 I444 已实现，AV1 4:4:4、远程打印和 Switch Sides 仍缺 |
+| G20 | P2 | **防休眠和界面入口一致性**（C10/C48/S24）**防休眠已完成（2026-11-09）** | 明确入站/出站保持唤醒，退出恢复电源请求；管理台登录接已有认证后端，语言与错误状态一致。已实现默认开启的 `keep_awake`，桌面请求系统+显示器、文件/终端只请求系统，按连接释放，待审批不持有；管理台入口一致性仍按各自模块验收 |
 
 ### G01 的代码证据与风险边界
 

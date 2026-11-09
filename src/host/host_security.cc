@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <string_view>
 
+#include "chast/host_settings.h"
 #include "chast/identity.h"
 
 namespace chast {
@@ -194,6 +195,38 @@ void HostSecurity::set_config(Config config) {
     }
 
     config_ = std::move(config);
+    tickets_.reset();
+    const bool primary_complete =
+        !config_.access_kid.empty() && !config_.access_public_key.empty();
+    const bool primary_partial =
+        config_.access_kid.empty() != config_.access_public_key.empty();
+    if (!config_.access_issuer.empty() &&
+        (!config_.access_kid.empty() || !config_.access_public_key.empty() ||
+         !config_.access_keys.empty())) {
+        // A partial primary pin is a configuration error; leaving the verifier
+        // unbuilt keeps managed hosts fail-closed instead of guessing. Extra
+        // pins may stand alone, which is how a rotation starts before the
+        // primary kid is switched.
+        if (!config_.device_id.empty() && !config_.access_issuer.empty() &&
+            !primary_partial && (primary_complete || !config_.access_keys.empty())) {
+            auto verifier = std::make_unique<AccessTicketVerifier>(
+                config_.access_issuer, "device:" + config_.device_id);
+            std::string error;
+            bool pinned = true;
+            if (primary_complete) {
+                pinned = verifier->pin_key(config_.access_kid,
+                                           config_.access_public_key, &error);
+            }
+            for (const Config::AccessKeyPin& pin : config_.access_keys) {
+                if (pinned) {
+                    pinned = verifier->pin_key(pin.kid, pin.public_key, &error);
+                }
+            }
+            if (pinned) {
+                tickets_ = std::move(verifier);
+            }
+        }
+    }
     const bool wants_temporary =
         !config_.service_mode && config_.mode != HostAuthMode::Click;
     if (!wants_temporary) {
@@ -323,7 +356,8 @@ void HostSecurity::prune_nonces_locked(int64_t now_unix) {
 
 HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
                                             const std::string& peer_address,
-                                            int64_t now_unix) {
+                                            int64_t now_unix,
+                                            const TicketRequest* ticket_request) {
     std::lock_guard<std::mutex> lock(mutex_);
     Result result;
     result.peer_address = peer_address;
@@ -337,8 +371,114 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     // serves: the host will announce no picture, input or other control for
     // it. Clamping the request here keeps every later decision and the
     // approval window on the same mask.
-    const PermissionMask requested =
-        hello.requested_permissions & mode_permissions(hello.mode);
+    PermissionMask requested = hello.requested_permissions & mode_permissions(hello.mode);
+
+    // A managed device only admits a verified access ticket, and the ticket is
+    // an upper bound in addition to the local policy: permissions are the
+    // intersection of what the ticket grants, what the device policy allows
+    // and what this host and operator permit. The gate runs before every
+    // credential check so a refusal neither confirms a password nor consumes a
+    // failure slot.
+    PermissionMask managed_mask = kPermissionAll;
+    {
+        const ManagedPolicyState marker = read_managed_policy_state(config_.policy_state);
+        if (!marker.readable) {
+            result = deny(AccessDenial::Declined,
+                          "the managed policy state cannot be read; "
+                          "refusing new sessions");
+            result.peer_address = peer_address;
+            result.peer_ip = ip;
+            return result;
+        }
+        if (marker.managed) {
+            if (!tickets_) {
+                result = deny(AccessDenial::Declined,
+                              "this device is centrally managed; no trusted "
+                              "access-ticket key is configured");
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            if (ticket_request == nullptr) {
+                result = deny(AccessDenial::Declined,
+                              "this device is centrally managed; an access "
+                              "ticket is required");
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            AccessTicket ticket;
+            TicketError error =
+                tickets_->inspect(ticket_request->signed_ticket, config_.device_id,
+                                  config_.host_fingerprint, now_unix, &ticket);
+            if (error != TicketError::None) {
+                result = deny(AccessDenial::Declined,
+                              std::string("this device is centrally managed; "
+                                          "the access ticket was refused: ") +
+                                  ticket_error_text(error));
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            // A ticket issued for an older policy may still carry a wider
+            // ceiling. Renewal is a new ticket; an old one cannot ride in.
+            if (ticket.policy_version != marker.policy_version) {
+                result = deny(AccessDenial::Declined,
+                              "the access ticket does not match the current "
+                              "device policy version");
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            bool challenged = false;
+            for (uint8_t byte : ticket_request->host_nonce) {
+                if (byte != 0) {
+                    challenged = true;
+                    break;
+                }
+            }
+            if (!challenged) {
+                result = deny(AccessDenial::Declined,
+                              "this device is centrally managed; the connection "
+                              "carried no host challenge");
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            // Possession is checked before the id is consumed, so a broken or
+            // replayed proof cannot burn a ticket the peer may still use.
+            const std::vector<uint8_t> client_nonce(hello.nonce.begin(), hello.nonce.end());
+            const std::vector<uint8_t> proof_message = access_ticket_proof_message(
+                config_.device_id, config_.host_fingerprint, ticket_request->host_nonce,
+                client_nonce, ticket_request->signed_ticket);
+            if (!verify_access_ticket_proof(ticket, proof_message, ticket_request->proof)) {
+                result = deny(AccessDenial::Declined,
+                              "this device is centrally managed; the access-ticket "
+                              "possession proof was refused");
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            error = tickets_->commit(ticket, now_unix);
+            if (error != TicketError::None) {
+                result = deny(AccessDenial::Declined,
+                              std::string("this device is centrally managed; "
+                                          "the access ticket was refused: ") +
+                                  ticket_error_text(error));
+                result.peer_address = peer_address;
+                result.peer_ip = ip;
+                return result;
+            }
+            managed_mask = ticket.permissions & marker.permission_ceiling;
+            result.via_access_ticket = true;
+            result.ticket_subject = ticket.subject;
+            result.ticket_id = ticket.id;
+            result.ticket_expires_at = ticket.expires_at;
+            result.ticket_policy_version = ticket.policy_version;
+            result.ticket_client_key = ticket.client_public_key;
+        }
+    }
+    requested &= managed_mask;
     result.permissions = config_.default_permissions & requested;
 
     if (whitelist_configured_) {
@@ -598,6 +738,88 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     }
 
     result.decision = Decision::Allow;
+    return result;
+}
+
+HostSecurity::RenewalResult HostSecurity::renew_ticket(
+    const TicketRenewal& renewal, const std::string& peer_address,
+    const std::array<uint8_t, kTicketProofHostNonceSize>& host_nonce,
+    const std::vector<uint8_t>& client_nonce,
+    const std::array<uint8_t, kTicketClientKeySize>& session_key,
+    const std::string& session_subject, int64_t now_unix) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RenewalResult result;
+    auto refuse = [&result](std::string reason) {
+        result.accepted = false;
+        result.reason = std::move(reason);
+        return result;
+    };
+    const ManagedPolicyState marker = read_managed_policy_state(config_.policy_state);
+    if (!marker.readable) {
+        return refuse("the managed policy state cannot be read; refusing the renewal");
+    }
+    if (!marker.managed) {
+        return refuse("this device is not centrally managed; no renewal is expected");
+    }
+    if (!tickets_) {
+        return refuse("no trusted access-ticket key is configured");
+    }
+    AccessTicket ticket;
+    TicketError error = tickets_->inspect(renewal.signed_ticket, config_.device_id,
+                                          config_.host_fingerprint, now_unix, &ticket);
+    if (error != TicketError::None) {
+        return refuse(std::string("the access ticket was refused: ") +
+                      ticket_error_text(error));
+    }
+    if (ticket.policy_version != marker.policy_version) {
+        return refuse("the access ticket does not match the current device policy version");
+    }
+    if (ticket.subject != session_subject) {
+        return refuse("the access ticket names a different subject");
+    }
+    bool challenged = false;
+    for (uint8_t byte : host_nonce) {
+        if (byte != 0) {
+            challenged = true;
+            break;
+        }
+    }
+    if (!challenged) {
+        return refuse("the renewal carried no host challenge");
+    }
+    // The renewal extends this connection only: a ticket for another client
+    // key belongs to a different viewer and cannot inherit this session.
+    if (!std::equal(ticket.client_public_key.begin(), ticket.client_public_key.end(),
+                    session_key.begin())) {
+        return refuse("the access ticket names a different client key");
+    }
+    const std::vector<uint8_t> proof_message = access_ticket_proof_message(
+        config_.device_id, config_.host_fingerprint, host_nonce, client_nonce,
+        renewal.signed_ticket);
+    if (!verify_access_ticket_proof(ticket, proof_message, renewal.proof)) {
+        return refuse("the access-ticket possession proof was refused");
+    }
+    if (whitelist_configured_) {
+        const std::string ip = peer_ip_text(peer_address);
+        IpAddress address;
+        if (!whitelist_valid_ || !parse_ip_address(ip, address) ||
+            !ip_in_ranges(address, whitelist_)) {
+            return refuse("this address is not on the host's allow list");
+        }
+    }
+    // The id is consumed only after every check, exactly like admission: a
+    // refused renewal must not burn a ticket the viewer may still use.
+    error = tickets_->commit(ticket, now_unix);
+    if (error != TicketError::None) {
+        return refuse(std::string("the access ticket was refused: ") +
+                      ticket_error_text(error));
+    }
+    result.accepted = true;
+    result.permissions =
+        ticket.permissions & marker.permission_ceiling & config_.default_permissions;
+    result.expires_at = ticket.expires_at;
+    result.subject = ticket.subject;
+    result.ticket_id = ticket.id;
     return result;
 }
 

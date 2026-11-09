@@ -223,7 +223,7 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if groupID == "" {
-		if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+		if _, _, ok := s.consoleActor(w, r, consoleRead, account.TokenResourceAudit); !ok {
 			return
 		}
 	}

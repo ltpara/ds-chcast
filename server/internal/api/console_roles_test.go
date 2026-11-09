@@ -53,9 +53,9 @@ func TestConsoleRoleMatrix(t *testing.T) {
 		"/v1/audit/file-transfers",
 	} {
 		for _, tc := range []struct {
-			name string
+			name  string
 			token string
-			want int
+			want  int
 		}{
 			{"readonly", readonly, http.StatusOK},
 			{"operator", operator, http.StatusOK},
@@ -97,9 +97,9 @@ func TestConsoleRoleMatrix(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name string
+		name  string
 		token string
-		want int
+		want  int
 	}{
 		{"readonly", readonly, http.StatusForbidden},
 		{"operator", operator, http.StatusForbidden},

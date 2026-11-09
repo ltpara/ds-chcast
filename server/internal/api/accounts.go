@@ -67,18 +67,19 @@ func viewAdminAccount(user account.User) adminAccountEntry {
 	}
 }
 
-// adminActor authorizes an account-management request and names the caller in
-// the audit detail. The server key is not an account, so it reports no user.
-func (s *server) adminActor(w http.ResponseWriter, r *http.Request) (account.User, string, bool) {
+// adminActor authorizes an administrative request for one resource and names
+// the caller in the audit detail. The server key is not an account, so it
+// reports no user.
+func (s *server) adminActor(w http.ResponseWriter, r *http.Request, resource string) (account.User, string, bool) {
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return account.User{}, "", false
 	}
-	return s.consoleActor(w, r, consoleAdmin)
+	return s.consoleActor(w, r, consoleAdmin, resource)
 }
 
 func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r); !ok {
+	if _, _, ok := s.adminActor(w, r, account.TokenResourceAccounts); !ok {
 		return
 	}
 	users, err := s.cfg.Accounts.ListUsers()
@@ -95,7 +96,7 @@ func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -133,7 +134,7 @@ func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -153,7 +154,7 @@ func (s *server) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -167,7 +168,7 @@ func (s *server) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminResetAccountPassword(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -202,7 +203,7 @@ func (s *server) adminResetAccountPassword(w http.ResponseWriter, r *http.Reques
 // adminSetAccountBan blocks or restores an account. A ban revokes every live
 // session in the store; lifting it lets the next login through again.
 func (s *server) adminSetAccountBan(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -222,7 +223,7 @@ func (s *server) adminSetAccountBan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminResetAccountTwoFactor(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r)
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}

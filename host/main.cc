@@ -60,6 +60,7 @@ using chast::host::narrow;
 using chast::host::load_ui_language;
 using chast::host::tr;
 using chast::host::TunnelEvent;
+using chast::host::TunnelPolicy;
 using chast::host::TunnelProcess;
 using chast::host::validate_tunnel_settings;
 using chast::host::widen;
@@ -197,6 +198,7 @@ struct HostApp {
     std::string tunnel_viewer_path;
     std::string tunnel_viewer_remote;
     std::string tunnel_error;
+    uint32_t policy_ack_version = 0;
     std::deque<std::wstring> log_lines;
     std::unique_ptr<chast::host::ConnectionsWindow> connections;
 
@@ -1200,6 +1202,36 @@ void refresh_ui() {
     update_tray_tip(tip);
 }
 
+// Confirms a managed policy to chast-tunnel so the agent can sign the server
+// receipt. The acknowledgement is only written when the shared marker already
+// names this exact version; the host itself keeps enforcing fail-closed from
+// that marker.
+void acknowledge_managed_policy(const TunnelPolicy& statement, bool announce) {
+    if (g_app->settings.policy_ack.empty() || g_app->settings.policy_state.empty()) {
+        return;
+    }
+    std::string error;
+    if (!write_managed_policy_ack(g_app->settings.policy_ack, g_app->settings.policy_state,
+                                  statement.mode, statement.policy_version,
+                                  statement.permission_ceiling, statement.updated_at_ms,
+                                  &error)) {
+        if (announce) {
+            append_log_line(tr(L"受管策略确认写入失败：") + widen(error));
+        }
+        return;
+    }
+    if (!announce && g_app->policy_ack_version == statement.policy_version) {
+        return;
+    }
+    g_app->policy_ack_version = statement.policy_version;
+    std::wstring line = std::wstring(tr(L"受管策略已确认 · 版本 ")) +
+                        std::to_wstring(statement.policy_version);
+    if (!statement.mode.empty()) {
+        line += tr(L" · 模式 ") + widen(statement.mode);
+    }
+    append_log_line(line + tr(L" · 新会话失败关闭"));
+}
+
 void apply_tunnel_event(const TunnelEvent& event) {
     if (event.event == "ready") {
         g_app->tunnel_relay = event.relay;
@@ -1234,6 +1266,9 @@ void apply_tunnel_event(const TunnelEvent& event) {
             line += tr(L"：") + widen(event.remote);
         }
         append_log_line(line);
+    }
+    if (event.has_policy && event.event != "viewer") {
+        acknowledge_managed_policy(event.policy, event.event == "ready");
     }
 }
 

@@ -9,6 +9,7 @@
 #include <flutter/flutter_engine.h>
 #include <flutter/standard_method_codec.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/access_ticket.h"
 #include "chast/audio.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
@@ -44,8 +46,12 @@ constexpr size_t kMaxTrustKeyLength = 512;
 // Binds account-token ciphertext to its purpose, so a blob lifted from another
 // DPAPI-protected file cannot be swapped in.
 constexpr char kAccountSecretEntropy[] = "chast.account.v1";
+// The ticket key is separate from the account envelope on purpose: one names a
+// connection, the other authorizes the account.
+constexpr char kTicketSeedEntropy[] = "chast.access-ticket.v1";
 constexpr size_t kMaxProtectPlaintext = 64 * 1024;
 constexpr size_t kMaxProtectedText = 128 * 1024;
+constexpr size_t kMaxTicketText = 2048;
 
 // A finished Windows Hello ceremony waiting for the platform thread. Both the
 // worker and the platform handler hold it through a shared_ptr, and `answered`
@@ -255,6 +261,58 @@ bool write_text_file(const std::filesystem::path& path, const std::string& text,
         return false;
     }
     return true;
+}
+
+std::filesystem::path ticket_seed_path() {
+    const std::filesystem::path dir = app_data_chast_dir();
+    return dir.empty() ? std::filesystem::path() : dir / L"access-ticket.key";
+}
+
+// Loads the viewer's Ed25519 ticket seed, creating and persisting one on first
+// use. A corrupt or foreign-profile store cannot authorize anything and is
+// replaced; only the next ticket fetch is affected.
+bool load_or_create_ticket_seed(std::vector<uint8_t>* seed, std::string* error) {
+    const std::filesystem::path path = ticket_seed_path();
+    if (path.empty()) {
+        *error = "the roaming profile is not available";
+        return false;
+    }
+    std::string stored;
+    if (read_text_file(path, &stored) && !stored.empty()) {
+        std::string plain;
+        if (chast::unprotect_secret(stored, chast::SecretScope::CurrentUser,
+                                    kTicketSeedEntropy, plain, error) &&
+            plain.size() == chast::kTicketClientKeySize) {
+            seed->assign(plain.begin(), plain.end());
+            std::fill(plain.begin(), plain.end(), '\0');
+            return true;
+        }
+        std::fprintf(stderr, "chast_viewer: ticket key unusable (%s); regenerating\n",
+                     error->empty() ? "wrong length" : error->c_str());
+        error->clear();
+    }
+    std::vector<uint8_t> generated;
+    std::vector<uint8_t> public_key;
+    if (!chast::generate_access_ticket_key(&generated, &public_key)) {
+        *error = "could not generate an access-ticket key";
+        return false;
+    }
+    const std::string plain(generated.begin(), generated.end());
+    std::string sealed;
+    if (!chast::protect_secret(plain, chast::SecretScope::CurrentUser,
+                               kTicketSeedEntropy, sealed, error) ||
+        !write_text_file(path, sealed, error)) {
+        return false;
+    }
+    *seed = std::move(generated);
+    return true;
+}
+
+bool decode_ticket_text(const std::string& text, std::vector<uint8_t>* ticket) {
+    return !text.empty() && text.size() <= kMaxTicketText &&
+           chast::decode_ticket_base64url(text, ticket) &&
+           ticket->size() > chast::kTicketSignatureSize &&
+           ticket->size() <= chast::kTicketMaxSigned;
 }
 
 }  // namespace
@@ -555,6 +613,24 @@ void ViewerBridge::HandleMethodCall(
             result->Error("bad_args", "totp must be at most 16 characters");
             return;
         }
+        // Managed hosts need a signed ticket and the seed behind its client
+        // public key. The key file is created by "ticketIdentity" before the
+        // lookup that mints the ticket, so this normally only reads it.
+        std::vector<uint8_t> access_ticket;
+        std::vector<uint8_t> access_ticket_seed;
+        std::string access_ticket_text;
+        if (map_string(*args, "accessTicket", &access_ticket_text) &&
+            !access_ticket_text.empty()) {
+            if (!decode_ticket_text(access_ticket_text, &access_ticket)) {
+                result->Error("bad_args", "accessTicket must be a signed access ticket");
+                return;
+            }
+            std::string key_error;
+            if (!load_or_create_ticket_seed(&access_ticket_seed, &key_error)) {
+                result->Error("ticket_key", key_error);
+                return;
+            }
+        }
         if (map_string(*args, "transport", &transport_text)) {
             if (transport_text.empty() || transport_text == "auto") {
                 transport = ViewerTransport::kAuto;
@@ -589,7 +665,9 @@ void ViewerBridge::HandleMethodCall(
                             trust_device, transport, std::move(carrier_host),
                             static_cast<uint16_t>(carrier_port),
                             std::move(carrier_host_id), std::move(carrier_token),
-                            file_transfer_only, session_mode)) {
+                            file_transfer_only, session_mode,
+                            std::move(access_ticket),
+                            std::move(access_ticket_seed))) {
             result->Error("busy", "a session is already running");
             return;
         }
@@ -1299,10 +1377,10 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "setKeyboardMode") {
         const auto* mode = std::get_if<std::string>(call.arguments());
-        if (!mode || (*mode != "physical" && *mode != "local")) {
-            result->Error("bad_args", "keyboard mode must be physical or local"); return;
+        if (!mode || (*mode != "physical" && *mode != "legacy" && *mode != "local")) {
+            result->Error("bad_args", "keyboard mode must be physical, legacy or local"); return;
         }
-        if (!SetKeyboardMode(*mode == "local")) {
+        if (!SetKeyboardMode(*mode)) {
             result->Error("keyboard_unavailable", "The local input method is not available"); return;
         }
         result->Success(); return;
@@ -1629,6 +1707,7 @@ void ViewerBridge::HandleMethodCall(
     if (method == "requestFileList" || method == "requestFileDownload") {
         const auto* path = std::get_if<std::string>(call.arguments());
         std::string cursor;
+        bool show_hidden = false;
         if (method == "requestFileList") {
             if (const auto* args = std::get_if<flutter::EncodableMap>(call.arguments())) {
                 const auto directory = args->find(key("directory"));
@@ -1639,6 +1718,12 @@ void ViewerBridge::HandleMethodCall(
                     if (!value) { result->Error("bad_args", "cursor must be a string"); return; }
                     cursor = *value;
                 }
+                const auto hidden = args->find(key("showHidden"));
+                if (hidden != args->end()) {
+                    const auto* value = std::get_if<bool>(&hidden->second);
+                    if (!value) { result->Error("bad_args", "showHidden must be a bool"); return; }
+                    show_hidden = *value;
+                }
             }
         }
         if (path == nullptr) {
@@ -1646,31 +1731,66 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         const bool queued =
-            viewer_ != nullptr && (method == "requestFileList"
-                                       ? viewer_->RequestFileList(*path, std::move(cursor))
-                                       : viewer_->RequestFileDownload(*path));
+            viewer_ != nullptr &&
+            (method == "requestFileList"
+                 ? viewer_->RequestFileList(*path, std::move(cursor), show_hidden)
+                 : viewer_->RequestFileDownload(*path));
         result->Success(flutter::EncodableValue(queued));
         return;
     }
 
     if (method == "downloadFolder") {
-        const auto* path = std::get_if<std::string>(call.arguments());
-        if (path == nullptr) {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        std::string path;
+        bool show_hidden = false;
+        if (args != nullptr) {
+            const auto directory = args->find(key("path"));
+            const auto* value =
+                directory == args->end() ? nullptr : std::get_if<std::string>(&directory->second);
+            if (value == nullptr) {
+                result->Error("bad_args", "downloadFolder wants a '/'-separated relative path");
+                return;
+            }
+            path = *value;
+            const auto hidden = args->find(key("showHidden"));
+            if (hidden != args->end()) {
+                const auto* flag = std::get_if<bool>(&hidden->second);
+                if (!flag) { result->Error("bad_args", "showHidden must be a bool"); return; }
+                show_hidden = *flag;
+            }
+        } else if (const auto* plain = std::get_if<std::string>(call.arguments())) {
+            path = *plain;
+        } else {
             result->Error("bad_args", "downloadFolder wants a '/'-separated relative path");
             return;
         }
-        const bool queued = viewer_ != nullptr && viewer_->RequestDirectoryDownload(*path);
+        const bool queued =
+            viewer_ != nullptr && viewer_->RequestDirectoryDownload(path, show_hidden);
         result->Success(flutter::EncodableValue(queued));
         return;
     }
 
     if (method == "downloadEntries") {
-        const auto* items = std::get_if<flutter::EncodableList>(call.arguments());
+        std::vector<ViewerEngine::DownloadRoot> roots;
+        bool show_hidden = false;
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "downloadEntries wants a list of entries");
+            return;
+        }
+        const auto entries = args->find(key("entries"));
+        const auto* items =
+            entries == args->end() ? nullptr : std::get_if<flutter::EncodableList>(&entries->second);
         if (items == nullptr) {
             result->Error("bad_args", "downloadEntries wants a list of entries");
             return;
         }
-        std::vector<ViewerEngine::DownloadRoot> roots;
+        const auto hidden = args->find(key("showHidden"));
+        if (hidden != args->end()) {
+            const auto* flag = std::get_if<bool>(&hidden->second);
+            if (!flag) { result->Error("bad_args", "showHidden must be a bool"); return; }
+            show_hidden = *flag;
+        }
         roots.reserve(items->size());
         for (const flutter::EncodableValue& item : *items) {
             const auto* map = std::get_if<flutter::EncodableMap>(&item);
@@ -1694,7 +1814,7 @@ void ViewerBridge::HandleMethodCall(
             roots.push_back(std::move(root));
         }
         const bool queued =
-            viewer_ != nullptr && viewer_->RequestBatchDownload(std::move(roots));
+            viewer_ != nullptr && viewer_->RequestBatchDownload(std::move(roots), show_hidden);
         result->Success(flutter::EncodableValue(queued));
         return;
     }
@@ -1736,7 +1856,7 @@ void ViewerBridge::HandleMethodCall(
         const auto* path_value =
             path == args->end() ? nullptr : std::get_if<std::string>(&path->second);
         if (operation_value == nullptr || path_value == nullptr || *operation_value < 0 ||
-            *operation_value > static_cast<int32_t>(chast::FileOperation::Remove)) {
+            *operation_value > static_cast<int32_t>(chast::FileOperation::RemoveTree)) {
             result->Error("bad_args", "fileOperation wants an operation and a path");
             return;
         }
@@ -1769,6 +1889,7 @@ void ViewerBridge::HandleMethodCall(
         flutter::EncodableMap map;
         map[key("directory")] = flutter::EncodableValue(answer.directory);
         map[key("cursor")] = flutter::EncodableValue(answer.cursor);
+        map[key("showHidden")] = flutter::EncodableValue(answer.show_hidden);
         map[key("nextCursor")] = flutter::EncodableValue(answer.result.next_cursor);
         map[key("code")] = flutter::EncodableValue(static_cast<int32_t>(answer.result.code));
         map[key("reason")] = flutter::EncodableValue(answer.result.reason);
@@ -2382,6 +2503,36 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "ticketIdentity") {
+        std::vector<uint8_t> seed;
+        std::string error;
+        if (!load_or_create_ticket_seed(&seed, &error)) {
+            result->Error("ticket_key", error);
+            return;
+        }
+        std::vector<uint8_t> public_key;
+        const bool derived = chast::derive_access_ticket_public_key(seed, &public_key);
+        std::fill(seed.begin(), seed.end(), '\0');
+        if (!derived) {
+            result->Error("ticket_key", "could not derive the ticket public key");
+            return;
+        }
+        result->Success(flutter::EncodableValue(chast::encode_ticket_base64url(public_key)));
+        return;
+    }
+
+    if (method == "renewAccessTicket") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        std::vector<uint8_t> ticket;
+        if (text == nullptr || !decode_ticket_text(*text, &ticket)) {
+            result->Error("bad_args", "renewAccessTicket wants a signed access ticket");
+            return;
+        }
+        result->Success(
+            flutter::EncodableValue(viewer_->RenewAccessTicket(std::move(ticket))));
+        return;
+    }
+
     if (method == "protectSecret" || method == "unprotectSecret") {
         const auto* text = std::get_if<std::string>(call.arguments());
         const bool protect = method == "protectSecret";
@@ -2865,19 +3016,26 @@ bool ViewerBridge::ReleaseInput() {
     return session_ && session_->ReleaseInput(this, session_generation_.load());
 }
 
-bool ViewerBridge::SetKeyboardMode(bool local) {
-    if (local_keyboard_ == local) return true;
+bool ViewerBridge::SetKeyboardMode(const std::string& mode) {
+    const bool local = mode == "local";
+    const bool legacy = mode == "legacy";
+    if (!local && !legacy && mode != "physical") return false;
+    if (local_keyboard_ == local && legacy_keyboard_ == legacy) return true;
     if (local && (!local_text_input_ || !keyboard_capture_ || !keyboard_capture_->available())) return false;
     const bool captured = key_capture_.load();
     SetKeyCapture(false);
     ReleaseInput();
     local_keyboard_ = local;
+    legacy_keyboard_ = legacy;
     keyboard_capture_->SetTranslated(local);
+    keyboard_capture_->SetLegacy(legacy);
     SetKeyCapture(captured);
     if (captured && local && !key_capture_) {
         SetKeyCapture(false);
         local_keyboard_ = false;
+        legacy_keyboard_ = false;
         keyboard_capture_->SetTranslated(false);
+        keyboard_capture_->SetLegacy(false);
         SetKeyCapture(captured);
         return false;
     }

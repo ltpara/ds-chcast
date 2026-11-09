@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 9
+const accountSchemaVersion = 11
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -23,6 +23,82 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 7, Name: "account groups", Apply: applyAccountGroups},
 	{Version: 8, Name: "audit location and route", Apply: applyAuditLocationRoute},
 	{Version: 9, Name: "host audit identity and deduplication", Apply: applyHostAuditIdentity},
+	{Version: 10, Name: "device policies", Apply: applyDevicePolicies},
+	{Version: 11, Name: "automation API tokens", Apply: applyAPITokens},
+}
+
+// applyAPITokens adds automation credentials that are independent from
+// interactive sessions: hashed secret, owner, role, resource set, optional
+// group scope, expiry and revocation.
+func applyAPITokens(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id            TEXT PRIMARY KEY,
+			token_hash    TEXT NOT NULL UNIQUE,
+			user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name          TEXT NOT NULL,
+			role          TEXT NOT NULL,
+			resources     TEXT NOT NULL DEFAULT '',
+			group_id      TEXT NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL,
+			expires_at    INTEGER NOT NULL,
+			revoked_at    INTEGER NOT NULL DEFAULT 0,
+			last_used_at  INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens(user_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS api_tokens_expiry ON api_tokens(expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create API token schema: %w", err)
+		}
+	}
+	return nil
+}
+
+// applyDevicePolicies adds the per-device admission policy that G02 consumes.
+// A device without a row stays unmanaged and keeps the v61 local-authentication
+// behavior; a row makes the device managed and records the version a host has
+// to apply and acknowledge. Allowed users and groups only matter in restricted
+// mode, while the permission ceiling also applies to managed open devices.
+func applyDevicePolicies(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS device_policies (
+			peer_id            TEXT PRIMARY KEY,
+			mode               TEXT NOT NULL DEFAULT 'open',
+			permission_ceiling INTEGER NOT NULL DEFAULT 0,
+			policy_version     INTEGER NOT NULL DEFAULT 1,
+			updated_at         INTEGER NOT NULL,
+			updated_by         TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS device_policy_users (
+			peer_id    TEXT NOT NULL REFERENCES device_policies(peer_id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (peer_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS device_policy_users_user
+			ON device_policy_users(user_id)`,
+		`CREATE TABLE IF NOT EXISTS device_policy_groups (
+			peer_id    TEXT NOT NULL REFERENCES device_policies(peer_id) ON DELETE CASCADE,
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (peer_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS device_policy_groups_group
+			ON device_policy_groups(group_id)`,
+		`CREATE TABLE IF NOT EXISTS device_policy_receipts (
+			peer_id        TEXT PRIMARY KEY REFERENCES device_policies(peer_id) ON DELETE CASCADE,
+			policy_version INTEGER NOT NULL,
+			applied        INTEGER NOT NULL,
+			detail         TEXT NOT NULL DEFAULT '',
+			reported_at    INTEGER NOT NULL
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create device policy schema: %w", err)
+		}
+	}
+	return nil
 }
 
 func applyHostAuditIdentity(db *sql.DB) error {

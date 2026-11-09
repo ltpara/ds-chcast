@@ -721,7 +721,15 @@ public:
                std::string carrier_host = {}, uint16_t carrier_port = 0,
                std::string carrier_host_id = {}, std::string carrier_token = {},
                bool file_transfer_only = false,
-               chast::SessionMode session_mode = chast::SessionMode::Desktop);
+               chast::SessionMode session_mode = chast::SessionMode::Desktop,
+               std::vector<uint8_t> access_ticket = {},
+               std::vector<uint8_t> access_ticket_seed = {});
+    // Queues a freshly issued access ticket for the running managed session.
+    // The session thread sends it as TicketRenew and moves the host's lease to
+    // the new expiry; the caller keeps fetching tickets on its own timer. The
+    // newest ticket wins when several are queued. False when no session is
+    // running or the ticket is not a signed envelope.
+    bool RenewAccessTicket(std::vector<uint8_t> signed_ticket);
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
@@ -822,11 +830,13 @@ public:
     // `directory` is a '/'-separated relative path; empty lists the root.
     // A nonempty cursor continues after the last returned page. Only the
     // newest manual browse request may replace the UI's current answer.
-    // Returns false when no session is streaming, the host did not grant file
-    // transfer, or the request queue is full. The newest answer is taken
-    // through TakeFileList(); counters and the last refusal arrive in
+    // `show_hidden` keeps entries the host marked hidden. Returns false when
+    // no session is streaming, the host did not grant file transfer, or the
+    // request queue is full. The newest answer is taken through
+    // TakeFileList(); counters and the last refusal arrive in
     // ViewerStatus::file_list_*.
-    bool RequestFileList(std::string directory, std::string cursor = {});
+    bool RequestFileList(std::string directory, std::string cursor = {},
+                         bool show_hidden = false);
     // Asks the host to send one regular file from the shared root. The host
     // answers through ViewerStatus::file_download_*; on Ok the offer then
     // arrives like any host download and lands in the viewer's receive
@@ -842,6 +852,7 @@ public:
     struct FileListAnswer {
         std::string directory;
         std::string cursor;
+        bool show_hidden = false;
         chast::FileListResult result;
     };
     // Copies the newest listing the host sent, once per answer. Returns false
@@ -888,8 +899,9 @@ public:
     // did not grant file transfer, the list is empty or holds an invalid path,
     // or a walk is already running. Progress arrives in
     // ViewerStatus::folder_download_* with folder_download_roots saying how
-    // many entries were selected.
-    bool RequestBatchDownload(std::vector<DownloadRoot> roots);
+    // many entries were selected. `show_hidden` walks the same view the
+    // browser lists, hidden entries included or not.
+    bool RequestBatchDownload(std::vector<DownloadRoot> roots, bool show_hidden = false);
     // Downloads one browsed folder and everything below it into the viewer's
     // receive directory, mirroring the remote tree below the folder's name.
     // The walk sends ordinary list and download requests in browse order, one
@@ -897,7 +909,7 @@ public:
     // Returns false when no session is streaming, the host did not grant file
     // transfer, `path` is empty or invalid, or a walk is already running.
     // Progress arrives in ViewerStatus::folder_download_*.
-    bool RequestDirectoryDownload(std::string path);
+    bool RequestDirectoryDownload(std::string path, bool show_hidden = false);
     // Stops the running walk; the transfer in flight is aborted and its partial
     // file removed. The outcome is published as cancelled.
     void CancelDirectoryDownload();
@@ -1103,7 +1115,8 @@ private:
              std::string carrier_host, uint16_t carrier_port,
              std::string carrier_host_id, std::string carrier_token,
              std::string audit_ref, bool file_transfer_only,
-             chast::SessionMode session_mode);
+             chast::SessionMode session_mode, std::vector<uint8_t> access_ticket,
+             std::vector<uint8_t> access_ticket_seed);
     void SetState(ViewerState state, std::string error = {});
     // Expands dropped folders and hashes queued uploads on its own thread, so
     // a multi-gigabyte read never stalls the session's receive loop.
@@ -1120,7 +1133,7 @@ private:
     bool HasHashableUploadLocked() const;
     // Shared validation and queueing for RequestBatchDownload and
     // RequestDirectoryDownload. `batch` tells the page which wording to use.
-    bool QueueDownload(std::vector<DownloadRoot> roots, bool batch);
+    bool QueueDownload(std::vector<DownloadRoot> roots, bool batch, bool show_hidden);
     // Applies the newest screenshot request. Runs on the session thread after
     // a picture was published, because the sink's readback and the decoder
     // share one D3D11 device.
@@ -1142,6 +1155,10 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+    // Tickets fetched by the UI cross to the session thread here; the QUIC
+    // client is single-threaded, so only Run may send them.
+    std::mutex ticket_mutex_;
+    std::optional<std::vector<uint8_t>> pending_ticket_renew_;
     // Survives reconnects: the speaker stays off until the user turns it on.
     std::atomic<bool> audio_muted_{false};
     // The microphone switch only crosses as a flag; the session thread owns
@@ -1376,6 +1393,7 @@ private:
         std::string path;
         std::string new_name;
         std::string cursor;
+        bool show_hidden = false;
     };
     // One walk of a remote folder. The session thread owns every field; the UI
     // threads only queue a request and set `cancel`, all under browse_mutex_.
@@ -1401,6 +1419,9 @@ private:
         std::string root;
         std::string name;
         std::string destination;
+        // The listing view the walk started from; every page of the walk uses
+        // it so hidden entries are included exactly when the browser shows them.
+        bool show_hidden = false;
         // Directory path and continuation cursor for the next page.
         std::deque<std::pair<std::string, std::string>> directories;
         std::deque<std::pair<std::string, std::string>> files;
@@ -1433,6 +1454,7 @@ private:
     struct FolderRequest {
         std::vector<DownloadRoot> roots;
         bool batch = false;
+        bool show_hidden = false;
     };
     std::optional<FolderRequest> folder_request_;
     FolderDownload folder_;

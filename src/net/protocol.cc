@@ -570,9 +570,16 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     const size_t audit_size = hello.audit_ref.size() > kMaxAuditRefLength
                                   ? kMaxAuditRefLength
                                   : hello.audit_ref.size();
+    const size_t ticket_size = hello.access_ticket.size() > kTicketMaxSigned
+                                   ? kTicketMaxSigned
+                                   : hello.access_ticket.size();
+    const size_t proof_size = hello.ticket_proof.size() > kTicketProofSize
+                                  ? kTicketProofSize
+                                  : hello.ticket_proof.size();
     std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 4 + 2 + key_size +
                                  1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
-                                 signature_size + 2 + totp_size + 2 + audit_size + 6);
+                                 signature_size + 2 + totp_size + 2 + audit_size + 6 + 2 +
+                                 ticket_size + 2 + proof_size);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
     put_u16(cursor, hello.display);
@@ -619,6 +626,15 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     put_u8(cursor, static_cast<uint8_t>(hello.codec_preference));
     put_u8(cursor, hello.decoding_444);
     put_u8(cursor, static_cast<uint8_t>(hello.prefer_chroma));
+    put_u16(cursor, static_cast<uint16_t>(ticket_size));
+    if (ticket_size > 0) {
+        std::memcpy(cursor, hello.access_ticket.data(), ticket_size);
+        cursor += ticket_size;
+    }
+    put_u16(cursor, static_cast<uint16_t>(proof_size));
+    if (proof_size > 0) {
+        std::memcpy(cursor, hello.ticket_proof.data(), proof_size);
+    }
     return make_control(ControlType::Hello, payload);
 }
 
@@ -752,6 +768,22 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "Hello carries invalid chroma capabilities or preference"); return false;
     }
     hello.prefer_chroma = static_cast<VideoChroma>(chroma);
+    uint16_t ticket_size = 0;
+    if (!reader.u16(ticket_size) || ticket_size > kTicketMaxSigned ||
+        !reader.bytes(hello.access_ticket, ticket_size)) {
+        set_error(error, "Hello carries a malformed access ticket");
+        return false;
+    }
+    uint16_t proof_size = 0;
+    if (!reader.u16(proof_size) || proof_size > kTicketProofSize ||
+        !reader.bytes(hello.ticket_proof, proof_size)) {
+        set_error(error, "Hello carries a malformed ticket proof");
+        return false;
+    }
+    if (hello.access_ticket.empty() != hello.ticket_proof.empty()) {
+        set_error(error, "Hello carries a ticket without its possession proof or the reverse");
+        return false;
+    }
     if (!reader.at_end()) {
         set_error(error, "Hello carries trailing bytes");
         return false;
@@ -775,6 +807,23 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
             return false;
         }
     }
+    return true;
+}
+
+std::vector<uint8_t> make_auth_challenge(
+    const std::array<uint8_t, kTicketProofHostNonceSize>& host_nonce) {
+    const std::vector<uint8_t> payload(host_nonce.begin(), host_nonce.end());
+    return make_control(ControlType::AuthChallenge, payload);
+}
+
+bool parse_auth_challenge(const std::vector<uint8_t>& payload,
+                          std::array<uint8_t, kTicketProofHostNonceSize>& host_nonce,
+                          std::string* error) {
+    if (payload.size() != kTicketProofHostNonceSize) {
+        set_error(error, "AuthChallenge must carry exactly 32 bytes");
+        return false;
+    }
+    std::memcpy(host_nonce.data(), payload.data(), payload.size());
     return true;
 }
 
@@ -817,6 +866,119 @@ bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code
         return false;
     }
     code = static_cast<AccessDenial>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_ticket_renew(const std::vector<uint8_t>& signed_ticket,
+                                       const std::vector<uint8_t>& proof) {
+    const size_t ticket_size = signed_ticket.size() > kTicketMaxSigned
+                                   ? kTicketMaxSigned
+                                   : signed_ticket.size();
+    const size_t proof_size =
+        proof.size() > kTicketProofSize ? kTicketProofSize : proof.size();
+    std::vector<uint8_t> payload(2 + ticket_size + 2 + proof_size);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, static_cast<uint16_t>(ticket_size));
+    if (ticket_size > 0) {
+        std::memcpy(cursor, signed_ticket.data(), ticket_size);
+        cursor += ticket_size;
+    }
+    put_u16(cursor, static_cast<uint16_t>(proof_size));
+    if (proof_size > 0) {
+        std::memcpy(cursor, proof.data(), proof_size);
+    }
+    return make_control(ControlType::TicketRenew, payload);
+}
+
+bool parse_ticket_renew(const std::vector<uint8_t>& payload, TicketRenewRequest& request,
+                        std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint16_t ticket_size = 0;
+    if (!reader.u16(ticket_size) || ticket_size == 0 || ticket_size > kTicketMaxSigned ||
+        !reader.bytes(request.signed_ticket, ticket_size)) {
+        set_error(error, "TicketRenew carries a malformed access ticket");
+        return false;
+    }
+    uint16_t proof_size = 0;
+    if (!reader.u16(proof_size) || proof_size != kTicketProofSize ||
+        !reader.bytes(request.proof, proof_size)) {
+        set_error(error, "TicketRenew carries a malformed possession proof");
+        return false;
+    }
+    if (!reader.at_end()) {
+        set_error(error, "TicketRenew carries trailing bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_ticket_renew_result(const TicketRenewResult& result) {
+    const std::string text = truncate_utf8_reason(result.reason, kMaxAccessDenialReason);
+    std::vector<uint8_t> payload(1 + 8 + 4 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    const bool accepted = result.code == TicketRenewCode::Accepted;
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u64(cursor, accepted && result.expires_at > 0
+                        ? static_cast<uint64_t>(result.expires_at)
+                        : 0);
+    put_u32(cursor, accepted ? result.permissions : 0);
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::TicketRenewResult, payload);
+}
+
+bool parse_ticket_renew_result(const std::vector<uint8_t>& payload,
+                               TicketRenewResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t code = 0;
+    uint64_t expires = 0;
+    uint32_t permissions = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(code) || !reader.u64(expires) || !reader.u32(permissions) ||
+        !reader.u16(reason_size)) {
+        set_error(error, "truncated TicketRenewResult");
+        return false;
+    }
+    if (code > static_cast<uint8_t>(TicketRenewCode::Refused)) {
+        set_error(error, "unknown ticket renewal code " + std::to_string(code));
+        return false;
+    }
+    if (expires > static_cast<uint64_t>(0x7fffffffffffffffULL)) {
+        set_error(error, "TicketRenewResult carries an invalid expiry");
+        return false;
+    }
+    if ((permissions & ~kPermissionAll) != 0) {
+        set_error(error, "TicketRenewResult carries unknown permission bits");
+        return false;
+    }
+    if (reason_size > kMaxAccessDenialReason || reader.remaining() != reason_size) {
+        set_error(error, "TicketRenewResult carries a malformed reason");
+        return false;
+    }
+    std::string reason;
+    if (!reader.string(reason, reason_size)) {
+        set_error(error, "truncated TicketRenewResult reason");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "TicketRenewResult reason is not valid UTF-8");
+        return false;
+    }
+    result.code = static_cast<TicketRenewCode>(code);
+    result.expires_at = static_cast<int64_t>(expires);
+    result.permissions = permissions;
+    result.reason = std::move(reason);
+    if (result.code == TicketRenewCode::Refused &&
+        (result.expires_at != 0 || result.permissions != 0)) {
+        set_error(error, "a refused TicketRenewResult carries a lease");
+        return false;
+    }
+    if (result.code == TicketRenewCode::Accepted && result.expires_at <= 0) {
+        set_error(error, "an accepted TicketRenewResult carries no expiry");
+        return false;
+    }
     return true;
 }
 
@@ -1523,6 +1685,10 @@ std::vector<uint8_t> make_input_event(const InputEvent& event) {
             action = static_cast<uint8_t>(event.key.action);
             hid_usage = event.key.hid_usage;
             break;
+        case InputKind::LegacyKey:
+            action = static_cast<uint8_t>(event.legacy_key.action);
+            hid_usage = event.legacy_key.virtual_key;
+            break;
         case InputKind::Touch:
             action = static_cast<uint8_t>(event.touch.action);
             contact = event.touch.contact;
@@ -1631,6 +1797,25 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
             event.kind = InputKind::Key;
             event.key.action = static_cast<KeyAction>(action);
             event.key.hid_usage = hid_usage;
+            break;
+        case static_cast<uint8_t>(InputKind::LegacyKey):
+            if (action > static_cast<uint8_t>(KeyAction::Up)) {
+                set_error(error, "InputEvent names unknown legacy key action " +
+                                     std::to_string(action));
+                return false;
+            }
+            if (hid_usage == 0 || hid_usage > 0xFF) {
+                set_error(error, "InputEvent carries an invalid virtual key");
+                return false;
+            }
+            if (buttons != 0 || pressure != 0 || contact != 0 || flags != 0 || tilt_x != 0 ||
+                tilt_y != 0) {
+                set_error(error, "InputEvent legacy key event carries non-key fields");
+                return false;
+            }
+            event.kind = InputKind::LegacyKey;
+            event.legacy_key.action = static_cast<KeyAction>(action);
+            event.legacy_key.virtual_key = hid_usage;
             break;
         case static_cast<uint8_t>(InputKind::Touch):
             if (action > static_cast<uint8_t>(TouchAction::Cancel)) {
@@ -4624,11 +4809,12 @@ bool valid_file_list_cursor(const std::string& cursor) {
 
 std::vector<uint8_t> make_file_list_request(uint32_t request_id,
                                             const std::string& directory,
-                                            const std::string& after) {
+                                            const std::string& after,
+                                            bool show_hidden) {
     if (request_id == 0 || !valid_file_browser_path(directory) || !valid_file_list_cursor(after)) {
         return {};
     }
-    std::vector<uint8_t> payload(4 + 2 + directory.size() + 2 + after.size());
+    std::vector<uint8_t> payload(4 + 2 + directory.size() + 2 + after.size() + 1);
     uint8_t* cursor = payload.data();
     put_u32(cursor, request_id);
     put_u16(cursor, static_cast<uint16_t>(directory.size()));
@@ -4637,18 +4823,24 @@ std::vector<uint8_t> make_file_list_request(uint32_t request_id,
         cursor += directory.size();
     }
     put_u16(cursor, static_cast<uint16_t>(after.size()));
-    if (!after.empty()) std::memcpy(cursor, after.data(), after.size());
+    if (!after.empty()) {
+        std::memcpy(cursor, after.data(), after.size());
+        cursor += after.size();
+    }
+    *cursor = show_hidden ? kFileListFlagShowHidden : 0;
     return make_control(ControlType::FileListRequest, payload);
 }
 
 bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
-                             std::string& directory, std::string* error, std::string* cursor) {
+                             std::string& directory, std::string* error, std::string* cursor,
+                             bool* show_hidden) {
     Reader reader(payload.data(), payload.size());
     uint16_t size = 0;
     std::string after;
+    uint8_t flags = 0;
     if (!reader.u32(request_id) || !reader.u16(size) ||
         !reader.string(directory, size) || !reader.u16(size) ||
-        !reader.string(after, size) || !reader.at_end()) {
+        !reader.string(after, size) || !reader.u8(flags) || !reader.at_end()) {
         set_error(error, "malformed FileListRequest");
         return false;
     }
@@ -4656,11 +4848,16 @@ bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& requ
         set_error(error, "FileListRequest has a zero request id");
         return false;
     }
+    if ((flags & ~kFileListFlagShowHidden) != 0) {
+        set_error(error, "FileListRequest has unknown flags");
+        return false;
+    }
     if (!valid_file_browser_path(directory) || !valid_file_list_cursor(after)) {
         set_error(error, "FileListRequest path is not a plain relative directory");
         return false;
     }
     if (cursor) *cursor = std::move(after);
+    if (show_hidden) *show_hidden = (flags & kFileListFlagShowHidden) != 0;
     return true;
 }
 
@@ -4878,7 +5075,7 @@ std::vector<uint8_t> make_file_op_request(uint32_t request_id, FileOperation op,
                                           const std::string& path,
                                           const std::string& new_name) {
     const uint8_t raw_op = static_cast<uint8_t>(op);
-    if (request_id == 0 || raw_op > static_cast<uint8_t>(FileOperation::Remove) ||
+    if (request_id == 0 || raw_op > static_cast<uint8_t>(FileOperation::RemoveTree) ||
         path.empty() || !valid_file_browser_path(path)) {
         return {};
     }
@@ -4917,7 +5114,7 @@ bool parse_file_op_request(const std::vector<uint8_t>& payload, uint32_t& reques
         set_error(error, "FileOpRequest has a zero request id");
         return false;
     }
-    if (raw_op > static_cast<uint8_t>(FileOperation::Remove)) {
+    if (raw_op > static_cast<uint8_t>(FileOperation::RemoveTree)) {
         set_error(error, "FileOpRequest carries an unknown operation");
         return false;
     }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/acmecert"
 	"github.com/ltpara/ds-chcast/server/internal/admin"
 	"github.com/ltpara/ds-chcast/server/internal/api"
@@ -80,6 +81,9 @@ func run() error {
 		serverKey        = flag.String("server-key", "", "management secret for the console, metrics and fallback authentication; empty refuses to start")
 		linkKey          = flag.String("link-key", "", "connection secret ordinary viewers use for lookup and punch proofs; empty keeps --server-key semantics")
 		hostKey          = flag.String("host-key", "", "secret controlled hosts use for registration and host audit; empty keeps --server-key semantics")
+		accessIssuerName = flag.String("access-issuer", "", "issuer name signed into access tickets; empty disables ticket issuance")
+		accessKeyID      = flag.String("access-kid", "", "key id of the access ticket signing key; required with --access-issuer")
+		accessSeed       = flag.String("access-key", "", "base64url Ed25519 seed for access ticket signing; prefer the env file over the command line")
 		insecureNoKey    = flag.Bool("insecure-no-server-key", false, "run without --server-key; the HTTP API is then limited to a loopback --http-listen and every other listener stays unauthenticated")
 		softwareVer      = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
 		softwareURL      = flag.String("software-url", "", "download URL advertised with --software-version")
@@ -582,6 +586,19 @@ func run() error {
 	}
 	log.Info("server identity", "public_key", serverIdentity.PublicKeyText())
 
+	var accessIssuer *acl.Issuer
+	if *accessIssuerName != "" || *accessKeyID != "" || *accessSeed != "" {
+		if *accessIssuerName == "" || *accessKeyID == "" || *accessSeed == "" {
+			return errors.New("--access-issuer, --access-kid and --access-key must be set together")
+		}
+		accessIssuer, err = acl.NewIssuerFromSeed(*accessIssuerName, *accessKeyID, *accessSeed)
+		if err != nil {
+			return fmt.Errorf("--access-key: %w", err)
+		}
+		log.Info("access ticket issuer", "issuer", accessIssuer.Name(), "kid", accessIssuer.KeyID(),
+			"public_key", accessIssuer.PublicKeyText())
+	}
+
 	var (
 		softwareSHA256             string
 		softwareSize               int64
@@ -1043,6 +1060,7 @@ func run() error {
 		ServerKey:         *serverKey,
 		LinkKey:           *linkKey,
 		HostKey:           *hostKey,
+		AccessIssuer:      accessIssuer,
 		WakeRelays:        wakeRelays,
 		TTL:               *hostTTL,
 		RelayOnly:         relayOnlyFlag,
@@ -1273,7 +1291,8 @@ func checkServerKey(key string, insecure bool, httpListen string) error {
 	return nil
 }
 
-func isLoopbackHost(host string) bool {	host = strings.Trim(host, "[]")
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(host, "[]")
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}

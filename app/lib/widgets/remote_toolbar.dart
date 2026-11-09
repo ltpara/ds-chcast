@@ -134,6 +134,10 @@ class RemoteToolbar extends StatelessWidget {
     this.recordingDenied = false,
     this.recording = false,
     this.onToggleRecording,
+    this.autoRecord = false,
+    this.recordKeep = 0,
+    this.onAutoRecordChanged,
+    this.onRecordKeepChanged,
     required this.onTogglePin,
     required this.onToggleStats,
     required this.onToggleFullscreen,
@@ -308,6 +312,15 @@ class RemoteToolbar extends StatelessWidget {
   final bool recordingDenied;
   final bool recording;
   final VoidCallback? onToggleRecording;
+
+  /// Start a recording automatically when a session turns live and the host
+  /// grants recording. Edited, together with the retention limit, by a long
+  /// press on the record button; each choice is shared by all sessions on this
+  /// viewer.
+  final bool autoRecord;
+  final int recordKeep;
+  final ValueChanged<bool>? onAutoRecordChanged;
+  final ValueChanged<int>? onRecordKeepChanged;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
   final VoidCallback onToggleFullscreen;
@@ -550,6 +563,59 @@ class RemoteToolbar extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  /// Recording options behind a long press: RustDesk keeps auto-record in its
+  /// general settings, which this viewer does not have, so the record button
+  /// owns both the auto-record switch and the retention limit.
+  Future<void> _openRecordingMenu(BuildContext context) async {
+    if (onAutoRecordChanged == null && onRecordKeepChanged == null) {
+      return;
+    }
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) {
+      return;
+    }
+    final Offset origin = box.localToGlobal(Offset.zero);
+    final Object? selected = await showMenu<Object>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        origin.dx,
+        origin.dy + box.size.height,
+        origin.dx + 300,
+        origin.dy + box.size.height,
+      ),
+      color: const Color(0xFF24252B),
+      elevation: 8,
+      items: <PopupMenuEntry<Object>>[
+        CheckedPopupMenuItem<Object>(
+          value: 'auto',
+          checked: autoRecord,
+          child: Text(tr('每次会话自动录制')),
+        ),
+        const PopupMenuDivider(),
+        CheckedPopupMenuItem<Object>(
+          value: 0,
+          checked: recordKeep == 0,
+          child: Text(tr('保留全部录制')),
+        ),
+        CheckedPopupMenuItem<Object>(
+          value: 10,
+          checked: recordKeep == 10,
+          child: Text(tr('保留最近 10 个录制')),
+        ),
+        CheckedPopupMenuItem<Object>(
+          value: 30,
+          checked: recordKeep == 30,
+          child: Text(tr('保留最近 30 个录制')),
+        ),
+      ],
+    );
+    if (selected == 'auto') {
+      onAutoRecordChanged?.call(!autoRecord);
+    } else if (selected is int) {
+      onRecordKeepChanged?.call(selected);
+    }
   }
 
   @override
@@ -921,10 +987,16 @@ class RemoteToolbar extends StatelessWidget {
                     ? (recordingDenied ? tr('主机未开放录制') : tr('会话建立后可录制到本地'))
                     : recording
                     ? tr('停止录制（保存为本地 MP4）')
-                    : tr('录制到本地（保存为 MP4）'),
+                    : autoRecord
+                    ? tr('录制到本地（已开启自动录制，长按设置）')
+                    : tr('录制到本地（保存为 MP4，长按设置自动录制）'),
                 disabled: !recordingAvailable,
                 active: recording,
                 onTap: () => onToggleRecording?.call(),
+                onLongPress:
+                    onAutoRecordChanged != null || onRecordKeepChanged != null
+                    ? _openRecordingMenu
+                    : null,
               ),
               _BarButton(
                 icon: portForwardActive

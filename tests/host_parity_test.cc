@@ -719,6 +719,151 @@ void global_policy(bool frozen) {
     finish(publisher);
 }
 
+struct LoopbackEcho {
+    SOCKET listener = INVALID_SOCKET;
+    std::atomic<bool> echoed{false};
+    std::atomic<bool> closed{false};
+    std::atomic<bool> stopping{false};
+    std::thread worker;
+    uint16_t port = 0;
+    LoopbackEcho() {
+        listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        require(listener != INVALID_SOCKET, "create the loopback echo listener");
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        require(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0,
+                "bind the loopback echo listener");
+        require(listen(listener, 1) == 0, "listen on the loopback echo port");
+        int length = sizeof(addr);
+        require(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &length) == 0,
+                "read the loopback echo port");
+        port = ntohs(addr.sin_port);
+        worker = std::thread([this] {
+            SOCKET client = INVALID_SOCKET;
+            char buffer[256];
+            while (!stopping.load()) {
+                fd_set ready;
+                FD_ZERO(&ready);
+                FD_SET(client == INVALID_SOCKET ? listener : client, &ready);
+                timeval wait{0, 100000};
+                const int signalled = select(0, &ready, nullptr, nullptr, &wait);
+                if (signalled <= 0) {
+                    continue;
+                }
+                if (client == INVALID_SOCKET) {
+                    client = accept(listener, nullptr, nullptr);
+                    continue;
+                }
+                const int got = recv(client, buffer, sizeof(buffer), 0);
+                if (got <= 0) {
+                    closed.store(true);
+                    break;
+                }
+                if (send(client, buffer, got, 0) == got) {
+                    echoed.store(true);
+                }
+            }
+            if (client != INVALID_SOCKET) {
+                closesocket(client);
+            }
+        });
+    }
+    ~LoopbackEcho() {
+        stopping.store(true);
+        if (worker.joinable()) worker.join();
+        if (listener != INVALID_SOCKET) closesocket(listener);
+    }
+};
+
+void running_services_revocation() {
+    LoopbackEcho echo;
+    Fixture f;
+    f.config.settings.allow_port_forward = true;
+    std::mutex log_mutex;
+    std::vector<std::string> logs;
+    f.config.log = [&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        logs.push_back(line);
+    };
+    f.start();
+    auto viewer = f.connect();
+    require((viewer->permissions() & (kPermissionPortForward | kPermissionTerminal)) ==
+                (kPermissionPortForward | kPermissionTerminal),
+            "desktop session receives forwarding and console grants");
+
+    require(viewer->request_port_forward(1, "127.0.0.1", echo.port).ok(),
+            "register a loopback forwarding target");
+    PortForwardResult forward_result;
+    require(until([&] { return viewer->take_port_forward_result(forward_result); }) &&
+            forward_result.code == PortForwardCode::Ok, "the host approves the target");
+    PortForwardHandle handle = 0;
+    require(viewer->open_port_forward_connection(1, 7, handle).ok(),
+            "open one forwarded connection");
+    require(viewer->wait_port_forward_connection(handle, 4s).ok(),
+            "the host dials the loopback service");
+    const char ping[] = "ping";
+    require(viewer->send_port_forward_data(handle,
+                reinterpret_cast<const uint8_t*>(ping), sizeof(ping) - 1, 1s).ok(),
+            "bytes enter the host relay");
+    std::vector<uint8_t> chunk;
+    require(until([&] {
+        const Error received =
+            viewer->receive_port_forward_data(handle, chunk, 100ms);
+        return received.ok() &&
+               std::string(chunk.begin(), chunk.end()) == "ping";
+    }, 4s) && echo.echoed.load(), "the loopback service echoes through the host");
+
+    require(viewer->request_terminal(1, 80, 24).ok(), "request a console");
+    TerminalResult terminal;
+    require(until([&] { return viewer->take_terminal_result(terminal); }) &&
+            terminal.code == TerminalCode::Ok, "the host starts the console");
+    require(viewer->open_terminal_input(1).ok(), "open the console uplink");
+    const std::string command = "echo chast-revocation\r\n";
+    require(viewer->send_terminal_input(1,
+                reinterpret_cast<const uint8_t*>(command.data()), command.size(), 1s).ok(),
+            "type into the console");
+    bool printed = false;
+    require(until([&] {
+        std::vector<uint8_t> output;
+        bool ended = false;
+        while (viewer->take_terminal_output(1, output, ended)) {
+            if (std::string(output.begin(), output.end())
+                    .find("chast-revocation") != std::string::npos) {
+                printed = true;
+            }
+        }
+        return printed;
+    }, 6s), "the console echoes the command");
+
+    f.host->set_permissions(kPermissionAll &
+                            ~(kPermissionPortForward | kPermissionTerminal));
+    require(until([&] {
+        return (viewer->permissions() & (kPermissionPortForward | kPermissionTerminal)) == 0;
+    }), "revocation reaches the viewer as a capability update");
+    require(until([&] {
+        return !viewer->send_port_forward_data(handle,
+                   reinterpret_cast<const uint8_t*>(ping), sizeof(ping) - 1, 100ms).ok();
+    }), "the revoked forward refuses new bytes");
+    require(until([&] {
+        return !viewer->send_terminal_input(1,
+                   reinterpret_cast<const uint8_t*>(command.data()), command.size(), 100ms).ok();
+    }), "the revoked console refuses new keystrokes");
+    require(until([&] { return echo.closed.load(); }, 4s),
+            "the host relay closes the forwarded TCP socket");
+    require(until([&] {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        for (const std::string& line : logs) {
+            if (line.find("terminal access was revoked") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }, 4s), "the host relay tears the console and its child down");
+    finish(viewer);
+}
+
 void pending_approval() {
     Fixture f;
     f.config.service_mode = false;
@@ -2266,9 +2411,17 @@ int main(int argc, char** argv) {
         WSACleanup();
         return failures ? 1 : 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--revocation") {
+        run("running services stop when their permission is revoked",
+            running_services_revocation);
+        WSACleanup();
+        return failures ? 1 : 0;
+    }
     run("elevation permission and cancellation", elevation_permissions);
     run("authenticated local elevation handoff", elevation_handoff);
     run("clipboard directions and independent file permissions", clipboard_directions);
+    run("running services stop when their permission is revoked",
+        running_services_revocation);
     run("session power request ownership", session_power_requests);
     run("static desktop, follower requests and audio", static_desktop_and_followers);
     run("global policy", [] { global_policy(false); });

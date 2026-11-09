@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -13,12 +14,23 @@ namespace chast {
 namespace {
 constexpr wchar_t kWindowClass[] = L"ChastClipboardListener";
 
+struct Run {
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~Run() {
+        if (ready) CloseHandle(ready);
+        if (cancel) CloseHandle(cancel);
+        if (done) CloseHandle(done);
+    }
+};
+
 struct State {
     std::mutex mutex;
     std::map<uint64_t, std::function<void()>> subscribers;
     uint64_t next_id = 1;
     std::thread thread;
-    HWND window = nullptr;
+    std::shared_ptr<Run> run;
     bool running = false;
 };
 
@@ -64,7 +76,7 @@ bool RegisterWindowClass() {
     return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
-void ThreadMain(HANDLE ready) {
+void ThreadMain(std::shared_ptr<Run> run) {
     HWND window = nullptr;
     bool listening = false;
     if (RegisterWindowClass()) {
@@ -80,18 +92,33 @@ void ThreadMain(HANDLE ready) {
     }
     {
         std::lock_guard<std::mutex> lock(state().mutex);
-        state().window = window;
+        listening = listening && WaitForSingleObject(run->cancel, 0) == WAIT_TIMEOUT;
         state().running = listening;
+        running.store(listening, std::memory_order_release);
     }
-    running.store(listening, std::memory_order_release);
-    SetEvent(ready);
-    if (!listening) return;
-    MSG message;
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+    SetEvent(run->ready);
+    while (listening) {
+        const DWORD result = MsgWaitForMultipleObjects(
+            1, &run->cancel, FALSE, INFINITE, QS_ALLINPUT);
+        if (result != WAIT_OBJECT_0 + 1) break;
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT ||
+                WaitForSingleObject(run->cancel, 0) != WAIT_TIMEOUT) {
+                listening = false;
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
-    running.store(false, std::memory_order_release);
+    if (window != nullptr && IsWindow(window)) DestroyWindow(window);
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        state().running = false;
+        running.store(false, std::memory_order_release);
+    }
+    SetEvent(run->done);
 }
 } // namespace
 
@@ -115,31 +142,33 @@ uint64_t ClipboardListener::Subscribe(std::function<void()> changed) {
                 shared.subscribers.emplace(id, std::move(changed));
                 return id;
             }
-            // A listener that lost its message loop is replaced, not reused.
+            // A timed-out startup still owns its handles and thread. Do not
+            // wait for it here or spawn more workers while Win32 is stalled.
+            if (WaitForSingleObject(shared.run->done, 0) != WAIT_OBJECT_0) return 0;
             stale = std::move(shared.thread);
         }
     }
     if (stale.joinable()) stale.join();
-    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (ready == nullptr) return 0;
-    std::thread thread(ThreadMain, ready);
-    WaitForSingleObject(ready, 2000);
-    CloseHandle(ready);
-    std::thread failed;
+    auto run = std::make_shared<Run>();
+    if (!run->ready || !run->cancel || !run->done) return 0;
+    try {
+        shared.thread = std::thread(ThreadMain, run);
+        shared.run = run;
+    } catch (const std::system_error&) {
+        return 0;
+    }
+    const DWORD ready = WaitForSingleObject(run->ready, 2000);
     uint64_t id = 0;
     {
         std::lock_guard<std::mutex> lock(shared.mutex);
-        shared.thread = std::move(thread);
-        if (!shared.running) {
-            failed = std::move(shared.thread);
+        if (ready != WAIT_OBJECT_0 || !shared.running) {
+            SetEvent(run->cancel);
+            shared.running = false;
+            running.store(false, std::memory_order_release);
         } else {
             id = shared.next_id++;
             shared.subscribers.emplace(id, std::move(changed));
         }
-    }
-    if (failed.joinable()) {
-        failed.join();
-        return 0;
     }
     return id;
 }
@@ -148,18 +177,23 @@ void ClipboardListener::Unsubscribe(uint64_t subscription) {
     if (subscription == 0) return;
     std::lock_guard<std::mutex> starting(start_mutex);
     State& shared = state();
-    HWND window = nullptr;
     std::thread thread;
     {
         std::lock_guard<std::mutex> lock(shared.mutex);
         shared.subscribers.erase(subscription);
         if (!shared.subscribers.empty() || !shared.thread.joinable()) return;
-        window = shared.window;
-        shared.window = nullptr;
         shared.running = false;
-        thread = std::move(shared.thread);
+        running.store(false, std::memory_order_release);
+        SetEvent(shared.run->cancel);
+        // A callback may unsubscribe itself. The next Subscribe reaps this
+        // thread after it exits; joining oneself is never valid.
+        if (shared.thread.get_id() == std::this_thread::get_id()) return;
     }
-    if (window != nullptr) PostMessageW(window, WM_CLOSE, 0, 0);
+    // Cancellation may arrive while Win32 is still creating the window, or
+    // while a callback is running. Leave the run owned by State on timeout;
+    // later Subscribe calls reap it once done, without creating extra workers.
+    if (WaitForSingleObject(shared.run->done, 2000) != WAIT_OBJECT_0) return;
+    thread = std::move(shared.thread);
     if (thread.joinable()) thread.join();
     running.store(false, std::memory_order_release);
 }

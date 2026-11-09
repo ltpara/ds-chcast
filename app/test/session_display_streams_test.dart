@@ -283,6 +283,19 @@ void main() {
       await poll();
       expect(tester.widget<RemoteView>(find.byType(RemoteView)).textureId, 104);
       expect(starts, 1);
+      // A child changed view/input preferences while the owner was inactive.
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pump();
+      ViewPreferences.update(
+        peerId: '127.0.0.1:1',
+        fit: 1,
+        keyboardMode: 'local',
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      await poll();
+      expect(toolbar().fit, ViewFit.original);
+      expect(toolbar().keyboardMode, ViewerKeyboardMode.local);
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump();
       await tester.pump();
@@ -300,6 +313,12 @@ void main() {
   testWidgets(
     'display child shares a session, maps coordinates and detaches before closing',
     (tester) async {
+      final dir = Directory.systemTemp.createTempSync('chast-display-child-');
+      ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
+      addTearDown(() {
+        ViewPreferences.configPathOverride = null;
+        dir.deleteSync(recursive: true);
+      });
       const native = MethodChannel('chast/viewer');
       const gpu = MethodChannel('flutter_gpu_texture_renderer');
       final messenger = tester.binding.defaultBinaryMessenger;

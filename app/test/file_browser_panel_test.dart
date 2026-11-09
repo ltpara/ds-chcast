@@ -25,6 +25,7 @@ ViewerFileListing _listing(
   bool truncated = false,
   String cursor = '',
   String nextCursor = '',
+  bool showHidden = false,
 }) {
   return ViewerFileListing(
     directory: directory,
@@ -34,6 +35,7 @@ ViewerFileListing _listing(
     entries: entries,
     cursor: cursor,
     nextCursor: nextCursor,
+    showHidden: showHidden,
   );
 }
 
@@ -74,6 +76,8 @@ Widget _host({
   required ViewerStatus status,
   required _ListRequest onRequestList,
   Future<bool> Function(String directory, String cursor)? onRequestPage,
+  Future<bool> Function(String directory, String cursor, bool showHidden)?
+  onRequestView,
   _DownloadRequest? onRequestDownload,
   _TakeList? onTakeList,
   _UploadRequest? onUpload,
@@ -89,7 +93,9 @@ Widget _host({
   ValueChanged<String>? onDirectoryChanged,
   FileBrowserSort initialSort = FileBrowserSort.name,
   bool initialSortAscending = true,
+  bool initialShowHidden = false,
   FileBrowserSortChanged? onSortChanged,
+  ValueChanged<bool>? onShowHiddenChanged,
   VoidCallback? onClose,
 }) {
   return MaterialApp(
@@ -98,15 +104,20 @@ Widget _host({
       body: Center(
         child: FileBrowserPanel(
           status: status,
-          onRequestList: (String directory, [String cursor = '']) =>
-              onRequestPage?.call(directory, cursor) ??
-              onRequestList(directory),
+          onRequestList:
+              (String directory, [String cursor = '', bool showHidden = false]) =>
+                  onRequestView?.call(directory, cursor, showHidden) ??
+                  onRequestPage?.call(directory, cursor) ??
+                  onRequestList(directory),
           onRequestDownload: onRequestDownload ?? (_) async => true,
           onTakeList: onTakeList ?? () async => null,
           onUpload: onUpload ?? (_) async => null,
           onFileOperation: onFileOperation ?? (_, _, _) async => true,
-          onDownloadFolder: onDownloadFolder ?? (_) async => true,
-          onDownloadEntries: onDownloadEntries ?? (_) async => true,
+          onDownloadFolder: (String path, [bool showHidden = false]) =>
+              onDownloadFolder?.call(path) ?? Future<bool>.value(true),
+          onDownloadEntries:
+              (List<ViewerFileSelection> entries, [bool showHidden = false]) =>
+                  onDownloadEntries?.call(entries) ?? Future<bool>.value(true),
           onCancelFolderDownload: onCancelFolderDownload ?? () async {},
           onCancelUpload: onCancelUpload ?? () async {},
           onCancelDownload: onCancelDownload ?? () async {},
@@ -116,7 +127,9 @@ Widget _host({
           onDirectoryChanged: onDirectoryChanged,
           initialSort: initialSort,
           initialSortAscending: initialSortAscending,
+          initialShowHidden: initialShowHidden,
           onSortChanged: onSortChanged,
+          onShowHiddenChanged: onShowHiddenChanged,
           onClose: onClose ?? () {},
         ),
       ),
@@ -187,6 +200,63 @@ void main() {
       expect(find.text('a.txt'), findsNothing);
     },
   );
+
+  testWidgets('the hidden-entry toggle reloads and ignores the other view', (
+    WidgetTester tester,
+  ) async {
+    final List<(String, String, bool)> requests = <(String, String, bool)>[];
+    final List<bool> remembered = <bool>[];
+    ViewerFileListing answer = _listing('', <ViewerFileEntry>[
+      _file('visible.txt'),
+    ]);
+    Widget build(int count) => _host(
+      status: ViewerStatus(fileListAnswers: count),
+      onRequestList: (_) async => true,
+      onRequestView: (String directory, String cursor, bool showHidden) async {
+        requests.add((directory, cursor, showHidden));
+        return true;
+      },
+      onTakeList: () async => answer,
+      onShowHiddenChanged: remembered.add,
+    );
+
+    await tester.pumpWidget(build(0));
+    await tester.pump();
+    expect(requests.last, ('', '', false));
+    await tester.pumpWidget(build(1));
+    await tester.pumpAndSettle();
+    expect(find.text('visible.txt'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey<String>('file-show-hidden')));
+    await tester.pump();
+    expect(requests.last, ('', '', true));
+    expect(remembered, <bool>[true]);
+    // An answer for the other view must not replace the page even though the
+    // directory and cursor are identical.
+    answer = _listing('', <ViewerFileEntry>[_file('stale.txt')]);
+    await tester.pumpWidget(build(2));
+    await tester.pumpAndSettle();
+    expect(find.text('stale.txt'), findsNothing);
+    expect(find.text('visible.txt'), findsOneWidget);
+
+    answer = _listing('', <ViewerFileEntry>[
+      _file('visible.txt'),
+      _file('hidden.txt'),
+    ], showHidden: true);
+    await tester.pumpWidget(build(3));
+    await tester.pumpAndSettle();
+    expect(find.text('hidden.txt'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey<String>('file-show-hidden')));
+    await tester.pump();
+    expect(requests.last, ('', '', false));
+    expect(remembered, <bool>[true, false]);
+    answer = _listing('', <ViewerFileEntry>[_file('visible.txt')]);
+    await tester.pumpWidget(build(4));
+    await tester.pumpAndSettle();
+    expect(find.text('hidden.txt'), findsNothing);
+    expect(find.text('visible.txt'), findsOneWidget);
+  });
 
   testWidgets('asks for the shared root on mount and adopts the listing', (
     WidgetTester tester,
@@ -1811,7 +1881,7 @@ void main() {
     await tester.tap(find.text('删除'));
     await tester.pumpAndSettle();
     expect(find.text('删除“photos”？'), findsOneWidget);
-    expect(find.text('文件夹必须为空才能删除，此操作不可撤销。'), findsOneWidget);
+    expect(find.text('文件夹及其内容将被删除，此操作不可撤销。'), findsOneWidget);
     await tester.tap(find.widgetWithText(TextButton, '取消'));
     await tester.pumpAndSettle();
     expect(ops, isEmpty);
@@ -1822,7 +1892,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(TextButton, '删除'));
     await tester.pumpAndSettle();
-    expect(ops, <String>['remove:photos']);
+    expect(ops, <String>['removeTree:photos']);
 
     await tester.pumpWidget(
       build(
@@ -2338,7 +2408,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // One request is outstanding at a time, so a poll cannot merge answers.
-    expect(ops, <String>['remove:photos']);
+    // A selected folder is removed with its contents, a file stays single.
+    expect(ops, <String>['removeTree:photos']);
     expect(find.text('正在删除选中的 2 项…'), findsOneWidget);
 
     await tester.pumpWidget(
@@ -2351,7 +2422,7 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(ops, <String>['remove:photos', 'remove:notes.txt']);
+    expect(ops, <String>['removeTree:photos', 'remove:notes.txt']);
 
     // The last answer fails: one success, one failure, and a single reload.
     await tester.pumpWidget(

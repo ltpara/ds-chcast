@@ -2,7 +2,17 @@ import 'package:flutter/services.dart';
 import 'package:chast_viewer/l10n.dart';
 
 enum ViewerState { idle, connecting, handshaking, streaming, ended, failed }
-enum ViewerKeyboardMode { physical, local }
+
+enum ViewerKeyboardMode { physical, legacy, local }
+
+ViewerKeyboardMode viewerKeyboardModeFromName(String? name) {
+  for (final ViewerKeyboardMode mode in ViewerKeyboardMode.values) {
+    if (mode.name == name) {
+      return mode;
+    }
+  }
+  return ViewerKeyboardMode.physical;
+}
 
 /// One remote console's life on the viewer (chast_viewer::TerminalPhase).
 /// Requesting covers the round trip to the host's answer; ended means the host
@@ -177,7 +187,8 @@ class ViewerFileEntry {
 enum ViewerFileOperation {
   makeDirectory(0),
   rename(1),
-  remove(2);
+  remove(2),
+  removeTree(3);
 
   const ViewerFileOperation(this.wireValue);
 
@@ -197,6 +208,7 @@ class ViewerFileListing {
     required this.entries,
     this.cursor = '',
     this.nextCursor = '',
+    this.showHidden = false,
   });
 
   final String directory;
@@ -206,6 +218,10 @@ class ViewerFileListing {
   final List<ViewerFileEntry> entries;
   final String cursor;
   final String nextCursor;
+
+  /// The hidden-entry view the listing was requested with, echoed by the
+  /// viewer so a page never mixes an answer from the other view.
+  final bool showHidden;
 
   bool get ok => code == 0;
 }
@@ -1437,8 +1453,11 @@ class ViewerStatus {
   String get audioOutputLabel => audioDeviceName.isNotEmpty
       ? audioDeviceName
       : (audioDevice.isEmpty ? tr('系统默认输出') : tr('输出设备'));
-  String get codecLabel =>
-      codec == 'vp9' ? 'VP9' : codec == 'hevc' ? 'HEVC' : (codec == 'av1' ? 'AV1' : 'H.264');
+  String get codecLabel => codec == 'vp9'
+      ? 'VP9'
+      : codec == 'hevc'
+      ? 'HEVC'
+      : (codec == 'av1' ? 'AV1' : 'H.264');
 
   /// "UDP", "TCP 回退" or "WebSocket 回退" for the stats overlay.
   String get transportLabel {
@@ -1877,6 +1896,10 @@ class ViewerBridge {
   /// not allow file transfer refuses the Hello. [sessionMode] (v41) selects
   /// `terminal`, `camera` or `port_forward` instead; those also need no
   /// [gpuOutput].
+  ///
+  /// [accessTicket] is the base64url signed ticket a managed host requires
+  /// (v62). It must have been minted for the public key returned by
+  /// [ticketIdentity]; leave it empty for hosts that authenticate locally.
   static Future<void> start({
     required String host,
     required int port,
@@ -1895,6 +1918,7 @@ class ViewerBridge {
     String carrierToken = '',
     bool fileTransferOnly = false,
     String sessionMode = 'desktop',
+    String accessTicket = '',
   }) async {
     await _channel.invokeMethod<void>('start', <String, Object>{
       'host': host,
@@ -1914,7 +1938,28 @@ class ViewerBridge {
       'carrierToken': carrierToken,
       'fileTransferOnly': fileTransferOnly,
       'sessionMode': sessionMode,
+      if (accessTicket.isNotEmpty) 'accessTicket': accessTicket,
     });
+  }
+
+  /// The base64url Ed25519 public key this installation names in lookup. The
+  /// native side creates and DPAPI-protects the seed on first use, so the key
+  /// survives restarts and every ticket stays bound to this viewer.
+  static Future<String> ticketIdentity() async {
+    final String? key = await _channel.invokeMethod<String>('ticketIdentity');
+    return key ?? '';
+  }
+
+  /// Hands a freshly fetched ticket to the running managed session. The engine
+  /// sends TicketRenew on its own thread and moves the host's lease to the new
+  /// expiry. Returns false when no session is running or the ticket is not a
+  /// signed envelope.
+  static Future<bool> renewAccessTicket(String ticket) async {
+    final bool? accepted = await _channel.invokeMethod<bool>(
+      'renewAccessTicket',
+      ticket,
+    );
+    return accepted ?? false;
   }
 
   /// Reads the password saved for [trustKey] from this Windows account's
@@ -2001,15 +2046,17 @@ class ViewerBridge {
     int y = 0,
     int modifiers = 0,
   }) async {
-    final bool? queued = await _channel
-        .invokeMethod<bool>('sendInput', <String, Object>{
-          'kind': 1,
-          'action': action,
-          'buttons': buttons,
-          'x': x,
-          'y': y,
-          'modifiers': modifiers,
-        });
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'sendInput',
+      <String, Object>{
+        'kind': 1,
+        'action': action,
+        'buttons': buttons,
+        'x': x,
+        'y': y,
+        'modifiers': modifiers,
+      },
+    );
     return queued ?? false;
   }
 
@@ -2074,15 +2121,17 @@ class ViewerBridge {
     int y = 0,
     int modifiers = 0,
   }) async {
-    final bool? queued = await _channel
-        .invokeMethod<bool>('sendInput', <String, Object>{
-          'kind': 5,
-          'action': zoom ? 1 : 0,
-          'buttons': 0,
-          'x': x,
-          'y': y,
-          'modifiers': modifiers,
-        });
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'sendInput',
+      <String, Object>{
+        'kind': 5,
+        'action': zoom ? 1 : 0,
+        'buttons': 0,
+        'x': x,
+        'y': y,
+        'modifiers': modifiers,
+      },
+    );
     return queued ?? false;
   }
 
@@ -2205,7 +2254,12 @@ class ViewerBridge {
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>(
       'setStreamOptions',
-      <String, Object>{'codec': codec, 'maxFps': maxFps, 'quality': quality, 'chroma': chroma},
+      <String, Object>{
+        'codec': codec,
+        'maxFps': maxFps,
+        'quality': quality,
+        'chroma': chroma,
+      },
     );
     return queued ?? false;
   }
@@ -2335,13 +2389,15 @@ class ViewerBridge {
     int terminalId = 1,
     int serviceId = 0,
   }) async {
-    final bool? opened = await _channel
-        .invokeMethod<bool>('openTerminal', <String, Object>{
-          'columns': columns,
-          'rows': rows,
-          'terminalId': terminalId,
-          'serviceId': serviceId,
-        });
+    final bool? opened = await _channel.invokeMethod<bool>(
+      'openTerminal',
+      <String, Object>{
+        'columns': columns,
+        'rows': rows,
+        'terminalId': terminalId,
+        'serviceId': serviceId,
+      },
+    );
     return opened ?? false;
   }
 
@@ -2598,14 +2654,20 @@ class ViewerBridge {
   /// the request was not queued: no streaming session, the host did not grant
   /// [ViewerPermission.fileTransfer], or too many requests are in flight. The
   /// answer arrives through [ViewerStatus.fileListAnswers] and
-  /// [takeFileList].
+  /// [takeFileList]. [showHidden] keeps entries the host marked hidden; the
+  /// answer echoes it so a page can discard the other view's answers.
   static Future<bool> requestFileList(
     String directory, [
     String cursor = '',
+    bool showHidden = false,
   ]) async {
     final bool? queued = await _channel.invokeMethod<bool>(
       'requestFileList',
-      <String, Object>{'directory': directory, 'cursor': cursor},
+      <String, Object>{
+        'directory': directory,
+        'cursor': cursor,
+        'showHidden': showHidden,
+      },
     );
     return queued ?? false;
   }
@@ -2651,10 +2713,13 @@ class ViewerBridge {
   /// [path] is '/'-separated, relative and non-empty. False means the walk was
   /// not started (see [requestFileList], or one is already running). Progress
   /// and the outcome arrive through the `folderDownload*` status fields.
-  static Future<bool> downloadFolder(String path) async {
+  static Future<bool> downloadFolder(
+    String path, [
+    bool showHidden = false,
+  ]) async {
     final bool? queued = await _channel.invokeMethod<bool>(
       'downloadFolder',
-      path,
+      <String, Object>{'path': path, 'showHidden': showHidden},
     );
     return queued ?? false;
   }
@@ -2666,20 +2731,26 @@ class ViewerBridge {
   /// (see [requestFileList], or one is already running). Progress and the
   /// outcome arrive through the `folderDownload*` status fields, with
   /// [ViewerStatus.folderDownloadRoots] naming the selection size.
-  static Future<bool> downloadEntries(List<ViewerFileSelection> entries) async {
+  static Future<bool> downloadEntries(
+    List<ViewerFileSelection> entries, [
+    bool showHidden = false,
+  ]) async {
     if (entries.isEmpty) {
       return false;
     }
     final bool? queued = await _channel.invokeMethod<bool>(
       'downloadEntries',
-      entries
-          .map(
-            (ViewerFileSelection entry) => <String, Object?>{
-              'path': entry.path,
-              'directory': entry.directory,
-            },
-          )
-          .toList(),
+      <String, Object>{
+        'entries': entries
+            .map(
+              (ViewerFileSelection entry) => <String, Object?>{
+                'path': entry.path,
+                'directory': entry.directory,
+              },
+            )
+            .toList(),
+        'showHidden': showHidden,
+      },
     );
     return queued ?? false;
   }
@@ -2758,6 +2829,7 @@ class ViewerBridge {
       truncated: map['truncated'] == true,
       cursor: map['cursor']?.toString() ?? '',
       nextCursor: map['nextCursor']?.toString() ?? '',
+      showHidden: map['showHidden'] == true,
       entries: entries,
     );
   }

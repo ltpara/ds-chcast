@@ -56,18 +56,21 @@ func runHost(args []string) error {
 	fs := flag.NewFlagSet("host", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "management server key (visible in the process command line; prefer --server-key-stdin)")
-	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the server key from the first line of stdin; overrides --server-key")
+	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the registration key before device key and proxy from stdin; overrides --server-key")
 	hostKey := fs.String("host-key", "", "host registration key installed by the operator; empty reuses --server-key (visible in the process command line; prefer --host-key-stdin)")
-	hostKeyStdin := fs.Bool("host-key-stdin", false, "read the host key from stdin instead of --host-key")
+	hostKeyStdin := fs.Bool("host-key-stdin", false, "read the registration key before device key and proxy from stdin; overrides --host-key")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id registered with the service")
 	oldID := fs.String("old-id", "", "previous host id to migrate on the server (used after changing --id)")
-	key := fs.String("key", "", "host key, at least 8 characters")
+	key := fs.String("key", "", "device key, at least 8 characters (visible in the process command line; prefer --key-stdin)")
+	keyStdin := fs.Bool("key-stdin", false, "read the device key after registration key and before proxy from stdin; overrides --key")
 	fingerprint := fs.String("fingerprint", "", "certificate fingerprint shown in lookups")
 	local := fs.String("local", "127.0.0.1:4433", "chast-host QUIC listener")
 	carrierAddr := fs.String("carrier", "", "chast-host TCP carrier listener (127.0.0.1:P+1); empty disables the relay's TCP fallback")
 	auditSpool := fs.String("audit-spool", "", "chast-host JSONL audit spool; the agent signs and forwards it")
+	policyState := fs.String("policy-state", "", "machine file that caches the server device policy; shared with chast-host as its managed marker")
+	policyAck := fs.String("policy-ack", "", "machine file chast-host writes after accepting a policy version; the agent signs the server receipt from it")
 	listen := fs.String("listen", "[::]:14434", "public-facing UDP address of this agent (dual-stack where available)")
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
@@ -81,6 +84,7 @@ func runHost(args []string) error {
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
 	proxyURL := fs.String("proxy", "", "outbound http://, https://, socks5:// or socks5h:// proxy for the API and TCP carrier (falls back to CHAST_PROXY)")
+	proxyStdin := fs.Bool("proxy-stdin", false, "read the proxy after registration and device keys from stdin; overrides --proxy")
 	wakeRelay := fs.Bool("wake-relay", false, "relay cross-subnet Wake-on-LAN jobs from the server onto this machine's link")
 	wakeTargets := fs.String("wake-targets", "", "comma-separated broadcast destinations for wake relays, e.g. 127.0.0.1:9 for a local diagnostic")
 	verbose := fs.Bool("verbose", false, "debug logging")
@@ -89,27 +93,13 @@ func runHost(args []string) error {
 	if *hostKeyStdin && *serverKeyStdin {
 		return fmt.Errorf("--host-key-stdin and --server-key-stdin cannot be combined")
 	}
-	if *serverKeyStdin {
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		key := strings.TrimRight(line, "\r\n")
-		if key == "" {
-			if err != nil {
-				return fmt.Errorf("read server key from stdin: %w", err)
-			}
-			return fmt.Errorf("read server key from stdin: empty key")
-		}
-		*serverKey = key
-	}
-	if *hostKeyStdin {
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		key := strings.TrimRight(line, "\r\n")
-		if key == "" {
-			if err != nil {
-				return fmt.Errorf("read host key from stdin: %w", err)
-			}
-			return fmt.Errorf("read host key from stdin: empty key")
-		}
-		*hostKey = key
+	if err := readStdinSecrets(os.Stdin,
+		stdinSecret{"server key", serverKey, *serverKeyStdin, 256},
+		stdinSecret{"host key", hostKey, *hostKeyStdin, 256},
+		stdinSecret{"device key", key, *keyStdin, 128},
+		stdinSecret{"proxy", proxyURL, *proxyStdin, 512},
+	); err != nil {
+		return err
 	}
 	proxy, err := resolveProxy(*proxyURL)
 	if err != nil {
@@ -162,6 +152,8 @@ func runHost(args []string) error {
 		LocalAddr:                 *local,
 		CarrierAddr:               *carrierAddr,
 		AuditSpool:                *auditSpool,
+		PolicyState:               *policyState,
+		PolicyAck:                 *policyAck,
 		ListenAddr:                *listen,
 		Keepalive:                 *keepalive,
 		UPnP:                      *upnpEnabled,
@@ -187,6 +179,7 @@ func runHost(args []string) error {
 				Relay:        info.Relay,
 				NAT:          info.NAT,
 				MigratedFrom: info.MigratedFrom,
+				Policy:       info.Policy,
 			}
 			if info.Viewer != "" {
 				event.Event = "viewer"
@@ -218,6 +211,7 @@ func runHost(args []string) error {
 		Relay:        info.Relay,
 		NAT:          info.NAT,
 		MigratedFrom: info.MigratedFrom,
+		Policy:       info.Policy,
 	})
 	emitMu.Unlock()
 	log.Info("host agent online", "id", *id)
@@ -536,22 +530,23 @@ func splitCSV(value string) []string {
 }
 
 type agentEvent struct {
-	Event        string `json:"event"`
-	Error        string `json:"error,omitempty"`
-	Retryable    bool   `json:"retryable,omitempty"`
-	Listen       string `json:"listen,omitempty"`
-	Host         string `json:"host,omitempty"`
-	Path         string `json:"path,omitempty"`
-	Transport    string `json:"transport,omitempty"`
-	Remote       string `json:"remote,omitempty"`
-	Punch        string `json:"punch,omitempty"`
-	Direct       string `json:"direct,omitempty"`
-	Relay        string `json:"relay,omitempty"`
-	NAT          string `json:"nat,omitempty"`
-	Candidates   int    `json:"candidates,omitempty"`
-	Carrier      string `json:"carrier,omitempty"`
-	CarrierToken string `json:"carrier_token,omitempty"`
-	MigratedFrom string `json:"migrated_from,omitempty"`
+	Event        string              `json:"event"`
+	Error        string              `json:"error,omitempty"`
+	Retryable    bool                `json:"retryable,omitempty"`
+	Listen       string              `json:"listen,omitempty"`
+	Host         string              `json:"host,omitempty"`
+	Path         string              `json:"path,omitempty"`
+	Transport    string              `json:"transport,omitempty"`
+	Remote       string              `json:"remote,omitempty"`
+	Punch        string              `json:"punch,omitempty"`
+	Direct       string              `json:"direct,omitempty"`
+	Relay        string              `json:"relay,omitempty"`
+	NAT          string              `json:"nat,omitempty"`
+	Candidates   int                 `json:"candidates,omitempty"`
+	Carrier      string              `json:"carrier,omitempty"`
+	CarrierToken string              `json:"carrier_token,omitempty"`
+	MigratedFrom string              `json:"migrated_from,omitempty"`
+	Policy       *agent.DevicePolicy `json:"device_policy,omitempty"`
 }
 
 func newLogger(verbose bool) *slog.Logger {

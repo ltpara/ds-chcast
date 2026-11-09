@@ -624,6 +624,22 @@ struct QuicSession::Impl {
     // wait_for_client, so the accessor reads this copy instead.
     std::string session_audit_ref;
     ClientHello pending_hello;
+    // v62: the challenge the server sent before Hello, and whether one went
+    // out. The application thread verifies the ticket possession proof with
+    // it. On the client side the same field is the host's challenge once
+    // auth_challenge_ready is set.
+    std::array<uint8_t, kTicketProofHostNonceSize> host_nonce{};
+    bool host_nonce_sent = false;
+    bool auth_challenge_ready = false;
+    // Server: the newest v62 ticket renewal the viewer sent. Client: the
+    // newest answer to this side's renewal, and the Hello nonce the accepted
+    // handshake used (a renewal proof covers it).
+    bool ticket_renew_ready = false;
+    TicketRenewRequest ticket_renew;
+    bool ticket_renew_result_ready = false;
+    TicketRenewResult ticket_renew_result;
+    uint64_t ticket_renew_results_seen = 0;
+    std::array<uint8_t, kHelloNonceBytes> client_nonce{};
     StreamCodecPreference initial_codec_preference = StreamCodecPreference::Auto;
     // Server: the newest SwitchDisplay the viewer asked for. Intermediate
     // targets are not queued; a viewer clicking through the list wants the
@@ -2888,6 +2904,94 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::AuthBegin: {
+                if (role != Role::Server) {
+                    break;
+                }
+                if (!payload.empty()) {
+                    control_protocol_failure("AuthBegin carries a payload");
+                    break;
+                }
+                std::array<uint8_t, kTicketProofHostNonceSize> nonce{};
+                bool issued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (host_nonce_sent) {
+                        // A repeated AuthBegin gets the same challenge: it
+                        // binds nothing, and a fresh value would break a
+                        // proof the viewer is already signing.
+                        nonce = host_nonce;
+                        issued = true;
+                    }
+                }
+                if (!issued) {
+                    if (!secure_random(nonce.data(), nonce.size())) {
+                        control_protocol_failure(
+                            "cannot generate the authentication challenge");
+                        break;
+                    }
+                    std::lock_guard<std::mutex> lock(mutex);
+                    host_nonce = nonce;
+                    host_nonce_sent = true;
+                }
+                if (!try_send_bytes(control.load(), make_auth_challenge(nonce),
+                                    QUIC_SEND_FLAG_NONE)) {
+                    control_protocol_failure("cannot send the authentication challenge");
+                }
+                break;
+            }
+            case ControlType::AuthChallenge: {
+                if (role != Role::Client) {
+                    break;
+                }
+                std::array<uint8_t, kTicketProofHostNonceSize> nonce{};
+                if (!parse_auth_challenge(payload, nonce, &error)) {
+                    control_protocol_failure("AuthChallenge: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    host_nonce = nonce;
+                    auth_challenge_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::TicketRenew: {
+                if (role != Role::Server) {
+                    break;
+                }
+                TicketRenewRequest request;
+                if (!parse_ticket_renew(payload, request, &error)) {
+                    control_protocol_failure("TicketRenew: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ticket_renew = std::move(request);
+                    ticket_renew_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::TicketRenewResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                TicketRenewResult result;
+                if (!parse_ticket_renew_result(payload, result, &error)) {
+                    control_protocol_failure("TicketRenewResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ticket_renew_result = std::move(result);
+                    ticket_renew_result_ready = true;
+                    ++ticket_renew_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::AccessDenied: {
                 if (role != Role::Client) {
                     break;
@@ -4207,7 +4311,9 @@ struct QuicSession::Impl {
                 uint32_t request_id = 0;
                 std::string directory;
                 std::string cursor;
-                if (!parse_file_list_request(payload, request_id, directory, &error, &cursor)) {
+                bool show_hidden = false;
+                if (!parse_file_list_request(payload, request_id, directory, &error, &cursor,
+                                             &show_hidden)) {
                     control_protocol_failure("FileListRequest: " + error);
                     break;
                 }
@@ -4216,7 +4322,8 @@ struct QuicSession::Impl {
                     while (file_list_requests.size() >= 8) {
                         file_list_requests.pop_front();
                     }
-                    file_list_requests.push_back({request_id, std::move(directory), std::move(cursor)});
+                    file_list_requests.push_back(
+                        {request_id, std::move(directory), std::move(cursor), show_hidden});
                 }
                 cv.notify_all();
                 break;
@@ -5066,6 +5173,14 @@ struct QuicSession::Impl {
             hello_ready = false;
             hello_ack_ready = false;
             pending_hello = ClientHello{};
+            host_nonce = {};
+            host_nonce_sent = false;
+            auth_challenge_ready = false;
+            ticket_renew_ready = false;
+            ticket_renew = TicketRenewRequest{};
+            ticket_renew_result_ready = false;
+            ticket_renew_result = TicketRenewResult{};
+            client_nonce = {};
             initial_codec_preference = StreamCodecPreference::Auto;
             requested_display = kDisplayAuto;
             decoding_codecs = kVideoCodecAll;
@@ -5780,6 +5895,7 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             request.mode = impl.requested_mode;
             request.peer_address = impl.requested_peer;
             request.hello = std::move(impl.pending_hello);
+            request.host_nonce = impl.host_nonce;
             impl.pending_hello = ClientHello{};
             request.peer_alive = [&impl] { return impl.peer_alive(); };
             lock.unlock();
@@ -5898,6 +6014,84 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
 std::optional<AccessDenial> QuicSession::denial() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->denial_code;
+}
+
+Error QuicSession::renew_access_ticket(const std::vector<uint8_t>& signed_ticket,
+                                       std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "renew_access_ticket is a client operation");
+    }
+    if (signed_ticket.size() <= kTicketSignatureSize ||
+        signed_ticket.size() > kTicketMaxSigned) {
+        return Error(Status::InvalidCall, "the renewal ticket is malformed");
+    }
+    if (impl.client_config.access_ticket_key.size() != kTicketClientKeySize) {
+        return Error(Status::InvalidCall,
+                     "the renewal needs the session's 32-byte client key");
+    }
+    AccessTicket ticket;
+    // decode_access_ticket takes the envelope; the signature stays attached
+    // because the proof covers the signed bytes the host will verify.
+    const std::vector<uint8_t> envelope(signed_ticket.begin(),
+                                        signed_ticket.end() - kTicketSignatureSize);
+    if (decode_access_ticket(envelope, &ticket) != TicketError::None) {
+        return Error(Status::InvalidCall, "the renewal ticket is malformed");
+    }
+    std::array<uint8_t, kTicketProofHostNonceSize> host_nonce{};
+    std::array<uint8_t, kHelloNonceBytes> client_nonce{};
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "handshake not complete");
+        }
+        if (impl.client_config.access_ticket.empty()) {
+            return Error(Status::InvalidCall,
+                         "this session was not admitted by an access ticket");
+        }
+        host_nonce = impl.host_nonce;
+        client_nonce = impl.client_nonce;
+        impl.ticket_renew_result_ready = false;
+    }
+    const std::vector<uint8_t> message = access_ticket_proof_message(
+        ticket.host_id, ticket.host_public_key_fingerprint, host_nonce,
+        std::vector<uint8_t>(client_nonce.begin(), client_nonce.end()), signed_ticket);
+    std::vector<uint8_t> proof;
+    if (!sign_access_ticket_proof(impl.client_config.access_ticket_key, message, &proof)) {
+        return Error(Status::CaptureFailed, "cannot sign the renewal proof");
+    }
+    const Error sent = impl.send_bytes(impl.control.load(),
+                                       make_ticket_renew(signed_ticket, proof),
+                                       QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        return sent;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(impl.mutex);
+    impl.cv.wait_until(lock, deadline, [&impl] {
+        return impl.ticket_renew_result_ready || impl.transport_failed ||
+               impl.shutdown_complete || impl.peer_closed;
+    });
+    if (impl.ticket_renew_result_ready) {
+        const TicketRenewResult result = impl.ticket_renew_result;
+        impl.ticket_renew_result_ready = false;
+        if (result.code != TicketRenewCode::Accepted) {
+            return Error(Status::PermissionDenied,
+                         result.reason.empty() ? "the host refused the ticket renewal"
+                                               : result.reason);
+        }
+        // The next renewal signs over this ticket, so keep it as the current
+        // one even if the caller drops its own copy.
+        impl.client_config.access_ticket = signed_ticket;
+        return Error::success();
+    }
+    if (impl.transport_failed) {
+        return Error(impl.transport_status, impl.transport_message);
+    }
+    if (impl.peer_closed || impl.shutdown_complete) {
+        return Error(Status::Unavailable, "the host closed the session during the renewal");
+    }
+    return Error(Status::WaitTimeout, "the host did not answer the ticket renewal");
 }
 
 uint16_t QuicSession::requested_display() const {
@@ -6133,6 +6327,29 @@ void QuicSession::set_access_token(std::string token) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->server_config.access_token = std::move(token);
     impl_->token_consumed = false;
+}
+
+bool QuicSession::take_ticket_renew(TicketRenewRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->ticket_renew_ready) {
+        return false;
+    }
+    request = std::move(impl_->ticket_renew);
+    impl_->ticket_renew = TicketRenewRequest{};
+    impl_->ticket_renew_ready = false;
+    return true;
+}
+
+Error QuicSession::send_ticket_renew_result(const TicketRenewResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_ticket_renew_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_ticket_renew_result(result),
+                           QUIC_SEND_FLAG_NONE);
 }
 
 void QuicSession::reset_for_next_client() {
@@ -7585,6 +7802,37 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
         return quic_error(status, "QUIC StreamStart(control)");
     }
 
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    // v62: a client-initiated stream is invisible to the host until its first
+    // byte, so the viewer opens the exchange and the host answers with its
+    // challenge. The possession proof is bound to that challenge.
+    Error began = impl.send_bytes(control, make_control(ControlType::AuthBegin, {}),
+                                  QUIC_SEND_FLAG_NONE);
+    if (!began.ok()) {
+        return began;
+    }
+    {
+        std::unique_lock<std::mutex> lock(impl.mutex);
+        impl.cv.wait_until(lock, deadline, [&impl] {
+            return impl.auth_challenge_ready || impl.access_denied_ready ||
+                   impl.transport_failed || impl.shutdown_complete || impl.peer_closed;
+        });
+        if (impl.access_denied_ready) {
+            return Error(Status::PermissionDenied, impl.denial_reason);
+        }
+        if (impl.transport_failed) {
+            return Error(impl.transport_status, impl.transport_message);
+        }
+        if (!impl.auth_challenge_ready) {
+            if (impl.peer_closed || impl.shutdown_complete) {
+                return Error(Status::Unavailable,
+                             "the server closed the connection before its authentication challenge");
+            }
+            return Error(Status::WaitTimeout,
+                         "the server did not send its authentication challenge");
+        }
+    }
+
     ClientHello hello;
     hello.display = display;
     hello.access_token = impl.client_config.access_token;
@@ -7598,15 +7846,15 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     hello.codec_preference = impl.client_config.codec_preference;
     hello.decoding_444 = impl.client_config.decoding_444;
     hello.prefer_chroma = impl.client_config.prefer_chroma;
+    if (!secure_random(hello.nonce.data(), hello.nonce.size())) {
+        return Error(Status::CaptureFailed, "cannot generate the Hello nonce");
+    }
+    hello.unix_seconds = static_cast<uint64_t>(std::time(nullptr));
     if (impl.client_config.device_identity) {
         const DeviceIdentity& identity = *impl.client_config.device_identity;
         hello.device_key = identity.public_key();
         hello.device_name = truncate_utf8(identity.name(), kMaxDeviceNameLength);
         hello.device_platform = static_cast<uint8_t>(impl.client_config.device_platform);
-        if (!secure_random(hello.nonce.data(), hello.nonce.size())) {
-            return Error(Status::CaptureFailed, "cannot generate the Hello nonce");
-        }
-        hello.unix_seconds = static_cast<uint64_t>(std::time(nullptr));
         hello.auth_flags = kAuthFlagSigned;
         if (impl.client_config.trust_device) {
             hello.auth_flags |= kAuthFlagTrustDevice;
@@ -7624,12 +7872,46 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     } else if (impl.client_config.trust_device) {
         return Error(Status::InvalidCall, "trust_device needs a device identity");
     }
+    if (!impl.client_config.access_ticket.empty()) {
+        if (impl.client_config.access_ticket_key.size() != kTicketClientKeySize) {
+            return Error(Status::InvalidCall,
+                         "an access ticket needs its 32-byte Ed25519 client key");
+        }
+        if (impl.client_config.access_ticket.size() <= kTicketSignatureSize) {
+            return Error(Status::InvalidCall, "the access ticket is malformed");
+        }
+        AccessTicket ticket;
+        // decode_access_ticket takes the envelope; the verifier strips the
+        // trailing Ed25519 signature the same way.
+        const std::vector<uint8_t> envelope(
+            impl.client_config.access_ticket.begin(),
+            impl.client_config.access_ticket.end() - kTicketSignatureSize);
+        if (decode_access_ticket(envelope, &ticket) != TicketError::None) {
+            return Error(Status::InvalidCall, "the access ticket is malformed");
+        }
+        std::array<uint8_t, kTicketProofHostNonceSize> host_nonce{};
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            host_nonce = impl.host_nonce;
+        }
+        const std::vector<uint8_t> message = access_ticket_proof_message(
+            ticket.host_id, ticket.host_public_key_fingerprint, host_nonce,
+            std::vector<uint8_t>(hello.nonce.begin(), hello.nonce.end()),
+            impl.client_config.access_ticket);
+        if (!sign_access_ticket_proof(impl.client_config.access_ticket_key, message,
+                                      &hello.ticket_proof)) {
+            return Error(Status::CaptureFailed, "cannot sign the access-ticket proof");
+        }
+        hello.access_ticket = impl.client_config.access_ticket;
+    } else if (!impl.client_config.access_ticket_key.empty()) {
+        return Error(Status::InvalidCall, "an access-ticket key needs a ticket");
+    }
     Error sent = impl.send_bytes(control, make_hello(hello), QUIC_SEND_FLAG_NONE);
     if (!sent.ok()) {
         return sent;
     }
     std::unique_lock<std::mutex> lock(impl.mutex);
-    impl.cv.wait_for(lock, timeout, [&impl] {
+    impl.cv.wait_until(lock, deadline, [&impl] {
         return impl.hello_ack_ready || impl.access_denied_ready || impl.transport_failed ||
                impl.shutdown_complete || impl.peer_closed;
     });
@@ -7647,6 +7929,9 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     // `lock` from the wait above is still held here.
     info = impl.peer_info;
     impl.hello_complete = true;
+    // A later renewal proof covers this nonce, so the host can tie the new
+    // ticket to the connection that was admitted.
+    impl.client_nonce = hello.nonce;
     return Error::success();
 }
 
@@ -8907,7 +9192,8 @@ bool QuicSession::take_file_result(FileResult& result) {
 
 // ----- shared-folder browsing -----
 
-bool QuicSession::take_file_list_request(uint32_t& request_id, std::string& directory, std::string* cursor) {
+bool QuicSession::take_file_list_request(uint32_t& request_id, std::string& directory,
+                                         std::string* cursor, bool* show_hidden) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->file_list_requests.empty()) {
         return false;
@@ -8915,6 +9201,7 @@ bool QuicSession::take_file_list_request(uint32_t& request_id, std::string& dire
     request_id = impl_->file_list_requests.front().request_id;
     directory = std::move(impl_->file_list_requests.front().directory);
     if (cursor) *cursor = std::move(impl_->file_list_requests.front().cursor);
+    if (show_hidden) *show_hidden = impl_->file_list_requests.front().show_hidden;
     impl_->file_list_requests.pop_front();
     return true;
 }
@@ -8980,12 +9267,13 @@ Error QuicSession::send_file_download_result(const FileDownloadResult& result, b
     return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
 }
 
-Error QuicSession::request_file_list(uint32_t request_id, const std::string& directory, const std::string& cursor) {
+Error QuicSession::request_file_list(uint32_t request_id, const std::string& directory,
+                                     const std::string& cursor, bool show_hidden) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "request_file_list is a client operation");
     }
-    std::vector<uint8_t> message = make_file_list_request(request_id, directory, cursor);
+    std::vector<uint8_t> message = make_file_list_request(request_id, directory, cursor, show_hidden);
     if (message.empty()) {
         return Error(Status::InvalidCall, "invalid file list request");
     }

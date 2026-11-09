@@ -203,7 +203,6 @@ func (s *Store) RecordingTotals(username string) (int64, int, error) {
 	return bytes, files, nil
 }
 
-
 func (s *Store) recordingLocked(userID, id string) (Recording, error) {
 	row := s.db.QueryRow(
 		`SELECT id, user_id, name, peer_id, size, sha256, duration_ms,

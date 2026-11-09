@@ -23,8 +23,8 @@ target_include_directories(chast_viewer_core PUBLIC "${CHAST_ROOT}/tools")
 target_compile_features(chast_viewer_core PUBLIC cxx_std_20)
 target_compile_definitions(chast_viewer_core PRIVATE NOMINMAX)
 target_compile_options(chast_viewer_core PRIVATE /W4 /permissive- /EHsc /utf-8)
-target_link_libraries(chast_viewer_core PUBLIC chast.codec chast.net chast.audio
-                                             chast.clipboard chast.transfer)
+target_link_libraries(chast_viewer_core PUBLIC chast.access chast.codec chast.net
+                                             chast.audio chast.clipboard chast.transfer)
 # avformat only backs the local recording; its TLS object resolves against
 # SChannel, so secur32 comes along.
 target_link_libraries(chast_viewer_core PRIVATE

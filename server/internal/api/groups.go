@@ -110,8 +110,10 @@ func groupView(group account.AccountGroup, role string) accountGroupView {
 // groupActor authorizes one action against one group. The server key outranks
 // everything; a console account uses the stronger of its global role and its
 // membership role in this group, so a global operator may write any group and
-// a viewer account promoted to group admin may manage that group alone.
-func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID string, need consolePermission) (account.User, string, bool) {
+// a viewer account promoted to group admin may manage that group alone. A
+// machine token uses its own role, must cover the resource, and a group-scoped
+// token only reaches its own group.
+func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID string, need consolePermission, resource string) (account.User, string, bool) {
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return account.User{}, "", false
@@ -123,6 +125,23 @@ func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID stri
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "server key or account token required")
 		return account.User{}, "", false
+	}
+	if account.HasAPITokenPrefix(token) {
+		principal, err := s.cfg.Accounts.AuthenticateAPIToken(token)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "server key or account token required")
+			return account.User{}, "", false
+		}
+		if principal.Token.GroupID != "" && principal.Token.GroupID != groupID {
+			writeError(w, http.StatusForbidden, "API token is limited to another group")
+			return account.User{}, "", false
+		}
+		perm, ok := rolePermission(principal.Token.Role)
+		if !ok || perm < need || !tokenCoversResource(principal.Token.Resources, resource) {
+			writeError(w, http.StatusForbidden, "API token does not allow this action")
+			return account.User{}, "", false
+		}
+		return principal.User, principal.User.Username, true
 	}
 	user, err := s.cfg.Accounts.Authenticate(token)
 	if err != nil {
@@ -170,6 +189,26 @@ func (s *server) auditGroupFilter(w http.ResponseWriter, r *http.Request) (strin
 		writeError(w, http.StatusUnauthorized, "server key or operator account token required")
 		return "", false
 	}
+	if account.HasAPITokenPrefix(token) {
+		principal, err := s.cfg.Accounts.AuthenticateAPIToken(token)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "server key or operator account token required")
+			return "", false
+		}
+		if !tokenCoversResource(principal.Token.Resources, account.TokenResourceAudit) {
+			writeError(w, http.StatusForbidden, "API token does not cover this resource")
+			return "", false
+		}
+		if principal.Token.GroupID != "" {
+			if groupID != "" && groupID != principal.Token.GroupID {
+				writeError(w, http.StatusForbidden, "API token is limited to another group")
+				return "", false
+			}
+			// A group-scoped token never reads the unfiltered trail.
+			return principal.Token.GroupID, true
+		}
+		return groupID, true
+	}
 	user, err := s.cfg.Accounts.Authenticate(token)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "server key or operator account token required")
@@ -196,8 +235,10 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var (
-		user       account.User
-		globalPerm = consolePermission(-1)
+		user        account.User
+		globalPerm  = consolePermission(-1)
+		groupFilter string
+		apiToken    bool
 	)
 	if s.serverKeyAuthorized(r) {
 		globalPerm = consoleAdmin
@@ -207,18 +248,36 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "server key or account token required")
 			return
 		}
-		var err error
-		user, err = s.cfg.Accounts.Authenticate(token)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, "server key or account token required")
-			return
-		}
-		if perm, ok := rolePermission(user.Role); ok {
-			globalPerm = perm
+		if account.HasAPITokenPrefix(token) {
+			principal, err := s.cfg.Accounts.AuthenticateAPIToken(token)
+			if err != nil {
+				writeError(w, http.StatusUnauthorized, "server key or account token required")
+				return
+			}
+			if !tokenCoversResource(principal.Token.Resources, account.TokenResourceGroups) {
+				writeError(w, http.StatusForbidden, "API token does not cover this resource")
+				return
+			}
+			user = principal.User
+			groupFilter = principal.Token.GroupID
+			apiToken = true
+			if perm, ok := rolePermission(principal.Token.Role); ok {
+				globalPerm = perm
+			}
+		} else {
+			var err error
+			user, err = s.cfg.Accounts.Authenticate(token)
+			if err != nil {
+				writeError(w, http.StatusUnauthorized, "server key or account token required")
+				return
+			}
+			if perm, ok := rolePermission(user.Role); ok {
+				globalPerm = perm
+			}
 		}
 	}
 	memberships := make(map[string]string)
-	if user.ID != "" {
+	if user.ID != "" && !apiToken {
 		access, err := s.cfg.Accounts.GroupsForUser(user.ID)
 		if err != nil {
 			s.cfg.Logger.Error("list account groups", "error", err)
@@ -255,6 +314,9 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 		resp.GlobalRole = permissionRole(globalPerm)
 	}
 	for _, group := range groups {
+		if groupFilter != "" && group.ID != groupFilter {
+			continue
+		}
 		effective := globalPerm
 		if role, ok := memberships[group.ID]; ok {
 			if perm, ok := rolePermission(role); ok {
@@ -270,7 +332,7 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createAccountGroup(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleAdmin)
+	_, actor, ok := s.consoleActor(w, r, consoleAdmin, account.TokenResourceGroups)
 	if !ok {
 		return
 	}
@@ -292,7 +354,7 @@ func (s *server) createAccountGroup(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) accountGroupDetail(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	if _, _, ok := s.groupActor(w, r, groupID, consoleRead); !ok {
+	if _, _, ok := s.groupActor(w, r, groupID, consoleRead, account.TokenResourceGroups); !ok {
 		return
 	}
 	s.writeAccountGroupDetail(w, groupID)
@@ -341,7 +403,7 @@ func (s *server) writeAccountGroupDetail(w http.ResponseWriter, groupID string) 
 
 func (s *server) updateAccountGroup(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin, account.TokenResourceGroups)
 	if !ok {
 		return
 	}
@@ -362,7 +424,7 @@ func (s *server) updateAccountGroup(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) deleteAccountGroup(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin, account.TokenResourceGroups)
 	if !ok {
 		return
 	}
@@ -376,7 +438,7 @@ func (s *server) deleteAccountGroup(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) accountGroupMembers(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	if _, _, ok := s.groupActor(w, r, groupID, consoleRead); !ok {
+	if _, _, ok := s.groupActor(w, r, groupID, consoleRead, account.TokenResourceGroups); !ok {
 		return
 	}
 	members, err := s.cfg.Accounts.GroupMembers(groupID)
@@ -399,7 +461,7 @@ func (s *server) accountGroupMembers(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) addAccountGroupMember(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin, account.TokenResourceGroups)
 	if !ok {
 		return
 	}
@@ -425,7 +487,7 @@ func (s *server) addAccountGroupMember(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) updateAccountGroupMember(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin, account.TokenResourceGroups)
 	if !ok {
 		return
 	}
@@ -453,7 +515,7 @@ func (s *server) updateAccountGroupMember(w http.ResponseWriter, r *http.Request
 func (s *server) removeAccountGroupMember(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
 	username := r.PathValue("username")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleAdmin, account.TokenResourceGroups)
 	if !ok {
 		return
 	}
@@ -468,7 +530,7 @@ func (s *server) removeAccountGroupMember(w http.ResponseWriter, r *http.Request
 
 func (s *server) accountGroupDevices(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	if _, _, ok := s.groupActor(w, r, groupID, consoleRead); !ok {
+	if _, _, ok := s.groupActor(w, r, groupID, consoleRead, account.TokenResourceDevices); !ok {
 		return
 	}
 	devices, err := s.cfg.Accounts.GroupDevices(groupID)
@@ -490,7 +552,7 @@ func (s *server) accountGroupDevices(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) addAccountGroupDevice(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleWrite)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleWrite, account.TokenResourceDevices)
 	if !ok {
 		return
 	}
@@ -516,7 +578,7 @@ func (s *server) addAccountGroupDevice(w http.ResponseWriter, r *http.Request) {
 func (s *server) removeAccountGroupDevice(w http.ResponseWriter, r *http.Request) {
 	groupID := r.PathValue("id")
 	peerID := r.PathValue("peer")
-	_, actor, ok := s.groupActor(w, r, groupID, consoleWrite)
+	_, actor, ok := s.groupActor(w, r, groupID, consoleWrite, account.TokenResourceDevices)
 	if !ok {
 		return
 	}

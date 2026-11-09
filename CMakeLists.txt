@@ -133,6 +133,23 @@ find_package(unofficial-libvpx CONFIG REQUIRED)
 find_package(libyuv CONFIG REQUIRED)
 set_target_properties(unofficial::libvpx::libvpx yuv PROPERTIES MAP_IMPORTED_CONFIG_PROFILE Release)
 
+# Ed25519 verification for v62 access tickets. vcpkg's static OpenSSL build
+# supplies libcrypto; hosts pin the issuer public keys out of band, so the
+# ticket signature never depends on the deployment host or link keys.
+if(NOT DEFINED OPENSSL_ROOT_DIR AND EXISTS "D:/vcpkg/installed/x64-windows-static-md/lib/libcrypto.lib")
+    set(OPENSSL_ROOT_DIR "D:/vcpkg/installed/x64-windows-static-md" CACHE PATH "OpenSSL install prefix")
+endif()
+set(OPENSSL_USE_STATIC_LIBS TRUE)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
+# Access-ticket v1 encoding and Ed25519 proofs. The host verifies tickets and
+# the viewer signs possession proofs, so this sits below both products: it has
+# no Windows dependencies beyond libcrypto, and neither side duplicates the
+# byte format.
+add_library(chast.access STATIC src/host/access_ticket.cc)
+target_include_directories(chast.access PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chast.access PUBLIC OpenSSL::Crypto)
+
 # FFmpeg static build for hardware decoding. D3D11VA lives in libavutil and
 # libavcodec supplies the H.264/HEVC decoders; vcpkg's x64-windows-static
 # triplet ships both, so the receiver needs no FFmpeg DLLs at run time.
@@ -309,7 +326,7 @@ target_link_libraries(chast.host PUBLIC "${FFMPEG_ROOT}/lib/avformat.lib" secur3
 # Media Foundation supplies camera enumeration and capture; mf holds the
 # device-source helpers and mfuuid the format GUIDs. SetupAPI and CfgMgr
 # identify virtual display adapters and their monitor children.
-target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt winmm)
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer chast.access shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt winmm OpenSSL::Crypto crypt32 ws2_32)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from
@@ -522,7 +539,7 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-desktop-stream-test tests/desktop_stream_test.cc)
     target_link_libraries(chast-desktop-stream-test PRIVATE chast.host)
     add_executable(chast-display-subscription-test tests/display_subscription_test.cc)
-    target_link_libraries(chast-display-subscription-test PRIVATE chast.net)
+    target_link_libraries(chast-display-subscription-test PRIVATE chast.net chast.access)
     add_executable(chast-display-video-test tests/display_video_receiver_test.cc
         app/windows/viewer/display_video_receiver.cc app/windows/viewer/viewer_engine.cc)
     target_include_directories(chast-display-video-test PRIVATE tools)
@@ -561,6 +578,9 @@ if(CHAST_BUILD_TESTS)
     # itself when the process cannot own a private window station.
     add_executable(chast-clipboard-listener-test tests/clipboard_listener_test.cc)
     target_link_libraries(chast-clipboard-listener-test PRIVATE chast.clipboard)
+    add_executable(chast-clipboard-listener-startup-test tests/clipboard_listener_startup_test.cc)
+    target_include_directories(chast-clipboard-listener-startup-test PRIVATE include)
+    target_link_libraries(chast-clipboard-listener-startup-test PRIVATE user32)
 
     # OS login: the password request over loopback QUIC, the permission and
     # logon-state gates, the exact text handed to a synthetic injector, and the
@@ -615,6 +635,23 @@ if(CHAST_BUILD_TESTS)
     # trusted devices, allow list and permission intersection.
     add_executable(chast-host-security-test tests/host_security_test.cc)
     target_link_libraries(chast-host-security-test PRIVATE chast.host)
+
+    # Access-ticket v1: the frozen golden vector, strict decoding, issuer and
+    # host binding, the time window and the bounded replay cache. No network.
+    add_executable(chast-access-ticket-test tests/access_ticket_test.cc)
+    target_link_libraries(chast-access-ticket-test PRIVATE chast.host)
+
+    # v62 managed admission over loopback QUIC: the host challenge, the Hello
+    # ticket and possession proof, and the refusals for a missing ticket or a
+    # foreign signing key. File-transfer sessions, so no GPU or desktop.
+    add_executable(chast-managed-access-test tests/managed_access_test.cc)
+    target_link_libraries(chast-managed-access-test PRIVATE chast.host)
+
+    # v62 host session lease: a ticket-admitted file session is closed by the
+    # host at the signed expiry, on the monotonic deadline, without traffic
+    # extending it. Loopback HostServer, no GPU.
+    add_executable(chast-host-ticket-lease-test tests/host_ticket_lease_test.cc)
+    target_link_libraries(chast-host-ticket-lease-test PRIVATE chast.host)
 
     # Adaptive bitrate policy: pure logic, driven by synthetic transport
     # samples.
@@ -711,6 +748,8 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(clipboard_async PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME clipboard_listener COMMAND chast-clipboard-listener-test)
     set_tests_properties(clipboard_listener PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    add_test(NAME clipboard_listener_startup COMMAND chast-clipboard-listener-startup-test)
+    set_tests_properties(clipboard_listener_startup PROPERTIES TIMEOUT 10 SKIP_RETURN_CODE 77)
     add_test(NAME host_login COMMAND chast-host-login-test)
     set_tests_properties(host_login PROPERTIES TIMEOUT 180)
     add_test(NAME block_input COMMAND chast-block-input-test)
@@ -722,6 +761,10 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME virtual_display COMMAND chast-virtual-display-test)
     add_test(NAME display_privacy COMMAND chast-display-privacy-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
+    add_test(NAME access_ticket COMMAND chast-access-ticket-test)
+    add_test(NAME managed_access COMMAND chast-managed-access-test)
+    add_test(NAME host_ticket_lease COMMAND chast-host-ticket-lease-test)
+    set_tests_properties(host_ticket_lease PROPERTIES TIMEOUT 120)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)

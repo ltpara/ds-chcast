@@ -218,6 +218,20 @@ uint16_t modifier_usage(uint16_t bit) {
     }
 }
 
+uint16_t modifier_vk(uint16_t bit) {
+    switch (bit) {
+        case kModifierLeftCtrl: return VK_LCONTROL;
+        case kModifierLeftShift: return VK_LSHIFT;
+        case kModifierLeftAlt: return VK_LMENU;
+        case kModifierLeftGui: return VK_LWIN;
+        case kModifierRightCtrl: return VK_RCONTROL;
+        case kModifierRightShift: return VK_RSHIFT;
+        case kModifierRightAlt: return VK_RMENU;
+        case kModifierRightGui: return VK_RWIN;
+        default: return 0;
+    }
+}
+
 uint16_t lock_usage(uint16_t bit) {
     switch (bit) {
         case kLockCaps: return 0x39;
@@ -234,6 +248,47 @@ uint16_t lock_bit_for_usage(uint16_t usage) {
         case 0x47: return kLockScroll;
         default: return 0;
     }
+}
+
+uint16_t lock_bit_for_vk(uint16_t vk) {
+    switch (vk) {
+        case VK_CAPITAL: return kLockCaps;
+        case VK_NUMLOCK: return kLockNum;
+        case VK_SCROLL: return kLockScroll;
+        default: return 0;
+    }
+}
+
+// Virtual keys that Windows distinguishes from their non-extended twins.
+// Sending the arrow block without this flag produces the NumLock keypad keys.
+bool extended_virtual_key(uint16_t vk) {
+    switch (vk) {
+        case VK_RMENU:
+        case VK_RCONTROL:
+        case VK_INSERT:
+        case VK_DELETE:
+        case VK_HOME:
+        case VK_END:
+        case VK_PRIOR:
+        case VK_NEXT:
+        case VK_LEFT:
+        case VK_RIGHT:
+        case VK_UP:
+        case VK_DOWN:
+        case VK_NUMLOCK:
+        case VK_DIVIDE:
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_APPS:
+        case VK_SNAPSHOT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool keypad_virtual_key(uint16_t vk) {
+    return (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) || vk == VK_DECIMAL;
 }
 
 bool system_lock_state(uint16_t bit) {
@@ -318,6 +373,34 @@ uint16_t modifier_bit_for_usage(uint16_t hid_usage) {
         return static_cast<uint16_t>(1u << (hid_usage - 0xE0));
     }
     return 0;
+}
+
+uint16_t modifier_bit_for_vk(uint16_t vk) {
+    switch (vk) {
+        case VK_LCONTROL: case VK_CONTROL: return kModifierLeftCtrl;
+        case VK_LSHIFT: case VK_SHIFT: return kModifierLeftShift;
+        case VK_LMENU: case VK_MENU: return kModifierLeftAlt;
+        case VK_LWIN: return kModifierLeftGui;
+        case VK_RCONTROL: return kModifierRightCtrl;
+        case VK_RSHIFT: return kModifierRightShift;
+        case VK_RMENU: return kModifierRightAlt;
+        case VK_RWIN: return kModifierRightGui;
+        default: return 0;
+    }
+}
+
+bool make_legacy_keyboard_input(uint16_t virtual_key, bool down, INPUT& input) {
+    if (virtual_key == 0 || virtual_key > 0xFF || virtual_key == VK_PACKET ||
+        virtual_key == VK_PROCESSKEY) {
+        return false;
+    }
+    input = INPUT{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = virtual_key;
+    input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    if (extended_virtual_key(virtual_key)) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    input.ki.dwExtraInfo = kInputInjectionTag;
+    return true;
 }
 
 std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* error,
@@ -503,11 +586,14 @@ void InputInjector::run() {
         }
         lock.unlock();
         const auto now = std::chrono::steady_clock::now();
-        std::vector<uint16_t> expired;
+        std::vector<HeldKey> expired;
         for (const HeldKey& held : held_keys_) {
-            if (now - held.last_down >= std::chrono::minutes(6)) expired.push_back(held.usage);
+            if (now - held.last_down >= std::chrono::minutes(6)) expired.push_back(held);
         }
-        for (const uint16_t usage : expired) apply_key({KeyAction::Up, usage});
+        for (const HeldKey& held : expired) {
+            if (held.legacy) apply_legacy_key({KeyAction::Up, held.usage});
+            else apply_key({KeyAction::Up, held.usage});
+        }
         lock.lock();
         if (stopping_ && queue_.empty()) {
             break;
@@ -532,8 +618,17 @@ void InputInjector::apply(const InputEvent& event) {
             sync_modifiers(target);
             return;
         }
+    } else if (event.kind == InputKind::LegacyKey) {
+        const uint16_t own = modifier_bit_for_vk(event.legacy_key.virtual_key);
+        if (own != 0) {
+            const uint16_t target = event.legacy_key.action == KeyAction::Down
+                                        ? static_cast<uint16_t>(reported | own)
+                                        : static_cast<uint16_t>(reported & ~own);
+            sync_modifiers(target, true);
+            return;
+        }
     }
-    sync_modifiers(reported);
+    sync_modifiers(reported, event.kind == InputKind::LegacyKey);
     switch (event.kind) {
         case InputKind::Mouse:
             apply_mouse(event.mouse);
@@ -560,6 +655,25 @@ void InputInjector::apply(const InputEvent& event) {
             }
             const uint16_t changed = sync_locks(event.modifiers, mask);
             apply_key(event.key);
+            sync_locks(static_cast<uint16_t>(event.modifiers ^ changed), changed);
+            break;
+        }
+        case InputKind::LegacyKey: {
+            // The same lock reconciliation as Key, addressed by virtual key.
+            // Caps and Num change the character a named key produces just as
+            // they change a scan code's.
+            const uint16_t vk = event.legacy_key.virtual_key;
+            INPUT mapped{};
+            uint16_t mask = 0;
+            if (lock_bit_for_vk(vk) == 0 && make_legacy_keyboard_input(vk, true, mapped)) {
+                mask = kLockCaps;
+                if (keypad_virtual_key(vk)) mask |= kLockNum;
+            }
+            if (!dry_run_ && (mask != 0 || lock_bit_for_vk(vk) != 0)) {
+                locks_seeded_ = read_system_locks(host_locks_);
+            }
+            const uint16_t changed = sync_locks(event.modifiers, mask);
+            apply_legacy_key(event.legacy_key);
             sync_locks(static_cast<uint16_t>(event.modifiers ^ changed), changed);
             break;
         }
@@ -626,27 +740,27 @@ uint16_t InputInjector::sync_locks(uint16_t reported, uint16_t mask) {
     return changed;
 }
 
-void InputInjector::sync_modifiers(uint16_t reported) {
+void InputInjector::sync_modifiers(uint16_t reported, bool legacy) {
+    const auto bit_for = [](const HeldKey& key) {
+        return key.legacy ? modifier_bit_for_vk(key.usage)
+                          : modifier_bit_for_usage(key.usage);
+    };
     uint16_t held = 0;
     for (const HeldKey& key : held_keys_) {
-        held |= modifier_bit_for_usage(key.usage);
+        held |= bit_for(key);
     }
 
     const uint16_t lift = held & ~reported;
     if (lift != 0) {
         // Reverse press order, like release_all: lifting a chord in the order
         // it went down keeps intermediate states sensible.
-        std::vector<uint16_t> usages;
+        std::vector<HeldKey> lifted;
         for (auto it = held_keys_.rbegin(); it != held_keys_.rend(); ++it) {
-            if (lift & modifier_bit_for_usage(it->usage)) {
-                usages.push_back(it->usage);
-            }
+            if (lift & bit_for(*it)) lifted.push_back(*it);
         }
-        for (uint16_t usage : usages) {
-            KeyEvent up;
-            up.action = KeyAction::Up;
-            up.hid_usage = usage;
-            apply_key(up);
+        for (const HeldKey& key : lifted) {
+            if (key.legacy) apply_legacy_key({KeyAction::Up, key.usage});
+            else apply_key({KeyAction::Up, key.usage});
         }
     }
 
@@ -654,10 +768,8 @@ void InputInjector::sync_modifiers(uint16_t reported) {
     for (uint16_t bit = kModifierLeftCtrl; bit <= kModifierRightGui;
          bit = static_cast<uint16_t>(bit << 1)) {
         if (press & bit) {
-            KeyEvent down;
-            down.action = KeyAction::Down;
-            down.hid_usage = modifier_usage(bit);
-            apply_key(down);
+            if (legacy) apply_legacy_key({KeyAction::Down, modifier_vk(bit)});
+            else apply_key({KeyAction::Down, modifier_usage(bit)});
         }
     }
 }
@@ -1133,7 +1245,9 @@ void InputInjector::apply_key(const KeyEvent& event) {
     }
 
     const auto matches = [&event](const HeldKey& held) {
-        return held.usage == event.hid_usage;
+        // A HID usage and a virtual key can share the same number. A lock-state
+        // tap must not hijack a legacy-held key (or release it on its way up).
+        return !held.legacy && held.usage == event.hid_usage;
     };
     const auto found = std::find_if(held_keys_.begin(), held_keys_.end(), matches);
     const UINT inserted = send(input);
@@ -1146,10 +1260,48 @@ void InputInjector::apply_key(const KeyEvent& event) {
         // Auto-repeat arrives as repeated Downs. Only the first press belongs
         // in the held set; otherwise a single Up would leave the key stuck.
         if (found == held_keys_.end()) {
-            held_keys_.push_back(HeldKey{event.hid_usage, std::chrono::steady_clock::now()});
+            held_keys_.push_back(
+                HeldKey{event.hid_usage, false, std::chrono::steady_clock::now()});
             // Whether the tap came from the peer or from sync_locks(), the
             // host's lock state just changed under us.
             if (const uint16_t lock = lock_bit_for_usage(event.hid_usage); lock != 0) {
+                host_locks_ ^= lock;
+            }
+        } else {
+            found->last_down = std::chrono::steady_clock::now();
+        }
+    } else if (found != held_keys_.end()) {
+        held_keys_.erase(found);
+    }
+
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    ++stats_.applied;
+}
+
+void InputInjector::apply_legacy_key(const LegacyKeyEvent& event) {
+    INPUT input{};
+    const bool pressed = event.action == KeyAction::Down;
+    if (!make_legacy_keyboard_input(event.virtual_key, pressed, input)) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.rejected;
+        return;
+    }
+
+    const auto matches = [&event](const HeldKey& held) {
+        return held.legacy && held.usage == event.virtual_key;
+    };
+    const auto found = std::find_if(held_keys_.begin(), held_keys_.end(), matches);
+    const UINT inserted = send(input);
+    if (inserted != 1) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.failed;
+        return;
+    }
+    if (pressed) {
+        if (found == held_keys_.end()) {
+            held_keys_.push_back(
+                HeldKey{event.virtual_key, true, std::chrono::steady_clock::now()});
+            if (const uint16_t lock = lock_bit_for_vk(event.virtual_key); lock != 0) {
                 host_locks_ ^= lock;
             }
         } else {
@@ -1273,7 +1425,12 @@ void InputInjector::release_all() {
         const HeldKey held = held_keys_.back();
         held_keys_.pop_back();
         INPUT input{};
-        make_keyboard_input(held.usage, false, input);
+        if (!(held.legacy ? make_legacy_keyboard_input(held.usage, false, input)
+                          : make_keyboard_input(held.usage, false, input))) {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            ++stats_.rejected;
+            continue;
+        }
         const UINT inserted = send(input);
         std::lock_guard<std::mutex> lock(stats_mutex_);
         if (inserted == 1) {

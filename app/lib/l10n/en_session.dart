@@ -233,6 +233,15 @@ const Map<String, String> kEnglishSession = <String, String>{
   '开启麦克风（长按选择设备）': 'Enable microphone (long-press to pick device)',
   '开始菜单': 'Start menu',
   '录制到本地（保存为 MP4）': 'Record locally (save as MP4)',
+  '录制到本地（已开启自动录制，长按设置）':
+      'Record locally (auto-record is on; long-press for settings)',
+  '录制到本地（保存为 MP4，长按设置自动录制）':
+      'Record locally (save as MP4; long-press for auto-record)',
+  '每次会话自动录制': 'Auto-record every session',
+  '保留全部录制': 'Keep all recordings',
+  '保留最近 10 个录制': 'Keep the last 10 recordings',
+  '保留最近 30 个录制': 'Keep the last 30 recordings',
+  '录制失败：{error}': 'Recording failed: {error}',
   '恢复剪贴板同步': 'Resume clipboard sync',
   '抑制平稳底噪，语音优先': 'Suppress steady noise, prioritize voice',
   '截图失败': 'Screenshot failed',
@@ -449,6 +458,8 @@ const Map<String, String> kEnglishSession = <String, String>{
   '共 {n} 项': '{n} items',
   '匹配 {n} / {total} 项': '{n} of {total} items',
   '上传文件到此处': 'Upload files here',
+  '显示隐藏文件': 'Show hidden files',
+  '不显示隐藏文件': 'Hide hidden files',
   '正在上传到 {dir}（队列剩余 {n} 个）': 'Uploading to {dir} ({n} left in queue)',
   '正在上传到 {dir} · {p1} / {p2} · {pct}%（队列剩余 {n} 个）':
       'Uploading to {dir} · {p1} / {p2} · {pct}% ({n} left in queue)',
@@ -484,8 +495,10 @@ const Map<String, String> kEnglishSession = <String, String>{
   '名称不能包含 / \\ : 或使用 . 与 ..': 'The name cannot contain / \\ : or be . or ..',
   '同名文件已存在': 'An entry with that name already exists',
   '删除“{name}”？': 'Delete "{name}"?',
-  '文件夹必须为空才能删除，此操作不可撤销。':
-      'A folder must be empty before it can be deleted; this cannot be undone.',
+  '文件夹及其内容将被删除，此操作不可撤销。':
+      'The folder and its contents will be deleted; this cannot be undone.',
+  '选中的文件夹及其内容将被删除，此操作不可撤销。':
+      'The selected folders and their contents will be deleted; this cannot be undone.',
   '此操作不可撤销。': 'This cannot be undone.',
   '下载文件夹到本机': 'Download the folder to this computer',
   '正在下载文件夹 {name} · {done}/{total} 个文件':
@@ -628,10 +641,15 @@ const Map<String, String> kEnglishSession = <String, String>{
   '显示器窗口': 'Display window',
   '键盘模式': 'Keyboard mode',
   '物理按键': 'Physical keys',
+  '传统按键': 'Legacy keys',
   '本地输入法': 'Local input method',
   '按键位置交给远端布局和输入法处理': 'Use the remote keyboard layout and input method',
-  '使用本机布局与输入法，确认后发送文字': 'Use the local layout and input method; send committed text',
-  '文字未发送，请检查控制权限或连接状态': 'Text was not sent. Check input permission and connection status.',
+  '发送虚拟键码，由远端布局和输入法解释':
+      'Send virtual-key codes for the remote layout and IME to interpret',
+  '使用本机布局与输入法，确认后发送文字':
+      'Use the local layout and input method; send committed text',
+  '文字未发送，请检查控制权限或连接状态':
+      'Text was not sent. Check input permission and connection status.',
   '无法切换键盘模式': 'Could not switch keyboard mode',
   '本地输入法未启用，请重新聚焦画面或切换物理按键':
       'Local input is unavailable. Refocus the display or select physical keys.',
@@ -645,4 +663,6 @@ const Map<String, String> kEnglishSession = <String, String>{
   '完整色彩 4:4:4': 'Full color 4:4:4',
   '兼顾性能与带宽': 'Balance performance and bandwidth',
   '使用 VP9；所有观看端支持时生效': 'Uses VP9 when all viewers support full color',
+  '无法获取访问票据：{p1}': 'Could not obtain an access ticket: {p1}',
+  '访问票据已过期': 'The access ticket has expired',
 };

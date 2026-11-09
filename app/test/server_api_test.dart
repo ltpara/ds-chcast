@@ -83,7 +83,76 @@ void main() {
     expect(host.serverPublicKey, _serverKey);
     expect(host.lastSeenMs, 1234);
     expect(host.expiresInMs, 9000);
+    expect(host.accessTicket, isNull);
     expect(authorization, isNull);
+  });
+
+  test('lookup with a client key returns the signed access ticket', () async {
+    Uri? requested;
+    String? authorization;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'online': true,
+          'fingerprint': 'AB' * 32,
+          'access_ticket': <String, Object?>{
+            'ticket': 'AQIDBA',
+            'issued_at_ms': 1794225600000,
+            'expires_at_ms': 1794225660000,
+            'expires_in_ms': 60000,
+            'policy_version': 7,
+            'permissions': 15,
+            'issuer': 'chast.example',
+            'kid': 'kid-2026-11',
+            'subject': 'alice',
+          },
+        }),
+      );
+      await request.response.close();
+    });
+
+    final HostInfo host = await ServerApi.lookup(
+      settings.copyWith(key: 'dev-secret'),
+      'devbox',
+      accountToken: 'account-token',
+      clientPublicKey: 'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg',
+    );
+    expect(requested?.path, '/v1/hosts/devbox');
+    expect(requested?.queryParameters['client_public_key'],
+        'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg');
+    expect(authorization, 'Bearer account-token');
+    final HostAccessTicket? ticket = host.accessTicket;
+    expect(ticket, isNotNull);
+    expect(ticket!.ticket, 'AQIDBA');
+    expect(ticket.expiresAtMs, 1794225660000);
+    expect(ticket.permissions, 15);
+    expect(ticket.policyVersion, 7);
+    expect(ticket.kid, 'kid-2026-11');
+    expect(ticket.subject, 'alice');
+  });
+
+  test('an empty access_ticket field is ignored', () async {
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'online': true,
+          'access_ticket': <String, Object?>{'ticket': '  '},
+        }),
+      );
+      await request.response.close();
+    });
+
+    final HostInfo host = await ServerApi.lookup(
+      settings,
+      'devbox',
+      accountToken: 'account-token',
+      clientPublicKey: 'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg',
+    );
+    expect(host.accessTicket, isNull);
   });
 
   test('serverIdentity reads and fingerprints /v1/server', () async {

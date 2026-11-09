@@ -1,11 +1,12 @@
 #pragma once
 
-// The chast wire protocol, version 60.
+// The chast wire protocol, version 63.
 //
 // One QUIC connection carries:
 //
-//   * a client-initiated bidirectional control stream (Hello / HelloAck,
-//     key-frame requests, input events, file offers, closing statistics),
+//   * a client-initiated bidirectional control stream (host auth challenge,
+//     Hello / HelloAck, key-frame requests, input events, file offers,
+//     closing statistics),
 //   * a server-initiated unidirectional video stream: a sequence of access
 //     units, each prefixed by a fixed FrameHeader,
 //   * when the host shares system audio, a second server-initiated
@@ -48,11 +49,12 @@
 #include <utility>
 #include <vector>
 
+#include "chast/access_ticket.h"
 #include "chast/encoder.h"
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 61;
+inline constexpr uint16_t kProtocolVersion = 65;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -265,7 +267,9 @@ enum class ControlType : uint16_t {
     // the shared root with '/' separators (empty means the root). Requires
     // the file-transfer permission and the host's gate; the host answers
     // FileListResult. Since v56, a u16 length and UTF-8 continuation cursor
-    // follow the directory. An empty cursor starts a fresh listing.
+    // follow the directory. An empty cursor starts a fresh listing. Since
+    // v65, a flags byte follows the cursor: bit 0 lists hidden entries too,
+    // otherwise entries with FILE_ATTRIBUTE_HIDDEN are omitted.
     FileListRequest = 45,
     // Host -> viewer: the answer to FileListRequest. Payload: request id
     // (u32), code (u8, see FileCode), flags (u8, bit 0 = cut at the entry
@@ -437,6 +441,29 @@ enum class ControlType : uint16_t {
     // v60: request local UAC approval. No OS credential travels on the wire.
     ElevationRequest = 77,
     ElevationState = 78,
+    // Host -> viewer, the answer to AuthBegin (v62). Payload: 32 random
+    // bytes. The viewer signs the access-ticket possession proof over this
+    // challenge, the Hello nonce and the ticket, so a captured Hello cannot
+    // be replayed on another connection. Sent before the Hello on every host,
+    // managed or not, so both sides always follow the same order.
+    AuthChallenge = 79,
+    // Viewer -> host, the first message on the control stream (v62). Empty.
+    // A client-initiated QUIC stream does not exist for the host until its
+    // first byte arrives, so the viewer opens the exchange; the host answers
+    // with AuthChallenge. Neither message is a credential.
+    AuthBegin = 80,
+    // Viewer -> host (v62): extend a ticket-admitted session with a freshly
+    // issued ticket for the same device and client key. Payload: u16 ticket
+    // length (1..1088), the signed ticket (envelope plus signature), u16 proof
+    // length (must be 64), the possession proof. The proof covers this
+    // session's Hello nonce and the host's challenge, so a renewal cannot be
+    // transplanted to another connection or another ticket.
+    TicketRenew = 81,
+    // Host -> viewer (v62): the renewal answer. Payload: u8 code (0 accepted,
+    // 1 refused), i64 expiry seconds (0 when refused), u32 permission mask in
+    // force after the renewal, u16 reason length, UTF-8 reason. A refusal is
+    // followed by the host closing the session.
+    TicketRenewResult = 82,
 };
 
 // ----- input -----
@@ -470,6 +497,13 @@ enum class InputKind : uint8_t {
     // wheel deltas, so the host scrolls or zooms exactly like a mouse wheel
     // without synthesizing a digitizer contact.
     Gesture = 5,
+    // Windows virtual-key input (protocol v63), the Legacy keyboard mode.
+    // The viewer sends the virtual-key code its own hook reported and the
+    // host injects that named key, so the host layout and IME decide what it
+    // produces. Key above sends a HID usage instead, which preserves the
+    // physical position. Virtual keys only exist on Windows; other platforms
+    // treat this kind as unsupported and keep using Key.
+    LegacyKey = 6,
 };
 
 // Simultaneous touch contacts the protocol and the Windows injector accept.
@@ -518,6 +552,14 @@ struct KeyEvent {
     KeyAction action = KeyAction::Down;
     // USB HID usage id from usage page 0x07 (keyboard), e.g. 0x04 for A.
     uint16_t hid_usage = 0;
+};
+
+// Legacy keyboard mode. The code is a Windows virtual-key code (the value a
+// WH_KEYBOARD_LL hook reports), never zero. It is carried in the same wire
+// slot as KeyEvent::hid_usage, and the two kinds never share a meaning.
+struct LegacyKeyEvent {
+    KeyAction action = KeyAction::Down;
+    uint16_t virtual_key = 0;
 };
 
 enum class TouchAction : uint8_t {
@@ -614,6 +656,7 @@ struct InputEvent {
     InputKind kind = InputKind::Mouse;
     MouseEvent mouse;
     KeyEvent key;
+    LegacyKeyEvent legacy_key;
     TouchEvent touch;
     PenEvent pen;
     GestureEvent gesture;
@@ -756,6 +799,7 @@ inline constexpr size_t kMaxFileListEntries = 1024;
 inline constexpr size_t kMaxFileBrowserPathBytes = kMaxFileRelativePathBytes;
 inline constexpr size_t kMaxFileBrowserReasonBytes = kMaxFileReasonBytes;
 inline constexpr uint8_t kFileListFlagTruncated = 0x01;
+inline constexpr uint8_t kFileListFlagShowHidden = 0x01;
 inline constexpr uint8_t kFileEntryFlagDirectory = 0x01;
 
 // True when `path` is empty or a '/'-separated relative path of at most
@@ -786,6 +830,7 @@ struct FileListRequest {
     uint32_t request_id = 0;
     std::string directory;
     std::string cursor;
+    bool show_hidden = false;
 };
 
 struct FileListResult {
@@ -808,6 +853,7 @@ enum class FileOperation : uint8_t {
     MakeDirectory = 0,  // path names the new folder itself
     Rename = 1,         // path names the entry, new_name replaces its name
     Remove = 2,         // path names a file or an empty directory
+    RemoveTree = 3,     // path names a directory whose contents are removed
 };
 
 struct FileOpResult {
@@ -827,10 +873,12 @@ bool valid_file_browser_name(const std::string& name);
 // trailing bytes.
 std::vector<uint8_t> make_file_list_request(uint32_t request_id,
                                             const std::string& directory,
-                                            const std::string& cursor = {});
+                                            const std::string& cursor = {},
+                                            bool show_hidden = false);
 bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
                              std::string& directory, std::string* error,
-                             std::string* cursor = nullptr);
+                             std::string* cursor = nullptr,
+                             bool* show_hidden = nullptr);
 std::vector<uint8_t> make_file_list_result(const FileListResult& result);
 bool parse_file_list_result(const std::vector<uint8_t>& payload, FileListResult& result,
                             std::string* error);
@@ -1497,6 +1545,13 @@ struct ClientHello {
     StreamCodecPreference codec_preference = static_cast<StreamCodecPreference>(0);
     VideoCodecMask decoding_444 = 0;
     VideoChroma prefer_chroma = VideoChroma::Yuv420;
+    // v62: a managed host's access ticket, envelope plus Ed25519 signature.
+    // Empty on unmanaged hosts; a managed host refuses an empty ticket.
+    std::vector<uint8_t> access_ticket;
+    // Ed25519 proof by the ticket's client key over
+    // access_ticket_proof_message(ticket host id, host fingerprint, the host's
+    // AuthChallenge, `nonce`, `access_ticket`). Empty when no ticket is sent.
+    std::vector<uint8_t> ticket_proof;
 };
 
 // The server accepts an empty reference or 8..64 lowercase hex digits. The
@@ -1548,10 +1603,50 @@ enum class AccessDenial : uint8_t {
 std::vector<uint8_t> make_hello(const ClientHello& hello);
 bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
                  std::string* error);
+// The host's per-connection challenge. Exactly 32 bytes; the viewer echoes
+// neither the challenge nor its own nonce, because the proof covers both and
+// the host already knows its challenge.
+std::vector<uint8_t> make_auth_challenge(
+    const std::array<uint8_t, kTicketProofHostNonceSize>& host_nonce);
+bool parse_auth_challenge(const std::vector<uint8_t>& payload,
+                          std::array<uint8_t, kTicketProofHostNonceSize>& host_nonce,
+                          std::string* error);
 // The server's refusal of a Hello. The viewer shows `reason` to the user.
 std::vector<uint8_t> make_access_denied(AccessDenial code, const std::string& reason);
 bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code,
                          std::string& reason, std::string* error);
+
+// The body of a v62 TicketRenew, without the control header.
+struct TicketRenewRequest {
+    std::vector<uint8_t> signed_ticket;
+    std::vector<uint8_t> proof;
+};
+
+enum class TicketRenewCode : uint8_t {
+    Accepted = 0,
+    Refused = 1,
+};
+
+// The body of a v62 TicketRenewResult, without the control header. A refused
+// answer carries expires_at=0 and permissions=0.
+struct TicketRenewResult {
+    TicketRenewCode code = TicketRenewCode::Refused;
+    int64_t expires_at = 0;
+    PermissionMask permissions = 0;
+    std::string reason;
+};
+
+// Rejects an empty or oversized ticket, a proof that is not exactly 64 bytes,
+// trailing bytes, an unknown code, a negative expiry or unknown permission
+// bits. Both sides always carry fresh values, so strictness costs nothing.
+std::vector<uint8_t> make_ticket_renew(const std::vector<uint8_t>& signed_ticket,
+                                       const std::vector<uint8_t>& proof);
+bool parse_ticket_renew(const std::vector<uint8_t>& payload, TicketRenewRequest& request,
+                        std::string* error);
+std::vector<uint8_t> make_ticket_renew_result(const TicketRenewResult& result);
+bool parse_ticket_renew_result(const std::vector<uint8_t>& payload,
+                               TicketRenewResult& result, std::string* error);
+
 std::vector<uint8_t> make_hello_ack(const ServerInfo& info);
 bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std::string* error);
 // A mid-session replacement for the HelloAck parameters. Same payload; the
