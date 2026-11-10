@@ -20,7 +20,7 @@ func TestAuthenticatorLeaseLifecycle(t *testing.T) {
 	auth.SetClock(func() time.Time { return now })
 
 	_, pub := testKey("host-a")
-	if _, err := auth.Put("devbox", pub, "token-a", 41000, time.Minute); err != nil {
+	if _, err := auth.Put("devbox", pub, "token-a", false, 41000, time.Minute); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	info, ok := auth.Lookup("devbox")
@@ -46,7 +46,7 @@ func TestAuthenticatorLeaseLifecycle(t *testing.T) {
 	}
 
 	now = now.Add(30 * time.Second)
-	renewed, err := auth.Put("devbox", pub, "token-b", 41000, time.Minute)
+	renewed, err := auth.Put("devbox", pub, "token-b", false, 41000, time.Minute)
 	if err != nil {
 		t.Fatalf("renew: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestAuthenticatorLeaseLifecycle(t *testing.T) {
 	}
 
 	_, otherPub := testKey("host-b")
-	if _, err := auth.Put("devbox", otherPub, "token-c", 41000, time.Minute); !errors.Is(err, ErrKeyMismatch) {
+	if _, err := auth.Put("devbox", otherPub, "token-c", false, 41000, time.Minute); !errors.Is(err, ErrKeyMismatch) {
 		t.Fatalf("key mismatch = %v", err)
 	}
 
@@ -74,7 +74,7 @@ func TestAuthenticatorLeaseLifecycle(t *testing.T) {
 	}
 
 	// An id whose lease lapsed may be rebound to a new host key.
-	if _, err := auth.Put("devbox", otherPub, "token-c", 41001, time.Minute); err != nil {
+	if _, err := auth.Put("devbox", otherPub, "token-c", false, 41001, time.Minute); err != nil {
 		t.Fatalf("rebind after expiry: %v", err)
 	}
 	if !auth.VerifyHost("devbox", 41001) {
@@ -87,7 +87,7 @@ func TestAuthenticatorChallengeIsOneShot(t *testing.T) {
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	auth.SetClock(func() time.Time { return now })
 	priv, pub := testKey("host-a")
-	if _, err := auth.Put("devbox", pub, "token", 41000, time.Minute); err != nil {
+	if _, err := auth.Put("devbox", pub, "token", false, 41000, time.Minute); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -132,7 +132,7 @@ func TestAuthenticatorChallengeSurvivesInterleavedIssues(t *testing.T) {
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	auth.SetClock(func() time.Time { return now })
 	priv, pub := testKey("host-a")
-	if _, err := auth.Put("devbox", pub, "token", 41000, time.Minute); err != nil {
+	if _, err := auth.Put("devbox", pub, "token", false, 41000, time.Minute); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	first, err := auth.IssueChallenge("devbox", identity.DomainRelay)
@@ -155,11 +155,11 @@ func TestAuthenticatorPruneAndRemove(t *testing.T) {
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	auth.SetClock(func() time.Time { return now })
 	_, pub := testKey("host-a")
-	if _, err := auth.Put("devbox", pub, "token", 41000, time.Minute); err != nil {
+	if _, err := auth.Put("devbox", pub, "token", false, 41000, time.Minute); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	nonce, _ := auth.IssueChallenge("devbox", identity.DomainRelay)
-	if _, err := auth.Put("keep", pub, "token", 41001, 10*time.Minute); err != nil {
+	if _, err := auth.Put("keep", pub, "token", false, 41001, 10*time.Minute); err != nil {
 		t.Fatalf("put keep: %v", err)
 	}
 
@@ -195,10 +195,29 @@ func TestAuthenticatorPruneAndRemove(t *testing.T) {
 
 func TestAuthenticatorRejectsMalformedPublicKey(t *testing.T) {
 	auth := NewAuthenticator()
-	if _, err := auth.Put("devbox", "not-a-key", "token", 41000, time.Minute); !errors.Is(err, identity.ErrBadPublicKey) {
+	if _, err := auth.Put("devbox", "not-a-key", "token", false, 41000, time.Minute); !errors.Is(err, identity.ErrBadPublicKey) {
 		t.Fatalf("malformed key = %v", err)
 	}
 	if auth.Count() != 0 {
 		t.Fatal("malformed key created a lease")
+	}
+}
+
+// A managed host must only admit viewers with a transport credential; the
+// lease flag makes the legacy carrier token unusable on a standalone node.
+func TestAuthenticatorManagedHostRefusesCarrierToken(t *testing.T) {
+	auth := NewAuthenticator()
+	_, pub := testKey("host-a")
+	if _, err := auth.Put("devbox", pub, "token", true, 41000, time.Minute); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if auth.VerifyCarrier("devbox", "token") {
+		t.Fatal("managed lease accepted the legacy carrier token")
+	}
+	if _, err := auth.Put("devbox", pub, "token", false, 41000, time.Minute); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if !auth.VerifyCarrier("devbox", "token") {
+		t.Fatal("unmanaged renewal did not restore the carrier token")
 	}
 }

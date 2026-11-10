@@ -35,6 +35,16 @@ void main() {
     expect(status.streamQuality, ViewerStreamQuality.high.code);
   });
 
+  test('a custom quality carries its effective percent', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'streamQuality': ViewerStreamQuality.custom.code,
+      'streamQualityPercent': 65,
+    });
+    expect(status.streamQuality, ViewerStreamQuality.custom.code);
+    expect(status.streamQualityPercent, 65);
+  });
+
   test('the stream-option fields default to the host defaults', () {
     final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
       'state': 'streaming',
@@ -53,6 +63,7 @@ void main() {
     expect(ViewerStreamQuality.high.code, 0);
     expect(ViewerStreamQuality.balanced.code, 1);
     expect(ViewerStreamQuality.smooth.code, 2);
+    expect(ViewerStreamQuality.custom.code, 3);
     expect(ViewerStreamOptionsCode.unsupported.code, 1);
     expect(ViewerStreamOptionsCode.failed.code, 2);
     expect(ViewerStreamOptionsCode.busy.code, 3);

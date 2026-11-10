@@ -111,10 +111,6 @@ func TestAPITokenRejectsOutOfScopeRequests(t *testing.T) {
 		[]string{TokenResourceDevices, TokenResourceAccounts}, "east", time.Hour); !errors.Is(err, ErrAPITokenGroupScope) {
 		t.Fatalf("group with accounts = %v", err)
 	}
-	if _, _, err := store.CreateAPIToken(alice.ID, "group devices", RoleReadonly,
-		[]string{TokenResourceDevices}, "east", time.Hour); !errors.Is(err, ErrAPITokenGroupScope) {
-		t.Fatalf("group with devices = %v", err)
-	}
 	if _, _, err := store.CreateAPIToken(alice.ID, "missing group", RoleReadonly,
 		[]string{TokenResourceGroups}, "east", time.Hour); !errors.Is(err, ErrUnknownAccountGroup) {
 		t.Fatalf("unknown group = %v", err)

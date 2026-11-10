@@ -91,7 +91,13 @@ type Message struct {
 	Signature   string `json:"signature,omitempty"`
 	Auth        string `json:"auth,omitempty"`
 	Token       string `json:"token,omitempty"`
-	Timestamp   int64  `json:"timestamp,omitempty"`
+	// Transport carries a signed short-lived transport credential and
+	// TransportProof proves the presenter holds the key bound inside it. The
+	// fields are additive: a deployment without transport credentials keeps the
+	// legacy Auth/Token exchange.
+	Transport      string `json:"transport,omitempty"`
+	TransportProof string `json:"transport_proof,omitempty"`
+	Timestamp      int64  `json:"timestamp,omitempty"`
 	Relay       string `json:"relay,omitempty"`
 	OK          bool   `json:"ok"`
 	Error       string `json:"error,omitempty"`

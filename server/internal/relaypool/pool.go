@@ -96,7 +96,10 @@ type leaseRequest struct {
 	ID           string `json:"id"`
 	PublicKey    string `json:"public_key"`
 	CarrierToken string `json:"carrier_token"`
-	TTLSeconds   int64  `json:"ttl_sec"`
+	// Managed tells the node that the host's device policy requires transport
+	// credentials, so the legacy carrier token must never admit a viewer.
+	Managed    bool  `json:"managed,omitempty"`
+	TTLSeconds int64 `json:"ttl_sec"`
 }
 
 func New(cfg Config) (*Pool, error) {
@@ -271,7 +274,7 @@ func (p *Pool) markFailed(node *nodeState, err error) {
 // so a renewal keeps its port and does not disturb a live viewer; otherwise
 // every usable node is offered once in round-robin order. A failed attempt
 // marks the node unhealthy until the next probe.
-func (p *Pool) Provision(id, publicKey, carrierToken string, ttl time.Duration, preferred string) (Lease, error) {
+func (p *Pool) Provision(id, publicKey, carrierToken string, managed bool, ttl time.Duration, preferred string) (Lease, error) {
 	p.mu.Lock()
 	closed := p.closed
 	order := p.candidateOrderLocked(preferred)
@@ -292,6 +295,7 @@ func (p *Pool) Provision(id, publicKey, carrierToken string, ttl time.Duration, 
 			ID:           id,
 			PublicKey:    publicKey,
 			CarrierToken: carrierToken,
+			Managed:      managed,
 			TTLSeconds:   ttlSeconds,
 		})
 		if err == nil {

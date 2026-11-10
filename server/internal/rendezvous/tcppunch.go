@@ -210,9 +210,9 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 	}
 }
 
-// checkAnnounce authenticates one half of a punch. Viewers prove the link or
-// server key with the same HMAC as a punch request; hosts prove their host key,
-// because only the registered key can speak for an id.
+// checkAnnounce authenticates one half of a punch. Viewers present either a
+// short-lived transport credential or the legacy link/server key HMAC; hosts
+// prove their registered host key, because only that key can speak for an id.
 func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
 	if p.srv.relayOnly != nil && p.srv.relayOnly() {
 		return errors.New("direct connections are disabled")
@@ -235,7 +235,7 @@ func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
 	// viewer without a connection credential must not be able to use this port
 	// to probe whether an ID exists or is online.
 	if msg.Role == wire.RoleViewer {
-		if !p.srv.checkViewerPunch(msg.HostID, msg.Nonce, msg.Auth, msg.Timestamp, now) {
+		if !p.srv.checkViewerPunch(msg, now) {
 			return errors.New("punch authentication failed")
 		}
 	}

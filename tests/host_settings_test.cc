@@ -13,6 +13,7 @@
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
 #include "chast/quic.h"
+#include "chast/wallpaper.h"
 #include "service_settings.h"
 #include "windows_sessions.h"
 
@@ -114,7 +115,8 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.file_receive_directory == b.file_receive_directory &&
            a.file_share_roots == b.file_share_roots &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
-           a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
+           a.audio_device == b.audio_device &&
+           a.voice_microphone == b.voice_microphone && a.audio_aec == b.audio_aec &&
            a.audio_silence_gate_ms == b.audio_silence_gate_ms &&
            a.allow_privacy_mode == b.allow_privacy_mode &&
            a.allow_os_login == b.allow_os_login &&
@@ -122,6 +124,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_remote_config == b.allow_remote_config &&
            a.lock_after_session_end == b.lock_after_session_end &&
            a.keep_awake == b.keep_awake &&
+           a.remove_wallpaper == b.remove_wallpaper &&
            a.auto_disconnect_minutes == b.auto_disconnect_minutes &&
            a.trusted_device_days == b.trusted_device_days &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
@@ -169,6 +172,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_audio = false;
     settings.allow_microphone = true;
     settings.audio_device = "{0.0.1.00000000}.{5f3a2c1b-9d4e-4a6f-8b7c-1234567890ab}";
+    settings.voice_microphone = "{0.0.1.00000000}.{a1b2c3d4-1111-2222-3333-444455556666}";
     settings.audio_aec = false;
     settings.audio_silence_gate_ms = 0;
     settings.allow_privacy_mode = true;
@@ -177,6 +181,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_remote_config = true;
     settings.lock_after_session_end = true;
     settings.keep_awake = false;
+    settings.remove_wallpaper = true;
     settings.auto_disconnect_minutes = 30;
     settings.trusted_device_days = 30;
     settings.auth_mode = chast::HostAuthMode::Password;
@@ -273,6 +278,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(!loaded.settings.allow_terminal_persist,
           "a fresh host does not keep consoles after a disconnect");
     check(loaded.settings.audio_device.empty(), "a fresh host follows the default output");
+    check(loaded.settings.voice_microphone.empty(),
+          "a fresh host follows the default communications microphone");
     check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
     check(loaded.settings.audio_silence_gate_ms == 2000,
           "a fresh host gates digital silence after two seconds");
@@ -290,6 +297,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(!loaded.settings.record_incoming && loaded.settings.record_directory.empty(),
           "host recording requires local opt-in and an explicit output folder");
     check(loaded.settings.keep_awake, "a fresh host keeps authenticated remote connections awake");
+    check(!loaded.settings.remove_wallpaper,
+          "a fresh host keeps the operator's wallpaper");
     check(loaded.settings.virtual_display == chast::VirtualDisplayPolicy::Off,
           "a fresh host never creates a virtual display on its own");
     check(loaded.settings.virtual_display_monitors == 1 &&
@@ -326,9 +335,11 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "max_viewers=9\n"
                "audio=perhaps\n"
                "audio_device=" + std::string(1100, 'd') + "\n"
+               "voice_microphone=" + std::string(1100, 'm') + "\n"
                "audio_aec=perhaps\n"
                "audio_silence_gate_ms=99999\n"
                "microphone=perhaps\n"
+               "remove_wallpaper=perhaps\n"
                "privacy_mode=perhaps\n"
                "keep_awake=invalid\n"
                "clipboard_direction=typo\n"
@@ -376,6 +387,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
     check(settings.max_viewers == 2, "an out-of-range viewer cap falls back");
     check(settings.audio_device.empty(), "an oversized output id is dropped");
+    check(settings.voice_microphone.empty(), "an oversized microphone id is dropped");
     check(settings.audio_aec, "an unparsable AEC toggle keeps the default");
     check(settings.audio_silence_gate_ms == 2000,
           "an out-of-range silence gate falls back");
@@ -390,6 +402,9 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "invalid host recording opt-in stays off and reports the problem");
     check(settings.keep_awake && loaded.warning.find("keep_awake") != std::string::npos,
           "an invalid keep-awake toggle retains its default and reports the problem");
+    check(!settings.remove_wallpaper &&
+              loaded.warning.find("remove_wallpaper") != std::string::npos,
+          "an invalid wallpaper toggle stays off and reports the problem");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -421,7 +436,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "malformed rotation pins are dropped with a warning");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
-                            "audio_device", "audio_aec", "audio_silence_gate_ms",
+                            "audio_device", "voice_microphone", "audio_aec",
+                            "audio_silence_gate_ms",
                             "microphone", "privacy_mode",
                             "auto_disconnect_minutes",
                             "record", "token_mode", "token", "codec",
@@ -509,12 +525,49 @@ void test_audio_settings(const std::filesystem::path& dir) {
               !empty.settings.audio_aec && empty.settings.audio_silence_gate_ms == 0,
           "an empty output id, AEC off and gate 0 load without warnings");
 
-    write_text(path, "audio_device={0.0.1.00000000}.{missing}\naudio_aec=1\n");
+    write_text(path, "audio_device={0.0.1.00000000}.{missing}\naudio_aec=1\n"
+                     "voice_microphone={0.0.1.00000000}.{unplugged-mic}\n");
     const chast::HostSettingsLoad pinned = chast::load_host_settings(path.string());
     check(pinned.warning.empty() &&
               pinned.settings.audio_device == "{0.0.1.00000000}.{missing}" &&
+              pinned.settings.voice_microphone == "{0.0.1.00000000}.{unplugged-mic}" &&
               pinned.settings.audio_aec,
           "a device id that is not plugged in is preserved for the session");
+}
+
+// Only the backup bookkeeping is exercised here: every path that could touch
+// the real desktop is refused before SystemParametersInfo runs.
+void test_wallpaper_state(const std::filesystem::path& dir) {
+    const std::filesystem::path state = dir / L"session.wallpaper";
+    std::error_code ec;
+    std::filesystem::remove(state, ec);
+
+    std::string error;
+    check(!chast::create_wallpaper_removal("", &error) &&
+              error.find("backup path") != std::string::npos,
+          "removing the wallpaper without a backup path is refused");
+    check(chast::restore_abandoned_wallpaper("", &error),
+          "an empty backup path restores nothing");
+
+    error.clear();
+    check(chast::restore_abandoned_wallpaper(state.string(), &error) &&
+              !std::filesystem::exists(state),
+          "a missing wallpaper backup is a successful restore");
+
+    write_text(state, "# chast wallpaper backup\n");
+    error.clear();
+    check(chast::restore_abandoned_wallpaper(state.string(), &error) &&
+              !std::filesystem::exists(state),
+          "a backup without a wallpaper path is discarded");
+
+    write_text(state, "# pending\nC:\\wallpaper.png\n");
+    error.clear();
+    check(!chast::create_wallpaper_removal(state.string(), &error) &&
+              error.find("pending") != std::string::npos,
+          "a pending backup blocks a second removal");
+    check(std::filesystem::exists(state),
+          "the pending backup is left for the restart restore");
+    std::filesystem::remove(state, ec);
 }
 
 void test_tokens() {
@@ -834,11 +887,18 @@ void test_audit_spool(const std::filesystem::path& dir) {
           "the policy acknowledgement sits next to the settings file");
     check(chast::policy_ack_path_for("").empty(),
           "an empty settings path has no policy acknowledgement");
+    const std::string wallpaper_path = (folder / L"host.wallpaper").string();
+    check(chast::wallpaper_state_path_for(settings_path) == wallpaper_path,
+          "the wallpaper backup sits next to the settings file");
+    check(chast::wallpaper_state_path_for("").empty(),
+          "an empty settings path has no wallpaper backup");
 
     const chast::HostSettingsLoad loaded = chast::load_host_settings(settings_path);
     check(loaded.settings.audit_spool == derived, "loading derives the spool path");
     check(loaded.settings.policy_state == policy_path, "loading derives the policy cache path");
     check(loaded.settings.policy_ack == ack_path, "loading derives the acknowledgement path");
+    check(loaded.settings.wallpaper_state == wallpaper_path,
+          "loading derives the wallpaper backup path");
 
     chast::HostSettings settings = loaded.settings;
     settings.audit_spool = (folder / L"custom-audit.jsonl").string();
@@ -1193,6 +1253,7 @@ int main() {
     test_invalid_values(dir);
     test_file_share_roots(dir);
     test_audio_settings(dir);
+    test_wallpaper_state(dir);
     test_idle_timeout_settings(dir);
     test_trusted_device_lifetime_settings(dir);
     test_virtual_display_settings(dir);

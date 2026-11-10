@@ -665,6 +665,21 @@ void cursor_sink_while_full() {
     while (state->encodes < 60 && std::chrono::steady_clock::now() < fill)
         std::this_thread::sleep_for(5ms);
     check(state->encodes >= 60, "fill the stalled viewer's video window");
+    // The encoder counter advances before the picture reaches the subscriber
+    // queue, so the 60th encode can be in flight when the counter is first
+    // read. Wait for the window to reach its high-water mark before taking
+    // the baseline; encoding stops while every queue is full.
+    auto last_change = std::chrono::steady_clock::now();
+    unsigned observed = state->encodes;
+    const auto settle = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() - last_change < 400ms &&
+           std::chrono::steady_clock::now() < settle) {
+        std::this_thread::sleep_for(10ms);
+        if (state->encodes != observed) {
+            observed = state->encodes;
+            last_change = std::chrono::steady_clock::now();
+        }
+    }
 
     // The subscriber sink models the host session's CursorPublisher: it runs
     // on the display service thread, beside video, like RustDesk's cursor

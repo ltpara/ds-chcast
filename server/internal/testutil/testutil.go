@@ -206,6 +206,14 @@ func StartWith(t testing.TB, opts Options) *Server {
 	if opts.CarrierV6 {
 		relayOpts = append(relayOpts, relay.WithCarrierBind6("::1"))
 	}
+	var transportVerifier *acl.TransportVerifier
+	if opts.AccessIssuer != nil {
+		transportVerifier = acl.NewTransportVerifier(opts.AccessIssuer.Name(), "")
+		if err := transportVerifier.PinKey(opts.AccessIssuer.KeyID(), opts.AccessIssuer.PublicKeyText()); err != nil {
+			t.Fatalf("transport verifier: %v", err)
+		}
+		relayOpts = append(relayOpts, relay.WithTransportVerifier(transportVerifier))
+	}
 	rm, err := relay.NewManager("127.0.0.1", []int{0, 0}, reg, log, relayOpts...)
 	if err != nil {
 		t.Fatalf("relay: %v", err)
@@ -219,7 +227,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 	relayOnly := &atomic.Bool{}
 	relayOnly.Store(opts.RelayOnly)
 	var pool *relaypool.Pool
-	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log,
+	meetOpts := []rendezvous.Option{
 		rendezvous.WithServerKey(ServerKey),
 		rendezvous.WithLinkKey(opts.LinkKey),
 		rendezvous.WithRelayOnly(relayOnly.Load),
@@ -233,7 +241,11 @@ func StartWith(t testing.TB, opts Options) *Server {
 			}
 			return rm.HostLinked(id)
 		}),
-	)
+	}
+	if transportVerifier != nil {
+		meetOpts = append(meetOpts, rendezvous.WithTransportVerifier(transportVerifier))
+	}
+	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log, meetOpts...)
 	if err != nil {
 		rm.Close()
 		t.Fatalf("rendezvous: %v", err)

@@ -299,6 +299,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   ViewerStreamCodec _streamCodec = ViewerStreamCodec.auto;
   bool _streamFullColor = false;
   ViewerStreamQuality _streamQuality = ViewerStreamQuality.high;
+  // RustDesk's custom image quality in percent. Kept while a preset is
+  // selected so the custom entry reopens with the last number.
+  int _streamQualityPercent = 50;
   int _streamMaxFps = 0;
   // Answers already consumed and requests still in flight, so a stale answer
   // cannot overwrite a newer menu choice.
@@ -341,6 +344,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // a running helper can still hold a dead NAT mapping or an expired token.
   TunnelAgent? _tunnel;
   Future<TunnelAgent>? _tunnelStarting;
+  // Explicit management override for a restricted device. The administrator
+  // token is collected on demand and kept only in memory; the tunnel agent
+  // re-signs the override on transport refresh, so this mode never does an
+  // ordinary viewer lookup and every reconnect is a fresh audited request.
+  String _emergencyAdmin = '';
+  String _emergencyReason = '';
+  StreamSubscription<TunnelAccessTicket>? _emergencyTickets;
+
+  bool get _emergencyActive => _emergencyAdmin.isNotEmpty;
   // Automatic reconnect after an unexpected drop. The policy holds the
   // attempt count and backoff; [_autoTimer] is the pending delay. The series
   // starts only after a session has shown frames, so a refused password or a
@@ -358,6 +370,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   bool get _inputActive =>
       !_keyboardChanging && _controlEnabled && _status.acceptsInput && _startError == null;
+
+  // "Show my cursor": the viewer pointer drawn on the host desktop. It is a
+  // draw-only hint, so it keeps working while remote control is off.
+  bool _showMyCursor = false;
+  bool _cursorHintOnHost = false;
+  int _cursorHintSentMs = 0;
+  // The hint is throttled rather than queued: only the latest position can
+  // still be where the pointer is. ~30 updates per second is smooth enough
+  // and keeps a fast mouse from flooding the control stream.
+  static const int _cursorHintIntervalMs = 33;
 
   String get _prefsPeerId => widget.target.preferencesKey;
 
@@ -389,6 +411,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _streamCodec = _streamCodecFor(prefs.codec);
     _streamFullColor = prefs.fullColor;
     _streamQuality = _streamQualityFor(prefs.quality);
+    _streamQualityPercent = prefs.qualityPercent;
     _streamMaxFps = prefs.maxFps;
     ViewerBridge.setKeyboardTextRejectedHandler(() {
       if (mounted && !_closing) {
@@ -404,6 +427,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _statsVisible = viewPrefs.stats;
     _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
+    _showMyCursor = viewPrefs.showMyCursor;
     _fileBrowserSortAscending = viewPrefs.fileSortAscending;
     _fileBrowserDirectory = viewPrefs.browserDirectory;
     _fileBrowserShowHidden = viewPrefs.browserShowHidden;
@@ -807,11 +831,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       } on TunnelException catch (error) {
         if (mounted) {
-          setState(
-            () => _startError = tr('无法通过连接服务打开设备：{p1}', <String, Object?>{
+          // A refused override ends this attempt; forget the token so the
+          // overlay offers a fresh administrator login instead of retrying
+          // credentials the server already rejected.
+          final bool dropEmergency = _emergencyActive && !error.retryable;
+          setState(() {
+            _startError = tr('无法通过连接服务打开设备：{p1}', <String, Object?>{
               'p1': error.message,
-            }),
-          );
+            });
+            if (dropEmergency) {
+              _emergencyAdmin = '';
+              _emergencyReason = '';
+            }
+          });
           final Duration? delay = _autoPolicy.afterStartupFailure(
             retryable: error.retryable && !_closing && !_identityChanged,
           );
@@ -820,6 +852,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       }
     }
+  }
+
+  /// The signed-in account token is handed to the tunnel only when it belongs
+  /// to the target deployment. A restricted managed device admits no shared
+  /// link key, so this is what makes lookup succeed; a token from another
+  /// server would authenticate against the wrong account namespace.
+  Future<String> _tunnelAccountToken(ServerSettings settings) async {
+    final AccountSession? account = await _activeAccount();
+    if (account == null || !account.isActiveAt(DateTime.now().toUtc())) {
+      return '';
+    }
+    final String accountServer = normalizeServerUrl(account.server);
+    if (accountServer.isEmpty ||
+        accountServer != normalizeServerUrl(settings.url)) {
+      return '';
+    }
+    return account.token;
   }
 
   /// Reuses the agent within an attempt. _reconnect retires it before starting
@@ -852,20 +901,77 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     ServerApi.proxy = widget.settings.proxy;
     _tunnelStarting ??= () async {
       final String serverKey = await _confirmedServerKey(settings);
+      final String accountToken = await _tunnelAccountToken(settings);
+      EmergencyAccessRequest? emergency;
+      if (_emergencyActive) {
+        // The ticket is bound to the application client identity, while the
+        // tunnel contributes its own ephemeral transport key. Both must come
+        // from this process, so the request is assembled here rather than
+        // carried in from the dialog.
+        final String clientKey = await ViewerBridge.ticketIdentity();
+        if (clientKey.isEmpty) {
+          throw TunnelException(tr('无法读取查看器票据身份'));
+        }
+        emergency = EmergencyAccessRequest(
+          adminToken: _emergencyAdmin,
+          reason: _emergencyReason,
+          clientPublicKey: clientKey,
+        );
+      }
       return TunnelAgent.start(
         server: settings,
         hostId: widget.target.hostId,
+        accountToken: accountToken,
         serverPublicKey: serverKey,
+        emergency: emergency,
       );
     }();
     try {
       final TunnelAgent agent = await _tunnelStarting!;
       _tunnel = agent;
       _tunnelStarting = null;
+      _watchEmergencyTickets(agent);
       return agent;
     } catch (_) {
       _tunnelStarting = null;
       rethrow;
+    }
+  }
+
+  /// Follows the tickets the agent re-signs while an override is active. The
+  /// ordinary 20-second lookup renewal does not apply here: only the agent
+  /// holds the transport key the override was minted against, so it is the
+  /// only party that can request the next ticket.
+  void _watchEmergencyTickets(TunnelAgent agent) {
+    unawaited(_emergencyTickets?.cancel());
+    _emergencyTickets = null;
+    if (!_emergencyActive) {
+      return;
+    }
+    _emergencyTickets = agent.accessTickets.listen((
+      TunnelAccessTicket ticket,
+    ) {
+      if (!mounted || _closing || _reconnecting || _tunnel != agent) {
+        return;
+      }
+      unawaited(_renewEmergencyTicket(ticket.ticket));
+    });
+  }
+
+  Future<void> _renewEmergencyTicket(String ticket) async {
+    if (_ticketRenewBusy) {
+      return;
+    }
+    _ticketRenewBusy = true;
+    try {
+      await ViewerBridge.renewAccessTicket(ticket);
+    } on MissingPluginException {
+      // Reported by the start path.
+    } on PlatformException {
+      // A rejected renewal leaves the previous lease in force; the host
+      // closes the session at its deadline rather than widening access.
+    } finally {
+      _ticketRenewBusy = false;
     }
   }
 
@@ -1064,6 +1170,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             codec: _streamCodec.code,
             maxFps: _streamMaxFps,
             quality: _streamQuality.code,
+            qualityPercent: _streamQuality == ViewerStreamQuality.custom
+                ? _streamQualityPercent
+                : 0,
             chroma: _streamFullColor ? 1 : 0,
           )) {
             --_streamPending;
@@ -1213,6 +1322,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// refusal from the server is surfaced instead of silently downgrading to
   /// local authentication, which a managed host would reject anyway.
   Future<String> _fetchAccessTicket() async {
+    if (_emergencyActive) {
+      // The agent obtained the override immediately before the tunnel became
+      // ready, so its first ticket is the one this session starts with.
+      final String ticket = _tunnel?.accessTicket ?? '';
+      if (ticket.isEmpty) {
+        throw TunnelException(tr('隧道代理没有返回应急访问票据'));
+      }
+      return ticket;
+    }
     final AccountSession? account = await _activeAccount();
     if (account == null ||
         !account.isActiveAt(DateTime.now()) ||
@@ -1245,7 +1363,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _startTicketRenewal(String ticket) {
     _ticketTimer?.cancel();
     _ticketTimer = null;
-    if (ticket.isEmpty) {
+    // In emergency mode the tunnel agent re-signs the override itself and
+    // pushes each replacement; a lookup with the viewer account would be
+    // refused by the restricted device.
+    if (_emergencyActive || ticket.isEmpty) {
       return;
     }
     _ticketTimer = Timer.periodic(
@@ -1259,7 +1380,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// session stops at once rather than waiting for the deadline; a transient
   /// failure leaves the existing deadline in force.
   Future<void> _renewAccessTicket() async {
-    if (_ticketRenewBusy || !mounted || _closing) {
+    if (_emergencyActive || _ticketRenewBusy || !mounted || _closing) {
       return;
     }
     final AccountSession? account = await _activeAccount();
@@ -1479,6 +1600,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           if (streamRollback != null) {
             _streamCodec = streamRollback.codec;
             _streamQuality = streamRollback.quality;
+            _streamQualityPercent = streamRollback.qualityPercent;
             _streamMaxFps = streamRollback.maxFps;
             _streamFullColor = streamRollback.fullColor;
           } else {
@@ -1491,9 +1613,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       ? ViewerStreamCodec.av1
                       : ViewerStreamCodec.h264);
             _streamQuality = _streamQualityFor(status.streamQuality);
+            if (status.streamQualityPercent != 0) {
+              _streamQualityPercent = status.streamQualityPercent;
+            }
           }
         } else {
           _streamQuality = _streamQualityFor(status.streamQuality);
+          if (status.streamQualityPercent != 0) {
+            _streamQualityPercent = status.streamQualityPercent;
+          }
         }
       }
       _status = status;
@@ -2173,6 +2301,37 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _toggleStats() {
     setState(() => _statsVisible = !_statsVisible);
     ViewPreferences.update(peerId: _prefsPeerId, stats: _statsVisible);
+  }
+
+  void _toggleShowMyCursor() {
+    final bool enabled = !_showMyCursor;
+    setState(() => _showMyCursor = enabled);
+    ViewPreferences.update(peerId: _prefsPeerId, showMyCursor: enabled);
+    if (!enabled) {
+      _hideCursorHint();
+    }
+  }
+
+  void _onCursorHint(Offset frame, {DisplayVideoStream? display}) {
+    if (!_showMyCursor) {
+      return;
+    }
+    final (int x, int y) = _desktopPoint(frame, display);
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (_cursorHintOnHost && now - _cursorHintSentMs < _cursorHintIntervalMs) {
+      return;
+    }
+    _cursorHintSentMs = now;
+    _cursorHintOnHost = true;
+    unawaited(ViewerBridge.showCursor(x: x, y: y, visible: true));
+  }
+
+  void _hideCursorHint() {
+    if (!_cursorHintOnHost) {
+      return;
+    }
+    _cursorHintOnHost = false;
+    unawaited(ViewerBridge.showCursor(x: 0, y: 0, visible: false));
   }
 
   void _rememberFileSort(FileBrowserSort sort, bool ascending) {
@@ -3479,6 +3638,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             _onGesture(p, zoom, x, y, display: stream),
         onDevicePointer: (e, p) => _onDevicePointer(e, p, display: stream),
         onDeviceCancel: (e, p) => _onDeviceCancel(e, p, display: stream),
+        onCursorHint: (p) => _onCursorHint(p, display: stream),
+        onCursorHintExit: _hideCursorHint,
       ),
     );
   }
@@ -3715,27 +3876,35 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Future<void> _changeStreamOptions({
     ViewerStreamCodec? codec,
     ViewerStreamQuality? quality,
+    int? qualityPercent,
     int? maxFps,
     bool? fullColor,
   }) async {
     final bool nextFullColor = fullColor ?? (codec != null && codec != ViewerStreamCodec.vp9 ? false : _streamFullColor);
     final ViewerStreamCodec nextCodec = fullColor == true ? ViewerStreamCodec.vp9 : codec ?? _streamCodec;
     final ViewerStreamQuality nextQuality = quality ?? _streamQuality;
+    final int nextQualityPercent = qualityPercent ?? _streamQualityPercent;
     final int nextFps = maxFps ?? _streamMaxFps;
+    final bool customPercentChanged =
+        nextQuality == ViewerStreamQuality.custom &&
+        nextQualityPercent != _streamQualityPercent;
     if (nextCodec == _streamCodec &&
         nextQuality == _streamQuality &&
-        nextFps == _streamMaxFps && nextFullColor == _streamFullColor) {
+        nextFps == _streamMaxFps && nextFullColor == _streamFullColor &&
+        !customPercentChanged) {
       return;
     }
     final _StreamOptionSnapshot previous = _StreamOptionSnapshot(
       _streamCodec,
       _streamQuality,
+      _streamQualityPercent,
       _streamMaxFps,
       _streamFullColor,
     );
     setState(() {
       _streamCodec = nextCodec;
       _streamQuality = nextQuality;
+      _streamQualityPercent = nextQualityPercent;
       _streamMaxFps = nextFps;
       _streamFullColor = nextFullColor;
       _streamRollback = previous;
@@ -3749,6 +3918,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         codec: nextCodec.code,
         maxFps: nextFps,
         quality: nextQuality.code,
+        qualityPercent:
+            nextQuality == ViewerStreamQuality.custom ? nextQualityPercent : 0,
         chroma: nextFullColor ? 1 : 0,
       );
     } on PlatformException {
@@ -3767,6 +3938,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     setState(() {
       _streamCodec = previous.codec;
       _streamQuality = previous.quality;
+      _streamQualityPercent = previous.qualityPercent;
       _streamMaxFps = previous.maxFps;
       _streamFullColor = previous.fullColor;
       _streamRollback = null;
@@ -3784,6 +3956,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       StreamPreferences(
         codec: _streamCodec.code,
         quality: _streamQuality.code,
+        qualityPercent: _streamQualityPercent,
         fullColor: _streamFullColor,
         maxFps: _streamMaxFps,
       ),
@@ -4122,6 +4295,35 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _starting;
   }
 
+  /// Collects an administrator login and a stated reason, then retries the
+  /// connection through an explicit override. The server keeps the permission
+  /// ceiling and host local authentication, so a refusal (non-admin account,
+  /// unmanaged device, ...) comes back through the tunnel and is shown as the
+  /// normal start error instead of silently downgrading.
+  Future<void> _promptEmergencyAccess() async {
+    if (_reconnecting || _closing) {
+      return;
+    }
+    final _EmergencyAccessResult? result =
+        await showDialog<_EmergencyAccessResult>(
+          context: context,
+          barrierDismissible: false,
+          builder: (BuildContext context) => _EmergencyAccessDialog(
+            server: widget.target.server,
+            proxy: widget.settings.proxy,
+          ),
+        );
+    if (result == null || !mounted || _closing) {
+      return;
+    }
+    setState(() {
+      _emergencyAdmin = result.token;
+      _emergencyReason = result.reason;
+      _startError = null;
+    });
+    await _reconnect();
+  }
+
   Future<void> _shutdown() {
     return _shutdownFuture ??= _shutdownOnce();
   }
@@ -4137,8 +4339,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _stopTunnel() async {
     final TunnelAgent? previous = _tunnel;
+    final StreamSubscription<TunnelAccessTicket>? tickets = _emergencyTickets;
     _tunnel = null;
     _tunnelStarting = null;
+    _emergencyTickets = null;
+    await tickets?.cancel();
     await previous?.stop();
   }
 
@@ -5573,6 +5778,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onGesture: _inputActive ? _onGesture : null,
                       onDevicePointer: _inputActive ? _onDevicePointer : null,
                       onDeviceCancel: _inputActive ? _onDeviceCancel : null,
+                      onCursorHint: _onCursorHint,
+                      onCursorHintExit: _hideCursorHint,
                       onFocusRequested: _focus.requestFocus,
                     ),
                   )
@@ -5598,6 +5805,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fit: _fit,
                         controlEnabled: _controlEnabled,
                         inputAvailable: _status.acceptsInput,
+                        showMyCursor: _showMyCursor,
+                        onToggleShowCursor: _toggleShowMyCursor,
                         clipboardEnabled: _clipboardSync,
                         clipboardAvailable: _status.acceptsClipboard,
                         clipboardDirection: _status.clipboardDirection,
@@ -5687,11 +5896,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         streamActualFormat: "${_status.codec.toUpperCase()} · ${_status.chroma == 1 ? '4:4:4' : '4:2:0'}",
                         onSelectStreamFullColor: (value) => unawaited(_changeStreamOptions(fullColor: value)),
                         streamQuality: _streamQuality,
+                        streamQualityPercent: _streamQualityPercent,
                         streamMaxFps: _streamMaxFps,
                         onSelectStreamCodec: (ViewerStreamCodec codec) =>
                             unawaited(_changeStreamOptions(codec: codec)),
                         onSelectStreamQuality: (ViewerStreamQuality quality) =>
                             unawaited(_changeStreamOptions(quality: quality)),
+                        onSelectStreamQualityPercent: (int percent) => unawaited(
+                            _changeStreamOptions(
+                                quality: ViewerStreamQuality.custom,
+                                qualityPercent: percent)),
                         onSelectStreamFps: (int fps) =>
                             unawaited(_changeStreamOptions(maxFps: fps)),
                         onToggleControl: _toggleControl,
@@ -7089,6 +7303,39 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                     ),
                   ],
                 ),
+              if (failed && !_denied && !_identityChanged) ...<Widget>[
+                if (_emergencyActive)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      tr('本次会话由管理员应急授权，操作已记录审计'),
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Color(0xFFFFCC80),
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  )
+                else if (widget.target.viaServer &&
+                    widget.target.hostId.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: TextButton.icon(
+                      onPressed: _reconnecting
+                          ? null
+                          : () => unawaited(_promptEmergencyAccess()),
+                      style: TextButton.styleFrom(
+                        foregroundColor: const Color(0xFFFFCC80),
+                        textStyle: const TextStyle(fontSize: 12),
+                      ),
+                      icon: const Icon(
+                        Icons.admin_panel_settings_outlined,
+                        size: 15,
+                      ),
+                      label: Text(tr('管理员应急访问')),
+                    ),
+                  ),
+              ],
             ],
           ),
         ),
@@ -7111,6 +7358,166 @@ class _CredentialResult {
 
   final String text;
   final bool remember;
+}
+
+class _EmergencyAccessResult {
+  const _EmergencyAccessResult({required this.token, required this.reason});
+
+  final String token;
+  final String reason;
+}
+
+/// Collects the administrator login and the mandatory reason for an explicit
+/// override. The login happens here so a wrong password or two-step code is
+/// reported inline instead of surfacing as a tunnel start failure. The token
+/// is returned to the page and never stored.
+class _EmergencyAccessDialog extends StatefulWidget {
+  const _EmergencyAccessDialog({required this.server, required this.proxy});
+
+  final String server;
+  final String proxy;
+
+  @override
+  State<_EmergencyAccessDialog> createState() => _EmergencyAccessDialogState();
+}
+
+class _EmergencyAccessDialogState extends State<_EmergencyAccessDialog> {
+  final TextEditingController _username = TextEditingController();
+  final TextEditingController _password = TextEditingController();
+  final TextEditingController _totp = TextEditingController();
+  final TextEditingController _reason = TextEditingController();
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _username.dispose();
+    _password.dispose();
+    _totp.dispose();
+    _reason.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_busy) {
+      return;
+    }
+    final String reason = _reason.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (reason.isEmpty) {
+      setState(() => _error = tr('请填写应急访问原因'));
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      ServerApi.proxy = widget.proxy;
+      final AccountLoginResult login = await ServerApi.login(
+        ServerSettings(url: widget.server),
+        username: _username.text,
+        password: _password.text,
+        totpCode: _totp.text,
+        deviceName: Platform.localHostname,
+      );
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pop(
+        _EmergencyAccessResult(token: login.token, reason: reason),
+      );
+    } on ServerApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _busy = false;
+        _error = error.message;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(tr('管理员应急访问')),
+      content: SizedBox(
+        width: 360,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                tr('受限设备拒绝普通账号时，管理员可为本次连接签发 60 秒应急票据。操作会记录管理员身份和填写的原因，且仍受设备权限上限与主机本地认证约束。'),
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: _username,
+                autofocus: true,
+                enabled: !_busy,
+                textInputAction: TextInputAction.next,
+                decoration: InputDecoration(labelText: tr('管理员用户名')),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _password,
+                enabled: !_busy,
+                obscureText: true,
+                textInputAction: TextInputAction.next,
+                decoration: InputDecoration(labelText: tr('管理员密码')),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _totp,
+                enabled: !_busy,
+                keyboardType: TextInputType.number,
+                maxLength: 16,
+                decoration: InputDecoration(
+                  labelText: tr('两步验证码（可选）'),
+                  counterText: '',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _reason,
+                enabled: !_busy,
+                maxLength: 160,
+                onSubmitted: (_) => _submit(),
+                decoration: InputDecoration(
+                  labelText: tr('应急原因'),
+                  hintText: tr('例如：工单 4711，远程桌面无法登录'),
+                  counterText: '',
+                  errorText: _error,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: _busy
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Text(tr('登录并连接')),
+        ),
+      ],
+    );
+  }
 }
 
 class _CredentialDialog extends StatefulWidget {
@@ -7235,10 +7642,17 @@ String _formatBytes(int bytes) {
 /// What the picture menu showed before an optimistic change, so a refused
 /// request can put it back.
 class _StreamOptionSnapshot {
-  const _StreamOptionSnapshot(this.codec, this.quality, this.maxFps, this.fullColor);
+  const _StreamOptionSnapshot(
+    this.codec,
+    this.quality,
+    this.qualityPercent,
+    this.maxFps,
+    this.fullColor,
+  );
 
   final ViewerStreamCodec codec;
   final ViewerStreamQuality quality;
+  final int qualityPercent;
   final int maxFps;
   final bool fullColor;
 }

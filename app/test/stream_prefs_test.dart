@@ -30,6 +30,7 @@ void main() {
     final StreamPreferences prefs = StreamPreferences.load();
     expect(prefs.codec, 0);
     expect(prefs.quality, 0);
+    expect(prefs.qualityPercent, 50);
     expect(prefs.maxFps, 0);
   });
 
@@ -43,6 +44,7 @@ void main() {
     expect(readFile(), <String, Object?>{
       'stream_codec': 2,
       'stream_quality': 1,
+      'stream_quality_percent': 50,
       'stream_max_fps': 30,
       'stream_full_color': false,
     });
@@ -58,12 +60,48 @@ void main() {
     File(path).writeAsStringSync(jsonEncode(<String, Object?>{
       'stream_codec': 2,
       'stream_quality': 'high',
-      'stream_max_fps': 45,
+      'stream_max_fps': 121,
     }));
     final StreamPreferences prefs = StreamPreferences.load();
     expect(prefs.codec, 2);
     expect(prefs.quality, 0);
     expect(prefs.maxFps, 0);
+  });
+
+  test('accepts the custom FPS range', () {
+    StreamPreferences.save(const StreamPreferences(maxFps: 45));
+    expect(StreamPreferences.load().maxFps, 45);
+    StreamPreferences.save(const StreamPreferences(maxFps: 5));
+    expect(StreamPreferences.load().maxFps, 5);
+    StreamPreferences.save(const StreamPreferences(maxFps: 120));
+    expect(StreamPreferences.load().maxFps, 120);
+    File(path).writeAsStringSync(jsonEncode(<String, Object?>{
+      'stream_max_fps': 4,
+    }));
+    expect(StreamPreferences.load().maxFps, 0);
+  });
+
+  test('accepts the custom quality range', () {
+    StreamPreferences.save(
+        const StreamPreferences(quality: 3, qualityPercent: 65));
+    expect(StreamPreferences.load().quality, 3);
+    expect(StreamPreferences.load().qualityPercent, 65);
+    StreamPreferences.save(
+        const StreamPreferences(quality: 3, qualityPercent: 10));
+    expect(StreamPreferences.load().qualityPercent, 10);
+    StreamPreferences.save(
+        const StreamPreferences(quality: 3, qualityPercent: 100));
+    expect(StreamPreferences.load().qualityPercent, 100);
+    File(path).writeAsStringSync(jsonEncode(<String, Object?>{
+      'stream_quality': 3,
+      'stream_quality_percent': 9,
+    }));
+    expect(StreamPreferences.load().quality, 3);
+    expect(StreamPreferences.load().qualityPercent, 50);
+    File(path).writeAsStringSync(jsonEncode(<String, Object?>{
+      'stream_quality_percent': 101,
+    }));
+    expect(StreamPreferences.load().qualityPercent, 50);
   });
 
   test('a corrupt or wrong-shaped file keeps the defaults', () {
@@ -79,12 +117,13 @@ void main() {
       'another_key': 7,
     }));
     StreamPreferences.save(
-        const StreamPreferences(codec: 9, quality: -1, maxFps: 12));
+        const StreamPreferences(codec: 9, quality: -1, maxFps: 4));
     expect(readFile(), <String, Object?>{
       'language': 'en',
       'another_key': 7,
       'stream_codec': 0,
       'stream_quality': 0,
+      'stream_quality_percent': 50,
       'stream_max_fps': 0,
       'stream_full_color': false,
     });
@@ -97,6 +136,7 @@ void main() {
     expect(readFile(), <String, Object?>{
       'stream_codec': 1,
       'stream_quality': 2,
+      'stream_quality_percent': 50,
       'stream_max_fps': 60,
       'stream_full_color': false,
       'language': 'en',

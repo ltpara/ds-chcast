@@ -46,6 +46,10 @@ const (
 
 	// AuditAccessTicket records one successful short-lived ticket issuance.
 	AuditAccessTicket = "access_ticket"
+	// AuditEmergencyAccess records an explicit management override. The actor
+	// and the stated reason are part of the detail so the grant is never
+	// indistinguishable from ordinary admission.
+	AuditEmergencyAccess = "emergency_access"
 
 	AuditGroupCreate       = "group_create"
 	AuditGroupUpdate       = "group_update"

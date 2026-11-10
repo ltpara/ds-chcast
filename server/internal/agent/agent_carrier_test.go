@@ -256,7 +256,7 @@ func TestCarrierKeepsHostOnlineWithoutRendezvous(t *testing.T) {
 
 	api := newAPIClient(s.URL, testutil.ServerKey, nil, nil)
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
-	host, err := api.lookup(lookupCtx, "devbox")
+	host, err := api.lookup(lookupCtx, "devbox", "")
 	lookupCancel()
 	if err != nil {
 		t.Fatalf("lookup after the UDP path died: %v", err)

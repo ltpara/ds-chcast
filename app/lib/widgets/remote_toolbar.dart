@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../theme.dart';
 import '../viewer_bridge.dart';
@@ -27,6 +28,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.fit,
     required this.controlEnabled,
     required this.inputAvailable,
+    this.showMyCursor = false,
+    this.onToggleShowCursor,
     required this.clipboardEnabled,
     required this.clipboardAvailable,
     this.clipboardDirection = 3,
@@ -92,9 +95,11 @@ class RemoteToolbar extends StatelessWidget {
     this.streamActualFormat = '',
     this.onSelectStreamFullColor,
     required this.streamQuality,
+    required this.streamQualityPercent,
     required this.streamMaxFps,
     required this.onSelectStreamCodec,
     required this.onSelectStreamQuality,
+    required this.onSelectStreamQualityPercent,
     required this.onSelectStreamFps,
     required this.onToggleControl,
     this.keyboardMode = ViewerKeyboardMode.physical,
@@ -154,6 +159,10 @@ class RemoteToolbar extends StatelessWidget {
   final ViewFit fit;
   final bool controlEnabled;
   final bool inputAvailable;
+  /// Draws the viewer pointer on the host desktop. Draw-only, so it works
+  /// with remote control off too.
+  final bool showMyCursor;
+  final VoidCallback? onToggleShowCursor;
   final bool clipboardEnabled;
   final bool clipboardAvailable;
   final int clipboardDirection;
@@ -251,9 +260,11 @@ class RemoteToolbar extends StatelessWidget {
   final String streamActualFormat;
   final ValueChanged<bool>? onSelectStreamFullColor;
   final ViewerStreamQuality streamQuality;
+  final int streamQualityPercent;
   final int streamMaxFps;
   final ValueChanged<ViewerStreamCodec> onSelectStreamCodec;
   final ValueChanged<ViewerStreamQuality> onSelectStreamQuality;
+  final ValueChanged<int> onSelectStreamQualityPercent;
   final ValueChanged<int> onSelectStreamFps;
   final VoidCallback onToggleControl;
 
@@ -677,9 +688,11 @@ class RemoteToolbar extends StatelessWidget {
                 actualFormat: streamActualFormat,
                 onSelectFullColor: onSelectStreamFullColor,
                 quality: streamQuality,
+                qualityPercent: streamQualityPercent,
                 maxFps: streamMaxFps,
                 onSelectCodec: onSelectStreamCodec,
                 onSelectQuality: onSelectStreamQuality,
+                onSelectQualityPercent: onSelectStreamQualityPercent,
                 onSelectFps: onSelectStreamFps,
               ),
               _MouseOptionsButton(
@@ -701,6 +714,14 @@ class RemoteToolbar extends StatelessWidget {
                 disabled: !inputAvailable,
                 active: controlEnabled,
                 onTap: onToggleControl,
+              ),
+              _BarButton(
+                icon: showMyCursor ? Icons.near_me_rounded : Icons.near_me_outlined,
+                tooltip: showMyCursor
+                    ? tr('停止在主机上显示我的光标')
+                    : tr('在主机上显示我的光标'),
+                active: showMyCursor,
+                onTap: () => onToggleShowCursor?.call(),
               ),
               _SpecialKeysButton(
                 available: specialKeysAvailable,
@@ -1843,6 +1864,14 @@ class _FpsChoice extends _StreamChoice {
   final int value;
 }
 
+class _CustomFpsChoice extends _StreamChoice {
+  const _CustomFpsChoice();
+}
+
+class _CustomQualityChoice extends _StreamChoice {
+  const _CustomQualityChoice();
+}
+
 /// Encoder, quality preset and frame-rate cap for the running session. The
 /// host answers every change with the values it actually runs, so the page
 /// can put a refused choice back on the previous one.
@@ -1854,9 +1883,11 @@ class _StreamOptionsButton extends StatelessWidget {
     required this.actualFormat,
     this.onSelectFullColor,
     required this.quality,
+    required this.qualityPercent,
     required this.maxFps,
     required this.onSelectCodec,
     required this.onSelectQuality,
+    required this.onSelectQualityPercent,
     required this.onSelectFps,
   });
 
@@ -1866,12 +1897,47 @@ class _StreamOptionsButton extends StatelessWidget {
   final String actualFormat;
   final ValueChanged<bool>? onSelectFullColor;
   final ViewerStreamQuality quality;
+  final int qualityPercent;
   final int maxFps;
   final ValueChanged<ViewerStreamCodec> onSelectCodec;
   final ValueChanged<ViewerStreamQuality> onSelectQuality;
+  final ValueChanged<int> onSelectQualityPercent;
   final ValueChanged<int> onSelectFps;
 
   static const List<int> _fpsCaps = <int>[15, 30, 60];
+  static const int _minFps = 5;
+  static const int _maxFps = 120;
+  static const int _minQualityPercent = 10;
+  static const int _maxQualityPercent = 100;
+
+  bool _presetFps(int value) => value == 0 || _fpsCaps.contains(value);
+
+  /// The typed value follows RustDesk's custom FPS entry. The host accepts
+  /// 1..240 over the wire but clamps its ceiling to 120, so offering more
+  /// would only produce a value the stream can never reach.
+  Future<void> _askCustomFps(BuildContext context) async {
+    final int? value = await showDialog<int>(
+      context: context,
+      builder: (BuildContext dialogContext) =>
+          _CustomFpsDialog(initial: _presetFps(maxFps) ? 30 : maxFps),
+    );
+    if (value != null && context.mounted) {
+      onSelectFps(value);
+    }
+  }
+
+  /// Custom image quality follows RustDesk's 10..100 percent entry. The host
+  /// maps percent / 50 onto its bitrate ratio, so 50 is the balanced default.
+  Future<void> _askCustomQuality(BuildContext context) async {
+    final int? value = await showDialog<int>(
+      context: context,
+      builder: (BuildContext dialogContext) =>
+          _CustomQualityDialog(initial: qualityPercent),
+    );
+    if (value != null && context.mounted) {
+      onSelectQualityPercent(value);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1894,6 +1960,10 @@ class _StreamOptionsButton extends StatelessWidget {
             onSelectFullColor?.call(choice.value);
           } else if (choice is _FpsChoice) {
             onSelectFps(choice.value);
+          } else if (choice is _CustomFpsChoice) {
+            unawaited(_askCustomFps(context));
+          } else if (choice is _CustomQualityChoice) {
+            unawaited(_askCustomQuality(context));
           }
         },
         itemBuilder: (BuildContext context) {
@@ -1921,6 +1991,20 @@ class _StreamOptionsButton extends StatelessWidget {
               Icons.speed_rounded,
               quality == ViewerStreamQuality.smooth,
             ),
+            _item(
+              const _CustomQualityChoice(),
+              quality == ViewerStreamQuality.custom
+                  ? tr('自定义画质（{percent}%）', <String, Object?>{
+                      'percent': qualityPercent,
+                    })
+                  : tr('自定义画质…'),
+              tr('输入 {min}–{max} 之间的画质百分比', <String, Object?>{
+                'min': _minQualityPercent,
+                'max': _maxQualityPercent,
+              }),
+              Icons.tune_rounded,
+              quality == ViewerStreamQuality.custom,
+            ),
             _section(tr('帧率上限')),
             _fpsItem(0, tr('自动'), tr('跟随主机设置')),
             for (final int cap in _fpsCaps)
@@ -1929,6 +2013,22 @@ class _StreamOptionsButton extends StatelessWidget {
                 '$cap fps',
                 tr('最高 {cap} 帧/秒', <String, Object?>{'cap': cap}),
               ),
+            if (!_presetFps(maxFps))
+              _fpsItem(
+                maxFps,
+                '$maxFps fps',
+                tr('自定义：最高 {cap} 帧/秒', <String, Object?>{'cap': maxFps}),
+              ),
+            _item(
+              const _CustomFpsChoice(),
+              tr('自定义…'),
+              tr('输入 {min}–{max} 之间的帧率上限', <String, Object?>{
+                'min': _minFps,
+                'max': _maxFps,
+              }),
+              Icons.edit_outlined,
+              false,
+            ),
             _section(tr('编码器')),
             _item(
               _CodecChoice(ViewerStreamCodec.auto),
@@ -2057,6 +2157,149 @@ class _StreamOptionsButton extends StatelessWidget {
             const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
+    );
+  }
+}
+
+/// Numeric frame cap entry. The dialog validates locally so a typo is
+/// corrected before it reaches the host, which would otherwise accept any
+/// 1..240 value.
+class _CustomFpsDialog extends StatefulWidget {
+  const _CustomFpsDialog({required this.initial});
+
+  final int initial;
+
+  @override
+  State<_CustomFpsDialog> createState() => _CustomFpsDialogState();
+}
+
+class _CustomFpsDialogState extends State<_CustomFpsDialog> {
+  late final TextEditingController _controller = TextEditingController(
+    text: '${widget.initial}',
+  );
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final int? value = int.tryParse(_controller.text.trim());
+    if (value == null ||
+        value < _StreamOptionsButton._minFps ||
+        value > _StreamOptionsButton._maxFps) {
+      setState(
+        () => _error = tr('请输入 {min}–{max} 之间的整数', <String, Object?>{
+          'min': _StreamOptionsButton._minFps,
+          'max': _StreamOptionsButton._maxFps,
+        }),
+      );
+      return;
+    }
+    Navigator.of(context).pop(value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(tr('自定义帧率上限')),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        keyboardType: TextInputType.number,
+        inputFormatters: <TextInputFormatter>[
+          FilteringTextInputFormatter.digitsOnly,
+        ],
+        decoration: InputDecoration(
+          labelText: tr('帧率（FPS）'),
+          helperText: tr('{min}–{max} fps，越高越流畅，也越占带宽', <String, Object?>{
+            'min': _StreamOptionsButton._minFps,
+            'max': _StreamOptionsButton._maxFps,
+          }),
+          errorText: _error,
+        ),
+        onSubmitted: (_) => _submit(),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
+        FilledButton(onPressed: _submit, child: Text(tr('确定'))),
+      ],
+    );
+  }
+}
+
+/// Numeric custom image quality. RustDesk exposes 10..100 percent; the host
+/// scales it into its bitrate ratio, so 50 keeps the balanced default.
+class _CustomQualityDialog extends StatefulWidget {
+  const _CustomQualityDialog({required this.initial});
+
+  final int initial;
+
+  @override
+  State<_CustomQualityDialog> createState() => _CustomQualityDialogState();
+}
+
+class _CustomQualityDialogState extends State<_CustomQualityDialog> {
+  late final TextEditingController _controller = TextEditingController(
+    text: '${widget.initial}',
+  );
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final int? value = int.tryParse(_controller.text.trim());
+    if (value == null ||
+        value < _StreamOptionsButton._minQualityPercent ||
+        value > _StreamOptionsButton._maxQualityPercent) {
+      setState(
+        () => _error = tr('请输入 {min}–{max} 之间的整数', <String, Object?>{
+          'min': _StreamOptionsButton._minQualityPercent,
+          'max': _StreamOptionsButton._maxQualityPercent,
+        }),
+      );
+      return;
+    }
+    Navigator.of(context).pop(value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(tr('自定义画质')),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        keyboardType: TextInputType.number,
+        inputFormatters: <TextInputFormatter>[
+          FilteringTextInputFormatter.digitsOnly,
+        ],
+        decoration: InputDecoration(
+          labelText: tr('画质（百分比）'),
+          helperText: tr('{min}–{max}%，越高越清晰，也越占带宽', <String, Object?>{
+            'min': _StreamOptionsButton._minQualityPercent,
+            'max': _StreamOptionsButton._maxQualityPercent,
+          }),
+          errorText: _error,
+        ),
+        onSubmitted: (_) => _submit(),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
+        FilledButton(onPressed: _submit, child: Text(tr('确定'))),
+      ],
     );
   }
 }

@@ -36,6 +36,11 @@ class Win32Window {
   // |Show| is called. Returns true if the window was created successfully.
   bool Create(const std::wstring& title, const Point& origin, const Size& size);
 
+  // Creates the window at exact physical pixels. Saved display-window bounds
+  // are already physical, so re-scaling them for the monitor DPI would move a
+  // restored window on every non-100% display.
+  bool CreateAtPhysicalBounds(const std::wstring& title, const RECT& bounds);
+
   // Show the current window. Returns true if the window was successfully shown.
   bool Show();
 
@@ -73,6 +78,9 @@ class Win32Window {
 
  private:
   friend class WindowClassRegistrar;
+
+  bool CreateImpl(const std::wstring& title, int x, int y, int width,
+                  int height);
 
   // OS callback called by message pump. Handles the WM_NCCREATE message which
   // is passed when the non-client area is being created and enables automatic

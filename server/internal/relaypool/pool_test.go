@@ -241,7 +241,7 @@ func TestProvisionRoundRobinAndSticky(t *testing.T) {
 	second := newFakeNode(t, "node2.example")
 	pool := newPool(t, first, second)
 
-	lease, err := pool.Provision("devbox", "pk", "token", time.Minute, "")
+	lease, err := pool.Provision("devbox", "pk", "token", false, time.Minute, "")
 	if err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestProvisionRoundRobinAndSticky(t *testing.T) {
 	if lease.Carrier != "carrier.example:8448" || lease.ExpiresInSec != 120 {
 		t.Fatalf("first lease fields = %+v", lease)
 	}
-	lease, err = pool.Provision("devbox2", "pk", "token", time.Minute, "")
+	lease, err = pool.Provision("devbox2", "pk", "token", false, time.Minute, "")
 	if err != nil {
 		t.Fatalf("second provision: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestProvisionRoundRobinAndSticky(t *testing.T) {
 	}
 
 	// A preferred node wins even when round robin would pick the other one.
-	lease, err = pool.Provision("devbox", "pk", "token", time.Minute, first.server.URL)
+	lease, err = pool.Provision("devbox", "pk", "token", false, time.Minute, first.server.URL)
 	if err != nil {
 		t.Fatalf("sticky provision: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestPreviewNextHealthyNode(t *testing.T) {
 		t.Fatalf("preview = %+v (ok=%v)", node, ok)
 	}
 	// Preview must not consume the rotation.
-	lease, err := pool.Provision("devbox", "pk", "token", time.Minute, "")
+	lease, err := pool.Provision("devbox", "pk", "token", false, time.Minute, "")
 	if err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestProvisionFailsOverAndSkipsUnhealthy(t *testing.T) {
 	first.setLeaseStatus(http.StatusInternalServerError)
 	pool := newPool(t, first, second)
 
-	lease, err := pool.Provision("devbox", "pk", "token", time.Minute, "")
+	lease, err := pool.Provision("devbox", "pk", "token", false, time.Minute, "")
 	if err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestProvisionFailsOverAndSkipsUnhealthy(t *testing.T) {
 		}
 	}
 
-	lease, err = pool.Provision("devbox2", "pk", "token", time.Minute, first.server.URL)
+	lease, err = pool.Provision("devbox2", "pk", "token", false, time.Minute, first.server.URL)
 	if err != nil {
 		t.Fatalf("second provision: %v", err)
 	}
@@ -374,11 +374,11 @@ func TestProvisionWithoutHealthyNode(t *testing.T) {
 	only.setLeaseStatus(http.StatusBadGateway)
 	pool := newPool(t, only)
 
-	if _, err := pool.Provision("devbox", "pk", "token", time.Minute, ""); err == nil ||
+	if _, err := pool.Provision("devbox", "pk", "token", false, time.Minute, ""); err == nil ||
 		!strings.Contains(err.Error(), "all relay nodes failed") {
 		t.Fatalf("all-failed provision = %v", err)
 	}
-	if _, err := pool.Provision("devbox", "pk", "token", time.Minute, ""); err == nil ||
+	if _, err := pool.Provision("devbox", "pk", "token", false, time.Minute, ""); err == nil ||
 		!strings.Contains(err.Error(), "no healthy relay node") {
 		t.Fatalf("empty-candidate provision = %v", err)
 	}
@@ -440,7 +440,7 @@ func TestTLSNodeUsesConfiguredRoots(t *testing.T) {
 	pool.Start()
 	waitStatus(t, pool, func(s Status) bool { return s.Nodes[0].Checked && s.Nodes[0].Healthy })
 
-	lease, err := pool.Provision("devbox", "pk", "token", time.Minute, "")
+	lease, err := pool.Provision("devbox", "pk", "token", false, time.Minute, "")
 	if err != nil {
 		t.Fatalf("provision over TLS: %v", err)
 	}
@@ -455,7 +455,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 	pool.Start()
 	pool.Close()
 	pool.Close()
-	if _, err := pool.Provision("devbox", "pk", "token", time.Minute, ""); err == nil {
+	if _, err := pool.Provision("devbox", "pk", "token", false, time.Minute, ""); err == nil {
 		t.Fatal("closed pool provisioned a lease")
 	}
 }

@@ -114,6 +114,7 @@ enum ControlId {
     kSessionSelectCheck,
     kRemoteConfigCheck,
     kLockAfterEndCheck,
+    kRemoveWallpaperCheck,
     kCarrierCheck,
     kAutostartCheck,
     kSecurityButton,
@@ -181,6 +182,9 @@ struct HostApp {
     bool elevation_transferring = false;
     std::shared_ptr<chast::host::ElevationHandoff> handled_elevation;
     HostSettings settings;
+    // Device ids behind the dynamic entries of the tray's microphone submenu,
+    // rebuilt every time the menu opens.
+    std::vector<std::string> tray_voice_mics;
     // The listener's microphone gate is fixed at creation; the UI uses this to
     // tell an operator whether enabling it applies now or next session.
     bool listener_microphone = false;
@@ -1351,6 +1355,9 @@ void load_settings() {
 }
 
 constexpr UINT kMenuShow = 1;
+// The tray microphone submenu uses this base for dynamic entries; index 0 is
+// "system default", then one id per g_app->tray_voice_mics entry.
+constexpr UINT kVoiceMicMenuBase = 7000;
 
 HWND add_control(const wchar_t* cls, const wchar_t* text, DWORD style, DWORD ex_style,
                  int x, int y, int width, int height, int id, HFONT font) {
@@ -1869,6 +1876,8 @@ enum SecurityDialogId {
     kSecAudioRefresh,
     kSecAudioAec,
     kSecAudioGate,
+    kSecVoiceMicrophone,
+    kSecVoiceMicRefresh,
     kSecVirtualDisplayPolicy,
     kSecVirtualDisplayCount,
     kSecVirtualDisplayResolution,
@@ -1927,6 +1936,7 @@ struct SecurityDialogState {
     HWND one_time = nullptr;
     HWND token_edit = nullptr;
     HWND audio_device = nullptr;
+    HWND voice_microphone = nullptr;
     HWND audio_aec = nullptr;
     HWND audio_gate = nullptr;
     HWND virtual_display_policy = nullptr;
@@ -1936,6 +1946,9 @@ struct SecurityDialogState {
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
+    // Same layout for the voice-call microphone combo.
+    std::vector<std::string> voice_mic_ids;
+    std::string selected_voice_microphone;
     std::vector<HWND> auth_page;
     std::vector<HWND> access_page;
     std::vector<HWND> advanced_page;
@@ -2057,6 +2070,51 @@ void refresh_audio_devices(SecurityDialogState& dialog) {
     }
     dialog.selected_audio_device = dialog.audio_device_ids[static_cast<size_t>(chosen)];
     SendMessageW(dialog.audio_device, CB_SETCURSEL, chosen, 0);
+}
+
+void refresh_voice_microphones(SecurityDialogState& dialog) {
+    if (dialog.voice_microphone == nullptr) {
+        return;
+    }
+    std::string selected = dialog.selected_voice_microphone;
+    const LRESULT current = SendMessageW(dialog.voice_microphone, CB_GETCURSEL, 0, 0);
+    if (current >= 0 && static_cast<size_t>(current) < dialog.voice_mic_ids.size()) {
+        selected = dialog.voice_mic_ids[static_cast<size_t>(current)];
+    }
+
+    SendMessageW(dialog.voice_microphone, CB_RESETCONTENT, 0, 0);
+    dialog.voice_mic_ids.clear();
+    SendMessageW(dialog.voice_microphone, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(tr(L"系统默认（跟随 Windows）")));
+    dialog.voice_mic_ids.emplace_back();
+    int chosen = 0;
+
+    std::string error;
+    for (const MicrophoneDevice& microphone : list_microphones(&error)) {
+        if (microphone.id.empty()) {
+            continue;
+        }
+        std::wstring label = widen(microphone.name.empty() ? microphone.id : microphone.name);
+        if (microphone.is_default) {
+            label += tr(L"（默认）");
+        }
+        const int index = static_cast<int>(dialog.voice_mic_ids.size());
+        SendMessageW(dialog.voice_microphone, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(label.c_str()));
+        dialog.voice_mic_ids.push_back(microphone.id);
+        if (microphone.id == selected) {
+            chosen = index;
+        }
+    }
+    if (!selected.empty() &&
+        dialog.voice_mic_ids[static_cast<size_t>(chosen)] != selected) {
+        SendMessageW(dialog.voice_microphone, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(tr(L"已选设备（当前不可用）")));
+        chosen = static_cast<int>(dialog.voice_mic_ids.size());
+        dialog.voice_mic_ids.push_back(selected);
+    }
+    dialog.selected_voice_microphone = dialog.voice_mic_ids[static_cast<size_t>(chosen)];
+    SendMessageW(dialog.voice_microphone, CB_SETCURSEL, chosen, 0);
 }
 
 void security_enable_two_factor(SecurityDialogState& dialog) {
@@ -2271,6 +2329,13 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
                 ? dialog.audio_device_ids[static_cast<size_t>(selected)]
                 : dialog.selected_audio_device;
     }
+    if (dialog.voice_microphone != nullptr) {
+        const LRESULT selected = SendMessageW(dialog.voice_microphone, CB_GETCURSEL, 0, 0);
+        updated.voice_microphone =
+            selected >= 0 && static_cast<size_t>(selected) < dialog.voice_mic_ids.size()
+                ? dialog.voice_mic_ids[static_cast<size_t>(selected)]
+                : dialog.selected_voice_microphone;
+    }
     updated.audio_aec = is_checked(dialog.audio_aec);
     if (dialog.audio_gate != nullptr) {
         // Keep a custom threshold (host.ini) when the box stays checked; the
@@ -2389,6 +2454,17 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                             dialog->audio_device_ids[static_cast<size_t>(selected)];
                     }
                     refresh_audio_devices(*dialog);
+                    return 0;
+                }
+                case kSecVoiceMicRefresh: {
+                    const LRESULT selected =
+                        SendMessageW(dialog->voice_microphone, CB_GETCURSEL, 0, 0);
+                    if (selected >= 0 &&
+                        static_cast<size_t>(selected) < dialog->voice_mic_ids.size()) {
+                        dialog->selected_voice_microphone =
+                            dialog->voice_mic_ids[static_cast<size_t>(selected)];
+                    }
+                    refresh_voice_microphones(*dialog);
                     return 0;
                 }
                 case kSecRecordPick: {
@@ -2849,8 +2925,16 @@ bool edit_security_settings(HostSettings& result) {
         add(L"BUTTON", audio_gate_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 386,
             std::max(400, check_px(audio_gate_text)), 24, kSecAudioGate, nullptr,
             &dialog.advanced_page);
-    add(L"STATIC", tr(L"留空跟随系统默认；固定设备不可用时系统声音不会启动。"), SS_LEFT, 0, 32,
-        414, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
+    const wchar_t* voice_mic_label = tr(L"语音麦克风（上行）");
+    const int voice_mic_left = 32 + text_px(voice_mic_label) + 12;
+    add(L"STATIC", voice_mic_label, SS_LEFT, 0, 32, 414, text_px(voice_mic_label) + 8, 20,
+        0, nullptr, &dialog.advanced_page);
+    dialog.voice_microphone =
+        add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+            WS_EX_CLIENTEDGE, voice_mic_left, 410, 500 - voice_mic_left, 200,
+            kSecVoiceMicrophone, nullptr, &dialog.advanced_page);
+    add(L"BUTTON", tr(L"刷新"), BS_PUSHBUTTON | WS_TABSTOP, 0, 500, 409, 76, 28,
+        kSecVoiceMicRefresh, nullptr, &dialog.advanced_page);
 
     const wchar_t* allow_session_select_text = tr(L"允许切换 Windows 会话（仅服务模式）");
     dialog.allow_session_select =
@@ -2996,6 +3080,7 @@ bool edit_security_settings(HostSettings& result) {
              g_app->server ? widen(format_fingerprint(g_app->server->status().fingerprint))
                            : std::wstring(tr(g_app->machine_settings_editor ? L"请在服务连接管理中查看当前指纹" : L"共享未启动")));
     dialog.selected_audio_device = settings.audio_device;
+    dialog.selected_voice_microphone = settings.voice_microphone;
     set_check(dialog.audio_aec, settings.audio_aec);
     set_check(dialog.audio_gate, settings.audio_silence_gate_ms != 0);
     for (const wchar_t* item :
@@ -3035,6 +3120,7 @@ bool edit_security_settings(HostSettings& result) {
     }
     SendMessageW(dialog.virtual_display_resolution, CB_SETCURSEL, resolution_index, 0);
     refresh_audio_devices(dialog);
+    refresh_voice_microphones(dialog);
 
     if (!settings.totp_secret.empty()) {
         set_text(dialog.two_factor_state, tr(L"已启用"));
@@ -3169,6 +3255,42 @@ void show_tray_menu() {
                 tr(L"共享系统声音"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_microphone ? MF_CHECKED : 0),
                 kMicrophoneCheck, tr(L"接收查看者麦克风"));
+    HMENU voice_mic_menu = CreatePopupMenu();
+    if (voice_mic_menu != nullptr) {
+        g_app->tray_voice_mics.clear();
+        AppendMenuW(voice_mic_menu,
+                    MF_STRING | (g_app->settings.voice_microphone.empty() ? MF_CHECKED : 0),
+                    kVoiceMicMenuBase, tr(L"系统默认（跟随 Windows）"));
+        std::string mic_error;
+        bool selected_listed = g_app->settings.voice_microphone.empty();
+        for (const MicrophoneDevice& microphone : list_microphones(&mic_error)) {
+            if (microphone.id.empty()) {
+                continue;
+            }
+            std::wstring label = widen(microphone.name.empty() ? microphone.id : microphone.name);
+            if (microphone.is_default) {
+                label += tr(L"（默认）");
+            }
+            const bool checked = g_app->settings.voice_microphone == microphone.id;
+            selected_listed = selected_listed || checked;
+            const UINT id =
+                kVoiceMicMenuBase + 1 + static_cast<UINT>(g_app->tray_voice_mics.size());
+            AppendMenuW(voice_mic_menu, MF_STRING | (checked ? MF_CHECKED : 0), id,
+                        label.c_str());
+            g_app->tray_voice_mics.push_back(microphone.id);
+        }
+        if (!selected_listed) {
+            // Keep a pinned but unplugged device visible and selectable, the
+            // same way the settings combo does.
+            const UINT id =
+                kVoiceMicMenuBase + 1 + static_cast<UINT>(g_app->tray_voice_mics.size());
+            AppendMenuW(voice_mic_menu, MF_STRING | MF_CHECKED, id,
+                        tr(L"已选设备（当前不可用）"));
+            g_app->tray_voice_mics.push_back(g_app->settings.voice_microphone);
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(voice_mic_menu),
+                    tr(L"上行语音麦克风"));
+    }
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_privacy_mode ? MF_CHECKED : 0),
                 kPrivacyModeCheck, tr(L"允许查看者开启隐私模式"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_restart ? MF_CHECKED : 0),
@@ -3185,6 +3307,9 @@ void show_tray_menu() {
     AppendMenuW(menu,
                 MF_STRING | (g_app->settings.lock_after_session_end ? MF_CHECKED : 0),
                 kLockAfterEndCheck, tr(L"会话结束后锁定本机"));
+    AppendMenuW(menu,
+                MF_STRING | (g_app->settings.remove_wallpaper ? MF_CHECKED : 0),
+                kRemoveWallpaperCheck, tr(L"会话期间移除壁纸（降低静止画面开销）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
                 tr(L"弱网回退（TCP/WebSocket）"));
     AppendMenuW(menu,
@@ -3261,6 +3386,18 @@ bool session_is_live() {
 
 void handle_command(int id) {
     if (g_app->elevation_transferring) return;
+    if (id >= static_cast<int>(kVoiceMicMenuBase) &&
+        id < static_cast<int>(kVoiceMicMenuBase) + 1 +
+                 static_cast<int>(g_app->tray_voice_mics.size())) {
+        const size_t index = static_cast<size_t>(id - kVoiceMicMenuBase);
+        const std::string selected = index == 0 ? std::string() : g_app->tray_voice_mics[index - 1];
+        g_app->settings.voice_microphone = selected;
+        save_settings();
+        append_log_line(selected.empty()
+                            ? tr(L"上行语音麦克风已设为系统默认（下次语音呼叫生效）")
+                            : tr(L"上行语音麦克风已更新（下次语音呼叫生效）"));
+        return;
+    }
     switch (id) {
         case kMenuShow:
             show_window();
@@ -3596,6 +3733,23 @@ void handle_command(int id) {
                                 : tr(L"会话结束后不再锁定本机"));
             break;
         }
+        case kRemoveWallpaperCheck:
+            g_app->settings.remove_wallpaper = !g_app->settings.remove_wallpaper;
+            save_settings();
+            // The wallpaper is changed by the host thread when a session is
+            // authorized and restored when it ends, so a toggle never touches
+            // the desktop from the tray thread. A running session keeps the
+            // policy it started with.
+            if (session_is_live()) {
+                append_log_line(g_app->settings.remove_wallpaper
+                                    ? tr(L"已启用会话期间移除壁纸；将在下次连接时生效")
+                                    : tr(L"已关闭会话期间移除壁纸；将在下次连接时生效"));
+            } else {
+                append_log_line(g_app->settings.remove_wallpaper
+                                    ? tr(L"已启用会话期间移除壁纸")
+                                    : tr(L"已关闭会话期间移除壁纸"));
+            }
+            break;
         case kCarrierCheck:
             g_app->settings.carrier = !g_app->settings.carrier;
             save_settings();

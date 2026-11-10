@@ -139,7 +139,7 @@
 ### 2026-11-09 静止桌面刷新对齐 RustDesk `static_refresh.rs`
 
 - `DesktopStreamPool` 的显示源在 `NoNewFrame` 时按编码器/厂商后端/画质分档刷新缓存画面：VP9 40/20/20/20，H.264 与 HEVC 区分 NVENC/QSV/AMF/其他，AV1 为 0；首次与 VP9 至少 100 ms，其余间隔取 `max(1/fps, 1/30)`。真实桌面变化才重置预算，纯光标采样不续期。
-- 刷新帧清除 `nv12_updated`/`desktop_updated`，不参与共享 QoS 的动态画面窗口；刷新失败回退新 IDR，VP9 允许丢帧，其他编码器连续 3 次失败或累计 100 次无输出即停止。
+- 刷新帧清除 `nv12_updated`/`desktop_updated`，不冒充新的桌面更新，也不计入共享 QoS 的发送计数与动态画面窗口，只有真实捕获帧提供 `dynamic` 证据；刷新失败回退新 IDR，VP9 允许丢帧，其他编码器连续 3 次失败或累计 100 次无输出即停止。2026-11-10 曾改为计入并声称对齐 RustDesk `send_counter`；2026-11-11 复核 `static_refresh.rs` 后确认 `try_encode` 不增加 `send_counter`（固定基线 `7423dce` 无该模块），该改动已撤销。
 - 传输层把刷新帧作为 best-effort：不占视频待收窗口、不为停滞观看者等待、不进入延迟统计，但受 QUIC 在途发送上限约束。
 - 回归中发现并修复多屏重建窗口的 IDR 饥饿：静止刷新以最高 30 fps 续填每订阅队列，连接适配器等待 IDR 时丢弃所有非 IDR，导致请求的关键帧长期不可达。现在发布 IDR 会清空该订阅旧刷新帧，IDR 下一次即可被取走。
 - 验证：`chast-desktop-stream-test` 408–410 项检查连续 3 次通过；`chast-host-parity-test` 全量 976–977 项检查连续 3 次 0 失败，`--topology` 连续 4 次通过；`chast-video-qos-test` 通过；真实 Intel GPU 双查看器 `--hardware` 92 项检查 0 失败；Release ctest 64/64 通过（1058.29 秒）。日志 `build/desktop-stream-rerun1..3.log`、`build/parity-final-run1..3.log`、`build/parity-topology-fix-run1..4.log`、`build/video-qos-final.log`、`build/parity-hardware-final.log`、`build/ctest-final.log`。边界：真实 GPU 只验证静止桌面请求 IDR 和连续取帧，未做跨机画质/功耗对比。

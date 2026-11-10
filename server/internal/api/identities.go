@@ -33,7 +33,8 @@ type identityListResponse struct {
 // identity, including offline peers, with a substring search and an optional
 // online filter. RustDesk's hbbs console lists the same peer-table view.
 func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.consoleActor(w, r, consoleRead, account.TokenResourceDevices); !ok {
+	principal, ok := s.consolePrincipalFor(w, r, consoleRead, account.TokenResourceDevices)
+	if !ok {
 		return
 	}
 	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
@@ -54,9 +55,25 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var groupDevices map[string]bool
+	if principal.GroupID != "" {
+		devices, err := s.cfg.Accounts.GroupDevices(principal.GroupID)
+		if err != nil {
+			s.cfg.Logger.Error("identity group scope", "group", principal.GroupID, "error", err)
+			writeError(w, http.StatusInternalServerError, "could not read the device group")
+			return
+		}
+		groupDevices = make(map[string]bool, len(devices))
+		for _, device := range devices {
+			groupDevices[device.PeerID] = true
+		}
+	}
 	now := time.Now()
 	out := identityListResponse{Identities: make([]identityListEntry, 0)}
 	for _, record := range s.cfg.Registry.Identities() {
+		if groupDevices != nil && !groupDevices[record.ID] {
+			continue
+		}
 		host, live := s.cfg.Registry.Lookup(record.ID)
 		online := live && s.cfg.Registry.Online(host)
 		if onlineOnly && !online {

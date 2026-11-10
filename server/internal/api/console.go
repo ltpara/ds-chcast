@@ -122,3 +122,45 @@ func (s *server) consoleActor(w http.ResponseWriter, r *http.Request, need conso
 	}
 	return principal.User, principal.Actor, true
 }
+
+// deviceActor authorizes one action against one device. A group-scoped token
+// only reaches devices that belong to its group.
+func (s *server) deviceActor(w http.ResponseWriter, r *http.Request, need consolePermission, peerID string) (consolePrincipal, bool) {
+	principal, ok := s.consolePrincipalFor(w, r, need, account.TokenResourceDevices)
+	if !ok {
+		return consolePrincipal{}, false
+	}
+	if !s.deviceInScope(w, principal, peerID) {
+		return consolePrincipal{}, false
+	}
+	return principal, true
+}
+
+// deviceInScope applies the token group range to one device id.
+func (s *server) deviceInScope(w http.ResponseWriter, principal consolePrincipal, peerID string) bool {
+	if principal.GroupID == "" {
+		return true
+	}
+	allowed, err := s.cfg.Accounts.DeviceInGroup(principal.GroupID, peerID)
+	if err != nil {
+		s.cfg.Logger.Error("device group check", "id", peerID, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not check the device group")
+		return false
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "device is outside the token group")
+		return false
+	}
+	return true
+}
+
+// requireUnscoped refuses global administration through a group-scoped token.
+// The group range has no meaning for policy objects, issuer revocation or the
+// access-kid list, so those surfaces stay whole-deployment operations.
+func requireUnscoped(w http.ResponseWriter, principal consolePrincipal) bool {
+	if principal.GroupID != "" {
+		writeError(w, http.StatusForbidden, "group-scoped token cannot manage global state")
+		return false
+	}
+	return true
+}

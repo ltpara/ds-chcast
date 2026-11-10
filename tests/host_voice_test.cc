@@ -16,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "chast/host_server.h"
 #include "clipboard_stub.h"
 #include "chast/security.h"
+#include "chast/wallpaper.h"
 
 namespace {
 
@@ -92,6 +94,43 @@ struct MicState {
     std::atomic<bool> started{false};
     std::atomic<bool> stopped{false};
     std::atomic<uint64_t> created{0};
+    std::mutex devices_mutex;
+    std::vector<std::string> requested_devices;
+
+    std::vector<std::string> devices() {
+        std::lock_guard<std::mutex> lock(devices_mutex);
+        return requested_devices;
+    }
+};
+
+struct WallpaperState {
+    std::atomic<int> created{0};
+    std::atomic<int> restored{0};
+};
+
+class FakeWallpaperRemoval : public chast::WallpaperRemoval {
+public:
+    explicit FakeWallpaperRemoval(std::shared_ptr<WallpaperState> state)
+        : state_(std::move(state)) {
+        ++state_->created;
+    }
+    ~FakeWallpaperRemoval() override {
+        std::string ignored;
+        restore(&ignored);
+    }
+    bool restore(std::string*) override {
+        if (!active_) {
+            return true;
+        }
+        active_ = false;
+        ++state_->restored;
+        return true;
+    }
+    bool active() const override { return active_; }
+
+private:
+    std::shared_ptr<WallpaperState> state_;
+    bool active_ = true;
 };
 
 chast::AudioInfo voice_info() {
@@ -165,6 +204,7 @@ private:
 
 std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesystem::path& dir,
                                               std::shared_ptr<MicState> mic,
+                                              std::shared_ptr<WallpaperState> wallpaper,
                                               std::string* error) {
     chast::HostServerConfig config;
     use_empty_clipboard(config);
@@ -177,6 +217,8 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
     config.settings.allow_input = false;
     config.settings.allow_audio = false;
     config.settings.allow_microphone = true;
+    config.settings.voice_microphone = "test-mic-id";
+    config.settings.remove_wallpaper = true;
     config.settings.auth_mode = chast::HostAuthMode::Password;
     config.settings.password_hash = chast::hash_password(password());
     config.settings.audit_spool = (dir / L"voice.audit.jsonl").string();
@@ -185,9 +227,23 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
     config.serve_once = false;
     config.max_consecutive_failures = 3;
     config.log = [](const std::string& line) { std::printf("     host: %s\n", line.c_str()); };
-    config.voice_capture = [mic](std::string*) -> std::unique_ptr<chast::IMicrophoneCapture> {
+    config.voice_capture = [mic](const chast::MicrophoneCaptureConfig& microphone,
+                                 std::string*) -> std::unique_ptr<chast::IMicrophoneCapture> {
+        {
+            std::lock_guard<std::mutex> lock(mic->devices_mutex);
+            mic->requested_devices.push_back(microphone.device_id);
+        }
         ++mic->created;
+        // The pinned device answers "unplugged"; the empty id is the default
+        // communications device and works, so the host must fall back.
+        if (!microphone.device_id.empty()) {
+            return nullptr;
+        }
         return std::make_unique<FakeMicCapture>(mic);
+    };
+    config.wallpaper_remover =
+        [wallpaper](std::string*) -> std::unique_ptr<chast::WallpaperRemoval> {
+        return std::make_unique<FakeWallpaperRemoval>(wallpaper);
     };
     std::unique_ptr<chast::HostServer> server =
         chast::HostServer::create(std::move(config), error);
@@ -262,8 +318,10 @@ int main() {
     check(port != 0, "a loopback port is available");
     std::string error;
     auto mic = std::make_shared<MicState>();
+    auto wallpaper = std::make_shared<WallpaperState>();
+    bool session_streamed = false;
     std::unique_ptr<chast::HostServer> host =
-        port == 0 ? nullptr : start_host(port, dir, mic, &error);
+        port == 0 ? nullptr : start_host(port, dir, mic, wallpaper, &error);
     check(host != nullptr, "the voice-call host starts");
     if (host) {
         const std::string fingerprint = host->status().fingerprint;
@@ -277,6 +335,7 @@ int main() {
             if (host->status().state != chast::HostState::Streaming) {
                 skip("the voice-call check needs a desktop stream");
             } else {
+                session_streamed = true;
                 check(viewer->request_voice_call().ok(), "the viewer requests a voice call");
                 chast::VoiceCallResponse response;
                 check(take_accepted(*viewer, response, std::chrono::seconds(5)),
@@ -291,6 +350,13 @@ int main() {
                                std::chrono::seconds(5)),
                       "the host reports the call as active");
                 check(mic->started.load(), "the host started the capture device");
+                {
+                    const std::vector<std::string> devices = mic->devices();
+                    check(devices.size() >= 2 && devices[0] == "test-mic-id" &&
+                              devices[1].empty(),
+                          "the host asks for the configured microphone, then falls back to the "
+                          "default device when it is missing");
+                }
 
                 uint64_t packets = 0;
                 uint64_t last_seq = 0;
@@ -354,6 +420,13 @@ int main() {
         }
         host->stop();
         host.reset();
+        if (session_streamed) {
+            check(wallpaper->created.load() == 1,
+                  "the wallpaper is removed once for the desktop session");
+            check(wait_for([&wallpaper] { return wallpaper->restored.load() == 1; },
+                           std::chrono::seconds(5)),
+                  "the wallpaper is restored when the session ends");
+        }
     }
     WSACleanup();
     std::error_code ec;

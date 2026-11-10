@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
@@ -84,6 +85,12 @@ type Manager struct {
 	// relay never forwards a stranger's datagrams to a host.
 	requireViewerToken bool
 
+	// transport verifies short-lived transport credentials when a viewer
+	// presents one. A credential, when presented, is authoritative: an invalid
+	// one never falls back to the carrier token. Managed hosts refuse the token
+	// through the authenticator, so policy cannot be bypassed.
+	transport *transportGuard
+
 	// handshakeLimiter bounds relay_hello and relay_viewer control messages
 	// per source IP so the port cannot be used as a reflection amplifier.
 	handshakeLimiter *ratelimit.Limiter
@@ -115,6 +122,18 @@ func WithReadBuffer(size int) Option {
 // default; only tests and embedded single-user relays turn it off.
 func WithViewerTokenRequired(required bool) Option {
 	return func(m *Manager) { m.requireViewerToken = required }
+}
+
+// WithTransportVerifier makes the relay accept short-lived transport
+// credentials for the relay and carrier audiences. Standalone relay nodes must
+// pin the same access issuer as hbbs; a node without a verifier refuses a
+// presented credential instead of silently trusting the legacy token.
+func WithTransportVerifier(verifier *acl.TransportVerifier) Option {
+	return func(m *Manager) {
+		if verifier != nil {
+			m.transport = newTransportGuard(verifier)
+		}
+	}
 }
 
 // WithHandshakeRateMax caps relay control handshakes per source IP per ten
@@ -821,7 +840,7 @@ func (m *Manager) Close() {
 // EnableSharedCarrier starts the single-port carrier used by hosts whose
 // registration names it. It is optional: per-port TCP carriers stay available.
 func (m *Manager) EnableSharedCarrier(bind string) error {
-	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.policy, m.log)
+	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.transport, m.policy, m.log)
 	if err != nil {
 		return err
 	}
@@ -1252,15 +1271,16 @@ func (p *port) reply(conn *net.UDPConn, to *net.UDPAddr, m wire.Message) {
 }
 
 // handleViewerAuth is the UDP counterpart of the carrier viewer hello. A valid
-// token reserves the source address, and a new valid source supersedes a stale
-// viewer association so a reconnect does not have to wait for viewerIdle.
+// transport credential or legacy token reserves the source address, and a new
+// valid source supersedes a stale viewer association so a reconnect does not
+// have to wait for viewerIdle.
 func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, hostID string) {
 	ack := wire.Message{Type: wire.TypeRelayViewerAck}
 	switch {
 	case hostID == "" || msg.HostID != hostID:
 		ack.Error = "no relay reservation for this host"
-	case p.set.manager.auth == nil || !p.set.manager.auth.VerifyCarrier(msg.HostID, msg.Token):
-		ack.Error = "viewer token was not accepted"
+	case !p.viewerAuthorized(msg, src.String(), acl.TransportAudienceRelay):
+		ack.Error = "viewer credential was not accepted"
 	default:
 		if p.multiplex {
 			if p.muxAuth == nil {
@@ -1290,6 +1310,21 @@ func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UD
 		ack.OK = true
 	}
 	p.reply(conn, src, ack)
+}
+
+// viewerAuthorized admits a viewer control message with a short-lived
+// transport credential or, for deployments that issue none, the legacy carrier
+// token. A presented credential is authoritative: a bad one never falls back
+// to the token, and the authenticator refuses tokens for managed hosts.
+func (p *port) viewerAuthorized(msg wire.Message, peer, audience string) bool {
+	if msg.Transport != "" || msg.TransportProof != "" {
+		return p.set.manager.transport.verify(msg.Transport, msg.TransportProof,
+			msg.HostID, msg.Nonce, msg.Timestamp, audience, peer, time.Now())
+	}
+	if p.set.manager.auth == nil {
+		return false
+	}
+	return p.set.manager.auth.VerifyCarrier(msg.HostID, msg.Token)
 }
 
 // serveTCP accepts both raw carriers and WebSocket upgrades on the relay port.
@@ -1346,7 +1381,7 @@ func (p *port) handleTCP(conn net.Conn) {
 		}
 		if p.set.manager.requireViewerToken {
 			body, err := ws.ReadMessage()
-			if err != nil || !p.viewerHelloOK(body) {
+			if err != nil || !p.viewerHelloOK(body, conn.RemoteAddr().String()) {
 				conn.Close()
 				return
 			}
@@ -1367,8 +1402,8 @@ func (p *port) handleTCP(conn net.Conn) {
 		case carrier.MagicRaw:
 			if p.set.manager.requireViewerToken {
 				hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
-				if err != nil || !p.viewerHelloTextOK(hello) {
-					p.refuseConn(conn, "viewer token was not accepted")
+				if err != nil || !p.viewerHelloTextOK(hello, conn.RemoteAddr().String()) {
+					p.refuseConn(conn, "viewer credential was not accepted")
 					return
 				}
 			}
@@ -1381,8 +1416,8 @@ func (p *port) handleTCP(conn net.Conn) {
 			})
 		case carrier.MagicViewer:
 			hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
-			if err != nil || !p.viewerHelloTextOK(hello) {
-				p.refuseConn(conn, "viewer token was not accepted")
+			if err != nil || !p.viewerHelloTextOK(hello, conn.RemoteAddr().String()) {
+				p.refuseConn(conn, "viewer credential was not accepted")
 				return
 			}
 			_ = conn.SetDeadline(time.Time{})
@@ -1575,18 +1610,30 @@ func (p *port) refuseConn(conn net.Conn, reason string) {
 	conn.Close()
 }
 
-func (p *port) viewerHelloTextOK(line string) bool {
+func (p *port) viewerHelloTextOK(line, peer string) bool {
 	var hello carrier.SharedViewerHello
 	if json.Unmarshal([]byte(line), &hello) != nil {
 		return false
 	}
-	return p.viewerTokenOK(hello.HostID, hello.Token)
+	return p.viewerHelloAdmitted(hello, peer)
 }
 
-func (p *port) viewerHelloOK(body []byte) bool {
+func (p *port) viewerHelloOK(body []byte, peer string) bool {
 	var hello carrier.SharedViewerHello
 	if json.Unmarshal(body, &hello) != nil {
 		return false
+	}
+	return p.viewerHelloAdmitted(hello, peer)
+}
+
+func (p *port) viewerHelloAdmitted(hello carrier.SharedViewerHello, peer string) bool {
+	reserved := p.reservedHost()
+	if reserved == "" || hello.HostID != reserved {
+		return false
+	}
+	if hello.Transport != "" || hello.TransportProof != "" {
+		return p.set.manager.transport.verify(hello.Transport, hello.TransportProof,
+			hello.HostID, hello.Nonce, hello.Timestamp, acl.TransportAudienceCarrier, peer, time.Now())
 	}
 	return p.viewerTokenOK(hello.HostID, hello.Token)
 }

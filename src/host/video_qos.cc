@@ -172,30 +172,38 @@ uint32_t VideoQos::highest_fps() const {
     for (const auto& [id, user] : users_) fps = std::min(fps, fps_cap(user));
     return std::clamp(fps, 1u, 120u);
 }
-std::optional<VideoQos::Quality> VideoQos::latest_quality() const {
-    std::optional<Quality> quality;
+VideoQos::Target VideoQos::latest_quality() const {
+    Target target;
     uint64_t order = 0;
-    for (const auto& [id, user] : users_) if (user.quality && user.quality_order > order) {
-        quality = user.quality;
-        order = user.quality_order;
+    for (const auto& [id, user] : users_) {
+        if ((user.quality || user.custom_ratio) && user.quality_order > order) {
+            target.quality = user.quality;
+            target.custom_ratio = user.custom_ratio;
+            order = user.quality_order;
+        }
     }
-    return quality;
+    return target;
 }
 float VideoQos::target_ratio() const {
-    auto quality = latest_quality();
-    return quality ? quality_ratio(*quality) : default_ratio_;
+    const Target target = latest_quality();
+    if (target.custom_ratio) return *target.custom_ratio;
+    return target.quality ? quality_ratio(*target.quality) : default_ratio_;
 }
 float VideoQos::min_ratio() const {
-    const auto quality = latest_quality();
-    const auto target = target_ratio();
+    const Target target = latest_quality();
+    const auto ratio = target_ratio();
     float minimum = 0.1f;
     float floor = 0.1f;
     // Presets keep a usable floor; a custom ratio keeps only the high-resolution
     // guard, as the reference does for Quality::Custom.
-    if ((quality && *quality == Quality::High) || (!quality && target == 1.5f)) {
+    if (target.custom_ratio) {
+        // Nothing beyond the 0.1 guard.
+    } else if ((target.quality && *target.quality == Quality::High) ||
+               (!target.quality && ratio == 1.5f)) {
         minimum = 0.6f;
         floor = 0.2f;
-    } else if ((quality && *quality == Quality::Balanced) || (!quality && target == 0.67f)) {
+    } else if ((target.quality && *target.quality == Quality::Balanced) ||
+               (!target.quality && ratio == 0.67f)) {
         minimum = 0.335f;
     }
     if (bitrate_kbps_) {
@@ -232,13 +240,20 @@ void VideoQos::close(uint64_t id, uint64_t now) {
     adjust_fps(now);
     ratio_ = std::min(ratio_, target_ratio());
 }
-void VideoQos::options(uint64_t id, uint32_t fps, std::optional<Quality> quality, uint64_t now) {
+void VideoQos::options(uint64_t id, uint32_t fps, std::optional<Quality> quality, uint64_t now,
+                       std::optional<float> custom_ratio) {
     std::lock_guard lock(mutex_);
     auto found = users_.find(id);
     if (found == users_.end()) return;
     found->second.fps = fps == 0 ? 0 : std::clamp(fps, 1u, 120u);
     if (quality) {
         found->second.quality = quality;
+        found->second.custom_ratio.reset();
+        found->second.quality_order = ++quality_order_;
+        ratio_ = target_ratio();
+    } else if (custom_ratio) {
+        found->second.quality.reset();
+        found->second.custom_ratio = std::clamp(*custom_ratio, 0.1f, 40.f);
         found->second.quality_order = ++quality_order_;
         ratio_ = target_ratio();
     }
@@ -421,6 +436,12 @@ void VideoQos::tick(uint64_t now) {
         return;
     }
     if (now - last_ratio_ < 3000) return;
+    // The reference feeds send counters to its periodic adjustment once a
+    // second. An elevated but unconfirmed delay returns without spending the
+    // cooldown, so re-check on that same cadence instead of every service tick;
+    // otherwise the dynamic window shrinks from about a second to one tick.
+    if (now - last_ratio_check_ < 1000) return;
+    last_ratio_check_ = now;
     bool dynamic = false;
     for (const auto& [id, display] : displays_) dynamic = dynamic || display.encoded >= 6;
     adjust_ratio(dynamic, now);

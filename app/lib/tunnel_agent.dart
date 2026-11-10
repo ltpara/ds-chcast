@@ -19,6 +19,10 @@ class TunnelEvent {
     this.relay = '',
     this.carrier = '',
     this.carrierToken = '',
+    this.accessTicket = '',
+    this.accessExpiresAtMs = 0,
+    this.accessSubject = '',
+    this.accessPermissions = 0,
     this.error = '',
     this.retryable = false,
   });
@@ -32,6 +36,14 @@ class TunnelEvent {
   final String relay;
   final String carrier;
   final String carrierToken;
+
+  /// Emergency override ticket. The initial one rides on the ready event; the
+  /// agent re-signs the override whenever it refreshes a transport credential
+  /// and sends the replacement as an access_ticket event.
+  final String accessTicket;
+  final int accessExpiresAtMs;
+  final String accessSubject;
+  final int accessPermissions;
   final String error;
   final bool retryable;
 
@@ -46,8 +58,16 @@ class TunnelEvent {
         return null;
       }
       String field(String key) => value[key]?.toString() ?? '';
+      int number(String key) {
+        final Object? raw = value[key];
+        return raw is int ? raw : int.tryParse(raw?.toString() ?? '') ?? 0;
+      }
+
       final String event = field('event');
-      if (event != 'ready' && event != 'path' && event != 'error') {
+      if (event != 'ready' &&
+          event != 'path' &&
+          event != 'error' &&
+          event != 'access_ticket') {
         return null;
       }
       return TunnelEvent(
@@ -60,6 +80,10 @@ class TunnelEvent {
         relay: field('relay'),
         carrier: field('carrier'),
         carrierToken: field('carrier_token'),
+        accessTicket: field('access_ticket'),
+        accessExpiresAtMs: number('access_expires_at_ms'),
+        accessSubject: field('access_subject'),
+        accessPermissions: number('access_permissions'),
         error: field('error'),
         retryable: value['retryable'] == true,
       );
@@ -77,6 +101,47 @@ class TunnelException implements Exception {
 
   @override
   String toString() => message;
+}
+
+/// An explicit management override for a restricted device. The administrator
+/// token is passed over stdin, never argv, and is kept only in memory by the
+/// page that collects it.
+class EmergencyAccessRequest {
+  const EmergencyAccessRequest({
+    required this.adminToken,
+    required this.reason,
+    required this.clientPublicKey,
+    this.permissions = 0,
+  });
+
+  final String adminToken;
+  final String reason;
+
+  /// base64url Ed25519 public key of the application client the access ticket
+  /// is bound to. The tunnel contributes its own ephemeral transport key.
+  final String clientPublicKey;
+
+  /// Permission mask to request; 0 asks for the device's full ceiling.
+  final int permissions;
+
+  bool get ready =>
+      adminToken.isNotEmpty && reason.isNotEmpty && clientPublicKey.isNotEmpty;
+}
+
+/// One emergency access ticket delivered by the tunnel agent, either in its
+/// ready event or after the agent re-signed the override.
+class TunnelAccessTicket {
+  const TunnelAccessTicket({
+    required this.ticket,
+    required this.expiresAtMs,
+    this.subject = '',
+    this.permissions = 0,
+  });
+
+  final String ticket;
+  final int expiresAtMs;
+  final String subject;
+  final int permissions;
 }
 
 /// Owns one `chast-tunnel viewer` child process for a session.
@@ -103,6 +168,10 @@ class TunnelAgent {
   String _relay = '';
   String _carrier = '';
   String _carrierToken = '';
+  String _accessTicket = '';
+  int _accessExpiresAtMs = 0;
+  final StreamController<TunnelAccessTicket> _ticketEvents =
+      StreamController<TunnelAccessTicket>.broadcast();
   int _port = 0;
   bool _running = true;
   bool _stopping = false;
@@ -186,9 +255,12 @@ class TunnelAgent {
     required TunnelMode mode,
     String key = '',
     String linkKey = '',
+    String accountToken = '',
     String serverPublicKey = '',
     String proxy = '',
+    EmergencyAccessRequest? emergency,
   }) {
+    final bool emergencyReady = emergency?.ready ?? false;
     return <String>[
       'viewer',
       '--server',
@@ -199,14 +271,25 @@ class TunnelAgent {
       '$loopback:0',
       '--mode',
       mode.name,
-      // The key and the proxy URL (which may carry credentials) travel over
-      // stdin, never argv: any process of this user, EDR and audit logs can
-      // read a child's command line. The connection key replaces the
-      // management key when the deployment issues one.
+      // The keys, the account token and the proxy URL (which may carry
+      // credentials) travel over stdin, never argv: any process of this user,
+      // EDR and audit logs can read a child's command line. The link key
+      // replaces the management key when the deployment issues one.
       if (linkKey.isNotEmpty)
         '--link-key-stdin'
       else if (key.isNotEmpty)
         '--server-key-stdin',
+      if (accountToken.isNotEmpty) '--account-token-stdin',
+      if (emergencyReady) ...<String>[
+        '--emergency-token-stdin',
+        '--emergency-reason-stdin',
+        '--emergency-client-key',
+        emergency!.clientPublicKey,
+        if (emergency.permissions != 0) ...<String>[
+          '--emergency-permissions',
+          '${emergency.permissions}',
+        ],
+      ],
       if (proxy.isNotEmpty) '--proxy-stdin',
       if (serverPublicKey.isNotEmpty) ...<String>[
         '--server-pubkey',
@@ -220,7 +303,9 @@ class TunnelAgent {
   static Future<TunnelAgent> start({
     required ServerSettings server,
     required String hostId,
+    String accountToken = '',
     String serverPublicKey = '',
+    EmergencyAccessRequest? emergency,
     String? executable,
     List<String>? argumentOverride,
     Duration timeout = const Duration(seconds: 15),
@@ -236,8 +321,10 @@ class TunnelAgent {
           mode: server.mode,
           key: server.key,
           linkKey: server.linkKey,
+          accountToken: accountToken,
           serverPublicKey: serverPublicKey,
           proxy: server.proxy,
+          emergency: emergency,
         );
     final Process process;
     try {
@@ -249,11 +336,26 @@ class TunnelAgent {
     }
     final String credential =
         server.linkKey.isNotEmpty ? server.linkKey : server.key;
-    if (credential.isNotEmpty || server.proxy.isNotEmpty) {
+    final bool emergencyReady = emergency?.ready ?? false;
+    if (credential.isNotEmpty ||
+        accountToken.isNotEmpty ||
+        emergencyReady ||
+        server.proxy.isNotEmpty) {
       try {
-        // Order matches the helper: connection credential first, then proxy.
+        // Order matches the helper: connection credential, account token,
+        // emergency administrator token and reason, then proxy. The account
+        // token authenticates lookup as the signed-in user; the connection key
+        // stays the legacy punch fallback. The emergency lines are read only
+        // when their flags are present.
         if (credential.isNotEmpty) {
           process.stdin.write('$credential\n');
+        }
+        if (accountToken.isNotEmpty) {
+          process.stdin.write('$accountToken\n');
+        }
+        if (emergencyReady) {
+          process.stdin.write('${emergency!.adminToken}\n');
+          process.stdin.write('${emergency.reason}\n');
         }
         if (server.proxy.isNotEmpty) {
           process.stdin.write('${server.proxy}\n');
@@ -340,6 +442,16 @@ class TunnelAgent {
   /// shared carrier. Empty when the server has no shared carrier.
   String get carrierToken => _carrierToken;
 
+  /// The current emergency override ticket, or empty on an ordinary lookup.
+  /// The page hands this to the native session on start.
+  String get accessTicket => _accessTicket;
+  int get accessExpiresAtMs => _accessExpiresAtMs;
+
+  /// Renewed emergency tickets. The agent re-signs the override whenever it
+  /// refreshes a transport credential, and the live session must follow it or
+  /// the host lease expires mid-session.
+  Stream<TunnelAccessTicket> get accessTickets => _ticketEvents.stream;
+
   /// "直连"/"中继"/"连接中" for the session overlay.
   String get pathLabel {
     switch (_path) {
@@ -363,6 +475,18 @@ class TunnelAgent {
     if (event.event == 'error') {
       _fail(TunnelException(event.error, retryable: event.retryable));
       return;
+    }
+    if (event.accessTicket.isNotEmpty) {
+      _accessTicket = event.accessTicket;
+      _accessExpiresAtMs = event.accessExpiresAtMs;
+      if (!_ticketEvents.isClosed) {
+        _ticketEvents.add(TunnelAccessTicket(
+          ticket: event.accessTicket,
+          expiresAtMs: event.accessExpiresAtMs,
+          subject: event.accessSubject,
+          permissions: event.accessPermissions,
+        ));
+      }
     }
     if (event.path.isNotEmpty) {
       _path = event.path;
@@ -441,6 +565,9 @@ class TunnelAgent {
     if (!_stderrDone.isCompleted) _stderrDone.complete();
     _stdout = null;
     _stderr = null;
+    if (!_ticketEvents.isClosed) {
+      await _ticketEvents.close();
+    }
     if (!_process.kill()) {
       // Already gone; exitCode still completes.
     }

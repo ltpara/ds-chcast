@@ -3,12 +3,15 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "display_layout.h"
 #include "flutter_window.h"
 #include "utils.h"
 
@@ -47,7 +50,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   std::function<bool(const std::string&)> open_window;
   FlutterWindow::OpenDisplayWindow open_display;
   open_display = [&windows](std::shared_ptr<chast_viewer::SharedViewerSession> session, uint32_t stream,
-                            const std::string& peer_id) {
+                            const std::string& peer_id, uint32_t display_index) {
     if (windows.size() >= kMaxSessionWindows) return false;
     flutter::DartProject display_project(L"data");
     display_project.set_dart_entrypoint_arguments(
@@ -55,8 +58,21 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     auto child = std::make_unique<FlutterWindow>(display_project,
         std::function<bool(const std::string&)>{}, FlutterWindow::OpenDisplayWindow{}, std::move(session), stream);
     const unsigned int offset = static_cast<unsigned int>(windows.size() % 8) * 28;
-    if (!child->Create(L"Chast - Display", Win32Window::Point(100 + offset, 80 + offset),
-                       Win32Window::Size(1120, 720))) return false;
+    const std::filesystem::path layout = chast::DisplayLayoutPath();
+    const std::optional<RECT> saved =
+        chast::LoadDisplayBounds(layout, peer_id, display_index);
+    const bool created = saved
+        ? child->CreateAtPhysicalBounds(L"Chast - Display", *saved)
+        : child->Create(L"Chast - Display",
+                        Win32Window::Point(100 + offset, 80 + offset),
+                        Win32Window::Size(1120, 720));
+    if (!created) return false;
+    child->SetCloseHook([layout, peer_id, display_index](HWND window) {
+      RECT bounds{};
+      if (GetWindowRect(window, &bounds)) {
+        chast::SaveDisplayBounds(layout, peer_id, display_index, bounds);
+      }
+    });
     child->SetQuitOnClose(false);
     windows.push_back(std::move(child));
     return true;

@@ -25,6 +25,7 @@ class ViewPreferences {
     this.keyboardMode = 'physical',
     this.autoRecord = false,
     this.recordKeep = 0,
+    this.showMyCursor = false,
   });
 
   /// 0 = adaptive (fit the window), 1 = original pixels.
@@ -59,6 +60,10 @@ class ViewPreferences {
   /// recording completes. 0 keeps everything.
   final int recordKeep;
 
+  /// Draw the viewer pointer on the host desktop (RustDesk's show-my-cursor).
+  /// Follows the device, like the input remapping.
+  final bool showMyCursor;
+
   static const String _fitKey = 'view_fit';
   static const String _statsKey = 'view_stats';
   static const String _fileSortKey = 'file_sort';
@@ -71,6 +76,7 @@ class ViewPreferences {
   static const String _keyboardModeKey = 'view_keyboard_mode';
   static const String _autoRecordKey = 'view_auto_record';
   static const String _recordKeepKey = 'view_record_keep';
+  static const String _showMyCursorKey = 'view_show_my_cursor';
 
   /// Kept here so existing tests can redirect the shared settings file.
   @visibleForTesting
@@ -94,6 +100,7 @@ class ViewPreferences {
     final Object? rawAutoRecord = map[_autoRecordKey];
     final Object? rawRecordKeep = map[_recordKeepKey];
     final Object? rawShowHidden = map[_browserShowHiddenKey];
+    final Object? rawShowMyCursor = map[_showMyCursorKey];
     return ViewPreferences(
       fit: rawFit is int && (rawFit == 0 || rawFit == 1) ? rawFit : 0,
       stats: rawStats is bool ? rawStats : false,
@@ -110,6 +117,7 @@ class ViewPreferences {
       keyboardMode: _normalizeKeyboardMode(map[_keyboardModeKey]),
       autoRecord: rawAutoRecord is bool ? rawAutoRecord : false,
       recordKeep: _normalizeRecordKeep(rawRecordKeep),
+      showMyCursor: rawShowMyCursor is bool ? rawShowMyCursor : false,
     );
   }
 
@@ -155,6 +163,7 @@ class ViewPreferences {
       keyboardMode: prefs.keyboardMode,
       autoRecord: prefs.autoRecord,
       recordKeep: prefs.recordKeep,
+      showMyCursor: prefs.showMyCursor,
     );
   }
 
@@ -174,6 +183,7 @@ class ViewPreferences {
     String? keyboardMode,
     bool? autoRecord,
     int? recordKeep,
+    bool? showMyCursor,
   }) {
     final Map<String, Object?> shared = <String, Object?>{
       if (fileSort != null)
@@ -194,6 +204,7 @@ class ViewPreferences {
       _reverseWheelKey: ?reverseWheel,
       _swapButtonsKey: ?swapButtons,
       _browserShowHiddenKey: ?browserShowHidden,
+      _showMyCursorKey: ?showMyCursor,
       if (keyboardMode != null)
         _keyboardModeKey: _normalizeKeyboardMode(keyboardMode),
     };

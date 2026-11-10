@@ -245,3 +245,106 @@ func TestConsoleRecordingsDisabled(t *testing.T) {
 		t.Fatalf("disabled download: %d %s", status, body)
 	}
 }
+
+// TestConsoleRecordingsGroupScope pins the group-scoped recording token: list,
+// totals, download and delete only reach recordings owned by group members or
+// recorded from a device in the group.
+func TestConsoleRecordingsGroupScope(t *testing.T) {
+	s := testutil.StartWith(t, testutil.Options{RecordingsDir: t.TempDir()})
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "correct horse"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if _, err := s.Accounts.CreateGroup("east", "East", "", 0, 0); err != nil {
+		t.Fatalf("create east: %v", err)
+	}
+	if _, err := s.Accounts.AddGroupMember("east", "alice", account.RoleReadonly); err != nil {
+		t.Fatalf("add alice: %v", err)
+	}
+	if _, err := s.Accounts.AddGroupDevice("east", "devbox", "root"); err != nil {
+		t.Fatalf("add devbox: %v", err)
+	}
+	alice := login(t, s.URL, "alice", "correct horse").Token
+	bob := login(t, s.URL, "bob", "correct horse").Token
+	upload := func(token, name, peer string, body []byte) consoleRecordingReply {
+		t.Helper()
+		query := "?" + url.Values{"name": {name}, "peer_id": {peer}}.Encode()
+		status, data := uploadRecording(t, s.URL, token, query, body, false)
+		if status != http.StatusCreated {
+			t.Fatalf("upload %s: %d %s", name, status, data)
+		}
+		var reply struct {
+			Recording consoleRecordingReply `json:"recording"`
+		}
+		if err := json.Unmarshal(data, &reply); err != nil {
+			t.Fatalf("upload reply %s: %v", name, err)
+		}
+		return reply.Recording
+	}
+	aliceBody := []byte("ALICE-EAST-BYTES")
+	bobBody := []byte("BOB-DEVBOX-BYTES")
+	outsideBody := []byte("BOB-WESTBOX-BYTES")
+	aliceRec := upload(alice, "alice.mp4", "devbox", aliceBody)
+	bobRec := upload(bob, "bob.mp4", "devbox", bobBody)
+	outsideRec := upload(bob, "outside.mp4", "westbox", outsideBody)
+
+	grouped := createToken(t, s.URL, alice,
+		`{"name":"east recordings","role":"admin","resources":["recordings"],"group_id":"east","expires_in_seconds":3600}`)
+	if grouped.Token.GroupID != "east" {
+		t.Fatalf("group = %q", grouped.Token.GroupID)
+	}
+
+	status, data := request(t, http.MethodGet, s.URL+"/v1/recordings", "", grouped.Secret)
+	if status != http.StatusOK {
+		t.Fatalf("group list: %d %s", status, data)
+	}
+	var list consoleRecordingsReply
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatalf("group list reply: %v", err)
+	}
+	if list.Total != 2 || len(list.Recordings) != 2 {
+		t.Fatalf("group list total = %d rows = %d", list.Total, len(list.Recordings))
+	}
+	if list.UsageBytes != int64(len(aliceBody)+len(bobBody)) {
+		t.Fatalf("group usage = %d", list.UsageBytes)
+	}
+	seen := map[string]bool{}
+	for _, rec := range list.Recordings {
+		seen[rec.ID] = true
+	}
+	if !seen[aliceRec.ID] || !seen[bobRec.ID] || seen[outsideRec.ID] {
+		t.Fatalf("group list = %+v", list.Recordings)
+	}
+
+	status, data = request(t, http.MethodGet, s.URL+"/v1/recordings?username=bob", "", grouped.Secret)
+	if status != http.StatusOK {
+		t.Fatalf("group username list: %d %s", status, data)
+	}
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatalf("group username reply: %v", err)
+	}
+	if list.Total != 1 || len(list.Recordings) != 1 || list.Recordings[0].ID != bobRec.ID {
+		t.Fatalf("group username list = %+v", list.Recordings)
+	}
+
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/recordings/"+outsideRec.ID, "", grouped.Secret); status != http.StatusForbidden {
+		t.Fatalf("outside download: %d %s", status, body)
+	}
+	status, body := request(t, http.MethodGet, s.URL+"/v1/recordings/"+bobRec.ID, "", grouped.Secret)
+	if status != http.StatusOK || string(body) != string(bobBody) {
+		t.Fatalf("inside download: %d %q", status, body)
+	}
+
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/recordings/"+outsideRec.ID, "", grouped.Secret); status != http.StatusForbidden {
+		t.Fatalf("outside delete: %d %s", status, body)
+	}
+	status, data = request(t, http.MethodGet, s.URL+"/v1/recordings", "", testutil.ServerKey)
+	if status != http.StatusOK || !strings.Contains(string(data), outsideRec.ID) {
+		t.Fatalf("outside recording was removed: %d %s", status, data)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/recordings/"+bobRec.ID, "", grouped.Secret); status != http.StatusNoContent {
+		t.Fatalf("inside delete: %d %s", status, body)
+	}
+}

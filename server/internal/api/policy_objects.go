@@ -81,7 +81,8 @@ func viewPolicyAssignment(assignment account.PolicyAssignment) policyAssignmentV
 }
 
 func (s *server) listPolicyObjects(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceDevices); !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
 	policies, err := s.cfg.Accounts.PolicyObjects()
@@ -98,10 +99,11 @@ func (s *server) listPolicyObjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createPolicyObject(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	var req policyObjectRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -119,7 +121,8 @@ func (s *server) createPolicyObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) policyObjectDetail(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceDevices); !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
 	policy, err := s.cfg.Accounts.PolicyObject(r.PathValue("id"))
@@ -131,10 +134,11 @@ func (s *server) policyObjectDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) updatePolicyObject(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	var req policyObjectRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -155,10 +159,11 @@ func (s *server) updatePolicyObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deletePolicyObject(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	id := r.PathValue("id")
 	if err := s.cfg.Accounts.DeletePolicyObject(id); err != nil {
 		writePolicyObjectError(w, err)
@@ -169,7 +174,8 @@ func (s *server) deletePolicyObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listPolicyAssignments(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceDevices); !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
 	assignments, err := s.cfg.Accounts.PolicyAssignments()
@@ -186,10 +192,11 @@ func (s *server) listPolicyAssignments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createPolicyAssignment(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	var req policyAssignmentRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -208,10 +215,11 @@ func (s *server) createPolicyAssignment(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) deletePolicyAssignment(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	id := r.PathValue("id")
 	if err := s.cfg.Accounts.DeletePolicyAssignment(id); err != nil {
 		writePolicyObjectError(w, err)
@@ -257,6 +265,12 @@ func (s *server) reconcileAllPolicies() {
 }
 
 func (s *server) publishReconciledPolicies(changed []account.DevicePolicy, unmanaged []string) {
+	for i := range changed {
+		s.syncRegistryPolicy(changed[i].PeerID)
+	}
+	for _, peerID := range unmanaged {
+		s.syncRegistryPolicy(peerID)
+	}
 	if s.eventHub == nil {
 		return
 	}

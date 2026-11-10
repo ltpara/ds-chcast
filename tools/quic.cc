@@ -2186,6 +2186,12 @@ struct ReceiverStats {
     // target and ladder pick after ABR).
     uint32_t target_bitrate = 0;
     uint32_t framerate = 0;
+    // Adaptive-bitrate recovery evidence: the lowest target announced and the
+    // highest one announced after that low. The final announcement alone can
+    // land on a legitimate backoff from a probe even though the controller
+    // did recover when the link came back.
+    uint32_t lowest_target_bitrate = 0;
+    uint32_t recovered_target_bitrate = 0;
     // Pointer updates received, and how many of them carried a sprite. The
     // last state is reported so a verification run can show the pointer moved.
     uint64_t cursor_updates = 0;
@@ -4878,6 +4884,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.clipboard_enabled = info.clipboard_enabled;
             stats.target_bitrate = info.bitrate;
             stats.framerate = info.framerate;
+            if (!stats.lowest_target_bitrate || info.bitrate < stats.lowest_target_bitrate) {
+                stats.lowest_target_bitrate = info.bitrate;
+                stats.recovered_target_bitrate = 0;
+            } else if (info.bitrate > stats.lowest_target_bitrate) {
+                stats.recovered_target_bitrate =
+                    (std::max)(stats.recovered_target_bitrate, info.bitrate);
+            }
             stats.audio_info = info.audio;
             stats.audio_announced = info.audio.enabled;
             stats.audio_datagram = info.audio_datagram;
@@ -8941,6 +8954,11 @@ int run_verify(const Options& options) {
         std::error_code ec;
         const std::filesystem::path dir =
             std::filesystem::temp_directory_path(ec) / "chast-quic-download";
+        // Rebuild the fixture: a hardened profile can deny writing into a
+        // directory left over from an earlier run.
+        if (!ec) {
+            std::filesystem::remove_all(dir, ec);
+        }
         if (!ec) {
             std::filesystem::create_directories(dir, ec);
         }
@@ -10395,7 +10413,14 @@ int run_weak_network(const Options& options) {
         check(sent.abr_changes > 0, "the weak link made the controller change the target");
         check(lowest_target > 0 && lowest_target < configured_bps,
               "the target dropped below the configured bitrate");
-        check(lowest_target > 0 && sent.target_bitrate > lowest_target,
+        // The controller raises the target in steps every three seconds, so a
+        // run can end just after a legitimate backoff from a probe. Recovery
+        // evidence is the highest target announced after the lowest one, not
+        // necessarily the final sample.
+        check(lowest_target > 0 &&
+                  (sent.target_bitrate > lowest_target ||
+                   (received.lowest_target_bitrate > 0 &&
+                    received.recovered_target_bitrate > received.lowest_target_bitrate)),
               "the target recovered after the link came back");
         check(sent.target_bitrate > 0 && sent.target_bitrate < configured_bps,
               "the cut did not snap back to the configured ceiling");
@@ -10514,9 +10539,10 @@ int run_weak_network(const Options& options) {
         }
     }
 
-    std::printf("     link: target %u -> lowest %u kbps, %llu change(s), "
-                "%u%% picture, %u fps at the end\n",
-                configured_bps / 1000u, lowest_target / 1000u,
+    std::printf("     link: configured %u, final %u, lowest %u, recovered %u kbps, "
+                "%llu change(s), %u%% picture, %u fps at the end\n",
+                configured_bps / 1000u, sent.target_bitrate / 1000u, lowest_target / 1000u,
+                (std::max)(sent.target_bitrate, received.recovered_target_bitrate) / 1000u,
                 static_cast<unsigned long long>(sent.abr_changes),
                 sent.resolution_percent, sent.framerate);
     std::printf("     frames: sent %llu, received %llu, decoded %llu, keyframes %llu, "

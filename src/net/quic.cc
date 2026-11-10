@@ -542,7 +542,14 @@ PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, const std::string& e
     const DWORD store_location = scope == IdentityScope::LocalMachine
                                      ? CERT_SYSTEM_STORE_LOCAL_MACHINE
                                      : CERT_SYSTEM_STORE_CURRENT_USER;
-    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, store_location, L"MY");
+    // Open the existing store first: a create-capable open asks CryptoAPI for
+    // write access even when the store exists, which some hardened profiles
+    // deny. Only fall back to letting CryptoAPI create a genuinely absent one.
+    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                                     store_location | CERT_STORE_OPEN_EXISTING_FLAG, L"MY");
+    if (!store) {
+        store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, store_location, L"MY");
+    }
     if (!store) {
         *error = std::string("cannot open the ") +
                  (scope == IdentityScope::LocalMachine ? "machine" : "current user's") +
@@ -746,6 +753,11 @@ struct QuicSession::Impl {
     bool display_follow_state_ready = false;
     DisplayFollowState display_follow_state;
     uint64_t display_follow_states_seen = 0;
+    // Server: the newest show-cursor hint. The overlay only needs the latest
+    // position, so older hints are replaced rather than queued.
+    bool cursor_hint_ready = false;
+    ShowCursorHint cursor_hint;
+    uint64_t cursor_hints_seen = 0;
     // Server: the newest SetPrivacyMode request. Client: the newest state the
     // host sent, also used for a host-initiated disable.
     bool privacy_mode_request_ready = false;
@@ -3690,6 +3702,24 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::ShowCursor: {
+                if (role != Role::Server) {
+                    break;
+                }
+                ShowCursorHint hint;
+                if (!parse_show_cursor(payload, hint, &error)) {
+                    control_protocol_failure("ShowCursor: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    cursor_hint = hint;
+                    cursor_hint_ready = true;
+                    ++cursor_hints_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::SetPrivacyMode: {
                 if (role != Role::Server ||
                     (effective_permissions() & kPermissionPrivacyMode) == 0) {
@@ -5445,6 +5475,9 @@ struct QuicSession::Impl {
             bye_ready = false;
             input_events.clear();
             input_releases = 0;
+            cursor_hint_ready = false;
+            cursor_hint = ShowCursorHint{};
+            cursor_hints_seen = 0;
             clipboard_updates.clear();
             clipboard_received = 0;
             cursor_update.reset();
@@ -7792,6 +7825,36 @@ Error QuicSession::send_display_follow_state(const DisplayFollowState& state) {
         return Error(Status::InvalidCall, "the stream is not open");
     }
     return impl.send_bytes(impl.control.load(), make_display_follow_state(state),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_show_cursor_hint(ShowCursorHint& hint) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->cursor_hint_ready) {
+        return false;
+    }
+    hint = impl_->cursor_hint;
+    impl_->cursor_hint_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::show_cursor_hints() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->cursor_hints_seen;
+}
+
+Error QuicSession::request_show_cursor(const ShowCursorHint& hint) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_show_cursor is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_show_cursor(hint),
                            QUIC_SEND_FLAG_NONE);
 }
 

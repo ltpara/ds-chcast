@@ -123,7 +123,7 @@ func TestNativeQUICAfterUDPBlackhole(t *testing.T) {
 		}
 	}()
 	api := newAPIClient(s.URL, testutil.ServerKey, nil, nil)
-	lookup, err := api.lookup(ctx, "devbox")
+	lookup, err := api.lookup(ctx, "devbox", "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1598,6 +1598,39 @@ void multiuser_quality() {
     finish(b);
     require(until([&] { return a->take_stream_update(info) && info.framerate == 20 && info.bitrate < high_rate; }),
             "leaving quality owner restores remaining viewer's setting");
+    // Custom image quality: percent/50 is the bitrate ratio, and the answer
+    // reports the effective percent; preset answers report 0 instead.
+    StreamOptions custom_options;
+    custom_options.codec = StreamCodecPreference::H264;
+    custom_options.max_fps = 20;
+    custom_options.quality = StreamQuality::Custom;
+    custom_options.quality_percent = 75;
+    require(a->request_stream_options(custom_options).ok(), "send custom quality vote");
+    StreamOptionsResult custom_result;
+    require(until([&] { return a->take_stream_options_result(custom_result); }) &&
+                custom_result.code == StreamOptionsCode::Ok &&
+                custom_result.quality == StreamQuality::Custom &&
+                custom_result.quality_percent == 75,
+            "custom quality answer carries the effective percent");
+    require(until([&] { return a->take_stream_update(info) && info.framerate == 20 && info.bitrate == high_rate; }),
+            "custom 75% maps to the High bitrate ratio");
+    custom_options.quality_percent = 25;
+    require(a->request_stream_options(custom_options).ok(), "lower custom quality");
+    require(until([&] { return a->take_stream_options_result(custom_result); }) &&
+                custom_result.code == StreamOptionsCode::Ok &&
+                custom_result.quality_percent == 25,
+            "lowered custom quality is acknowledged");
+    require(until([&] { return a->take_stream_update(info) && info.framerate == 20 && info.bitrate < high_rate; }),
+            "custom 25% lowers the bitrate again");
+    custom_options.quality = StreamQuality::High;
+    custom_options.quality_percent = 0;
+    require(a->request_stream_options(custom_options).ok(), "return to a preset after custom quality");
+    require(until([&] { return a->take_stream_options_result(custom_result); }) &&
+                custom_result.code == StreamOptionsCode::Ok &&
+                custom_result.quality == StreamQuality::High && custom_result.quality_percent == 0,
+            "a preset answer carries no custom percent");
+    require(until([&] { return a->take_stream_update(info) && info.framerate == 20 && info.bitrate == high_rate; }),
+            "a preset vote replaces the custom ratio");
     switch_to(*a, 1, DisplaySwitchCode::Ok);
     require(until([&] { return a->take_stream_update(info) && info.width == 800 && info.framerate == 20; }) &&
             picture(*a, 800), "quality participant survives independent display switch");

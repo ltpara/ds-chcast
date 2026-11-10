@@ -164,7 +164,7 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-func (s *Server) Provision(id, publicKey, carrierToken string, ttl time.Duration) (Lease, error) {
+func (s *Server) Provision(id, publicKey, carrierToken string, managed bool, ttl time.Duration) (Lease, error) {
 	id = strings.TrimSpace(id)
 	if !registry.ValidID(id) {
 		return Lease{}, fmt.Errorf("id %q must be 1..64 characters of [A-Za-z0-9_.-]", id)
@@ -190,7 +190,7 @@ func (s *Server) Provision(id, publicKey, carrierToken string, ttl time.Duration
 	if err != nil {
 		return Lease{}, err
 	}
-	info, err := s.auth.Put(id, publicKey, carrierToken, port, ttl)
+	info, err := s.auth.Put(id, publicKey, carrierToken, managed, port, ttl)
 	if err != nil {
 		return Lease{}, err
 	}
@@ -294,7 +294,11 @@ type leaseRequest struct {
 	ID           string `json:"id"`
 	PublicKey    string `json:"public_key"`
 	CarrierToken string `json:"carrier_token"`
-	TTLSeconds   int64  `json:"ttl_sec"`
+	// Managed marks a host whose device policy requires transport credentials.
+	// hbbs recomputes it on every lease, and the node refuses the legacy
+	// carrier token for such a host.
+	Managed    bool  `json:"managed,omitempty"`
+	TTLSeconds int64 `json:"ttl_sec"`
 }
 
 func (s *Server) handleLease(w http.ResponseWriter, r *http.Request) {
@@ -309,7 +313,7 @@ func (s *Server) handleLease(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: trailing data"})
 		return
 	}
-	lease, err := s.Provision(req.ID, req.PublicKey, req.CarrierToken,
+	lease, err := s.Provision(req.ID, req.PublicKey, req.CarrierToken, req.Managed,
 		time.Duration(req.TTLSeconds)*time.Second)
 	switch {
 	case err == nil:

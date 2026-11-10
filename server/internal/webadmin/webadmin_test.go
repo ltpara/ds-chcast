@@ -188,6 +188,51 @@ func TestConsoleExposesPolicyAuthoring(t *testing.T) {
 	}
 }
 
+// TestConsoleExposesAPITokenManagement keeps the token tab wired to the
+// account-owned token API: creation carries role, resources, optional group
+// scope and TTL, the secret is shown once, and listing/revocation stay on the
+// same admin surface.
+func TestConsoleExposesAPITokenManagement(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(index)
+	for _, want := range []string{
+		`data-tab="tokens"`,
+		`id="panel-tokens"`,
+		`id="token-create"`,
+		`id="token-resources"`,
+		`id="token-group"`,
+		`id="token-ttl-days"`,
+		`id="token-rows"`,
+		`id="token-secret-dialog"`,
+		`id="token-secret-value"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html is missing %q", want)
+		}
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(script)
+	for _, want := range []string{
+		"'/v1/api-tokens'",
+		"function loadTokens",
+		"function tokenRow",
+		"function showTokenSecret",
+		"expires_in_seconds",
+		"GROUP_SCOPED_RESOURCES",
+		"tokenAdmin",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing %q", want)
+		}
+	}
+}
+
 // TestAssetsStayCSPCompatible guards the policy that the console contains no
 // inline script or style and never assigns data through HTML parsing helpers.
 func TestAssetsStayCSPCompatible(t *testing.T) {

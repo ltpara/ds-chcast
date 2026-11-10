@@ -76,6 +76,8 @@ class RemoteView extends StatefulWidget {
     this.onGesture,
     this.onDevicePointer,
     this.onDeviceCancel,
+    this.onCursorHint,
+    this.onCursorHintExit,
     this.onFocusRequested,
     this.overlayBuilder,
   });
@@ -119,6 +121,13 @@ class RemoteView extends StatefulWidget {
   /// has no contact to inject.
   final FrameDeviceHandler? onDevicePointer;
   final FrameDeviceHandler? onDeviceCancel;
+
+  /// Reports the pointer position in captured-desktop pixels for the host's
+  /// "show my cursor" hint. Unlike the input callbacks it also runs while
+  /// remote control is off, because the hint is draw-only. [onCursorHintExit]
+  /// fires when the pointer leaves the picture so the host can hide it.
+  final ValueChanged<Offset>? onCursorHint;
+  final VoidCallback? onCursorHintExit;
   final VoidCallback? onFocusRequested;
   final Widget Function(Size drawn)? overlayBuilder;
 
@@ -286,11 +295,34 @@ class _RemoteViewState extends State<RemoteView> {
       ]));
     }
     if (!widget.captureInput) {
-      return Listener(onPointerDown: (_) => widget.onFocusRequested?.call(), child: texture);
+      if (widget.onCursorHint == null) {
+        return Listener(
+          onPointerDown: (_) => widget.onFocusRequested?.call(),
+          child: texture,
+        );
+      }
+      // The host-side pointer hint keeps working while control is off, so the
+      // picture still needs hover tracking even though no button, scroll or
+      // key event may reach the host in this mode.
+      return MouseRegion(
+        onExit: (_) => widget.onCursorHintExit?.call(),
+        child: Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: (_) => widget.onFocusRequested?.call(),
+          onPointerMove: (PointerMoveEvent event) =>
+              widget.onCursorHint?.call(_toFrame(event.localPosition, box)),
+          onPointerHover: (PointerHoverEvent event) =>
+              widget.onCursorHint?.call(_toFrame(event.localPosition, box)),
+          child: texture,
+        ),
+      );
     }
     return MouseRegion(
       cursor: widget.hideCursor ? SystemMouseCursors.none : MouseCursor.defer,
-      onExit: (_) => _releaseButtons(),
+      onExit: (_) {
+        widget.onCursorHintExit?.call();
+        _releaseButtons();
+      },
       child: Listener(
         behavior: HitTestBehavior.opaque,
         onPointerDown: (PointerDownEvent event) {
@@ -317,6 +349,7 @@ class _RemoteViewState extends State<RemoteView> {
             return;
           }
           _syncButtons(event.buttons, position);
+          widget.onCursorHint?.call(position);
           widget.onMove?.call(position, event.buttons);
         },
         onPointerHover: (PointerHoverEvent event) {
@@ -327,6 +360,7 @@ class _RemoteViewState extends State<RemoteView> {
           }
           final Offset position = _toFrame(event.localPosition, box);
           _syncButtons(event.buttons, position);
+          widget.onCursorHint?.call(position);
           widget.onHover?.call(position, event.buttons);
         },
         onPointerCancel: (PointerCancelEvent event) {

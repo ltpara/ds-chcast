@@ -2,7 +2,9 @@
 
 > 2026-11-09 v61 更新：主表已按 `codex/development-checkpoint-2026-11-09`（`ddf75d2` + 工作区 R01–R05 修复，协议 v61）重新核对。此前“首观看者生产、其他人跟随”的结构性差距已由 v50–v55 关闭；v56–v61 补齐分页、剪贴板方向、空目录、按需文件剪贴板、事件监听、防休眠、主机录屏、会话内提权、服务审批和 VP9 4:4:4。下方历史更新记录保留，主表和“剩余差距”为当前结论。
 
-> 静止刷新更新（2026-11-09）：已按 RustDesk `video_service/static_refresh.rs` 接入按编码器/厂商后端/画质分档的静止刷新预算（VP9、H.264、HEVC 表格；AV1 关闭）、首次与 VP9 至少 100 ms、其余不超过 30 fps、桌面变化才重置计数；刷新帧不计入共享 QoS 的动态画面证据，并以不占发送窗口的 best-effort 方式发送。发布 IDR 时清空该订阅旧刷新帧，修复静止桌面关键帧请求被排队刷新掩埋的问题。测试证据见 [共享视频质量](shared-video-qos-rustdesk-2026-11-08.md)。
+> 静止刷新更新（2026-11-09）：已按 RustDesk `video_service/static_refresh.rs` 接入按编码器/厂商后端/画质分档的静止刷新预算（VP9、H.264、HEVC 表格；AV1 关闭）、首次与 VP9 至少 100 ms、其余不超过 30 fps、桌面变化才重置计数；刷新帧不计入共享 QoS 的发送计数与动态画面窗口，只有真实捕获帧提供 `dynamic` 证据（2026-11-11 复核：RustDesk `static_refresh.rs` 的 `try_encode` 不增加 `send_counter`；2026-11-10 曾改为计入并声称对齐，该判断错误，已撤销），仍以不占发送窗口的 best-effort 方式发送。发布 IDR 时清空该订阅旧刷新帧，修复静止桌面关键帧请求被排队刷新掩埋的问题。测试证据见 [共享视频质量](shared-video-qos-rustdesk-2026-11-08.md)。
+
+> 2026-11-11 二次比对（固定提交 `7423dce`）：宿主侧常用路径没有新的 P0/P1 缺口，新增三项 P3 差异并登记为 G21–G23。① **显示我的光标/白板**：RustDesk 在固定提交已进入 Flutter 产品面（`show_my_cursor` 工具栏与快捷键、主机端 `src/whiteboard` 透明覆盖层），把观看端光标画到主机屏幕；我方只有主机光标回发观看端，没有反向覆盖层，旧任务文档“白板未进入产品面”的判断已过期。② **主机语音呼叫麦克风选择**：RustDesk 主机可为语音呼叫选择本机麦克风（`audio-input`、Flutter `AudioInput(isCm: true, isVoiceCall: true)`），我方主机语音固定默认通信设备（`host_server.cc:8417` 传空 `MicrophoneCaptureConfig`）。③ **会话期间移除壁纸**：RustDesk `allow-remove-wallpaper` 在入站授权后移除并在会话结束恢复壁纸，我方未实现，属带宽优化。另核实并**不计缺口**：直连 `host:port` 不经会合（`app/lib/target.dart`）、观看端麦克风设备选择（`list_microphones`）、LAN 发现（`server/internal/lan`）、WebSocket 载体（`server/internal/carrier/ws.go`）、IPv6 打洞、临时密码、空闲自动断开、双向语音、自动更新均已实现。**截图改为部分对齐**：我方在观看端把最新解码帧写成 PNG（`viewer_engine.cc:1423`），RustDesk 由主机处理 `ScreenshotRequest`，因此截图分辨率和可截取范围受当前订阅限制，不能称为完全等价。
 
 > 键盘与输入法更新（2026-11-09）：主/子窗口已加入“物理按键 / 本地输入法”模式，本机组合确认后通过已有 TextInput 发送 Unicode；补齐文字与按键顺序、取消和回环注入过滤。真实双 Flutter 窗口/QUIC、微软拼音及快速回车确认通过，相关 Flutter 检查 51 项通过。其他输入法、布局与双机目标应用仍需实测，见 [本机键盘布局与输入法](local-keyboard-ime-2026-11-09.md)。
 
@@ -46,13 +48,13 @@
 
 日期：2026-11-08。发射端指 Windows 被控主机，包括托盘、Windows 服务、主机会话、采集编码、媒体发送、输入、剪贴板和附属会话。只在必要时追踪接收端协议配合，不展开账号管理和中央服务。
 
-本项目基线为 `ddf75d2` 加当前工作区 R01–R05 修复及后续 v62–v66 变更，协议 v66；本节主表已按 2026-11-10 当前代码更新。RustDesk 对照使用固定提交 `7423dced37845c48093b6f71bd82e4a16cc8c79d`；本机参照仓库为 `D:/rustdesk`，当前检出 `55786aa`，固定提交已浅拉取到同一仓库并用 `git show`/`git grep` 读取，不改变其工作区。本报告不是与最新发行版的比较。
+本项目基线为 `ddf75d2` 加当前工作区 R01–R05 修复及后续 v62–v67 变更，协议 v67；本节主表已按 2026-11-10 当前代码更新。RustDesk 对照使用固定提交 `7423dced37845c48093b6f71bd82e4a16cc8c79d`；本机参照仓库为 `D:/rustdesk`，当前检出 `55786aa`，固定提交已浅拉取到同一仓库并用 `git show`/`git grep` 读取，不改变其工作区。本报告不是与最新发行版的比较。
 
 11 月 7 日的旧报告使用另一份固定版本。它的 F01–F04 已修复，旧表格是修复前快照。本轮重新核查当前代码，不把旧问题原样列为现存缺陷，也不混用旧版本行号。
 
 结论：常用单人远控的发射端功能已基本齐全；此前最大的结构差距“一位观看者生产桌面、其他观看者跟随”已经关闭。当前实现按显示源共享采集/编码，每连接独立订阅、独立发送队列与反馈，全局 QoS 汇总全部观看者，支持不同观看者独立选屏和解码能力交集。
 
-与 RustDesk 相比，剩余的是有界产品项和环境验收，而不是主链路缺失：连接 ACL/账号级权限票据（G02/G03）、AV1 4:4:4、远程打印/角色互换、虚拟显示驱动和 HDR 端到端。查看端出站自动录制（G11）、文件夹递归删除、隐藏项开关、多共享根/盘符与文件压缩（G18）已于 2026-11-10 补齐。管理权限颗粒度与自动化 API Token（G12）属于中央控制台，不改变发射端矩阵，单独见 [管理权限与 API Token](admin-api-tokens-2026-11-10.md)。真实多屏/混合 DPI、UAC/RDP、物理摄像头、Explorer/Office、公网 NAT 与电源策略仍需按设备记录证据。
+与 RustDesk 相比，剩余的是有界产品项和环境验收，而不是主链路缺失：连接 ACL/账号级权限票据（G02/G03）、AV1 4:4:4、远程打印/角色互换、虚拟显示驱动和 HDR 端到端；2026-11-11 二次比对登记的三项宿主 P3（显示我的光标、主机语音麦克风选择、会话期间移除壁纸）已于同日补齐：光标部分随协议 v68、主机覆盖层和查看端工具栏落地，语音麦克风选择与壁纸移除完成设置、主机路径和自动化验证；物理麦克风录音、壁纸视觉切换和 RustDesk 式白板绘制仍待人工验证或未立项。查看端出站自动录制（G11）、文件夹递归删除、隐藏项开关、多共享根/盘符与文件压缩（G18）已于 2026-11-10 补齐。管理权限颗粒度与自动化 API Token（G12）属于中央控制台，不改变发射端矩阵，单独见 [管理权限与 API Token](admin-api-tokens-2026-11-10.md)。真实多屏/混合 DPI、UAC/RDP、物理摄像头、Explorer/Office、公网 NAT 与电源策略仍需按设备记录证据。
 
 ## 1. 按模块比较（v63 现状）
 
@@ -71,7 +73,7 @@
 | 静止桌面与关键帧 | `NoNewFrame` 时按编码器/后端/画质分档重复编码缓存画面（VP9/H.264/HEVC，AV1 关闭），首次与 VP9 ≥100 ms、其余 ≤30 fps；IDR 入队清空旧刷新帧 | snapshot + 受限重复编码 | **已实现**。真实硬件静态画质收益、各后端预算和长时间功耗待测。[P09][R07] |
 | 采集/编码异常恢复 | DXGI `DuplicateOutput` 失败或不可用时切 GDI 上传路径；GPU 重建、桌面切换、缓存失效、硬件后端尝试；普通硬件编码连续失败回退软件 H.264 | DXGI → GDI、编码创建失败 → VP9 等分支 | **已实现（方向一致）**。驱动复位、RDP 进出、热插拔仍待真机复验；GDI 不是零拷贝路径，只作可用性兜底。[P10][R07] |
 | 媒体发送与弱网 | 每显示源独立服务线程；全局 `VideoQos` 汇总所有订阅者的延迟/FPS/画质；每连接独立发送队列、积压丢弃和关键帧恢复；不再以生产连接发送成功作为全体广播前提；光标在采集线程内经每订阅 sink 直接投递（33 ms 节流），视频队列满时采样不暂停 | 多用户 QoS、帧反馈、有限等待；独立 cursor 服务 | **已实现**。极端拥塞/跨机弱网下共享降质规则和恢复时延仍需实测；RustDesk 同样受慢连接影响，不承诺完全隔离。500 kbps/30 ms 回环中视频帧年龄 3553 ms 时光标仍 291 次/0 丢弃。[P11][R08] |
-| 系统声音与双向语音 | 注册表级 `SharedLoopback` 系统音源，按会话订阅/退订，各连接独立权限和发送；麦克风上行、呼叫、AEC、静音门 | 共享音频服务，按连接订阅 | **已实现**。真实回声、热插拔、多人争用和音源设备切换待实机验证。[P12][R09] |
+| 系统声音与双向语音 | 注册表级 `SharedLoopback` 系统音源，按会话订阅/退订，各连接独立权限和发送；麦克风上行、呼叫、AEC、静音门 | 共享音频服务，按连接订阅 | **已实现**。主机语音麦克风可在设置页/托盘固定，设备缺失时回退默认通信设备并记日志（G22）；真实回声、热插拔、多人争用和观看端麦克风设备切换待实机验证。[P12][R09] |
 | 键鼠、触摸、笔 | HID/扫描码物理映射、Unicode 文本、本地输入法模式、v63 Legacy 虚拟键码注入、相对鼠标、触控/笔、释放屏障、卡键清理、注入回环过滤 | Map / Translate / Legacy 三种模式 | **已实现/待验**：Map、本地输入法（Translate 方向）与 Legacy 三种模式均已接入；非 US 布局、AltGr、死键、其他 IME、安全桌面输入待实测。[P13][R10] |
 | 锁屏、SAS、登录与 WTS | SAS、锁屏、重启、BlockInput、登录密码输入、会话列举/切换；跟随会话也消费这些请求；RDP-only 主机和登录代次防 ID 复用 | 对应控制消息、会话/平台服务 | **已实现/待验**。真实多用户切换、UAC/安全桌面进出仍需受控验收；OS 登录目前是登录屏密码输入，不是通用登录自动化。[P14][R02][R03] |
 | 隐私与虚拟显示 | 遮罩、BlockInput、隐私拓扑守卫、usbmmidd；通用 `vdd` 明确 unsupported；PLAT-01 虚拟显示被驱动条款/固定哈希阻塞 | 虚拟显示管理、隐私模式与恢复 | **部分/待验**。驱动 provider、崩溃后恢复、多人适用性不同；不能把 provider 名称当可用性证明。[P15][R11] |
@@ -82,11 +84,14 @@
 | 存活、回退与重连 | UDP/TCP 直连失效检测、auto 回退、中继/carrier、新会话重查；QUIC 数据路径保活 | 连接流存活检查、结束清理和新会话建立 | **已实现**。真实公网 NAT/IPv6/代理/弱网切换仍需按网络记录；本机回环不能替代。[P20][R16] |
 | 会话期间防休眠 | 默认开启 `keep_awake`；桌面连接请求系统+显示器，文件/终端只请求系统；按连接独立释放，待审批不持有 | 入站连接 WakeLock，Windows `SetThreadExecutionState` | **已实现**。真实电源策略、无人观看/传文件长时间会话和退出恢复待验。[P21][R17][R21] |
 | 主机录屏与审计 | `record_incoming` 默认关闭；共享源压缩数据异步写 MP4，同源多人只录一份；H.264/HEVC/AV1/VP9、重建/定时分段、积压关键帧恢复 | video service 的 `record_incoming` recorder | **已实现**。只录视频；主机侧磁盘容量/保留、失败提示、服务账户和物理摄像头待验收。查看端出站自动录制已由 G11 补齐，见 [查看端自动录制](viewer-auto-record-2026-11-10.md)。[P22][R18] |
+| 显示我的光标 / 白板 | v68 `ShowCursor` 控制消息（虚拟桌面像素坐标 + 可见标志，查看端 33 ms 节流）；主机独立线程的分层、点击穿透、不激活覆盖层绘制本地指针，断线/关闭即隐藏；查看端工具栏开关按设备保存 | `show_my_cursor`、`src/whiteboard` 透明覆盖层、Flutter 工具栏/快捷键 | **已实现（光标部分，P3，G21）**。协议往返/拒绝路径、覆盖层构建和工具栏开关自动化通过，不注入点击；RustDesk 式白板绘制未实现，覆盖层在混合 DPI/多屏负坐标下的目视位置待人工验证。[P24][R23] |
+| 主机语音麦克风选择 | `host.ini voice_microphone=`（空=系统默认）、设置页下拉和托盘“上行语音麦克风”子菜单；语音呼叫开始时读取，固定设备打不开则记日志并回退默认通信设备，已在通话中不切换 | `audio-input` 选项、Flutter `AudioInput(isCm/isVoiceCall)`、`audio_service.rs` 按配置打开设备 | **已实现（P3，G22）**。设置往返、设置页/托盘入口和合成采集回退已自动化通过；本机没有物理麦克风，真实录音与设备切换待人工验证。[P25][R24] |
+| 会话期间移除壁纸 | `host.ini remove_wallpaper=` 默认关闭，托盘开关；桌面会话开始时把当前壁纸路径备份到 `<stem>.wallpaper` 后清空壁纸，会话结束或下次启动恢复，备份文件处理异常退出 | `allow-remove-wallpaper` 授权后移除、会话结束恢复 | **已实现（P3，G23，优化项）**。备份/恢复/冲突拒绝和会话生命周期已自动化通过；真实壁纸视觉切换和异常断电恢复待人工验证。不改变零拷贝与 QoS。[P26][R25] |
 | 远程打印、角色互换、平台 | 未找到打印或 Switch Sides 协议；主机仅 Windows | printer service、SwitchSides、多平台被控 | **缺失/产品项**。涉及双端和部署，按 G19 单独立项；不与 Windows 主机稳定性修复混在一起。[P23][R19][R22] |
 
 ## 2. 当前剩余差距（发射端）
 
-以下按开发顺序排列，编号与 [当前状态与计划](status-and-plan-2026-11-09.md) 及 [RustDesk 全量对照](rustdesk-full-parity-2026-11-07.md) 的 G 编号一致。前六项是代码/产品缺口，最后一项是环境验收，不作为代码缺陷计入。键盘 Legacy（G10）已于 v63 实现，查看端出站自动录制（G11）已于 2026-11-10 实现，均不再列为剩余缺口。
+以下按开发顺序排列，编号与 [当前状态与计划](status-and-plan-2026-11-09.md) 及 [RustDesk 全量对照](rustdesk-full-parity-2026-11-07.md) 的 G 编号一致。前七项是代码/产品缺口，最后一项是环境验收，不作为代码缺陷计入。键盘 Legacy（G10）已于 v63 实现，查看端出站自动录制（G11）已于 2026-11-10 实现，均不再列为剩余缺口。
 
 1. **G02 连接 ACL（最高优先）**：账号/组 → 设备策略，禁用设备或账号、移组、过期票据均能拒绝；直连、打洞、relay/carrier 都受同一守门，不允许退回旧 link key 绕过。账号 schema 已升到 v10，服务端设备策略存储/管理 API/签名回执有自动化覆盖；管理台新增仅 admin 的“设备策略”页，只有签名回执版本等于当前策略且 applied=true 才显示“已应用版本 N”，否则显示“待应用/应用失败”；lookup 也已区分账号与共享凭据并拒绝 restricted 设备上的共享凭据。源码链路已端到端：lookup 携带客户端临时公钥时签发 60 秒票据（`client_public_key`，受管主机才返回）；v62 Hello 携带票据与客户端挑战证明，主机按固定签发 `kid` 验签并要求版本匹配、未重放，权限取票据 ∩ `permission_ceiling` ∩ 本机默认 ∩ 查看器请求；查看器启动取票、20 秒续租，`host_ticket_lease` 覆盖到期、续租、拒绝与权限收窄；撤权走 `policy`/`revoke` 长轮询，主机按新策略版本或退役 `kid` 立即断开匹配会话，65 秒上限由租约保证。剩余边界：真 `chast-host.exe` 受管会话矩阵（直连/打洞/relay/carrier）、独立短期传输凭证、应急访问授权/审计，以及 Postgres/多操作者部署验收。设计约束见 [受管准入与会话授权设计](access-control-design-2026-11-09.md)。验收：新 lookup、先取票再撤权、已连接后撤权三种状态 × 各连接路径。
 2. **G03 账号级会话权限票据**：在 G02 的独立签发/租约框架上，权限取票据上限、设备策略、主机本地策略和用户同意的交集，覆盖全部敏感入口；撤权停止终端/转发/文件等正在执行的操作，存量会话最多 65 秒失效。
@@ -95,6 +100,9 @@
 5. **文件管理剩余项（G18，已关闭）**：v64 文件夹递归删除和确认、v65 隐藏项过滤/显示开关与多共享根/盘符别名、v66 CFIL v2 文件压缩均已实现并通过真实 QUIC 回环；万条目录由 v56 分页覆盖。真实素材和跨网吞吐仍待复验；共享根和容量上限仍是安全边界，不为了对齐直接取消。
 6. **虚拟显示驱动与 HDR 端到端**：PLAT-01 的代码路径存在，但驱动分发被第三方条款与固定哈希阻塞；HDR 目前采集归一为 SDR，不能宣称 HDR10 端到端。前者是外部依赖，后者是明确的产品边界。
 7. **环境验收（不是代码缺口）**：真实多物理屏/混合 DPI/多 GPU、真实 UAC 与跨管理员账户、多用户 RDP、物理摄像头、真实 HDR、Explorer/Office 粘贴、其他键盘布局/IME、跨公网 NAT/IPv6/代理/中继、弱网和不同显卡故障恢复。需要在对应设备或网络执行并记录证据边界。
+8. **G21–G23 宿主 P3（2026-11-11 已关闭）**：**G21 显示我的光标**随协议 v68 落地 `ShowCursor`、主机点击穿透覆盖层和查看端工具栏/节流发送，RustDesk 式白板绘制未实现；**G22 主机语音麦克风选择**新增 `voice_microphone` 设置、设置页/托盘入口、按呼叫读取和缺失设备回退；**G23 会话期间移除壁纸**新增默认关闭的托盘开关、会话生命周期备份/恢复与崩溃后恢复。三项的代码、设置和自动化证据见本节各行及 [缺口任务](rustdesk-gap-tasks-2026-11-01.md) 同日小节；物理麦克风录音、壁纸视觉切换、白板绘制和真实多屏覆盖层位置仍待人工验证。
+
+截图功能本身已存在，但**实现来源不同**：我方在观看端把最新解码帧写成 PNG，RustDesk 由主机处理 `ScreenshotRequest` 后返回主机侧截图；因此我方截图的分辨率和可截取范围受当前订阅限制，已在全量对照 C40 标为部分对齐，不单独计为 G 编号。
 
 ## 3. 已修复项与验证边界
 
@@ -140,6 +148,9 @@ v56–v63 追加能力（目录分页、剪贴板方向、空目录、按需文�
 [P21]: include/chast/host_settings.h:191、src/win/power_request.cc:35
 [P22]: include/chast/host_settings.h:108、src/host/stream_recorder.h:20、src/host/host_server.cc:2402
 [P23]: 全仓检索 `printer`、`SwitchSides` 无入口；平台范围见 CMakeLists.txt
+[P24]: include/chast/show_cursor.h、src/win/show_cursor.cc、src/net/protocol.cc（`ShowCursor`，v68）、app/lib/pages/session_page.dart:2306、app/lib/widgets/remote_toolbar.dart:718
+[P25]: include/chast/host_settings.h（`voice_microphone`）、src/host/host_server.cc（语音呼叫读取与默认设备回退）、host/main.cc（设置页与托盘入口）
+[P26]: include/chast/wallpaper.h、src/win/wallpaper.cc、src/host/host_server.cc（会话生命周期）、host/main.cc（托盘开关）
 [R01]: rustdesk@7423dce:src/server.rs
 [R02]: rustdesk@7423dce:src/server/connection.rs（批准、WTS、OS 登录）
 [R03]: rustdesk@7423dce:src/server/connection.rs（`ElevationRequest`/portable service）
@@ -162,5 +173,8 @@ v56–v63 追加能力（目录分页、剪贴板方向、空目录、按需文�
 [R20]: rustdesk@7423dce:libs/scrap/src/common/codec.rs（`use_i444` 仅 VP9/AV1）
 [R21]: rustdesk@7423dce:src/platform/windows.rs（`SetThreadExecutionState` WakeLock）
 [R22]: rustdesk@7423dce:src/server.rs、各平台被控实现
+[R23]: rustdesk@7423dce:src/server/connection.rs:4760、src/whiteboard/、flutter/lib/desktop/widgets/remote_toolbar.dart:2730
+[R24]: rustdesk@7423dce:src/server/audio_service.rs:62、flutter/lib/common/widgets/audio_input.dart
+[R25]: rustdesk@7423dce:src/server/connection.rs:2115、src/platform/windows.rs（WallpaperRemover）
 
 补充定位：发送容量与等待 `src/net/quic.cc`；全订阅者 QoS 决策 `src/host/video_qos.h`、`src/host/desktop_stream.cc`；文件大小/目录数量上限 `include/chast/protocol.h`；协议版本 `include/chast/protocol.h:57`；当前回归入口 `tests/desktop_stream_test.cc`、`tests/host_parity_test.cc`、`tests/host_multi_test.cc`、`tests/host_voice_test.cc`、`tests/clipboard_async_test.cc`、`tests/mp4_recorder_test.cc`。G02/G03 的签发、策略同步和租约约束见 `docs/access-control-design-2026-11-09.md`；其中设备策略存储/管理 API、lookup 准入、服务端换票端点和管理台设备策略回执页已实现并有自动化，注册响应已携带 `device_policy`，Go 代理已解析并经 `HostInfo.Policy`/`chast-tunnel` 事件上报并落盘到共享 `<stem>.policy.json`，C++ 对受管设备的新会话失败关闭，并已形成签名回执闭环（主机确认文件 + agent 设备密钥异步上报）；C++ 票据校验库（`src/host/access_ticket.cc`）已通过黄金向量测试并接入 `HostSecurity` 准入（固定项来自 `host.ini`，权限交集与拒绝路径有 `host_security_test` 覆盖）；v62 已让客户端在 Hello 携带票据、lookup 返回票据并支持 20 秒续租与运行中撤权；撤销推送和真实链路验收仍待完成。

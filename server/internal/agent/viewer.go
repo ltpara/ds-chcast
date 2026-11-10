@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/netproxy"
@@ -39,9 +41,21 @@ type ViewerConfig struct {
 	// Servers seeds the failover list before the first lookup.
 	Servers   []string
 	ServerKey string
-	// LinkKey is the lookup and punch credential ordinary viewers hold. Empty
-	// reuses ServerKey.
+	// LinkKey is the legacy lookup and punch credential. Empty reuses
+	// ServerKey. When AccountToken is set the lookup authenticates as that
+	// account instead, and LinkKey remains the fallback punch proof for
+	// deployments that issue no transport credentials.
 	LinkKey string
+	// AccountToken is a signed-in viewer's bearer token. A restricted managed
+	// device only admits an account subject, so the tunnel must present this
+	// instead of the shared link key. It is never logged or written to disk.
+	AccountToken string
+	// Emergency, when set, replaces the initial lookup with an explicit
+	// management override. A restricted device still refuses this viewer's
+	// ordinary lookup, so the admin supplies a signed-in admin token, a stated
+	// reason and the application's Ed25519 public key; the agent contributes
+	// its own ephemeral transport key and uses the returned tickets directly.
+	Emergency *EmergencyAccess
 	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
 	// client certificate for mTLS, or both. Nil uses the system roots.
 	TLS *tls.Config
@@ -68,6 +82,35 @@ type ViewerConfig struct {
 	// path once StartViewer has resolved the host. It is called from the read
 	// or timer goroutine, so it must not block.
 	OnPath func(PathInfo)
+	// OnAccessTicket receives each renewed access ticket in emergency mode.
+	// The initial ticket is available from AccessTicket after StartViewer.
+	// The callback runs on the refresh goroutine, so it must not block.
+	OnAccessTicket func(AccessTicket)
+}
+
+// EmergencyAccess is one explicit management override for a restricted
+// device. Permissions 0 asks for the device's full ceiling; the server still
+// intersects the request with that ceiling.
+type EmergencyAccess struct {
+	AdminToken      string
+	ClientPublicKey string
+	Reason          string
+	Permissions     uint32
+}
+
+// AccessTicket is the short-lived application credential bound to the
+// viewer's client key. The viewer presents it, with its possession proof, when
+// it opens the session; unmanaged devices never receive one.
+type AccessTicket struct {
+	Ticket        string `json:"ticket"`
+	IssuedAtMS    int64  `json:"issued_at_ms"`
+	ExpiresAtMS   int64  `json:"expires_at_ms"`
+	ExpiresInMS   int64  `json:"expires_in_ms"`
+	PolicyVersion uint32 `json:"policy_version"`
+	Permissions   uint32 `json:"permissions"`
+	Issuer        string `json:"issuer"`
+	KeyID         string `json:"kid"`
+	Subject       string `json:"subject"`
 }
 
 // PathInfo is the viewer agent's current forwarding path. Path is "direct",
@@ -117,6 +160,24 @@ type ViewerAgent struct {
 	punch6 *net.UDPAddr
 	direct *net.UDPAddr
 	relay  *net.UDPAddr
+
+	// transportKey is the ephemeral key this viewer presents transport
+	// credentials with. The credentials the lookup bound to it are guarded by
+	// transportMu because the relay and carrier loops refresh them when they
+	// approach expiry. No credential means the deployment issues none and every
+	// transport keeps its legacy credential (link key or carrier token).
+	transportKey     ed25519.PrivateKey
+	transportIssued  bool
+	transportPunch   *transportCredential
+	transportRelay   *transportCredential
+	transportCarrier *transportCredential
+	transportMu      sync.Mutex
+
+	// accessMu guards the application ticket minted by an emergency override.
+	// Ordinary lookups do not return one, so a nil ticket keeps the local
+	// authentication path.
+	accessMu     sync.Mutex
+	accessTicket *AccessTicket
 
 	// carrier and carrierV6 come from the authenticated lookup. The token
 	// authorizes this viewer's slot while the host's lease is live.
@@ -251,6 +312,17 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 			return nil, fmt.Errorf("--server-pubkey: %w", err)
 		}
 	}
+	if cfg.Emergency != nil {
+		cfg.Emergency.Reason = strings.TrimSpace(cfg.Emergency.Reason)
+		cfg.Emergency.ClientPublicKey = strings.TrimSpace(cfg.Emergency.ClientPublicKey)
+		if cfg.Emergency.AdminToken == "" || cfg.Emergency.Reason == "" {
+			return nil, fmt.Errorf("emergency access needs an admin token and a reason")
+		}
+		key, err := base64.RawURLEncoding.DecodeString(cfg.Emergency.ClientPublicKey)
+		if err != nil || len(key) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("emergency access client key must be a base64url Ed25519 public key")
+		}
+	}
 	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
 	if err != nil {
 		return nil, fmt.Errorf("rendezvous servers: %w", err)
@@ -269,21 +341,29 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
+	transportPub, transportKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		out.Close()
+		conn.Close()
+		cancel()
+		return nil, fmt.Errorf("transport key: %w", err)
+	}
 	v := &ViewerAgent{
-		cfg:     cfg,
-		conn:    conn,
-		out:     out,
-		api:     newAPIClient(servers.Current(), viewerAPIKey(cfg), cfg.TLS, cfg.Proxy),
-		servers: servers,
-		log:     cfg.Logger.With("agent", "viewer", "id", cfg.HostID),
-		ctx:     ctx,
-		cancel:  cancel,
-		nonce:   newNonce(),
+		cfg:          cfg,
+		conn:         conn,
+		out:          out,
+		api:          newAPIClient(servers.Current(), viewerAPIKey(cfg), cfg.TLS, cfg.Proxy),
+		servers:      servers,
+		log:          cfg.Logger.With("agent", "viewer", "id", cfg.HostID),
+		ctx:          ctx,
+		cancel:       cancel,
+		nonce:        newNonce(),
+		transportKey: transportKey,
 	}
 	v.directCtx, v.directCancel = context.WithCancel(ctx)
 	v.localAddrs, v.localAddrsV6 = splitByFamily(localCandidates(out.LocalAddr().(*net.UDPAddr)))
 
-	host, err := v.lookupWithFailover(ctx)
+	host, err := v.lookupHost(ctx, base64.RawURLEncoding.EncodeToString(transportPub))
 	if err != nil {
 		v.closeSockets()
 		cancel()
@@ -294,6 +374,8 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel()
 		return nil, err
 	}
+	v.applyAccessTicket(host.AccessTicket, false)
+	v.applyTransportCredentials(host)
 	if host.PublicKey != "" {
 		if pub, err := identity.ParsePublicKey(host.PublicKey); err == nil {
 			v.hostPub = pub
@@ -388,7 +470,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 			return nil, fmt.Errorf("relay address %q is not reachable from %s", strings.Join(relayTexts, ", "), v.out.LocalAddr().String())
 		}
 	}
-	carrierReady := v.carrierToken != "" && len(v.carrierCandidates()) > 0
+	carrierReady := v.carrierCredentialReady() && len(v.carrierCandidates()) > 0
 	tcpReady := v.tcpPunch != nil && v.hostPub != nil
 	useCarrier := false
 
@@ -521,13 +603,70 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	return v, nil
 }
 
-// lookupWithFailover tries every known endpoint once so a viewer is not stuck
-// on a broken node from its seed list.
-func (v *ViewerAgent) lookupWithFailover(ctx context.Context) (lookupResult, error) {
+// lookupHost performs the initial host lookup, or the explicit management
+// override when one was configured. Both answers carry the rendezvous fields
+// the agent needs; only the override also carries an application ticket.
+func (v *ViewerAgent) lookupHost(ctx context.Context, transportKey string) (lookupResult, error) {
+	if v.cfg.Emergency == nil {
+		return v.lookupWithFailover(ctx, transportKey)
+	}
 	var lastErr error
 	for attempt := 0; attempt < v.servers.Len(); attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		host, err := v.api.lookup(attemptCtx, v.cfg.HostID)
+		host, err := v.api.emergencyAccess(attemptCtx, v.cfg.HostID,
+			v.cfg.Emergency.ClientPublicKey, transportKey,
+			v.cfg.Emergency.Permissions, v.cfg.Emergency.Reason)
+		cancel()
+		if err == nil {
+			return host, nil
+		}
+		lastErr = err
+		if next, ok := v.servers.Next(); ok {
+			v.api.setBase(next)
+			v.log.Warn("emergency access failed; trying the next rendezvous server",
+				"server", next, "error", err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no rendezvous server answered")
+	}
+	return lookupResult{}, lastErr
+}
+
+// applyAccessTicket stores the application ticket an override issued. A
+// renewal is handed to the embedding viewer so it can move the live session's
+// lease; the first ticket is read back through AccessTicket.
+func (v *ViewerAgent) applyAccessTicket(ticket *AccessTicket, notify bool) {
+	if ticket == nil || ticket.Ticket == "" {
+		return
+	}
+	v.accessMu.Lock()
+	v.accessTicket = ticket
+	v.accessMu.Unlock()
+	if notify && v.cfg.OnAccessTicket != nil {
+		v.cfg.OnAccessTicket(*ticket)
+	}
+}
+
+// AccessTicket returns the latest emergency access ticket, or nil when this
+// viewer was not started with an override.
+func (v *ViewerAgent) AccessTicket() *AccessTicket {
+	v.accessMu.Lock()
+	defer v.accessMu.Unlock()
+	if v.accessTicket == nil {
+		return nil
+	}
+	ticket := *v.accessTicket
+	return &ticket
+}
+
+// lookupWithFailover tries every known endpoint once so a viewer is not stuck
+// on a broken node from its seed list.
+func (v *ViewerAgent) lookupWithFailover(ctx context.Context, transportKey string) (lookupResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < v.servers.Len(); attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		host, err := v.api.lookup(attemptCtx, v.cfg.HostID, transportKey)
 		cancel()
 		if err == nil {
 			return host, nil
@@ -542,6 +681,89 @@ func (v *ViewerAgent) lookupWithFailover(ctx context.Context) (lookupResult, err
 		lastErr = errors.New("no rendezvous server answered")
 	}
 	return lookupResult{}, lastErr
+}
+
+// transportRefreshMargin renews a credential well before the relay or carrier
+// would refuse it. Tickets live for 60s and the relay re-authenticates every
+// 20s, so 15s leaves room for a lost renewal.
+const transportRefreshMargin = 15 * time.Second
+
+func (v *ViewerAgent) applyTransportCredentials(host lookupResult) {
+	v.transportMu.Lock()
+	defer v.transportMu.Unlock()
+	v.applyTransportCredentialsLocked(host)
+}
+
+func (v *ViewerAgent) applyTransportCredentialsLocked(host lookupResult) {
+	if credential := host.TransportPunch; credential != nil && credential.Ticket != "" {
+		v.transportPunch = credential
+		v.transportIssued = true
+	}
+	if credential := host.TransportRelay; credential != nil && credential.Ticket != "" {
+		v.transportRelay = credential
+		v.transportIssued = true
+	}
+	if credential := host.TransportCarrier; credential != nil && credential.Ticket != "" {
+		v.transportCarrier = credential
+		v.transportIssued = true
+	}
+}
+
+// transportCredentialFor returns a live credential for one transport purpose.
+// A missing or nearly expired credential triggers a fresh lookup, because a
+// lookup mints all three audiences together and the relay link can outlive the
+// session start by minutes. Nil means the deployment issued none, and the
+// caller keeps the legacy credential for that transport.
+func (v *ViewerAgent) transportCredentialFor(audience string) *transportCredential {
+	if v.transportKey == nil {
+		return nil
+	}
+	v.transportMu.Lock()
+	defer v.transportMu.Unlock()
+	current := v.transportCredentialLocked(audience)
+	if !v.transportIssued {
+		return nil
+	}
+	if current != nil && time.Until(time.UnixMilli(current.ExpiresAtMS)) > transportRefreshMargin {
+		return current
+	}
+	key := base64.RawURLEncoding.EncodeToString(v.transportKey.Public().(ed25519.PublicKey))
+	ctx, cancel := context.WithTimeout(v.ctx, 10*time.Second)
+	host, err := v.lookupHost(ctx, key)
+	cancel()
+	if err != nil {
+		v.log.Warn("transport credential refresh failed", "audience", audience, "error", err)
+		return current
+	}
+	if err := checkHostBinding(v.cfg.ServerPublicKey, v.cfg.HostID, host); err != nil {
+		v.log.Warn("transport credential refresh binding", "audience", audience, "error", err)
+		return current
+	}
+	v.applyAccessTicket(host.AccessTicket, true)
+	v.applyTransportCredentialsLocked(host)
+	return v.transportCredentialLocked(audience)
+}
+
+func (v *ViewerAgent) transportCredentialLocked(audience string) *transportCredential {
+	switch audience {
+	case acl.TransportAudiencePunch:
+		return v.transportPunch
+	case acl.TransportAudienceRelay:
+		return v.transportRelay
+	case acl.TransportAudienceCarrier:
+		return v.transportCarrier
+	default:
+		return nil
+	}
+}
+
+// carrierCredentialReady reports whether the viewer can admit itself to the
+// shared carrier. It is the transport credential when issued, and the legacy
+// lookup token otherwise.
+func (v *ViewerAgent) carrierCredentialReady() bool {
+	v.transportMu.Lock()
+	defer v.transportMu.Unlock()
+	return v.transportCarrier != nil || v.carrierToken != ""
 }
 
 func (v *ViewerAgent) LocalAddr() net.Addr { return v.conn.LocalAddr() }
@@ -637,7 +859,12 @@ func (v *ViewerAgent) sendPunchRequest() {
 	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce,
 		UpnpPort: v.upnpPort, NATType: ownNAT, SelfV6: v.selfV6,
 		LocalAddrs: v.localAddrs, LocalAddrsV6: v.localAddrsV6}
-	if key := viewerAPIKey(v.cfg); key != "" {
+	if credential := v.transportCredentialFor(acl.TransportAudiencePunch); credential != nil {
+		msg.Timestamp = time.Now().Unix()
+		msg.Transport = credential.Ticket
+		msg.TransportProof = identity.Sign(v.transportKey,
+			identity.TransportProofMessage(credential.Audience, v.cfg.HostID, v.nonce, msg.Timestamp))
+	} else if key := punchAPIKey(v.cfg); key != "" {
 		msg.Timestamp = time.Now().Unix()
 		msg.Auth = identity.PunchAuth(key, v.cfg.HostID, v.nonce, msg.Timestamp)
 	}
@@ -675,18 +902,18 @@ func (v *ViewerAgent) relayAddress() *net.UDPAddr {
 }
 
 func (v *ViewerAgent) relayAuthLoop() {
-	if v.carrierToken == "" {
-		v.log.Warn("relay did not return a viewer token")
-		return
-	}
-	msg := wire.Encode(wire.Message{
-		Type:   wire.TypeRelayViewer,
-		HostID: v.cfg.HostID,
-		Token:  v.carrierToken,
-	})
+	warned := false
 	for attempt := 1; ; attempt++ {
 		relay := v.relayAddress()
 		if relay == nil {
+			return
+		}
+		msg := v.relayAuthMessage()
+		if msg == nil {
+			if !warned {
+				v.log.Warn("relay did not return a viewer token")
+				warned = true
+			}
 			return
 		}
 		if _, err := v.out.WriteToUDP(msg, relay); err != nil {
@@ -702,6 +929,27 @@ func (v *ViewerAgent) relayAuthLoop() {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// relayAuthMessage builds one relay_viewer control message. A transport
+// credential, when the deployment issues one, is authoritative and proves
+// possession over a fresh timestamp; otherwise the legacy carrier token is
+// sent. A nil result means neither credential is available.
+func (v *ViewerAgent) relayAuthMessage() []byte {
+	msg := wire.Message{Type: wire.TypeRelayViewer, HostID: v.cfg.HostID}
+	if credential := v.transportCredentialFor(acl.TransportAudienceRelay); credential != nil {
+		msg.Nonce = v.nonce
+		msg.Timestamp = time.Now().Unix()
+		msg.Transport = credential.Ticket
+		msg.TransportProof = identity.Sign(v.transportKey,
+			identity.TransportProofMessage(credential.Audience, v.cfg.HostID, msg.Nonce, msg.Timestamp))
+		return wire.Encode(msg)
+	}
+	if v.carrierToken == "" {
+		return nil
+	}
+	msg.Token = v.carrierToken
+	return wire.Encode(msg)
 }
 
 const (
@@ -997,6 +1245,26 @@ func (v *ViewerAgent) carrierLoop() {
 	}
 }
 
+// carrierViewerHello builds one shared-carrier hello. Every reconnect signs a
+// fresh nonce, because the relay refuses an identical proof from a different
+// TCP connection and a ticket can outlive several reconnect attempts.
+func (v *ViewerAgent) carrierViewerHello() (carrier.SharedViewerHello, error) {
+	hello := carrier.SharedViewerHello{HostID: v.cfg.HostID}
+	if credential := v.transportCredentialFor(acl.TransportAudienceCarrier); credential != nil {
+		hello.Nonce = newNonce()
+		hello.Timestamp = time.Now().Unix()
+		hello.Transport = credential.Ticket
+		hello.TransportProof = identity.Sign(v.transportKey,
+			identity.TransportProofMessage(credential.Audience, v.cfg.HostID, hello.Nonce, hello.Timestamp))
+		return hello, nil
+	}
+	if v.carrierToken == "" {
+		return hello, errors.New("relay did not return a viewer token")
+	}
+	hello.Token = v.carrierToken
+	return hello, nil
+}
+
 func (v *ViewerAgent) runCarrierLink() error {
 	var conn net.Conn
 	var err error
@@ -1020,13 +1288,18 @@ func (v *ViewerAgent) runCarrierLink() error {
 		}
 		return err
 	}
-	hello, err := json.Marshal(carrier.SharedViewerHello{HostID: v.cfg.HostID, Token: v.carrierToken})
+	hello, err := v.carrierViewerHello()
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	marshaled, err := json.Marshal(hello)
 	if err != nil {
 		conn.Close()
 		return err
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(viewerCarrierDial))
-	if _, err := io.WriteString(conn, carrier.MagicViewer+string(hello)+"\n"); err != nil {
+	if _, err := io.WriteString(conn, carrier.MagicViewer+string(marshaled)+"\n"); err != nil {
 		conn.Close()
 		return err
 	}
@@ -1321,7 +1594,7 @@ func (v *ViewerAgent) fallBackToRelay(reason string) {
 		v.mu.Unlock()
 		return
 	}
-	carrierReady := v.carrierToken != "" && len(v.carrierCandidates()) > 0
+	carrierReady := v.carrierCredentialReady() && len(v.carrierCandidates()) > 0
 	useCarrier := carrierReady && (v.transport == "carrier" || v.relay == nil)
 	if !useCarrier && (v.relay == nil || sameAddr(v.remote, v.relay)) {
 		v.mu.Unlock()

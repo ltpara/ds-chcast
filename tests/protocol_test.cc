@@ -416,6 +416,44 @@ void test_ticket_renew() {
           "a refused TicketRenewResult carrying a lease is rejected");
 }
 
+void test_show_cursor() {
+    chast::ShowCursorHint sent;
+    sent.x = -1920;
+    sent.y = 1080;
+    sent.visible = true;
+    chast::ShowCursorHint got;
+    std::string error;
+    const std::vector<uint8_t> message = chast::make_show_cursor(sent);
+    check(message[6] == static_cast<uint8_t>(chast::ControlType::ShowCursor),
+          "ShowCursor uses its own control type");
+    check(chast::parse_show_cursor(payload_of(message), got, &error) && got.x == sent.x &&
+              got.y == sent.y && got.visible,
+          "ShowCursor round-trips negative coordinates");
+    sent.visible = false;
+    sent.x = 0;
+    sent.y = 0;
+    check(chast::parse_show_cursor(payload_of(chast::make_show_cursor(sent)), got, &error) &&
+              got.x == 0 && got.y == 0 && !got.visible,
+          "ShowCursor round-trips a hidden hint");
+    check(!chast::parse_show_cursor({}, got, &error), "an empty ShowCursor is rejected");
+    const std::vector<uint8_t> payload = payload_of(message);
+    check(!chast::parse_show_cursor(
+              std::vector<uint8_t>(payload.begin(), payload.end() - 1), got, &error),
+          "a truncated ShowCursor is rejected");
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    check(!chast::parse_show_cursor(trailing, got, &error),
+          "ShowCursor with trailing bytes is rejected");
+    std::vector<uint8_t> unknown_flags = payload;
+    unknown_flags[8] = 0x02;
+    check(!chast::parse_show_cursor(unknown_flags, got, &error),
+          "ShowCursor with unknown flags is rejected");
+    std::vector<uint8_t> reserved = payload;
+    reserved[9] = 0x01;
+    check(!chast::parse_show_cursor(reserved, got, &error),
+          "ShowCursor with non-zero reserved bytes is rejected");
+}
+
 void test_hello_ack() {
     chast::ServerInfo sent;
     sent.codec = chast::VideoCodec::Hevc;
@@ -1388,7 +1426,7 @@ void test_stream_options() {
     check(chast::parse_set_stream_options(
               payload_of(chast::make_set_stream_options(options)), options, &error) &&
               options.codec == chast::StreamCodecPreference::Auto && options.max_fps == 0 &&
-              options.quality == chast::StreamQuality::High,
+              options.quality == chast::StreamQuality::High && options.quality_percent == 0,
           "SetStreamOptions round-trips the defaults");
 
     chast::StreamOptions asked;
@@ -1399,9 +1437,37 @@ void test_stream_options() {
               payload_of(chast::make_set_stream_options(asked)), options, &error) &&
               options.codec == chast::StreamCodecPreference::Hevc &&
               options.max_fps == 60 &&
-              options.quality == chast::StreamQuality::Smooth,
+              options.quality == chast::StreamQuality::Smooth && options.quality_percent == 0,
           "SetStreamOptions round-trips explicit preferences");
 
+    asked.quality = chast::StreamQuality::Custom;
+    asked.quality_percent = 72;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error) &&
+              options.quality == chast::StreamQuality::Custom &&
+              options.quality_percent == 72,
+          "SetStreamOptions round-trips a custom quality percent");
+    asked.quality_percent = chast::kMinCustomQualityPercent;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error) &&
+              options.quality_percent == chast::kMinCustomQualityPercent,
+          "SetStreamOptions accepts the bottom of the custom quality range");
+    asked.quality_percent = chast::kMaxCustomQualityPercent;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error) &&
+              options.quality_percent == chast::kMaxCustomQualityPercent,
+          "SetStreamOptions accepts the top of the custom quality range");
+    asked.quality_percent = chast::kMinCustomQualityPercent - 1;
+    check(!chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error),
+          "SetStreamOptions rejects a custom quality below the range");
+    asked.quality_percent = chast::kMaxCustomQualityPercent + 1;
+    check(!chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error),
+          "SetStreamOptions rejects a custom quality past the range");
+
+    asked.quality = chast::StreamQuality::Smooth;
+    asked.quality_percent = 0;
     asked.max_fps = chast::kMaxStreamFps;
     check(chast::parse_set_stream_options(
               payload_of(chast::make_set_stream_options(asked)), options, &error) &&
@@ -1427,9 +1493,14 @@ void test_stream_options() {
           "SetStreamOptions with an unknown codec is rejected");
     std::vector<uint8_t> unknown_quality =
         payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
-    unknown_quality[3] = 3;
+    unknown_quality[3] = 4;
     check(!chast::parse_set_stream_options(unknown_quality, options, &error),
           "SetStreamOptions with an unknown quality is rejected");
+    std::vector<uint8_t> preset_percent =
+        payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
+    preset_percent[5] = 50;
+    check(!chast::parse_set_stream_options(preset_percent, options, &error),
+          "SetStreamOptions rejects a percent beside a preset quality");
     std::vector<uint8_t> trailing =
         payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
     trailing.push_back(0);
@@ -1437,6 +1508,8 @@ void test_stream_options() {
           "SetStreamOptions with trailing bytes is rejected");
     check(!chast::parse_set_stream_options(std::vector<uint8_t>(3), options, &error),
           "short SetStreamOptions is rejected");
+    check(!chast::parse_set_stream_options(std::vector<uint8_t>(5), options, &error),
+          "a v66 SetStreamOptions without the percent byte is rejected");
 
     chast::StreamOptionsResult result;
     chast::StreamOptionsResult sent;
@@ -1458,6 +1531,26 @@ void test_stream_options() {
               result.code == chast::StreamOptionsCode::Unsupported &&
               result.reason == "no HEVC encoder is available",
           "StreamOptionsResult round-trips a refusal with its reason");
+
+    sent.code = chast::StreamOptionsCode::Ok;
+    sent.reason.clear();
+    sent.quality = chast::StreamQuality::Custom;
+    sent.quality_percent = 65;
+    check(chast::parse_stream_options_result(
+              payload_of(chast::make_stream_options_result(sent)), result, &error) &&
+              result.quality == chast::StreamQuality::Custom &&
+              result.quality_percent == 65,
+          "StreamOptionsResult round-trips a custom quality percent");
+    sent.quality_percent = chast::kMinCustomQualityPercent - 1;
+    check(!chast::parse_stream_options_result(
+              payload_of(chast::make_stream_options_result(sent)), result, &error),
+          "StreamOptionsResult rejects a custom quality below the range");
+    sent.quality = chast::StreamQuality::Balanced;
+    sent.quality_percent = 0;
+    preset_percent = payload_of(chast::make_stream_options_result(sent));
+    preset_percent[6] = 50;
+    check(!chast::parse_stream_options_result(preset_percent, result, &error),
+          "StreamOptionsResult rejects a percent beside a preset quality");
 
     std::vector<uint8_t> unknown_result =
         payload_of(chast::make_stream_options_result(sent));
@@ -4811,6 +4904,7 @@ int main(int argc, char** argv) {
     test_auth_challenge();
     test_access_denied();
     test_ticket_renew();
+    test_show_cursor();
     test_hello_ack();
     test_files_only_hello_ack();
     test_control_only_hello_ack();

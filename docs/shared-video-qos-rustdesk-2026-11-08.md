@@ -66,7 +66,7 @@ v51 引入双向 LatencyProbe/Reply；客户端的时钟同步保留，主机测
 - **预算**按编码器、厂商后端与画质比例分档：VP9 为 40/20/20/20；H.264 与 HEVC 区分 NVENC、QSV、AMF 和其他后端；AV1 固定为 0，不做静止刷新。画质比例仍来自共享 QoS 的 0.5/0.67/1.5 分档。
 - **节奏**：间隔取 `max(1/fps, 1/30)`，即不超过 30 fps；第一帧和 VP9 的间隔至少 100 ms。计数随服务 tick 量化，实际约 100–116 ms 一次。
 - **停止与重置**：VP9 允许刷新失败（libvpx 可合法丢帧），其他编码器连续 3 次失败停止；累计 100 次无输出停止；只有真实桌面变化（`nv12_updated`/`desktop_updated`）才把预算计数清零并重新等待首个 IDR，纯光标采样不会续期。
-- **不计为动态画面**：刷新发布前清除图片的 `nv12_updated`/`desktop_updated`，共享 QoS 的码率上调仍要求真实画面窗口；刷新失败回退到一次新 IDR，不改变后端。
+- **不计入动态画面**：刷新发布前清除图片的 `nv12_updated`/`desktop_updated`，刷新帧不冒充新的桌面更新，也不计入共享 QoS 的发送计数和动态画面窗口；只有真实捕获帧提供 `dynamic` 证据。2026-11-11 复核 `D:/rustdesk` 的 `src/server/video_service/static_refresh.rs`：`try_encode` 直接调用 `encoder.encode_to_message`，不增加 `send_counter`；固定基线 `7423dce` 没有该模块，只有旧版软件 YUV 重复路径会累加。2026-11-10 曾把刷新帧计入并声称对齐 `send_counter`，该判断错误，已撤销。静止桌面在拥塞降码率后要等真实画面更新才恢复码率，与参考一致；本机弱网测试的桌面有持续真实更新，回升不依赖刷新帧。刷新失败仍回退到一次新 IDR，不改变后端。
 - **传输**：刷新帧不领取视频待收窗口额度、不为停滞的观看者等待，也不进入延迟统计；仍受 QUIC 在途发送上限约束，冻结的显示端不会因此无限增长队列。
 - **顺序修复**：发布 IDR 时清空该订阅已排队的旧刷新帧。此前静止刷新以最高 30 fps 续填队列，适配器在等待 IDR 时丢弃所有非 IDR，多屏拓扑重建窗口内会出现请求 IDR 被掩埋、观看端只收到另一块屏刷新帧的饥饿。
 
@@ -76,6 +76,9 @@ v51 引入双向 LatencyProbe/Reply；客户端的时钟同步保留，主机测
 - `chast-host-parity-test` 全量 976–977 项检查，连续 3 次 0 失败；`--topology` 连续 4 次通过，覆盖多屏重排、几何重建和静止桌面关键帧。日志 `build/parity-final-run1..3.log`、`build/parity-topology-fix-run1..4.log`。
 - 真实 Intel GPU 双查看器 `chast-host-parity-test --hardware` 92 项检查 0 失败，含静止桌面请求硬件 IDR、共享 GPU 访问单元解码和剩余观看者继续取帧；日志 `build/parity-hardware-final.log`。
 - Release ctest 64/64 通过、0 失败，总耗时 1058.29 秒；日志 `build/ctest-final.log`。
+- 2026-11-10 弱网恢复判据修正：`chast-quic verify --netem`（`quic_weak_network`）连续 4 次通过，1000 kbps 瓶颈下最低目标 1000 kbps、恢复阶段回升到 1749 kbps 与 30 fps，访问单元全部送达并解码；日志 `build/weak-abr-v67-run1..4.log`。恢复判据取“最低目标之后出现过更高目标通告”，会话末尾的合法回退不再抹掉已经发生的恢复（当时把回升归因于刷新计入，该归因已被 2026-11-11 的复核否定）。
+- 2026-11-11 撤销刷新计入后的复测：`video_qos`、`desktop_stream`、`quic_weak_network` 定向 3/3 通过（`build/ctest-v67-repeat-revert-1.log`）；`chast-quic verify --netem` 直跑 2 次，496/492 个访问单元全部送达并解码，最低目标 1000 kbps、回升 1749 kbps、30 fps（`build/weak-abr-v67-revert-run1..2.log`）。本轮回升由持续的真实画面帧提供 `dynamic` 证据，刷新帧仍不计入；完全静止桌面不会仅凭刷新帧回升码率，与参考一致。撤销后全量 Release ctest 70/70 通过（917.55 秒，`build/ctest-v67-full-4.log`）。全队列饱和的桌面流基线仍等待队列高水位稳定后取样。
+- 2026-11-11 调价入口节奏对齐：`VideoQos::tick` 之前在每个服务 tick 都会进入 `adjust_ratio`；高延迟未确认的早退不更新 `last_ratio_`，动态计数因此约每 33 ms 被清零。现在周期入口增加 1 s 节流（完整调价仍保持 3 s 冷却），与 RustDesk 每秒一次的 `update_display_data` 一致。`video_qos` 新增确定性断言：先降比例制造余量，在 160 ms 超额延迟下逐 tick 送帧，1 s 后延迟恢复时必须带着累积的 `dynamic` 证据回升；去掉节流该断言即失败。`video_qos` 110 项通过（`build/video-qos-cadence.log`），`desktop_stream`/`quic_weak_network` 同轮定向 3/3 通过（`build/ctest-v67-cadence-1.log`）。全量构建还发现并修复 `tests/protocol_test.cc` 中 `preset_percent` 的重复定义（既有工作区编译错误），`protocol` 测试通过。节奏修复后的全量 Release ctest **70/70** 通过（946.63 秒，`build/ctest-v67-full-5.log`；2 项剪贴板监听测试按既有条件跳过），完整 `go test ./...` 同轮通过。
 - 边界：刷新画质/功耗收益只在真实 GPU 回环上验证了“可解码、继续取帧”，未做跨机画质对比；预算表来自 RustDesk 实测值，本机显卡不保证同样适用。
 
 ## 验证入口

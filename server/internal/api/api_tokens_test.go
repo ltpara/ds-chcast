@@ -125,10 +125,6 @@ func TestAPITokenScopesAndLifecycle(t *testing.T) {
 		t.Fatalf("group-scoped account token: %d %s", status, body)
 	}
 	if status, body := request(t, http.MethodPost, s.URL+"/v1/api-tokens",
-		`{"name":"wide","role":"admin","resources":["devices"],"group_id":"east"}`, adminToken); status != http.StatusBadRequest {
-		t.Fatalf("group-scoped device token: %d %s", status, body)
-	}
-	if status, body := request(t, http.MethodPost, s.URL+"/v1/api-tokens",
 		`{"name":"weak","role":"admin","resources":["devices"]}`, bobToken); status != http.StatusForbidden {
 		t.Fatalf("outranking token: %d %s", status, body)
 	}
@@ -158,6 +154,108 @@ func TestAPITokenScopesAndLifecycle(t *testing.T) {
 	}
 	if status, body := request(t, http.MethodDelete, s.URL+"/v1/api-tokens/missing", "", adminToken); status != http.StatusNotFound {
 		t.Fatalf("revoke unknown: %d %s", status, body)
+	}
+}
+
+// TestAPITokenDeviceGroupScope pins the device token range: listing, policy
+// management and per-device operations only reach devices in the token group,
+// while global policy objects and issuer revocation stay whole-deployment.
+func TestAPITokenDeviceGroupScope(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	for _, group := range []string{"east", "west"} {
+		if _, err := s.Accounts.CreateGroup(group, group, "", 0, 0); err != nil {
+			t.Fatalf("create %s: %v", group, err)
+		}
+	}
+	if _, err := s.Accounts.AddGroupDevice("east", "devbox", "root"); err != nil {
+		t.Fatalf("add devbox: %v", err)
+	}
+	if _, err := s.Accounts.AddGroupDevice("west", "westbox", "root"); err != nil {
+		t.Fatalf("add westbox: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse").Token
+	token := createToken(t, s.URL, admin,
+		`{"name":"east devices","role":"admin","resources":["devices"],"group_id":"east","expires_in_seconds":3600}`)
+	if token.Token.GroupID != "east" {
+		t.Fatalf("group = %q", token.Token.GroupID)
+	}
+	now := time.Now().Unix()
+	for _, id := range []string{"devbox", "westbox"} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+			registerBody(t, id, id+" secret", "AB12", now), testutil.ServerKey); status != http.StatusOK {
+			t.Fatalf("register %s: %d %s", id, status, body)
+		}
+	}
+
+	status, data := request(t, http.MethodGet, s.URL+"/v1/identities", "", token.Secret)
+	if status != http.StatusOK {
+		t.Fatalf("group identities: %d %s", status, data)
+	}
+	var identities struct {
+		Identities []struct {
+			ID string `json:"id"`
+		} `json:"identities"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(data, &identities); err != nil {
+		t.Fatalf("identity reply: %v", err)
+	}
+	if identities.Total != 1 || len(identities.Identities) != 1 || identities.Identities[0].ID != "devbox" {
+		t.Fatalf("group identities = %+v", identities)
+	}
+
+	if status, body := request(t, http.MethodPut, s.URL+"/v1/device-policies/devbox",
+		`{"mode":"open","permission_ceiling":7}`, token.Secret); status != http.StatusOK {
+		t.Fatalf("group policy set: %d %s", status, body)
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPut, "/v1/device-policies/westbox", `{"mode":"open","permission_ceiling":7}`},
+		{http.MethodDelete, "/v1/device-policies/westbox", ""},
+		{http.MethodGet, "/v1/device-policies/westbox", ""},
+		{http.MethodPatch, "/v1/identities/westbox", `{"alias":"west"}`},
+		{http.MethodDelete, "/v1/hosts/westbox", ""},
+		{http.MethodDelete, "/v1/identities/westbox", ""},
+		{http.MethodGet, "/v1/policies", ""},
+		{http.MethodPost, "/v1/policy-assignments", `{"policy_id":"p","scope_kind":"all"}`},
+		{http.MethodGet, "/v1/access-kids", ""},
+	} {
+		if status, body := request(t, test.method, s.URL+test.path, test.body, token.Secret); status != http.StatusForbidden {
+			t.Fatalf("%s %s = %d %s", test.method, test.path, status, body)
+		}
+	}
+
+	status, data = request(t, http.MethodGet, s.URL+"/v1/device-policies", "", token.Secret)
+	if status != http.StatusOK {
+		t.Fatalf("group policy list: %d %s", status, data)
+	}
+	var policies struct {
+		Policies []struct {
+			PeerID string `json:"peer_id"`
+		} `json:"policies"`
+	}
+	if err := json.Unmarshal(data, &policies); err != nil {
+		t.Fatalf("policy list reply: %v", err)
+	}
+	if len(policies.Policies) != 1 || policies.Policies[0].PeerID != "devbox" {
+		t.Fatalf("group policy list = %+v", policies.Policies)
+	}
+
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/identities/devbox",
+		`{"alias":"east box"}`, token.Secret); status != http.StatusOK {
+		t.Fatalf("group label update: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/device-policies/devbox", "", token.Secret); status != http.StatusNoContent {
+		t.Fatalf("group policy delete: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/identities/devbox", "", token.Secret); status != http.StatusNoContent {
+		t.Fatalf("group identity reset: %d %s", status, body)
 	}
 }
 

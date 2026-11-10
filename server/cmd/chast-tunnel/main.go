@@ -244,8 +244,13 @@ func runViewer(args []string) error {
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "management server key (visible in the process command line; prefer --server-key-stdin)")
 	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the server key from the first line of stdin; overrides --server-key")
-	linkKey := fs.String("link-key", "", "connection key ordinary viewers use for lookup and punch; empty reuses --server-key (visible in the process command line; prefer --link-key-stdin)")
-	linkKeyStdin := fs.Bool("link-key-stdin", false, "read the link key from stdin before the proxy; overrides --link-key")
+	linkKey := fs.String("link-key", "", "legacy connection key for lookup and punch; empty reuses --server-key (visible in the process command line; prefer --link-key-stdin)")
+	linkKeyStdin := fs.Bool("link-key-stdin", false, "read the link key from stdin before the account token and proxy; overrides --link-key")
+	accountTokenStdin := fs.Bool("account-token-stdin", false, "read a signed-in viewer account token from stdin after the link/server key and before the proxy; lookup authenticates as the account while the link key remains the legacy punch proof")
+	emergencyTokenStdin := fs.Bool("emergency-token-stdin", false, "read a signed-in administrator token from stdin after the account token; the tunnel requests an explicit emergency override instead of an ordinary lookup")
+	emergencyReasonStdin := fs.Bool("emergency-reason-stdin", false, "read the emergency access reason from stdin after the administrator token")
+	emergencyClientKey := fs.String("emergency-client-key", "", "base64url Ed25519 public key of the application client the emergency access ticket is bound to")
+	emergencyPermissions := fs.Uint64("emergency-permissions", 0, "permission mask to request for emergency access; 0 asks for the device's full ceiling")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id to reach")
@@ -263,9 +268,11 @@ func runViewer(args []string) error {
 	fs.Parse(args)
 
 	// Stdin order matches the embedding client: the connection credential
-	// first, then the proxy. --server-key-stdin stays for older callers.
+	// first, then the optional account token, then the proxy.
+	// --server-key-stdin stays for older callers.
 	var stdin *bufio.Reader
-	if *linkKeyStdin || *serverKeyStdin || *proxyStdin {
+	if *linkKeyStdin || *serverKeyStdin || *accountTokenStdin || *emergencyTokenStdin ||
+		*emergencyReasonStdin || *proxyStdin {
 		stdin = bufio.NewReader(os.Stdin)
 	}
 	if *linkKeyStdin && *serverKeyStdin {
@@ -292,6 +299,51 @@ func runViewer(args []string) error {
 			return fmt.Errorf("read server key from stdin: empty key")
 		}
 		*serverKey = key
+	}
+	var accountToken string
+	if *accountTokenStdin {
+		line, err := stdin.ReadString('\n')
+		accountToken = strings.TrimRight(line, "\r\n")
+		if accountToken == "" {
+			if err != nil {
+				return fmt.Errorf("read account token from stdin: %w", err)
+			}
+			return fmt.Errorf("read account token from stdin: empty token")
+		}
+	}
+	var emergency agent.EmergencyAccess
+	if *emergencyTokenStdin {
+		line, err := stdin.ReadString('\n')
+		emergency.AdminToken = strings.TrimRight(line, "\r\n")
+		if emergency.AdminToken == "" {
+			if err != nil {
+				return fmt.Errorf("read emergency admin token from stdin: %w", err)
+			}
+			return fmt.Errorf("read emergency admin token from stdin: empty token")
+		}
+	}
+	if *emergencyReasonStdin {
+		line, err := stdin.ReadString('\n')
+		emergency.Reason = strings.TrimRight(line, "\r\n")
+		if emergency.Reason == "" {
+			if err != nil {
+				return fmt.Errorf("read emergency reason from stdin: %w", err)
+			}
+			return fmt.Errorf("read emergency reason from stdin: empty reason")
+		}
+	}
+	var useEmergency bool
+	if *emergencyTokenStdin || *emergencyReasonStdin || *emergencyClientKey != "" ||
+		*emergencyPermissions != 0 {
+		if emergency.AdminToken == "" || emergency.Reason == "" || *emergencyClientKey == "" {
+			return fmt.Errorf("emergency access needs --emergency-token-stdin, --emergency-reason-stdin and --emergency-client-key")
+		}
+		if *emergencyPermissions > 0xffffffff {
+			return fmt.Errorf("--emergency-permissions does not fit in 32 bits")
+		}
+		emergency.ClientPublicKey = *emergencyClientKey
+		emergency.Permissions = uint32(*emergencyPermissions)
+		useEmergency = true
 	}
 	if *proxyStdin {
 		line, err := stdin.ReadString('\n')
@@ -328,11 +380,12 @@ func runViewer(args []string) error {
 		_ = json.NewEncoder(os.Stdout).Encode(event)
 	}
 
-	v, err := agent.StartViewer(ctx, agent.ViewerConfig{
+	viewerCfg := agent.ViewerConfig{
 		ServerURL:        *server,
 		Servers:          splitCSV(*rendezvousList),
 		ServerKey:        *serverKey,
 		LinkKey:          *linkKey,
+		AccountToken:     accountToken,
 		ServerPublicKey:  *serverPubKey,
 		Proxy:            proxy,
 		HostID:           *id,
@@ -357,14 +410,29 @@ func runViewer(args []string) error {
 				CarrierToken: info.CarrierToken,
 			})
 		},
-	})
+	}
+	if useEmergency {
+		viewerCfg.Emergency = &emergency
+		// Every transport refresh re-signs the override, so the application
+		// follows the renewed ticket instead of letting the session expire.
+		viewerCfg.OnAccessTicket = func(ticket agent.AccessTicket) {
+			emit(agentEvent{
+				Event:             "access_ticket",
+				AccessTicket:      ticket.Ticket,
+				AccessExpiresAtMS: ticket.ExpiresAtMS,
+				AccessSubject:     ticket.Subject,
+				AccessPermissions: ticket.Permissions,
+			})
+		}
+	}
+	v, err := agent.StartViewer(ctx, viewerCfg)
 	if err != nil {
 		emit(agentEvent{Event: "error", Error: err.Error(), Retryable: agent.IsRetryableStartError(err)})
 		return err
 	}
 	defer v.Close()
 	info := v.PathInfo()
-	emit(agentEvent{
+	readyEvent := agentEvent{
 		Event:        "ready",
 		Listen:       v.LocalAddr().String(),
 		Host:         *id,
@@ -377,7 +445,14 @@ func runViewer(args []string) error {
 		Candidates:   info.Candidates,
 		Carrier:      info.Carrier,
 		CarrierToken: info.CarrierToken,
-	})
+	}
+	if ticket := v.AccessTicket(); ticket != nil {
+		readyEvent.AccessTicket = ticket.Ticket
+		readyEvent.AccessExpiresAtMS = ticket.ExpiresAtMS
+		readyEvent.AccessSubject = ticket.Subject
+		readyEvent.AccessPermissions = ticket.Permissions
+	}
+	emit(readyEvent)
 	log.Info("viewer agent online", "host", *id)
 	<-ctx.Done()
 	return nil
@@ -561,6 +636,13 @@ type agentEvent struct {
 	// operator's detail for both revoke and policy events.
 	Kid    string `json:"kid,omitempty"`
 	Reason string `json:"reason,omitempty"`
+	// AccessTicket is the current emergency override ticket: the initial one
+	// rides on ready, later ones arrive as access_ticket events after the
+	// transport credential refresh re-signs the override.
+	AccessTicket      string `json:"access_ticket,omitempty"`
+	AccessExpiresAtMS int64  `json:"access_expires_at_ms,omitempty"`
+	AccessSubject     string `json:"access_subject,omitempty"`
+	AccessPermissions uint32 `json:"access_permissions,omitempty"`
 }
 
 func newLogger(verbose bool) *slog.Logger {

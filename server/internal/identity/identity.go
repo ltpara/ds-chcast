@@ -42,6 +42,10 @@ const (
 	DomainHostBinding = "chast-host-binding-v1"
 	// DomainPunch covers the viewer's server-key proof in a punch request.
 	DomainPunch = "chast-punch-v1"
+	// DomainTransportProof covers a viewer proving it holds the key bound to a
+	// short-lived transport ticket. The audience names the transport purpose so
+	// a proof for one path cannot be replayed on another.
+	DomainTransportProof = "chast-transport-proof-v1"
 	// DomainTCPPunch covers the host's announce on the server's TCP punch port.
 	// A host signature is what lets the server relay an observed endpoint
 	// without trusting an unauthenticated announce.
@@ -132,6 +136,13 @@ func RegisterMessage(id, fingerprint string, unix int64) []byte {
 // because only the holder of the host key can produce it.
 func MigrateMessage(oldID, newID string, unix int64) []byte {
 	return fieldsMessage(DomainMigrate, oldID, newID, strconv.FormatInt(unix, 10))
+}
+
+// TransportProofMessage binds a transport credential to one fresh exchange.
+// The nonce is chosen by the viewer or minted by the transport node, and the
+// timestamp keeps a captured proof from outliving the credential.
+func TransportProofMessage(audience, hostID, nonce string, unix int64) []byte {
+	return fieldsMessage(DomainTransportProof, audience, hostID, nonce, strconv.FormatInt(unix, 10))
 }
 
 func boolText(value bool) string {

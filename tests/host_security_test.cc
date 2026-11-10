@@ -110,10 +110,14 @@ void test_modes() {
 }
 
 void test_managed_policy() {
-    const std::filesystem::path path =
-        std::filesystem::temp_directory_path() / L"chast-host-security-managed.json";
     std::error_code ignored;
-    std::filesystem::remove(path, ignored);
+    // A hardened profile can deny creating files directly in the temp root
+    // while still allowing a directory this process just created.
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / L"chast-host-security-managed";
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory, ignored);
+    const std::filesystem::path path = directory / L"managed.json";
 
     chast::HostSecurity::Config config;
     config.mode = chast::HostAuthMode::Password;
@@ -152,7 +156,7 @@ void test_managed_policy() {
     result = security.evaluate(hello, "192.0.2.5:5003", 5004);
     check(result.decision == Decision::Allow,
           "clearing the policy path keeps a purely local host unmanaged");
-    std::filesystem::remove(path, ignored);
+    std::filesystem::remove_all(directory, ignored);
 }
 
 void test_temporary_password() {
@@ -871,10 +875,12 @@ chast::HostSecurity::TicketRequest ticket_request(
 }
 
 void test_managed_ticket() {
-    const std::filesystem::path path =
-        std::filesystem::temp_directory_path() / L"chast-host-security-ticket.json";
     std::error_code ignored;
-    std::filesystem::remove(path, ignored);
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / L"chast-host-security-ticket";
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory, ignored);
+    const std::filesystem::path path = directory / L"ticket.json";
     const auto write_marker = [&path](uint32_t ceiling, uint32_t version) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         out << "{\n  \"managed\": true,\n  \"mode\": \"restricted\",\n"
@@ -1063,7 +1069,7 @@ void test_managed_ticket() {
               "the retired primary kid stops admitting tickets");
     }
 
-    std::filesystem::remove(path, ignored);
+    std::filesystem::remove_all(directory, ignored);
 }
 
 void test_signature_message() {

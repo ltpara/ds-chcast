@@ -2945,8 +2945,11 @@
      列 P1，其余 P2/P3，DEV-23 仍受零拷贝约束（只加直接写 GPU 缓冲的硬件
      后端，不接受 CPU fallback）。已核对 Ctrl+Alt+Del、富剪贴板、隐私模式、
      摄像头/终端面板、单目标端口转发等不是缺口；白板仅在 RustDesk CLI 内部
-     工具中出现，不计入。验证：仅源码对照与文档登记，无代码改动，未跑构建
-     与测试。边界：本轮不改变 ENV/DEV/PLAT-01～03 的既有处置与状态。
+     工具中出现，不计入（**2026-11-11 更正**：固定提交 `7423dce` 已有
+     `show_my_cursor` Flutter 工具栏和主机 `src/whiteboard` 覆盖层，旧判断
+     过期，登记为 G21；同日已实现光标部分，协议 v68，白板绘制仍未实现）。
+     初轮对照仅做源码与文档登记；实现与验证见第 162 条。边界：本轮不改变
+     ENV/DEV/PLAT-01～03 的既有处置与状态。
 124. **P1 · DEV-12 出站 SOCKS5/HTTP(S) 代理（2026-11-05 完成）**：新增
      `server/internal/netproxy`（HTTP/HTTPS CONNECT、SOCKS5 握手、回环桥接
      `chast-tunnel proxy`）；主机与查看器 agent 的会合控制面、中继 TCP 载体
@@ -3546,6 +3549,22 @@
      双栈并行、事务号、TCP 协调鉴权等用例。文档见
      `docs/nat-traversal-2026-11-07.md`。边界：单机无真实 NAT，跨网锥形/
      对称 NAT、IPv6 与 TCP 打洞的成功率仍需双机验收，清单已随文档给出。
+162. **P3 · 宿主对齐：光标提示、语音麦克风与壁纸（2026-11-11 完成，协议 v68）**：
+     2026-11-11 RustDesk 二次比对登记的 G21/G22/G23 同日实现。v68 新增
+     `ControlType::ShowCursor`（83），查看端工具栏开关按设备保存并按 33 ms
+     节流发送，主机在独立线程创建分层、点击穿透、不激活的覆盖层绘制指针，
+     断线/关闭隐藏，坐标不进入注入器；RustDesk 式白板绘制未实现。主机语音
+     呼叫新增 `host.ini voice_microphone=`、设置页下拉/刷新和托盘“上行语音
+     麦克风”子菜单，呼叫开始时读取，固定设备缺失时记日志并回退默认通信
+     设备；通话中不切换。新增默认关闭的 `host.ini remove_wallpaper=` 与托盘
+     开关，授权会话开始备份壁纸到 `<stem>.wallpaper` 并清屏，结束恢复，
+     下次启动恢复异常退出遗留的备份。验证：`protocol`、`host_settings`、
+     `host_voice` 通过（合成采集与注入壁纸移除器，未改真实桌面），
+     `chast-host` Release 构建通过，`flutter analyze` 无问题，
+     `display_menu`/`view_prefs` 定向 57/57。边界：本机无物理麦克风，真实
+     录音与设备切换未验；壁纸视觉切换、异常断电恢复、白板绘制和真实多屏/
+     混合 DPI 覆盖层位置待人工验证。三项均不改变零拷贝媒体路径。详见
+     `docs/rustdesk-gap-tasks-2026-11-01.md` 的同日小节。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

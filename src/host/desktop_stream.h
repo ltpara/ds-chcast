@@ -56,7 +56,8 @@ public:
         ~QualityPeer();
         QualityPeer(const QualityPeer&) = delete;
         QualityPeer& operator=(const QualityPeer&) = delete;
-        void options(uint32_t fps, std::optional<VideoQos::Quality> quality);
+        void options(uint32_t fps, std::optional<VideoQos::Quality> quality,
+                     std::optional<float> custom_ratio = std::nullopt);
         void feedback(uint32_t delay_ms, uint64_t pending_ms, bool new_reply);
     private:
         std::shared_ptr<VideoQos> policy_;

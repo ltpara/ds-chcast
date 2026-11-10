@@ -1393,8 +1393,9 @@ unsigned DesktopStreamPool::static_refresh_budget(VideoCodec codec, float qualit
 DesktopStreamPool::QualityPeer::QualityPeer(std::shared_ptr<VideoQos> policy, uint64_t id)
     : policy_(std::move(policy)), id_(id) { policy_->open(id_, now_ms()); }
 DesktopStreamPool::QualityPeer::~QualityPeer() { policy_->close(id_, now_ms()); }
-void DesktopStreamPool::QualityPeer::options(uint32_t fps, std::optional<VideoQos::Quality> quality) {
-    policy_->options(id_, fps, quality, now_ms());
+void DesktopStreamPool::QualityPeer::options(uint32_t fps, std::optional<VideoQos::Quality> quality,
+                                             std::optional<float> custom_ratio) {
+    policy_->options(id_, fps, quality, now_ms(), custom_ratio);
 }
 void DesktopStreamPool::QualityPeer::feedback(uint32_t delay, uint64_t pending, bool new_reply) {
     if (new_reply) policy_->delay(id_, delay, now_ms());

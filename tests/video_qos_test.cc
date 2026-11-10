@@ -120,6 +120,26 @@ int main() {
         check(near(bitrate.state(6700).ratio, 1.5f),
               "any fixed-quality display disables adaptive ratio globally");
 
+        // RustDesk feeds its periodic adjustment once a second. An elevated
+        // but unconfirmed delay must not clear the dynamic counter on every
+        // tick, or a moving screen loses the evidence needed to recover.
+        VideoQos cadence(30, 0.67f);
+        cadence.open(1, 0);
+        cadence.display(10, 1, 5000, true, 0);
+        cadence.delay(1, 10, 1100);
+        cadence.delay(1, 300, 3200);
+        cadence.delay(1, 300, 3300);
+        check(near(cadence.state(3300).ratio, 0.603f),
+              "two bad replies cut the ratio before the cadence check");
+        cadence.delay(1, 40, 3400);
+        cadence.state(6300);
+        for (uint64_t tick = 6333; tick <= 7268; tick += 33)
+            cadence.display(10, 1, 5000, true, tick);
+        const float cadence_before = cadence.state(7268).ratio;
+        cadence.delay(1, 40, 7290);
+        check(cadence.state(7300).ratio > cadence_before,
+              "an unconfirmed high delay keeps the dynamic window on its one-second cadence");
+
         VideoQos multi(60, 1.5f);
         multi.open(1, 0);
         multi.open(2, 0);
@@ -175,6 +195,23 @@ int main() {
         fixed_rates.pending(1, 3000, 1200);
         check(fixed_rates.state(1200).fps == 60 && near(fixed_rates.state(1200).ratio, 1.5f),
               "adaptive_fps=false pins configured rates for exact-rate probes");
+
+        VideoQos voted(60, 1.5f, false, false);
+        voted.open(1, 0);
+        voted.open(2, 0);
+        voted.options(1, 10, VideoQos::Quality::Smooth, 1000);
+        voted.options(2, 15, std::nullopt, 1100, 1.2f);
+        check(voted.state(1100).fps == 10 && near(voted.state(1100).ratio, 1.2f),
+              "a numeric custom quality becomes the latest vote");
+        voted.options(2, 15, std::nullopt, 1200);
+        check(near(voted.state(1200).ratio, 1.2f),
+              "an FPS-only update keeps the custom quality vote");
+        voted.options(1, 10, VideoQos::Quality::High, 1300);
+        check(near(voted.state(1300).ratio, 1.5f),
+              "a newer preset replaces the custom quality");
+        voted.options(2, 15, std::nullopt, 1400, 0.5f);
+        check(near(voted.state(1400).ratio, 0.5f),
+              "a newer custom vote replaces the preset");
 
         VideoQos custom(30, 2.0f);
         custom.open(1, 0);

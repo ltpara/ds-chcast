@@ -380,6 +380,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/policy-assignments", s.createPolicyAssignment)
 	mux.HandleFunc("DELETE /v1/policy-assignments/{id}", s.deletePolicyAssignment)
 	mux.HandleFunc("POST /v1/access-tickets", s.issueAccessTicket)
+	mux.HandleFunc("POST /v1/emergency-access", s.issueEmergencyAccess)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return s.instrument(mux)
 }
@@ -518,9 +519,16 @@ type lookupResponse struct {
 	// ephemeral client_public_key, the caller authenticated as an account and
 	// the device is managed. The viewer presents it, with the matching proof,
 	// on the connection it opens; unmanaged devices need no ticket.
-	AccessTicket      *lookupAccessTicket `json:"access_ticket,omitempty"`
-	ConfigSerial      int64               `json:"config_serial,omitempty"`
-	RendezvousServers []string            `json:"rendezvous_servers,omitempty"`
+	AccessTicket *lookupAccessTicket `json:"access_ticket,omitempty"`
+	// Transport tickets are minted when the lookup carries the agent's
+	// ephemeral transport_public_key. They are separate from the access ticket:
+	// one credential per transport purpose, bound to the host, the requesting
+	// subject and the agent key, and never usable for application admission.
+	TransportPunch    *lookupTransportTicket `json:"transport_punch,omitempty"`
+	TransportRelay    *lookupTransportTicket `json:"transport_relay,omitempty"`
+	TransportCarrier  *lookupTransportTicket `json:"transport_carrier,omitempty"`
+	ConfigSerial      int64                  `json:"config_serial,omitempty"`
+	RendezvousServers []string               `json:"rendezvous_servers,omitempty"`
 }
 
 type batchLookupResponse struct {
@@ -648,6 +656,24 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.IPChanges != nil {
 		s.cfg.IPChanges.Observe(req.ID, clientAddr)
 	}
+	// Resolve the current policy before leasing a relay slot: a standalone
+	// node learns the managed flag from the lease, so a stale registry value
+	// would let the legacy carrier token survive one renewal.
+	policy, err := s.hostDevicePolicy(req.ID)
+	if err != nil {
+		// Returning no policy would make a managed host treat itself as
+		// unmanaged, so an unreadable policy refuses the renewal instead.
+		s.cfg.Logger.Error("read device policy for registration", "id", req.ID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "device policy is unavailable")
+		return
+	}
+	if policy == nil {
+		s.cfg.Registry.SetPolicy(req.ID, false, 0)
+		host.Managed, host.PolicyVersion = false, 0
+	} else {
+		s.cfg.Registry.SetPolicy(req.ID, true, policy.PolicyVersion)
+		host.Managed, host.PolicyVersion = true, policy.PolicyVersion
+	}
 	relayEndpoint, relays, carrier, carrierV6, err := s.assignRelay(req.ID, req.PublicKey, host)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "no relay port is available")
@@ -666,19 +692,11 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Carrier:         carrier,
 		CarrierV6:       carrierV6,
 		CarrierToken:    host.CarrierToken,
+		DevicePolicy:    policy,
 		MigratedFrom:    req.OldID,
 		Software:        s.software(),
 	}
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
-	policy, err := s.hostDevicePolicy(req.ID)
-	if err != nil {
-		// Returning no policy would make a managed host treat itself as
-		// unmanaged, so an unreadable policy refuses the renewal instead.
-		s.cfg.Logger.Error("read device policy for registration", "id", req.ID, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "device policy is unavailable")
-		return
-	}
-	resp.DevicePolicy = policy
 	// Match jobs against the persisted report so a relay agent that omits the
 	// field on a renewal still uses the link it registered earlier.
 	effectiveTargets := wakeTargets
@@ -750,6 +768,9 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.attachLookupTicket(w, r, subject, id, resp.Fingerprint, &resp) {
+		return
+	}
+	if !s.attachLookupTransport(w, r, subject, id, &resp) {
 		return
 	}
 	resp.Software = s.software()
@@ -931,11 +952,12 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 }
 
 func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleWrite, account.TokenResourceDevices)
+	id := r.PathValue("id")
+	principal, ok := s.deviceActor(w, r, consoleWrite, id)
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
+	actor := principal.Actor
 	host, ok := s.cfg.Registry.Remove(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "host is not registered")
@@ -961,11 +983,12 @@ func (s *server) releaseLease(id string, host registry.Host) {
 // resetIdentity is the administrative escape hatch for a lost host key. It
 // removes the permanent binding as well as any live lease.
 func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleWrite, account.TokenResourceDevices)
+	id := r.PathValue("id")
+	principal, ok := s.deviceActor(w, r, consoleWrite, id)
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
+	actor := principal.Actor
 	host, _ := s.cfg.Registry.Lookup(id)
 	removed, err := s.cfg.Registry.RemoveIdentity(id)
 	if err != nil {
@@ -996,11 +1019,12 @@ type identityLabelsResponse struct {
 // metadata, these survive host renewals and are never accepted from the host
 // registration body.
 func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.consoleActor(w, r, consoleWrite, account.TokenResourceDevices)
+	id := r.PathValue("id")
+	principal, ok := s.deviceActor(w, r, consoleWrite, id)
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
+	actor := principal.Actor
 	if !registry.ValidID(id) {
 		writeError(w, http.StatusNotFound, "host identity is unknown")
 		return
@@ -1516,7 +1540,7 @@ func (s *server) assignRelay(id, publicKey string, host registry.Host) (string, 
 	if s.cfg.RelayPool != nil {
 		// The node lease outlives the host lease so a brief hbbs outage does
 		// not tear down a working relay path.
-		lease, err := s.cfg.RelayPool.Provision(id, publicKey, host.CarrierToken, 2*s.cfg.TTL, host.RelayNode)
+		lease, err := s.cfg.RelayPool.Provision(id, publicKey, host.CarrierToken, host.Managed, 2*s.cfg.TTL, host.RelayNode)
 		if err == nil {
 			nodeHost, _, splitErr := splitRelayEndpoint(lease.Relay)
 			if splitErr == nil {

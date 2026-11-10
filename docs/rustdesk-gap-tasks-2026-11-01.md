@@ -1377,8 +1377,13 @@ chast 的两端是分离产品：查看器只有 QUIC 客户端、解码/渲染�
   录制、地址簿分组/ACL、同网段 Wake-on-LAN、局域网发现、直连 IP、TLS/mTLS/
   ACME、2FA/WebAuthn/找回、管理台角色、审计导出/归档、i18n、安装器、
   IPv6/打洞/中继/共享载体、UPnP 均已实现，见 `docs/status-2026-10-25.md`。
-- 白板（`src/whiteboard`）只在 RustDesk CLI/内部工具中出现，未进入 Flutter
-  产品面，不计为对齐缺口；`PluginRequest` 属插件机制，也不是产品功能缺口。
+- 白板（`src/whiteboard`）**更正（2026-11-11）**：在固定提交 `7423dce` 上已进入
+  Flutter 产品面（`show_my_cursor` 工具栏/快捷键、主机透明覆盖层），旧判断
+  “只在 CLI/内部工具中出现”已过期；本轮登记为 G21（P3）并已实现光标部分
+  （协议 v68），RustDesk 式白板绘制仍未实现，见
+  [发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md) 与本文同日
+  小节。
+  `PluginRequest` 仍属插件机制，不是产品功能缺口。
 - 虚拟显示器、远程打印、非 Windows/Web/移动客户端仍由 PLAT-01～03 跟踪，
   本表不重复登记。
 
@@ -1477,6 +1482,51 @@ u16 权限掩码在 `kPermissionRemoteConfig = 0x8000` 之后已经没有空闲�
 验证：`protocol`、`protocol_fuzz`（69 个解析入口）、`host_settings`、
 `host_security` 与全量串行 `ctest`（54/54）通过；`go test ./...` 与
 `go vet ./...` 通过。
+
+## 宿主 P3 修正：光标提示、语音麦克风与壁纸（2026-11-11，协议 v68）
+
+2026-11-11 RustDesk 二次比对登记的三项宿主 P3（G21/G22/G23）同日实现。三项
+都不改变零拷贝媒体路径；G21 升协议到 v68，G22/G23 只动主机设置和会话
+生命周期。
+
+- **G21 显示我的光标（光标部分）**：新增 `ControlType::ShowCursor`（83），
+  负载为虚拟桌面像素坐标 `int32 x/y`、可见标志和保留字节；解析拒绝截断、
+  尾随字节、未知标志和非零保留位。主机只保留最新提示，在独立线程创建
+  分层、点击穿透、不激活、不进 Alt+Tab 的覆盖层，按虚拟桌面边界夹取坐标
+  后绘制本地指针；断线、会话结束和覆盖层销毁都会隐藏，坐标永不进入注入器。
+  查看端工具栏新增按设备保存的开关，指针移动按 33 ms 节流发送，关闭或离开
+  会话发送隐藏提示。自动化：`chast-protocol-test` 的往返/负坐标/隐藏/截断/
+  尾随/未知标志/保留位用例；`flutter analyze` 无问题；`display_menu` 与
+  `view_prefs` 定向 57/57。边界：RustDesk 式白板绘制未实现；覆盖层在真实
+  多屏、混合 DPI 和负坐标下的目视位置，以及 Windows 10 实机，待人工验证。
+- **G22 主机语音麦克风选择**：`host.ini` 新增 `voice_microphone=`（空表示
+  跟随系统默认通信麦克风）。安全设置“高级”页新增下拉与刷新，托盘新增
+  “上行语音麦克风”子菜单；两份入口都保留已拔出但仍固定的设备 ID，
+  显示“已选设备（当前不可用）”。语音呼叫开始时读取设置，固定设备打开
+  失败会记录日志并回退默认通信设备；已在通话中不切换。自动化：
+  `chast-host-settings-test` 覆盖往返、空值、超长值拒绝和拔出设备保留；
+  `chast-host-voice-test` 用合成采集器断言主机先请求固定 ID、失败后以空
+  ID 重试并成功出包。边界：本机没有物理麦克风，真实录音、设备切换和双机
+  听感待人工验证；`voice_capture` 注入接口未改动。
+- **G23 会话期间移除壁纸**：`host.ini` 新增默认关闭的 `remove_wallpaper=`，
+  托盘新增“会话期间移除壁纸（降低静止画面开销）”。桌面会话开始时先读取
+  `SPI_GETDESKTOPWALLPAPER`（回退当前用户与 shell 用户的壁纸历史注册表），
+  把路径备份到 host.ini 同目录的 `<stem>.wallpaper`，再用
+  `SPI_SETDESKWALLPAPER` 空路径清屏；会话结束恢复并删除备份。下次
+  `HostServer::create` 会恢复上次进程异常退出遗留的备份；已有备份时拒绝
+  再次移除，纯色桌面直接跳过；文件/终端会话不触发移除。自动化：
+  `chast-host-settings-test` 覆盖空
+  路径拒绝、缺失备份、无壁纸路径备份的丢弃和挂起备份阻止二次移除（不触碰
+  真实桌面）；`chast-host-voice-test` 断言桌面会话只创建一次移除器并在
+  会话结束时恢复。边界：真实壁纸视觉切换、异常断电恢复和混合 DPI 待人工
+  验证；该开关只降低静止画面编码成本，不改变零拷贝与 QoS。
+- **验证与构建**：`chast-protocol-test`、`chast-host-settings-test`、
+  `chast-host-voice-test` 通过；全量 Release 构建通过，第二次全量 `ctest`
+  70/70 通过（仅 2 项既有 `clipboard_listener` 跳过）。首次全量出现 13 项
+  与本改动无关的临时目录 `ACCESS_DENIED` 失败，这些用例连同 `host_voice`
+  单独复跑 14/14 通过，判定为环境侧文件锁抖动。`flutter analyze` 无问题，
+  `display_menu`/`view_prefs` 定向 57/57 通过。主语言与英文翻译已同步。
+  旧版对端读到 v68 会按既有版本规则拒绝，主机与查看端需同步升级。
 
 ## 完成定义
 

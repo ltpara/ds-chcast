@@ -98,8 +98,22 @@ func viewDevicePolicy(policy account.DevicePolicy) devicePolicyView {
 }
 
 func (s *server) listDevicePolicies(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceDevices); !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok {
 		return
+	}
+	var groupDevices map[string]bool
+	if principal.GroupID != "" {
+		devices, err := s.cfg.Accounts.GroupDevices(principal.GroupID)
+		if err != nil {
+			s.cfg.Logger.Error("device policy group scope", "group", principal.GroupID, "error", err)
+			writeError(w, http.StatusInternalServerError, "could not read the device group")
+			return
+		}
+		groupDevices = make(map[string]bool, len(devices))
+		for _, device := range devices {
+			groupDevices[device.PeerID] = true
+		}
 	}
 	policies, err := s.cfg.Accounts.DevicePolicies()
 	if err != nil {
@@ -109,16 +123,19 @@ func (s *server) listDevicePolicies(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]devicePolicyView, 0, len(policies))
 	for _, policy := range policies {
+		if groupDevices != nil && !groupDevices[policy.PeerID] {
+			continue
+		}
 		out = append(out, viewDevicePolicy(policy))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"policies": out})
 }
 
 func (s *server) devicePolicyDetail(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceDevices); !ok {
+	peerID := r.PathValue("peer")
+	if _, ok := s.deviceActor(w, r, consoleAdmin, peerID); !ok {
 		return
 	}
-	peerID := r.PathValue("peer")
 	policy, managed, err := s.cfg.Accounts.DevicePolicy(peerID)
 	if err != nil {
 		writeDevicePolicyError(w, err)
@@ -133,16 +150,17 @@ func (s *server) devicePolicyDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) setDevicePolicy(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
+	peerID := r.PathValue("peer")
+	principal, ok := s.deviceActor(w, r, consoleAdmin, peerID)
 	if !ok {
 		return
 	}
+	actor := principal.Actor
 	var req devicePolicySetRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	peerID := r.PathValue("peer")
 	policy, err := s.cfg.Accounts.SetDevicePolicy(
 		peerID, req.Mode, req.PermissionCeiling, req.AllowedUsers, req.AllowedGroups, actor)
 	if err != nil {
@@ -151,6 +169,7 @@ func (s *server) setDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordAudit(r, actor, account.AuditDevicePolicyUpdate,
 		"set "+policy.Mode+" policy version "+strconv.FormatUint(uint64(policy.PolicyVersion), 10)+" for "+policy.PeerID, true)
+	s.syncRegistryPolicy(policy.PeerID)
 	if s.eventHub != nil {
 		s.eventHub.publishPolicy(policy.PeerID, &policy)
 	}
@@ -159,11 +178,12 @@ func (s *server) setDevicePolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deleteDevicePolicy(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
+	peerID := r.PathValue("peer")
+	principal, ok := s.deviceActor(w, r, consoleAdmin, peerID)
 	if !ok {
 		return
 	}
-	peerID := r.PathValue("peer")
+	actor := principal.Actor
 	if err := s.cfg.Accounts.DeleteDevicePolicy(peerID); err != nil {
 		writeDevicePolicyError(w, err)
 		return
@@ -176,6 +196,7 @@ func (s *server) deleteDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.cfg.Logger.Error("reconcile device policy after delete", "id", peerID, "error", err)
 	}
+	s.syncRegistryPolicy(peerID)
 	if s.eventHub != nil {
 		if len(changed) > 0 {
 			s.eventHub.publishPolicy(peerID, &changed[0])
@@ -186,6 +207,25 @@ func (s *server) deleteDevicePolicy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// syncRegistryPolicy mirrors the durable policy state into the registry, so
+// punch admission stops trusting the link key as soon as a device becomes
+// managed instead of at the host's next registration.
+func (s *server) syncRegistryPolicy(peerID string) {
+	if s.cfg.Accounts == nil || s.cfg.Registry == nil {
+		return
+	}
+	policy, managed, err := s.cfg.Accounts.DevicePolicy(peerID)
+	if err != nil {
+		s.cfg.Logger.Error("sync registry device policy", "id", peerID, "error", err)
+		return
+	}
+	if !managed {
+		s.cfg.Registry.SetPolicy(peerID, false, 0)
+		return
+	}
+	s.cfg.Registry.SetPolicy(peerID, true, policy.PolicyVersion)
 }
 
 // hostDevicePolicy is the policy statement a host receives on registration.

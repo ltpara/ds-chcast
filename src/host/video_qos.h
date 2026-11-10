@@ -25,7 +25,8 @@ public:
                       bool abr = true, bool adaptive_fps = true);
     void open(uint64_t id, uint64_t now_ms);
     void close(uint64_t id, uint64_t now_ms);
-    void options(uint64_t id, uint32_t fps, std::optional<Quality> quality, uint64_t now_ms);
+    void options(uint64_t id, uint32_t fps, std::optional<Quality> quality, uint64_t now_ms,
+                 std::optional<float> custom_ratio = std::nullopt);
     void delay(uint64_t id, uint32_t delay_ms, uint64_t now_ms);
     void pending(uint64_t id, uint64_t elapsed_ms, uint64_t now_ms);
     void display(uint64_t id, uint32_t encoded, uint32_t bitrate_kbps, bool variable,
@@ -72,14 +73,21 @@ private:
     struct User {
         uint32_t fps = 0;
         std::optional<Quality> quality;
+        // Set by a custom numeric quality; the newest vote of either kind
+        // wins, so a preset clears this and vice versa.
+        std::optional<float> custom_ratio;
         uint64_t quality_order = 0;
         uint64_t joined_at = 0;
         Delay delay;
     };
     struct Display { uint32_t encoded = 0; bool variable = true; };
+    struct Target {
+        std::optional<Quality> quality;
+        std::optional<float> custom_ratio;
+    };
     uint32_t fps_cap(const User& user) const;
     uint32_t highest_fps() const;
-    std::optional<Quality> latest_quality() const;
+    Target latest_quality() const;
     float target_ratio() const;
     float min_ratio() const;
     bool variable() const;
@@ -94,6 +102,6 @@ private:
     float default_ratio_, ratio_;
     bool abr_;
     bool adaptive_fps_;
-    uint64_t last_ratio_ = 0, quality_order_ = 0;
+    uint64_t last_ratio_ = 0, last_ratio_check_ = 0, quality_order_ = 0;
 };
 } // namespace chast

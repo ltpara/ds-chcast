@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/tracing"
@@ -25,11 +26,12 @@ import (
 // except that only the control plane is multiplexed: each host still keeps its
 // own UDP relay port because the relay cannot demultiplex opaque QUIC.
 type SharedCarrier struct {
-	lns    []net.Listener
-	addrs  []string
-	auth   Authenticator
-	policy *Policy
-	log    *slog.Logger
+	lns       []net.Listener
+	addrs     []string
+	auth      Authenticator
+	transport *transportGuard
+	policy    *Policy
+	log       *slog.Logger
 
 	mu       sync.Mutex
 	hosts    map[string]*sharedHost
@@ -107,18 +109,20 @@ func listenSharedCarrier(bind string, bind6 net.IP) ([]net.Listener, error) {
 	return nil, lastErr
 }
 
-func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, policy *Policy, log *slog.Logger) (*SharedCarrier, error) {
+func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, transport *transportGuard,
+	policy *Policy, log *slog.Logger) (*SharedCarrier, error) {
 	lns, err := listenSharedCarrier(bind, bind6)
 	if err != nil {
 		return nil, err
 	}
 	sc := &SharedCarrier{
-		lns:    lns,
-		addrs:  make([]string, 0, len(lns)),
-		auth:   auth,
-		policy: policy,
-		log:    log,
-		hosts:  make(map[string]*sharedHost),
+		lns:       lns,
+		addrs:     make([]string, 0, len(lns)),
+		auth:      auth,
+		transport: transport,
+		policy:    policy,
+		log:       log,
+		hosts:     make(map[string]*sharedHost),
 	}
 	for _, ln := range lns {
 		sc.addrs = append(sc.addrs, ln.Addr().String())
@@ -435,9 +439,20 @@ func (sc *SharedCarrier) hostLoop(link *sharedHost, br *bufio.Reader) {
 	}
 }
 
+// viewerAdmitted applies the same rule as the per-port carrier: a transport
+// credential is authoritative when presented, and the legacy token is only
+// consulted when no credential was offered.
+func (sc *SharedCarrier) viewerAdmitted(hello carrier.SharedViewerHello, peer string) bool {
+	if hello.Transport != "" || hello.TransportProof != "" {
+		return sc.transport.verify(hello.Transport, hello.TransportProof,
+			hello.HostID, hello.Nonce, hello.Timestamp, acl.TransportAudienceCarrier, peer, time.Now())
+	}
+	return sc.auth != nil && sc.auth.VerifyCarrier(hello.HostID, hello.Token)
+}
+
 func (sc *SharedCarrier) serveViewer(v *carrierViewer, hello carrier.SharedViewerHello) {
 	defer v.close()
-	if hello.HostID == "" || sc.auth == nil || !sc.auth.VerifyCarrier(hello.HostID, hello.Token) {
+	if hello.HostID == "" || !sc.viewerAdmitted(hello, v.peer) {
 		sc.mu.Lock()
 		sc.rejected++
 		sc.mu.Unlock()

@@ -82,9 +82,25 @@ func hostAPIKey(cfg HostConfig) string {
 	return cfg.ServerKey
 }
 
-// viewerAPIKey picks the lookup credential, falling back to the management key
-// when the deployment does not split them.
+// viewerAPIKey picks the lookup credential. A signed-in account is the only
+// identity that can satisfy a restricted device policy, so it wins over the
+// shared link key; without one the legacy shared credential remains. An
+// explicit emergency override uses the admin token instead and never mixes it
+// with the viewer's ordinary account token.
 func viewerAPIKey(cfg ViewerConfig) string {
+	if cfg.Emergency != nil && cfg.Emergency.AdminToken != "" {
+		return cfg.Emergency.AdminToken
+	}
+	if cfg.AccountToken != "" {
+		return cfg.AccountToken
+	}
+	return punchAPIKey(cfg)
+}
+
+// punchAPIKey is the legacy punch proof credential. An account token is a
+// bearer credential for lookup, not an HMAC key, so it must never leak into
+// the wire punch proof.
+func punchAPIKey(cfg ViewerConfig) string {
 	if cfg.LinkKey != "" {
 		return cfg.LinkKey
 	}
@@ -132,32 +148,61 @@ type registerResult struct {
 	Wake []wake.Job `json:"wake"`
 }
 
+// transportCredential is one short-lived admission credential from the lookup.
+// The agent treats the ticket as opaque and proves possession of the bound key
+// when it presents the credential to a transport node.
+type transportCredential struct {
+	Ticket        string `json:"ticket"`
+	Audience      string `json:"audience"`
+	IssuedAtMS    int64  `json:"issued_at_ms"`
+	ExpiresAtMS   int64  `json:"expires_at_ms"`
+	ExpiresInMS   int64  `json:"expires_in_ms"`
+	PolicyVersion uint32 `json:"policy_version"`
+	Issuer        string `json:"issuer"`
+	KeyID         string `json:"kid"`
+	Subject       string `json:"subject"`
+}
+
 type lookupResult struct {
-	ID                string        `json:"id"`
-	Online            bool          `json:"online"`
-	Candidate         string        `json:"candidate"`
-	CandidateV6       string        `json:"candidate_v6"`
-	Candidates        []string      `json:"candidates"`
-	Relay             string        `json:"relay"`
-	Relays            []string      `json:"relays"`
-	Punch             string        `json:"punch"`
-	PunchV6           string        `json:"punch_v6"`
-	TCPPunch          string        `json:"tcp_punch"`
-	Carrier           string        `json:"carrier"`
-	CarrierV6         string        `json:"carrier_v6"`
-	CarrierToken      string        `json:"carrier_token"`
-	Fingerprint       string        `json:"fingerprint"`
-	PublicKey         string        `json:"public_key"`
-	ServerPublicKey   string        `json:"server_public_key"`
-	Binding           string        `json:"binding"`
-	LocalAddrs        []string      `json:"local_addrs"`
-	LocalAddrsV6      []string      `json:"local_addrs_v6"`
-	NATType           string        `json:"nat_type"`
-	UpnpPort          int           `json:"upnp_port"`
-	LastSeenMS        int64         `json:"last_seen_ms"`
-	ExpiresInMS       int64         `json:"expires_in_ms"`
-	RelayOnly         bool          `json:"relay_only"`
-	Transport         string        `json:"transport"`
+	ID              string   `json:"id"`
+	Online          bool     `json:"online"`
+	Candidate       string   `json:"candidate"`
+	CandidateV6     string   `json:"candidate_v6"`
+	Candidates      []string `json:"candidates"`
+	Relay           string   `json:"relay"`
+	Relays          []string `json:"relays"`
+	Punch           string   `json:"punch"`
+	PunchV6         string   `json:"punch_v6"`
+	TCPPunch        string   `json:"tcp_punch"`
+	Carrier         string   `json:"carrier"`
+	CarrierV6       string   `json:"carrier_v6"`
+	CarrierToken    string   `json:"carrier_token"`
+	Fingerprint     string   `json:"fingerprint"`
+	PublicKey       string   `json:"public_key"`
+	ServerPublicKey string   `json:"server_public_key"`
+	Binding         string   `json:"binding"`
+	LocalAddrs      []string `json:"local_addrs"`
+	LocalAddrsV6    []string `json:"local_addrs_v6"`
+	NATType         string   `json:"nat_type"`
+	UpnpPort        int      `json:"upnp_port"`
+	LastSeenMS      int64    `json:"last_seen_ms"`
+	ExpiresInMS     int64    `json:"expires_in_ms"`
+	RelayOnly       bool     `json:"relay_only"`
+	Transport       string   `json:"transport"`
+	// TransportPunch authorizes this viewer's punch for a managed host. It is
+	// absent when the deployment issues no transport credentials and the
+	// lookup link key remains the punch credential.
+	TransportPunch *transportCredential `json:"transport_punch"`
+	// TransportRelay and TransportCarrier admit the same viewer to a relay port
+	// and to the shared carrier. They carry the same binding as the punch
+	// credential but a different audience, so one transport cannot stand in
+	// for another.
+	TransportRelay   *transportCredential `json:"transport_relay"`
+	TransportCarrier *transportCredential `json:"transport_carrier"`
+	// AccessTicket is only present on an emergency override response. The
+	// viewer presents it, with its possession proof, when it opens the
+	// application session.
+	AccessTicket      *AccessTicket `json:"access_ticket"`
 	Software          *softwareInfo `json:"software"`
 	ConfigSerial      int64         `json:"config_serial"`
 	RendezvousServers []string      `json:"rendezvous_servers"`
@@ -210,9 +255,38 @@ func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey e
 	return out, nil
 }
 
-func (c *apiClient) lookup(ctx context.Context, id string) (lookupResult, error) {
+// lookup asks for the host's current transport coordinates. transportKey is
+// this viewer's ephemeral public key; when the server issues transport
+// credentials it binds them to that key.
+func (c *apiClient) lookup(ctx context.Context, id, transportKey string) (lookupResult, error) {
+	path := "/v1/hosts/" + url.PathEscape(id)
+	if transportKey != "" {
+		path += "?transport_public_key=" + url.QueryEscape(transportKey)
+	}
 	var out lookupResult
-	if err := c.do(ctx, http.MethodGet, "/v1/hosts/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return lookupResult{}, err
+	}
+	return out, nil
+}
+
+// emergencyAccess asks the server for an explicit management override. The
+// reply carries the same rendezvous fields as a lookup plus the access ticket
+// and three transport credentials, all bound to the supplied public keys.
+func (c *apiClient) emergencyAccess(ctx context.Context, id, clientKey, transportKey string,
+	permissions uint32, reason string) (lookupResult, error) {
+	body, err := json.Marshal(map[string]any{
+		"peer_id":              id,
+		"client_public_key":    clientKey,
+		"transport_public_key": transportKey,
+		"permissions":          permissions,
+		"reason":               reason,
+	})
+	if err != nil {
+		return lookupResult{}, err
+	}
+	var out lookupResult
+	if err := c.do(ctx, http.MethodPost, "/v1/emergency-access", body, &out); err != nil {
 		return lookupResult{}, err
 	}
 	return out, nil

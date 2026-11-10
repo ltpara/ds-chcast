@@ -247,13 +247,104 @@ void main() {
     ]);
   });
 
+  test('the account token is requested over stdin, never argv', () {
+    final List<String> args = TunnelAgent.arguments(
+      server: 'https://chast.example',
+      hostId: 'devbox',
+      mode: TunnelMode.auto,
+      key: 'dev-secret',
+      accountToken: 'chast_session_secret',
+      proxy: 'socks5://127.0.0.1:10808',
+    );
+    expect(args, contains('--server-key-stdin'));
+    expect(args, contains('--account-token-stdin'));
+    expect(args, contains('--proxy-stdin'));
+    expect(args.join(' '), isNot(contains('chast_session_secret')));
+    expect(
+      args.indexOf('--account-token-stdin'),
+      lessThan(args.indexOf('--proxy-stdin')),
+    );
+  });
+
+  test('decodes emergency tickets from ready and renewal events', () {
+    final TunnelEvent? ready = TunnelEvent.decode(
+      '{"event":"ready","listen":"127.0.0.1:45678",'
+      '"access_ticket":"ticket-one","access_expires_at_ms":1700000000000,'
+      '"access_subject":"emergency:rootadmin","access_permissions":6}',
+    );
+    expect(ready?.accessTicket, 'ticket-one');
+    expect(ready?.accessExpiresAtMs, 1700000000000);
+    expect(ready?.accessSubject, 'emergency:rootadmin');
+    expect(ready?.accessPermissions, 6);
+
+    final TunnelEvent? renewal = TunnelEvent.decode(
+      '{"event":"access_ticket","access_ticket":"ticket-two",'
+      '"access_expires_at_ms":1700000060000,'
+      '"access_subject":"emergency:rootadmin"}',
+    );
+    expect(renewal?.event, 'access_ticket');
+    expect(renewal?.accessTicket, 'ticket-two');
+    expect(TunnelEvent.decode('{"event":"access_ticket"}')?.accessTicket, '');
+  });
+
+  test('the emergency override rides on stdin flags, never argv', () {
+    final List<String> args = TunnelAgent.arguments(
+      server: 'https://chast.example',
+      hostId: 'devbox',
+      mode: TunnelMode.auto,
+      key: 'dev-secret',
+      emergency: const EmergencyAccessRequest(
+        adminToken: 'admin-session-secret',
+        reason: 'incident 4711',
+        clientPublicKey: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+        permissions: 6,
+      ),
+    );
+    expect(args, contains('--emergency-token-stdin'));
+    expect(args, contains('--emergency-reason-stdin'));
+    expect(args.join(' '), isNot(contains('admin-session-secret')));
+    expect(args.join(' '), isNot(contains('incident 4711')));
+    expect(
+      args[args.indexOf('--emergency-client-key') + 1],
+      'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+    );
+    expect(args[args.indexOf('--emergency-permissions') + 1], '6');
+
+    expect(
+      TunnelAgent.arguments(
+        server: 'https://chast.example',
+        hostId: 'devbox',
+        mode: TunnelMode.auto,
+        emergency: const EmergencyAccessRequest(
+          adminToken: '',
+          reason: 'incident',
+          clientPublicKey: 'client-key',
+        ),
+      ),
+      <String>[
+        'viewer',
+        '--server',
+        'https://chast.example',
+        '--id',
+        'devbox',
+        '--listen',
+        '127.0.0.1:0',
+        '--mode',
+        'auto',
+      ],
+    );
+  });
+
   test(
-    'the key and proxy reach the child in that order over stdin',
+    'the emergency credentials reach the child in order over stdin',
     () async {
       final File script = await _ps1(
         '\$key = [Console]::In.ReadLine()\r\n'
+        '\$account = [Console]::In.ReadLine()\r\n'
+        '\$admin = [Console]::In.ReadLine()\r\n'
+        '\$reason = [Console]::In.ReadLine()\r\n'
         '\$proxy = [Console]::In.ReadLine()\r\n'
-        '[Console]::Out.WriteLine(\'{"event":"ready","listen":"127.0.0.1:45678","remote":"\' + \$key + \',\' + \$proxy + \'"}\')\r\n',
+        '[Console]::Out.WriteLine(\'{"event":"ready","listen":"127.0.0.1:45678","remote":"\' + \$key + \',\' + \$account + \',\' + \$admin + \',\' + \$reason + \',\' + \$proxy + \'"}\')\r\n',
       );
       final TunnelAgent agent = await TunnelAgent.start(
         server: const ServerSettings(
@@ -262,6 +353,12 @@ void main() {
           proxy: 'socks5://127.0.0.1:10808',
         ),
         hostId: 'devbox',
+        accountToken: 'chast_session_secret',
+        emergency: const EmergencyAccessRequest(
+          adminToken: 'admin-session-secret',
+          reason: 'incident 4711',
+          clientPublicKey: 'client-key',
+        ),
         executable: 'powershell',
         argumentOverride: <String>[
           '-NoProfile',
@@ -275,7 +372,70 @@ void main() {
       );
       addTearDown(agent.stop);
 
-      expect(agent.remote, 'dev-secret,socks5://127.0.0.1:10808');
+      expect(
+        agent.remote,
+        'dev-secret,chast_session_secret,admin-session-secret,'
+        'incident 4711,socks5://127.0.0.1:10808',
+      );
+    },
+    skip: !Platform.isWindows,
+  );
+
+  test('adopts the initial emergency ticket and follows renewals', () async {
+    final File script = await _bat(
+      '@echo {"event":"ready","listen":"127.0.0.1:45678","path":"direct",'
+      '"access_ticket":"ticket-one","access_expires_at_ms":1700000000000}\r\n'
+      '@ping -n 2 127.0.0.1 >nul\r\n'
+      '@echo {"event":"access_ticket","access_ticket":"ticket-two",'
+      '"access_expires_at_ms":1700000060000}\r\n'
+      '@ping -n 30 127.0.0.1 >nul\r\n',
+    );
+    final TunnelAgent agent = await _start(script);
+    addTearDown(agent.stop);
+
+    expect(agent.accessTicket, 'ticket-one');
+    expect(agent.accessExpiresAtMs, 1700000000000);
+    final TunnelAccessTicket renewal = await agent.accessTickets.first
+        .timeout(const Duration(seconds: 10));
+    expect(renewal.ticket, 'ticket-two');
+    expect(renewal.expiresAtMs, 1700000060000);
+    expect(agent.accessTicket, 'ticket-two');
+  }, skip: !Platform.isWindows);
+
+  test(
+    'the key, account token and proxy reach the child in that order over stdin',
+    () async {
+      final File script = await _ps1(
+        '\$key = [Console]::In.ReadLine()\r\n'
+        '\$token = [Console]::In.ReadLine()\r\n'
+        '\$proxy = [Console]::In.ReadLine()\r\n'
+        '[Console]::Out.WriteLine(\'{"event":"ready","listen":"127.0.0.1:45678","remote":"\' + \$key + \',\' + \$token + \',\' + \$proxy + \'"}\')\r\n',
+      );
+      final TunnelAgent agent = await TunnelAgent.start(
+        server: const ServerSettings(
+          url: 'http://127.0.0.1:1',
+          key: 'dev-secret',
+          proxy: 'socks5://127.0.0.1:10808',
+        ),
+        hostId: 'devbox',
+        accountToken: 'chast_session_secret',
+        executable: 'powershell',
+        argumentOverride: <String>[
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script.path,
+        ],
+        timeout: const Duration(seconds: 20),
+      );
+      addTearDown(agent.stop);
+
+      expect(
+        agent.remote,
+        'dev-secret,chast_session_secret,socks5://127.0.0.1:10808',
+      );
     },
     skip: !Platform.isWindows,
   );

@@ -186,6 +186,88 @@ bool read_file(const fs::path& path, std::string* bytes, std::string* error) {
     return true;
 }
 
+// The viewer saves transfers into the real Downloads\chast folder. A hardened
+// profile can deny creating files in directories that predate the process, so
+// when that root or its partial folder is not writable, move the existing
+// folder aside for the probe and let the receiver create it; the original is
+// restored on every exit path.
+class ReceiveDirectoryGuard {
+public:
+    explicit ReceiveDirectoryGuard(const fs::path& directory) : directory_(directory) {
+        if (writable(directory_)) {
+            return;
+        }
+        backup_ = directory_;
+        backup_ += ".probe-backup-" + std::to_string(GetCurrentProcessId());
+        std::error_code ec;
+        fs::remove_all(backup_, ec);
+        ec.clear();
+        fs::rename(directory_, backup_, ec);
+        if (ec) {
+            std::fprintf(stderr, "viewer-probe: cannot move %s aside: %s\n",
+                         utf8(directory_).c_str(), ec.message().c_str());
+            backup_.clear();
+            return;
+        }
+        std::printf("viewer-probe: the receive folder is not writable here; "
+                    "using a fresh one and restoring it afterwards\n");
+        fs::create_directories(directory_, ec);
+    }
+    ~ReceiveDirectoryGuard() {
+        if (backup_.empty()) {
+            return;
+        }
+        std::error_code ignored;
+        fs::remove_all(directory_, ignored);
+        fs::rename(backup_, directory_, ignored);
+    }
+    ReceiveDirectoryGuard(const ReceiveDirectoryGuard&) = delete;
+    ReceiveDirectoryGuard& operator=(const ReceiveDirectoryGuard&) = delete;
+
+private:
+    static bool writable(const fs::path& directory) {
+        std::error_code ec;
+        fs::create_directories(directory, ec);
+        if (ec) {
+            return false;
+        }
+        const std::string probe_name =
+            ".chast-probe-" + std::to_string(GetCurrentProcessId());
+        const fs::path root_probe = directory / probe_name;
+        {
+            std::ofstream out(root_probe, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                return false;
+            }
+        }
+        fs::remove(root_probe, ec);
+        if (ec) {
+            return false;
+        }
+        const fs::path partial = directory / ".chast-partial";
+        if (!fs::exists(partial, ec)) {
+            return true;
+        }
+        ec.clear();
+        fs::create_directories(partial, ec);
+        if (ec) {
+            return false;
+        }
+        const fs::path partial_probe = partial / probe_name;
+        {
+            std::ofstream out(partial_probe, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                return false;
+            }
+        }
+        fs::remove(partial_probe, ec);
+        return !ec;
+    }
+
+    fs::path directory_;
+    fs::path backup_;
+};
+
 struct ShareSeed {
     std::string tree_name;
     std::string big_name;
@@ -2023,6 +2105,7 @@ int multi_share_probe() {
         return 1;
     }
     const fs::path downloads = from_utf8(downloads_text);
+    ReceiveDirectoryGuard receive_guard(downloads);
 
     std::string error;
     bool success = false;
@@ -2318,6 +2401,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     const fs::path downloads = from_utf8(downloads_text);
+    ReceiveDirectoryGuard receive_guard(downloads);
 
     int exit_code = 1;
     {

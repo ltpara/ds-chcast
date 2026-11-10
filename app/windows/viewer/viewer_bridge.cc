@@ -481,19 +481,25 @@ void ViewerBridge::HandleMethodCall(
             }
         }
         const auto status = viewer_->Snapshot();
-        if (value < 0 || value > UINT32_MAX || status.state != ViewerState::kStreaming ||
-            !status.multiple_displays || std::none_of(status.display_streams.begin(),
-                status.display_streams.end(), [value](const auto& s) { return s.stream.stream_id == value; })) {
+        const auto found = std::find_if(status.display_streams.begin(),
+                                        status.display_streams.end(),
+                                        [value](const auto& s) {
+                                            return s.stream.stream_id == value;
+                                        });
+        if (value < 0 || value > UINT32_MAX ||
+            status.state != ViewerState::kStreaming ||
+            !status.multiple_displays || found == status.display_streams.end()) {
             result->Success(flutter::EncodableValue(false)); return;
         }
         const auto stream = static_cast<uint32_t>(value);
+        const uint32_t display_index = found->stream.display_index;
         const auto it = session_->windows.find(stream);
         if (it != session_->windows.end() && IsWindow(it->second)) {
             ShowWindow(it->second, SW_RESTORE);
             SetForegroundWindow(it->second);
             result->Success(flutter::EncodableValue(true)); return;
         }
-        result->Success(flutter::EncodableValue(open_display_window && open_display_window(session_, stream, peer_id)));
+        result->Success(flutter::EncodableValue(open_display_window && open_display_window(session_, stream, peer_id, display_index)));
         return;
     }
 
@@ -1293,6 +1299,8 @@ void ViewerBridge::HandleMethodCall(
         map[key("chroma")] = flutter::EncodableValue(static_cast<int>(status.chroma));
         map[key("streamQuality")] =
             flutter::EncodableValue(static_cast<int32_t>(status.stream_quality));
+        map[key("streamQualityPercent")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.stream_quality_percent));
         map[key("streamOptionCode")] =
             flutter::EncodableValue(static_cast<int32_t>(status.stream_option_code));
         map[key("streamOptionError")] =
@@ -1465,6 +1473,23 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "showCursor") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t x = 0;
+        int64_t y = 0;
+        bool visible = false;
+        if (args == nullptr || !map_int(*args, "x", &x) || !map_int(*args, "y", &y) ||
+            !map_bool(*args, "visible", &visible) || x < INT32_MIN || x > INT32_MAX ||
+            y < INT32_MIN || y > INT32_MAX) {
+            result->Error("bad_args", "showCursor wants x, y and visible");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->ShowCursor(
+            static_cast<int32_t>(x), static_cast<int32_t>(y), visible);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
     if (method == "requestDisplayModes") {
         const auto* display = std::get_if<int32_t>(call.arguments());
         if (display == nullptr || *display < 0 || *display >= chast::kMaxDisplayCount) {
@@ -1513,21 +1538,25 @@ void ViewerBridge::HandleMethodCall(
         }
         int64_t codec = 0;
         int64_t max_fps = 0;
-        int64_t quality = 0, chroma = 0;
+        int64_t quality = 0, chroma = 0, quality_percent = 0;
         map_int(*args, "chroma", &chroma);
+        map_int(*args, "qualityPercent", &quality_percent);
         if (!map_int(*args, "codec", &codec) || !map_int(*args, "maxFps", &max_fps) ||
             !map_int(*args, "quality", &quality) || codec < 0 || codec > 4 || chroma < 0 || chroma > 1 ||
-            max_fps < 0 || max_fps > chast::kMaxStreamFps || quality < 0 || quality > 2) {
+            max_fps < 0 || max_fps > chast::kMaxStreamFps || quality < 0 || quality > 3 ||
+            quality_percent < 0 || quality_percent > chast::kMaxCustomQualityPercent ||
+            (quality == 3 && quality_percent < chast::kMinCustomQualityPercent)) {
             result->Error("bad_args",
-                          "setStreamOptions wants codec in 0..4, chroma in 0..1 and quality in 0..2 and maxFps in "
-                          "0..240");
+                          "setStreamOptions wants codec in 0..4, chroma in 0..1 and quality in 0..3 with "
+                          "qualityPercent in 10..100 for custom quality, and maxFps in 0..240");
             return;
         }
         const bool queued =
             viewer_ != nullptr &&
             viewer_->SetStreamOptions(static_cast<chast::StreamCodecPreference>(codec),
                                       static_cast<uint16_t>(max_fps),
-                                      static_cast<chast::StreamQuality>(quality), static_cast<chast::VideoChroma>(chroma));
+                                      static_cast<chast::StreamQuality>(quality), static_cast<chast::VideoChroma>(chroma),
+                                      static_cast<uint8_t>(quality_percent));
         result->Success(flutter::EncodableValue(queued));
         return;
     }

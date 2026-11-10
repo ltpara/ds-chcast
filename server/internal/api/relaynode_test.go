@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
 
@@ -31,6 +32,7 @@ type stubNode struct {
 	ports         map[string]int
 	ttls          map[string]int64
 	carrierTokens map[string]string
+	managed       map[string]bool
 	linked        map[string]bool
 	releases      []string
 	requests      int
@@ -48,6 +50,7 @@ func newStubNode(t *testing.T, relayHost, carrier string) *stubNode {
 		ports:         make(map[string]int),
 		ttls:          make(map[string]int64),
 		carrierTokens: make(map[string]string),
+		managed:       make(map[string]bool),
 		linked:        make(map[string]bool),
 	}
 	mux := http.NewServeMux()
@@ -96,6 +99,12 @@ func (n *stubNode) leaseRequest(id string) (int64, string, int) {
 	return n.ttls[id], n.lastPublicKey, n.requests
 }
 
+func (n *stubNode) managedFor(id string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.managed[id]
+}
+
 func (n *stubNode) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -122,6 +131,7 @@ func (n *stubNode) handleLease(w http.ResponseWriter, r *http.Request) {
 		ID           string `json:"id"`
 		PublicKey    string `json:"public_key"`
 		CarrierToken string `json:"carrier_token"`
+		Managed      bool   `json:"managed"`
 		TTLSeconds   int64  `json:"ttl_sec"`
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<10))
@@ -146,6 +156,7 @@ func (n *stubNode) handleLease(w http.ResponseWriter, r *http.Request) {
 	}
 	n.ttls[req.ID] = req.TTLSeconds
 	n.carrierTokens[req.ID] = req.CarrierToken
+	n.managed[req.ID] = req.Managed
 	carrier := n.carrier
 	carrierV6 := n.carrierV6
 	n.mu.Unlock()
@@ -302,6 +313,28 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 	}
 	if _, _, calls := node.leaseRequest("devbox"); calls != 2 {
 		t.Fatalf("renewal did not ask the node again: %d", calls)
+	}
+	// A device becoming managed must reach the standalone node at its next
+	// registration, because the node cannot read the account store itself.
+	if _, err := s.Accounts.SetDevicePolicy("devbox", account.DevicePolicyOpen, 4, nil, nil, "root"); err != nil {
+		t.Fatalf("set device policy: %v", err)
+	}
+	managed := register()
+	if managed.Relay != first.Relay {
+		t.Fatalf("managed renewal moved the lease: %+v -> %+v", first, managed)
+	}
+	if !node.managedFor("devbox") {
+		t.Fatal("managed renewal did not tell the node the host is managed")
+	}
+	// Removing the policy restores the unmanaged lease on the next renewal.
+	if err := s.Accounts.DeleteDevicePolicy("devbox"); err != nil {
+		t.Fatalf("delete device policy: %v", err)
+	}
+	if unmanaged := register(); unmanaged.Relay != first.Relay {
+		t.Fatalf("unmanaged renewal moved the lease: %+v -> %+v", first, unmanaged)
+	}
+	if node.managedFor("devbox") {
+		t.Fatal("unmanaged renewal left the node refusing the legacy token")
 	}
 	if released := node.releaseCount("devbox"); released != 0 {
 		t.Fatalf("renewal released the lease %d times", released)

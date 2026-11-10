@@ -73,7 +73,7 @@ func (v *ViewerAgent) connectWait(punch time.Duration, local bool) time.Duration
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	relay := v.cfg.Mode == ModeAuto && (v.relay != nil ||
-		(v.carrierToken != "" && len(v.carrierCandidates()) > 0))
+		(v.carrierCredentialReady() && len(v.carrierCandidates()) > 0))
 	return directConnectTimeout(punch, v.natType, v.ownNAT, local, relay, v.directFailed)
 }
 

@@ -70,12 +70,20 @@ func viewAdminAccount(user account.User) adminAccountEntry {
 // adminActor authorizes an administrative request for one resource and names
 // the caller in the audit detail. The server key is not an account, so it
 // reports no user.
-func (s *server) adminActor(w http.ResponseWriter, r *http.Request, resource string) (account.User, string, bool) {
+func (s *server) adminPrincipal(w http.ResponseWriter, r *http.Request, resource string) (consolePrincipal, bool) {
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
+		return consolePrincipal{}, false
+	}
+	return s.consolePrincipalFor(w, r, consoleAdmin, resource)
+}
+
+func (s *server) adminActor(w http.ResponseWriter, r *http.Request, resource string) (account.User, string, bool) {
+	principal, ok := s.adminPrincipal(w, r, resource)
+	if !ok {
 		return account.User{}, "", false
 	}
-	return s.consoleActor(w, r, consoleAdmin, resource)
+	return principal.User, principal.Actor, true
 }
 
 func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {

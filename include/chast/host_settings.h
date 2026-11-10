@@ -126,6 +126,13 @@ struct HostSettings {
     // is not present at session time makes audio unavailable instead of
     // silently moving to another endpoint.
     std::string audio_device;
+    // Capture endpoint the host opens when a viewer starts a voice call, as a
+    // WASAPI id. Empty follows the default communications microphone. A
+    // pinned device that has disappeared at call time falls back to the
+    // default and the host logs it, because a call should not fail just
+    // because a headset was unplugged. The choice is read when a call starts,
+    // so changing it never interrupts a running call.
+    std::string voice_microphone;
     // Cancel the viewer's microphone out of the loopback capture. Needs a live
     // microphone playback reference; with no CMIC stream it stays bypassed.
     bool audio_aec = true;
@@ -194,6 +201,12 @@ struct HostSettings {
     // also keep the display awake; other session modes only keep the system
     // awake. Local policy, applied when the host next starts.
     bool keep_awake = true;
+    // Remove the desktop wallpaper while a viewer session is authorized and
+    // put it back when the session ends (RustDesk's allow-remove-wallpaper).
+    // Off by default because it changes what the operator sees locally. A
+    // solid background encodes far cheaper than a photo, so this lowers the
+    // cost of static desktop frames without touching the zero-copy path.
+    bool remove_wallpaper = false;
     // Close the session after this many minutes without viewer activity
     // (input, chat, clipboard and other viewer requests). 0 keeps it open until
     // one side leaves and is the default: a forgotten viewer should not hold
@@ -280,6 +293,10 @@ struct HostSettings {
     // back by chast-tunnel to sign the server receipt. Derived from the
     // settings path as <stem>.policy-ack.json; not stored in host.ini.
     std::string policy_ack;
+    // Backup written just before the wallpaper is removed, restored when the
+    // session ends or on the next host start after a crash. Derived from the
+    // settings path as <stem>.wallpaper; not stored in host.ini.
+    std::string wallpaper_state;
     // Access-ticket issuer pin installed by the deployment. All three values
     // are required before a managed host admits a ticket; an incomplete or
     // invalid set keeps it fail-closed. The key is the issuer's public
@@ -382,6 +399,9 @@ std::string policy_state_path_for(const std::string& settings_path);
 // Written by the host and read by chast-tunnel; empty for an empty settings
 // path.
 std::string policy_ack_path_for(const std::string& settings_path);
+// Wallpaper backup next to a settings file: <dir>/<stem>.wallpaper. Empty for
+// an empty settings path.
+std::string wallpaper_state_path_for(const std::string& settings_path);
 // The managed marker inside <stem>.policy.json. A missing file reports
 // unmanaged; a file that exists but cannot be parsed reports readable=false so
 // the host can refuse new sessions instead of falling back to open. A managed

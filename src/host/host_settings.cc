@@ -429,6 +429,17 @@ std::string policy_ack_path_for(const std::string& settings_path) {
     return to_utf8(path.wstring());
 }
 
+std::string wallpaper_state_path_for(const std::string& settings_path) {
+    if (settings_path.empty()) {
+        return {};
+    }
+    std::filesystem::path path = native_path(settings_path);
+    std::filesystem::path name = path.stem();
+    name += L".wallpaper";
+    path.replace_filename(name);
+    return to_utf8(path.wstring());
+}
+
 namespace {
 
 // The device policy state is a machine file written by chast-tunnel, so these
@@ -762,6 +773,7 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         missing.settings.audit_spool = audit_spool_path_for(path);
         missing.settings.policy_state = policy_state_path_for(path);
         missing.settings.policy_ack = policy_ack_path_for(path);
+        missing.settings.wallpaper_state = wallpaper_state_path_for(path);
         return missing;
     }
     std::ostringstream text;
@@ -774,6 +786,7 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
     result.settings.audit_spool = audit_spool_path_for(path);
     result.settings.policy_state = policy_state_path_for(path);
     result.settings.policy_ack = policy_ack_path_for(path);
+    result.settings.wallpaper_state = wallpaper_state_path_for(path);
     result.existed = true;
     std::istringstream in(contents);
     bool auth_mode_seen = false;
@@ -900,6 +913,16 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
             if (!parse_bool(value, settings.allow_microphone)) {
                 warn(result.warning, "microphone '" + value + "' is not a boolean");
             }
+        } else if (key == "voice_microphone") {
+            if (value.size() > 1024) {
+                warn(result.warning,
+                     "voice_microphone is too long; using the default communications device");
+            } else {
+                // Same rule as audio_device: a device that is unplugged right
+                // now stays selected, and the call falls back to the default
+                // at open time with a log line.
+                settings.voice_microphone = value;
+            }
         } else if (key == "privacy_mode") {
             if (!parse_bool(value, settings.allow_privacy_mode)) {
                 warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
@@ -942,6 +965,10 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
         } else if (key == "keep_awake") {
             if (!parse_bool(value, settings.keep_awake)) {
                 warn(result.warning, "keep_awake '" + value + "' is not a boolean");
+            }
+        } else if (key == "remove_wallpaper") {
+            if (!parse_bool(value, settings.remove_wallpaper)) {
+                warn(result.warning, "remove_wallpaper '" + value + "' is not a boolean");
             }
         } else if (key == "auto_disconnect_minutes") {
             uint32_t minutes = 0;
@@ -1396,6 +1423,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "file_share_roots=" << share_roots << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "audio_device=" << settings.audio_device << "\n"
+         << "voice_microphone=" << settings.voice_microphone << "\n"
          << "audio_aec=" << (settings.audio_aec ? 1 : 0) << "\n"
          << "audio_silence_gate_ms=" << settings.audio_silence_gate_ms << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
@@ -1409,6 +1437,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "lock_after_session_end=" << (settings.lock_after_session_end ? 1 : 0)
          << "\n"
          << "keep_awake=" << (settings.keep_awake ? 1 : 0) << "\n"
+         << "remove_wallpaper=" << (settings.remove_wallpaper ? 1 : 0) << "\n"
          << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
          << "trusted_device_days=" << settings.trusted_device_days << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"

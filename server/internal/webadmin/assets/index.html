@@ -43,6 +43,7 @@
       <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
       <button type="button" class="tab" data-tab="policies" role="tab">设备策略</button>
       <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
+      <button type="button" class="tab" data-tab="tokens" role="tab">API 令牌</button>
       <button type="button" class="tab" data-tab="groups" role="tab">分组</button>
       <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
       <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
@@ -186,6 +187,54 @@
       </div>
     </section>
 
+    <section id="panel-tokens" class="panel-page">
+      <div class="panel" id="token-create-panel">
+        <div class="panel-head"><h2>新建 API 令牌</h2></div>
+        <form id="token-create" class="inline-form" autocomplete="off">
+          <label>名称<input id="token-name" required maxlength="64" spellcheck="false" placeholder="nightly-backup"></label>
+          <label>角色
+            <select id="token-role">
+              <option value="readonly">readonly（只读）</option>
+              <option value="operator">operator（设备管理）</option>
+              <option value="admin">admin（全部资源）</option>
+            </select>
+          </label>
+          <label>有效期（天）<input id="token-ttl-days" type="number" min="1" max="365" step="1" value="90"></label>
+          <label>分组（可选）
+            <select id="token-group">
+              <option value="">（不限定分组）</option>
+            </select>
+          </label>
+          <div id="token-resources" class="check-grid">
+            <label class="check"><input type="checkbox" value="devices" checked> 设备</label>
+            <label class="check"><input type="checkbox" value="recordings"> 录制</label>
+            <label class="check"><input type="checkbox" value="audit"> 审计</label>
+            <label class="check"><input type="checkbox" value="groups"> 分组</label>
+            <label class="check"><input type="checkbox" value="accounts"> 账号</label>
+            <label class="check"><input type="checkbox" value="ops"> 运维</label>
+            <label class="check"><input type="checkbox" value="all"> 全部</label>
+          </div>
+          <button type="submit" class="primary">创建</button>
+        </form>
+        <p class="muted">令牌以当前登录账号名义持有，角色不能高于账号角色；密钥只在创建时显示一次。选择分组后，令牌只能覆盖设备、录制、审计与分组资源，账号、运维与全部资源必须使用全局令牌。账号被降权或封禁后，其令牌会随之失效。</p>
+        <p id="token-resource-note" class="muted"></p>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>我的令牌</h2><button type="button" id="token-refresh">刷新</button></div>
+        <p id="token-summary" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>名称</th><th>角色</th><th>资源</th><th>分组</th><th>创建时间</th><th>到期时间</th><th>最近使用</th><th>状态</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="token-rows"></tbody>
+          </table>
+        </div>
+        <p id="token-empty" class="muted hidden">还没有令牌。创建后密钥只显示一次，请立即保存。</p>
+        <p id="token-key-note" class="muted hidden">API 令牌必须由账号持有。请使用 admin 账号登录后管理令牌。</p>
+      </div>
+    </section>
+
     <section id="panel-groups" class="panel-page">
       <div class="panel" id="group-create-panel">
         <div class="panel-head"><h2>新建分组</h2></div>
@@ -254,6 +303,7 @@
           <input id="audit-filter" type="search" placeholder="动作" spellcheck="false">
           <input id="audit-host" class="hidden" type="search" placeholder="主机 ID（可选）" spellcheck="false">
           <button type="button" id="audit-reload">查询</button>
+          <button type="button" id="audit-emergency" class="ghost" title="列出管理员应急授权记录">应急授权</button>
           <button type="button" id="audit-csv" class="ghost">导出 CSV</button>
         </div>
         <div class="table-wrap">
@@ -373,6 +423,18 @@
         <span class="spacer"></span>
         <button type="button" id="policy-assignment-cancel">取消</button>
         <button type="submit" class="primary">创建</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="token-secret-dialog">
+    <form method="dialog" class="dialog-stack">
+      <h2>令牌已创建</h2>
+      <p class="muted">这是唯一一次显示密钥。关闭后无法再次查看；如果丢失，请撤销该令牌并重新创建。</p>
+      <p id="token-secret-value" class="mono secret"></p>
+      <div class="dialog-actions">
+        <button type="button" id="token-secret-copy">复制密钥</button>
+        <button type="submit" class="primary">我已保存</button>
       </div>
     </form>
   </dialog>

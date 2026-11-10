@@ -741,6 +741,7 @@ class ViewerStatus {
     this.displayFollowError = '',
     this.displayFollowResults = 0,
     this.streamQuality = 0,
+    this.streamQualityPercent = 0,
     this.chroma = 0,
     this.streamOptionCode = 0,
     this.streamOptionError = '',
@@ -1265,13 +1266,17 @@ class ViewerStatus {
   final int displayFollowResults;
 
   /// Stream preferences the host actually runs. [streamQuality] is a
-  /// [ViewerStreamQuality] value; the effective encoder and frame rate are
-  /// [codec] and [framerate], which the host's StreamInfo also updates.
+  /// [ViewerStreamQuality] value; [streamQualityPercent] is the effective
+  /// custom quality in percent when that value is
+  /// [ViewerStreamQuality.custom], otherwise 0. The effective encoder and
+  /// frame rate are [codec] and [framerate], which the host's StreamInfo also
+  /// updates.
   /// [streamOptionCode] is the host's [ViewerStreamOptionsCode] (0 = Ok) for
   /// the most recent answer and [streamOptionError] its refusal reason
   /// (cleared by an accepted change). [streamOptionResults] counts answers,
   /// including local send failures, so the page can pair one with its poll.
   final int streamQuality;
+  final int streamQualityPercent;
   final int chroma;
   final int streamOptionCode;
   final String streamOptionError;
@@ -1801,6 +1806,7 @@ class ViewerStatus {
       displayFollowError: asString(map['displayFollowError']),
       displayFollowResults: asInt(map['displayFollowResults']),
       streamQuality: asInt(map['streamQuality']),
+      streamQualityPercent: asInt(map['streamQualityPercent']),
       chroma: asInt(map['chroma']),
       streamOptionCode: asInt(map['streamOptionCode']),
       streamOptionError: asString(map['streamOptionError']),
@@ -2239,17 +2245,21 @@ class ViewerBridge {
     return queued ?? false;
   }
 
-  /// Asks the host to change the stream's encoder, frame-rate cap and quality
-  /// preset. [codec] is a [ViewerStreamCodec] value, [maxFps] 0 follows the
-  /// host's configured rate, and [quality] is a [ViewerStreamQuality] value.
+  /// Asks the host to change the stream's encoder, frame-rate cap and quality.
+  /// [codec] is a [ViewerStreamCodec] value, [maxFps] 0 follows the host's
+  /// configured rate, and [quality] is a [ViewerStreamQuality] value.
+  /// [qualityPercent] is the custom quality in percent, 10..100, when
+  /// [quality] is [ViewerStreamQuality.custom]; preset requests send 0.
   /// No input permission is needed. False means the request was not queued
   /// (no session); the host's answer arrives in [ViewerStatus.streamOptionCode]
   /// and reports the values it actually runs in [ViewerStatus.codec],
-  /// [ViewerStatus.framerate] and [ViewerStatus.streamQuality].
+  /// [ViewerStatus.framerate], [ViewerStatus.streamQuality] and
+  /// [ViewerStatus.streamQualityPercent].
   static Future<bool> setStreamOptions({
     required int codec,
     required int maxFps,
     required int quality,
+    int qualityPercent = 0,
     int chroma = 0,
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>(
@@ -2258,6 +2268,7 @@ class ViewerBridge {
         'codec': codec,
         'maxFps': maxFps,
         'quality': quality,
+        'qualityPercent': qualityPercent,
         'chroma': chroma,
       },
     );
@@ -2982,6 +2993,23 @@ class ViewerBridge {
     return applied ?? false;
   }
 
+  /// Draws the viewer pointer on the host desktop ("show my cursor"). The
+  /// coordinates are captured-desktop pixels like the mouse events; the hint
+  /// is draw-only and needs no input permission. Returns false when no
+  /// session is streaming.
+  static Future<bool> showCursor({
+    required int x,
+    required int y,
+    required bool visible,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>('showCursor', {
+      'x': x,
+      'y': y,
+      'visible': visible,
+    });
+    return queued ?? false;
+  }
+
   /// Sends one display-management request (protocol v47). [action] is a
   /// [ViewerDisplayControlAction] value, [value] the count, toggle state or
   /// privacy implementation, and [target] the host-issued output id for a
@@ -3364,11 +3392,13 @@ enum ViewerStreamCodec {
 
 /// Quality preset (chast::StreamQuality). It scales the host's video bitrate
 /// budget; adaptive bitrate can still go below the preset when the link
-/// degrades.
+/// degrades. [custom] uses [ViewerStatus.streamQualityPercent] as the ratio
+/// percent / 50, matching RustDesk's custom image quality.
 enum ViewerStreamQuality {
   high(0),
   balanced(1),
-  smooth(2);
+  smooth(2),
+  custom(3);
 
   const ViewerStreamQuality(this.code);
   final int code;
@@ -3381,6 +3411,8 @@ enum ViewerStreamQuality {
         return tr('均衡');
       case ViewerStreamQuality.smooth:
         return tr('流畅');
+      case ViewerStreamQuality.custom:
+        return tr('自定义');
     }
   }
 }

@@ -45,7 +45,7 @@ var (
 	ErrEmptyTokenResources  = errors.New("API token needs at least one resource")
 	ErrInvalidAPITokenTTL   = errors.New("API token lifetime must be between one minute and 365 days")
 	ErrAPITokenOutranks     = errors.New("API token role exceeds the owner role")
-	ErrAPITokenGroupScope   = errors.New("group-scoped tokens may only cover groups and audit")
+	ErrAPITokenGroupScope   = errors.New("group-scoped tokens may only cover devices, recordings, audit and groups")
 	ErrUnknownAPIToken      = errors.New("unknown API token")
 	ErrAPITokenQuota        = errors.New("API token quota reached")
 )
@@ -118,7 +118,7 @@ func normalizeTokenResources(resources []string) ([]string, error) {
 func tokenGroupScopedResources(resources []string) bool {
 	for _, resource := range resources {
 		switch resource {
-		case TokenResourceGroups, TokenResourceAudit:
+		case TokenResourceGroups, TokenResourceAudit, TokenResourceRecordings, TokenResourceDevices:
 		default:
 			return false
 		}

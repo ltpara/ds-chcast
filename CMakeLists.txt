@@ -329,7 +329,9 @@ add_library(chast.host STATIC
     src/win/display_privacy.cc
     src/win/privacy.cc
     src/win/power_request.cc
-    src/win/sas.cc)
+    src/win/sas.cc
+    src/win/show_cursor.cc
+    src/win/wallpaper.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

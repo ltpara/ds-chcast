@@ -1901,6 +1901,50 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
     return true;
 }
 
+std::vector<uint8_t> make_show_cursor(const ShowCursorHint& hint) {
+    std::vector<uint8_t> payload(12);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, static_cast<uint32_t>(hint.x));
+    put_u32(cursor, static_cast<uint32_t>(hint.y));
+    put_u8(cursor, hint.visible ? 0x01 : 0x00);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    return make_control(ControlType::ShowCursor, payload);
+}
+
+bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint,
+                       std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint8_t flags = 0;
+    uint8_t reserved0 = 0;
+    uint8_t reserved1 = 0;
+    uint8_t reserved2 = 0;
+    if (!reader.u32(x) || !reader.u32(y) || !reader.u8(flags) || !reader.u8(reserved0) ||
+        !reader.u8(reserved1) || !reader.u8(reserved2)) {
+        set_error(error, "truncated ShowCursor");
+        return false;
+    }
+    if (!reader.at_end()) {
+        set_error(error, "ShowCursor carries trailing bytes");
+        return false;
+    }
+    if ((flags & ~0x01u) != 0) {
+        set_error(error, "ShowCursor carries unknown flags");
+        return false;
+    }
+    if (reserved0 != 0 || reserved1 != 0 || reserved2 != 0) {
+        set_error(error, "ShowCursor carries non-zero reserved bytes");
+        return false;
+    }
+    hint.x = static_cast<int32_t>(x);
+    hint.y = static_cast<int32_t>(y);
+    hint.visible = (flags & 0x01u) != 0;
+    return true;
+}
+
 bool valid_clipboard_text(const std::string& text) {
     return !text.empty() && text.size() <= kMaxClipboardBytes && valid_utf8(text);
 }
@@ -4294,12 +4338,13 @@ bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
 }
 
 std::vector<uint8_t> make_set_stream_options(const StreamOptions& options) {
-    std::vector<uint8_t> payload(5);
+    std::vector<uint8_t> payload(6);
     uint8_t* cursor = payload.data();
     put_u8(cursor, static_cast<uint8_t>(options.codec));
     put_u16(cursor, options.max_fps);
     put_u8(cursor, static_cast<uint8_t>(options.quality));
     put_u8(cursor, static_cast<uint8_t>(options.chroma));
+    put_u8(cursor, options.quality == StreamQuality::Custom ? options.quality_percent : 0);
     return make_control(ControlType::SetStreamOptions, payload);
 }
 
@@ -4309,8 +4354,10 @@ bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions
     uint8_t raw_codec = 0;
     uint8_t raw_quality = 0;
     uint8_t chroma = 0;
+    uint8_t quality_percent = 0;
     if (!reader.u8(raw_codec) || !reader.u16(options.max_fps) ||
-        !reader.u8(raw_quality) || !reader.u8(chroma) || chroma > 1 || !reader.at_end()) {
+        !reader.u8(raw_quality) || !reader.u8(chroma) || chroma > 1 ||
+        !reader.u8(quality_percent) || !reader.at_end()) {
         set_error(error, "malformed SetStreamOptions");
         return false;
     }
@@ -4323,25 +4370,40 @@ bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions
                              " is outside 0.." + std::to_string(kMaxStreamFps));
         return false;
     }
-    if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
+    if (raw_quality > static_cast<uint8_t>(StreamQuality::Custom)) {
         set_error(error, "unknown stream quality " + std::to_string(raw_quality));
+        return false;
+    }
+    if (raw_quality == static_cast<uint8_t>(StreamQuality::Custom)) {
+        if (quality_percent < kMinCustomQualityPercent ||
+            quality_percent > kMaxCustomQualityPercent) {
+            set_error(error, "SetStreamOptions custom quality " +
+                                 std::to_string(quality_percent) + " is outside " +
+                                 std::to_string(kMinCustomQualityPercent) + ".." +
+                                 std::to_string(kMaxCustomQualityPercent));
+            return false;
+        }
+    } else if (quality_percent != 0) {
+        set_error(error, "SetStreamOptions carries a custom quality percent without custom quality");
         return false;
     }
     options.codec = static_cast<StreamCodecPreference>(raw_codec);
     options.quality = static_cast<StreamQuality>(raw_quality);
     options.chroma = static_cast<VideoChroma>(chroma);
+    options.quality_percent = quality_percent;
     return true;
 }
 
 std::vector<uint8_t> make_stream_options_result(const StreamOptionsResult& result) {
     const std::string text = truncate_utf8_reason(result.reason, kMaxStreamOptionReason);
-    std::vector<uint8_t> payload(8 + text.size());
+    std::vector<uint8_t> payload(9 + text.size());
     uint8_t* cursor = payload.data();
     put_u8(cursor, static_cast<uint8_t>(result.code));
     put_u8(cursor, codec_wire(result.codec));
     put_u16(cursor, result.fps);
     put_u8(cursor, static_cast<uint8_t>(result.quality));
     put_u8(cursor, static_cast<uint8_t>(result.chroma));
+    put_u8(cursor, result.quality == StreamQuality::Custom ? result.quality_percent : 0);
     put_u16(cursor, static_cast<uint16_t>(text.size()));
     if (!text.empty()) {
         std::memcpy(cursor, text.data(), text.size());
@@ -4356,9 +4418,11 @@ bool parse_stream_options_result(const std::vector<uint8_t>& payload,
     uint8_t raw_codec = 0;
     uint8_t raw_quality = 0;
     uint8_t chroma = 0;
+    uint8_t quality_percent = 0;
     uint16_t reason_size = 0;
     if (!reader.u8(raw_code) || !reader.u8(raw_codec) || !reader.u16(result.fps) ||
-        !reader.u8(raw_quality) || !reader.u8(chroma) || chroma > 1 || !reader.u16(reason_size) ||
+        !reader.u8(raw_quality) || !reader.u8(chroma) || chroma > 1 ||
+        !reader.u8(quality_percent) || !reader.u16(reason_size) ||
         !reader.string(result.reason, reason_size) || !reader.at_end()) {
         set_error(error, "malformed StreamOptionsResult");
         return false;
@@ -4375,8 +4439,21 @@ bool parse_stream_options_result(const std::vector<uint8_t>& payload,
     if (!valid_video_format(result.codec, result.chroma)) {
         set_error(error, "StreamOptionsResult carries an invalid chroma format"); return false;
     }
-    if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
+    if (raw_quality > static_cast<uint8_t>(StreamQuality::Custom)) {
         set_error(error, "unknown stream quality " + std::to_string(raw_quality));
+        return false;
+    }
+    if (raw_quality == static_cast<uint8_t>(StreamQuality::Custom)) {
+        if (quality_percent < kMinCustomQualityPercent ||
+            quality_percent > kMaxCustomQualityPercent) {
+            set_error(error, "StreamOptionsResult custom quality " +
+                                 std::to_string(quality_percent) + " is outside " +
+                                 std::to_string(kMinCustomQualityPercent) + ".." +
+                                 std::to_string(kMaxCustomQualityPercent));
+            return false;
+        }
+    } else if (quality_percent != 0) {
+        set_error(error, "StreamOptionsResult carries a custom quality percent without custom quality");
         return false;
     }
     if (result.fps > kMaxStreamFps) {
@@ -4394,6 +4471,7 @@ bool parse_stream_options_result(const std::vector<uint8_t>& payload,
     }
     result.code = static_cast<StreamOptionsCode>(raw_code);
     result.quality = static_cast<StreamQuality>(raw_quality);
+    result.quality_percent = quality_percent;
     return true;
 }
 

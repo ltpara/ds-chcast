@@ -599,6 +599,16 @@ func run() error {
 			"public_key", accessIssuer.PublicKeyText())
 	}
 
+	var transportVerifier *acl.TransportVerifier
+	if accessIssuer != nil {
+		// One pinned verifier serves every transport purpose on this node; each
+		// admission site enforces its own audience.
+		transportVerifier = acl.NewTransportVerifier(accessIssuer.Name(), "")
+		if err := transportVerifier.PinKey(accessIssuer.KeyID(), accessIssuer.PublicKeyText()); err != nil {
+			return fmt.Errorf("transport verifier: %w", err)
+		}
+	}
+
 	var (
 		softwareSHA256             string
 		softwareSize               int64
@@ -706,15 +716,20 @@ func run() error {
 	relayAddr := func(port int) string {
 		return net.JoinHostPort(advertised, strconv.Itoa(port))
 	}
-	relayManager, err := relay.NewManager(*relayListen, ports, reg, log,
+	relayOpts := []relay.Option{
 		relay.WithReadBuffer(*rmem),
-		// Every lease requires the per-lease carrier token; it is issued by
-		// the registry and only handed out through an authenticated lookup.
+		// Every lease requires viewer admission; it is issued by the registry
+		// and only handed out through an authenticated lookup. A managed host
+		// refuses the token and needs a transport credential instead.
 		relay.WithViewerTokenRequired(true),
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
 		relay.WithTracer(tracer),
-	)
+	}
+	if transportVerifier != nil {
+		relayOpts = append(relayOpts, relay.WithTransportVerifier(transportVerifier))
+	}
+	relayManager, err := relay.NewManager(*relayListen, ports, reg, log, relayOpts...)
 	if err != nil {
 		return err
 	}
@@ -784,6 +799,9 @@ func run() error {
 		meetOpts = append(meetOpts, rendezvous.WithTCPPunchListen(""))
 	default:
 		meetOpts = append(meetOpts, rendezvous.WithTCPPunchListen(*tcpPunchListen))
+	}
+	if transportVerifier != nil {
+		meetOpts = append(meetOpts, rendezvous.WithTransportVerifier(transportVerifier))
 	}
 	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log, meetOpts...)
 	if err != nil {

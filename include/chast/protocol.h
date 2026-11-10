@@ -54,7 +54,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 66;
+inline constexpr uint16_t kProtocolVersion = 68;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -464,6 +464,13 @@ enum class ControlType : uint16_t {
     // force after the renewal, u16 reason length, UTF-8 reason. A refusal is
     // followed by the host closing the session.
     TicketRenewResult = 82,
+    // Viewer -> host (v68): the viewer's pointer position for the "show my
+    // cursor" hint. Payload: x (i32), y (i32) in virtual-desktop pixels,
+    // flags (u8, bit 0 visible), 3 zero bytes. Draw-only: the host never
+    // feeds these coordinates to the injector, so no kPermissionInput is
+    // needed; admission already authorized the session. Sent at a throttled
+    // rate while the viewer pointer moves.
+    ShowCursor = 83,
 };
 
 // ----- input -----
@@ -664,6 +671,21 @@ struct InputEvent {
     // ModifierBit and LockStateBit.
     uint16_t modifiers = 0;
 };
+
+// ----- show cursor (protocol v68) -----
+//
+// The viewer's pointer position for the host-side "show my cursor" hint.
+// Coordinates use the same virtual-desktop pixel space as InputEvent::mouse,
+// so the host overlay needs no per-display mapping. The hint is draw-only and
+// carries no button state: it can never actuate the host.
+struct ShowCursorHint {
+    int32_t x = 0;
+    int32_t y = 0;
+    bool visible = false;
+};
+std::vector<uint8_t> make_show_cursor(const ShowCursorHint& hint);
+bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint,
+                       std::string* error);
 
 // ----- clipboard -----
 //
@@ -2298,7 +2320,13 @@ enum class StreamQuality : uint8_t {
     High = 0,      // RustDesk Best ratio: 1.5
     Balanced = 1,  // RustDesk Balanced ratio: 0.67
     Smooth = 2,    // RustDesk Low ratio: 0.5
+    // A custom numeric image quality. `quality_percent` carries 10..100, and
+    // the ratio is percent / 50 (RustDesk's custom quality mapping).
+    Custom = 3,
 };
+// RustDesk's custom image-quality range, in percent.
+inline constexpr uint8_t kMinCustomQualityPercent = 10;
+inline constexpr uint8_t kMaxCustomQualityPercent = 100;
 
 // Ok accepts the vote; the returned codec is the globally negotiated result
 // and may differ from this viewer's preference. Unusable votes are retained
@@ -2320,6 +2348,9 @@ struct StreamOptions {
     uint16_t max_fps = 0;
     StreamQuality quality = StreamQuality::High;
     VideoChroma chroma = VideoChroma::Yuv420;
+    // Custom quality in percent, 10..100, meaningful only with
+    // StreamQuality::Custom; preset requests carry 0.
+    uint8_t quality_percent = 0;
 };
 
 struct StreamOptionsResult {
@@ -2332,6 +2363,9 @@ struct StreamOptionsResult {
     StreamQuality quality = StreamQuality::High;
     std::string reason;
     VideoChroma chroma = VideoChroma::Yuv420;
+    // The effective custom quality in percent when `quality` is Custom,
+    // otherwise 0.
+    uint8_t quality_percent = 0;
 };
 
 std::vector<uint8_t> make_set_stream_options(const StreamOptions& options);

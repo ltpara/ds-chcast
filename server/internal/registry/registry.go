@@ -105,9 +105,15 @@ type Host struct {
 	// carrier. It is regenerated per registration lease, so after a restart it
 	// no longer matches on old viewers, similar to RustDesk's relay uuid.
 	CarrierToken string
-	LastSeen     time.Time
-	Registered   time.Time
-	ExpiresAt    time.Time
+	// Managed and PolicyVersion mirror the device policy delivered at
+	// registration. A managed host refuses viewer traffic without a transport
+	// credential, so relay and punch checks read this instead of trusting the
+	// caller to say whether the device is managed.
+	Managed       bool
+	PolicyVersion uint32
+	LastSeen      time.Time
+	Registered    time.Time
+	ExpiresAt     time.Time
 }
 
 type RegisterRequest struct {
@@ -416,6 +422,18 @@ func (r *Registry) SetRemoteRelay(id, node string, port int, host, carrier, carr
 	}
 }
 
+// SetPolicy records the managed marker and policy version delivered on the
+// current registration. Relay and punch admission use it to decide whether a
+// legacy shared credential is still acceptable for this host.
+func (r *Registry) SetPolicy(id string, managed bool, version uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if live, ok := r.hosts[id]; ok {
+		live.Managed = managed
+		live.PolicyVersion = version
+	}
+}
+
 func (r *Registry) Lookup(id string) (Host, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -643,6 +661,10 @@ func (r *Registry) HostOnline(id string) bool {
 // VerifyCarrier checks the shared-carrier token of a live host. The token is
 // what lets many hosts share one TCP port while viewers still reach exactly
 // the host they looked up.
+//
+// A managed host refuses the token outright: its transport admission must be a
+// short-lived transport credential, so assigning a device policy cannot be
+// bypassed with the deployment-wide token.
 func (r *Registry) VerifyCarrier(id, token string) bool {
 	if token == "" {
 		return false
@@ -650,7 +672,7 @@ func (r *Registry) VerifyCarrier(id, token string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	host, ok := r.hosts[id]
-	if !ok || host.CarrierToken == "" || r.now().After(host.ExpiresAt) {
+	if !ok || host.Managed || host.CarrierToken == "" || r.now().After(host.ExpiresAt) {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(host.CarrierToken), []byte(token)) == 1

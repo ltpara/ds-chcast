@@ -176,21 +176,21 @@ func TestPostgresStore(t *testing.T) {
 	if byID.Username != username || byID.Size != 100 {
 		t.Fatalf("recording by id: %+v", byID)
 	}
-	page, err := store.AllRecordings(username, 0, 1)
+	page, err := store.AllRecordings(username, "", 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page) != 1 || page[0].ID != secondID || page[0].Seq == 0 {
 		t.Fatalf("first recording page: %+v", page)
 	}
-	older, err := store.AllRecordings(username, page[0].Seq, 10)
+	older, err := store.AllRecordings(username, "", page[0].Seq, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(older) != 1 || older[0].ID != firstID {
 		t.Fatalf("older recording page: %+v", older)
 	}
-	bytes, files, err := store.RecordingTotals(username)
+	bytes, files, err := store.RecordingTotals(username, "")
 	if err != nil {
 		t.Fatal(err)
 	}

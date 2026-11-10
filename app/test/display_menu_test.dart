@@ -40,6 +40,8 @@ void main() {
     bool followWindow = false,
     VoidCallback? onToggleFollowCursor,
     VoidCallback? onToggleFollowWindow,
+    bool showMyCursor = false,
+    VoidCallback? onToggleShowCursor,
     List<ViewerDisplayMode> modes = const <ViewerDisplayMode>[],
     bool modeChangeAvailable = true,
     ValueChanged<ViewerDisplayMode>? onSelectMode,
@@ -75,9 +77,11 @@ void main() {
     bool streamOptionsAvailable = true,
     ViewerStreamCodec streamCodec = ViewerStreamCodec.auto,
     ViewerStreamQuality streamQuality = ViewerStreamQuality.high,
+    int streamQualityPercent = 50,
     int streamMaxFps = 0,
     ValueChanged<ViewerStreamCodec>? onSelectStreamCodec,
     ValueChanged<ViewerStreamQuality>? onSelectStreamQuality,
+    ValueChanged<int>? onSelectStreamQualityPercent,
     ValueChanged<int>? onSelectStreamFps,
     bool restartAvailable = false,
     bool lockAvailable = false,
@@ -155,6 +159,8 @@ void main() {
           followWindow: followWindow,
           onToggleFollowCursor: onToggleFollowCursor ?? () {},
           onToggleFollowWindow: onToggleFollowWindow ?? () {},
+          showMyCursor: showMyCursor,
+          onToggleShowCursor: onToggleShowCursor,
           onSelectDisplay: onSelect,
           onOpenDisplayWindow: onOpenDisplayWindow,
           onIndependentDisplays: onIndependentDisplays,
@@ -165,9 +171,11 @@ void main() {
           streamOptionsAvailable: streamOptionsAvailable,
           streamCodec: streamCodec,
           streamQuality: streamQuality,
+          streamQualityPercent: streamQualityPercent,
           streamMaxFps: streamMaxFps,
           onSelectStreamCodec: onSelectStreamCodec ?? (_) {},
           onSelectStreamQuality: onSelectStreamQuality ?? (_) {},
+          onSelectStreamQualityPercent: onSelectStreamQualityPercent ?? (_) {},
           onSelectStreamFps: onSelectStreamFps ?? (_) {},
           onToggleControl: () {},
           reverseWheel: reverseWheel,
@@ -351,8 +359,25 @@ void main() {
     expect(cursorTaps, 0);
   });
 
-  testWidgets('follow stays inert on a merged stream', (WidgetTester tester) async {
+  testWidgets('the show-my-cursor toggle reports clicks and marks the state',
+      (WidgetTester tester) async {
     int taps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      showMyCursor: true,
+      onToggleShowCursor: () => ++taps,
+    ));
+
+    expect(find.byIcon(Icons.near_me_rounded), findsOneWidget);
+    expect(find.byTooltip('停止在主机上显示我的光标'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.near_me_rounded));
+    await tester.pumpAndSettle();
+    expect(taps, 1);
+  });
+
+  testWidgets('follow stays inert on a merged stream', (WidgetTester tester) async {    int taps = 0;
     await tester.pumpWidget(toolbar(
       announced: displays,
       active: kViewerDisplayAll,
@@ -595,6 +620,118 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('高清'), findsNothing);
     expect(quality, isNull);
+  });
+
+  testWidgets('the frame cap accepts a typed custom value',
+      (WidgetTester tester) async {
+    int? fps;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      streamMaxFps: 45,
+      onSelectStreamFps: (int value) => fps = value,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('45 fps'), findsOneWidget);
+
+    await tester.tap(find.text('自定义…'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '72');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(fps, 72);
+  });
+
+  testWidgets('an out-of-range custom frame cap stays in the dialog',
+      (WidgetTester tester) async {
+    int? fps;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onSelectStreamFps: (int value) => fps = value,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('自定义…'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '300');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(fps, isNull);
+    expect(find.text('请输入 5–120 之间的整数'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), '120');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(fps, 120);
+  });
+
+  testWidgets('the picture menu accepts a typed custom quality',
+      (WidgetTester tester) async {
+    int? percent;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      streamQualityPercent: 65,
+      onSelectStreamQualityPercent: (int value) => percent = value,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('自定义画质…'));
+    await tester.pumpAndSettle();
+    expect(find.text('自定义画质'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), '72');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(percent, 72);
+  });
+
+  testWidgets('an out-of-range custom quality stays in the dialog',
+      (WidgetTester tester) async {
+    int? percent;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onSelectStreamQualityPercent: (int value) => percent = value,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('自定义画质…'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '5');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(percent, isNull);
+    expect(find.text('请输入 10–100 之间的整数'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), '100');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(percent, 100);
+  });
+
+  testWidgets('the selected custom quality shows its percent',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      streamQuality: ViewerStreamQuality.custom,
+      streamQualityPercent: 65,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('自定义画质（65%）'), findsOneWidget);
   });
 
   testWidgets('the host settings button follows the host grant',

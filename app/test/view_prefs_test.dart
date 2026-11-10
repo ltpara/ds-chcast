@@ -143,6 +143,7 @@ void main() {
         keyboardMode: 'local',
         autoRecord: true,
         recordKeep: 10,
+        showMyCursor: true,
       ),
     );
     final ViewPreferences prefs = ViewPreferences.load();
@@ -158,6 +159,7 @@ void main() {
     expect(prefs.keyboardMode, 'local');
     expect(prefs.autoRecord, isTrue);
     expect(prefs.recordKeep, 10);
+    expect(prefs.showMyCursor, isTrue);
     expect(readFile(), <String, Object?>{
       'view_fit': 1,
       'view_stats': true,
@@ -171,7 +173,16 @@ void main() {
       'view_keyboard_mode': 'local',
       'view_auto_record': true,
       'view_record_keep': 10,
+      'view_show_my_cursor': true,
     });
+  });
+
+  test('show my cursor follows the device and defaults to off', () {
+    expect(ViewPreferences.load().showMyCursor, isFalse);
+    ViewPreferences.update(peerId: 'desk', showMyCursor: true);
+    expect(ViewPreferences.load(peerId: 'desk').showMyCursor, isTrue);
+    expect(ViewPreferences.load(peerId: 'other').showMyCursor, isFalse);
+    expect(readFile().containsKey('view_show_my_cursor'), isFalse);
   });
 
   test('auto record and retention stay shared and reject bad values', () {
@@ -261,6 +272,7 @@ void main() {
       'view_keyboard_mode': 'physical',
       'view_auto_record': false,
       'view_record_keep': 0,
+      'view_show_my_cursor': false,
     });
   });
 

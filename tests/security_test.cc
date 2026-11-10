@@ -27,15 +27,21 @@ std::vector<uint8_t> bytes_of(const std::string& text) {
     return std::vector<uint8_t>(text.begin(), text.end());
 }
 
-std::string temp_path(const char* suffix) {
+std::string temp_root() {
     char directory[MAX_PATH] = {};
     const DWORD length = GetTempPathA(MAX_PATH, directory);
     std::string path = length > 0 ? std::string(directory, length) : std::string(".\\");
     path += "chast-security-test-";
     path += std::to_string(GetCurrentProcessId());
-    path += "-";
-    path += suffix;
     return path;
+}
+
+std::string temp_path(const char* suffix) {
+    // A hardened profile can deny creating files directly in the temp root
+    // while still allowing a subdirectory, so keep the fixtures one level down.
+    const std::string root = temp_root();
+    CreateDirectoryA(root.c_str(), nullptr);
+    return root + "\\" + suffix;
 }
 
 void test_encoding() {
@@ -287,6 +293,7 @@ void test_device_identity() {
     DeleteFileA(path.c_str());
     DeleteFileA(corrupt_path.c_str());
     DeleteFileA((path + ".tmp").c_str());
+    RemoveDirectoryA(temp_root().c_str());
 }
 
 void test_ipv4() {

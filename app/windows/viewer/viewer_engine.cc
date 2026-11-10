@@ -244,6 +244,8 @@ const char* stream_quality_name(chast::StreamQuality quality) {
             return "balanced";
         case chast::StreamQuality::Smooth:
             return "smooth";
+        case chast::StreamQuality::Custom:
+            return "custom";
     }
     return "unknown";
 }
@@ -548,6 +550,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_follow_.reset();
     }
     {
+        std::lock_guard<std::mutex> lock(cursor_hint_mutex_);
+        pending_show_cursor_.reset();
+    }
+    {
         std::lock_guard<std::mutex> lock(stream_option_mutex_);
         pending_stream_options_.reset();
     }
@@ -837,8 +843,28 @@ bool ViewerEngine::SetDisplayFollow(bool cursor, bool window) {
     return true;
 }
 
+bool ViewerEngine::ShowCursor(int32_t x, int32_t y, bool visible) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming) {
+            return false;
+        }
+    }
+    chast::ShowCursorHint hint;
+    hint.x = x;
+    hint.y = y;
+    hint.visible = visible;
+    std::lock_guard<std::mutex> lock(cursor_hint_mutex_);
+    pending_show_cursor_ = hint;
+    return true;
+}
+
 bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
-                                    chast::StreamQuality quality, chast::VideoChroma chroma) {
+                                    chast::StreamQuality quality, chast::VideoChroma chroma,
+                                    uint8_t quality_percent) {
     if (!running_.load(std::memory_order_acquire) || max_fps > chast::kMaxStreamFps || static_cast<unsigned>(chroma) > 1) {
         return false;
     }
@@ -856,6 +882,13 @@ bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t
         case chast::StreamQuality::High:
         case chast::StreamQuality::Balanced:
         case chast::StreamQuality::Smooth:
+            quality_percent = 0;
+            break;
+        case chast::StreamQuality::Custom:
+            if (quality_percent < chast::kMinCustomQualityPercent ||
+                quality_percent > chast::kMaxCustomQualityPercent) {
+                return false;
+            }
             break;
         default:
             return false;
@@ -865,6 +898,7 @@ bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t
     options.chroma = chroma;
     options.max_fps = max_fps;
     options.quality = quality;
+    options.quality_percent = quality_percent;
     std::lock_guard<std::mutex> lock(stream_option_mutex_);
     pending_stream_options_ = options;
     return true;
@@ -2255,6 +2289,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     std::string display_follow_error;
     uint64_t display_follow_results = 0;
     int stream_quality = 0;
+    int stream_quality_percent = 0;
     int stream_option_code = 0;
     std::string stream_option_error;
     uint64_t stream_option_results = 0;
@@ -2664,6 +2699,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.display_follow_error = display_follow_error;
             status_.display_follow_results = display_follow_results;
             status_.stream_quality = stream_quality;
+            status_.stream_quality_percent = stream_quality_percent;
             status_.stream_option_code = stream_option_code;
             status_.stream_option_error = stream_option_error;
             status_.stream_option_results = stream_option_results;
@@ -7766,6 +7802,24 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                  sent.to_string().c_str());
                 };
 
+                // Sends the newest pointer hint. Position updates are frequent,
+                // so only the latest one is worth sending.
+                auto drain_show_cursor = [&] {
+                    std::optional<chast::ShowCursorHint> hint;
+                    {
+                        std::lock_guard<std::mutex> lock(cursor_hint_mutex_);
+                        hint.swap(pending_show_cursor_);
+                    }
+                    if (!hint) {
+                        return;
+                    }
+                    chast::Error sent = session->request_show_cursor(*hint);
+                    if (!sent.ok()) {
+                        std::fprintf(stderr, "viewer: show cursor hint: %s\n",
+                                     sent.to_string().c_str());
+                    }
+                };
+
                 // Adopts every follow state. The host reports the modes in
                 // effect, not the modes requested, so a refusal or a
                 // host-initiated disable returns the menu to reality.
@@ -7837,6 +7891,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                        ? stream_option_code_name(result.code)
                                        : result.reason);
                         stream_quality = static_cast<int>(result.quality);
+                        stream_quality_percent = result.quality_percent;
                         ++stream_option_results;
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
@@ -7844,16 +7899,22 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.stream_option_error = stream_option_error;
                             status_.stream_option_results = stream_option_results;
                             status_.stream_quality = stream_quality;
+                            status_.stream_quality_percent = stream_quality_percent;
                             status_.codec = result.codec;
                             status_.chroma = result.chroma;
                             status_.framerate = result.fps;
+                        }
+                        std::string quality_text = stream_quality_name(result.quality);
+                        if (result.quality == chast::StreamQuality::Custom) {
+                            quality_text +=
+                                " " + std::to_string(result.quality_percent) + "%";
                         }
                         std::fprintf(stderr,
                                      "viewer: stream options %s: %s, %u fps, quality %s%s%s\n",
                                      result.code == chast::StreamOptionsCode::Ok ? "accepted"
                                                                                  : "refused",
                                      codec_name(result.codec).c_str(), result.fps,
-                                     stream_quality_name(result.quality),
+                                     quality_text.c_str(),
                                      stream_option_error.empty() ? "" : ": ",
                                      stream_option_error.c_str());
                     }
@@ -8014,6 +8075,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_display_switch();
                     drain_display_modes();
                     drain_display_follow();
+                    drain_show_cursor();
                     drain_stream_options();
                     {
                         const auto probe_now = Clock::now();

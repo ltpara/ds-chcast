@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/admin"
 	"github.com/ltpara/ds-chcast/server/internal/logging"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
@@ -43,13 +44,20 @@ func run() error {
 		advertise   = flag.String("advertise", "", "host name or IP published to hbbs and peers")
 		advertiseV6 = flag.String("advertise-v6", "", "optional public IPv6 address of the shared carrier; requires --carrier-listen-v6")
 		nodeKey     = flag.String("key", "", "control key shared with hbbs --relay-node-key")
-		nodeID      = flag.String("node-id", "", "node name shown in health and stats")
-		janitor     = flag.Duration("lease-janitor", 5*time.Second, "how often expired leases are released")
-		tlsCert     = flag.String("tls-cert", "", "PEM certificate for the control API; requires --tls-key")
-		tlsKey      = flag.String("tls-key", "", "PEM private key for the control API; requires --tls-cert")
-		tlsClientCA = flag.String("tls-client-ca", "", "PEM CA bundle; when set, HTTPS clients must present a certificate signed by it (mTLS)")
-		adminListen = flag.String("admin-listen", "127.0.0.1:8449", "loopback-only relay console; empty disables it")
-		adminToken  = flag.String("admin-token", "", "secret the relay console requires; empty generates and logs one at startup")
+		// Transport credentials are minted by hbbs. A standalone node must pin
+		// the issuer key to verify relay and carrier admissions; without it the
+		// node keeps the legacy carrier token and refuses any presented
+		// credential.
+		accessIssuer = flag.String("access-issuer", "", "issuer name of the transport credentials hbbs mints; empty keeps the legacy carrier token")
+		accessKeyID  = flag.String("access-kid", "", "key id of the pinned transport issuer; required with --access-issuer")
+		accessKey    = flag.String("access-key", "", "base64url Ed25519 public key of the transport issuer; required with --access-issuer")
+		nodeID       = flag.String("node-id", "", "node name shown in health and stats")
+		janitor      = flag.Duration("lease-janitor", 5*time.Second, "how often expired leases are released")
+		tlsCert      = flag.String("tls-cert", "", "PEM certificate for the control API; requires --tls-key")
+		tlsKey       = flag.String("tls-key", "", "PEM private key for the control API; requires --tls-cert")
+		tlsClientCA  = flag.String("tls-client-ca", "", "PEM CA bundle; when set, HTTPS clients must present a certificate signed by it (mTLS)")
+		adminListen  = flag.String("admin-listen", "127.0.0.1:8449", "loopback-only relay console; empty disables it")
+		adminToken   = flag.String("admin-token", "", "secret the relay console requires; empty generates and logs one at startup")
 
 		singleBandwidth = flag.Float64("relay-single-bandwidth", 128, "per-session relay bandwidth in Mbit/s; 0 disables the limit")
 		totalBandwidth  = flag.Float64("relay-total-bandwidth", 1024, "total relay bandwidth in Mbit/s; 0 disables the limit")
@@ -151,13 +159,26 @@ func run() error {
 	}
 
 	auth := relaynode.NewAuthenticator()
-	manager, err := relay.NewManager(*relayListen, ports, auth, log,
+	relayOpts := []relay.Option{
 		relay.WithReadBuffer(*rmem),
 		relay.WithViewerTokenRequired(true),
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
 		relay.WithTracer(tracer),
-	)
+	}
+	var transportVerifier *acl.TransportVerifier
+	if *accessIssuer != "" || *accessKeyID != "" || *accessKey != "" {
+		if *accessIssuer == "" || *accessKeyID == "" || *accessKey == "" {
+			return errors.New("--access-issuer, --access-kid and --access-key must be set together")
+		}
+		transportVerifier = acl.NewTransportVerifier(*accessIssuer, "")
+		if err := transportVerifier.PinKey(*accessKeyID, *accessKey); err != nil {
+			return fmt.Errorf("--access-key: %w", err)
+		}
+		relayOpts = append(relayOpts, relay.WithTransportVerifier(transportVerifier))
+		log.Info("transport credential verification enabled", "issuer", *accessIssuer, "kid", *accessKeyID)
+	}
+	manager, err := relay.NewManager(*relayListen, ports, auth, log, relayOpts...)
 	if err != nil {
 		return err
 	}
@@ -256,6 +277,7 @@ func run() error {
 		"janitor", *janitor,
 		"rmem", *rmem,
 		"relay_read_buffer", manager.ReadBuffer(),
+		"transport_credentials", transportVerifier != nil,
 	)
 	<-ctx.Done()
 

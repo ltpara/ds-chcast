@@ -148,13 +148,14 @@ func (s *Store) RecordingByID(id string) (Recording, error) {
 }
 
 // AllRecordings lists recordings across accounts newest first, optionally
-// limited to one username. before is the Seq of the last row from the previous
-// page; zero starts at the newest row.
-func (s *Store) AllRecordings(username string, before int64, limit int) ([]Recording, error) {
+// limited to one username and to one account group. before is the Seq of the
+// last row from the previous page; zero starts at the newest row.
+func (s *Store) AllRecordings(username, groupID string, before int64, limit int) ([]Recording, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	username = strings.TrimSpace(username)
+	groupID = strings.TrimSpace(groupID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
@@ -163,8 +164,10 @@ func (s *Store) AllRecordings(username string, before int64, limit int) ([]Recor
 		 FROM recordings r JOIN users u ON u.id = r.user_id
 		 WHERE (? = '' OR lower(u.username) = lower(?))
 		   AND (? = 0 OR r.rowid < ?)
+		   AND (? = '' OR r.user_id IN (SELECT user_id FROM account_group_members WHERE group_id = ?)
+		                OR r.peer_id IN (SELECT peer_id FROM account_group_devices WHERE group_id = ?))
 		 ORDER BY r.rowid DESC LIMIT ?`,
-		username, username, before, before, limit,
+		username, username, before, before, groupID, groupID, groupID, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("account store %s: list all recordings: %w", s.path, err)
@@ -185,9 +188,10 @@ func (s *Store) AllRecordings(username string, before int64, limit int) ([]Recor
 }
 
 // RecordingTotals reports bytes and files across accounts, optionally limited
-// to one username.
-func (s *Store) RecordingTotals(username string) (int64, int, error) {
+// to one username and to one account group.
+func (s *Store) RecordingTotals(username, groupID string) (int64, int, error) {
 	username = strings.TrimSpace(username)
+	groupID = strings.TrimSpace(groupID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var bytes int64
@@ -195,12 +199,41 @@ func (s *Store) RecordingTotals(username string) (int64, int, error) {
 	if err := s.db.QueryRow(
 		`SELECT COALESCE(SUM(r.size), 0), COUNT(*)
 		 FROM recordings r JOIN users u ON u.id = r.user_id
-		 WHERE (? = '' OR lower(u.username) = lower(?))`,
-		username, username,
+		 WHERE (? = '' OR lower(u.username) = lower(?))
+		   AND (? = '' OR r.user_id IN (SELECT user_id FROM account_group_members WHERE group_id = ?)
+		                OR r.peer_id IN (SELECT peer_id FROM account_group_devices WHERE group_id = ?))`,
+		username, username, groupID, groupID, groupID,
 	).Scan(&bytes, &files); err != nil {
 		return 0, 0, fmt.Errorf("account store %s: recording totals: %w", s.path, err)
 	}
 	return bytes, files, nil
+}
+
+// RecordingInGroup reports whether a recording belongs to the group scope: its
+// owner is a group member or it was recorded from a device in the group. An
+// empty group is the unscoped operator view.
+func (s *Store) RecordingInGroup(id, groupID string) (bool, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return true, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var exists int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM recordings r
+		 WHERE r.id = ?
+		   AND (r.user_id IN (SELECT user_id FROM account_group_members WHERE group_id = ?)
+		        OR r.peer_id IN (SELECT peer_id FROM account_group_devices WHERE group_id = ?))`,
+		strings.TrimSpace(id), groupID, groupID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("account store %s: check recording group: %w", s.path, err)
+	}
+	return true, nil
 }
 
 func (s *Store) recordingLocked(userID, id string) (Recording, error) {

@@ -28,6 +28,9 @@
     groupsLoaded: false,
     groupsLoading: false,
     groupEditing: null,
+    tokens: [],
+    tokensLoading: false,
+    tokenSecret: '',
     policies: [],
     policiesLoaded: false,
     policiesLoading: false,
@@ -432,11 +435,13 @@
     const write = can('operator');
     const read = can('readonly');
     const restricted = groupOnly();
+    const tokenAdmin = admin && !restricted && Boolean(state.auth && state.auth.mode === 'account');
     const visibility = {
       overview: read && !restricted,
       devices: read && !restricted,
       policies: admin,
       accounts: admin,
+      tokens: tokenAdmin,
       groups: true,
       recordings: read && !restricted,
       audit: read || restricted,
@@ -477,10 +482,13 @@
     state.policyObjects = [];
     state.policyAssignments = [];
     state.policyObjectEditing = null;
+    state.tokens = [];
+    state.tokenSecret = '';
     clear($('group-rows'));
     clear($('policy-rows'));
     clear($('policy-object-rows'));
     clear($('policy-assignment-rows'));
+    clear($('token-rows'));
     clear($('audit-group'));
     const dialog = $('device-dialog');
     if (dialog.open) dialog.close();
@@ -492,6 +500,9 @@
     if (policyAssignmentDialog.open) policyAssignmentDialog.close();
     const groupDialog = $('group-dialog');
     if (groupDialog.open) groupDialog.close();
+    const tokenSecretDialog = $('token-secret-dialog');
+    if (tokenSecretDialog.open) tokenSecretDialog.close();
+    $('token-secret-value').textContent = '';
     clearSession();
     $('workspace').classList.add('hidden');
     $('session-bar').classList.add('hidden');
@@ -540,6 +551,7 @@
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'policies') loadPolicies().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
+    else if (tab === 'tokens') loadTokens().catch(reportError);
     else if (tab === 'groups') loadGroups().catch(reportError);
     else if (tab === 'recordings') loadRecordings(true).catch(reportError);
     else if (tab === 'audit') loadAudit(true).catch(reportError);
@@ -1485,6 +1497,164 @@
     });
   }
 
+  // ---------- API tokens ----------
+
+  const TOKEN_RESOURCE_LABELS = {
+    devices: '设备',
+    recordings: '录制',
+    audit: '审计',
+    groups: '分组',
+    accounts: '账号',
+    ops: '运维',
+    all: '全部',
+  };
+  const GROUP_SCOPED_RESOURCES = new Set(['devices', 'recordings', 'audit', 'groups']);
+
+  function tokenExpired(token) {
+    const expires = Number(token.expires_at_ms);
+    return Number.isFinite(expires) && expires > 0 && expires <= Date.now();
+  }
+
+  function tokenResources() {
+    return Array.from(document.querySelectorAll('#token-resources input[type="checkbox"]:checked'))
+      .map((node) => node.value);
+  }
+
+  function syncTokenScope() {
+    const group = $('token-group').value;
+    document.querySelectorAll('#token-resources input[type="checkbox"]').forEach((node) => {
+      node.disabled = Boolean(group) && !GROUP_SCOPED_RESOURCES.has(node.value);
+      if (node.disabled) node.checked = false;
+    });
+    $('token-resource-note').textContent = group
+      ? '已选择分组：设备、录制与审计按该分组成员/设备过滤；账号、运维与全部资源不可用于分组令牌。'
+      : '';
+  }
+
+  function renderTokenGroups() {
+    const select = $('token-group');
+    const current = select.value;
+    clear(select);
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = '（不限定分组）';
+    select.appendChild(none);
+    state.groups.forEach((group) => {
+      const option = document.createElement('option');
+      option.value = group.id;
+      option.textContent = group.id + ' · ' + (group.name || group.id);
+      select.appendChild(option);
+    });
+    if (state.groups.some((group) => group.id === current)) select.value = current;
+    syncTokenScope();
+  }
+
+  async function loadTokens(silent) {
+    if (!state.auth || state.auth.mode !== 'account') {
+      state.tokens = [];
+      renderTokens();
+      return state.tokens;
+    }
+    if (state.tokensLoading) return state.tokens;
+    state.tokensLoading = true;
+    try {
+      const data = await api('/v1/api-tokens') || {};
+      state.tokens = Array.isArray(data.tokens) ? data.tokens : [];
+      renderTokenGroups();
+      renderTokens();
+      return state.tokens;
+    } catch (err) {
+      if (!silent) throw err;
+      return state.tokens;
+    } finally {
+      state.tokensLoading = false;
+    }
+  }
+
+  function renderTokens() {
+    const body = $('token-rows');
+    clear(body);
+    const account = Boolean(state.auth && state.auth.mode === 'account');
+    $('token-create-panel').classList.toggle('hidden', !account);
+    $('token-key-note').classList.toggle('hidden', account);
+    if (!account) {
+      $('token-empty').classList.add('hidden');
+      $('token-summary').textContent = '';
+      return;
+    }
+    state.tokens.forEach((token) => body.appendChild(tokenRow(token)));
+    const active = state.tokens.filter((token) => !token.revoked && !tokenExpired(token)).length;
+    $('token-summary').textContent = state.tokens.length
+      ? '共 ' + state.tokens.length + ' 个令牌，' + active + ' 个有效（每个账号最多保留 20 个有效令牌）'
+      : '';
+    $('token-empty').classList.toggle('hidden', state.tokens.length > 0);
+  }
+
+  function tokenRow(token) {
+    const tr = document.createElement('tr');
+    const name = cell(token.name);
+    name.className = 'mono';
+    tr.appendChild(name);
+    tr.appendChild(cell(rolePill(token.role)));
+    const resources = Array.isArray(token.resources) ? token.resources : [];
+    tr.appendChild(cell(resources.map((value) => TOKEN_RESOURCE_LABELS[value] || value).join('、') || '—'));
+    tr.appendChild(cell(token.group_id || '全局'));
+    tr.appendChild(cell(fmtTime(token.created_at_ms)));
+    tr.appendChild(cell(fmtTime(token.expires_at_ms)));
+    tr.appendChild(cell(token.last_used_at_ms ? fmtTime(token.last_used_at_ms) : '从未'));
+    tr.appendChild(cell(token.revoked ? pill('已撤销', 'bad')
+      : tokenExpired(token) ? pill('已过期', 'warn') : pill('有效', 'ok')));
+
+    const actions = el('div', 'actions-wrap');
+    const revoke = button('撤销', 'small danger');
+    revoke.disabled = token.revoked || tokenExpired(token);
+    revoke.addEventListener('click', () => withButton(revoke, async () => {
+      if (!window.confirm('撤销令牌 ' + token.name + '？使用该密钥的集成会立即失效。')) return;
+      await api('/v1/api-tokens/' + encodeURIComponent(token.id), { method: 'DELETE' });
+      toast('已撤销令牌 ' + token.name);
+      await loadTokens();
+    }));
+    actions.appendChild(revoke);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  async function createToken() {
+    const submit = $('token-create').querySelector('button[type="submit"]');
+    const resources = tokenResources();
+    if (!resources.length) {
+      toast('至少选择一个资源', true);
+      return;
+    }
+    const days = Number($('token-ttl-days').value || 0);
+    if (!Number.isFinite(days) || days < 1 || days > 365) {
+      toast('有效期需在 1 到 365 天之间', true);
+      return;
+    }
+    const body = {
+      name: $('token-name').value.trim(),
+      role: $('token-role').value,
+      resources,
+      group_id: $('token-group').value,
+      expires_in_seconds: Math.round(days * 86400),
+    };
+    await withButton(submit, async () => {
+      const reply = await api('/v1/api-tokens', { method: 'POST', body });
+      $('token-name').value = '';
+      if (reply && reply.secret) showTokenSecret(reply.secret);
+      toast('令牌已创建');
+      await loadTokens();
+    });
+  }
+
+  function showTokenSecret(secret) {
+    state.tokenSecret = secret || '';
+    $('token-secret-value').textContent = state.tokenSecret;
+    const dialog = $('token-secret-dialog');
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else window.prompt('令牌密钥（只显示一次）：', state.tokenSecret);
+  }
+
   // ---------- groups ----------
 
   async function loadGroups(silent) {
@@ -1525,6 +1695,7 @@
     state.groups.forEach((group) => body.appendChild(groupRow(group)));
     $('group-empty').classList.toggle('hidden', state.groups.length > 0);
     $('group-readonly').classList.toggle('hidden', can('admin'));
+    renderTokenGroups();
   }
 
   function groupRow(group) {
@@ -2237,6 +2408,27 @@
       toast('已刷新');
     }));
 
+    $('token-create').addEventListener('submit', (event) => {
+      event.preventDefault();
+      createToken();
+    });
+    $('token-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadTokens();
+      toast('已刷新');
+    }));
+    $('token-group').addEventListener('change', syncTokenScope);
+    $('token-secret-copy').addEventListener('click', () => {
+      if (!state.tokenSecret) {
+        toast('没有可复制的密钥', true);
+        return;
+      }
+      copyText(state.tokenSecret);
+    });
+    $('token-secret-dialog').addEventListener('close', () => {
+      state.tokenSecret = '';
+      $('token-secret-value').textContent = '';
+    });
+
     $('group-create').addEventListener('submit', (event) => {
       event.preventDefault();
       createGroup();
@@ -2282,6 +2474,19 @@
     $('audit-more').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
       await loadAudit(false);
     }));
+    $('audit-emergency').addEventListener('click', () => {
+      // Emergency grants are account audit events; switch to that subtab and
+      // filter by the dedicated action so an operator sees every override.
+      state.auditTab = 'events';
+      document.querySelectorAll('.subtab').forEach((node) => {
+        node.classList.toggle('active', node.dataset.audit === 'events');
+      });
+      $('audit-filter').placeholder = AUDIT.events.filterPlaceholder;
+      $('audit-host').classList.add('hidden');
+      $('audit-host').value = '';
+      $('audit-filter').value = 'emergency_access';
+      loadAudit(true).catch(reportError);
+    });
     $('audit-csv').addEventListener('click', (event) => withButton(event.currentTarget, exportAudit));
     $('audit-group').addEventListener('change', () => loadAudit(true).catch(reportError));
     [$('audit-filter'), $('audit-host')].forEach((input) => {

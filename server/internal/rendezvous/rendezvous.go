@@ -7,6 +7,8 @@
 package rendezvous
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
@@ -52,6 +55,7 @@ type options struct {
 	tcpPunchListen    string
 	relayOnly         func() bool
 	hostCarrierLinked func(string) bool
+	transport         *acl.TransportVerifier
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -122,6 +126,13 @@ func WithHostCarrierLinked(linked func(string) bool) Option {
 	return func(o *options) { o.hostCarrierLinked = linked }
 }
 
+// WithTransportVerifier makes punch coordination accept short-lived transport
+// credentials. A managed host then refuses the legacy shared-key HMAC, so an
+// account deployment never falls back to a deployment-wide punch secret.
+func WithTransportVerifier(verifier *acl.TransportVerifier) Option {
+	return func(o *options) { o.transport = verifier }
+}
+
 type Server struct {
 	conn      *net.UDPConn
 	reg       *registry.Registry
@@ -144,6 +155,7 @@ type Server struct {
 	readBuffer        int
 	relayOnly         func() bool
 	hostCarrierLinked func(string) bool
+	transport         *acl.TransportVerifier
 	// tcpPunch is nil when the coordination listener is disabled or could not
 	// bind; punching then stays on UDP.
 	tcpPunch  *tcpPuncher
@@ -187,6 +199,7 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		readBuffer:        readBuffer,
 		relayOnly:         cfg.relayOnly,
 		hostCarrierLinked: cfg.hostCarrierLinked,
+		transport:         cfg.transport,
 		done:              make(chan struct{}),
 	}
 	server.startTCPPunch(cfg)
@@ -385,7 +398,8 @@ func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	s.reply(src, ack)
 }
 
-func (s *Server) relayFor(host registry.Host) string {	if host.RelayPort == 0 {
+func (s *Server) relayFor(host registry.Host) string {
+	if host.RelayPort == 0 {
 		return ""
 	}
 	if host.RelayHost != "" {
@@ -394,19 +408,57 @@ func (s *Server) relayFor(host registry.Host) string {	if host.RelayPort == 0 {
 	return s.relayAddr(host.RelayPort)
 }
 
-// checkViewerPunch verifies the viewer half of a punch. Ordinary viewers hold
-// the link key; the management key remains accepted for operators and older
-// clients. With neither key configured, coordination stays public.
-func (s *Server) checkViewerPunch(id, nonce, auth string, stamp int64, now time.Time) bool {
+// checkViewerPunch verifies the viewer half of a punch. A transport
+// credential, when presented, is authoritative: an invalid one never falls
+// back to the legacy keys. A managed host always requires a credential, so
+// device policy can never be bypassed with the deployment-wide punch secret;
+// unmanaged devices keep the historical shared-key behavior.
+func (s *Server) checkViewerPunch(msg wire.Message, now time.Time) bool {
+	if s.verifyTransportPunch(msg, now) {
+		return true
+	}
+	if msg.Transport != "" {
+		return false
+	}
+	if host, ok := s.reg.Lookup(msg.HostID); ok && host.Managed {
+		return false
+	}
 	if s.linkKey != "" &&
-		identity.CheckPunchAuth(s.linkKey, id, nonce, auth, stamp, now, punchAuthWindow) {
+		identity.CheckPunchAuth(s.linkKey, msg.HostID, msg.Nonce, msg.Auth, msg.Timestamp, now, punchAuthWindow) {
 		return true
 	}
 	if s.serverKey != "" &&
-		identity.CheckPunchAuth(s.serverKey, id, nonce, auth, stamp, now, punchAuthWindow) {
+		identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth, msg.Timestamp, now, punchAuthWindow) {
 		return true
 	}
 	return s.linkKey == "" && s.serverKey == ""
+}
+
+// verifyTransportPunch validates the signed credential and the viewer's proof
+// of possession. The proof covers the fresh nonce and timestamp, so a captured
+// credential cannot be presented by another party.
+func (s *Server) verifyTransportPunch(msg wire.Message, now time.Time) bool {
+	if s.transport == nil || msg.Transport == "" || msg.TransportProof == "" || msg.Timestamp <= 0 {
+		return false
+	}
+	stale := now.Unix() - msg.Timestamp
+	if stale < 0 {
+		stale = -stale
+	}
+	if stale > int64(punchAuthWindow/time.Second) {
+		return false
+	}
+	signed, err := base64.RawURLEncoding.DecodeString(msg.Transport)
+	if err != nil {
+		return false
+	}
+	ticket, err := s.transport.Verify(signed, now)
+	if err != nil || ticket.HostID != msg.HostID ||
+		ticket.Audience != acl.TransportAudiencePunch {
+		return false
+	}
+	message := identity.TransportProofMessage(ticket.Audience, ticket.HostID, msg.Nonce, msg.Timestamp)
+	return identity.Verify(ed25519.PublicKey(ticket.ClientPublicKey[:]), message, msg.TransportProof)
 }
 
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
@@ -446,7 +498,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
-	if !s.checkViewerPunch(msg.HostID, msg.Nonce, msg.Auth, msg.Timestamp, time.Now()) {
+	if !s.checkViewerPunch(msg, time.Now()) {
 		result = "auth_failed"
 		reply.Error = "punch authentication failed"
 		s.reply(src, reply)

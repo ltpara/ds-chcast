@@ -37,8 +37,10 @@
 #include "chast/privacy.h"
 #include "chast/sas.h"
 #include "chast/security.h"
+#include "chast/show_cursor.h"
 #include "chast/terminal_relay.h"
 #include "chast/virtual_display.h"
+#include "chast/wallpaper.h"
 
 namespace chast {
 
@@ -388,6 +390,8 @@ const char* stream_quality_name(StreamQuality quality) {
             return "balanced";
         case StreamQuality::Smooth:
             return "smooth";
+        case StreamQuality::Custom:
+            return "custom";
     }
     return "unknown";
 }
@@ -1027,6 +1031,15 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
     }
     server->permission_policy_ = std::make_shared<std::atomic<PermissionMask>>(
         server->policy_permissions());
+    if (!server->settings_.wallpaper_state.empty()) {
+        // A previous host may have been killed before it put the wallpaper
+        // back; the backup file outlives the process for exactly this case.
+        std::string wallpaper_error;
+        if (!restore_abandoned_wallpaper(server->settings_.wallpaper_state,
+                                         &wallpaper_error)) {
+            server->log("restore wallpaper from the last run failed: " + wallpaper_error);
+        }
+    }
     if (!server->open_session(error)) {
         return nullptr;
     }
@@ -2026,6 +2039,17 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
         if (!power_request || !power_error.empty())
             log("keep awake: " + (power_error.empty() ? std::string("power request unavailable") : power_error));
     }
+    std::unique_ptr<WallpaperRemoval> wallpaper;
+    if (settings_.remove_wallpaper && mode == SessionMode::Desktop) {
+        std::string wallpaper_error;
+        wallpaper = config_.wallpaper_remover
+                        ? config_.wallpaper_remover(&wallpaper_error)
+                        : create_wallpaper_removal(settings_.wallpaper_state, &wallpaper_error);
+        if (!wallpaper) {
+            log("remove wallpaper: " +
+                (wallpaper_error.empty() ? std::string("unavailable") : wallpaper_error));
+        }
+    }
     // A new viewer starts with a fresh idle clock; the time it spent waiting
     // for approval or a first frame is not idleness.
     touch_viewer_activity();
@@ -2105,6 +2129,12 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
                         : mode == SessionMode::Desktop
                               ? stream_session(stats, error, peer_left)
                               : control_session(mode, stats, error, peer_left));
+    if (wallpaper) {
+        std::string restore_error;
+        if (!wallpaper->restore(&restore_error)) {
+            log("restore wallpaper: " + restore_error);
+        }
+    }
 
     bool operator_disconnected = false;
     {
@@ -2909,6 +2939,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // revoked mid-session, so both are checked before acting.
     std::unique_ptr<PrivacyOverlay> privacy_overlay;
     bool privacy_active = false;
+    // The viewer's pointer hint is drawn on the host desktop on demand. A
+    // machine without an interactive desktop simply stays without a hint;
+    // the failure is logged once and never blocks the session.
+    std::unique_ptr<CursorHintOverlay> cursor_overlay;
+    bool cursor_overlay_failed = false;
     // Assigned with the capture-rebuild helpers below: restoring a virtual
     // display topology must wait for GPU capture to work again, and those
     // helpers need the pointer state declared later in this function. The
@@ -3035,6 +3070,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     VideoChroma chroma_preference = session_->chroma_preference();
     StreamQuality stream_quality = settings_.quality >= 1.5f ? StreamQuality::High :
         settings_.quality >= 0.67f ? StreamQuality::Balanced : StreamQuality::Smooth;
+    uint8_t stream_quality_percent = 0;
     uint16_t stream_fps_cap = 0;
     auto fps_ceiling = [&]() -> uint16_t {
         return stream_fps_cap == 0 ? configured_fps : std::min(configured_fps, stream_fps_cap);
@@ -4911,6 +4947,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             result.chroma = encoder ? encoder->chroma() : VideoChroma::Yuv420;
             result.fps = fps_ceiling();
             result.quality = stream_quality;
+            result.quality_percent =
+                stream_quality == StreamQuality::Custom ? stream_quality_percent : 0;
             result.reason = reason;
             Error sent = session_->send_stream_options_result(result);
             if (sent.ok()) {
@@ -4935,7 +4973,26 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         const bool preference_change = options.codec != codec_preference || options.chroma != chroma_preference;
         // Re-selecting the same preset is an intentional vote: another viewer
         // may have changed global quality since this connection selected it.
-        const bool quality_change = options.quality != stream_quality || (!cap_change && !preference_change);
+        const bool custom_quality = options.quality == StreamQuality::Custom;
+        const bool quality_change =
+            options.quality != stream_quality ||
+            (custom_quality && options.quality_percent != stream_quality_percent) ||
+            (!cap_change && !preference_change);
+        auto vote_quality = [&] {
+            if (!quality_change) {
+                quality_peer->options(options.max_fps, std::nullopt);
+            } else if (custom_quality) {
+                quality_peer->options(options.max_fps, std::nullopt,
+                                      options.quality_percent / 50.0f);
+            } else {
+                quality_peer->options(
+                    options.max_fps,
+                    std::optional<VideoQos::Quality>(
+                        options.quality == StreamQuality::High ? VideoQos::Quality::High :
+                        options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced :
+                        VideoQos::Quality::Smooth));
+            }
+        };
         if (!quality_change && !cap_change && !preference_change) {
             return answer(StreamOptionsCode::Ok, std::string());
         }
@@ -4944,13 +5001,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             std::string failure;
             if (!DesktopStreamPool::vote_peer(*codec_peer, codec_vote(options.codec), &failure, options.chroma))
                 return refuse(StreamOptionsCode::Failed, failure);
-            quality_peer->options(options.max_fps, quality_change
-                ? std::optional<VideoQos::Quality>(options.quality == StreamQuality::High ? VideoQos::Quality::High :
-                    options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced : VideoQos::Quality::Smooth)
-                : std::nullopt);
+            vote_quality();
             codec_preference = options.codec;
             chroma_preference = options.chroma;
             stream_quality = options.quality;
+            stream_quality_percent = custom_quality ? options.quality_percent : 0;
             stream_fps_cap = options.max_fps;
             return answer(StreamOptionsCode::Ok, {});
         }
@@ -4981,14 +5036,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             chroma_preference = options.chroma;
         }
 
-        quality_peer->options(options.max_fps, quality_change
-            ? std::optional<VideoQos::Quality>(options.quality == StreamQuality::High ? VideoQos::Quality::High :
-                options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced : VideoQos::Quality::Smooth)
-            : std::nullopt);
+        vote_quality();
         auto shared_rate = encoder->set_rate(0, 0);
         if (!shared_rate.ok()) log("shared video rate: " + shared_rate.to_string());
         applied = applied || encoder->bitrate() != previous_rate || encoder->framerate() != previous_fps;
         stream_quality = options.quality;
+        stream_quality_percent = custom_quality ? options.quality_percent : 0;
         stream_fps_cap = options.max_fps;
 
         if (applied) {
@@ -5006,10 +5059,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
             }
+            std::string quality_text = stream_quality_name(stream_quality);
+            if (stream_quality == StreamQuality::Custom) {
+                quality_text += " " + std::to_string(stream_quality_percent) + "%";
+            }
             log("stream options: " + std::string(codec_name(encoder->codec())) + ", " +
                 std::to_string(stream_info.bitrate / 1000u) + " kbps at " +
-                std::to_string(framerate) + " fps, quality " +
-                stream_quality_name(stream_quality) +
+                std::to_string(framerate) + " fps, quality " + quality_text +
                 (stream_fps_cap == 0
                      ? ""
                      : " (viewer cap " + std::to_string(stream_fps_cap) + " fps)"));
@@ -5590,6 +5646,32 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (session_->take_capture_displays_request(display_subscriptions)) {
             touch_viewer_activity();
             if (!capture_displays(display_subscriptions)) { drain_peer(stats); return error->empty(); }
+        }
+        ShowCursorHint cursor_hint;
+        if (session_->take_show_cursor_hint(cursor_hint)) {
+            touch_viewer_activity();
+            if (!cursor_hint.visible) {
+                if (cursor_overlay) {
+                    cursor_overlay->hide();
+                }
+            } else {
+                if (!cursor_overlay && !cursor_overlay_failed) {
+                    std::string overlay_error;
+                    cursor_overlay = CursorHintOverlay::create(&overlay_error);
+                    if (!cursor_overlay) {
+                        cursor_overlay_failed = true;
+                        log("show-cursor hint is unavailable: " + overlay_error);
+                    }
+                }
+                if (cursor_overlay) {
+                    std::string overlay_error;
+                    if (!cursor_overlay->move(cursor_hint.x, cursor_hint.y, &overlay_error)) {
+                        cursor_overlay.reset();
+                        cursor_overlay_failed = true;
+                        log("show-cursor hint failed: " + overlay_error);
+                    }
+                }
+            }
         }
         uint16_t switch_index = kDisplayAuto;
         if (session_->take_display_switch_request(switch_index)) {
@@ -7650,6 +7732,11 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
                 config_.adaptive_bitrate, config_.adaptive_fps);
             CameraRelay::Subscription result;
             result.quality = [quality](const StreamOptions& options) {
+                if (options.quality == StreamQuality::Custom) {
+                    quality->options(options.max_fps, std::nullopt,
+                                     options.quality_percent / 50.0f);
+                    return;
+                }
                 quality->options(options.max_fps,
                     options.quality == StreamQuality::High ? VideoQos::Quality::High :
                     options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced :
@@ -8384,9 +8471,25 @@ void HostServer::handle_voice_call_requests(HostServerStats& stats) {
         std::string setup_error;
         std::unique_ptr<IMicrophoneCapture> capture;
         if (allowed) {
-            capture = config_.voice_capture
-                          ? config_.voice_capture(&setup_error)
-                          : create_microphone_capture(MicrophoneCaptureConfig{}, &setup_error);
+            MicrophoneCaptureConfig microphone_config;
+            microphone_config.device_id = settings_.voice_microphone;
+            if (config_.voice_capture) {
+                capture = config_.voice_capture(microphone_config, &setup_error);
+            } else {
+                capture = create_microphone_capture(microphone_config, &setup_error);
+            }
+            if (!capture && !microphone_config.device_id.empty()) {
+                // A pinned device can be unplugged between calls. The call
+                // falls back to the default communications microphone instead
+                // of failing; the operator log names the substitute so the
+                // recording route does not silently change.
+                log("voice call: microphone '" + microphone_config.device_id +
+                    "' is unavailable; using the default communications device");
+                microphone_config.device_id.clear();
+                capture = config_.voice_capture
+                              ? config_.voice_capture(microphone_config, &setup_error)
+                              : create_microphone_capture(microphone_config, &setup_error);
+            }
             if (capture) {
                 capture->start();
                 if (capture->failed()) {

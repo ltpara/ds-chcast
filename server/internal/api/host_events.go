@@ -256,7 +256,8 @@ func viewRevokedAccessKid(record account.RevokedAccessKid) revokedAccessKidView 
 }
 
 func (s *server) listRevokedAccessKids(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceDevices); !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
 	records, err := s.cfg.Accounts.RevokedAccessKids()
@@ -282,10 +283,11 @@ type revokeAccessKidRequest struct {
 // push ends sessions that are already running instead of waiting for their
 // 60-second lease to lapse.
 func (s *server) revokeAccessKid(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceDevices)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	var req revokeAccessKidRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

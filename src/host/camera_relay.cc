@@ -185,7 +185,10 @@ void CameraRelay::Worker::run(LUID adapter, CameraRelayConfig config, CameraDevi
     effective.fps = static_cast<uint16_t>(config.framerate);
     effective.quality = config.quality_ratio >= 1.0f ? StreamQuality::High :
         config.quality_ratio >= 0.6f ? StreamQuality::Balanced : StreamQuality::Smooth;
-    if (initial_options) effective.quality = initial_options->quality;
+    if (initial_options) {
+        effective.quality = initial_options->quality;
+        effective.quality_percent = initial_options->quality_percent;
+    }
     while (!stop.load()) {
         std::optional<StreamOptions> options;
         { std::lock_guard<std::mutex> lock(mutex); options.swap(pending_options); }
@@ -205,6 +208,8 @@ void CameraRelay::Worker::run(LUID adapter, CameraRelayConfig config, CameraDevi
                 effective.chroma = encoder->chroma();
                 effective.fps = static_cast<uint16_t>(encoder->framerate());
                 effective.quality = options->quality;
+                effective.quality_percent =
+                    options->quality == StreamQuality::Custom ? options->quality_percent : 0;
                 result = effective;
                 if (changed) resync();
             } else {

@@ -575,6 +575,9 @@ struct ViewerStatus {
     // it. `stream_option_results` counts answers (including local send
     // failures), so the UI can pair one answer with a poll.
     int stream_quality = 0;
+    // The effective custom image quality in percent when stream_quality is
+    // Custom (3), otherwise 0.
+    int stream_quality_percent = 0;
     int stream_option_code = 0;
     std::string stream_option_error;
     uint64_t stream_option_results = 0;
@@ -772,6 +775,12 @@ public:
     // through display_follow_flags/display_follow_code, which the menu reads;
     // a merged stream is refused because it already shows every display.
     bool SetDisplayFollow(bool cursor, bool window);
+    // Queues the viewer pointer position drawn on the host desktop ("show my
+    // cursor"). Returns false when no session is streaming. No input
+    // permission is required: the hint is draw-only and never injected. Only
+    // the newest position is kept, so a fast pointer does not build a backlog;
+    // visible=false hides the host-side pointer.
+    bool ShowCursor(int32_t x, int32_t y, bool visible);
     // Queues stream preferences: encoder choice, frame-rate cap and quality
     // preset. Returns false when no session is running or a value is outside
     // its wire range. Accepted as soon as the session starts, before the first
@@ -781,7 +790,8 @@ public:
     // actually runs in codec/framerate/stream_quality (so a refusal also
     // returns the menus to reality). No input permission is required.
     bool SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
-                          chast::StreamQuality quality, chast::VideoChroma chroma = chast::VideoChroma::Yuv420);
+                          chast::StreamQuality quality, chast::VideoChroma chroma = chast::VideoChroma::Yuv420,
+                          uint8_t quality_percent = 0);
     // Pauses or resumes the native rich-clipboard bridge. While paused neither
     // direction touches the local clipboard; resuming starts from a fresh
     // baseline, so whatever changed in between is not flushed to the host.
@@ -1520,6 +1530,11 @@ private:
     // matters, so an unsent request is replaced rather than queued.
     mutable std::mutex follow_mutex_;
     std::optional<uint8_t> pending_follow_;
+
+    // Cursor hints are a snapshot too: only the latest pointer position
+    // matters to the host overlay.
+    mutable std::mutex cursor_hint_mutex_;
+    std::optional<chast::ShowCursorHint> pending_show_cursor_;
 
     // Stream preferences are a snapshot, not a queue: the operator wants the
     // menu's last choice applied, not every intermediate one.

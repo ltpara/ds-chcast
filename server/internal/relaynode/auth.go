@@ -28,6 +28,7 @@ type lease struct {
 	pubText string
 	pub     ed25519.PublicKey
 	token   string
+	managed bool
 	port    int
 	expires time.Time
 }
@@ -85,7 +86,9 @@ func (a *Authenticator) Lookup(id string) (LeaseInfo, bool) {
 
 // Put creates or renews a lease for an already allocated port. Reusing a live
 // id with a different key is refused; an expired id may be bound to a new key.
-func (a *Authenticator) Put(id, pubText, token string, port int, ttl time.Duration) (LeaseInfo, error) {
+// The managed flag is recomputed by hbbs on every renewal, so a device policy
+// assignment reaches the node within one host registration TTL.
+func (a *Authenticator) Put(id, pubText, token string, managed bool, port int, ttl time.Duration) (LeaseInfo, error) {
 	pub, err := identity.ParsePublicKey(pubText)
 	if err != nil {
 		return LeaseInfo{}, err
@@ -101,6 +104,7 @@ func (a *Authenticator) Put(id, pubText, token string, port int, ttl time.Durati
 		pubText: pubText,
 		pub:     pub,
 		token:   token,
+		managed: managed,
 		port:    port,
 		expires: now.Add(ttl),
 	}
@@ -181,6 +185,9 @@ func (a *Authenticator) HostOnline(id string) bool {
 	return a.liveLocked(id, a.now()) != nil
 }
 
+// VerifyCarrier checks the legacy carrier token. A managed host never accepts
+// it: only a short-lived transport credential can admit a viewer to a managed
+// device, exactly as the in-process registry enforces.
 func (a *Authenticator) VerifyCarrier(id, token string) bool {
 	if token == "" {
 		return false
@@ -188,7 +195,7 @@ func (a *Authenticator) VerifyCarrier(id, token string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	entry := a.liveLocked(id, a.now())
-	if entry == nil || entry.token == "" {
+	if entry == nil || entry.managed || entry.token == "" {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(entry.token), []byte(token)) == 1

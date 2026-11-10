@@ -652,6 +652,36 @@ func (s *Store) GroupDevices(groupID string) ([]GroupDevice, error) {
 	return out, nil
 }
 
+// DeviceInGroup reports whether peerID is a member of the group. An empty
+// group is the unscoped console view and admits every device.
+func (s *Store) DeviceInGroup(groupID, peerID string) (bool, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return true, nil
+	}
+	if !registry.ValidID(groupID) {
+		return false, ErrInvalidAccountGroupID
+	}
+	peerID = strings.TrimSpace(peerID)
+	if !registry.ValidID(peerID) {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var exists int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM account_group_devices WHERE group_id = ? AND peer_id = ?`,
+		groupID, peerID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("account store %s: check group device: %w", s.path, err)
+	}
+	return true, nil
+}
+
 func (s *Store) AddGroupDevice(groupID, peerID, addedBy string) (GroupDevice, error) {
 	groupID = strings.TrimSpace(groupID)
 	if !registry.ValidID(groupID) {

@@ -223,6 +223,20 @@ type lookupAccessTicket struct {
 	Subject       string `json:"subject"`
 }
 
+func (s *server) accessTicketView(grant accessTicketGrant) *lookupAccessTicket {
+	return &lookupAccessTicket{
+		Ticket:        base64.RawURLEncoding.EncodeToString(grant.signed),
+		IssuedAtMS:    grant.issuedAt.UnixMilli(),
+		ExpiresAtMS:   grant.expiresAt.UnixMilli(),
+		ExpiresInMS:   grant.expiresAt.Sub(grant.issuedAt).Milliseconds(),
+		PolicyVersion: grant.policyVersion,
+		Permissions:   grant.permissions,
+		Issuer:        s.accessIssuer.Name(),
+		KeyID:         s.accessIssuer.KeyID(),
+		Subject:       grant.subject,
+	}
+}
+
 // attachLookupTicket fills resp.AccessTicket when the lookup carries the
 // ephemeral Ed25519 public key (`client_public_key`) of the connection the
 // viewer is about to open. A shared deployment credential has no account
@@ -298,16 +312,138 @@ func (s *server) attachLookupTicket(w http.ResponseWriter, r *http.Request,
 		"issued lookup ticket for "+peerID+" policy "+
 			strconv.FormatUint(uint64(grant.policyVersion), 10)+" permissions "+
 			strconv.FormatUint(uint64(grant.permissions), 10), true)
-	resp.AccessTicket = &lookupAccessTicket{
-		Ticket:        base64.RawURLEncoding.EncodeToString(grant.signed),
-		IssuedAtMS:    grant.issuedAt.UnixMilli(),
-		ExpiresAtMS:   grant.expiresAt.UnixMilli(),
-		ExpiresInMS:   grant.expiresAt.Sub(grant.issuedAt).Milliseconds(),
-		PolicyVersion: grant.policyVersion,
-		Permissions:   grant.permissions,
-		Issuer:        s.accessIssuer.Name(),
-		KeyID:         s.accessIssuer.KeyID(),
-		Subject:       grant.subject,
+	resp.AccessTicket = s.accessTicketView(grant)
+	return true
+}
+
+// lookupTransportTicket is one transport admission credential. The payload is
+// opaque to the viewer: the Go agent carries it to the transport node and
+// proves possession of the bound key.
+type lookupTransportTicket struct {
+	Ticket        string `json:"ticket"`
+	Audience      string `json:"audience"`
+	IssuedAtMS    int64  `json:"issued_at_ms"`
+	ExpiresAtMS   int64  `json:"expires_at_ms"`
+	ExpiresInMS   int64  `json:"expires_in_ms"`
+	PolicyVersion uint32 `json:"policy_version"`
+	Issuer        string `json:"issuer"`
+	KeyID         string `json:"kid"`
+	Subject       string `json:"subject"`
+}
+
+// transportCredentials is the rendered credential for each transport purpose.
+type transportCredentials struct {
+	punch   *lookupTransportTicket
+	relay   *lookupTransportTicket
+	carrier *lookupTransportTicket
+}
+
+// mintTransportCredentials signs one short-lived credential per transport
+// audience. The caller has already checked the issuer state and admission.
+func (s *server) mintTransportCredentials(peerID, subject string,
+	admission account.DeviceAdmission, clientKey []byte, now time.Time) (transportCredentials, error) {
+	var out transportCredentials
+	slots := [...]**lookupTransportTicket{&out.punch, &out.relay, &out.carrier}
+	expires := now.Add(accessTicketLifetime)
+	for i, audience := range []string{
+		acl.TransportAudiencePunch,
+		acl.TransportAudienceRelay,
+		acl.TransportAudienceCarrier,
+	} {
+		id, err := randomTicketID()
+		if err != nil {
+			return transportCredentials{}, err
+		}
+		ticket := acl.TransportTicket{
+			Audience:      audience,
+			HostID:        peerID,
+			Subject:       subject,
+			PolicyVersion: admission.PolicyVersion,
+			IssuedAt:      now.Unix(),
+			NotBefore:     now.Unix(),
+			ExpiresAt:     expires.Unix(),
+			ID:            id,
+		}
+		copy(ticket.ClientPublicKey[:], clientKey)
+		signed, err := s.accessIssuer.SignTransport(ticket, now)
+		if err != nil {
+			return transportCredentials{}, err
+		}
+		*slots[i] = &lookupTransportTicket{
+			Ticket:        base64.RawURLEncoding.EncodeToString(signed),
+			Audience:      audience,
+			IssuedAtMS:    now.UnixMilli(),
+			ExpiresAtMS:   expires.UnixMilli(),
+			ExpiresInMS:   expires.Sub(now).Milliseconds(),
+			PolicyVersion: admission.PolicyVersion,
+			Issuer:        s.accessIssuer.Name(),
+			KeyID:         s.accessIssuer.KeyID(),
+			Subject:       subject,
+		}
 	}
+	return out, nil
+}
+
+// attachLookupTransport fills the punch, relay and carrier credentials when
+// the lookup carries the agent's ephemeral transport_public_key. Transport
+// credentials are deliberately separate from access tickets: they bind a
+// transport purpose, never application permissions, and the host still runs
+// the full access-ticket handshake afterwards.
+func (s *server) attachLookupTransport(w http.ResponseWriter, r *http.Request,
+	subject lookupSubject, peerID string, resp *lookupResponse) bool {
+	rawKey := strings.TrimSpace(r.URL.Query().Get("transport_public_key"))
+	if rawKey == "" {
+		return true
+	}
+	clientKey, err := base64.RawURLEncoding.DecodeString(rawKey)
+	if err != nil || len(clientKey) != 32 {
+		writeError(w, http.StatusBadRequest, "transport_public_key must be 32 base64url bytes")
+		return false
+	}
+	if s.cfg.Accounts == nil {
+		return true
+	}
+	admission, err := s.cfg.Accounts.CheckDeviceAdmission(peerID, subject.UserID)
+	if err != nil {
+		s.cfg.Logger.Error("lookup transport admission", "id", peerID, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not check the device policy")
+		return false
+	}
+	if !admission.Allowed {
+		writeError(w, http.StatusForbidden, admission.Reason)
+		return false
+	}
+	if s.accessIssuer == nil {
+		// Without an issuer a deployment keeps the legacy shared-key punch and
+		// carrier token. A managed device must not silently fall back, because
+		// its transport checks require a central credential.
+		if admission.Managed {
+			writeError(w, http.StatusServiceUnavailable, errTicketNotConfigured.Error())
+			return false
+		}
+		return true
+	}
+	if s.accessIssuerRevoked() {
+		writeError(w, http.StatusServiceUnavailable, "the access ticket issuer key has been revoked")
+		return false
+	}
+	subjectText := subject.UserID
+	switch {
+	case subjectText != "":
+	case subject.Management:
+		subjectText = "management"
+	default:
+		subjectText = "shared"
+	}
+	now := time.Now().UTC()
+	credentials, err := s.mintTransportCredentials(peerID, subjectText, admission, clientKey, now)
+	if err != nil {
+		s.cfg.Logger.Error("lookup transport ticket", "id", peerID, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not mint the transport ticket")
+		return false
+	}
+	resp.TransportPunch = credentials.punch
+	resp.TransportRelay = credentials.relay
+	resp.TransportCarrier = credentials.carrier
 	return true
 }

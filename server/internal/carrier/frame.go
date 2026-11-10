@@ -60,12 +60,22 @@ type HostAuth struct {
 	Signature string `json:"signature"`
 }
 
-// SharedViewerHello selects a host on the shared carrier. The token comes from
-// the authenticated lookup; raw TCP sends it as a line after MagicViewer and
-// WebSocket sends it as the first binary message.
+// SharedViewerHello selects a host on the shared carrier. Raw TCP sends it as
+// a line after MagicViewer and WebSocket sends it as the first binary message.
+//
+// A viewer presents either the legacy carrier token from the authenticated
+// lookup or a short-lived transport credential with a proof of possession. A
+// deployment that issues transport credentials requires the latter, and a
+// presented credential is authoritative: it never falls back to the token.
 type SharedViewerHello struct {
 	HostID string `json:"host_id"`
-	Token  string `json:"token"`
+	Token  string `json:"token,omitempty"`
+	// Transport is the signed credential minted for the carrier audience;
+	// TransportProof signs the nonce and timestamp with the key bound inside it.
+	Transport      string `json:"transport,omitempty"`
+	TransportProof string `json:"transport_proof,omitempty"`
+	Nonce          string `json:"nonce,omitempty"`
+	Timestamp      int64  `json:"timestamp,omitempty"`
 }
 
 // FrameReader decodes u32le length-prefixed payloads from a byte stream.

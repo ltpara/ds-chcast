@@ -62,6 +62,8 @@ class IAudioDecoder;
 class IAudioPlayer;
 class ILoopbackCapture;
 class IMicrophoneCapture;
+class WallpaperRemoval;
+struct MicrophoneCaptureConfig;
 struct ViewerRegistry;
 
 enum class HostState {
@@ -456,11 +458,20 @@ struct HostServerConfig {
     // not make noise. Created lazily, the first time a viewer opens CMIC.
     std::function<std::unique_ptr<IAudioPlayer>(std::string*)> microphone_player;
     // Creates the host microphone a viewer's voice call sends (protocol v37).
-    // Empty opens the default communications capture device; the loopback
-    // check substitutes a synthetic packet source. Called only while
-    // settings.allow_microphone is set; returning nullptr (with `error`)
-    // answers the call with Failed.
-    std::function<std::unique_ptr<IMicrophoneCapture>(std::string*)> voice_capture;
+    // The config carries settings.voice_microphone as device_id; empty follows
+    // the default communications capture device. The loopback check
+    // substitutes a synthetic packet source and inspects the requested
+    // device. Called only while settings.allow_microphone is set; returning
+    // nullptr (with `error`) answers the call with Failed.
+    std::function<std::unique_ptr<IMicrophoneCapture>(const MicrophoneCaptureConfig&,
+                                                      std::string*)>
+        voice_capture;
+    // Removes the desktop wallpaper for the authorized session, restoring it
+    // when the session ends or the host restarts. Empty uses the Win32
+    // backend; the loopback check substitutes a no-op so a test never changes
+    // the operator's desktop. Only called while settings.remove_wallpaper is
+    // set.
+    std::function<std::unique_ptr<WallpaperRemoval>(std::string*)> wallpaper_remover;
     // Injects Ctrl+Alt+Del. Empty uses the platform SendSAS in service mode and
     // answers Unsupported otherwise (the tray host cannot call it). The
     // loopback check substitutes a callback so it never touches the real

@@ -587,6 +587,17 @@ public:
     // Asks the host for the follow modes this viewer wants. Returns false when
     // the handshake is not complete or the host did not grant input.
     Error request_display_follow(uint8_t flags);
+    // Pops the newest show-cursor hint. Only the newest is kept: the host
+    // overlay only needs the latest pointer position. Hints need no input
+    // permission; they are draw-only and never reach the injector.
+    bool take_show_cursor_hint(ShowCursorHint& hint);
+    // Number of show-cursor hints received. Observation hook for tools and
+    // the host's own counters.
+    uint64_t show_cursor_hints() const;
+    // Asks the host to draw the viewer pointer. No permission is required
+    // beyond a completed handshake; the host may ignore hints at its own
+    // policy. Returns InvalidCall before the handshake completes.
+    Error request_show_cursor(const ShowCursorHint& hint);
     // Pops the newest DisplayFollowState. The host sends it as the answer and
     // unsolicited when it turns a mode off itself.
     bool take_display_follow_state(DisplayFollowState& state);
