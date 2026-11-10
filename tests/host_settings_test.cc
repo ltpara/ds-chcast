@@ -56,6 +56,22 @@ std::wstring widen_utf8(const std::string& text) {
     return out;
 }
 
+std::string narrow_utf8(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                                         static_cast<int>(text.size()), nullptr, 0, nullptr,
+                                         nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size,
+                        nullptr, nullptr);
+    return out;
+}
+
 bool same_devices(const std::vector<chast::TrustedDevice>& a,
                   const std::vector<chast::TrustedDevice>& b) {
     if (a.size() != b.size()) {
@@ -96,6 +112,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.record_incoming == b.record_incoming && a.record_directory == b.record_directory &&
            a.allow_terminal_persist == b.allow_terminal_persist &&
            a.file_receive_directory == b.file_receive_directory &&
+           a.file_share_roots == b.file_share_roots &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
            a.audio_silence_gate_ms == b.audio_silence_gate_ms &&
@@ -148,6 +165,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.record_incoming = true;
     settings.record_directory = "D:\\录像 存档\\chast";
     settings.file_receive_directory = "D:\\接收 文件\\chast";
+    settings.file_share_roots = {"C:\\", "D:\\共享 文件夹\\资料"};
     settings.allow_audio = false;
     settings.allow_microphone = true;
     settings.audio_device = "{0.0.1.00000000}.{5f3a2c1b-9d4e-4a6f-8b7c-1234567890ab}";
@@ -247,6 +265,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.allow_file_transfer, "a fresh host accepts files");
     check(loaded.settings.file_receive_directory.empty(),
           "a fresh host uses the default receive directory");
+    check(loaded.settings.file_share_roots.empty(),
+          "a fresh host shares no extra folders");
     check(loaded.settings.allow_audio, "a fresh host shares the system sound");
     check(!loaded.settings.allow_microphone,
           "a fresh host does not accept the viewer microphone");
@@ -431,6 +451,54 @@ void test_invalid_values(const std::filesystem::path& dir) {
     recording.record_directory = "D:\\recordings\ninput=1";
     check(!chast::save_host_settings(path.string(), recording, &error),
           "recording folder cannot inject another configuration key");
+}
+
+void test_file_share_roots(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "shares.ini";
+    const std::string share_one = narrow_utf8((dir / L"share one").wstring());
+    const std::string share_two = narrow_utf8((dir / L"共享 资料").wstring());
+    write_text(path, "file_share_roots=C:\\; " + share_one + " ;relative-folder; ;" +
+                         share_two + "\n");
+    chast::HostSettingsLoad loaded = chast::load_host_settings(path.string());
+    check(loaded.settings.file_share_roots.size() == 3 &&
+              loaded.settings.file_share_roots[0] == "C:\\" &&
+              loaded.settings.file_share_roots[1] == share_one &&
+              loaded.settings.file_share_roots[2] == share_two,
+          "share roots split on semicolons and skip empty entries");
+    check(loaded.warning.find("relative-folder") != std::string::npos,
+          "a relative share root is reported and skipped");
+
+    std::string many;
+    for (int i = 0; i < static_cast<int>(chast::kMaxFileShares) + 2; ++i) {
+        if (!many.empty()) {
+            many += ';';
+        }
+        many += "C:\\share" + std::to_string(i);
+    }
+    write_text(path, "file_share_roots=" + many + "\n");
+    loaded = chast::load_host_settings(path.string());
+    check(loaded.settings.file_share_roots.size() == chast::kMaxFileShares &&
+              loaded.warning.find("more than") != std::string::npos,
+          "share roots are capped at sixteen with a warning");
+
+    chast::HostSettings settings;
+    settings.file_share_roots = {"C:\\", share_two};
+    std::string error;
+    check(chast::save_host_settings(path.string(), settings, &error),
+          "configured share roots save");
+    const chast::HostSettingsLoad saved = chast::load_host_settings(path.string());
+    check(saved.warning.empty() && saved.settings.file_share_roots == settings.file_share_roots,
+          "share roots round-trip through the settings file");
+
+    settings.file_share_roots = {"relative-folder"};
+    check(!chast::save_host_settings(path.string(), settings, &error),
+          "a relative share root cannot be saved");
+    settings.file_share_roots = {"C:\\one;two"};
+    check(!chast::save_host_settings(path.string(), settings, &error),
+          "a share root cannot smuggle a list separator");
+    settings.file_share_roots.assign(chast::kMaxFileShares + 1, "C:\\too-many");
+    check(!chast::save_host_settings(path.string(), settings, &error),
+          "more than sixteen share roots cannot be saved");
 }
 
 void test_audio_settings(const std::filesystem::path& dir) {
@@ -968,6 +1036,7 @@ void test_service_settings_merge() {
     edited.clipboard_direction = chast::ClipboardDirection::HostToViewer;
     edited.record_incoming = true;
     edited.record_directory = "D:\\host-recordings";
+    edited.file_share_roots = {"C:\\", "D:\\共享 资料"};
     edited.trusted_devices = {kept};
     auto current = original;
     current.access_token = "rotated-token";
@@ -979,6 +1048,7 @@ void test_service_settings_merge() {
     check(merge_service_settings(original, edited, current, ServiceSettingsPage::Security, merged, &error) &&
               !merged.allow_clipboard && merged.clipboard_direction == chast::ClipboardDirection::HostToViewer &&
               merged.record_incoming && merged.record_directory == edited.record_directory &&
+              merged.file_share_roots == edited.file_share_roots &&
               merged.access_token == current.access_token && merged.tunnel_id == current.tunnel_id &&
               merged.trusted_devices.size() == 2 && merged.trusted_devices[0].last_seen_unix_seconds == 20 &&
               merged.trusted_devices[1].public_key == admitted.public_key,
@@ -1121,6 +1191,7 @@ int main() {
     test_round_trip(dir);
     test_missing_file(dir);
     test_invalid_values(dir);
+    test_file_share_roots(dir);
     test_audio_settings(dir);
     test_idle_timeout_settings(dir);
     test_trusted_device_lifetime_settings(dir);

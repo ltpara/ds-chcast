@@ -272,7 +272,8 @@ bool parse_tunnel_event(const std::string& line, TunnelEvent& event) {
     }
     event = TunnelEvent{};
     event.event = json_string_field(line, "event");
-    if (event.event != "ready" && event.event != "viewer" && event.event != "relay") {
+    if (event.event != "ready" && event.event != "viewer" && event.event != "relay" &&
+        event.event != "policy" && event.event != "revoke") {
         return false;
     }
     event.listen = json_string_field(line, "listen");
@@ -282,6 +283,8 @@ bool parse_tunnel_event(const std::string& line, TunnelEvent& event) {
     event.punch = json_string_field(line, "punch");
     event.relay = json_string_field(line, "relay");
     event.migrated_from = json_string_field(line, "migrated_from");
+    event.kid = json_string_field(line, "kid");
+    event.reason = json_string_field(line, "reason");
     std::string policy_object;
     if (json_object_field(line, "device_policy", policy_object)) {
         event.has_policy = true;

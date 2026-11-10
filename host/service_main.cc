@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 
+#include "chast/desktop.h"
 #include "chast/host_settings.h"
 #include "service.h"
 
@@ -33,6 +34,9 @@ int report(int code, const std::string& error) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // The worker owns capture and input injection for a whole session and has
+    // no UI to lay out, so physical-pixel coordinates are always correct here.
+    chast::enable_physical_desktop_coordinates();
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 

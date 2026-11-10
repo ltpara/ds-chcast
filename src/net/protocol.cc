@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 
 namespace chast {
@@ -4709,7 +4710,9 @@ void encode_file_stream_header(const FileStreamHeader& header,
     uint8_t* cursor = out;
     std::memcpy(cursor, kFileStreamMagic, sizeof(kFileStreamMagic));
     cursor += sizeof(kFileStreamMagic);
-    put_u8(cursor, kFileStreamVersion);
+    put_u8(cursor, header.version == kFileStreamVersionCompressed
+                       ? kFileStreamVersionCompressed
+                       : kFileStreamVersion);
     put_u8(cursor, 0);
     put_u8(cursor, 0);
     put_u8(cursor, 0);
@@ -4727,7 +4730,7 @@ bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeade
         set_error(error, "CFIL stream has bad magic");
         return false;
     }
-    if (data[4] != kFileStreamVersion) {
+    if (data[4] != kFileStreamVersion && data[4] != kFileStreamVersionCompressed) {
         set_error(error, "CFIL stream version " + std::to_string(data[4]) +
                              " is not supported");
         return false;
@@ -4744,6 +4747,80 @@ bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeade
     if (header.offset > kMaxFileTransferBytes) {
         set_error(error, "CFIL offset is past the protocol limit");
         return false;
+    }
+    // A compressed stream restarts block framing at zero; resuming mid-file
+    // always uses the raw v1 body so no block boundary has to line up.
+    if (data[4] == kFileStreamVersionCompressed && header.offset != 0) {
+        set_error(error, "CFIL v2 stream cannot resume mid-file");
+        return false;
+    }
+    header.version = data[4];
+    return true;
+}
+
+void encode_file_block_header(const FileBlockHeader& header,
+                              uint8_t out[kFileBlockHeaderSize]) {
+    uint8_t* cursor = out;
+    put_u32(cursor, header.stored_size);
+    put_u32(cursor, header.raw_size);
+    put_u8(cursor, header.compressed ? kFileBlockFlagCompressed : 0);
+}
+
+bool decode_file_block_header(const uint8_t* data, size_t size, FileBlockHeader& header,
+                              std::string* error) {
+    if (size != kFileBlockHeaderSize) {
+        set_error(error, "truncated CFIL block header");
+        return false;
+    }
+    Reader reader(data, size);
+    uint8_t flags = 0;
+    if (!reader.u32(header.stored_size) || !reader.u32(header.raw_size) ||
+        !reader.u8(flags) || !reader.at_end()) {
+        set_error(error, "malformed CFIL block header");
+        return false;
+    }
+    if ((flags & ~kFileBlockFlagsKnown) != 0) {
+        set_error(error, "CFIL block header carries unknown flags");
+        return false;
+    }
+    header.compressed = (flags & kFileBlockFlagCompressed) != 0;
+    if (header.raw_size == 0 || header.raw_size > kFileBlockMaxRawBytes) {
+        set_error(error, "CFIL block raw size is out of range");
+        return false;
+    }
+    if (header.stored_size == 0 || header.stored_size > kFileBlockMaxStoredBytes) {
+        set_error(error, "CFIL block stored size is out of range");
+        return false;
+    }
+    if (!header.compressed && header.stored_size != header.raw_size) {
+        set_error(error, "CFIL raw block sizes disagree");
+        return false;
+    }
+    return true;
+}
+
+bool file_compression_worthwhile(const std::string& name, uint64_t size, bool clipboard) {
+    if (clipboard || size < kFileCompressionMinBytes) {
+        return false;
+    }
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0) {
+        return true;
+    }
+    const size_t separator = name.find_last_of("/\\");
+    if (separator != std::string::npos && dot < separator) {
+        return true;
+    }
+    std::string extension = name.substr(dot + 1);
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    static const std::array<const char*, 9> kAlreadyCompressed = {
+        "xz", "gz", "zip", "7z", "rar", "bz2", "tgz", "png", "jpg"};
+    for (const char* known : kAlreadyCompressed) {
+        if (extension == known) {
+            return false;
+        }
     }
     return true;
 }

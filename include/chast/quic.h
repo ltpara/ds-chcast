@@ -305,6 +305,8 @@ struct FileChunk {
 struct FileUploadState {
     uint64_t resume_offset = 0;  // where the CFIL stream started
     uint64_t received = 0;       // content bytes, resume offset excluded
+    uint64_t wire_bytes = 0;     // CFIL body bytes, compressed framing included
+    bool compressed = false;     // the sender picked the v2 block stream
     bool finished = false;       // stream ended and every chunk was taken
     std::string error;           // set when the stream broke
 };

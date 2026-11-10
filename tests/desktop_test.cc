@@ -3,6 +3,7 @@
 // paths stay manual.
 
 #include <windows.h>
+#include <shellscalingapi.h>
 
 #include <cstdio>
 #include <string>
@@ -18,6 +19,13 @@ int main() {
             ++failures;
         }
     };
+
+    check(chast::enable_physical_desktop_coordinates(),
+          "the process switches to per-monitor DPI awareness");
+    PROCESS_DPI_AWARENESS awareness = PROCESS_DPI_UNAWARE;
+    check(SUCCEEDED(GetProcessDpiAwareness(nullptr, &awareness)) &&
+              awareness == PROCESS_PER_MONITOR_DPI_AWARE,
+          "the effective awareness is per-monitor");
 
     const chast::InputDesktopStatus status = chast::input_desktop_status();
     check(status.kind == chast::InputDesktopKind::Default,

@@ -15,6 +15,10 @@ struct Source {
     FrameInfo frame;
     CursorInfo cursor;
     uint64_t sequence = 0;
+    // Advances only when a capture carried new desktop pixels. Pointer-only
+    // wakes keep it unchanged so a reader that missed ticks knows whether the
+    // retained surface is new to it.
+    uint64_t desktop_sequence = 0;
     uint64_t generation = 1;
     bool lost = false;
     bool want_hdr = true;
@@ -92,9 +96,15 @@ public:
             if (result == CaptureResult::NoNewFrame) return result;
             const auto& incoming = source_->capture->frame();
             if (!incoming.texture) return CaptureResult::NoNewFrame;
-            error_ = surface(incoming.device, incoming.texture, source_->texture, source_->handle);
-            if (!error_.ok()) return CaptureResult::FatalError;
-            incoming.context->CopyResource(source_->texture.get(), incoming.texture);
+            // A pointer-only wake leaves the desktop image untouched. Keeping
+            // the retained copy is not just cheaper: it is what lets every
+            // reader report the wake as pointer-only instead of new pixels.
+            if (incoming.desktop_updated || !source_->texture) {
+                error_ = surface(incoming.device, incoming.texture, source_->texture, source_->handle);
+                if (!error_.ok()) return CaptureResult::FatalError;
+                incoming.context->CopyResource(source_->texture.get(), incoming.texture);
+                if (incoming.desktop_updated) ++source_->desktop_sequence;
+            }
             source_->frame = incoming;
             source_->frame.texture = source_->texture.get();
             source_->frame.shared_handle = source_->handle;
@@ -103,6 +113,27 @@ public:
         }
         if (!source_->texture) { dirty_ = false; return CaptureResult::NoNewFrame; }
         const auto& incoming = source_->frame;
+        cursor_ = config_.capture_cursor ? source_->cursor : CursorInfo{};
+        display_ = source_->capture->display();
+        seen_ = source_->sequence;
+        // This reader may have skipped ticks while another read the source.
+        // Its texture is fresh when it holds no surface yet or when the source
+        // published desktop pixels since this reader last converted them.
+        const bool desktop_fresh = dirty_ || !texture_ ||
+            seen_desktop_ != source_->desktop_sequence;
+        dirty_ = false;
+        if (!desktop_fresh) {
+            // Cursor moved over an unchanged desktop: reuse this reader's GPU
+            // surface and NV12 copy, and let consumers see a pointer-only
+            // frame. RustDesk's duplication returns WouldBlock for the same
+            // wake and leaves cursor delivery to its own cursor services.
+            frame_.frame_number = ++frame_number_;
+            frame_.desktop_updated = false;
+            frame_.nv12_updated = false;
+            frame_.texture = texture_.get();
+            frame_.shared_handle = handle_;
+            return CaptureResult::Frame;
+        }
         error_ = surface(device_.get(), source_->texture.get(), texture_, handle_);
         if (!error_.ok()) return CaptureResult::FatalError;
         const bool cross_device = device_.get() != incoming.device;
@@ -124,10 +155,8 @@ public:
         frame_.shared_handle = handle_;
         frame_.device = device_.get();
         frame_.context = context_.get();
-        frame_.desktop_updated = true; // this reader may have skipped desktop updates
+        frame_.desktop_updated = true;
         frame_.frame_number = ++frame_number_;
-        cursor_ = config_.capture_cursor ? source_->cursor : CursorInfo{};
-        display_ = source_->capture->display();
         if (config_.nv12.enabled) {
             D3D11_TEXTURE2D_DESC desc{};
             texture_->GetDesc(&desc);
@@ -153,6 +182,7 @@ public:
         context_->Flush();
         dirty_ = false;
         seen_ = source_->sequence;
+        seen_desktop_ = source_->desktop_sequence;
         return CaptureResult::Frame;
     }
     const FrameInfo& frame() const override { return frame_; }
@@ -174,7 +204,7 @@ public:
             source_->sequence = 0;
         }
         texture_.reset(); nv12_.reset(); frame_ = {}; cursor_ = {};
-        seen_ = 0; dirty_ = false;
+        seen_ = 0; seen_desktop_ = 0; dirty_ = false;
         if (external_) {
             generation_ = source_->generation;
             display_ = source_->capture->display();
@@ -216,7 +246,7 @@ private:
     CursorInfo cursor_;
     DisplayInfo display_;
     Error error_ = Error::success();
-    uint64_t seen_ = 0, generation_ = 0, frame_number_ = 0;
+    uint64_t seen_ = 0, seen_desktop_ = 0, generation_ = 0, frame_number_ = 0;
     UINT width_ = 0, height_ = 0, percent_ = 100, vendor_ = 0;
     bool dirty_ = false, external_ = false;
 };

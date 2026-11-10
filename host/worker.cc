@@ -136,7 +136,7 @@ void clear_migrated_identity(const std::string& old_id) {
     }
 }
 
-void log_tunnel_event(const TunnelEvent& event) {
+void log_tunnel_event(HostServer& server, const TunnelEvent& event) {
     if (event.event == "ready") {
         if (!event.migrated_from.empty()) {
             clear_migrated_identity(event.migrated_from);
@@ -152,6 +152,25 @@ void log_tunnel_event(const TunnelEvent& event) {
                       {"remote", event.remote}});
     } else if (event.event == "relay") {
         worker_event("tunnel.relay", {{"relay", event.relay}});
+    } else if (event.event == "policy") {
+        worker_event("tunnel.policy",
+                     {{"version", event.has_policy
+                                     ? std::to_string(event.policy.policy_version)
+                                     : std::string()},
+                      {"managed", event.has_policy ? "true" : "false"},
+                      {"reason", event.reason}});
+        if (event.has_policy) {
+            server.revoke_managed_sessions(
+                event.reason.empty() ? std::string("device policy changed") : event.reason,
+                event.policy.policy_version);
+        }
+    } else if (event.event == "revoke") {
+        worker_event("tunnel.revoke", {{"kid", event.kid}, {"reason", event.reason}});
+        if (!event.kid.empty()) {
+            server.revoke_managed_sessions(
+                event.reason.empty() ? std::string("issuer key revoked") : event.reason, 0,
+                event.kid);
+        }
     }
     if (event.has_policy && event.event != "viewer") {
         std::string ack_path;
@@ -306,12 +325,13 @@ void prepare_virtual_display_on_start(const HostSettings& settings) {
 }
 
 bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
-                  const std::string& fingerprint, std::atomic<bool>& ended,
-                  std::atomic<uint32_t>& exit_code) {
+                  const std::string& fingerprint, HostServer& server,
+                  std::atomic<bool>& ended, std::atomic<uint32_t>& exit_code) {
     ended = false;
     exit_code = 0;
     std::string error;
-    if (!tunnel.start(settings, settings.port, fingerprint, log_tunnel_event,
+    if (!tunnel.start(settings, settings.port, fingerprint,
+                      [&server](const TunnelEvent& event) { log_tunnel_event(server, event); },
                       [](const std::string& line) {
                           worker_event("tunnel.output", {{"text", line}});
                       },
@@ -448,7 +468,8 @@ int run_worker(std::string* error) {
     bool tunnel_needs_start = tunnel_wanted;
     auto next_tunnel = std::chrono::steady_clock::now();
     if (tunnel_wanted &&
-        start_tunnel(tunnel, settings, status.fingerprint, tunnel_ended, tunnel_exit_code)) {
+        start_tunnel(tunnel, settings, status.fingerprint, *server, tunnel_ended,
+                     tunnel_exit_code)) {
         tunnel_needs_start = false;
     }
 
@@ -470,7 +491,8 @@ int run_worker(std::string* error) {
         if (!tunnel_needs_start || now < next_tunnel) {
             continue;
         }
-        if (start_tunnel(tunnel, settings, status.fingerprint, tunnel_ended, tunnel_exit_code)) {
+        if (start_tunnel(tunnel, settings, status.fingerprint, *server, tunnel_ended,
+                         tunnel_exit_code)) {
             tunnel_needs_start = false;
         } else {
             next_tunnel = now + std::chrono::seconds(5);

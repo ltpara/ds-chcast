@@ -60,6 +60,19 @@ const (
 	AuditDevicePolicyDelete  = "device_policy_delete"
 	AuditDevicePolicyReceipt = "device_policy_receipt"
 
+	// AuditPolicyObject* and AuditPolicyAssignment* record the central policy
+	// authoring layer; the materialised per-device rows still report through
+	// the device policy actions above.
+	AuditPolicyObjectCreate       = "policy_object_create"
+	AuditPolicyObjectUpdate       = "policy_object_update"
+	AuditPolicyObjectDelete       = "policy_object_delete"
+	AuditPolicyAssignmentCreate   = "policy_assignment_create"
+	AuditPolicyAssignmentDelete   = "policy_assignment_delete"
+
+	// AuditAccessKidRevoke records retiring an issuer key. The key id is in the
+	// detail; connected hosts receive the same statement on the event stream.
+	AuditAccessKidRevoke = "access_kid_revoke"
+
 	AuditAPITokenCreate = "api_token_create"
 	AuditAPITokenRevoke = "api_token_revoke"
 )

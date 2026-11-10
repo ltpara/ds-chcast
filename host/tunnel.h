@@ -38,6 +38,10 @@ struct TunnelEvent {
     std::string relay;
     // Set on ready when the service moved the durable identity from this id.
     std::string migrated_from;
+    // Set on policy and revoke events: the operator's reason and, for revoke,
+    // the issuer key whose tickets must no longer admit sessions.
+    std::string kid;
+    std::string reason;
     bool has_policy = false;
     TunnelPolicy policy;
 };

@@ -1,6 +1,7 @@
 #include "chast/desktop.h"
 
 #include <windows.h>
+#include <shellscalingapi.h>
 #include <wtsapi32.h>
 
 #include <string>
@@ -118,6 +119,24 @@ SessionUserQuery session_user(std::wstring* user) {
 }
 
 }  // namespace
+
+bool enable_physical_desktop_coordinates() {
+    // RustDesk calls SetProcessDpiAwareness(2) at start-up for the same
+    // reason: DXGI reports output rects in physical pixels, so every Win32
+    // API that feeds or consumes those coordinates must too. Processes with
+    // an awareness manifest already set fail this call; read the effective
+    // state instead of trusting the return value.
+    if (FAILED(SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE))) {
+        // Older systems without shcore.dll fall back to system awareness,
+        // which still keeps the primary display in physical pixels.
+        SetProcessDPIAware();
+    }
+    PROCESS_DPI_AWARENESS awareness = PROCESS_DPI_UNAWARE;
+    if (FAILED(GetProcessDpiAwareness(nullptr, &awareness))) {
+        return false;
+    }
+    return awareness == PROCESS_PER_MONITOR_DPI_AWARE;
+}
 
 InputDesktopStatus input_desktop_status() {
     InputDesktopStatus status;

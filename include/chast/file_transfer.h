@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "chast/protocol.h"
 
@@ -141,5 +142,44 @@ void list_receive_directory(const std::string& root, const std::string& relative
 FileCode apply_file_operation(const std::string& root, FileOperation op,
                               const std::string& path, const std::string& new_name,
                               std::string& error);
+
+// ----- multiple shared roots -----
+//
+// Without configured shares the receive root is the whole sandbox. A host may
+// instead share several absolute directories (drive roots included). The
+// viewer then sees one virtual top-level directory per share, named after the
+// configured folder, and every path below a share resolves inside that share
+// with the same reparse-point and traversal rules.
+
+// Upper bound on configured shares, so the virtual top level always fits in
+// one listing page.
+inline constexpr size_t kMaxFileShares = 16;
+
+struct FileShareRoot {
+    // Single safe path component the viewer sees and echoes back.
+    std::string name;
+    // Absolute UTF-8 directory.
+    std::string path;
+};
+
+// Turns configured absolute paths into stable, unique, wire-safe share names.
+// Empty entries, relative paths and duplicates are skipped; a drive root is
+// named after its letter, other roots after their final component, and a
+// collision gets a " (2)" suffix.
+std::vector<FileShareRoot> make_file_share_roots(const std::vector<std::string>& configured);
+
+// Fills a successful top-level listing with one directory entry per share.
+// A non-empty cursor is refused: the top level never pages.
+void list_file_share_roots(const std::vector<FileShareRoot>& shares, FileListResult& result,
+                           const std::string& cursor = {});
+
+// Splits a viewer path into the share it names and the path below that share.
+// An empty `path` is refused; callers list the shares themselves. With no
+// shares, `fallback_root` is used and `path` is returned unchanged. A path
+// whose first component is not a configured share reports NotFound.
+FileCode split_file_share_path(const std::vector<FileShareRoot>& shares,
+                               const std::string& fallback_root, const std::string& path,
+                               std::string& root, std::string& relative,
+                               std::string& error);
 
 }  // namespace chast

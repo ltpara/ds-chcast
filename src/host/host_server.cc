@@ -146,6 +146,124 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// RustDesk sends the pointer from a 33 ms service that runs beside video, so a
+// slow encode or a full video queue never freezes the cursor. The display
+// service invokes publish() on its capture thread right after each frame and
+// before encoding it. The session thread owns routing, resets, statistics and
+// teardown; send_cursor/send_display_cursor are non-blocking and thread-safe.
+class CursorPublisher {
+public:
+    void bind(QuicSession* session, const IDxgiCapturer* capture) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        session_ = session;
+        capture_ = capture;
+    }
+    bool bound_to(const IDxgiCapturer* capture) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return capture_ == capture;
+    }
+    void route(uint32_t stream_id, bool multiple_streams) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stream_id_ = stream_id;
+        multiple_streams_ = multiple_streams;
+    }
+    // The session is about to go away. An in-flight send finishes first, so the
+    // sink can never touch it after this returns.
+    void detach() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        session_ = nullptr;
+        capture_ = nullptr;
+    }
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sent_once_ = false;
+        sent_ = CursorUpdate{};
+    }
+    void publish(const CursorInfo& info) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (session_ == nullptr || !info.position_valid) return;
+        const bool shape_known = info.shape_valid && info.content_id != 0;
+        CursorUpdate update;
+        update.visible = info.visible;
+        update.x = info.position.x;
+        update.y = info.position.y;
+        // A pointer whose shape the decoder has not seen yet (the first frames
+        // of a session) still moves; reuse the geometry already sent so the
+        // viewer can keep placing the sprite it holds.
+        if (shape_known) {
+            update.shape_id = info.content_id;
+            update.width = static_cast<uint16_t>(info.width);
+            update.height = static_cast<uint16_t>(info.height);
+            update.hotspot_x = static_cast<uint16_t>(info.hotspot.x);
+            update.hotspot_y = static_cast<uint16_t>(info.hotspot.y);
+        } else if (sent_once_) {
+            update.shape_id = sent_.shape_id;
+            update.width = sent_.width;
+            update.height = sent_.height;
+            update.hotspot_x = sent_.hotspot_x;
+            update.hotspot_y = sent_.hotspot_y;
+        } else {
+            return;
+        }
+        const bool new_shape = shape_known && update.shape_id != sent_.shape_id;
+        if (new_shape) update.sprite = info.bitmap;
+        if (sent_once_ && !new_shape && update.visible == sent_.visible &&
+            update.x == sent_.x && update.y == sent_.y) {
+            return;
+        }
+        // Position and shape are 33 ms services in RustDesk. The capture tick
+        // is faster than that, and a static desktop would otherwise flood the
+        // control queue with identical state.
+        const auto now = Clock::now();
+        if (sent_once_ && now - sent_at_ < std::chrono::milliseconds(33)) return;
+        const Error sent = multiple_streams_
+            ? session_->send_display_cursor({stream_id_, update})
+            : session_->send_cursor(update);
+        if (!sent.ok()) {
+            if (sent.status() == Status::WaitTimeout) {
+                // The control queue is full; the next sample carries the same
+                // state again, so nothing is lost by skipping this one.
+                ++dropped_;
+            } else {
+                ++errors_;
+                if (last_error_.empty()) last_error_ = sent.to_string();
+            }
+            return;
+        }
+        ++sent_count_;
+        if (new_shape) {
+            ++shape_count_;
+            byte_count_ += update.sprite.size();
+        }
+        sent_ = std::move(update);
+        sent_once_ = true;
+        sent_at_ = now;
+    }
+    struct Snapshot {
+        uint64_t sent = 0, shapes = 0, bytes = 0, dropped = 0, errors = 0;
+        std::string last_error;
+    };
+    Snapshot take() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Snapshot result{sent_count_, shape_count_, byte_count_, dropped_, errors_,
+                        std::move(last_error_)};
+        sent_count_ = shape_count_ = byte_count_ = dropped_ = errors_ = 0;
+        last_error_.clear();
+        return result;
+    }
+private:
+    mutable std::mutex mutex_;
+    QuicSession* session_ = nullptr;
+    const IDxgiCapturer* capture_ = nullptr;
+    uint32_t stream_id_ = 0;
+    bool multiple_streams_ = false;
+    bool sent_once_ = false;
+    Clock::time_point sent_at_{};
+    CursorUpdate sent_;
+    uint64_t sent_count_ = 0, shape_count_ = 0, byte_count_ = 0, dropped_ = 0, errors_ = 0;
+    std::string last_error_;
+};
+
 // Downloads use the same budget the viewer applies to uploads: enough to move
 // a large file quickly without starving video, audio and input.
 constexpr auto kDownloadSendBudget = std::chrono::milliseconds(8);
@@ -1220,6 +1338,14 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
                              ? pending_security_.ticket_client_key
                              : std::array<uint8_t, kTicketClientKeySize>{};
     ticket_renew_failed_ = false;
+    {
+        // Published before the session starts so an online revocation that
+        // arrives during approval still matches the right policy and issuer.
+        std::lock_guard<std::mutex> lock(ticket_meta_mutex_);
+        managed_session_ = pending_security_.via_access_ticket;
+        ticket_key_id_ = pending_security_.ticket_key_id;
+        ticket_policy_version_ = pending_security_.ticket_policy_version;
+    }
     const std::string from =
         request.peer_address.empty() ? std::string("an unknown address") : request.peer_address;
     auth.permissions = pending_security_.permissions;
@@ -1454,6 +1580,53 @@ bool HostServer::disconnect_viewer(uint64_t id) {
     if (!id || connection_id_ != id || stopping_) return false;
     disconnect_requested_ = true;
     return true;
+}
+
+void HostServer::revoke_managed_sessions(const std::string& reason, uint32_t policy_version,
+                                         const std::string& kid) {
+    if (policy_version == 0 && kid.empty()) {
+        return;
+    }
+    if (registry_ && !adopted_) {
+        std::vector<std::shared_ptr<HostServer>> workers;
+        {
+            std::lock_guard lock(registry_->mutex);
+            for (const auto& weak : registry_->workers)
+                if (auto worker = weak.lock()) workers.push_back(std::move(worker));
+        }
+        for (const auto& worker : workers)
+            worker->revoke_managed_sessions(reason, policy_version, kid);
+        return;
+    }
+    std::lock_guard action(operator_mutex_);
+    if (stopping_ || disconnect_requested_) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        if (status_.state != HostState::Streaming) {
+            return;
+        }
+    }
+    bool managed = false;
+    std::string key_id;
+    uint32_t version = 0;
+    {
+        std::lock_guard<std::mutex> lock(ticket_meta_mutex_);
+        managed = managed_session_;
+        key_id = ticket_key_id_;
+        version = ticket_policy_version_;
+    }
+    if (!managed) {
+        return;
+    }
+    const bool by_key = !kid.empty() && key_id == kid;
+    const bool by_policy = policy_version != 0 && version < policy_version;
+    if (!by_key && !by_policy) {
+        return;
+    }
+    disconnect_requested_ = true;
+    log("the server ended this managed session: " + reason);
 }
 
 void HostServer::set_permissions(PermissionMask permissions) {
@@ -1802,6 +1975,15 @@ bool HostServer::apply_ticket_renewals(std::string* error) {
             Clock::now() + std::chrono::seconds((std::max)(int64_t{0}, remaining));
         pending_security_.ticket_expires_at = result.expires_at;
         pending_security_.ticket_id = result.ticket_id;
+        {
+            // The renewed ticket may have been signed by a rotated key and
+            // carries the policy version in force when it was issued; a later
+            // revocation must match the statement this session actually
+            // holds, not the one it was first admitted under.
+            std::lock_guard<std::mutex> lock(ticket_meta_mutex_);
+            ticket_key_id_ = result.key_id;
+            ticket_policy_version_ = result.policy_version;
+        }
         answer.code = TicketRenewCode::Accepted;
         answer.expires_at = result.expires_at;
         answer.permissions = session_->permissions();
@@ -2501,7 +2683,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     auto& streams = registry_ ? registry_->desktop_streams : standalone_streams;
     // One policy participant per connection, retained across display changes.
     auto quality_peer = streams.connect_quality(settings_.framerate, settings_.quality,
-                                                config_.adaptive_bitrate);
+                                                config_.adaptive_bitrate, config_.adaptive_fps);
     auto codec_peer = streams.connect_codecs(session_->decoding_codecs(), codec_vote(session_->codec_preference()),
         session_->decoding_444(), session_->chroma_preference());
     auto subscribe_display = [&](const DisplayInfo& display, const CaptureConfig& cfg,
@@ -2539,17 +2721,31 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         Clock::time_point recovery_at{};
         bool encoder_recovery_only = false;
         bool force_keyframe = true, have_input = false, resolution_fixed = false;
-        bool probe_pending = false, needs_resync = false, cursor_sent_once = false;
+        bool probe_pending = false, needs_resync = false;
         uint32_t extra_idrs = 0, frames_without_nv12 = 0, framerate = 30;
         uint16_t resolution_request = 100, resolution_percent = 100;
         uint32_t target_bitrate = 0;
         ComPtr<ID3D11Texture2D> cached_nv12;
         FrameInfo cached_frame;
-        CursorUpdate cursor_sent;
+        // Pointer delivery belongs to this subscription, not to the video
+        // loop: the display service drives it from its capture tick.
+        std::shared_ptr<CursorPublisher> cursor;
         std::vector<EncodedPacket> packets;
     } video;
     std::map<uint32_t, DesktopVideo> other_videos;
     bool multiple_streams = false, pumping_extra = false;
+    // The display service can invoke a cursor sink at any time, including
+    // while this function unwinds. Sever the session pointer before the
+    // unique_ptr above outlives the session object.
+    struct CursorDetachGuard {
+        std::function<void()> detach;
+        ~CursorDetachGuard() { detach(); }
+    } cursor_detach_guard{[&] {
+        if (video.cursor) video.cursor->detach();
+        for (auto& [id, entry] : other_videos) {
+            if (entry.cursor) entry.cursor->detach();
+        }
+    }};
     std::wstring selected_device;
     std::function<bool()> publish_subscriptions;
     uint32_t next_video_id = 1, video_round = 0;
@@ -3132,72 +3328,43 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // Pointer state. Desktop Duplication keeps the pointer out of the desktop
     // image, so the viewer is told the sprite and where it is; the sprite
     // travels once per shape id and later updates carry only the position.
-    // The cadence comes from capture(): DXGI produces a frame for every
-    // pointer move, so no timer is needed and an idle pointer costs nothing.
-    auto& cursor_sent_once = video.cursor_sent_once;
-    auto& cursor_sent = video.cursor_sent;
+    // Like RustDesk's cursor service, the display service invokes this
+    // subscription's sink on its capture tick (before encoding and regardless
+    // of the video queues), so pointer motion is not serialized behind encode
+    // or the session loop. publish_cursor() only seeds the state after resets
+    // and drains the counters the sink keeps.
+    auto ensure_cursor = [&]() {
+        if (!config_.capture_cursor || !capturer) return;
+        if (!video.cursor || !video.cursor->bound_to(capturer.get())) {
+            video.cursor = std::make_shared<CursorPublisher>();
+            video.cursor->bind(session_.get(), capturer.get());
+            std::shared_ptr<CursorPublisher> publisher = video.cursor;
+            DesktopStreamPool::set_cursor_sink(*capturer, [publisher](const CursorInfo& info) {
+                publisher->publish(info);
+            });
+        }
+        video.cursor->route(video.id, multiple_streams);
+    };
+    auto flush_cursor_stats = [&]() {
+        if (!video.cursor) return;
+        const auto counts = video.cursor->take();
+        stats.cursor_sent += counts.sent;
+        stats.cursor_shapes += counts.shapes;
+        stats.cursor_bytes += counts.bytes;
+        stats.cursor_dropped += counts.dropped;
+        stats.cursor_errors += counts.errors;
+        if (!counts.last_error.empty() && stats.cursor_errors <= 3) {
+            log("cursor send failed: " + counts.last_error);
+        }
+    };
     auto publish_cursor = [&]() {
         if (!config_.capture_cursor || !capturer) {
             return;
         }
+        ensure_cursor();
         const auto snapshot = DesktopStreamPool::cursor_snapshot(*capturer);
-        if (!snapshot || !snapshot->position_valid) {
-            return;
-        }
-        const CursorInfo& info = *snapshot;
-        const bool shape_known = info.shape_valid && info.content_id != 0;
-        CursorUpdate update;
-        update.visible = info.visible;
-        update.x = info.position.x;
-        update.y = info.position.y;
-        // A pointer whose shape the decoder has not seen yet (the first frames
-        // of a session) still moves; reuse the geometry already sent so the
-        // viewer can keep placing the sprite it holds.
-        if (shape_known) {
-            update.shape_id = info.content_id;
-            update.width = static_cast<uint16_t>(info.width);
-            update.height = static_cast<uint16_t>(info.height);
-            update.hotspot_x = static_cast<uint16_t>(info.hotspot.x);
-            update.hotspot_y = static_cast<uint16_t>(info.hotspot.y);
-        } else if (cursor_sent_once) {
-            update.shape_id = cursor_sent.shape_id;
-            update.width = cursor_sent.width;
-            update.height = cursor_sent.height;
-            update.hotspot_x = cursor_sent.hotspot_x;
-            update.hotspot_y = cursor_sent.hotspot_y;
-        } else {
-            return;
-        }
-        const bool new_shape = shape_known && update.shape_id != cursor_sent.shape_id;
-        if (new_shape) {
-            update.sprite = info.bitmap;
-        }
-        if (cursor_sent_once && !new_shape && update.visible == cursor_sent.visible &&
-            update.x == cursor_sent.x && update.y == cursor_sent.y) {
-            return;
-        }
-        Error sent = multiple_streams ? session_->send_display_cursor({video.id, update}) :
-                                       session_->send_cursor(update);
-        if (!sent.ok()) {
-            if (sent.status() == Status::WaitTimeout) {
-                // The control queue is full; the next frame carries the same
-                // state again, so nothing is lost by skipping this one.
-                ++stats.cursor_dropped;
-                return;
-            }
-            ++stats.cursor_errors;
-            if (stats.cursor_errors <= 3) {
-                log("cursor send failed: " + sent.to_string());
-            }
-            return;
-        }
-        ++stats.cursor_sent;
-        if (new_shape) {
-            ++stats.cursor_shapes;
-            stats.cursor_bytes += update.sprite.size();
-        }
-        cursor_sent = std::move(update);
-        cursor_sent_once = true;
+        if (snapshot) video.cursor->publish(*snapshot);
+        flush_cursor_stats();
     };
 
     // Physical display privacy and management. Both paths rebuild the stream
@@ -3305,8 +3472,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         force_keyframe = true;
         extra_idrs = 1;
         frames_without_nv12 = 0;
-        cursor_sent_once = false;
-        cursor_sent = CursorUpdate{};
+        if (video.cursor) video.cursor->reset();
         resolution_request = static_cast<uint16_t>(next_scale_request);
         if (next_effective_percent != stats.resolution_percent) {
             stats.resolution_percent = next_effective_percent;
@@ -3928,7 +4094,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 if (rebuilt || !result.ok()) {
                     entry.encoder.reset(); entry.cached_nv12.reset(); entry.have_input = false;
                     entry.force_keyframe = true; entry.frames_without_nv12 = 0;
-                    entry.cursor_sent_once = false; entry.cursor_sent = {};
+                    if (entry.cursor) entry.cursor->reset();
                     entry.recovery_at = result.ok() ? Clock::time_point{} : Clock::now() + std::chrono::seconds(1);
                 }
                 entry.info.origin_x = display.rect.left; entry.info.origin_y = display.rect.top;
@@ -3961,8 +4127,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     };
     auto capture_displays = [&](const CaptureDisplaysRequest& request) -> bool {
         if (!multiple_streams) {
-            cursor_sent_once = false;
-            cursor_sent = {};
+            if (video.cursor) video.cursor->reset();
         }
         multiple_streams = true;
         if (!refresh_topology(true)) return false;
@@ -4344,8 +4509,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         // The new output has its own pointer shape and position; the viewer
         // must not keep placing the old sprite.
-        cursor_sent_once = false;
-        cursor_sent = CursorUpdate{};
+        if (video.cursor) video.cursor->reset();
         const size_t new_index =
             capturer->merged() ? size_t{0} : find_display(attached, capturer->display());
         stream_info = describe_stream(attached, *capturer, *encoder, next_frame.width,
@@ -4696,8 +4860,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         force_keyframe = true;
         extra_idrs = 1;
         // The output was re-created: its pointer position and sprite are new.
-        cursor_sent_once = false;
-        cursor_sent = CursorUpdate{};
+        if (video.cursor) video.cursor->reset();
         // `fresh` was read before ChangeDisplaySettingsExW, so its rects
         // describe the old mode. Announce the list as it is now.
         attached = config_.displays();
@@ -5003,7 +5166,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             } else entry.recovery_at = {};
             entry.encoder.reset(); entry.cached_nv12.reset();
             entry.have_input = false; entry.force_keyframe = true;
-            entry.cursor_sent_once = false; entry.cursor_sent = {};
+            if (entry.cursor) entry.cursor->reset();
         }
         if (!capturer) { desktop_paused = false; return true; }
         Error rebuilt = capturer->reinitialize();
@@ -5028,7 +5191,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         desktop_paused = false;
         desktop_reinitialized = true;
         video.recovery_at = {};
-        cursor_sent_once = false; cursor_sent = {};
+        if (video.cursor) video.cursor->reset();
         encoder.reset();
         have_input = false;
         cached_nv12.reset();
@@ -5089,7 +5252,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             video.encoder_recovery_only = false;
             video.recovery_at = {};
             encoder.reset(); cached_nv12.reset(); have_input = false; force_keyframe = true;
-            cursor_sent_once = false; cursor_sent = {}; frames_without_nv12 = 0;
+            if (video.cursor) video.cursor->reset(); frames_without_nv12 = 0;
         }
         publish_cursor();
         if (config_.keyframe_interval_ms > 0 &&
@@ -5804,6 +5967,38 @@ void HostServer::begin_file_session() {
     file_receive_directory_ = settings_.file_receive_directory.empty()
                                   ? default_receive_directory()
                                   : settings_.file_receive_directory;
+    file_shares_.clear();
+    if (!settings_.file_share_roots.empty()) {
+        std::vector<std::string> configured;
+        if (!file_receive_directory_.empty()) {
+            configured.push_back(file_receive_directory_);
+        }
+        configured.insert(configured.end(), settings_.file_share_roots.begin(),
+                          settings_.file_share_roots.end());
+        for (const FileShareRoot& share : make_file_share_roots(configured)) {
+            const DWORD attributes =
+                GetFileAttributesW(path_from_utf8(share.path).c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES ||
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                log("file: share '" + share.name +
+                    "' is not an accessible folder; skipping it");
+                continue;
+            }
+            file_shares_.push_back(share);
+        }
+        if (!file_shares_.empty()) {
+            std::string names;
+            for (const FileShareRoot& share : file_shares_) {
+                if (!names.empty()) {
+                    names += ", ";
+                }
+                names += share.name;
+            }
+            log("file: sharing " + std::to_string(file_shares_.size()) +
+                " folders: " + names);
+        }
+    }
     file_audit_ref_ = session_audit_ref_;
     file_audit_ref_absent_ = session_audit_ref_absent_;
     upload_.reset();
@@ -5873,6 +6068,7 @@ void HostServer::end_file_session() {
     }
     reset_clipboard_incoming(true);
     file_receive_directory_.clear();
+    file_shares_.clear();
     file_audit_ref_.clear();
     file_audit_ref_absent_ = false;
     {
@@ -6221,10 +6417,28 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
             log("file: refused " + offer.name + ": no receive directory is configured");
             continue;
         }
+        std::string upload_root = file_receive_directory_;
+        std::string upload_relative = offer.relative_path;
+        if (!file_shares_.empty() && !offer.relative_path.empty()) {
+            // A drop into a browsed share belongs to that share. The mapped
+            // path stays inside the configured root and is sanitized again by
+            // FileReceiver before anything is created.
+            std::string split_error;
+            const FileCode split =
+                split_file_share_path(file_shares_, file_receive_directory_,
+                                      offer.relative_path, upload_root, upload_relative,
+                                      split_error);
+            if (split != FileCode::Ok) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(offer.transfer_id, split, 0, split_error);
+                log("file: refused " + offer.name + ": " + split_error);
+                continue;
+            }
+        }
         FileReceiveOptions options;
-        options.directory = file_receive_directory_;
+        options.directory = upload_root;
         options.name = offer.name;
-        options.relative_path = offer.relative_path;
+        options.relative_path = upload_relative;
         options.size = offer.size;
         options.sha256 = offer.sha256;
         options.allow_resume = offer.resume;
@@ -6427,8 +6641,22 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
         } else if (file_receive_directory_.empty()) {
             result.code = FileCode::Refused;
             result.reason = "the host has no receive directory";
+        } else if (directory.empty() && !file_shares_.empty()) {
+            list_file_share_roots(file_shares_, result, cursor);
         } else {
-            list_receive_directory(file_receive_directory_, directory, result, cursor, show_hidden);
+            std::string root = file_receive_directory_;
+            std::string relative = directory;
+            std::string split_error;
+            if (!file_shares_.empty()) {
+                result.code = split_file_share_path(file_shares_, file_receive_directory_,
+                                                    directory, root, relative, split_error);
+                if (result.code != FileCode::Ok) {
+                    result.reason = split_error;
+                }
+            }
+            if (result.code == FileCode::Ok) {
+                list_receive_directory(root, relative, result, cursor, show_hidden);
+            }
         }
         const Error sent = session_->send_file_list_result(result);
         if (!sent.ok()) {
@@ -6481,11 +6709,20 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
             answer.code = FileCode::Refused;
             answer.reason = "the host has no receive directory";
         } else {
-            std::string resolve_error;
-            answer.code = resolve_receive_path(file_receive_directory_, path, full_path,
-                                               is_directory, resolve_error);
+            std::string root = file_receive_directory_;
+            std::string relative = path;
+            std::string split_error;
+            answer.code = split_file_share_path(file_shares_, file_receive_directory_, path,
+                                                root, relative, split_error);
             if (answer.code != FileCode::Ok) {
-                answer.reason = resolve_error;
+                answer.reason = split_error;
+            } else {
+                std::string resolve_error;
+                answer.code = resolve_receive_path(root, relative, full_path, is_directory,
+                                                   resolve_error);
+                if (answer.code != FileCode::Ok) {
+                    answer.reason = resolve_error;
+                }
             }
         }
         if (answer.code == FileCode::Ok && is_directory) {
@@ -6550,11 +6787,20 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
             answer.code = FileCode::Refused;
             answer.reason = "the host has no receive directory";
         } else {
-            std::string operation_error;
-            answer.code = apply_file_operation(file_receive_directory_, op, op_path,
-                                               op_new_name, operation_error);
+            std::string root = file_receive_directory_;
+            std::string relative = op_path;
+            std::string split_error;
+            answer.code = split_file_share_path(file_shares_, file_receive_directory_, op_path,
+                                                root, relative, split_error);
             if (answer.code != FileCode::Ok) {
-                answer.reason = operation_error;
+                answer.reason = split_error;
+            } else {
+                std::string operation_error;
+                answer.code = apply_file_operation(root, op, relative, op_new_name,
+                                                   operation_error);
+                if (answer.code != FileCode::Ok) {
+                    answer.reason = operation_error;
+                }
             }
         }
         const Error sent = session_->send_file_op_result(answer);
@@ -7401,7 +7647,7 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
             // Stop/revocation releases this peer with the worker subscription.
             auto peer = streams.connect_codecs(decoders, preference, decoders_444, chroma);
             auto quality = streams.connect_quality(settings_.framerate, settings_.quality,
-                config_.adaptive_bitrate);
+                config_.adaptive_bitrate, config_.adaptive_fps);
             CameraRelay::Subscription result;
             result.quality = [quality](const StreamOptions& options) {
                 quality->options(options.max_fps,

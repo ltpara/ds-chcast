@@ -603,6 +603,85 @@ void test_directory_pages(const std::filesystem::path& directory) {
           "invalid continuation keys cannot escape the share or expose an old page");
 }
 
+void test_share_roots(const std::filesystem::path& directory) {
+    std::error_code ignored;
+    const std::filesystem::path a = directory / "shares-a";
+    const std::filesystem::path b = directory / "shares-b";
+    std::filesystem::create_directories(a / "docs", ignored);
+    std::filesystem::create_directories(b / "docs", ignored);
+    const std::string docs_a = (a / "docs").string();
+    const std::string docs_b = (b / "docs").string();
+
+    std::vector<chast::FileShareRoot> shares =
+        chast::make_file_share_roots({"C:\\", "relative-folder", " " + docs_a + " ",
+                                      docs_a, docs_b});
+    check(shares.size() == 3 && shares[0].name == "C" && shares[1].name == "docs" &&
+              shares[2].name == "docs (2)",
+          "share aliases name drives, dedupe paths and suffix name collisions");
+    check(shares.size() == 3 &&
+              _wcsicmp(std::filesystem::path(shares[1].path).c_str(),
+                       (a / "docs").c_str()) == 0 &&
+              _wcsicmp(std::filesystem::path(shares[2].path).c_str(),
+                       (b / "docs").c_str()) == 0,
+          "each alias maps back to its absolute folder");
+    check(chast::make_file_share_roots({}).empty(), "no configured shares means no aliases");
+    check(chast::make_file_share_roots({(directory / ".chast-partial").string()}).empty(),
+          "the reserved partial directory never becomes a share alias");
+
+    std::vector<std::string> many;
+    for (int i = 0; i < static_cast<int>(chast::kMaxFileShares) + 2; ++i) {
+        many.push_back("C:\\chast-share-" + std::to_string(i));
+    }
+    check(chast::make_file_share_roots(many).size() == chast::kMaxFileShares,
+          "share aliases stop at the configured maximum");
+
+    chast::FileListResult list;
+    list.request_id = 9;
+    chast::list_file_share_roots(shares, list);
+    check(list.code == chast::FileCode::Ok && list.request_id == 9 && !list.truncated &&
+              list.next_cursor.empty() && list.entries.size() == 3 &&
+              list.entries[0].name == "C" && list.entries[0].directory &&
+              list.entries[1].name == "docs" && list.entries[1].directory &&
+              list.entries[2].name == "docs (2)",
+          "the top-level share list is sorted, directory-only and never paged");
+    chast::list_file_share_roots(shares, list, "d:docs");
+    check(list.code == chast::FileCode::Refused && list.entries.empty() &&
+              list.next_cursor.empty() && !list.reason.empty(),
+          "the share list refuses a continuation cursor");
+
+    const std::string fallback = (directory / "receive").string();
+    std::string root;
+    std::string relative;
+    std::string error;
+    check(chast::split_file_share_path(shares, fallback, "docs", root, relative, error) ==
+                  chast::FileCode::Ok &&
+              relative.empty() &&
+              _wcsicmp(std::filesystem::path(root).c_str(), (a / "docs").c_str()) == 0,
+          "a bare alias maps to its share root");
+    check(chast::split_file_share_path(shares, fallback, "DOCS/report 2026.txt", root,
+                                       relative, error) == chast::FileCode::Ok &&
+              relative == "report 2026.txt",
+          "aliases match case-insensitively and keep the remainder relative");
+    check(chast::split_file_share_path(shares, fallback, "", root, relative, error) ==
+              chast::FileCode::Refused,
+          "an empty path is refused while shares exist");
+    check(chast::split_file_share_path(shares, fallback, "/docs", root, relative, error) ==
+              chast::FileCode::Refused &&
+              chast::split_file_share_path(shares, fallback, "C:/docs", root, relative, error) ==
+                  chast::FileCode::Refused &&
+              chast::split_file_share_path(shares, fallback, "docs/..", root, relative, error) ==
+                  chast::FileCode::Refused,
+          "absolute, drive-letter and dot-dot paths are refused");
+    check(chast::split_file_share_path(shares, fallback, "unknown/x", root, relative, error) ==
+                  chast::FileCode::NotFound &&
+              !error.empty(),
+          "an unknown alias reports NotFound with a reason");
+    check(chast::split_file_share_path({}, fallback, "anything/here", root, relative, error) ==
+                  chast::FileCode::Ok &&
+              root == fallback && relative == "anything/here",
+          "without configured shares the path passes straight to the receive folder");
+}
+
 }  // namespace
 
 int main() {
@@ -634,6 +713,7 @@ int main() {
         test_part_isolation(directory);
         test_partial_reparse(directory);
         test_browser(directory);
+        test_share_roots(directory);
         test_directory_pages(directory);
     } else {
         std::printf("FAIL could not create a temp directory\n");

@@ -57,6 +57,10 @@ const (
 	// applied. The signature binds the receipt to the host id, so another
 	// machine holding the shared host key cannot report on its behalf.
 	DomainDevicePolicy = "chast-device-policy-v1"
+	// DomainHostEvents covers a host subscribing to its revocation event
+	// stream. The device key binds the subscription to the host id, so the
+	// shared host credential alone cannot read another device's events.
+	DomainHostEvents = "chast-host-events-v1"
 	// DomainSoftware covers the advertised software update: version, download
 	// URL, SHA-256 and size. Clients that pin the server key can reject a
 	// notice or binary swapped between the server and the download host.
@@ -172,6 +176,13 @@ func HostDevicePolicyReceiptMessage(hostID string, version uint32, applied bool,
 	return fieldsMessage(DomainDevicePolicy, "receipt", hostID,
 		strconv.FormatUint(uint64(version), 10), boolText(applied), detail,
 		strconv.FormatInt(timestamp, 10))
+}
+
+// HostEventsSubscribeMessage binds a long-poll cursor to the device id. A
+// captured subscription cannot be replayed for another host or cursor.
+func HostEventsSubscribeMessage(hostID string, after uint64, timestamp int64) []byte {
+	return fieldsMessage(DomainHostEvents, "subscribe", hostID,
+		strconv.FormatUint(after, 10), strconv.FormatInt(timestamp, 10))
 }
 
 // SoftwareMessage binds the update notice fields a client verifies before

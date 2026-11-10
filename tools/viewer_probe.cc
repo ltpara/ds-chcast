@@ -2002,10 +2002,275 @@ int elevation_probe() {
     return success ? 0 : 1;
 }
 
+// Protocol-level acceptance for configured extra share roots: the receive
+// folder and two configured folders appear as sorted top-level aliases, while
+// browse, walk-download, upload and management operations all map through an
+// alias. Unknown aliases, traversals and attempts to rename or remove a share
+// root itself are refused.
+int multi_share_probe() {
+    const uint64_t suffix =
+        (static_cast<uint64_t>(GetCurrentProcessId()) << 20) ^ GetTickCount64();
+    const fs::path work = fs::temp_directory_path() /
+                          ("chast-multi-share-probe-" + std::to_string(suffix));
+    const fs::path receive = work / "receive";
+    const fs::path share_a = work / "share-a";
+    const fs::path share_b = work / "share-b";
+    const fs::path staging = work / "staging";
+    const std::string tree = "tree-" + std::to_string(suffix);
+    const std::string downloads_text = chast::default_receive_directory();
+    if (downloads_text.empty()) {
+        std::fprintf(stderr, "viewer-probe: the viewer has no download directory\n");
+        return 1;
+    }
+    const fs::path downloads = from_utf8(downloads_text);
+
+    std::string error;
+    bool success = false;
+    if (!write_file(receive / "receive-only.txt", "receive", &error) ||
+        !write_file(share_a / tree / "a.txt", "alpha", &error) ||
+        !write_file(share_a / tree / "sub" / "inner.txt", "inner", &error) ||
+        !write_file(share_b / "b.txt", "bravo", &error) ||
+        !write_file(staging / "upload.txt", "upload", &error)) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        std::error_code ignored;
+        fs::remove_all(work, ignored);
+        return 1;
+    }
+
+    const uint16_t port = pick_free_port();
+    ProbeSink sink;
+    std::unique_ptr<chast::HostServer> host;
+    if (port == 0) {
+        error = "no free loopback port";
+    } else if (!sink.create(&error)) {
+        // keep the error
+    } else {
+        host = start_host(utf8(receive), port, &error, true, {}, {}, {},
+                          chast::ClipboardDirection::Both, {}, {},
+                          [&](chast::HostServerConfig& config) {
+                              config.settings.file_share_roots = {utf8(share_a),
+                                                                  utf8(share_b)};
+                          });
+    }
+    std::unique_ptr<chast_viewer::ViewerEngine> engine;
+    if (host) {
+        engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+        engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
+        if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
+                           kPassword, {}, {}, false,
+                           chast_viewer::ViewerTransport::kAuto, {}, 0, {}, {},
+                           true)) {
+            error = "ViewerEngine::Start was refused";
+            engine.reset();
+        }
+    }
+    if (engine && wait_streaming(*engine, 20s, &error) &&
+        wait_file_permission(*engine, 10s)) {
+        chast_viewer::ViewerEngine& viewer = *engine;
+        auto take_list = [&](chast::FileListResult* out) {
+            const auto deadline = std::chrono::steady_clock::now() + 15s;
+            for (;;) {
+                chast_viewer::ViewerEngine::FileListAnswer answer;
+                if (viewer.TakeFileList(answer)) {
+                    *out = std::move(answer.result);
+                    return true;
+                }
+                if (viewer.Snapshot().state != chast_viewer::ViewerState::kStreaming) {
+                    error = "the session ended while a listing was pending";
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    error = "a listing answer did not arrive";
+                    return false;
+                }
+                std::this_thread::sleep_for(5ms);
+            }
+        };
+        auto list = [&](const std::string& directory, chast::FileListResult* out) {
+            if (!viewer.RequestFileList(directory)) {
+                error = "RequestFileList(" + directory + ") was refused locally";
+                return false;
+            }
+            return take_list(out);
+        };
+        auto has_entry = [](const chast::FileListResult& result, const std::string& name,
+                            bool directory) {
+            for (const chast::FileListEntry& entry : result.entries) {
+                if (entry.name == name && entry.directory == directory) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto wait_upload = [&](uint64_t sent_before, uint64_t failures_before) {
+            // 1 sent, 0 failed, -1 session/timeout.
+            const auto deadline = std::chrono::steady_clock::now() + 60s;
+            for (;;) {
+                const chast_viewer::ViewerStatus status = viewer.Snapshot();
+                if (status.files_sent > sent_before) {
+                    return 1;
+                }
+                if (status.file_failures > failures_before) {
+                    error = status.last_file_error;
+                    return 0;
+                }
+                if (status.state != chast_viewer::ViewerState::kStreaming) {
+                    error = "the session ended during an upload";
+                    return -1;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    error = "the upload did not finish";
+                    return -1;
+                }
+                std::this_thread::sleep_for(5ms);
+            }
+        };
+        auto operation = [&](chast::FileOperation op, const std::string& path,
+                             const std::string& new_name, int* code) {
+            const uint64_t before = viewer.Snapshot().file_op_answers;
+            if (!viewer.RequestFileOperation(op, path, new_name)) {
+                error = "RequestFileOperation(" + path + ") was refused locally";
+                return false;
+            }
+            const auto deadline = std::chrono::steady_clock::now() + 15s;
+            for (;;) {
+                const chast_viewer::ViewerStatus status = viewer.Snapshot();
+                if (status.file_op_answers > before) {
+                    *code = status.file_op_code;
+                    error = status.file_op_error;
+                    return true;
+                }
+                if (status.state != chast_viewer::ViewerState::kStreaming) {
+                    error = "the session ended while an operation was pending";
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    error = "a file operation answer did not arrive";
+                    return false;
+                }
+                std::this_thread::sleep_for(5ms);
+            }
+        };
+
+        chast::FileListResult listing;
+        WalkOutcome walk;
+        std::string bytes;
+        int code = -1;
+        const int refused = static_cast<int>(chast::FileCode::Refused);
+        const chast_viewer::ViewerStatus upload_before = viewer.Snapshot();
+        std::error_code ignored;
+        if (!list("", &listing)) {
+            // error set
+        } else if (listing.code != chast::FileCode::Ok || listing.entries.size() != 3 ||
+                   listing.entries[0].name != "receive" ||
+                   listing.entries[1].name != "share-a" ||
+                   listing.entries[2].name != "share-b" || !listing.entries[0].directory ||
+                   !listing.entries[1].directory || !listing.entries[2].directory) {
+            error = "the top-level listing is not the three sorted share aliases";
+        } else if (!list("share-a", &listing) || listing.code != chast::FileCode::Ok ||
+                   listing.entries.size() != 1 || !has_entry(listing, tree, true)) {
+            error = "share-a does not list its seeded folder";
+        } else if (!list("share-a/" + tree, &listing) ||
+                   listing.code != chast::FileCode::Ok || listing.entries.size() != 2 ||
+                   !has_entry(listing, "sub", true) || !has_entry(listing, "a.txt", false)) {
+            error = "a nested folder inside share-a does not list its entries";
+        } else if (!list("share-a/" + tree + "/sub", &listing) ||
+                   listing.code != chast::FileCode::Ok ||
+                   !has_entry(listing, "inner.txt", false)) {
+            error = "a two-level folder inside share-a does not list its file";
+        } else if (!list("share-b", &listing) || listing.code != chast::FileCode::Ok ||
+                   !has_entry(listing, "b.txt", false)) {
+            error = "share-b does not list its seeded file";
+        } else if (!list("missing-alias", &listing) ||
+                   listing.code != chast::FileCode::NotFound) {
+            error = "an unknown alias did not report NotFound";
+        } else if (viewer.RequestFileList("../outside")) {
+            error = "a traversal was accepted for listing";
+        } else if (!run_walk(viewer, "share-a/" + tree, 60s, &walk, &error)) {
+            // error set
+        } else if (walk.code != 0 || walk.total != 2 || walk.done != 2) {
+            error = "the share-a walk reported code " + std::to_string(walk.code) + " with " +
+                    std::to_string(walk.done) + "/" + std::to_string(walk.total) + " files";
+        } else if (!read_file(downloads / tree / "a.txt", &bytes, &error) ||
+                   bytes != "alpha" ||
+                   !read_file(downloads / tree / "sub" / "inner.txt", &bytes, &error) ||
+                   bytes != "inner") {
+            error = "the share-a walk did not mirror the seeded tree";
+        } else if (!read_file(receive / "receive-only.txt", &bytes, &error) ||
+                   bytes != "receive") {
+            error = "the receive folder changed during the share walk";
+        } else if (!viewer.SendFiles({utf8(staging / "upload.txt")}, "share-b/incoming")) {
+            error = "SendFiles into share-b was refused locally";
+        } else if (wait_upload(upload_before.files_sent, upload_before.file_failures) != 1) {
+            // error set by wait_upload
+        } else if (!read_file(share_b / "incoming" / "upload.txt", &bytes, &error) ||
+                   bytes != "upload") {
+            error = "the upload did not land below share-b/incoming";
+        } else {
+            const chast_viewer::ViewerStatus refused_before = viewer.Snapshot();
+            if (!viewer.SendFiles({utf8(staging / "upload.txt")}, "missing-alias")) {
+                error = "an upload to an unknown alias was refused locally";
+            } else if (wait_upload(refused_before.files_sent, refused_before.file_failures) != 0) {
+                error = "an upload to an unknown alias was not refused";
+            } else if (fs::exists(work / "missing-alias", ignored) ||
+                       fs::exists(receive / "missing-alias", ignored) ||
+                       fs::exists(share_a / "missing-alias", ignored) ||
+                       fs::exists(share_b / "missing-alias", ignored)) {
+                error = "a refused upload created files";
+            } else if (!operation(chast::FileOperation::MakeDirectory, "share-b/made", "",
+                                  &code) ||
+                       code != 0 || !fs::is_directory(share_b / "made", ignored)) {
+                error = "creating a folder inside share-b failed: " + error;
+            } else if (!operation(chast::FileOperation::Rename, "share-b/made", "renamed",
+                                  &code) ||
+                       code != 0 || !fs::is_directory(share_b / "renamed", ignored) ||
+                       fs::exists(share_b / "made", ignored)) {
+                error = "renaming a folder inside share-b failed: " + error;
+            } else if (!operation(chast::FileOperation::Remove, "share-b/renamed", "", &code) ||
+                       code != 0 || fs::exists(share_b / "renamed", ignored)) {
+                error = "removing a folder inside share-b failed: " + error;
+            } else if (!operation(chast::FileOperation::Rename, "share-b", "renamed-root",
+                                  &code) ||
+                       code != refused || !fs::is_directory(share_b, ignored)) {
+                error = "a share root itself accepted a rename (code " +
+                        std::to_string(code) + ")";
+            } else if (!operation(chast::FileOperation::RemoveTree, "share-b", "", &code) ||
+                       code != refused || !fs::is_directory(share_b, ignored) ||
+                       !fs::exists(share_b / "b.txt", ignored)) {
+                error = "a share root itself accepted a recursive removal (code " +
+                        std::to_string(code) + ")";
+            } else {
+                std::printf(
+                    "viewer-probe: multi-share session -> 3 sorted aliases, nested listing "
+                    "in share-a, 2 files walked from share-a, upload landed in "
+                    "share-b/incoming, unknown alias and root rename/remove refused\n");
+                success = true;
+            }
+        }
+        if (!success && !error.empty()) {
+            std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        }
+        std::filesystem::remove_all(downloads / tree, ignored);
+    } else if (!error.empty()) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+    }
+    if (engine) {
+        engine->Stop();
+    }
+    if (host) {
+        host->stop();
+    }
+    std::error_code ignored;
+    fs::remove_all(work, ignored);
+    return success ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--elevation") return elevation_probe();
     if (argc == 2 && std::string(argv[1]) == "--clipboard-native") return native_clipboard_probe();
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
+    if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();
     bool files_only = false;
     bool file_pages = false;
     bool file_transfer_denied = false;

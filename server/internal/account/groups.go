@@ -322,6 +322,14 @@ func (s *Store) DeleteAccountGroup(groupID string) error {
 	if _, err := tx.Exec(`DELETE FROM account_group_devices WHERE group_id = ?`, groupID); err != nil {
 		return fmt.Errorf("account store %s: delete group devices: %w", s.path, err)
 	}
+	// A group-scoped policy assignment dies with its group; devices that were
+	// covered by it are reconciled back to open/manual by the caller.
+	if _, err := tx.Exec(
+		`DELETE FROM policy_assignments WHERE scope_kind = ? AND scope_value = ?`,
+		PolicyScopeGroup, groupID,
+	); err != nil {
+		return fmt.Errorf("account store %s: delete group policy assignments: %w", s.path, err)
+	}
 	res, err := tx.Exec(`DELETE FROM account_groups WHERE id = ?`, groupID)
 	if err != nil {
 		return fmt.Errorf("account store %s: delete group: %w", s.path, err)

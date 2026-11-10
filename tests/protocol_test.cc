@@ -4214,8 +4214,9 @@ void test_file_transfer() {
     chast::FileStreamHeader got_header;
     check(chast::decode_file_stream_header(stream_header, sizeof(stream_header), got_header,
                                            &error) &&
-              got_header.transfer_id == 7 && got_header.offset == 4096,
-          "CFIL header round-trips");
+              got_header.transfer_id == 7 && got_header.offset == 4096 &&
+              got_header.version == chast::kFileStreamVersion,
+          "CFIL v1 header round-trips");
     uint8_t bad_magic[chast::kFileStreamHeaderSize]{};
     std::memcpy(bad_magic, stream_header, sizeof(bad_magic));
     bad_magic[0] = 'X';
@@ -4223,7 +4224,7 @@ void test_file_transfer() {
           "CFIL header with bad magic is rejected");
     uint8_t bad_version[chast::kFileStreamHeaderSize]{};
     std::memcpy(bad_version, stream_header, sizeof(bad_version));
-    bad_version[4] = 2;
+    bad_version[4] = 3;
     check(!chast::decode_file_stream_header(bad_version, sizeof(bad_version), got_header,
                                             &error),
           "CFIL header with a newer version is rejected");
@@ -4237,6 +4238,71 @@ void test_file_transfer() {
                                             chast::kFileStreamHeaderSize - 1, got_header,
                                             &error),
           "a truncated CFIL header is rejected");
+
+    chast::FileStreamHeader compressed_header;
+    compressed_header.transfer_id = 11;
+    compressed_header.version = chast::kFileStreamVersionCompressed;
+    uint8_t compressed_wire[chast::kFileStreamHeaderSize]{};
+    chast::encode_file_stream_header(compressed_header, compressed_wire);
+    check(chast::decode_file_stream_header(compressed_wire, sizeof(compressed_wire),
+                                           got_header, &error) &&
+              got_header.transfer_id == 11 && got_header.offset == 0 &&
+              got_header.version == chast::kFileStreamVersionCompressed,
+          "CFIL v2 header round-trips");
+    uint8_t resumed_compressed[chast::kFileStreamHeaderSize]{};
+    std::memcpy(resumed_compressed, compressed_wire, sizeof(resumed_compressed));
+    resumed_compressed[16] = 1;  // offset byte
+    check(!chast::decode_file_stream_header(resumed_compressed, sizeof(resumed_compressed),
+                                            got_header, &error),
+          "a CFIL v2 stream with a nonzero offset is rejected");
+
+    chast::FileBlockHeader block;
+    block.stored_size = 1000;
+    block.raw_size = 4096;
+    block.compressed = true;
+    uint8_t block_wire[chast::kFileBlockHeaderSize]{};
+    chast::encode_file_block_header(block, block_wire);
+    chast::FileBlockHeader got_block;
+    check(chast::decode_file_block_header(block_wire, sizeof(block_wire), got_block, &error) &&
+              got_block.stored_size == 1000 && got_block.raw_size == 4096 &&
+              got_block.compressed,
+          "CFIL block header round-trips a compressed block");
+    chast::encode_file_block_header(chast::FileBlockHeader{512, 512, false}, block_wire);
+    check(chast::decode_file_block_header(block_wire, sizeof(block_wire), got_block, &error) &&
+              got_block.stored_size == 512 && got_block.raw_size == 512 &&
+              !got_block.compressed,
+          "CFIL block header round-trips a raw block");
+    uint8_t bad_block[chast::kFileBlockHeaderSize]{};
+    std::memcpy(bad_block, block_wire, sizeof(bad_block));
+    bad_block[8] = 0x80;
+    check(!chast::decode_file_block_header(bad_block, sizeof(bad_block), got_block, &error),
+          "CFIL block header with unknown flags is rejected");
+    chast::encode_file_block_header(chast::FileBlockHeader{1000, 4096, false}, bad_block);
+    check(!chast::decode_file_block_header(bad_block, sizeof(bad_block), got_block, &error),
+          "a raw CFIL block with mismatched sizes is rejected");
+    chast::encode_file_block_header(
+        chast::FileBlockHeader{0, chast::kFileBlockMaxRawBytes, true}, bad_block);
+    check(!chast::decode_file_block_header(bad_block, sizeof(bad_block), got_block, &error),
+          "a CFIL block with a zero stored size is rejected");
+    chast::encode_file_block_header(
+        chast::FileBlockHeader{1024, chast::kFileBlockMaxRawBytes + 1, true}, bad_block);
+    check(!chast::decode_file_block_header(bad_block, sizeof(bad_block), got_block, &error),
+          "a CFIL block with an oversized raw size is rejected");
+    check(!chast::decode_file_block_header(bad_block, chast::kFileBlockHeaderSize - 1,
+                                           got_block, &error),
+          "a truncated CFIL block header is rejected");
+
+    check(!chast::file_compression_worthwhile("notes.txt", 4095, false) &&
+              chast::file_compression_worthwhile("notes.txt", 4096, false) &&
+              chast::file_compression_worthwhile("README", 65536, false),
+          "file compression skips short files and keeps plain names");
+    check(!chast::file_compression_worthwhile("archive.ZIP", 65536, false) &&
+              !chast::file_compression_worthwhile("clip.jpg", 65536, false) &&
+              !chast::file_compression_worthwhile("deep.tar.tgz", 65536, false) &&
+              !chast::file_compression_worthwhile("notes.txt", 65536, true),
+          "file compression skips compressed containers and clipboard copies");
+    check(chast::file_compression_worthwhile("folder.tar.gz.txt", 65536, false),
+          "only the final extension decides file compression");
 }
 
 void test_file_browser() {

@@ -12,7 +12,16 @@ FlutterWindow::FlutterWindow(const flutter::DartProject& project,
     : project_(project), open_window_(std::move(open_window)),
       open_display_(std::move(open_display)), session_(std::move(session)), stream_(stream) {}
 
-FlutterWindow::~FlutterWindow() {}
+FlutterWindow::~FlutterWindow() {
+  // Tearing the engine down from WM_DESTROY crashes flutter_windows.dll when
+  // other windows of this process are still alive, so the runner deletes the
+  // window after DispatchMessage returns and the engine dies here instead.
+  if (viewer_bridge_) {
+    viewer_bridge_->Shutdown();
+    viewer_bridge_.reset();
+  }
+  flutter_controller_ = nullptr;
+}
 
 bool FlutterWindow::OnCreate() {
   if (!Win32Window::OnCreate()) {
@@ -50,14 +59,6 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
-  if (viewer_bridge_) {
-    viewer_bridge_->Shutdown();
-    viewer_bridge_.reset();
-  }
-  if (flutter_controller_) {
-    flutter_controller_ = nullptr;
-  }
-
   Win32Window::OnDestroy();
 }
 

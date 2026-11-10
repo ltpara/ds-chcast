@@ -214,6 +214,7 @@ type server struct {
 
 	accessIssuer *acl.Issuer
 	ticketReplay *acl.ReplayGuard
+	eventHub     *hostEventHub
 
 	wake *wake.Broker
 }
@@ -247,6 +248,7 @@ func New(cfg Config) http.Handler {
 		durationBuckets: make(map[string][]uint64),
 		recoveryLast:    make(map[string]time.Time),
 		wake:            wake.New(wake.DefaultTTL, wake.DefaultCooldown, wake.DefaultMaxJobs),
+		eventHub:        newHostEventHub(),
 	}
 	if cfg.AccessIssuer != nil {
 		s.accessIssuer = cfg.AccessIssuer
@@ -334,7 +336,10 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/file-transfers/batch", s.recordAccountFileTransferBatch)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
+	mux.HandleFunc("GET /v1/hosts/{id}/events", s.hostEvents)
 	mux.HandleFunc("POST /v1/hosts/{id}/wake", s.wakeHost)
+	mux.HandleFunc("GET /v1/access-kids", s.listRevokedAccessKids)
+	mux.HandleFunc("POST /v1/access-kids", s.revokeAccessKid)
 	mux.HandleFunc("GET /v1/api-tokens", s.listAPITokens)
 	mux.HandleFunc("POST /v1/api-tokens", s.createAPIToken)
 	mux.HandleFunc("DELETE /v1/api-tokens/{id}", s.revokeAPIToken)
@@ -366,6 +371,14 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("PUT /v1/device-policies/{peer}", s.setDevicePolicy)
 	mux.HandleFunc("DELETE /v1/device-policies/{peer}", s.deleteDevicePolicy)
 	mux.HandleFunc("POST /v1/device-policies/{peer}/receipt", s.reportDevicePolicyReceipt)
+	mux.HandleFunc("GET /v1/policies", s.listPolicyObjects)
+	mux.HandleFunc("POST /v1/policies", s.createPolicyObject)
+	mux.HandleFunc("GET /v1/policies/{id}", s.policyObjectDetail)
+	mux.HandleFunc("PUT /v1/policies/{id}", s.updatePolicyObject)
+	mux.HandleFunc("DELETE /v1/policies/{id}", s.deletePolicyObject)
+	mux.HandleFunc("GET /v1/policy-assignments", s.listPolicyAssignments)
+	mux.HandleFunc("POST /v1/policy-assignments", s.createPolicyAssignment)
+	mux.HandleFunc("DELETE /v1/policy-assignments/{id}", s.deletePolicyAssignment)
 	mux.HandleFunc("POST /v1/access-tickets", s.issueAccessTicket)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return s.instrument(mux)

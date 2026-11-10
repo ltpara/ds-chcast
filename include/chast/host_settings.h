@@ -109,6 +109,11 @@ struct HostSettings {
     std::string record_directory;
     // UTF-8 directory for received files. Empty means Downloads\chast.
     std::string file_receive_directory;
+    // Extra absolute folders the viewer may browse and manage, written as a
+    // semicolon-separated list in host.ini. The receive folder stays the upload
+    // home; when this list is non-empty it appears at the browse top level
+    // beside one entry per configured folder.
+    std::vector<std::string> file_share_roots;
     // Send the system sound to the viewer. Off means no audio stream is
     // opened and the HelloAck reports audio unavailable.
     bool allow_audio = true;

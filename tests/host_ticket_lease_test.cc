@@ -434,6 +434,94 @@ int main() {
                     narrow_viewer->finish_client(narrow_stats, std::chrono::seconds(1));
                 }
             }
+
+            wait_listening(*fixture, std::chrono::seconds(5));
+
+            // Online revocation: a statement naming another issuer key or an
+            // older policy version leaves the session alone; the matching kid
+            // ends it at once instead of waiting for the ticket deadline.
+            {
+                const int64_t issued5 = now_seconds();
+                const std::vector<uint8_t> ticket5 =
+                    mint_ticket(fixture->fingerprint, issued5, issued5 + 30, "jti-revoke-1");
+                std::string revoke_error;
+                std::unique_ptr<chast::QuicSession> revoke_viewer =
+                    connect_ticket_viewer(*fixture, ticket5, kClientSeedFirst, &revoke_error);
+                check(revoke_viewer != nullptr, "the revocation viewer is admitted");
+                if (!revoke_viewer) {
+                    std::printf("     client: %s\n", revoke_error.c_str());
+                } else {
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (std::chrono::steady_clock::now() < deadline &&
+                           fixture->server->status().state != chast::HostState::Streaming) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    check(fixture->server->status().state == chast::HostState::Streaming,
+                          "the revocation viewer streams");
+                    fixture->server->revoke_managed_sessions("another key", 0, "kid-other");
+                    fixture->server->revoke_managed_sessions("older policy", kPolicyVersion, "");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    check(revoke_viewer->peer_alive(),
+                          "unrelated statements leave the managed session alone");
+                    fixture->server->revoke_managed_sessions("issuer key revoked", 0, kKid);
+                    bool revoked_closed = false;
+                    const auto close_deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (std::chrono::steady_clock::now() < close_deadline) {
+                        if (!revoke_viewer->peer_alive()) {
+                            revoked_closed = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    check(revoked_closed, "the revoked kid ends the managed session at once");
+                    check(log_contains(*fixture, "the server ended this managed session"),
+                          "the host records why the session ended");
+                    chast::ClientStats revoke_stats;
+                    revoke_viewer->finish_client(revoke_stats, std::chrono::seconds(1));
+                    check(wait_listening(*fixture, std::chrono::seconds(5)),
+                          "the host returns to listening after the revocation");
+                }
+            }
+
+            // A policy version newer than the ticket's closes the session too;
+            // the host matches the version the viewer was admitted under.
+            {
+                const int64_t issued6 = now_seconds();
+                const std::vector<uint8_t> ticket6 =
+                    mint_ticket(fixture->fingerprint, issued6, issued6 + 30, "jti-revoke-2");
+                std::string policy_error;
+                std::unique_ptr<chast::QuicSession> policy_viewer =
+                    connect_ticket_viewer(*fixture, ticket6, kClientSeedFirst, &policy_error);
+                check(policy_viewer != nullptr, "the policy viewer is admitted");
+                if (!policy_viewer) {
+                    std::printf("     client: %s\n", policy_error.c_str());
+                } else {
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (std::chrono::steady_clock::now() < deadline &&
+                           fixture->server->status().state != chast::HostState::Streaming) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    fixture->server->revoke_managed_sessions("device policy changed",
+                                                             kPolicyVersion + 1);
+                    bool policy_closed = false;
+                    const auto close_deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (std::chrono::steady_clock::now() < close_deadline) {
+                        if (!policy_viewer->peer_alive()) {
+                            policy_closed = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    check(policy_closed, "a newer policy version ends the managed session");
+                    chast::ClientStats policy_stats;
+                    policy_viewer->finish_client(policy_stats, std::chrono::seconds(1));
+                    wait_listening(*fixture, std::chrono::seconds(5));
+                }
+            }
         }
         if (fixture) {
             fixture->server->stop();

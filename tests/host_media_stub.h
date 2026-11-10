@@ -303,6 +303,7 @@ inline std::shared_ptr<MediaState> use_media(HostServerConfig& config) {
     };
     config.dry_run_input = true;
     config.adaptive_bitrate = false;
+    config.adaptive_fps = false;
     config.keyframe_interval_ms = 0;
     return state;
 }

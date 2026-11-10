@@ -2,7 +2,7 @@
 
 本文件记录本次暂停开发时的真实状态，作为下次继续工作的入口。当前源码已包含多轮 Windows 发射端、观看端和连接服务改动；**这是开发检查点，不是发布验收完成版**。VP9 / 4:4:4 已接入主要路径，仍处于验证和收尾阶段。
 
-2026-11-10 更新：开发已推进到 **v65**（票据/受管策略、Legacy 键盘、查看端自动录制、机器令牌、递归删除、隐藏项浏览），当前状态和后续顺序以 [当前状态与后续计划](status-and-plan-2026-11-09.md) 为准；本文其余内容保留 2026-11-09 快照语义，其中协议版本和验证记录不随之后提交改写。
+2026-11-10 更新：开发已推进到 **v66**（票据/受管策略、Legacy 键盘、查看端自动录制、机器令牌、递归删除、隐藏项浏览、多共享根/盘符与 CFIL v2 文件压缩），当前状态和后续顺序以 [当前状态与后续计划](status-and-plan-2026-11-09.md) 为准；本文其余内容保留 2026-11-09 快照语义，其中协议版本和验证记录不随之后提交改写。
 
 ## 1. 保存范围与基线
 
@@ -209,13 +209,14 @@
 | libjpeg-turbo | `D:/vcpkg/installed/x64-windows-static-md` | 3.1.3 | libyuv 构建依赖 |
 | Opus | `D:/vcpkg/installed/x64-windows-static` | 1.5.2#1 | 音频编解码 |
 | SpeexDSP | `D:/vcpkg/installed/x64-windows-static` | 1.2.1#1 | 回声消除与预处理 |
+| zstd | `D:/vcpkg/installed/x64-windows-static` | 1.5.7 | v66 CFIL v2 文件块压缩；静态链接 |
 | MsQuic | `D:/vcpkg/installed/x64-windows` | 2.4.8#1 | QUIC 传输；构建自动复制 `msquic.dll` |
 
 vcpkg 安装入口（缺包时执行；版本由上述 baseline 决定）：
 
 ```powershell
 D:/vcpkg/vcpkg.exe install openh264:x64-windows-static-md libvpx:x64-windows-static-md libyuv:x64-windows-static-md
-D:/vcpkg/vcpkg.exe install ffmpeg:x64-windows-static opus:x64-windows-static speexdsp:x64-windows-static
+D:/vcpkg/vcpkg.exe install ffmpeg:x64-windows-static opus:x64-windows-static speexdsp:x64-windows-static zstd:x64-windows-static
 D:/vcpkg/vcpkg.exe install msquic:x64-windows
 ```
 

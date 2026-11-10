@@ -49,6 +49,7 @@ type DevicePolicy struct {
 	UpdatedBy         string               `json:"updated_by,omitempty"`
 	AllowedUsers      []string             `json:"allowed_users"`
 	AllowedGroups     []string             `json:"allowed_groups"`
+	Source            *DevicePolicySource  `json:"source,omitempty"`
 	Receipt           *DevicePolicyReceipt `json:"receipt,omitempty"`
 }
 
@@ -111,27 +112,39 @@ func (s *Store) SetDevicePolicy(peerID, mode string, ceiling uint32, usernames, 
 	}
 	defer tx.Rollback()
 
-	var current uint32
-	err = tx.QueryRow(`SELECT policy_version FROM device_policies WHERE peer_id = ?`, peerID).Scan(&current)
+	var marker int
+	err = tx.QueryRow(`SELECT 1 FROM device_policies WHERE peer_id = ?`, peerID).Scan(&marker)
+	existing := true
+	if errors.Is(err, sql.ErrNoRows) {
+		existing = false
+		err = nil
+	}
+	if err != nil {
+		return DevicePolicy{}, fmt.Errorf("account store %s: read device policy: %w", s.path, err)
+	}
+	next, err := s.nextDevicePolicyVersionTx(tx, peerID)
+	if err != nil {
+		return DevicePolicy{}, err
+	}
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case !existing:
 		if _, err := tx.Exec(
 			`INSERT INTO device_policies
-				(peer_id, mode, permission_ceiling, policy_version, updated_at, updated_by)
-			 VALUES (?, ?, ?, 1, ?, ?)`,
-			peerID, mode, int64(ceiling), unixMillis(updated), updatedBy,
+				(peer_id, mode, permission_ceiling, policy_version, updated_at, updated_by,
+				 source_kind, source_id, source_version, source_priority)
+			 VALUES (?, ?, ?, ?, ?, ?, 'manual', '', 0, 0)`,
+			peerID, mode, int64(ceiling), next, unixMillis(updated), updatedBy,
 		); err != nil {
 			return DevicePolicy{}, fmt.Errorf("account store %s: create device policy: %w", s.path, err)
 		}
-	case err != nil:
-		return DevicePolicy{}, fmt.Errorf("account store %s: read device policy: %w", s.path, err)
 	default:
 		if _, err := tx.Exec(
 			`UPDATE device_policies
-			 SET mode = ?, permission_ceiling = ?, policy_version = policy_version + 1,
-			     updated_at = ?, updated_by = ?
+			 SET mode = ?, permission_ceiling = ?, policy_version = ?,
+			     updated_at = ?, updated_by = ?,
+			     source_kind = 'manual', source_id = '', source_version = 0, source_priority = 0
 			 WHERE peer_id = ?`,
-			mode, int64(ceiling), unixMillis(updated), updatedBy, peerID,
+			mode, int64(ceiling), next, unixMillis(updated), updatedBy, peerID,
 		); err != nil {
 			return DevicePolicy{}, fmt.Errorf("account store %s: update device policy: %w", s.path, err)
 		}
@@ -163,6 +176,42 @@ func (s *Store) SetDevicePolicy(peerID, mode string, ceiling uint32, usernames, 
 		return DevicePolicy{}, fmt.Errorf("account store %s: commit device policy: %w", s.path, err)
 	}
 	return s.devicePolicyLocked(peerID)
+}
+
+// nextDevicePolicyVersionTx allocates the next per-device policy version. The
+// sequence is durable and independent of the device_policies row so deleting a
+// manual override does not restart the counter: an agent ignores any policy
+// older than the one it already holds, so a reset would leave the host
+// enforcing the deleted policy while the server believes it is unmanaged.
+func (s *Store) nextDevicePolicyVersionTx(tx *sql.Tx, peerID string) (uint32, error) {
+	var last int64
+	err := tx.QueryRow(
+		`SELECT last_version FROM device_policy_versions WHERE peer_id = ?`, peerID,
+	).Scan(&last)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRow(
+			`SELECT policy_version FROM device_policies WHERE peer_id = ?`, peerID,
+		).Scan(&last)
+		if errors.Is(err, sql.ErrNoRows) {
+			last = 0
+			err = nil
+		}
+	}
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: read device policy version: %w", s.path, err)
+	}
+	if last >= int64(1<<32-1) {
+		return 0, fmt.Errorf("account store %s: device policy version overflow for %s", s.path, peerID)
+	}
+	next := uint32(last + 1)
+	if _, err := tx.Exec(
+		`INSERT INTO device_policy_versions (peer_id, last_version) VALUES (?, ?)
+		 ON CONFLICT(peer_id) DO UPDATE SET last_version = excluded.last_version`,
+		peerID, int64(next),
+	); err != nil {
+		return 0, fmt.Errorf("account store %s: record device policy version: %w", s.path, err)
+	}
+	return next, nil
 }
 
 func (s *Store) resolvePolicyUsers(usernames []string) ([]string, error) {
@@ -236,18 +285,24 @@ func (s *Store) DevicePolicy(peerID string) (DevicePolicy, bool, error) {
 
 func (s *Store) devicePolicyLocked(peerID string) (DevicePolicy, error) {
 	var (
-		policy    DevicePolicy
-		ceiling   int64
-		updated   int64
-		receipt   DevicePolicyReceipt
-		applied   int
-		reported  int64
-		hasResult bool
+		policy         DevicePolicy
+		ceiling        int64
+		updated        int64
+		receipt        DevicePolicyReceipt
+		applied        int
+		reported       int64
+		hasResult      bool
+		sourceKind     string
+		sourceID       string
+		sourceVersion  int64
+		sourcePriority int64
 	)
 	err := s.db.QueryRow(
-		`SELECT peer_id, mode, permission_ceiling, policy_version, updated_at, updated_by
+		`SELECT peer_id, mode, permission_ceiling, policy_version, updated_at, updated_by,
+		        source_kind, source_id, source_version, source_priority
 		 FROM device_policies WHERE peer_id = ?`, peerID,
-	).Scan(&policy.PeerID, &policy.Mode, &ceiling, &policy.PolicyVersion, &updated, &policy.UpdatedBy)
+	).Scan(&policy.PeerID, &policy.Mode, &ceiling, &policy.PolicyVersion, &updated, &policy.UpdatedBy,
+		&sourceKind, &sourceID, &sourceVersion, &sourcePriority)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DevicePolicy{}, ErrUnknownDevicePolicy
 	}
@@ -256,6 +311,18 @@ func (s *Store) devicePolicyLocked(peerID string) (DevicePolicy, error) {
 	}
 	policy.PermissionCeiling = uint32(ceiling)
 	policy.UpdatedAt = timeFromMillis(updated)
+	if sourceKind == "policy" && sourceID != "" {
+		source := &DevicePolicySource{
+			Kind:     sourceKind,
+			ID:       sourceID,
+			Version:  uint32(sourceVersion),
+			Priority: int(sourcePriority),
+		}
+		if err := s.db.QueryRow(`SELECT name FROM policy_objects WHERE id = ?`, sourceID).Scan(&source.Name); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return DevicePolicy{}, fmt.Errorf("account store %s: read policy source: %w", s.path, err)
+		}
+		policy.Source = source
+	}
 
 	rows, err := s.db.Query(
 		`SELECT u.username FROM device_policy_users pu

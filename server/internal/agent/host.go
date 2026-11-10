@@ -112,6 +112,22 @@ type HostConfig struct {
 	// relay assigned by the server. It is called from the read or refresh
 	// goroutine, so it must not block.
 	OnInfo func(HostInfo)
+	// OnRevoke receives control statements that end admitted sessions: a
+	// policy version the host must apply, or an issuer key the server retired.
+	// The embedding host must close matching managed sessions instead of
+	// waiting for the 60-second ticket lease to lapse. It runs on the event
+	// stream goroutine and must not block.
+	OnRevoke func(RevokeEvent)
+}
+
+// RevokeEvent is one pushed control statement. Kind is "policy" (Policy is the
+// new statement, nil when the device became unmanaged) or "revoke" (Kid names
+// the retired issuer key).
+type RevokeEvent struct {
+	Kind   string        `json:"kind"`
+	Kid    string        `json:"kid,omitempty"`
+	Reason string        `json:"reason,omitempty"`
+	Policy *DevicePolicy `json:"policy,omitempty"`
 }
 
 // HostInfo is a snapshot of the host agent for an embedding application.
@@ -412,6 +428,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	go h.rendezvousControlLoop()
 	go h.relayHelloLoop()
 	go h.refreshLoop()
+	go h.hostEventLoop()
 	if h.carrier != nil {
 		go h.carrierLinkLoop()
 	}
@@ -635,6 +652,11 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	relaySet := resolveUDPAll(endpoints)
 	policy := cloneDevicePolicy(reg.DevicePolicy)
 	h.mu.Lock()
+	if h.policy != nil && policy != nil && policy.PolicyVersion < h.policy.PolicyVersion {
+		// A refresh sent before a pushed policy change can answer with the
+		// older statement; the event stream already applied the newer one.
+		policy = h.policy
+	}
 	policyChanged := !sameDevicePolicy(h.policy, policy)
 	if policyChanged {
 		h.policy = policy
@@ -1762,5 +1784,107 @@ func (h *HostAgent) refreshLoop() {
 			continue
 		}
 		h.applyRegistration(reg)
+	}
+}
+
+// hostEventLoop keeps one long poll open so a policy change or issuer-key
+// revocation reaches the host in seconds instead of waiting for the next
+// registration. The loop is best effort: a failed poll backs off and the
+// 60-second ticket lease remains the correctness bound.
+func (h *HostAgent) hostEventLoop() {
+	var after uint64
+	delay := time.Second
+	for {
+		if h.ctx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(h.ctx, hostEventPollWait+15*time.Second)
+		result, err := h.api.hostEvents(ctx, h.cfg.ID, after, h.priv)
+		cancel()
+		if err != nil {
+			if h.ctx.Err() != nil {
+				return
+			}
+			h.log.Debug("host event stream interrupted", "error", err)
+			select {
+			case <-h.ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			if delay < 30*time.Second {
+				delay *= 2
+			}
+			continue
+		}
+		delay = time.Second
+		after = result.Cursor
+		for _, event := range result.Events {
+			h.applyHostEvent(event)
+		}
+	}
+}
+
+func (h *HostAgent) applyHostEvent(event hostEvent) {
+	switch event.Kind {
+	case "policy":
+		managed := event.Managed != nil && *event.Managed
+		var policy *DevicePolicy
+		if managed {
+			policy = &DevicePolicy{
+				Mode:              event.Mode,
+				PermissionCeiling: event.PermissionCeiling,
+				PolicyVersion:     event.PolicyVersion,
+				UpdatedAtMS:       event.UpdatedAtMS,
+			}
+			h.mu.Lock()
+			if h.policy != nil && h.policy.PolicyVersion > policy.PolicyVersion {
+				h.mu.Unlock()
+				return
+			}
+			h.mu.Unlock()
+		}
+		h.mu.Lock()
+		h.policy = policy
+		h.policySaved = false
+		h.receiptVersion = 0
+		h.receiptTried = 0
+		h.mu.Unlock()
+		saved := true
+		if h.cfg.PolicyState != "" {
+			if err := savePolicyState(h.cfg.PolicyState, policy, time.Now()); err != nil {
+				saved = false
+				h.log.Error("cannot persist pushed device policy",
+					"path", h.cfg.PolicyState, "error", err)
+			}
+		}
+		if saved {
+			h.mu.Lock()
+			h.policySaved = true
+			h.mu.Unlock()
+		}
+		if policy == nil {
+			h.log.Info("device policy removed; local authentication remains in effect")
+		} else {
+			h.log.Info("device policy pushed", "mode", policy.Mode,
+				"version", policy.PolicyVersion, "permission_ceiling", policy.PermissionCeiling)
+			if !policy.Valid() {
+				h.log.Warn("unknown device policy mode; the host must keep this device managed",
+					"mode", policy.Mode, "version", policy.PolicyVersion)
+			}
+			h.maybeReportPolicyReceipt(policy)
+		}
+		if h.cfg.OnRevoke != nil {
+			h.cfg.OnRevoke(RevokeEvent{Kind: "policy", Reason: event.Reason, Policy: policy})
+		}
+		h.reportInfo()
+	case "revoke":
+		if event.Kid == "" {
+			return
+		}
+		h.log.Warn("access key revoked; admitted sessions must end",
+			"kid", event.Kid, "reason", event.Reason)
+		if h.cfg.OnRevoke != nil {
+			h.cfg.OnRevoke(RevokeEvent{Kind: "revoke", Kid: event.Kid, Reason: event.Reason})
+		}
 	}
 }

@@ -16,6 +16,7 @@
 
 #include "chast/security.h"
 #include "chast/access_ticket.h"
+#include "chast/file_transfer.h"
 
 namespace chast {
 
@@ -862,6 +863,28 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
             }
         } else if (key == "file_receive_dir") {
             settings.file_receive_directory = value;
+        } else if (key == "file_share_roots") {
+            settings.file_share_roots.clear();
+            for (const std::string& entry : split(value, ';')) {
+                const std::string item = trim(entry);
+                if (item.empty()) {
+                    continue;
+                }
+                if (item.find('\0') != std::string::npos ||
+                    item.find_first_of("\r\n") != std::string::npos ||
+                    !native_path(item).is_absolute()) {
+                    warn(result.warning, "file_share_roots entry '" + item +
+                                             "' is not an absolute folder; skipping it");
+                    continue;
+                }
+                if (settings.file_share_roots.size() >= kMaxFileShares) {
+                    warn(result.warning, "file_share_roots holds more than " +
+                                             std::to_string(kMaxFileShares) +
+                                             " folders; the rest is ignored");
+                    break;
+                }
+                settings.file_share_roots.push_back(item);
+            }
         } else if (key == "record_incoming") {
             if (!parse_bool(value, settings.record_incoming)) {
                 settings.record_incoming = false;
@@ -1304,6 +1327,27 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
         if (error) *error = "Host recording requires an absolute directory without line breaks.";
         return false;
     }
+    if (settings.file_share_roots.size() > kMaxFileShares) {
+        if (error) *error = "Host file shares are limited to " +
+                             std::to_string(kMaxFileShares) + " folders.";
+        return false;
+    }
+    std::string share_roots;
+    for (const std::string& root : settings.file_share_roots) {
+        if (root.empty() || root.find('\0') != std::string::npos ||
+            root.find_first_of("\r\n;") != std::string::npos ||
+            !native_path(root).is_absolute()) {
+            if (error) {
+                *error = "Host file shares require absolute folders without line breaks or "
+                         "semicolons.";
+            }
+            return false;
+        }
+        if (!share_roots.empty()) {
+            share_roots += ';';
+        }
+        share_roots += root;
+    }
     const PermissionMask permissions =
         (settings.allow_input ? kPermissionInput : 0) |
         (settings.allow_clipboard ? kPermissionClipboard : 0) |
@@ -1349,6 +1393,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "record_incoming=" << (settings.record_incoming ? 1 : 0) << "\n"
          << "record_directory=" << settings.record_directory << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
+         << "file_share_roots=" << share_roots << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "audio_device=" << settings.audio_device << "\n"
          << "audio_aec=" << (settings.audio_aec ? 1 : 0) << "\n"

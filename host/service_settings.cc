@@ -31,7 +31,7 @@ bool merge_service_settings(const HostSettings& original, const HostSettings& ed
         APPLY(allow_os_login); APPLY(allow_session_select); APPLY(allow_remote_config);
         APPLY(lock_after_session_end); APPLY(keep_awake); APPLY(auto_disconnect_minutes); APPLY(trusted_device_days);
         APPLY(allow_audio); APPLY(allow_microphone); APPLY(allow_privacy_mode); APPLY(allow_permission_change);
-        APPLY(file_receive_directory); APPLY(audio_device); APPLY(audio_aec); APPLY(audio_silence_gate_ms);
+        APPLY(file_receive_directory); APPLY(file_share_roots); APPLY(audio_device); APPLY(audio_aec); APPLY(audio_silence_gate_ms);
         APPLY(virtual_display); APPLY(virtual_display_monitors); APPLY(virtual_display_resolution); APPLY(privacy_mode_impl);
         APPLY(token_auth); APPLY(token_mode); APPLY(access_token);
         if (original.password_hash != edited.password_hash) result.trusted_devices.clear();

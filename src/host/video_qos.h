@@ -18,8 +18,11 @@ public:
         uint32_t fps;
         float ratio;
     };
+    // abr matches RustDesk's enable-abr: it gates only the quality ratio.
+    // Delay-driven FPS adaptation stays on unless adaptive_fps is turned off;
+    // only probes that assert exact configured rates need that.
     explicit VideoQos(uint32_t max_fps = 30, float default_ratio = 0.67f,
-                      bool adaptive = true);
+                      bool abr = true, bool adaptive_fps = true);
     void open(uint64_t id, uint64_t now_ms);
     void close(uint64_t id, uint64_t now_ms);
     void options(uint64_t id, uint32_t fps, std::optional<Quality> quality, uint64_t now_ms);
@@ -89,7 +92,8 @@ private:
     std::map<uint64_t, Display> displays_;
     uint32_t max_fps_, fps_, bitrate_kbps_ = 0;
     float default_ratio_, ratio_;
-    bool adaptive_;
+    bool abr_;
+    bool adaptive_fps_;
     uint64_t last_ratio_ = 0, quality_order_ = 0;
 };
 } // namespace chast

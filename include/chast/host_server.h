@@ -367,6 +367,10 @@ struct HostServerConfig {
     // (less the audio reserve) is the ceiling; the target recovers when the
     // path is clean again.
     bool adaptive_bitrate = true;
+    // Keep the configured frame rate even though ABR may be off. Probes that
+    // assert exact rates turn this off; RustDesk's enable-abr only gates the
+    // quality ratio, so FPS adaptation stays on in production.
+    bool adaptive_fps = true;
     // How long the first wait_for_client() may take; 0 = wait forever. Later
     // waits are unlimited.
     uint32_t first_client_timeout_ms = 0;
@@ -522,6 +526,13 @@ public:
     bool start_file_download(uint64_t connection_id, const std::string& utf8_path, std::string* error,
                              std::shared_ptr<void> file_access_token = {});
     bool disconnect_viewer(uint64_t connection_id);
+    // Ends managed sessions that a control statement from the server
+    // invalidates: policy_version > 0 closes sessions admitted under an older
+    // policy version, kid closes sessions whose ticket was signed by that
+    // issuer key. Sessions without an access ticket are untouched. Safe to
+    // call from any thread.
+    void revoke_managed_sessions(const std::string& reason, uint32_t policy_version,
+                                 const std::string& kid = std::string());
     // The token CLI/automation needs right now. Rotates after a one-time
     // session.
     std::string token() const;
@@ -791,6 +802,15 @@ private:
     // True once a refused renewal ended the session; the finish step then
     // skips the usual stats grace, like an expired lease.
     bool ticket_renew_failed_ = false;
+    // What an online revocation matches: the issuer key that signed the
+    // admitted ticket and the policy version it carried; a renewal replaces
+    // both. Only a ticket-admitted session is managed. Guarded by
+    // ticket_meta_mutex_ because the tunnel event thread reads them while the
+    // host thread admits or renews.
+    mutable std::mutex ticket_meta_mutex_;
+    bool managed_session_ = false;
+    std::string ticket_key_id_;
+    uint32_t ticket_policy_version_ = 0;
 
     // The operator download. Queued by the UI, hashed off the frame loop,
     // then offered and streamed from the host thread.
@@ -934,6 +954,10 @@ private:
 
     std::unique_ptr<ActiveUpload> upload_;
     std::string file_receive_directory_;
+    // Browse roots for this session. Empty keeps the receive directory as the
+    // only root; otherwise the top level lists the receive directory (when it
+    // exists) and every configured share.
+    std::vector<FileShareRoot> file_shares_;
     // The id the current session's audit records carry: the viewer's
     // reference, or one the host generated when the viewer sent none.
     std::string session_audit_ref_;

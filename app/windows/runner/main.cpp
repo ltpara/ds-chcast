@@ -94,17 +94,32 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   while (::GetMessage(&msg, nullptr, 0, 0)) {
     ::TranslateMessage(&msg);
     ::DispatchMessage(&msg);
-    windows.erase(
-        std::remove_if(windows.begin(), windows.end(),
-                       [](const std::unique_ptr<FlutterWindow>& window) {
-                         return window->GetHandle() == nullptr;
-                       }),
-        windows.end());
-    if (windows.empty()) {
+    // The first engine owns the process-wide Dart VM. Tearing it down while
+    // other windows keep dispatching messages crashes the next Dart callback
+    // (access violation in dart::DartEntry::InvokeFunction), so keep the home
+    // window object alive until the loop ends and only drop the other windows
+    // once their HWNDs are gone.
+    if (windows.size() > 1) {
+      windows.erase(
+          std::remove_if(windows.begin() + 1, windows.end(),
+                         [](const std::unique_ptr<FlutterWindow>& window) {
+                           return window->GetHandle() == nullptr;
+                         }),
+          windows.end());
+    }
+    const bool any_live = std::any_of(
+        windows.begin(), windows.end(), [](const std::unique_ptr<FlutterWindow>& window) {
+          return window->GetHandle() != nullptr;
+        });
+    if (!any_live) {
       break;
     }
   }
 
+  // Destroy child engines before the VM-owning home engine.
+  for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
+    it->reset();
+  }
   windows.clear();
 
   ::CoUninitialize();

@@ -1,6 +1,6 @@
 # 发射端与 RustDesk 的实现及效果对照（2026-11-07）
 
-> **历史快照（2026-11-09 复核）**：本文件记录 11 月 7 日审查时的问题、源码行号和修复计划，F01–F04 已在当时完成。此后 v50–v61 已关闭 F05–F08 的结构性差距（按显示器共享采集编码、全订阅者 QoS、按连接 ID 管理、编解码能力协商），并补齐防休眠、GDI 兜底、文件分页、剪贴板方向、空目录、按需文件剪贴板、远程提权、主机入站录屏和 VP9 4:4:4。文中 H08/H10/H11/H13/H15/H16/H18/H19/H29–H33/H37 等行不代表当前状态。**当前功能矩阵和剩余差距以 [发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md) 和 [当前状态与计划](status-and-plan-2026-11-09.md) 为准**；本文件只保留审查过程作为历史记录。
+> **历史快照（2026-11-09 复核）**：本文件记录 11 月 7 日审查时的问题、源码行号和修复计划，F01–F04 已在当时完成。此后 v50–v61 已关闭 F05–F08 的结构性差距（按显示器共享采集编码、全订阅者 QoS、按连接 ID 管理、编解码能力协商），并补齐防休眠、GDI 兜底、文件分页、剪贴板方向、空目录、按需文件剪贴板、远程提权、主机入站录屏和 VP9 4:4:4。文中 H08/H11/H13/H15/H16/H18/H29–H33/H37 等行不代表当前状态。**当前功能矩阵和剩余差距以 [发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md) 和 [当前状态与计划](status-and-plan-2026-11-09.md) 为准**；本文件只保留审查过程作为历史记录。
 
 ## 范围与结论
 
@@ -136,9 +136,9 @@
 | H05 | 可信设备、2FA、IP 限制 | 对应安全设置；R10 | **有路径**：签名设备、TOTP、期限、IPv4/IPv6 CIDR；P03 | 到期/撤销/重放/代理来源判断单独验收，不扩成账号 ACL 比对 |
 | H06 | 多连接与控制权 | 连接表与服务订阅；R01、R06 | **部分**：默认 2、上限 8，输入独占；媒体依附首会话；P04 | F04–F07；选择目标、控制权与生产资源解耦 |
 | H07 | 会话内权限和全局策略 | 按连接权限操作；R06 | **部分**：有 live 权限，主机策略传播不完整；P04 | F03；可查询的设置必须与实际执行一致 |
-| H08 | 活跃会话、防休眠 | 依据入站连接数持有 wakelock；R08 | **缺失**：未找到电源请求或对应设置；P01、P05 | 无输入观看/传文件期间按配置保持唤醒，最后连接结束释放 |
+| H08 | 活跃会话、防休眠 | 依据入站连接数持有 wakelock；R08 | **已有实现**：`keep_awake`（默认开）为每个已认证会话创建独立 `PowerRequest`，桌面会话加显示请求，结束即释放；P01、P05 | 无输入观看/传文件期间按配置保持唤醒，最后连接结束释放；真实睡眠策略验收 |
 | H09 | 单屏、合并桌面 | 按显示器服务、显示器订阅集合；R01、R03 | **有路径**：DXGI 单屏及合并采集；P06 | 跨 GPU、旋转、负坐标与尺寸上限需真机验证 |
-| H10 | 不同观看者独立选屏 | 连接的显示器订阅不同；R03 | **未对齐**：全局一条流，跟随者不能切屏；P04 | F05；A/B 可同时看不同屏幕 |
+| H10 | 不同观看者独立选屏 | 连接的显示器订阅不同；R03 | **已对齐/已验证**：每连接按稳定显示器身份订阅（`src/host/host_server.cc:2573`），同屏共享采集编码；`chast-host-parity-test` 覆盖 A/B 独立选屏、切换互不影响、同目标复用流水线；P04 | 真实双显示器 A/B 同看不同屏、热插拔；F05 审查过程见前文快照 |
 | H11 | 远程分辨率/跟随窗口 | 显示模式与跟随订阅；R03 | **部分**：生产者有模式修改、跟随逻辑，跟随者限制/漏处理；P04 | F02/F05；区分选看屏幕与改变物理模式 |
 | H12 | 无头与虚拟显示器 | Windows 虚拟显示集成；R10 | **部分/待验**：usbmmidd、安装检查、拓扑守卫；通用 vdd 未实现；P07 | 无物理屏、驱动不可用、异常退出恢复；不能把 provider 名称视为可用性证明 |
 | H13 | 隐私与本地输入屏蔽 | 隐私服务与恢复逻辑；R10 | **有路径/组合有限**：遮罩/虚拟屏、BlockInput，跟随者拒绝；P07、P04 | 撤权/断线/进程崩溃后恢复拓扑及本地输入；按控制权而非生产身份管理 |
@@ -147,15 +147,15 @@
 | H16 | 文字清晰度/真彩色 | 可选 I444；R07、R10 | **差异**：BGRA→NV12 4:2:0；无 I444；P06 | 小字号彩色文字/细线图的截图对比；码率提高不能等价恢复色度采样 |
 | H17 | HDR | 平台相关采集、色彩转换；R10 | **有限实现**：FP16 归一为 BGRA8/NV12；P06 | 高光/暗部、SDR/HDR 混屏、色彩切换；不宣称 HDR10 端到端 |
 | H18 | 采集/编码故障恢复 | DXGI 有限重试，GDI/VP9 回退；R04 | **取舍+待验**：GPU 重建、后端尝试，无 GDI/CPU 回退；P06、P09 | 驱动重置、热插拔、RDP 进出；先完善 GPU 内恢复、明确失败状态 |
-| H19 | 静态桌面首帧/质量刷新 | snapshot、受限重复编码；R02、R04 | **不完整**：无新帧直接跳过，关键帧待办会滞留；P04 | F01；无需移动鼠标即可加入/恢复，静态画质及空闲占用待测 |
-| H20 | 光标形状与位置 | cursor/position/window focus 独立服务；R01 | **有路径/耦合**：独立光标消息，但采样/广播仍跟桌面循环；P04 | 视频卡顿时测远端光标更新；不要把独立消息类型当成独立调度 |
-| H21 | 自适应码率/FPS/分辨率 | 多用户 QoS 和帧反馈；R04 | **部分**：传输指标 ABR、FPS/分辨率梯度，但只看生产连接；P10 | F06；记录所有观看者的时延和队列年龄 |
+| H19 | 静态桌面首帧/质量刷新 | snapshot、受限重复编码；R02、R04 | **已对齐/待实测**：F01 关键帧待办可重复编码，F10 指针唤醒不产生视频帧；静态刷新预算按真实桌面更新重置；P04 | 无需移动鼠标即可加入/恢复；真实双机静止画质、空闲占用与长期预算消耗待测 |
+| H20 | 光标形状与位置 | cursor/position/window focus 独立服务；R01 | **已对齐/已验证**：指针在显示采集线程内、编码之前经每订阅 sink 直接投递（`src/host/desktop_stream.cc:225`、`src/host/host_server.cc:154` 的 `CursorPublisher`），33 ms 节流、独立光标消息；视频队列全满时采样不停，指针唤醒不产视频帧；P04 | 500 kbps 拥塞下视频帧年龄 3553 ms 时光标仍 291 次/0 丢弃；真实双机高延迟/丢包的节拍与坐标精度待验 |
+| H21 | 自适应码率/FPS/分辨率 | 多用户 QoS 和帧反馈；R04 | **基本对齐**：所有观看者参与同一 `VideoQos`（FPS 取最小上限、延迟/取帧反馈、画质投票），共享源按聚合结果调码率/FPS/比例；P10 | F06；不同屏共享同一 FPS 决策，慢屏会拉低其他屏；记录所有观看者时延与队列年龄 |
 | H22 | 系统声音 | 主机音频服务按连接订阅；R05 | **单会话有路径，多会话有缺陷**：WASAPI/Opus/datagram，广播依附生产者；P11 | F04；授权组合、设备热插拔、静音恢复 |
 | H23 | 麦克风/语音通话 | 通话协商与音频设备切换；R03、R05 | **有路径/待验**：独立上行、呼叫流程、AEC/静音门；P11 | 双机对讲、扬声器回声、多连接竞争，不能用包传递测试代替听感 |
 | H24 | 摄像头 | 摄像头视频服务及独立连接；R01 | **有路径/待验**：CameraRelay，独立/桌面内会话；P12 | 相机占用、拔插、权限撤销和多会话设备争用 |
 | H25 | 默认键盘、修饰键、释放 | Map/Legacy/Translate、独立输入处理；R09 | **默认 Map 方向一致**：HID→扫描码、Unicode 文本、释放屏障、6 分钟卡键清理；P08 | 已有默认模式工作应保留；不同布局/AltGr/失焦/断线验收 |
 | H26 | Translate/本地 IME | 按模式处理按键和字符；R09 | **缺少完整模式**：主机能注入文本，但协议/控制端转换不能仅靠主机补齐 | 后续定义端到端输入语义；不把“发送文本”当成 Translate 完成 |
-| H27 | 鼠标、触摸、笔 | 平台输入注入；R09 | **有路径/待验**：相对鼠标、滚轮、多触点/压感；P08 | 负坐标、高 DPI、触控板、压感真实设备，长按后撤权全部释放 |
+| H27 | 鼠标、触摸、笔 | 平台输入注入；R09 | **有路径/待验**：相对鼠标、滚轮、多触点/压感；无 UI 进程已改为逐显示器 DPI 感知（F09）；P08 | 负坐标、高 DPI、触控板、压感真实设备，长按后撤权全部释放 |
 | H28 | SAS、重启、锁屏、登录、WTS | 权限检查后的连接控制请求；R03、R10 | **部分**：单生产会话已实现；跟随会话拒绝或遗漏，OS 登录仅密码输入；P04、P01 | F02；假平台接口验证请求完成，真实系统动作另做受控验收 |
 | H29 | 多格式剪贴板 | 全局 listener、订阅者；R11 | **有路径/方式不同**：各会话异步 worker，500ms 轮询；P13 | 来源路由、延迟、阻塞调用、撤权恢复、多个远端同时复制 |
 | H30 | 文件剪贴板/复制粘贴 | Windows IDataObject/FILECONTENTS 按需内容请求；R11 | **部分**：立即暂存传输，完成后 CF_HDROP；限 256 普通文件，空目录不能完整表示；P13 | 仅复制未粘贴不应无谓搬大文件；空目录、取消、源文件变化 |
@@ -298,4 +298,81 @@ git diff --check
 
 串行测试 **6/6 通过，26.54 秒**：protocol 0.07s、host_parity 9.97s、host_voice 2.02s、host_control 8.12s、host_login 2.25s、host_security 3.94s。七个 host_parity 场景全部通过；原有语音/控制/登录用例实际使用 2560×1440 oneVPL VDENC AVC，未跳过。主机、Windows 服务、原生查看器探针构建通过。构建仍有现有 CRT 链接冲突/未使用 DELAYLOAD 等警告，不声称零警告。日志位于本地 `build/root/Testing/Temporary/LastTest.log`，构建产物不提交。
 
-下一批依原顺序处理 F05/F07（按显示器组织共享服务、按会话 ID 操作），再处理 F06（全订阅者反馈、发送时效和故障隔离）及 F08（编码能力协商、静态质量）。本次不宣称主机已全面等同 RustDesk。
+## 八、第二批修复记录（2026-11-10）
+
+### F09 · P1：缩放显示器上绝对鼠标/触摸/笔坐标落在错误位置
+
+RustDesk 在进程入口调用 `SetProcessDpiAwareness(2)`（`src/main.rs:23`），使 Win32 坐标 API 与 DXGI 输出矩形同处物理像素空间。本项目此前只有托盘
+`host/main.cc` 调用了 `SetProcessDPIAware()`（系统级）；真正承担会话采集与输入注入的服务 worker（`host/service_main.cc` 的 `--worker`）
+和 `chast-quic` 工具完全没有声明 DPI 感知。在缩放比例非 100% 的显示器上，这些进程的
+`GetSystemMetrics(SM_*VIRTUALSCREEN)`（`src/win/input.cc` 的绝对移动、触摸与笔映射）、`GetCursorPos`、`GetMonitorInfoW`
+被 Windows 虚拟化为逻辑像素，而 DXGI 显示矩形（`src/capture/display.cc`）和查看器发送的虚拟桌面坐标都是物理像素。结果是：
+绝对鼠标、触摸、笔点击按缩放比例偏移；`foreground_display_index` 可能选错显示器。
+
+修复（不引入 RustDesk 代码，仅对齐进程声明）：
+
+| 位置 | 变更 |
+| --- | --- |
+| `include/chast/desktop.h`、`src/win/desktop.cc` | 新增 `enable_physical_desktop_coordinates()`：先 `SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)`，失败时回退 `SetProcessDPIAware()`，最后用 `GetProcessDpiAwareness` 返回有效状态，不轻信调用返回值 |
+| `host/service_main.cc` | `wmain` 入口最先调用，`--run`/`--worker` 两条路径都覆盖；worker 无 UI，物理像素坐标始终正确 |
+| `tools/quic.cc` | `main` 入口调用；`verify` 与 `serve` 共用真实 `HostServer` 采集/注入路径 |
+| `CMakeLists.txt` | `chast.net` 链接 `shcore`（`SetProcessDpiAwareness`/`GetProcessDpiAwareness`） |
+| `tests/desktop_test.cc` | 断言调用成功且 `GetProcessDpiAwareness` 实际为逐显示器感知 |
+
+边界与验证：
+
+- 托盘主机仍保持系统级感知：其 UI 按主屏 `LOGPIXELSX` 固定布局，直接升级为逐显示器感知需要补 `WM_DPICHANGED` 布局重排，否则会引入界面回归。因此便携模式在混合 DPI 的非主屏上仍可能偏移，这是已知限制，不是已修复项。
+- 本机为单屏 1920×1080、缩放 100%（AppliedDPI=96），无法在本机复现缩放偏移效果。已完成的验证是：Release 构建通过；`desktop` ctest 通过（含新增的两条感知断言，0.02 s）；`chast-service --help` 与 `chast-quic` 启动正常；真实 `quic_stream_options` 回环（实际采集/编码/解码）40.07 s 通过。
+- 仍需在 125%/150% 缩放的真实显示器上做双机验收：远端光标落点、触摸/笔映射、前台窗口所在屏选择。在该验收完成前，不宣称高 DPI 效果已与 RustDesk 等同。
+
+### F10 · P1：指针唤醒被当成桌面帧，静止桌面上的每次鼠标移动都触发视频编码
+
+RustDesk 的 DXGI 复制在 `AccumulatedFrames == 0 || LastPresentTime == 0`（只有指针更新）时返回
+`WouldBlock`（`libs/scrap/src/win/dxgi/mod.rs`），使指针唤醒根本不进入视频发送路径；光标由
+`input_service.rs` 中约 33 ms 的 `new_cursor()`/`new_pos()` 服务独立发布。本项目此前在两层都把指针唤醒
+当成新桌面：共享采集对每次唤醒都复制 GPU 表面并重新做 NV12 转换，`DesktopStreamPool::Source::pump`
+随即编码一个完整视频帧；主机空闲时又每约 5 ms 轮询一次光标，指针移动会把控制队列灌满
+`CursorUpdate`。效果是静止桌面上移动鼠标持续产生视频帧、抬高编码占用，并把刷新预算当成运动消耗。
+
+修复（仅参考行为与字段语义，不引入 RustDesk 代码）：
+
+| 位置 | 变更 |
+| --- | --- |
+| `src/capture/shared_capturer.cc` | 指针专用唤醒返回 `desktop_updated=false`、`nv12_updated=false` 的帧，复用已缓存纹理与共享句柄，跳过 `CopyResource` 和 NV12 转换；光标/序列号作为源元数据独立更新，读者仍能观察到最新指针 |
+| `src/host/desktop_stream.cc` | `Source::pump` 只在真实桌面更新时编码；指针采样只刷新元数据，不再编码，也不重置静态刷新预算（真实桌面更新才重置）；待处理的关键帧和静态质量刷新仍会被服务 |
+| `src/host/host_server.cc` | `publish_cursor` 增加 33 ms 节流（`DesktopVideo::cursor_sent_at`），对齐 RustDesk 光标服务节拍，避免空闲 5 ms 轮询把每次指针变化都发成控制消息 |
+| `tests/desktop_stream_test.cc` | 新增 `cursor_only_wake`：指针移动后订阅者能在 1 s 内看到新坐标，且静止桌面不增加任何 `encodes`；同时修正大用例重置循环，改用 `discard_backlog` 丢弃旧代图片，消除与 `generation` 递增竞争的偶发失败 |
+
+边界与验证：
+
+- `desktop_stream` ctest 连续 5 次通过；`desktop`、`host_parity`（170.4 s）、`video_qos`、`cursor`、`remote_cursor` 通过；真实共享采集工具 6/6 通过。
+- 真实路径对照（`chast-quic verify --port 45683/45684 --seconds 8`，真实 DXGI 采集与硬件编码，全屏黑窗口制造静止桌面）：
+  - 真实光标以约 8 ms 步进移动：`frames=120 encoded=119 pointer-only=118 repeats=127`，`cursor sent=223 shapes=1 dropped=0 errors=0`。
+  - 同一静止桌面不移动光标：`frames=119 encoded=119 pointer-only=117 repeats=117`，`cursor sent=1`。
+  - 两次的视频访问单元完全相同（119），变化只有光标消息数；指针事件没有换算成任何额外视频帧。光标约 26 次/秒，与 33 ms 节拍一致；动画桌面基线为 `frames=148 encoded=147 pointer-only=0 repeats=3`。
+- F10 已解决“指针唤醒不产视频帧”，但采样仍在会话循环内；该剩余部分由下一节关闭。
+
+### F10 补充（2026-11-10）· P1：光标投递从会话循环移到显示采集线程
+
+RustDesk 约 33 ms 的光标服务（`input_service.rs` 的 `new_cursor()`/`new_pos()`）独立于视频编码和发送队列。此前本项目的光标采样挂在主机会话循环上：视频编码慢、发送队列满或会话忙于其他消息时，光标消息会一起被推迟。现改为每订阅一条从采集线程直达发送层的路径。
+
+修复（仅参考行为与字段语义）：
+
+| 位置 | 变更 |
+| --- | --- |
+| `src/host/desktop_stream.cc` | 每个 `Subscription` 增加 `cursor_mutex`/`cursor_sink`；`Source::notify_cursor()`（`:225`）在显示服务线程捕获后、编码前调用该订阅的 sink；所有视频队列全满时仍以 0 超时采样并 `remember()`/`notify_cursor()`，仅置 `skipped_update`（`:89`）推迟编码；采集返回 `NoNewFrame` 且队列仍满时直接返回，待处理的桌面更新、关键帧和静态刷新不会被编码进注定丢弃的窗口；队列腾出后用 `encode(false, true)` 编码被记住的真实桌面更新，不重复旧的编码器输入 |
+| `src/host/host_server.cc` | `CursorPublisher`（`:154`）：采集线程内完成可见性/坐标/形状去重与 33 ms 节流，非阻塞调用 `send_cursor`/`send_display_cursor`，计数分离；`ensure_cursor`（`:3336`）按订阅绑定会话与捕获器；`CursorDetachGuard`（`:2740`）保证会话退出先解绑再销毁 |
+| `tests/desktop_stream_test.cc` | 新增 `cursor_sink_while_full`（`:647`）：所有队列满时 sink 仍收到指针且编码数不变，变更在空闲采集期间保持待处理，队列腾出后被真正编码；`slow_viewer_backpressure`（`:540`）改为断言编码/强制 IDR 暂停但采集继续 |
+
+验证：
+
+- `desktop_stream` ctest 连续 3 次通过（422 项断言，含全队列满载时待处理变更与腾出后真正编码）；`host_parity`（189.15 s）、`cursor`、`remote_cursor`、`multi_session`、`display_subscriptions`、`host_multi`、`video_qos` 通过；修复后全量 Release ctest 70/70（1148.07 s）。
+- 修复后真实路径复跑：静止桌面 8 s `frames=236 encoded=234 pointer-only=0`、`cursor sent=1`；光标持续移动 8 s `frames=228 encoded=226 pointer-only=0`、`cursor sent=219 shapes=23 dropped=0 errors=0`。
+- 真实路径 `chast-quic verify`（真实 DXGI 采集 + 硬件编码 + QUIC 接收解码）：
+  - 静止桌面 8 s：`frames=216 encoded=214 pointer-only=0 repeats=6`，`cursor sent=81 shapes=6 bytes=25632 dropped=0 errors=0`。
+  - 光标持续移动 8 s：`frames=116 encoded=116 pointer-only=98 repeats=103`，`cursor sent=197 shapes=24 dropped=0 errors=0`。
+  - 500 kbps / 30 ms netem、光标持续移动 10 s：视频帧年龄升到 3553 ms，`cursor sent=291 shapes=81 bytes=334416 dropped=0 errors=0`，光标仍约 29 次/秒，弱网检查通过。
+  - 修复后复验（`--port 48983 --seconds 10 --netem --netem-rate-kbps 500 --netem-delay-ms 30`）：470 个访问单元全部送达/解码，最大帧年龄 4116 ms，`cursor sent=156 shapes=19 dropped=0 errors=0`；本次指针脚本起步早于会话建立，156 次只覆盖脚本后半段。全队列满载与空闲采集同时出现时不再编码待丢弃帧，桌面变更保持待处理并在队列腾出后编码。
+- 尚未对齐：sink 依附采集节拍（与 RustDesk 按服务节拍轮询语义一致，不是独立线程）；真实双机高延迟/丢包下的光标节拍、形状切换与坐标精度仍待验收。
+
+H20 的调度剩余项已随本节关闭；矩阵中仍标注“部分/待验”的主机能力保持原判断，真实双机验收仍是未完成的证据项。本次不宣称主机已全面等同 RustDesk。

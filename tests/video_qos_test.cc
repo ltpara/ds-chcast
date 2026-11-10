@@ -136,7 +136,7 @@ int main() {
         multi.close(2, 3700);
         check(multi.state(3700).fps == 60, "leaving viewer releases the global constraint");
 
-        VideoQos settings(60, 1.5f, false);
+        VideoQos settings(60, 1.5f, false, false);
         settings.open(1, 0);
         settings.open(2, 0);
         settings.options(1, 10, VideoQos::Quality::Smooth, 1000);
@@ -155,6 +155,26 @@ int main() {
         settings.close(1, 4000);
         check(settings.state(4000).fps == 60 && near(settings.state(4000).ratio, 1.5f),
               "last close resets the controller for the next session");
+
+        VideoQos abr_off(60, 1.5f, false);
+        abr_off.open(1, 0);
+        check(abr_off.state(0).fps == 15,
+              "ABR off still starts at the RustDesk initial FPS");
+        warm(abr_off, 1, 1100, 4);
+        check(abr_off.state(1400).fps == 60,
+              "ABR off keeps delay-driven FPS adaptation");
+        for (unsigned n = 0; n < 3; ++n) abr_off.delay(1, 400, 1500 + n * 100);
+        check(abr_off.state(1700).fps < 60,
+              "confirmed congestion lowers FPS with ABR off");
+        check(near(abr_off.state(1700).ratio, 1.5f),
+              "ABR off holds the quality ratio at the viewer target");
+
+        VideoQos fixed_rates(60, 1.5f, false, false);
+        fixed_rates.open(1, 0);
+        fixed_rates.delay(1, 400, 1100);
+        fixed_rates.pending(1, 3000, 1200);
+        check(fixed_rates.state(1200).fps == 60 && near(fixed_rates.state(1200).ratio, 1.5f),
+              "adaptive_fps=false pins configured rates for exact-rate probes");
 
         VideoQos custom(30, 2.0f);
         custom.open(1, 0);

@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 11
+const accountSchemaVersion = 14
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -25,6 +25,117 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 9, Name: "host audit identity and deduplication", Apply: applyHostAuditIdentity},
 	{Version: 10, Name: "device policies", Apply: applyDevicePolicies},
 	{Version: 11, Name: "automation API tokens", Apply: applyAPITokens},
+	{Version: 12, Name: "revoked access ticket keys", Apply: applyRevokedAccessKids},
+	{Version: 13, Name: "policy objects and assignments", Apply: applyPolicyObjects},
+	{Version: 14, Name: "device policy version sequence", Apply: applyDevicePolicyVersionSequence},
+}
+
+// applyPolicyObjects adds the authoring layer above device_policies: named
+// policy objects, assignments scoped to all devices, an account group or a
+// single device, and the source columns that tell a materialised policy where
+// it came from. A direct per-device policy stays a manual override and wins
+// over assignments; the source columns let a recompute leave it alone.
+func applyPolicyObjects(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS policy_objects (
+			id                 TEXT PRIMARY KEY,
+			name               TEXT NOT NULL UNIQUE,
+			mode               TEXT NOT NULL DEFAULT 'open',
+			permission_ceiling INTEGER NOT NULL DEFAULT 0,
+			policy_version     INTEGER NOT NULL DEFAULT 1,
+			created_at         INTEGER NOT NULL,
+			updated_at         INTEGER NOT NULL,
+			updated_by         TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS policy_object_users (
+			policy_id  TEXT NOT NULL REFERENCES policy_objects(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (policy_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS policy_object_users_user
+			ON policy_object_users(user_id)`,
+		`CREATE TABLE IF NOT EXISTS policy_object_groups (
+			policy_id  TEXT NOT NULL REFERENCES policy_objects(id) ON DELETE CASCADE,
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (policy_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS policy_object_groups_group
+			ON policy_object_groups(group_id)`,
+		`CREATE TABLE IF NOT EXISTS policy_assignments (
+			id          TEXT PRIMARY KEY,
+			policy_id   TEXT NOT NULL REFERENCES policy_objects(id) ON DELETE CASCADE,
+			scope_kind  TEXT NOT NULL,
+			scope_value TEXT NOT NULL DEFAULT '',
+			priority    INTEGER NOT NULL DEFAULT 0,
+			created_at  INTEGER NOT NULL,
+			created_by  TEXT NOT NULL DEFAULT '',
+			UNIQUE (scope_kind, scope_value)
+		)`,
+		`CREATE INDEX IF NOT EXISTS policy_assignments_policy
+			ON policy_assignments(policy_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create policy object schema: %w", err)
+		}
+	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{"source_kind", "source_kind TEXT NOT NULL DEFAULT 'manual'"},
+		{"source_id", "source_id TEXT NOT NULL DEFAULT ''"},
+		{"source_version", "source_version INTEGER NOT NULL DEFAULT 0"},
+		{"source_priority", "source_priority INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureColumn(db, "device_policies", column.name, column.ddl); err != nil {
+			return fmt.Errorf("migrate device_policies.%s: %w", column.name, err)
+		}
+	}
+	return nil
+}
+
+// applyDevicePolicyVersionSequence makes the per-device policy version durable
+// across row deletions. A manual override that falls back to an assignment
+// deletes the device_policies row; without the sequence the new row would
+// restart at version 1, and agents ignore a policy older than the one they
+// already hold, leaving the host on the stale policy.
+func applyDevicePolicyVersionSequence(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS device_policy_versions (
+			peer_id      TEXT PRIMARY KEY,
+			last_version INTEGER NOT NULL DEFAULT 0
+		)`,
+		`INSERT INTO device_policy_versions (peer_id, last_version)
+		 SELECT peer_id, policy_version FROM device_policies WHERE true
+		 ON CONFLICT(peer_id) DO NOTHING`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create device policy version sequence: %w", err)
+		}
+	}
+	return nil
+}
+
+// applyRevokedAccessKids records issuer key ids an administrator retired. The
+// server refuses to sign new tickets with a revoked kid; online hosts learn
+// about it through the device event stream and end sessions admitted under
+// that key instead of waiting for the 65-second lease bound.
+func applyRevokedAccessKids(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS revoked_access_kids (
+			kid        TEXT PRIMARY KEY,
+			revoked_at INTEGER NOT NULL,
+			revoked_by TEXT NOT NULL DEFAULT '',
+			reason     TEXT NOT NULL DEFAULT ''
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create revoked access key schema: %w", err)
+		}
+	}
+	return nil
 }
 
 // applyAPITokens adds automation credentials that are independent from

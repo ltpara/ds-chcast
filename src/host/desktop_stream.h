@@ -62,7 +62,8 @@ public:
         std::shared_ptr<VideoQos> policy_;
         uint64_t id_;
     };
-    std::shared_ptr<QualityPeer> connect_quality(uint32_t max_fps, float ratio, bool adaptive);
+    std::shared_ptr<QualityPeer> connect_quality(uint32_t max_fps, float ratio, bool abr,
+                                                 bool adaptive_fps = true);
     std::unique_ptr<IDxgiCapturer> subscribe(const std::wstring& key,
         CaptureFactory capture, EncoderFactory encoder, std::string* error,
         FollowDesktop follow_desktop = {}, VideoCodecMask decoding_codecs = kVideoCodecAll,
@@ -101,6 +102,11 @@ public:
                                           const std::string& implementation = {});
     // Latest pointer state, independent of this subscriber's video backlog.
     static std::shared_ptr<const CursorInfo> cursor_snapshot(const IDxgiCapturer& capture);
+    // Install this subscriber's pointer sink. The display service invokes it
+    // on its own thread right after a frame is captured, before encoding it,
+    // so pointer delivery does not wait for video or for the session loop.
+    static void set_cursor_sink(IDxgiCapturer& capture,
+                                std::function<void(const CursorInfo&)> sink);
     // Reconcile a source with a fresh OS enumeration once for all subscribers.
     // A second viewer adopts the new generation without rebuilding it again.
     static Error refresh_display(IDxgiCapturer& capture, const DisplayInfo& display, bool* changed);

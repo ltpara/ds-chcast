@@ -130,6 +130,10 @@ func (s *server) issueAccessTicket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "access tickets are not configured")
 		return
 	}
+	if s.accessIssuerRevoked() {
+		writeError(w, http.StatusServiceUnavailable, "the access ticket issuer key has been revoked")
+		return
+	}
 	user, ok := s.accountUser(w, r)
 	if !ok {
 		return
@@ -237,6 +241,10 @@ func (s *server) attachLookupTicket(w http.ResponseWriter, r *http.Request,
 	}
 	if s.accessIssuer == nil {
 		writeError(w, http.StatusServiceUnavailable, errTicketNotConfigured.Error())
+		return false
+	}
+	if s.accessIssuerRevoked() {
+		writeError(w, http.StatusServiceUnavailable, "the access ticket issuer key has been revoked")
 		return false
 	}
 	clientKey, err := base64.RawURLEncoding.DecodeString(rawKey)

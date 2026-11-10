@@ -155,6 +155,7 @@
 #include "chast/capture.h"
 #include "chast/carrier.h"
 #include "chast/decoder.h"
+#include "chast/desktop.h"
 #include "chast/display_mode.h"
 #include "chast/encoder.h"
 #include "chast/host_server.h"
@@ -306,6 +307,23 @@ std::vector<uint8_t> file_probe_content(size_t size) {
     for (size_t i = 0; i < size; ++i) {
         state = state * 1664525u + 1013904223u;
         bytes[i] = static_cast<uint8_t>(state >> 24);
+    }
+    return bytes;
+}
+
+// Deterministic, highly compressible text for verify --file-compression. The
+// repeated line lets zstd shrink a 1 MiB file far below its size, so the probe
+// can tell a v2 block stream from a raw v1 body by wire bytes alone.
+inline constexpr size_t kFileCompressionProbeBytes = 1024u * 1024u;
+std::vector<uint8_t> compression_probe_content(size_t size) {
+    static constexpr char kLine[] =
+        "chast file compression probe: the quick brown fox jumps over the lazy dog "
+        "0123456789\n";
+    std::vector<uint8_t> bytes;
+    bytes.reserve(size);
+    while (bytes.size() < size) {
+        const size_t take = (std::min)(sizeof(kLine) - 1, size - bytes.size());
+        bytes.insert(bytes.end(), kLine, kLine + take);
     }
     return bytes;
 }
@@ -995,6 +1013,10 @@ struct Options {
     // The file the host offers when --file-download is given; verify writes
     // it to a temporary folder before the session starts.
     std::string download_source;
+    // verify only: offer a 1 MiB compressible .txt instead of the random
+    // 300 KiB payload, then require the viewer to report a v2 block stream
+    // whose wire bytes are far below the file size.
+    bool file_compression = false;
     // verify only: list the host's receive directory through the browse
     // channel, walk into a subfolder, check that escapes are refused, then
     // download a seeded file and compare it byte for byte.
@@ -1292,6 +1314,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.file_upload = true;
             } else if (arg == "--file-download") {
                 options.file_download = true;
+            } else if (arg == "--file-compression") {
+                options.file_compression = true;
             } else if (arg == "--file-browse") {
                 options.file_browse = true;
             } else if (arg == "--port-forward") {
@@ -1448,6 +1472,10 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.file_download && options.mode != "verify") {
         std::fprintf(stderr, "--file-download only applies to verify\n");
+        return false;
+    }
+    if (options.file_compression && !options.file_download) {
+        std::fprintf(stderr, "--file-compression extends --file-download; add both\n");
         return false;
     }
     if (options.file_browse && options.mode != "verify") {
@@ -1891,6 +1919,8 @@ struct ReceiverStats {
     bool download_probe = false;
     uint64_t download_offers = 0;
     uint64_t download_bytes = 0;
+    bool download_compressed = false;
+    uint64_t download_wire_bytes = 0;
     bool download_finished = false;
     bool download_ok = false;
     std::string download_error;
@@ -2410,9 +2440,12 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     // QoS has separate trace and multi-viewer tests and must not move those
     // rates while the probe is measuring a codec change. The plain loopback
     // makes the same promise, so it opts out too; --netem is the probe whose
-    // purpose is to drive the adaptive controller.
-    if (options.stream_options || (options.mode == "verify" && !options.netem))
+    // purpose is to drive the adaptive controller. adaptive_bitrate keeps its
+    // RustDesk meaning (ratio only), so exact rates also pin the FPS.
+    if (options.stream_options || (options.mode == "verify" && !options.netem)) {
         config.adaptive_bitrate = false;
+        config.adaptive_fps = false;
+    }
     if (options.display_set) {
         config.settings.display = static_cast<uint16_t>(options.display);
     }
@@ -3303,6 +3336,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             return true;
         }
+        stats.download_compressed = state.compressed;
+        stats.download_wire_bytes = state.wire_bytes;
         bool ok = download_content.size() == download_size;
         std::array<uint8_t, 32> digest{};
         if (ok && !chast::sha256(download_content.data(), download_content.size(), digest)) {
@@ -8898,8 +8933,8 @@ int run_verify(const Options& options) {
         local.file_receive_dir.assign(utf8.begin(), utf8.end());
     }
     if (local.file_download) {
-        // The host hashes the file before it offers it; hashing 300 KiB takes
-        // a moment but the transfer itself needs a few frame-loop passes.
+        // The host hashes the file before it offers it; the transfer itself
+        // needs a few frame-loop passes.
         if (local.seconds < 6.0) {
             local.seconds = 6.0;
         }
@@ -8909,9 +8944,13 @@ int run_verify(const Options& options) {
         if (!ec) {
             std::filesystem::create_directories(dir, ec);
         }
-        const std::filesystem::path source = dir / "chast-verify-download.bin";
+        const std::filesystem::path source =
+            dir / (local.file_compression ? "chast-verify-compress.txt"
+                                          : "chast-verify-download.bin");
         if (!ec) {
-            const std::vector<uint8_t> payload = file_probe_content(kFileProbeBytes);
+            const std::vector<uint8_t> payload =
+                local.file_compression ? compression_probe_content(kFileCompressionProbeBytes)
+                                       : file_probe_content(kFileProbeBytes);
             std::ofstream out(source, std::ios::binary | std::ios::trunc);
             if (!out) {
                 ec = std::make_error_code(std::errc::io_error);
@@ -9850,16 +9889,34 @@ int run_verify(const Options& options) {
     }
 
     if (local.file_download) {
+        const uint64_t expected_download =
+            local.file_compression ? kFileCompressionProbeBytes : kFileProbeBytes;
         check(received.download_probe, "the viewer ran the file download probe");
         check(received.download_offers == 1, "the host offered exactly one download");
-        check(received.download_bytes == kFileProbeBytes,
-              "the viewer received all 300 KiB");
+        check(received.download_bytes == expected_download,
+              "the viewer received every offered byte");
         check(received.download_finished && received.download_ok,
               "the viewer accepted the host's file and its digest");
         check(sent.download_queued, "the host queued the download once the viewer attached");
-        check(sent.files_sent == 1 && sent.file_bytes_sent == kFileProbeBytes,
-              "the host completed one 300 KiB download");
+        check(sent.files_sent == 1 && sent.file_bytes_sent == expected_download,
+              "the host completed one download");
         check(sent.file_send_failures == 0, "the host's download path saw no failures");
+        if (local.file_compression) {
+            check(received.download_compressed,
+                  "the compressible .txt arrived as a CFIL v2 block stream");
+            check(received.download_wire_bytes < expected_download / 4,
+                  "compression cut the CFIL body below a quarter of the file");
+        } else {
+            // The random .bin takes the v2 framing too, but every block falls
+            // back to raw bytes, so the wire grows only by block headers.
+            check(received.download_compressed &&
+                      received.download_wire_bytes >= expected_download,
+                  "incompressible blocks travel raw inside the v2 framing");
+        }
+        std::printf("     download wire: %llu bytes for %llu file bytes (v%d)\n",
+                    static_cast<unsigned long long>(received.download_wire_bytes),
+                    static_cast<unsigned long long>(expected_download),
+                    received.download_compressed ? 2 : 1);
         if (!received.download_ok) {
             std::printf("     download: %s\n", received.download_error.c_str());
         }
@@ -10505,6 +10562,7 @@ int run_weak_network(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    chast::enable_physical_desktop_coordinates();
     chast_tools::install_crash_handler();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     Options options;

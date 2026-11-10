@@ -473,6 +473,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result.via_access_ticket = true;
             result.ticket_subject = ticket.subject;
             result.ticket_id = ticket.id;
+            result.ticket_key_id = ticket.key_id;
             result.ticket_expires_at = ticket.expires_at;
             result.ticket_policy_version = ticket.policy_version;
             result.ticket_client_key = ticket.client_public_key;
@@ -820,6 +821,8 @@ HostSecurity::RenewalResult HostSecurity::renew_ticket(
     result.expires_at = ticket.expires_at;
     result.subject = ticket.subject;
     result.ticket_id = ticket.id;
+    result.policy_version = ticket.policy_version;
+    result.key_id = ticket.key_id;
     return result;
 }
 

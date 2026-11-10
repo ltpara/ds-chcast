@@ -186,6 +186,16 @@ func runHost(args []string) error {
 			}
 			emit(event)
 		},
+		OnRevoke: func(rev agent.RevokeEvent) {
+			emitMu.Lock()
+			defer emitMu.Unlock()
+			emit(agentEvent{
+				Event:  rev.Kind,
+				Kid:    rev.Kid,
+				Reason: rev.Reason,
+				Policy: rev.Policy,
+			})
+		},
 	})
 	if err != nil {
 		return err
@@ -547,6 +557,10 @@ type agentEvent struct {
 	CarrierToken string              `json:"carrier_token,omitempty"`
 	MigratedFrom string              `json:"migrated_from,omitempty"`
 	Policy       *agent.DevicePolicy `json:"device_policy,omitempty"`
+	// Kid names a retired issuer key on a revoke event; Reason carries the
+	// operator's detail for both revoke and policy events.
+	Kid    string `json:"kid,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 func newLogger(verbose bool) *slog.Logger {

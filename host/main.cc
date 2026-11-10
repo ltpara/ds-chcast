@@ -1266,6 +1266,34 @@ void apply_tunnel_event(const TunnelEvent& event) {
             line += tr(L"：") + widen(event.remote);
         }
         append_log_line(line);
+    } else if (event.event == "policy") {
+        std::wstring line = tr(L"受管策略已由服务端更新");
+        if (event.has_policy) {
+            line += tr(L" · 版本 ") + std::to_wstring(event.policy.policy_version);
+        }
+        if (!event.reason.empty()) {
+            line += tr(L" · 原因：") + widen(event.reason);
+        }
+        append_log_line(line);
+        if (g_app->server && event.has_policy) {
+            g_app->server->revoke_managed_sessions(
+                event.reason.empty() ? std::string("device policy changed") : event.reason,
+                event.policy.policy_version);
+        }
+    } else if (event.event == "revoke") {
+        std::wstring line = tr(L"服务端已撤销访问密钥");
+        if (!event.kid.empty()) {
+            line += tr(L" · kid ") + widen(event.kid);
+        }
+        if (!event.reason.empty()) {
+            line += tr(L" · 原因：") + widen(event.reason);
+        }
+        append_log_line(line);
+        if (g_app->server && !event.kid.empty()) {
+            g_app->server->revoke_managed_sessions(
+                event.reason.empty() ? std::string("issuer key revoked") : event.reason, 0,
+                event.kid);
+        }
     }
     if (event.has_policy && event.event != "viewer") {
         acknowledge_managed_policy(event.policy, event.event == "ready");

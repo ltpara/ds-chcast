@@ -32,6 +32,9 @@
     policiesLoaded: false,
     policiesLoading: false,
     policyEditing: null,
+    policyObjects: [],
+    policyAssignments: [],
+    policyObjectEditing: null,
   };
 
   class ApiError extends Error {
@@ -471,13 +474,22 @@
     state.policies = [];
     state.policiesLoaded = false;
     state.policyEditing = null;
+    state.policyObjects = [];
+    state.policyAssignments = [];
+    state.policyObjectEditing = null;
     clear($('group-rows'));
     clear($('policy-rows'));
+    clear($('policy-object-rows'));
+    clear($('policy-assignment-rows'));
     clear($('audit-group'));
     const dialog = $('device-dialog');
     if (dialog.open) dialog.close();
     const policyDialog = $('policy-dialog');
     if (policyDialog.open) policyDialog.close();
+    const policyObjectDialog = $('policy-object-dialog');
+    if (policyObjectDialog.open) policyObjectDialog.close();
+    const policyAssignmentDialog = $('policy-assignment-dialog');
+    if (policyAssignmentDialog.open) policyAssignmentDialog.close();
     const groupDialog = $('group-dialog');
     if (groupDialog.open) groupDialog.close();
     clearSession();
@@ -921,13 +933,22 @@
     if (state.policiesLoading) return;
     state.policiesLoading = true;
     try {
-      const data = await api('/v1/device-policies') || {};
-      state.policies = Array.isArray(data.policies) ? data.policies : [];
+      const [devices, objects, assignments] = await Promise.all([
+        api('/v1/device-policies'),
+        api('/v1/policies'),
+        api('/v1/policy-assignments'),
+      ]);
+      state.policies = Array.isArray(devices && devices.policies) ? devices.policies : [];
+      state.policyObjects = Array.isArray(objects && objects.policies) ? objects.policies : [];
+      state.policyAssignments = Array.isArray(assignments && assignments.assignments)
+        ? assignments.assignments : [];
       state.policiesLoaded = true;
       renderPolicies();
     } catch (err) {
       if (err && err.status === 503) {
         state.policies = [];
+        state.policyObjects = [];
+        state.policyAssignments = [];
         state.policiesLoaded = true;
         renderPolicies();
         $('policy-summary').textContent = '服务端未启用账号库（缺少 --accounts-db），设备策略不可用。';
@@ -940,6 +961,18 @@
   }
 
   function renderPolicies() {
+    const objectBody = $('policy-object-rows');
+    clear(objectBody);
+    state.policyObjects.forEach((policy) => objectBody.appendChild(policyObjectRow(policy)));
+    $('policy-object-empty').classList.toggle('hidden', state.policyObjects.length > 0);
+    $('policy-object-readonly').classList.toggle('hidden', can('admin'));
+
+    const assignmentBody = $('policy-assignment-rows');
+    clear(assignmentBody);
+    state.policyAssignments.forEach((assignment) =>
+      assignmentBody.appendChild(policyAssignmentRow(assignment)));
+    $('policy-assignment-empty').classList.toggle('hidden', state.policyAssignments.length > 0);
+
     const body = $('policy-rows');
     clear(body);
     state.policies.forEach((policy) => body.appendChild(policyRow(policy)));
@@ -949,8 +982,63 @@
       const receipt = policy.receipt;
       return Boolean(receipt && receipt.applied && receipt.policy_version === policy.policy_version);
     }).length;
-    $('policy-summary').textContent = '受管设备 ' + state.policies.length +
-      ' 台，主机已确认当前版本 ' + applied + ' 台。';
+    $('policy-summary').textContent = '生效设备 ' + state.policies.length +
+      ' 台；策略对象 ' + state.policyObjects.length + ' 个，分配 ' +
+      state.policyAssignments.length + ' 条；主机已确认当前版本 ' + applied + ' 台。';
+  }
+
+  function policyObjectRow(policy) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(policy.name));
+    tr.appendChild(cell(pill(policy.mode === 'restricted' ? '受限' : '开放',
+      policy.mode === 'restricted' ? 'warn' : 'ok')));
+    tr.appendChild(cell(ceilingCell(policy.permission_ceiling)));
+
+    const allow = (list, placeholder) => {
+      if (policy.mode !== 'restricted') return '不适用';
+      return Array.isArray(list) && list.length ? list.join(', ') : placeholder;
+    };
+    tr.appendChild(cell(allow(policy.allowed_users, '无（仅分组）')));
+    tr.appendChild(cell(allow(policy.allowed_groups, '无（仅用户）')));
+    tr.appendChild(cell('v' + policy.policy_version));
+    tr.appendChild(cell(fmtTime(policy.updated_at_ms)));
+
+    const actions = el('div', 'actions-wrap');
+    const edit = button('编辑', 'small');
+    edit.addEventListener('click', () => openPolicyObjectDialog(policy));
+    actions.appendChild(edit);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function policyScopeText(assignment) {
+    if (assignment.scope_kind === 'all') return '全部设备';
+    if (assignment.scope_kind === 'group') return '分组 · ' + assignment.scope_value;
+    return '设备 · ' + assignment.scope_value;
+  }
+
+  function policyAssignmentRow(assignment) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(assignment.policy_name || assignment.policy_id));
+    tr.appendChild(cell(policyScopeText(assignment)));
+    tr.appendChild(cell(String(assignment.priority)));
+    tr.appendChild(cell(fmtTime(assignment.created_at_ms)));
+
+    const actions = el('div', 'actions-wrap');
+    const remove = button('删除', 'small danger');
+    remove.addEventListener('click', (event) =>
+      withButton(event.currentTarget, () => deletePolicyAssignment(assignment)));
+    actions.appendChild(remove);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function sourceCell(policy) {
+    const source = policy.source;
+    if (!source) return el('span', 'muted', '手动覆盖');
+    const node = el('span', '', '策略 ' + source.name + ' · v' + source.version);
+    node.title = '来源 ' + source.kind + ' ' + source.id + ' · 优先级 ' + source.priority;
+    return node;
   }
 
   function policyRow(policy) {
@@ -969,6 +1057,7 @@
     tr.appendChild(cell(allow(policy.allowed_users, '无（仅分组）')));
     tr.appendChild(cell(allow(policy.allowed_groups, '无（仅用户）')));
     tr.appendChild(cell('v' + policy.policy_version));
+    tr.appendChild(cell(sourceCell(policy)));
 
     const receipt = receiptState(policy);
     const receiptBox = el('div', 'stack');
@@ -995,24 +1084,42 @@
     return value.split(',').map((item) => item.trim()).filter((item) => item.length > 0);
   }
 
+  function applyPolicyMode(modeEl, usersEl, groupsEl, hintEl, note) {
+    const restricted = modeEl.value === 'restricted';
+    usersEl.disabled = !restricted;
+    groupsEl.disabled = !restricted;
+    hintEl.textContent = (restricted
+      ? '只有下列用户与分组能获得接入票据；两列都为空时无人可连。'
+      : 'open 允许所有未被封禁的账号获得接入票据，允许列表不生效。') + note;
+  }
+
   function syncPolicyMode() {
-    const restricted = $('policy-mode').value === 'restricted';
-    $('policy-users').disabled = !restricted;
-    $('policy-groups').disabled = !restricted;
-    $('policy-mode-hint').textContent = restricted
-      ? '只有下列用户与分组能获得接入票据；两列都为空时无人可连。当前主机版本对所有新会话失败关闭。'
-      : 'open 允许所有未被封禁的账号获得接入票据，允许列表不生效。当前主机版本对所有新会话失败关闭。';
+    applyPolicyMode($('policy-mode'), $('policy-users'), $('policy-groups'),
+      $('policy-mode-hint'), '当前主机版本对所有新会话失败关闭。');
+  }
+
+  function syncPolicyObjectMode() {
+    applyPolicyMode($('policy-object-mode'), $('policy-object-users'), $('policy-object-groups'),
+      $('policy-object-mode-hint'), '对象生效后仍受设备本机设置收紧。');
+  }
+
+  function applyPolicyCeiling(inputEl, hintEl) {
+    const value = Number(inputEl.value || 0);
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      hintEl.textContent = '请输入 0..4294967295 之间的整数。';
+      return;
+    }
+    hintEl.textContent = value === 0
+      ? '0 表示不限制权限。'
+      : '上限包含：' + fmtCeiling(value);
   }
 
   function syncPolicyCeiling() {
-    const value = Number($('policy-ceiling').value || 0);
-    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
-      $('policy-ceiling-hint').textContent = '请输入 0..4294967295 之间的整数。';
-      return;
-    }
-    $('policy-ceiling-hint').textContent = value === 0
-      ? '0 表示不限制权限。'
-      : '上限包含：' + fmtCeiling(value);
+    applyPolicyCeiling($('policy-ceiling'), $('policy-ceiling-hint'));
+  }
+
+  function syncPolicyObjectCeiling() {
+    applyPolicyCeiling($('policy-object-ceiling'), $('policy-object-ceiling-hint'));
   }
 
   function openPolicyDialog(policy) {
@@ -1076,11 +1183,188 @@
   async function deletePolicy() {
     const policy = state.policyEditing;
     if (!policy) return;
-    if (!window.confirm('删除设备 ' + policy.peer_id + ' 的策略？\n设备会回到未受管状态，连接恢复本机认证；此操作会写入审计。')) return;
+    if (!window.confirm('删除设备 ' + policy.peer_id + ' 的策略？\n设备会回到未受管状态或回落到匹配的分配；此操作会写入审计。')) return;
     await api('/v1/device-policies/' + encodeURIComponent(policy.peer_id), { method: 'DELETE' });
     $('policy-dialog').close();
     state.policyEditing = null;
     toast('已删除策略 ' + policy.peer_id);
+    await loadPolicies();
+  }
+
+  // ---------- policy objects and assignments ----------
+
+  function openPolicyObjectDialog(policy) {
+    state.policyObjectEditing = policy || null;
+    const editing = Boolean(policy);
+    $('policy-object-dialog-title').textContent = editing
+      ? '策略对象 · ' + policy.name : '新建策略对象';
+    $('policy-object-name').value = editing ? policy.name : '';
+    $('policy-object-mode').value = editing ? policy.mode : 'open';
+    $('policy-object-ceiling').value = editing ? String(policy.permission_ceiling) : '0';
+    $('policy-object-users').value = editing && Array.isArray(policy.allowed_users)
+      ? policy.allowed_users.join(', ') : '';
+    $('policy-object-groups').value = editing && Array.isArray(policy.allowed_groups)
+      ? policy.allowed_groups.join(', ') : '';
+    $('policy-object-delete').classList.toggle('hidden', !editing);
+    $('policy-object-dialog-note').textContent = editing
+      ? '当前版本 v' + policy.policy_version +
+        '。保存会提升对象版本并同步所有覆盖设备；删除前必须先删除它的分配。'
+      : '保存后可在“策略分配”中把对象绑定到全部设备、分组或单台设备。';
+    syncPolicyObjectMode();
+    syncPolicyObjectCeiling();
+    $('policy-object-dialog').showModal();
+    $('policy-object-name').focus();
+  }
+
+  async function savePolicyObject() {
+    const name = $('policy-object-name').value.trim();
+    if (!name) {
+      toast('请填写策略对象名称', true);
+      return;
+    }
+    const ceiling = Number($('policy-object-ceiling').value || 0);
+    if (!Number.isInteger(ceiling) || ceiling < 0 || ceiling > 0xffffffff) {
+      toast('权限上限必须是 0..4294967295 的整数', true);
+      return;
+    }
+    const editing = state.policyObjectEditing;
+    const submit = $('policy-object-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      const reply = await api(
+        editing ? '/v1/policies/' + encodeURIComponent(editing.id) : '/v1/policies',
+        {
+          method: editing ? 'PUT' : 'POST',
+          body: {
+            name,
+            mode: $('policy-object-mode').value,
+            permission_ceiling: ceiling,
+            allowed_users: splitNames($('policy-object-users').value),
+            allowed_groups: splitNames($('policy-object-groups').value),
+          },
+        },
+      );
+      const version = reply && reply.policy_version ? reply.policy_version : 0;
+      $('policy-object-dialog').close();
+      state.policyObjectEditing = null;
+      toast((editing ? '已更新 ' : '已创建 ') + name +
+        (version ? '（v' + version + '）' : ''));
+      await loadPolicies();
+    });
+  }
+
+  async function deletePolicyObject() {
+    const policy = state.policyObjectEditing;
+    if (!policy) return;
+    if (!window.confirm('删除策略对象 ' + policy.name +
+      '？\n存在分配时服务器会拒绝删除；请先删除相关分配。')) return;
+    await api('/v1/policies/' + encodeURIComponent(policy.id), { method: 'DELETE' });
+    $('policy-object-dialog').close();
+    state.policyObjectEditing = null;
+    toast('已删除策略对象 ' + policy.name);
+    await loadPolicies();
+  }
+
+  function fillPolicyGroupOptions() {
+    const list = $('policy-assignment-groups');
+    clear(list);
+    state.groups.forEach((group) => {
+      const option = document.createElement('option');
+      option.value = group.id;
+      if (group.name) option.label = group.name;
+      list.appendChild(option);
+    });
+  }
+
+  async function openPolicyAssignmentDialog() {
+    if (!state.policyObjects.length) {
+      toast('请先创建策略对象', true);
+      return;
+    }
+    if (!state.groupsLoaded) {
+      try {
+        await loadGroups(true);
+      } catch {
+        /* free-text group ids still work without the picker */
+      }
+    }
+    fillPolicyGroupOptions();
+    const select = $('policy-assignment-policy');
+    clear(select);
+    state.policyObjects.forEach((policy) => {
+      const option = document.createElement('option');
+      option.value = policy.id;
+      option.textContent = policy.name + '（v' + policy.policy_version + '）';
+      select.appendChild(option);
+    });
+    $('policy-assignment-scope').value = 'all';
+    $('policy-assignment-value').value = '';
+    $('policy-assignment-priority').value = '0';
+    syncPolicyAssignmentScope();
+    $('policy-assignment-dialog').showModal();
+  }
+
+  function syncPolicyAssignmentScope() {
+    const kind = $('policy-assignment-scope').value;
+    const input = $('policy-assignment-value');
+    const label = $('policy-assignment-value-text');
+    const hint = $('policy-assignment-hint');
+    if (kind === 'all') {
+      input.value = '';
+      input.disabled = true;
+      input.removeAttribute('list');
+      input.placeholder = '';
+      label.textContent = '范围值（全部设备不需要填写）';
+      hint.textContent = '全部设备是兜底范围；分组与设备分配优先于它，优先级相同时也不会覆盖更具体的范围。';
+      return;
+    }
+    input.disabled = false;
+    if (kind === 'group') {
+      input.setAttribute('list', 'policy-assignment-groups');
+      input.placeholder = 'lab-a';
+      label.textContent = '设备分组 ID';
+      hint.textContent = '组内设备会匹配该分配；分组在“分组”页签维护。';
+    } else {
+      input.removeAttribute('list');
+      input.placeholder = 'devbox';
+      label.textContent = '设备 ID';
+      hint.textContent = '只覆盖这一台设备；手动设置的设备策略仍然优先。';
+    }
+  }
+
+  async function savePolicyAssignment() {
+    const policyID = $('policy-assignment-policy').value;
+    if (!policyID) {
+      toast('请选择策略对象', true);
+      return;
+    }
+    const kind = $('policy-assignment-scope').value;
+    const value = kind === 'all' ? '' : $('policy-assignment-value').value.trim();
+    if (kind !== 'all' && !value) {
+      toast('请填写范围值', true);
+      return;
+    }
+    const priority = Number($('policy-assignment-priority').value || 0);
+    if (!Number.isInteger(priority) || priority < -10000 || priority > 10000) {
+      toast('优先级必须是 -10000..10000 的整数', true);
+      return;
+    }
+    const submit = $('policy-assignment-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/policy-assignments', {
+        method: 'POST',
+        body: { policy_id: policyID, scope_kind: kind, scope_value: value, priority },
+      });
+      $('policy-assignment-dialog').close();
+      toast('已创建策略分配');
+      await loadPolicies();
+    });
+  }
+
+  async function deletePolicyAssignment(assignment) {
+    if (!window.confirm('删除分配：' + assignment.policy_name + ' → ' +
+      policyScopeText(assignment) + '？\n被覆盖设备会重新解析策略或回到未受管状态。')) return;
+    await api('/v1/policy-assignments/' + encodeURIComponent(assignment.id), { method: 'DELETE' });
+    toast('已删除分配');
     await loadPolicies();
   }
 
@@ -1919,6 +2203,30 @@
     $('policy-dialog').addEventListener('close', () => {
       state.policyEditing = null;
     });
+
+    $('policy-object-create').addEventListener('click', () => openPolicyObjectDialog(null));
+    $('policy-object-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      savePolicyObject();
+    });
+    $('policy-object-mode').addEventListener('change', syncPolicyObjectMode);
+    $('policy-object-ceiling').addEventListener('input', syncPolicyObjectCeiling);
+    $('policy-object-cancel').addEventListener('click', () => $('policy-object-dialog').close());
+    $('policy-object-delete').addEventListener('click', (event) =>
+      withButton(event.currentTarget, deletePolicyObject));
+    $('policy-object-dialog').addEventListener('close', () => {
+      state.policyObjectEditing = null;
+    });
+
+    $('policy-assignment-create').addEventListener('click', (event) =>
+      withButton(event.currentTarget, openPolicyAssignmentDialog));
+    $('policy-assignment-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      savePolicyAssignment();
+    });
+    $('policy-assignment-scope').addEventListener('change', syncPolicyAssignmentScope);
+    $('policy-assignment-cancel').addEventListener('click', () =>
+      $('policy-assignment-dialog').close());
 
     $('account-create').addEventListener('submit', (event) => {
       event.preventDefault();

@@ -433,6 +433,9 @@ func (s *server) deleteAccountGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordAudit(r, actor, account.AuditGroupDelete, "deleted group "+groupID, true)
+	// Deleting a group drops its device links and group-scoped assignments, so
+	// devices can fall back to another assignment or become unmanaged.
+	s.reconcileAllPolicies()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -568,6 +571,8 @@ func (s *server) addAccountGroupDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordAudit(r, actor, account.AuditGroupDeviceAdd,
 		"added device "+device.PeerID+" to "+groupID, true)
+	// Group membership can make a group-scoped assignment apply to this device.
+	s.reconcilePolicies([]string{device.PeerID})
 	writeJSON(w, http.StatusCreated, accountGroupDeviceView{
 		PeerID:      device.PeerID,
 		AddedBy:     device.AddedBy,
@@ -588,6 +593,8 @@ func (s *server) removeAccountGroupDevice(w http.ResponseWriter, r *http.Request
 	}
 	s.recordAudit(r, actor, account.AuditGroupDeviceRemove,
 		"removed device "+peerID+" from "+groupID, true)
+	// The device may lose its group-scoped policy, so re-resolve it now.
+	s.reconcilePolicies([]string{peerID})
 	w.WriteHeader(http.StatusNoContent)
 }
 

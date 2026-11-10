@@ -24,6 +24,7 @@
 #include <wincrypt.h>
 
 #include <msquic.h>
+#include <zstd.h>
 
 #include <atomic>
 #include <algorithm>
@@ -106,6 +107,65 @@ const std::chrono::steady_clock::time_point kNoSendDeadline =
 // connection may never deliver. Ten seconds is far beyond a healthy drain,
 // yet short enough for the caller to surface the stuck transport as an error.
 constexpr std::chrono::milliseconds kSendCapacityTimeout{10000};
+
+// One context per thread and direction. The sender compresses on whichever
+// application thread pushes chunks; the receiver decompresses on MsQuic's
+// callback thread. Contexts are reused across blocks so a multi-gigabyte
+// transfer does not allocate one per 64 KiB.
+struct ZstdContexts {
+    ZSTD_CCtx* compressor = nullptr;
+    ZSTD_DCtx* decompressor = nullptr;
+    ZstdContexts()
+        : compressor(ZSTD_createCCtx()), decompressor(ZSTD_createDCtx()) {}
+    ~ZstdContexts() {
+        if (compressor) ZSTD_freeCCtx(compressor);
+        if (decompressor) ZSTD_freeDCtx(decompressor);
+    }
+    ZstdContexts(const ZstdContexts&) = delete;
+    ZstdContexts& operator=(const ZstdContexts&) = delete;
+};
+
+ZstdContexts& zstd_contexts() {
+    static thread_local ZstdContexts contexts;
+    return contexts;
+}
+
+// Appends one v2 block for `data`. The caller writes a raw block instead when
+// this returns false, so the wire never carries a block that grew in flight.
+bool append_compressed_file_block(const uint8_t* data, size_t size,
+                                  std::vector<uint8_t>& out) {
+    ZSTD_CCtx* context = zstd_contexts().compressor;
+    if (!context || size == 0 || size > kFileBlockMaxRawBytes) {
+        return false;
+    }
+    std::vector<uint8_t> compressed(ZSTD_compressBound(size));
+    const size_t produced =
+        ZSTD_compressCCtx(context, compressed.data(), compressed.size(), data, size, 1);
+    if (ZSTD_isError(produced) || produced >= size ||
+        produced > kFileBlockMaxStoredBytes) {
+        return false;
+    }
+    FileBlockHeader header;
+    header.stored_size = static_cast<uint32_t>(produced);
+    header.raw_size = static_cast<uint32_t>(size);
+    header.compressed = true;
+    uint8_t block_header[kFileBlockHeaderSize];
+    encode_file_block_header(header, block_header);
+    out.insert(out.end(), block_header, block_header + kFileBlockHeaderSize);
+    out.insert(out.end(), compressed.begin(), compressed.begin() + produced);
+    return true;
+}
+
+void append_raw_file_block(const uint8_t* data, size_t size, std::vector<uint8_t>& out) {
+    FileBlockHeader header;
+    header.stored_size = static_cast<uint32_t>(size);
+    header.raw_size = static_cast<uint32_t>(size);
+    header.compressed = false;
+    uint8_t block_header[kFileBlockHeaderSize];
+    encode_file_block_header(header, block_header);
+    out.insert(out.end(), block_header, block_header + kFileBlockHeaderSize);
+    out.insert(out.end(), data, data + size);
+}
 
 // Device names come from the local computer and the protocol caps them at
 // kMaxDeviceNameLength bytes. Cut on a whole UTF-8 sequence so a long name
@@ -868,8 +928,14 @@ struct QuicSession::Impl {
         HQUIC stream = nullptr;
         uint64_t start_offset = 0;
         uint64_t received = 0;
+        uint64_t wire_bytes = 0;
+        bool compressed = false;
         bool finished = false;
         bool receive_paused = false;
+        // v2 wire bytes that do not yet form a whole block. Bounded by one
+        // block header plus one maximum stored block, because the loop drains
+        // every complete block as soon as it arrives.
+        std::vector<uint8_t> block_pending;
         std::string error;
     };
     struct OutgoingUpload {
@@ -877,6 +943,7 @@ struct QuicSession::Impl {
         bool accepted = false;
         bool started = false;
         bool finished = false;
+        bool compress = false;  // v2 block stream, chosen when the stream opens
         HQUIC stream = nullptr;
         uint64_t next_offset = 0;
     };
@@ -1673,13 +1740,14 @@ struct QuicSession::Impl {
                     upload.clipboard = offered->second.clipboard;
                     upload.stream = stream;
                     upload.start_offset = header.offset;
+                    upload.compressed = header.version == kFileStreamVersionCompressed;
                     const auto inserted =
                         received_uploads.emplace(header.transfer_id, std::move(upload));
                     if (pending->size() > kFileStreamHeaderSize) {
-                        push_file_chunk_locked(
+                        feed_file_stream_locked(
                             inserted.first->second, inserted.first->first,
                             pending->data() + kFileStreamHeaderSize,
-                            pending->size() - kFileStreamHeaderSize, header.offset);
+                            pending->size() - kFileStreamHeaderSize);
                     }
                     kind = Kind::File;
                 }
@@ -1935,6 +2003,80 @@ struct QuicSession::Impl {
             note_transport_failure("the peer opened an unusable stream");
         }
         cv.notify_all();
+    }
+
+    // Fails one upload without ending the session: queued bytes are dropped,
+    // the stream is aborted, and the host loop reports the reason.
+    void fail_file_stream_locked(ReceivedUpload& upload, uint32_t id,
+                                 const std::string& error) {
+        upload.finished = true;
+        upload.error = error;
+        drop_file_chunks_locked(id);
+        if (upload.stream) {
+            api->StreamShutdown(upload.stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+    }
+
+    // Turns CFIL body bytes into file chunks. v1 is raw content; v2 carries
+    // 9-byte block headers, and a block may hold zstd data instead of raw
+    // bytes. A block can straddle QUIC receive buffers, so an incomplete tail
+    // stays in block_pending until the rest arrives.
+    void feed_file_stream_locked(ReceivedUpload& upload, uint32_t id, const uint8_t* data,
+                                 size_t size) {
+        if (upload.finished) {
+            return;
+        }
+        upload.wire_bytes += size;
+        if (!upload.compressed) {
+            push_file_chunk_locked(upload, id, data, size,
+                                   upload.start_offset + upload.received);
+            return;
+        }
+        upload.block_pending.insert(upload.block_pending.end(), data, data + size);
+        size_t read = 0;
+        while (upload.block_pending.size() - read >= kFileBlockHeaderSize) {
+            FileBlockHeader header;
+            std::string error;
+            if (!decode_file_block_header(upload.block_pending.data() + read,
+                                          kFileBlockHeaderSize, header, &error)) {
+                fail_file_stream_locked(upload, id, "bad compressed file block: " + error);
+                return;
+            }
+            const size_t total = kFileBlockHeaderSize + header.stored_size;
+            if (upload.block_pending.size() - read < total) {
+                break;
+            }
+            const uint8_t* payload =
+                upload.block_pending.data() + read + kFileBlockHeaderSize;
+            if (!header.compressed) {
+                push_file_chunk_locked(upload, id, payload, header.raw_size,
+                                       upload.start_offset + upload.received);
+            } else {
+                std::vector<uint8_t> raw(header.raw_size);
+                ZSTD_DCtx* context = zstd_contexts().decompressor;
+                const size_t produced =
+                    context ? ZSTD_decompressDCtx(context, raw.data(), raw.size(), payload,
+                                                  header.stored_size)
+                            : 0;
+                if (!context || ZSTD_isError(produced) || produced != header.raw_size) {
+                    fail_file_stream_locked(upload, id,
+                                            "compressed file block did not decompress");
+                    return;
+                }
+                push_file_chunk_locked(upload, id, raw.data(), raw.size(),
+                                       upload.start_offset + upload.received);
+            }
+            if (upload.finished) {
+                return;
+            }
+            read += total;
+        }
+        if (read == upload.block_pending.size()) {
+            upload.block_pending.clear();
+        } else if (read != 0) {
+            upload.block_pending.erase(upload.block_pending.begin(),
+                                       upload.block_pending.begin() + read);
+        }
     }
 
     // Caller holds `mutex` and an entry in received_uploads. Drops every queued
@@ -2342,9 +2484,8 @@ struct QuicSession::Impl {
                 }
                 for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
                     const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
-                    push_file_chunk_locked(
-                        entry.second, entry.first, buffer.Buffer, buffer.Length,
-                        entry.second.start_offset + entry.second.received);
+                    feed_file_stream_locked(entry.second, entry.first, buffer.Buffer,
+                                            buffer.Length);
                 }
                 return true;
             }
@@ -2602,6 +2743,13 @@ struct QuicSession::Impl {
                             for (auto& entry : received_uploads) {
                                 if (entry.second.stream == stream) {
                                     entry.second.finished = true;
+                                    if (entry.second.compressed &&
+                                        !entry.second.block_pending.empty()) {
+                                        entry.second.error =
+                                            "the compressed upload ended in the middle of a "
+                                            "block";
+                                        drop_file_chunks_locked(entry.first);
+                                    }
                                     matched = true;
                                     break;
                                 }
@@ -8910,6 +9058,8 @@ bool QuicSession::file_upload_state(uint32_t transfer_id, FileUploadState& state
     }
     state.resume_offset = it->second.start_offset;
     state.received = it->second.received;
+    state.wire_bytes = it->second.wire_bytes;
+    state.compressed = it->second.compressed;
     state.error = it->second.error;
     bool queued = false;
     for (const FileChunk& chunk : impl_->file_chunks) {
@@ -9037,12 +9187,32 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
             }
             upload.started = true;
             starting = true;
+            // A resumed transfer always uses the raw body: the receiver
+            // already has bytes on disk and a v2 stream cannot restart block
+            // framing at an arbitrary offset.
+            upload.compress =
+                upload.next_offset == 0 &&
+                file_compression_worthwhile(upload.offer.name, upload.offer.size,
+                                            upload.offer.clipboard);
             FileStreamHeader header;
             header.transfer_id = transfer_id;
             header.offset = upload.next_offset;
-            bytes.resize(kFileStreamHeaderSize + size);
+            if (upload.compress) {
+                header.version = kFileStreamVersionCompressed;
+            }
+            bytes.resize(kFileStreamHeaderSize);
             encode_file_stream_header(header, bytes.data());
-            std::memcpy(bytes.data() + kFileStreamHeaderSize, data, size);
+            if (upload.compress) {
+                if (!append_compressed_file_block(data, size, bytes)) {
+                    append_raw_file_block(data, size, bytes);
+                }
+            } else {
+                bytes.insert(bytes.end(), data, data + size);
+            }
+        } else if (upload.compress) {
+            if (!append_compressed_file_block(data, size, bytes)) {
+                append_raw_file_block(data, size, bytes);
+            }
         } else {
             bytes.assign(data, data + size);
         }
@@ -9076,7 +9246,7 @@ Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data,
     if (!data || size == 0 || size > kFileChunkBytes) {
         return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
     }
-    if (!impl.has_send_capacity(size + kFileStreamHeaderSize)) {
+    if (!impl.has_send_capacity(size + kFileStreamHeaderSize + kFileBlockHeaderSize)) {
         return Error(Status::WaitTimeout, "send queue is full");
     }
     return send_file_data(transfer_id, data, size);
@@ -9112,6 +9282,8 @@ Error QuicSession::finish_file_upload(uint32_t transfer_id) {
             FileStreamHeader header;
             header.transfer_id = transfer_id;
             header.offset = upload.next_offset;
+            header.version = upload.compress ? kFileStreamVersionCompressed
+                                             : kFileStreamVersion;
             header_bytes.resize(kFileStreamHeaderSize);
             encode_file_stream_header(header, header_bytes.data());
         }

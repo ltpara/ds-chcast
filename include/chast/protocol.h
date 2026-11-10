@@ -54,7 +54,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 65;
+inline constexpr uint16_t kProtocolVersion = 66;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -712,9 +712,24 @@ bool parse_clipboard_file_data(const std::vector<uint8_t>& payload, ClipboardFil
 // the bytes. Either side may start one: the viewer uploads to the host and the
 // host downloads to the viewer. The control stream never carries file data.
 inline constexpr char kFileStreamMagic[4] = {'C', 'F', 'I', 'L'};
+// v1 carries raw file bytes after the header. v2 (protocol v66) keeps the same
+// header and turns the body into blocks whose payload may be zstd data; the
+// sender picks v2 only for files that are worth compressing.
 inline constexpr uint8_t kFileStreamVersion = 1;
+inline constexpr uint8_t kFileStreamVersionCompressed = 2;
 // magic (4) + version (1) + reserved (3) + transfer id (4) + offset (8).
 inline constexpr size_t kFileStreamHeaderSize = 20;
+// v2 block: stored_size (4) + raw_size (4) + flags (1).
+inline constexpr size_t kFileBlockHeaderSize = 9;
+inline constexpr uint8_t kFileBlockFlagCompressed = 0x01;
+inline constexpr uint8_t kFileBlockFlagsKnown = kFileBlockFlagCompressed;
+inline constexpr uint32_t kFileBlockMaxRawBytes = 64u * 1024u;
+// ZSTD_compressBound(65536) is a little above the raw size; the sender falls
+// back to a raw block when compression does not shrink the chunk.
+inline constexpr uint32_t kFileBlockMaxStoredBytes = kFileBlockMaxRawBytes + 4096u;
+// Files smaller than this stay on the raw stream: the per-block headers cost
+// more than zstd can win back on such short inputs.
+inline constexpr uint64_t kFileCompressionMinBytes = 4096u;
 inline constexpr size_t kFileChunkBytes = 64u * 1024u;
 // Protocol ceiling; the host applies a smaller, configurable limit.
 inline constexpr uint64_t kMaxFileTransferBytes = 16ull * 1024ull * 1024ull * 1024ull;
@@ -776,15 +791,31 @@ struct FileCancel {
 };
 
 // CFIL stream prefix. The bytes after it are raw file content starting at
-// `offset`; the stream ends with a QUIC FIN.
+// `offset` (v1), or v2 blocks that each carry their own raw/stored sizes.
 struct FileStreamHeader {
     uint32_t transfer_id = 0;
     uint64_t offset = 0;
+    uint8_t version = kFileStreamVersion;
 };
 void encode_file_stream_header(const FileStreamHeader& header,
                                uint8_t out[kFileStreamHeaderSize]);
 bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeader& header,
                                std::string* error);
+
+struct FileBlockHeader {
+    uint32_t stored_size = 0;
+    uint32_t raw_size = 0;
+    bool compressed = false;
+};
+void encode_file_block_header(const FileBlockHeader& header,
+                              uint8_t out[kFileBlockHeaderSize]);
+bool decode_file_block_header(const uint8_t* data, size_t size, FileBlockHeader& header,
+                              std::string* error);
+
+// True when the sender should offer this file as a v2 stream: it is large
+// enough to amortise the block headers, is not a clipboard staging copy, and
+// its extension does not already denote a compressed container.
+bool file_compression_worthwhile(const std::string& name, uint64_t size, bool clipboard);
 
 // ----- shared-folder browsing -----
 //

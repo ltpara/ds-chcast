@@ -138,6 +138,9 @@ public:
         bool via_access_ticket = false;
         std::string ticket_subject;
         std::string ticket_id;
+        // Issuer key that signed the admitted ticket. An online revocation
+        // names this kid, so only the sessions admitted under that key end.
+        std::string ticket_key_id;
         int64_t ticket_expires_at = 0;
         uint32_t ticket_policy_version = 0;
         // The key the admitted ticket names. A mid-session renewal must
@@ -202,6 +205,8 @@ public:
         int64_t expires_at = 0;
         std::string subject;
         std::string ticket_id;
+        uint32_t policy_version = 0;
+        std::string key_id;
     };
 
     RenewalResult renew_ticket(const TicketRenewal& renewal, const std::string& peer_address,

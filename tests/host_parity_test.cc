@@ -2143,6 +2143,7 @@ void application_latency() {
     Fixture f;
     f.config.settings.max_viewers = 1;
     f.config.adaptive_bitrate = true;
+    f.config.adaptive_fps = true;
     f.start();
     ServerInfo info;
     auto viewer = f.connect(SessionMode::Desktop, kPermissionAll & ~kPermissionInput, {}, 0, &info);
@@ -2163,6 +2164,7 @@ void video_backpressure() {
     Fixture f;
     f.config.settings.max_viewers = 1;
     f.config.adaptive_bitrate = true;
+    f.config.adaptive_fps = true;
     f.media->moving = true;
     f.start();
     auto viewer = f.connect(SessionMode::Desktop, kPermissionAll & ~kPermissionInput);
@@ -2231,6 +2233,7 @@ void slow_viewer_independent_display() {
 void hardware_shared_display(bool automatic = false) {
     Fixture f;
     f.config.adaptive_bitrate = true;
+    f.config.adaptive_fps = true;
     HostServerConfig defaults;
     std::atomic<unsigned> captures{0}, encoders{0};
     f.config.displays = defaults.displays;

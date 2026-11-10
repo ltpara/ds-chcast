@@ -19,10 +19,10 @@ float clamp_ratio(float value, float low, float high) {
 }
 } // namespace
 
-VideoQos::VideoQos(uint32_t max_fps, float default_ratio, bool adaptive)
+VideoQos::VideoQos(uint32_t max_fps, float default_ratio, bool abr, bool adaptive_fps)
     : max_fps_(std::clamp(max_fps ? max_fps : 30u, 1u, 120u)), fps_(max_fps_),
       default_ratio_(std::clamp(default_ratio, 0.1f, 40.f)), ratio_(default_ratio_),
-      adaptive_(adaptive) {}
+      abr_(abr), adaptive_fps_(adaptive_fps) {}
 
 float VideoQos::quality_ratio(Quality quality) {
     switch (quality) {
@@ -205,7 +205,7 @@ float VideoQos::min_ratio() const {
     return std::max(minimum, floor);
 }
 bool VideoQos::variable() const {
-    return adaptive_ && std::all_of(displays_.begin(), displays_.end(),
+    return abr_ && std::all_of(displays_.begin(), displays_.end(),
         [](const auto& entry) { return entry.second.variable; });
 }
 bool VideoQos::can_reduce_bitrate() const {
@@ -245,9 +245,9 @@ void VideoQos::options(uint64_t id, uint32_t fps, std::optional<Quality> quality
     adjust_fps(now);
 }
 void VideoQos::adjust_fps(uint64_t now) {
-    if (!adaptive_) {
-        // adaptive_bitrate=false keeps the documented semantics: only explicit
-        // viewer requests are aggregated, without automatic FPS adaptation.
+    if (!adaptive_fps_) {
+        // Exact-rate probes need the configured frame rate; production always
+        // adapts, including when ABR only controls the quality ratio.
         fps_ = highest_fps();
         return;
     }
@@ -270,7 +270,7 @@ void VideoQos::adjust_fps(uint64_t now) {
 void VideoQos::delay(uint64_t id, uint32_t value, uint64_t now) {
     std::lock_guard lock(mutex_);
     auto found = users_.find(id);
-    if (found == users_.end() || !adaptive_) return;
+    if (found == users_.end() || !adaptive_fps_) return;
     auto& user = found->second;
     auto& delay = user.delay;
     const auto target = target_ratio();
@@ -330,7 +330,7 @@ void VideoQos::delay(uint64_t id, uint32_t value, uint64_t now) {
 void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
     std::lock_guard lock(mutex_);
     auto found = users_.find(id);
-    if (found == users_.end() || !adaptive_) return;
+    if (found == users_.end() || !adaptive_fps_) return;
     auto& user = found->second;
     auto& delay = user.delay;
     if (elapsed <= 2000) {

@@ -35,6 +35,16 @@ struct InputDesktopStatus {
     std::string error;
 };
 
+// Switches the process to per-monitor DPI awareness so that every Win32
+// coordinate API (GetSystemMetrics, GetCursorPos, GetMonitorInfo, SendInput's
+// virtual-desktop normalization) reports physical pixels, the same space as
+// the DXGI output rects and the coordinates viewers send. Without it a process
+// on a scaled display sees logical pixels and remote mouse, touch and pen
+// input lands off target. Must be called before any window or capture object
+// exists; callers that already have a DPI-aware manifest get the manifest's
+// awareness instead. Returns true when the process ended up per-monitor aware.
+bool enable_physical_desktop_coordinates();
+
 // Opens the input desktop, reads the lock state and closes it again. Does not
 // change the calling thread's desktop.
 InputDesktopStatus input_desktop_status();

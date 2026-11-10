@@ -23,8 +23,99 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[8].Apply = applyHostAuditIdentityPostgres
 	list[9].Apply = applyDevicePoliciesPostgres
 	list[10].Apply = applyAPITokensPostgres
+	list[11].Apply = applyRevokedAccessKidsPostgres
+	list[12].Apply = applyPolicyObjectsPostgres
+	list[13].Apply = applyDevicePolicyVersionSequencePostgres
 	return list
 }()
+
+// applyPolicyObjectsPostgres mirrors the SQLite migration. PostgreSQL needs
+// its own ALTER syntax because ensureColumn reads PRAGMA table_info.
+func applyPolicyObjectsPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS policy_objects (
+			id                 TEXT PRIMARY KEY,
+			name               TEXT NOT NULL UNIQUE,
+			mode               TEXT NOT NULL DEFAULT 'open',
+			permission_ceiling BIGINT NOT NULL DEFAULT 0,
+			policy_version     BIGINT NOT NULL DEFAULT 1,
+			created_at         BIGINT NOT NULL,
+			updated_at         BIGINT NOT NULL,
+			updated_by         TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS policy_object_users (
+			policy_id  TEXT NOT NULL REFERENCES policy_objects(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (policy_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS policy_object_users_user
+			ON policy_object_users(user_id)`,
+		`CREATE TABLE IF NOT EXISTS policy_object_groups (
+			policy_id  TEXT NOT NULL REFERENCES policy_objects(id) ON DELETE CASCADE,
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (policy_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS policy_object_groups_group
+			ON policy_object_groups(group_id)`,
+		`CREATE TABLE IF NOT EXISTS policy_assignments (
+			id          TEXT PRIMARY KEY,
+			policy_id   TEXT NOT NULL REFERENCES policy_objects(id) ON DELETE CASCADE,
+			scope_kind  TEXT NOT NULL,
+			scope_value TEXT NOT NULL DEFAULT '',
+			priority    BIGINT NOT NULL DEFAULT 0,
+			created_at  BIGINT NOT NULL,
+			created_by  TEXT NOT NULL DEFAULT '',
+			UNIQUE (scope_kind, scope_value)
+		)`,
+		`CREATE INDEX IF NOT EXISTS policy_assignments_policy
+			ON policy_assignments(policy_id)`,
+		`ALTER TABLE device_policies ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'manual'`,
+		`ALTER TABLE device_policies ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE device_policies ADD COLUMN IF NOT EXISTS source_version BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE device_policies ADD COLUMN IF NOT EXISTS source_priority BIGINT NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL policy object schema: %w", err)
+		}
+	}
+	return nil
+}
+
+// applyDevicePolicyVersionSequencePostgres mirrors the SQLite sequence table.
+func applyDevicePolicyVersionSequencePostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS device_policy_versions (
+			peer_id      TEXT PRIMARY KEY,
+			last_version BIGINT NOT NULL DEFAULT 0
+		)`,
+		`INSERT INTO device_policy_versions (peer_id, last_version)
+		 SELECT peer_id, policy_version FROM device_policies WHERE true
+		 ON CONFLICT (peer_id) DO NOTHING`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL device policy version sequence: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyRevokedAccessKidsPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS revoked_access_kids (
+			kid        TEXT PRIMARY KEY,
+			revoked_at BIGINT NOT NULL,
+			revoked_by TEXT NOT NULL DEFAULT '',
+			reason     TEXT NOT NULL DEFAULT ''
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL revoked access key schema: %w", err)
+		}
+	}
+	return nil
+}
 
 func applyAPITokensPostgres(db *sql.DB) error {
 	for _, statement := range []string{

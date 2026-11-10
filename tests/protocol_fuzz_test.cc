@@ -677,6 +677,21 @@ std::vector<Target> make_targets() {
                                                         &parse_error);
             }));
     }
+    {
+        chast::FileBlockHeader block;
+        block.stored_size = 700;
+        block.raw_size = 1024;
+        block.compressed = true;
+        uint8_t wire[chast::kFileBlockHeaderSize]{};
+        chast::encode_file_block_header(block, wire);
+        targets.push_back(raw_target(
+            "file_block_header", std::vector<uint8_t>(wire, wire + sizeof(wire)),
+            [](const std::vector<uint8_t>& payload) {
+                chast::FileBlockHeader parsed;
+                return chast::decode_file_block_header(payload.data(), payload.size(), parsed,
+                                                       &parse_error);
+            }));
+    }
     targets.push_back(raw_target(
         "port_forward_stream_header", chast::make_port_forward_stream_header(1, 2),
         [](const std::vector<uint8_t>& payload) {

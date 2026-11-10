@@ -102,18 +102,51 @@
     <section id="panel-policies" class="panel-page">
       <div class="panel">
         <div class="panel-head">
-          <h2>设备策略</h2>
+          <h2>策略对象</h2>
           <div class="toolbar">
             <button type="button" id="policy-refresh">刷新</button>
-            <button type="button" id="policy-create" class="primary">设置策略</button>
+            <button type="button" id="policy-object-create" class="primary">新建策略对象</button>
           </div>
         </div>
-        <p id="policy-summary" class="muted"></p>
-        <p class="muted">受管设备在每次注册时收到服务器策略。当前主机版本收到受管策略后执行失败关闭：v62 票据握手可用前，所有新会话都会被拒绝，已建立的会话不会中断。主机确认策略文件后由 chast-tunnel 用设备密钥签名上报回执；只有回执版本与当前策略一致且 applied=true，表格才显示“已应用版本”，否则显示“待应用”或“应用失败”。允许用户与分组只用于后续票据签发；删除策略会让设备回到未受管状态。</p>
+        <p class="muted">策略对象是可复用的命名模板；编辑对象会提升其版本，并在下一次同步时更新所有被该对象覆盖的设备。设备上实际生效的版本单独递增，回执只对生效版本有意义。</p>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>设备</th><th>模式</th><th>权限上限</th><th>允许用户</th><th>允许分组</th><th>策略版本</th><th>主机回执</th><th>更新时间</th><th class="actions-col">操作</th></tr>
+              <tr><th>名称</th><th>模式</th><th>权限上限</th><th>允许用户</th><th>允许分组</th><th>版本</th><th>更新时间</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="policy-object-rows"></tbody>
+          </table>
+        </div>
+        <p id="policy-object-empty" class="muted hidden">还没有策略对象。先新建对象，再把对象分配到设备或分组。</p>
+        <p id="policy-object-readonly" class="muted hidden">只有 admin 可以编辑策略对象。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>策略分配</h2>
+          <button type="button" id="policy-assignment-create" class="primary">新建分配</button>
+        </div>
+        <p class="muted">分配把策略对象绑定到全部设备、设备分组或单台设备。同一范围只能有一个分配；多个范围同时命中时优先级高者生效，优先级相同则设备 &gt; 分组 &gt; 全部。设备分组沿用“分组”页签中的设备成员关系。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>策略对象</th><th>范围</th><th>优先级</th><th>创建时间</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="policy-assignment-rows"></tbody>
+          </table>
+        </div>
+        <p id="policy-assignment-empty" class="muted hidden">还没有策略分配，所有设备仍使用手动策略或本机认证。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>设备策略（生效结果）</h2>
+          <button type="button" id="policy-create">设置设备覆盖</button>
+        </div>
+        <p id="policy-summary" class="muted"></p>
+        <p class="muted">这里显示每台设备实际生效的策略。手动设置的设备策略优先于所有分配，删除手动策略后会回落到匹配的分配。受管设备在每次注册时收到服务器策略。当前主机版本收到受管策略后执行失败关闭：v62 票据握手可用前，所有新会话都会被拒绝，已建立的会话不会中断。主机确认策略文件后由 chast-tunnel 用设备密钥签名上报回执；只有回执版本与策略版本一致且 applied=true，表格才显示“已应用版本”，否则显示“待应用”或“应用失败”。允许用户与分组只用于票据签发。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>设备</th><th>模式</th><th>权限上限</th><th>允许用户</th><th>允许分组</th><th>策略版本</th><th>来源</th><th>主机回执</th><th>更新时间</th><th class="actions-col">操作</th></tr>
             </thead>
             <tbody id="policy-rows"></tbody>
           </table>
@@ -291,6 +324,55 @@
         <span class="spacer"></span>
         <button type="button" id="policy-cancel">取消</button>
         <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="policy-object-dialog">
+    <form id="policy-object-form" method="dialog" class="dialog-stack" autocomplete="off">
+      <h2 id="policy-object-dialog-title">策略对象</h2>
+      <p id="policy-object-dialog-note" class="muted"></p>
+      <label>名称<input id="policy-object-name" required maxlength="64" spellcheck="false" placeholder="默认受限策略"></label>
+      <label>模式
+        <select id="policy-object-mode">
+          <option value="open">open（所有账号可接入）</option>
+          <option value="restricted">restricted（仅允许列表）</option>
+        </select>
+      </label>
+      <label>权限上限（32 位掩码，0 表示不限制）<input id="policy-object-ceiling" type="number" min="0" max="4294967295" step="1" value="0"></label>
+      <p id="policy-object-ceiling-hint" class="muted"></p>
+      <p id="policy-object-mode-hint" class="muted"></p>
+      <label>允许用户（逗号分隔）<input id="policy-object-users" placeholder="alice, bob" spellcheck="false"></label>
+      <label>允许分组（逗号分隔）<input id="policy-object-groups" placeholder="lab-a" spellcheck="false"></label>
+      <div class="dialog-actions">
+        <button type="button" id="policy-object-delete" class="danger hidden">删除策略对象</button>
+        <span class="spacer"></span>
+        <button type="button" id="policy-object-cancel">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="policy-assignment-dialog">
+    <form id="policy-assignment-form" method="dialog" class="dialog-stack" autocomplete="off">
+      <h2>新建策略分配</h2>
+      <p class="muted">同一范围再次分配会返回冲突；要更换策略，请先删除原分配。</p>
+      <label>策略对象<select id="policy-assignment-policy"></select></label>
+      <label>范围
+        <select id="policy-assignment-scope">
+          <option value="all">all（全部设备）</option>
+          <option value="group">group（设备分组）</option>
+          <option value="device">device（单台设备）</option>
+        </select>
+      </label>
+      <label id="policy-assignment-value-label"><span id="policy-assignment-value-text">范围值</span><input id="policy-assignment-value" maxlength="64" spellcheck="false" placeholder="lab-a" list="policy-assignment-groups"></label>
+      <datalist id="policy-assignment-groups"></datalist>
+      <label>优先级（-10000..10000，数值越大越优先）<input id="policy-assignment-priority" type="number" min="-10000" max="10000" step="1" value="0"></label>
+      <p id="policy-assignment-hint" class="muted"></p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="policy-assignment-cancel">取消</button>
+        <button type="submit" class="primary">创建</button>
       </div>
     </form>
   </dialog>

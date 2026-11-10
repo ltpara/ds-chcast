@@ -1057,6 +1057,188 @@ FileCode apply_file_operation(const std::string& root, FileOperation op,
     return FileCode::Refused;
 }
 
+namespace {
+
+std::string trim_share_root(const std::string& text) {
+    size_t begin = 0;
+    size_t end = text.size();
+    const auto space = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    while (begin < end && space(text[begin])) {
+        ++begin;
+    }
+    while (end > begin && space(text[end - 1])) {
+        --end;
+    }
+    return text.substr(begin, end - begin);
+}
+
+bool absolute_share_path(const std::wstring& path) {
+    if (path.size() >= 3 && std::iswalpha(static_cast<wint_t>(path[0])) &&
+        path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+        return true;
+    }
+    return path.size() >= 2 && ((path[0] == L'\\' && path[1] == L'\\') ||
+                                (path[0] == L'/' && path[1] == L'/'));
+}
+
+// A drive root is named after its letter; every other root after its final
+// component. Aliases must not contain ':' because the wire path grammar
+// reserves it for drive letters inside the viewer.
+std::wstring share_base_name(const std::wstring& path) {
+    if (path.size() == 3 && path[1] == L':' &&
+        (path[2] == L'\\' || path[2] == L'/')) {
+        return std::wstring(1, std::towupper(path[0]));
+    }
+    std::wstring clean = path;
+    while (clean.size() > 1 && (clean.back() == L'\\' || clean.back() == L'/')) {
+        clean.pop_back();
+    }
+    const size_t slash = clean.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        clean = clean.substr(slash + 1);
+    }
+    return clean;
+}
+
+std::string share_alias_with_index(const std::string& alias, unsigned index) {
+    const std::wstring wide = utf8_to_wide(alias);
+    const std::wstring suffix = L" (" + std::to_wstring(index) + L")";
+    std::wstring truncated = wide;
+    if (truncated.size() + suffix.size() > kMaxReceiveNameChars) {
+        size_t cut = kMaxReceiveNameChars - suffix.size();
+        if (cut > 0 && truncated[cut - 1] >= 0xD800 && truncated[cut - 1] <= 0xDBFF) {
+            --cut;
+        }
+        truncated.resize(cut);
+    }
+    truncated += suffix;
+    return wide_to_utf8(truncated);
+}
+
+bool share_name_taken(const std::vector<FileShareRoot>& shares, const std::string& name) {
+    const std::wstring wide = utf8_to_wide(name);
+    return std::any_of(shares.begin(), shares.end(), [&](const FileShareRoot& share) {
+        return _wcsicmp(utf8_to_wide(share.name).c_str(), wide.c_str()) == 0;
+    });
+}
+
+}  // namespace
+
+std::vector<FileShareRoot> make_file_share_roots(const std::vector<std::string>& configured) {
+    std::vector<FileShareRoot> shares;
+    std::vector<std::wstring> seen_paths;
+    for (const std::string& entry : configured) {
+        if (shares.size() >= kMaxFileShares) {
+            break;
+        }
+        const std::string text = trim_share_root(entry);
+        const std::wstring wide = utf8_to_wide(text);
+        if (wide.empty() || !absolute_share_path(wide)) {
+            continue;
+        }
+        const std::wstring normalized = absolute_path(wide);
+        if (normalized.empty()) {
+            continue;
+        }
+        const bool duplicate = std::any_of(
+            seen_paths.begin(), seen_paths.end(), [&](const std::wstring& seen) {
+                return _wcsicmp(seen.c_str(), normalized.c_str()) == 0;
+            });
+        if (duplicate) {
+            continue;
+        }
+        const std::wstring base = share_base_name(normalized);
+        if (base.empty()) {
+            continue;
+        }
+        const std::string alias = sanitize_received_name(wide_to_utf8(base));
+        if (alias.empty() ||
+            _wcsicmp(utf8_to_wide(alias).c_str(), kPartialDirectory) == 0) {
+            continue;
+        }
+        std::string name = alias;
+        for (unsigned index = 2; share_name_taken(shares, name); ++index) {
+            name = share_alias_with_index(alias, index);
+            if (index > kMaxFileShares + 1) {
+                break;
+            }
+        }
+        if (share_name_taken(shares, name)) {
+            continue;
+        }
+        seen_paths.push_back(normalized);
+        shares.push_back(FileShareRoot{name, wide_to_utf8(normalized)});
+    }
+    return shares;
+}
+
+void list_file_share_roots(const std::vector<FileShareRoot>& shares, FileListResult& result,
+                           const std::string& cursor) {
+    result.entries.clear();
+    result.truncated = false;
+    result.next_cursor.clear();
+    result.code = FileCode::Ok;
+    result.reason.clear();
+    if (!cursor.empty()) {
+        result.code = FileCode::Refused;
+        result.reason = "the share list has no pages";
+        return;
+    }
+    result.entries.reserve(shares.size());
+    for (const FileShareRoot& share : shares) {
+        FileListEntry entry;
+        entry.name = share.name;
+        entry.directory = true;
+        result.entries.push_back(std::move(entry));
+    }
+    std::sort(result.entries.begin(), result.entries.end(), file_list_entry_less);
+}
+
+FileCode split_file_share_path(const std::vector<FileShareRoot>& shares,
+                               const std::string& fallback_root, const std::string& path,
+                               std::string& root, std::string& relative,
+                               std::string& error) {
+    root.clear();
+    relative.clear();
+    error.clear();
+    if (shares.empty()) {
+        root = fallback_root;
+        relative = path;
+        return FileCode::Ok;
+    }
+    if (path.empty() || path.size() > kMaxFileBrowserPathBytes ||
+        path.find('\\') != std::string::npos ||
+        path.find(':') != std::string::npos ||
+        path.find('\0') != std::string::npos || path.front() == '/') {
+        error = "the path is not a plain relative path";
+        return FileCode::Refused;
+    }
+    const size_t slash = path.find('/');
+    const std::string name = path.substr(0, slash);
+    if (!valid_operation_name(name)) {
+        error = "a path component is not usable";
+        return FileCode::Refused;
+    }
+    const std::wstring wide_name = utf8_to_wide(name);
+    for (const FileShareRoot& share : shares) {
+        if (_wcsicmp(utf8_to_wide(share.name).c_str(), wide_name.c_str()) != 0) {
+            continue;
+        }
+        root = share.path;
+        relative = slash == std::string::npos ? std::string() : path.substr(slash + 1);
+        if (relative == "." || relative == "..") {
+            root.clear();
+            error = "a path component is not usable";
+            return FileCode::Refused;
+        }
+        return FileCode::Ok;
+    }
+    error = "no shared folder has that name";
+    return FileCode::NotFound;
+}
+
 FileReceiver::FileReceiver() : impl_(std::make_unique<Impl>()) {}
 FileReceiver::~FileReceiver() {
     if (impl_ && impl_->file != INVALID_HANDLE_VALUE) {

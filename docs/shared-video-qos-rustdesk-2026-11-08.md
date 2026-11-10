@@ -51,7 +51,7 @@ v51 引入双向 LatencyProbe/Reply；客户端的时钟同步保留，主机测
 - 码率阶梯与增长上限：按 0.95/0.9/0.7/0.85/0.5/0.8 阶梯下调，确认后才降；上调只在动态画面窗口进行（3 秒窗口至少编码 6 帧），按 15/10/5% 步进，单次最多 +150 kbps，并受当前画质目标与比例下限约束。
 - 画质投票：显式画质投票才推进票序，FPS-only 投票保留其他观看者最近的画质；再次选中同一预设视为一次新的显式投票（主机 `quality_change` 的 `!cap_change && !preference_change` 分支）。
 
-`adaptive_bitrate=false` 保留本项目原语义：不自动改 FPS/码率，只聚合观看者的显式上限。`application_latency` 与 `video_backpressure` 走自适应路径，验证 15 FPS 起步、干净回复升帧，以及未取帧时降至 5 FPS 并在恢复消费后回升。
+当时 `adaptive_bitrate=false` 同时冻结 FPS 和码率，只聚合观看者的显式上限；该语义已在 2026-11-10 拆分，见下文。`application_latency` 与 `video_backpressure` 走自适应路径，验证 15 FPS 起步、干净回复升帧，以及未取帧时降至 5 FPS 并在恢复消费后回升。
 
 本轮验证：
 
@@ -99,11 +99,37 @@ v52 验证：
 
 网络损伤代理验证不等于两台异地设备实测；真实 GPU 双查看器是本机同屏，异屏仍由不同尺寸的确定性媒体验证。
 
+## 2026-11-10：全部订阅队列满时暂停生产
+
+RustDesk 的 `video_service` 在每帧发送后最多等待 3 秒，直到所有订阅者从各自的 `rx_video` 取走该帧；慢观看者因此直接约束采集/编码节奏。本项目的订阅队列只在 `Source::call` 的服务线程上读写，若在该线程内同步等待连接取帧会与取帧命令互锁，不能照搬这一等待。
+
+改为等价的高水位反压：每个订阅仍有 60 帧 / 8 MiB 的独立队列上限；`Source::pump()` 在推进下一个 tick 后检查全部存活订阅，**所有**队列都满时直接返回，不再采集和编码。只要还有一个观看者有空间，服务继续为该观看者生产，满队列的观看者保持原有的“丢弃旧引用、等待新 IDR”恢复路径。这样既消除了“所有观看端都停住后仍持续采集/编码并反复强制 IDR”的空转，也保留了本项目“一个慢连接不拖住其他观看者”的隔离性。tick 先推进再返回，避免反压期间忙等；暂停前已置位的 `keyframe` 在恢复后的第一帧继续生效。
+
+验证：
+
+- 新增 `slow_viewer_backpressure`：单观看者不取帧时，队列填充到窗口上限后 `captures`/`encodes`/`idrs` 在 500 ms 内完全不变；交付一帧后采集与编码立即恢复。既有慢订阅者溢出、静态刷新和双观看者隔离断言全部保留，`desktop_stream` ctest 通过（11.67 s）。
+- 真实 1080p H.264 回环复核：`chast-quic serve/connect`，1920×1080、6000 kbps、30 fps，接收端 346 帧 / 11.985 s（约 28.9 fps），`crc-errors=0 decode-errors=0 gaps=0`，帧龄平均 8.1 ms、最大 43.2 ms，与修改前 28.7 fps 基线一致。该次只有一个持续取帧的观看者，未在真实 QUIC 上触发反压；暂停/恢复的行为证据来自确定性 `DesktopStreamPool` 测试。
+
+## 2026-11-10：拆分 enable-abr 与 FPS 自适应
+
+RustDesk 的 `abr_config`（`enable-abr != "N"`）只通过 `in_vbr_state()` 门控质量比例：关闭后 `adjust_ratio` 不运行、比例回到 `latest_quality().ratio()`、`can_reduce_bitrate()` 为假；延迟驱动的 FPS 调整（`user_network_delay`、`user_delay_response_elapsed`、`adjust_fps`）始终运行。本项目此前用同一个 `adaptive_bitrate=false` 同时冻结 FPS 和码率，配置语义与参考不同。
+
+现拆成两个开关：
+
+- `adaptive_bitrate` 只表示 ABR 质量比例，语义与 RustDesk 一致；关闭时 `variable()` 为假，比例保持观看者画质目标，FPS 仍按延迟、探测超时和启动加速调整。
+- `adaptive_fps`（默认 true）只在需要精确手动速率的探针中关闭，固定为观看者上限的聚合值。`quic_stream_options` 与不带 `--netem` 的 verify 探针同时关闭两者；`host_media_stub` 为确定性测试关闭 FPS 自适应。该开关不进入 `host.ini`，生产配置始终开启。
+- `host_parity_test` 的 `application_latency`、`video_backpressure`、`hardware_shared_display` 显式同时开启两个开关，保留原有的自适应场景。
+
+验证：
+
+- `chast-video-qos-test` 104 项检查通过。新增断言：ABR 关闭时仍从 15 FPS 起步、干净回复升至 60、确认拥塞后降帧，且比例始终为 1.5；`adaptive_fps=false` 时 400 ms 延迟和 3 秒探测超时都不改变配置速率。
+- `desktop_stream` ctest 通过（11.22 s）；`host_parity` 全量通过（172.81 s），其中 `application_latency`、`video_backpressure` 和硬件场景现在显式同时开启两个开关。
+- 真实 1080p 回环：`quic_stream_options` 通过（39.99 s），手动格式/参数切换仍按精确 FPS 和码率断言；`quic_loopback` 通过（39.71 s）。两者都在 `adaptive_fps=false` 下运行。
+
 ## 仍需继续完成或验收
 
-1. v52 已补视频取帧反馈、有限发送窗口和恢复，控制流绕过视频积压的缺口已处理。两套调度算法仍有上述差异；其他流（例如大文件）的发送容量和极端拥塞需单独验收，不能据此声称 F06 全部等效。
-2. `adaptive_bitrate=false` 在本项目中关闭自动 FPS/码率调节，只保留用户请求聚合；参考 RustDesk 的 enable-abr 主要约束质量比例，配置语义有区别。
-3. 编码器拒绝设置新码率时保留已有流，按间隔重试，并将该显示源标为不能动态改变质量；跨不同硬件的失败和恢复还需专项验证。
+1. v52 已补视频取帧反馈、有限发送窗口和恢复，控制流绕过视频积压的缺口已处理；2026-11-10 又补了全部队列满时暂停生产。RustDesk 的逐帧同步等待仍与上述高水位方案不同；其他流（例如大文件）的发送容量和极端拥塞需单独验收，不能据此声称 F06 全部等效。
+2. 编码器拒绝设置新码率时保留已有流，按间隔重试，并将该显示源标为不能动态改变质量；跨不同硬件的失败和恢复还需专项验证。
 4. v53 已接入所有桌面连接的全局编码交集和偏好多数票，见 [全局编码协商](D:/ds-chcast/docs/global-codec-rustdesk-2026-11-08.md)。色度协商、摄像头并入该策略、单连接多个独立视频流仍在后续范围。实际双屏、跨机弱网以及 Windows 桌面/驱动恢复未由本机回环代替。
 
 完整剩余模块继续以 [发射端模块审核](D:/ds-chcast/docs/host-rustdesk-module-comparison-2026-11-08.md) 和 [完整功能审核](D:/ds-chcast/docs/rustdesk-full-parity-2026-11-07.md) 为清单；其中历史行号与修复前描述需按当前代码核实。后续还包括按连接 ID 的本地管理、服务审批和会话内提权、防休眠、主机录制、剪贴板方向和惰性文件内容、文件分页/空目录、键盘模式、打印及角色互换等，未在本轮重新定义为完成。

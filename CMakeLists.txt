@@ -100,6 +100,17 @@ if(DEFINED OPUS_ROOT)
 endif()
 find_package(Opus CONFIG REQUIRED)
 
+# Zstandard for the v66 compressed CFIL block format. The static triplet
+# matches Opus, so the library is linked in and no DLL ships beside the host
+# or the viewer.
+if(NOT DEFINED ZSTD_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static/share/zstd")
+    set(ZSTD_ROOT "D:/vcpkg/installed/x64-windows-static" CACHE PATH "zstd install prefix")
+endif()
+if(DEFINED ZSTD_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH "${ZSTD_ROOT}")
+endif()
+find_package(zstd CONFIG REQUIRED)
+
 # OpenH264 software fallback. Use the static-library/dynamic-CRT triplet so it
 # matches the MSVC runtime used by the application. The vcpkg port exports
 # pkg-config metadata but no CMake package, so import it from the prefix.
@@ -290,8 +301,9 @@ target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
 # user32 supplies SendInput/GetSystemMetrics for the injector; wtsapi32 the
-# session lock state behind the desktop tracker.
-target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32 wtsapi32)
+# session lock state behind the desktop tracker; shcore the per-monitor DPI
+# declaration that keeps those APIs in physical pixels.
+target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32 wtsapi32 shcore zstd::libzstd)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -839,6 +851,12 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_file_browse
         COMMAND chast-quic verify --port 45510 --file-browse --quiet)
     set_tests_properties(quic_file_browse PROPERTIES TIMEOUT 120)
+    # CFIL v2 compression: the host offers a 1 MiB compressible .txt and the
+    # viewer must report a v2 block stream whose wire bytes stay far below the
+    # file size while the decoded bytes still match the offered digest.
+    add_test(NAME quic_file_compression
+        COMMAND chast-quic verify --port 45512 --file-download --file-compression --quiet)
+    set_tests_properties(quic_file_compression PROPERTIES TIMEOUT 120)
     # Recursive folder download and upload through the real ViewerEngine: the
     # walk must mirror the seeded tree including empty folders, a cancel must
     # end with code 2 and leave no partial file, and a dropped file plus a

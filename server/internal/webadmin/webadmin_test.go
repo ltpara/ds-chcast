@@ -146,6 +146,48 @@ func TestConsoleExposesDevicePolicyReceipts(t *testing.T) {
 	}
 }
 
+// TestConsoleExposesPolicyAuthoring keeps the policy tab wired to the
+// reusable policy objects and scoped assignments, and to the materialised
+// per-device view that names the assignment it came from.
+func TestConsoleExposesPolicyAuthoring(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(index)
+	for _, want := range []string{
+		`id="policy-object-rows"`,
+		`id="policy-object-dialog"`,
+		`id="policy-object-ceiling"`,
+		`id="policy-assignment-rows"`,
+		`id="policy-assignment-dialog"`,
+		`id="policy-assignment-scope"`,
+		`id="policy-assignment-priority"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html is missing %q", want)
+		}
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(script)
+	for _, want := range []string{
+		"'/v1/policies'",
+		"'/v1/policy-assignments'",
+		"'/v1/device-policies'",
+		"function policyObjectRow",
+		"function policyAssignmentRow",
+		"function sourceCell",
+		"scope_kind",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing %q", want)
+		}
+	}
+}
+
 // TestAssetsStayCSPCompatible guards the policy that the console contains no
 // inline script or style and never assigns data through HTML parsing helpers.
 func TestAssetsStayCSPCompatible(t *testing.T) {

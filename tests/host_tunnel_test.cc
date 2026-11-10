@@ -130,6 +130,30 @@ void test_event_parse() {
     check(chast::host::parse_tunnel_event(R"({"event":"ready","device_policy":null})", event),
           "a null policy keeps the event usable");
     check(!event.has_policy, "a null policy means unmanaged");
+
+    check(chast::host::parse_tunnel_event(
+              R"({"event":"policy","device_policy":{"mode":"restricted",)"
+              R"("permission_ceiling":7,"policy_version":9,"updated_at_ms":456},)"
+              R"("reason":"tightened"})",
+              event),
+          "a pushed policy event parses");
+    check_text(event.reason, "tightened", "the policy reason is kept");
+    check(event.has_policy && event.policy.policy_version == 9,
+          "the pushed policy version is kept");
+    check(event.policy.permission_ceiling == 7, "the pushed policy ceiling is kept");
+
+    check(chast::host::parse_tunnel_event(
+              R"({"event":"revoke","kid":"k-2026-11","reason":"rotation"})", event),
+          "a revoke event parses");
+    check_text(event.kid, "k-2026-11", "the revoked kid is kept");
+    check_text(event.reason, "rotation", "the revoke reason is kept");
+    check(!event.has_policy, "a revoke event carries no policy");
+
+    check(chast::host::parse_tunnel_event(
+              R"({"event":"policy","reason":"policy removed"})", event),
+          "a policy-delete event parses without a statement");
+    check(!event.has_policy && event.reason == "policy removed",
+          "a policy delete relaxes without a statement");
 }
 
 void test_executable_paths() {

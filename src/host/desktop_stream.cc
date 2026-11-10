@@ -32,6 +32,8 @@ struct Picture {
     size_t bytes = 0;
     bool idr = false;
 };
+constexpr size_t kMaxSubscriberQueueFrames = 60;
+constexpr size_t kMaxSubscriberQueueBytes = 8u * 1024u * 1024u;
 struct Subscription {
     // Only the owning connection reads/replaces current. The service changes
     // queues on its thread, not metadata a connection might be inspecting.
@@ -43,6 +45,11 @@ struct Subscription {
     bool consumed = false;
     uint64_t delivered_capture_ms = 0;
     VideoCodecMask decoding_codecs = kVideoCodecAll;
+    // RustDesk runs its pointer service beside the video service, so a slow
+    // encode never delays the cursor. The source invokes this right after a
+    // frame is captured, before encoding it.
+    std::mutex cursor_mutex;
+    std::function<void(const CursorInfo&)> cursor_sink;
 };
 } // namespace
 
@@ -76,6 +83,10 @@ struct DesktopStreamPool::Source {
     bool fatal = false;
     bool keyframe = true;
     bool have_input = false;
+    // A desktop change was captured while every subscriber queue was full and
+    // has not been encoded yet. The next free tick must send a real frame
+    // instead of repeating the encoder's older input.
+    bool skipped_update = false;
     // RustDesk static_refresh: a bounded burst of repeats lets the rate
     // control refine a static picture. Counters restart on every new frame
     // and refinements must not count as motion for the shared QoS.
@@ -211,6 +222,19 @@ struct DesktopStreamPool::Source {
         }
         keyframe = true;
     }
+    void notify_cursor() {
+        if (!image) return;
+        for (const auto& weak : subscribers) {
+            auto sub = weak.lock();
+            if (!sub) continue;
+            std::function<void(const CursorInfo&)> sink;
+            {
+                std::lock_guard<std::mutex> lock(sub->cursor_mutex);
+                sink = sub->cursor_sink;
+            }
+            if (sink) sink(*image->cursor);
+        }
+    }
     void request_keyframe(const Subscription& sub) {
         // The connection may ask again while its first IDR is waiting to be
         // consumed. Coalesce that request instead of encoding another IDR on
@@ -260,6 +284,17 @@ struct DesktopStreamPool::Source {
     bool has_subscribers() const {
         return std::any_of(subscribers.begin(), subscribers.end(),
                            [](const auto& weak) { return !weak.expired(); });
+    }
+    bool all_subscribers_full() const {
+        bool any = false;
+        for (const auto& weak : subscribers) {
+            auto sub = weak.lock();
+            if (!sub) continue;
+            any = true;
+            if (sub->queue.size() < kMaxSubscriberQueueFrames &&
+                sub->queued_bytes < kMaxSubscriberQueueBytes) return false;
+        }
+        return any;
     }
     bool static_refresh_due(Clock::time_point now) const {
         if (!encoder || !image || !configured || !have_input || !source_ready || fatal || lost)
@@ -487,7 +522,8 @@ struct DesktopStreamPool::Source {
             ++it;
             // Bound each slow connection independently. Never resume at a P
             // frame after dropping references: request a fresh IDR instead.
-            if (sub->queue.size() >= 60 || sub->queued_bytes + picture->bytes > 8 * 1024 * 1024) {
+            if (sub->queue.size() >= kMaxSubscriberQueueFrames ||
+                sub->queued_bytes + picture->bytes > kMaxSubscriberQueueBytes) {
                 sub->queue.clear();
                 sub->queued_bytes = 0;
                 sub->waiting_idr = true;
@@ -510,7 +546,7 @@ struct DesktopStreamPool::Source {
             sub->queued_bytes += picture->bytes;
         }
     }
-    bool encode(bool repeat) {
+    bool encode(bool repeat, bool force_update = false) {
         if (!image || !image->nv12) return true;
         if (!encoder || encoder->width() != image->frame.nv12_width ||
             encoder->height() != image->frame.nv12_height) {
@@ -531,7 +567,8 @@ struct DesktopStreamPool::Source {
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
         Error result = Error::success();
         auto* input = encoder->bgra_input() ? next->bgra.get() : next->nv12.get();
-        const bool updated = encoder->bgra_input() ? next->frame.desktop_updated : next->frame.nv12_updated;
+        const bool updated = force_update ||
+            (encoder->bgra_input() ? next->frame.desktop_updated : next->frame.nv12_updated);
         if (repeat) {
             // Refinement republishes the cached picture; it is not a new
             // desktop image for any subscriber.
@@ -677,12 +714,20 @@ struct DesktopStreamPool::Source {
         // An encoder slower than the interval must skip a beat instead of
         // bursting two frames back to back to catch up.
         if (due <= tick) due = tick + interval;
+        // Every live connection is behind by a full window. Like RustDesk's
+        // per-frame subscriber wait, stop encoding until one drains instead of
+        // burning work for frames every queue would drop. The pointer is still
+        // sampled: RustDesk's cursor services run beside video and keep moving
+        // while a viewer's video queue is saturated.
+        const bool full = all_subscribers_full();
         // Wait up to the next tick for a desktop change. A short fixed timeout
         // samples the present stream with a low duty cycle: when its cadence
         // and the tick cadence share a phase, whole intervals report no new
         // frame while others carry two. The target framerate is the cap.
-        const auto capture_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::clamp<Clock::duration>(due - Clock::now(), std::chrono::milliseconds(1), interval));
+        const auto capture_timeout = full
+            ? std::chrono::milliseconds(0)
+            : std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::clamp<Clock::duration>(due - Clock::now(), std::chrono::milliseconds(1), interval));
         const auto result = capture->capture(capture_timeout);
         if (result == CaptureResult::ReinitNeeded || result == CaptureResult::FatalError) {
             error = capture->last_error();
@@ -694,16 +739,39 @@ struct DesktopStreamPool::Source {
         }
         if (result == CaptureResult::Frame) {
             if (!capture->frame().nv12_texture || capture->frame().rotation_degrees) {
-                if (++missing_nv12 < 3) return;
+                if (full || ++missing_nv12 < 3) return;
                 error = Error(Status::Unavailable, "capture produced no usable NV12 image");
                 fatal = true;
                 return;
             }
             missing_nv12 = 0;
             remember();
-            // Every changed desktop restarts RustDesk's static-refresh budget;
-            // a cursor-only sample must not keep the refinement alive.
-            if (image->frame.nv12_updated || image->frame.desktop_updated) {
+            notify_cursor();
+            // Cursor-only wakes refresh the pointer but carry no new desktop
+            // pixels. RustDesk's duplication reports the same wake as
+            // WouldBlock and leaves cursor delivery to its cursor services;
+            // encoding here would make every mouse move over a static desktop
+            // a full frame and count it as motion for the shared QoS.
+            const bool desktop_updated =
+                image->frame.nv12_updated || image->frame.desktop_updated;
+            if (full) {
+                // Keep the newest picture for the first free tick; encoding it
+                // now would only be dropped by every saturated queue.
+                if (desktop_updated) skipped_update = true;
+                return;
+            }
+            if (skipped_update && !desktop_updated) {
+                // The last change arrived while every queue was full. Repeat
+                // encoding would reuse the encoder's stale input, so encode
+                // the remembered picture once before resuming normal pacing.
+                skipped_update = false;
+                if (configured) encode(false, true);
+                return;
+            }
+            if (desktop_updated) {
+                skipped_update = false;
+                // Every changed desktop restarts RustDesk's static-refresh budget;
+                // a cursor-only sample must not keep the refinement alive.
                 repeat_outputs = 0;
                 repeat_no_outputs = 0;
                 source_ready = false;
@@ -713,7 +781,19 @@ struct DesktopStreamPool::Source {
                 needs_group_rebuild = true;
                 return;
             }
-            if (configured) encode(false);
+            if (!configured) return;
+            if (desktop_updated) encode(false);
+            else if (keyframe) encode(true);
+            else if (static_refresh_due(Clock::now())) encode(true);
+        } else if (full) {
+            // Every queue is saturated and no new frame arrived. Leave the
+            // remembered desktop change and any forced refresh for the first
+            // free tick; encoding now would only be dropped by every window
+            // and the change would be lost.
+            return;
+        } else if (skipped_update && image && configured) {
+            skipped_update = false;
+            encode(false, true);
         } else if (keyframe && image && configured) {
             encode(true);
         } else if (static_refresh_due(Clock::now())) {
@@ -846,6 +926,13 @@ Error DesktopStreamPool::refresh_display(IDxgiCapturer& capture, const DisplayIn
 std::shared_ptr<const CursorInfo> DesktopStreamPool::cursor_snapshot(const IDxgiCapturer& capture) {
     const auto& shared = static_cast<const Capture&>(capture);
     return shared.source->read_metadata().cursor;
+}
+
+void DesktopStreamPool::set_cursor_sink(IDxgiCapturer& capture,
+                                        std::function<void(const CursorInfo&)> sink) {
+    auto& shared = static_cast<Capture&>(capture);
+    std::lock_guard<std::mutex> lock(shared.sub->cursor_mutex);
+    shared.sub->cursor_sink = std::move(sink);
 }
 
 class DesktopStreamPool::Encoder final : public IVideoEncoder {
@@ -1314,9 +1401,9 @@ void DesktopStreamPool::QualityPeer::feedback(uint32_t delay, uint64_t pending, 
     policy_->pending(id_, pending, now_ms());
 }
 std::shared_ptr<DesktopStreamPool::QualityPeer> DesktopStreamPool::connect_quality(
-        uint32_t max_fps, float ratio, bool adaptive) {
+        uint32_t max_fps, float ratio, bool abr, bool adaptive_fps) {
     std::lock_guard lock(mutex_);
-    if (!qos_) qos_ = std::make_shared<VideoQos>(max_fps, ratio, adaptive);
+    if (!qos_) qos_ = std::make_shared<VideoQos>(max_fps, ratio, abr, adaptive_fps);
     return std::make_shared<QualityPeer>(qos_, ++next_peer_);
 }
 Error DesktopStreamPool::reserve_audio(IDxgiCapturer& capturer, UINT bitrate) {

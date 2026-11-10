@@ -21,7 +21,16 @@ type devicePolicyView struct {
 	UpdatedBy         string                   `json:"updated_by,omitempty"`
 	AllowedUsers      []string                 `json:"allowed_users"`
 	AllowedGroups     []string                 `json:"allowed_groups"`
+	Source            *devicePolicySourceView  `json:"source,omitempty"`
 	Receipt           *devicePolicyReceiptView `json:"receipt,omitempty"`
+}
+
+type devicePolicySourceView struct {
+	Kind     string `json:"kind"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Version  uint32 `json:"version"`
+	Priority int    `json:"priority"`
 }
 
 type devicePolicyReceiptView struct {
@@ -67,6 +76,15 @@ func viewDevicePolicy(policy account.DevicePolicy) devicePolicyView {
 	}
 	if view.AllowedGroups == nil {
 		view.AllowedGroups = []string{}
+	}
+	if policy.Source != nil {
+		view.Source = &devicePolicySourceView{
+			Kind:     policy.Source.Kind,
+			ID:       policy.Source.ID,
+			Name:     policy.Source.Name,
+			Version:  policy.Source.Version,
+			Priority: policy.Source.Priority,
+		}
 	}
 	if policy.Receipt != nil {
 		view.Receipt = &devicePolicyReceiptView{
@@ -133,6 +151,9 @@ func (s *server) setDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordAudit(r, actor, account.AuditDevicePolicyUpdate,
 		"set "+policy.Mode+" policy version "+strconv.FormatUint(uint64(policy.PolicyVersion), 10)+" for "+policy.PeerID, true)
+	if s.eventHub != nil {
+		s.eventHub.publishPolicy(policy.PeerID, &policy)
+	}
 	view := viewDevicePolicy(policy)
 	writeJSON(w, http.StatusOK, devicePolicyResponse{Managed: true, Policy: &view})
 }
@@ -149,6 +170,21 @@ func (s *server) deleteDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordAudit(r, actor, account.AuditDevicePolicyDelete,
 		"removed device policy for "+peerID, true)
+	// Deleting the manual override can reveal an assignment underneath it, so
+	// the device is not necessarily unmanaged afterwards.
+	changed, _, err := s.cfg.Accounts.ReconcileDevicePolicies([]string{peerID})
+	if err != nil {
+		s.cfg.Logger.Error("reconcile device policy after delete", "id", peerID, "error", err)
+	}
+	if s.eventHub != nil {
+		if len(changed) > 0 {
+			s.eventHub.publishPolicy(peerID, &changed[0])
+		} else {
+			// Managed=false tells the host to drop its policy file. Existing
+			// sessions are not terminated: deleting a policy relaxes admission.
+			s.eventHub.publishPolicy(peerID, nil)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -159,6 +195,12 @@ func (s *server) deleteDevicePolicy(w http.ResponseWriter, r *http.Request) {
 func (s *server) hostDevicePolicy(peerID string) (*hostDevicePolicy, error) {
 	if s.cfg.Accounts == nil {
 		return nil, nil
+	}
+	// A device that registers after an assignment was created has no
+	// materialised row yet; reconcile before reading so registration carries
+	// the assigned policy instead of the unmanaged state.
+	if _, _, err := s.cfg.Accounts.ReconcileDevicePolicies([]string{peerID}); err != nil {
+		return nil, err
 	}
 	policy, managed, err := s.cfg.Accounts.DevicePolicy(peerID)
 	if err != nil {

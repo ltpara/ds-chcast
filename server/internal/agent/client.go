@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +53,12 @@ type apiClient struct {
 	base      string
 	serverKey string
 	http      *http.Client
+	// poll serves the host event stream: a long poll must outlive the 5 s
+	// control-plane timeout, so it relies on the caller's context instead.
+	poll *http.Client
 }
+
+const hostEventPollWait = 25 * time.Second
 
 func newAPIClient(base, serverKey string, tlsConfig *tls.Config, proxy *netproxy.Proxy) *apiClient {
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -63,6 +69,7 @@ func newAPIClient(base, serverKey string, tlsConfig *tls.Config, proxy *netproxy
 		base:      strings.TrimRight(base, "/"),
 		serverKey: serverKey,
 		http:      client,
+		poll:      &http.Client{Transport: client.Transport},
 	}
 }
 
@@ -227,7 +234,50 @@ func (c *apiClient) reportDevicePolicyReceipt(ctx context.Context, peerID string
 		"/v1/device-policies/"+url.PathEscape(peerID)+"/receipt", data, nil)
 }
 
+// hostEvent is one statement on the host control stream. Policy events carry
+// the new managed statement; revoke events name an issuer key that must no
+// longer admit sessions.
+type hostEvent struct {
+	Seq               uint64 `json:"seq"`
+	Kind              string `json:"kind"`
+	Mode              string `json:"mode"`
+	PermissionCeiling uint32 `json:"permission_ceiling"`
+	PolicyVersion     uint32 `json:"policy_version"`
+	UpdatedAtMS       int64  `json:"updated_at_ms"`
+	Managed           *bool  `json:"managed"`
+	Kid               string `json:"kid"`
+	Reason            string `json:"reason"`
+	AtMS              int64  `json:"at_ms"`
+}
+
+type hostEventsResult struct {
+	Events []hostEvent `json:"events"`
+	Cursor uint64      `json:"cursor"`
+}
+
+// hostEvents long-polls the server for policy and key-revocation statements.
+// The cursor and timestamp are signed with the device key, so a shared host
+// credential cannot read another machine's stream.
+func (c *apiClient) hostEvents(ctx context.Context, id string, after uint64, priv ed25519.PrivateKey) (hostEventsResult, error) {
+	timestamp := time.Now().Unix()
+	query := url.Values{}
+	query.Set("after", strconv.FormatUint(after, 10))
+	query.Set("wait_ms", strconv.FormatInt(hostEventPollWait.Milliseconds(), 10))
+	query.Set("timestamp", strconv.FormatInt(timestamp, 10))
+	query.Set("signature", identity.Sign(priv, identity.HostEventsSubscribeMessage(id, after, timestamp)))
+	var out hostEventsResult
+	path := "/v1/hosts/" + url.PathEscape(id) + "/events?" + query.Encode()
+	if err := c.doWith(ctx, c.poll, http.MethodGet, path, nil, &out); err != nil {
+		return hostEventsResult{}, err
+	}
+	return out, nil
+}
+
 func (c *apiClient) do(ctx context.Context, method, path string, body []byte, out any) error {
+	return c.doWith(ctx, c.http, method, path, body, out)
+}
+
+func (c *apiClient) doWith(ctx context.Context, client *http.Client, method, path string, body []byte, out any) error {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -243,7 +293,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 	if c.serverKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.serverKey)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}

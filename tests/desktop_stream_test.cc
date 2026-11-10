@@ -3,6 +3,9 @@
 #include "../src/host/desktop_stream.h"
 #include <cstdio>
 #include <stdexcept>
+#include <algorithm>
+#include <mutex>
+#include <vector>
 
 using namespace chast;
 using namespace std::chrono_literals;
@@ -534,6 +537,190 @@ void static_refresh_budget() {
     display.reset();
 }
 
+void slow_viewer_backpressure() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto viewer = pool.subscribe(L"backpressure", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe a viewer that never reads");
+    frame(*viewer);
+    EncoderConfig config;
+    config.width = 640; config.height = 480;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "start encoding for the stalled viewer");
+    // Filling the 60-picture window at 60 fps takes about a second.
+    const auto fill = std::chrono::steady_clock::now() + 8s;
+    while (state->encodes < 55 && std::chrono::steady_clock::now() < fill)
+        std::this_thread::sleep_for(5ms);
+    check(state->encodes >= 55, "service publishes into the bounded window");
+    // Production must stop once every queue is at the high-water mark.
+    auto last_change = std::chrono::steady_clock::now();
+    unsigned observed = state->encodes;
+    const auto settle = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() - last_change < 400ms &&
+           std::chrono::steady_clock::now() < settle) {
+        std::this_thread::sleep_for(10ms);
+        if (state->encodes != observed) {
+            observed = state->encodes;
+            last_change = std::chrono::steady_clock::now();
+        }
+    }
+    const unsigned paused_encodes = state->encodes, paused_captures = state->captures,
+                   paused_idrs = state->idrs;
+    std::this_thread::sleep_for(500ms);
+    // RustDesk's pointer service runs beside video, so the capture tick keeps
+    // sampling the desktop while every video queue is full; encoding and
+    // forced IDRs still stop.
+    check(state->encodes == paused_encodes && state->idrs == paused_idrs &&
+              state->captures > paused_captures,
+          "encoding and forced IDRs pause while every viewer is behind, pointer sampling continues");
+    // One delivered picture reopens room in the window.
+    frame(*viewer);
+    std::vector<EncodedPacket> packets;
+    check(encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty(),
+          "deliver one queued picture");
+    const auto resume = std::chrono::steady_clock::now() + 2s;
+    while ((state->captures <= paused_captures || state->encodes <= paused_encodes) &&
+           std::chrono::steady_clock::now() < resume)
+        std::this_thread::sleep_for(5ms);
+    check(state->captures > paused_captures && state->encodes > paused_encodes,
+          "one delivered picture resumes capture and encoding");
+    encoder.reset();
+    viewer.reset();
+}
+
+void cursor_only_wake() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto display = pool.subscribe(L"cursor", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(display != nullptr, "subscribe to a desktop for cursor updates");
+    frame(*display);
+    EncoderConfig config;
+    config.width = 640; config.height = 480;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*display, config, &error);
+    check(encoder != nullptr, "start the cursor test encoder");
+    std::vector<EncodedPacket> packets;
+    const auto encoded = std::chrono::steady_clock::now() + 2s;
+    while (packets.empty() && std::chrono::steady_clock::now() < encoded) {
+        packets.clear();
+        check(encoder->encode(nullptr, 0, false, packets).ok(), "poll the first picture");
+        if (packets.empty()) std::this_thread::sleep_for(5ms);
+    }
+    check(!packets.empty(), "deliver the moving desktop picture");
+    state->moving = false;
+    std::this_thread::sleep_for(100ms);
+    CursorInfo pointer;
+    pointer.visible = true;
+    pointer.position_valid = true;
+    pointer.position = {321, 123};
+    pointer.width = pointer.height = 32;
+    state->set_cursor(pointer);
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    bool cursor_arrived = false;
+    while (std::chrono::steady_clock::now() < deadline && !cursor_arrived) {
+        const auto snapshot = DesktopStreamPool::cursor_snapshot(*display);
+        cursor_arrived = snapshot && snapshot->position.x == 321 && snapshot->position.y == 123;
+        if (!cursor_arrived) std::this_thread::sleep_for(5ms);
+    }
+    check(cursor_arrived, "pointer-only wake reaches subscribers as a cursor update");
+    const unsigned encodes = state->encodes;
+    std::this_thread::sleep_for(150ms);
+    check(state->encodes == encodes,
+          "pointer movement over a static desktop does not encode a video frame");
+    encoder.reset();
+    display.reset();
+}
+
+void cursor_sink_while_full() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto viewer = pool.subscribe(L"cursor-backpressure", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe to a display whose video queue will saturate");
+    frame(*viewer);
+    EncoderConfig config;
+    config.width = 640; config.height = 480;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "start the saturated-viewer encoder");
+    const auto fill = std::chrono::steady_clock::now() + 8s;
+    while (state->encodes < 60 && std::chrono::steady_clock::now() < fill)
+        std::this_thread::sleep_for(5ms);
+    check(state->encodes >= 60, "fill the stalled viewer's video window");
+
+    // The subscriber sink models the host session's CursorPublisher: it runs
+    // on the display service thread, beside video, like RustDesk's cursor
+    // service.
+    std::mutex seen_mutex;
+    std::vector<CursorInfo> seen;
+    DesktopStreamPool::set_cursor_sink(*viewer, [&](const CursorInfo& info) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(info);
+    });
+    const unsigned encodes = state->encodes;
+    state->moving = false;
+    CursorInfo pointer;
+    pointer.visible = true;
+    pointer.position_valid = true;
+    pointer.position = {77, 55};
+    pointer.width = pointer.height = 24;
+    state->set_cursor(pointer);
+    bool sunk = false;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (!sunk && std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lock(seen_mutex);
+            sunk = std::any_of(seen.begin(), seen.end(), [](const CursorInfo& info) {
+                return info.position_valid && info.position.x == 77 && info.position.y == 55;
+            });
+        }
+        if (!sunk) std::this_thread::sleep_for(5ms);
+    }
+    check(sunk, "the source hands pointer motion to the sink while every video queue is full");
+    check(state->encodes == encodes,
+          "pointer delivery beside saturated video encodes no frame");
+
+    // A desktop change captured while every queue was full must reach the
+    // encoder once a viewer drains a picture, not be replaced by a repeat of
+    // the encoder's older input. While the queues stay full and capture has
+    // no new frame, the change must stay pending rather than be encoded into
+    // a window that would drop it.
+    state->moving = true;
+    std::this_thread::sleep_for(100ms);
+    state->moving = false;
+    const unsigned before_resume = state->encodes;
+    std::this_thread::sleep_for(300ms);
+    check(state->encodes == before_resume,
+          "a change caught under full queues stays pending while capture is idle");
+    std::vector<EncodedPacket> packets;
+    check(encoder->encode(nullptr, 0, false, packets).ok(), "drain one queued picture");
+    const auto resume = std::chrono::steady_clock::now() + 2s;
+    while (state->encodes == before_resume && std::chrono::steady_clock::now() < resume)
+        std::this_thread::sleep_for(5ms);
+    check(state->encodes > before_resume,
+          "a desktop change captured while full is encoded once room opens");
+    encoder.reset();
+    viewer.reset();
+}
+
 int main() {
     try {
         runtime_encoder_recovery();
@@ -542,10 +729,11 @@ int main() {
         multi_display_full_color();
         global_codec_voting();
         static_refresh_budget();
+        slow_viewer_backpressure();
         {
             DesktopStreamPool quality_pool;
-            auto a = quality_pool.connect_quality(60, 0.67f, false);
-            auto b = quality_pool.connect_quality(60, 0.67f, false);
+            auto a = quality_pool.connect_quality(60, 0.67f, false, false);
+            auto b = quality_pool.connect_quality(60, 0.67f, false, false);
             auto media_a = std::make_shared<host_test::MediaState>();
             auto media_b = std::make_shared<host_test::MediaState>();
             std::string failure;
@@ -578,6 +766,8 @@ int main() {
                   "leaving viewer restores remaining rate without rebuilding encoder");
         }
         codec_admission_rollback();
+        cursor_only_wake();
+        cursor_sink_while_full();
         DesktopStreamPool pool;
         auto state = std::make_shared<host_test::MediaState>();
         CursorInfo pointer;
@@ -649,6 +839,10 @@ int main() {
         check(state->capture_thread != GetCurrentThreadId() &&
               state->capture_thread == state->encoder_thread,
               "capture and encoding belong to the same independent service thread");
+        // Both idle queues are full by now, so production is paused. Deliver a
+        // picture to reopen the window before holding a real encode below.
+        frame(*first);
+        encode(*encoder, *first);
         state->encode_delay_ms = 700;
         const auto slow_deadline = std::chrono::steady_clock::now() + 2s;
         while (!state->encoding_delayed && std::chrono::steady_clock::now() < slow_deadline)
@@ -689,12 +883,14 @@ int main() {
         check(state->capture_destroyed == 0 && state->encoder_destroyed == 0,
               "original subscriber leaving preserves the shared pipeline");
         // A stale generation must not replay the previous desktop's texture.
+        // Pictures queued before the reset are dropped instead of delivered:
+        // encoding one needs a generation that the reset is about to bump.
         state->moving = false;
         state->reset_requested = true;
         CaptureResult result = CaptureResult::NoNewFrame;
         for (int i = 0; i < 100 && result != CaptureResult::ReinitNeeded; ++i) {
             result = slow->capture(5ms);
-            if (result == CaptureResult::Frame) encode(*slow_encoder, *slow);
+            if (result == CaptureResult::Frame) DesktopStreamPool::discard_backlog(*slow);
         }
         state->hold_frames = true;
         check(result == CaptureResult::ReinitNeeded && slow->reinitialize().ok(), "reset shared capture");
