@@ -1,6 +1,7 @@
 // Checks for the host-side voice call (protocol v37): a viewer asks for the
 // host microphone, the relay answers with the capture format, forwards Opus
-// packets until the viewer stops the call, and tears the call down when the
+// packets until the viewer stops the call, restarts capture when the operator
+// picks another microphone mid-call, and tears the call down when the
 // microphone permission is revoked. A synthetic capture stands in for the
 // device so the check needs no microphone; it still needs an interactive
 // desktop because the call lives inside a desktop session.
@@ -93,6 +94,7 @@ std::filesystem::path temp_dir() {
 struct MicState {
     std::atomic<bool> started{false};
     std::atomic<bool> stopped{false};
+    std::atomic<int> active{0};
     std::atomic<uint64_t> created{0};
     std::mutex devices_mutex;
     std::vector<std::string> requested_devices;
@@ -162,6 +164,10 @@ public:
     ~FakeMicCapture() override { stop(); }
 
     void start() override {
+        if (!active_) {
+            active_ = true;
+            ++state_->active;
+        }
         state_->started = true;
         state_->stopped = false;
         last_ms_ = 0;
@@ -169,14 +175,17 @@ public:
     }
 
     void stop() override {
-        if (state_->started && !state_->stopped) {
-            state_->stopped = true;
+        if (active_) {
+            active_ = false;
+            if (--state_->active == 0) {
+                state_->started = false;
+                state_->stopped = true;
+            }
         }
-        state_->started = false;
     }
 
     bool take_packet(chast::EncodedAudio& packet) override {
-        if (!state_->started) {
+        if (!active_) {
             return false;
         }
         const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -198,6 +207,7 @@ public:
 
 private:
     std::shared_ptr<MicState> state_;
+    bool active_ = false;
     long long last_ms_ = 0;
     uint64_t seq_ = 0;
 };
@@ -234,9 +244,10 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
             mic->requested_devices.push_back(microphone.device_id);
         }
         ++mic->created;
-        // The pinned device answers "unplugged"; the empty id is the default
-        // communications device and works, so the host must fall back.
-        if (!microphone.device_id.empty()) {
+        // "test-mic-id" answers "unplugged" so the start path exercises the
+        // fallback to the default communications device; "second-mic-id" is a
+        // working device used to check the mid-call switch.
+        if (!microphone.device_id.empty() && microphone.device_id != "second-mic-id") {
             return nullptr;
         }
         return std::make_unique<FakeMicCapture>(mic);
@@ -378,6 +389,36 @@ int main() {
                 check(packets >= 3, "the viewer receives host microphone packets");
                 check(seq_ok, "the voice packets carry increasing sequence numbers");
                 check(payload_ok, "the voice packets keep their Opus payload");
+
+                // The operator pins another microphone from the tray. The
+                // capture restarts on it while the call and the viewer's
+                // decoder stay up.
+                const uint64_t created_before = mic->created.load();
+                host->set_voice_microphone("second-mic-id");
+                check(wait_for(
+                          [&mic] {
+                              const std::vector<std::string> devices = mic->devices();
+                              return !devices.empty() && devices.back() == "second-mic-id";
+                          },
+                          std::chrono::seconds(5)),
+                      "the running call restarts capture on the selected microphone");
+                check(mic->created.load() > created_before,
+                      "the switch opened a new capture device");
+                check(host->status().stats.voice_call_active,
+                      "the voice call stays active across the microphone switch");
+                uint64_t after_switch = 0;
+                wait_for(
+                    [&] {
+                        chast::AudioHeader header;
+                        std::vector<uint8_t> payload;
+                        while (viewer->take_voice_audio(header, payload)) {
+                            ++after_switch;
+                        }
+                        return after_switch >= 3;
+                    },
+                    std::chrono::seconds(5));
+                check(after_switch >= 3,
+                      "the viewer keeps receiving packets after the switch");
 
                 check(viewer->request_voice_call_stop().ok(),
                       "the viewer ends the voice call");

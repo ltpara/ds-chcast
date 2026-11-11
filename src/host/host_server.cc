@@ -34,6 +34,7 @@
 #include "chast/display_privacy.h"
 #include "chast/file_transfer.h"
 #include "chast/port_forward_relay.h"
+#include "chast/png.h"
 #include "chast/privacy.h"
 #include "chast/sas.h"
 #include "chast/security.h"
@@ -138,6 +139,11 @@ struct ViewerRegistry {
     // is set once the listener seeds the copy.
     HostSettings remote_settings;
     bool remote_settings_valid = false;
+    // Host microphone chosen from the tray. Like the remote switches it is
+    // process-wide: workers seed new sessions from it and live calls are
+    // restarted on their own thread when it changes.
+    std::string voice_microphone;
+    bool voice_microphone_valid = false;
     // Read by the last worker at session teardown, possibly from a different
     // worker than the one that set it.
     std::atomic<bool> lock_after_session_end{false};
@@ -149,9 +155,9 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 // RustDesk sends the pointer from a 33 ms service that runs beside video, so a
-// slow encode or a full video queue never freezes the cursor. The display
-// service invokes publish() on its capture thread right after each frame and
-// before encoding it. The session thread owns routing, resets, statistics and
+// slow encode or a full video queue never freezes the cursor. Desktop sources
+// invoke publish() on an independent pointer thread. The session thread owns
+// routing, resets, statistics and
 // teardown; send_cursor/send_display_cursor are non-blocking and thread-safe.
 class CursorPublisher {
 public:
@@ -166,6 +172,10 @@ public:
     }
     void route(uint32_t stream_id, bool multiple_streams) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (stream_id_ != stream_id || multiple_streams_ != multiple_streams) {
+            sent_once_ = false;
+            sent_ = CursorUpdate{};
+        }
         stream_id_ = stream_id;
         multiple_streams_ = multiple_streams;
     }
@@ -618,7 +628,7 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
                 break;
         }
         const FrameInfo& frame = capturer.frame();
-        if (!frame.nv12_texture) {
+        if (!frame.has_video_image()) {
             continue;
         }
         if (frame.rotation_degrees != 0) {
@@ -1047,7 +1057,7 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
     // exists only once the session knows its fingerprint.
     server->security_ = std::make_shared<HostSecurity>(
         server->security_config(server->session_->server_fingerprint()));
-    if (server->settings_.max_viewers > 1) {
+    {
         server->registry_ = std::make_shared<ViewerRegistry>();
         server->registry_->max_viewers = server->settings_.max_viewers;
         copy_remote_config_fields(server->settings_, server->registry_->remote_settings);
@@ -1171,7 +1181,8 @@ bool HostServer::open_session(std::string* error) {
     quic.expected_identity_fingerprint = config_.expected_identity_fingerprint;
     // Above one, the listener hands every connection to its own session
     // worker instead of holding a single slot.
-    quic.max_clients = settings_.max_viewers > 1 ? settings_.max_viewers : 1;
+    quic.max_authenticated_clients = config_.serve_once ? 1u : std::max(1u, settings_.max_viewers);
+    quic.max_clients = quic.max_authenticated_clients + 8;
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
     quic.clipboard_direction = settings_.clipboard_direction;
@@ -1391,7 +1402,7 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
         case HostSecurity::Decision::Allow:
             auth.action = ClientAuthAction::Allow;
             log("admitted " + from + auth_method_suffix(pending_security_));
-            commit_security();
+            if (!adopted_) commit_security();
             break;
         case HostSecurity::Decision::RequireApproval:
             auth.action = ClientAuthAction::RequireApproval;
@@ -1446,7 +1457,7 @@ ClientApproval HostServer::approve_client(const ClientRequest& request) {
         // The operator's decision also bounds what the lease may grant later.
         approved_permissions_ &= approval.permissions;
     }
-    commit_security();
+    if (!adopted_) commit_security();
     log("the operator approved the viewer from " + from + "; granting " +
         permission_names(request.permissions & approval.permissions));
     return approval;
@@ -1680,6 +1691,24 @@ void HostServer::set_lock_after_session_end(bool enabled) {
     ++registry_->remote_settings_version;
 }
 
+void HostServer::set_voice_microphone(const std::string& device_id) {
+    {
+        std::lock_guard<std::mutex> lock(voice_microphone_mutex_);
+        pending_voice_microphone_ = device_id;
+        voice_microphone_pending_ = true;
+    }
+    if (!registry_) {
+        // A sequential host runs its session in this object; the pending
+        // value is picked up by the frame loop.
+        return;
+    }
+    // The listener runs no session of its own, so the choice is published
+    // where workers and sessions created later can see it.
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->voice_microphone = device_id;
+    registry_->voice_microphone_valid = true;
+}
+
 bool HostServer::send_chat(const std::string& text) {
     return send_chat(status().connection_id, text);
 }
@@ -1813,10 +1842,6 @@ void HostServer::publish_download() {
 void HostServer::run() {
     if (adopted_) {
         run_adopted();
-        return;
-    }
-    if (settings_.max_viewers <= 1) {
-        run_single();
         return;
     }
     run_multi();
@@ -2241,6 +2266,10 @@ void HostServer::run_multi() {
 
     while (!stopping_.load()) {
         reap_viewers();
+        if (config_.serve_once) {
+            std::lock_guard lock(registry_->mutex);
+            stop_after_viewer = registry_->admitted != 0;
+        }
         const bool past_deadline =
             run_deadline != Clock::time_point::max() && Clock::now() >= run_deadline;
         if (config_.serve_once && stop_after_viewer) {
@@ -2317,10 +2346,6 @@ void HostServer::run_multi() {
                     0.001, std::chrono::duration<double>(run_deadline - Clock::now()).count());
             }
             start_viewer(std::move(connection), run_seconds_left);
-            if (config_.serve_once) {
-                // One connection: stop accepting, then wait for its worker.
-                stop_after_viewer = true;
-            }
             continue;
         }
         if (accepted.status() != Status::WaitTimeout) {
@@ -2394,6 +2419,9 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
         std::lock_guard<std::mutex> lock(registry_->mutex);
         if (registry_->remote_settings_valid) {
             copy_remote_config_fields(registry_->remote_settings, viewer->settings_);
+        }
+        if (registry_->voice_microphone_valid) {
+            viewer->settings_.voice_microphone = registry_->voice_microphone;
         }
         viewer->settings_.lock_after_session_end =
             registry_->lock_after_session_end.load();
@@ -2546,6 +2574,7 @@ void HostServer::run_adopted() {
         running_ = false;
         return;
     }
+    commit_security();
     {
         std::lock_guard<std::mutex> lock(registry_->mutex);
         if (registry_->pending > 0) {
@@ -2724,7 +2753,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return streams.subscribe(key, [&](std::string* out) {
             return config_.capture_factory(display, cfg, out);
         }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
-           {settings_.record_incoming, settings_.record_directory, config_.log});
+           {settings_.record_incoming, settings_.record_directory, config_.log},
+           cfg.capture_cursor ? config_.cursor_sampler : DesktopStreamPool::CursorSampler{});
     };
     auto subscribe_merged = [&](const std::vector<DisplayInfo>& displays,
                                 const CaptureConfig& cfg, std::string* failure) {
@@ -2739,7 +2769,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return streams.subscribe(key, [&](std::string* out) {
             return create_merged_capturer(displays, cfg, out);
         }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
-           {settings_.record_incoming, settings_.record_directory, config_.log});
+           {settings_.record_incoming, settings_.record_directory, config_.log},
+           cfg.capture_cursor ? config_.cursor_sampler : DesktopStreamPool::CursorSampler{});
     };
 
     struct DesktopVideo {
@@ -3374,6 +3405,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (!video.cursor || !video.cursor->bound_to(capturer.get())) {
             video.cursor = std::make_shared<CursorPublisher>();
             video.cursor->bind(session_.get(), capturer.get());
+            video.cursor->route(video.id, multiple_streams);
             std::shared_ptr<CursorPublisher> publisher = video.cursor;
             DesktopStreamPool::set_cursor_sink(*capturer, [publisher](const CursorInfo& info) {
                 publisher->publish(info);
@@ -3903,7 +3935,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     auto& video_needs_resync = video.needs_resync;
     auto process_frame = [&](uint64_t pts_ms, bool idle = false) -> bool {
         const FrameInfo& frame = idle ? cached_frame : capturer->frame();
-        if (!frame.nv12_texture) {
+        if (!frame.has_video_image()) {
             have_input = false;
             cached_nv12.reset();
             // A conversion can fail for one frame and recover; a pass that was
@@ -3950,7 +3982,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         have_input = true;
         if (!idle) {
-            frame.nv12_texture->AddRef();
+            if (frame.nv12_texture) frame.nv12_texture->AddRef();
             cached_nv12 = ComPtr<ID3D11Texture2D>(frame.nv12_texture);
             cached_frame = frame;
         }
@@ -5515,7 +5547,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // than the encoder was built for. VPL fixes the coded size at session
         // creation, so a size change is a new encoder -- built with the rate
         // and frame rate the controller currently holds -- not a reset.
-        if (frame.nv12_texture &&
+        if (frame.has_video_image() &&
             (frame.nv12_width != encoder->width() || frame.nv12_height != encoder->height() ||
              DesktopStreamPool::codec(*capturer) != encoder->codec() ||
              DesktopStreamPool::chroma(*capturer) != encoder->chroma())) {
@@ -5616,6 +5648,118 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     };
 
     const Clock::duration idle_timeout = idle_disconnect_timeout();
+    // Host screenshots (v72). Readback runs on the display service thread;
+    // PNG encoding runs on a helper while this loop continues processing
+    // controls. Bounded slices use a separate unidirectional stream. A slice
+    // refused by the send budget is retried on a later pass.
+    struct PendingScreenshot {
+        ScreenshotResponse response;
+        std::vector<uint8_t> png;
+        size_t offset = 0;
+        std::future<std::pair<ScreenshotResponse, std::vector<uint8_t>>> encoding;
+    };
+    std::unique_ptr<PendingScreenshot> screenshot;
+    bool screenshot_pending = false;
+    auto pump_screenshot = [&] {
+        if (!screenshot) {
+            ScreenshotRequest request;
+            if (!session_->take_screenshot_request(request)) {
+                return;
+            }
+            touch_viewer_activity();
+            screenshot = std::make_unique<PendingScreenshot>();
+            ScreenshotResponse& answer = screenshot->response;
+            answer.request_id = request.request_id;
+            answer.stream_id = request.stream_id;
+            IDxgiCapturer* source = nullptr;
+            if (request.stream_id == kScreenshotCurrentStream || (capturer && request.stream_id == video.id)) {
+                source = capturer.get();
+                answer.stream_id = video.id;
+            } else {
+                const auto found = other_videos.find(request.stream_id);
+                if (found != other_videos.end()) source = found->second.capture.get();
+            }
+            if (!source) {
+                answer.code = ScreenshotCode::Denied;
+                answer.reason = "that display is not being streamed to this viewer";
+            } else {
+                auto raw = DesktopStreamPool::screenshot_async(*source);
+                screenshot->encoding = std::async(std::launch::async,
+                    [answer, raw = std::move(raw)]() mutable {
+                        std::vector<uint8_t> png;
+                        try {
+                            auto pixels = raw.get();
+                            std::string failure;
+                            if (pixels.bgra.empty()) {
+                                answer.code = ScreenshotCode::Unavailable;
+                                answer.reason = std::move(pixels.error);
+                            } else if (!encode_png_bgra(pixels.bgra.data(), pixels.width, pixels.height,
+                                        pixels.width * 4, png, &failure)) {
+                                answer.code = ScreenshotCode::Failed;
+                                answer.reason = std::move(failure);
+                            } else if (png.size() > kMaxScreenshotBytes) {
+                                answer.code = ScreenshotCode::TooLarge;
+                                answer.reason = "the desktop picture is too large to send";
+                                png.clear();
+                            } else {
+                                answer.width = pixels.width; answer.height = pixels.height;
+                                answer.total = static_cast<uint32_t>(png.size());
+                                answer.count = (answer.total + kScreenshotChunkBytes - 1) / kScreenshotChunkBytes;
+                            }
+                        } catch (const std::exception& exception) {
+                            answer.code = ScreenshotCode::Failed;
+                            answer.reason = exception.what();
+                        }
+                        return std::make_pair(std::move(answer), std::move(png));
+                    });
+            }
+        }
+        PendingScreenshot& pending = *screenshot;
+        if (pending.encoding.valid()) {
+            if (pending.encoding.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                screenshot_pending = true;
+                return;
+            }
+            auto result = pending.encoding.get();
+            pending.response = std::move(result.first);
+            pending.png = std::move(result.second);
+        }
+        ScreenshotResponse slice = pending.response;
+        for (;;) {
+            if (pending.response.code != ScreenshotCode::Ok) {
+                const Error sent = session_->send_screenshot_response(pending.response);
+                if (sent.status() == Status::WaitTimeout) {
+                    screenshot_pending = true;
+                    return;
+                }
+                screenshot.reset();
+                screenshot_pending = false;
+                return;
+            }
+            if (pending.offset >= pending.png.size()) {
+                screenshot.reset();
+                screenshot_pending = false;
+                return;
+            }
+            const size_t bytes = std::min<size_t>(kScreenshotChunkBytes,
+                                                  pending.png.size() - pending.offset);
+            slice.index = static_cast<uint32_t>(pending.offset / kScreenshotChunkBytes);
+            slice.data.assign(pending.png.begin() + static_cast<ptrdiff_t>(pending.offset),
+                              pending.png.begin() +
+                                  static_cast<ptrdiff_t>(pending.offset + bytes));
+            const Error sent = session_->send_screenshot_response(slice);
+            if (sent.status() == Status::WaitTimeout) {
+                screenshot_pending = true;
+                return;
+            }
+            if (!sent.ok()) {
+                screenshot.reset();
+                screenshot_pending = false;
+                return;
+            }
+            pending.offset += bytes;
+        }
+    };
     while (!stopping_.load() && !disconnect_requested_.load()) {
         const auto now = Clock::now();
         if (!apply_ticket_renewals(error)) return false;
@@ -5662,6 +5806,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             touch_viewer_activity();
             if (!capture_displays(display_subscriptions)) { drain_peer(stats); return error->empty(); }
         }
+        pump_screenshot();
         ShowCursorHint cursor_hint;
         if (session_->take_show_cursor_hint(cursor_hint)) {
             touch_viewer_activity();
@@ -5672,7 +5817,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             } else {
                 if (!cursor_overlay && !cursor_overlay_failed) {
                     std::string overlay_error;
-                    cursor_overlay = CursorHintOverlay::create(&overlay_error);
+                    cursor_overlay =
+                        CursorHintOverlay::create(&overlay_error, pending_security_.device_name);
                     if (!cursor_overlay) {
                         cursor_overlay_failed = true;
                         log("show-cursor hint is unavailable: " + overlay_error);
@@ -5680,7 +5826,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 }
                 if (cursor_overlay) {
                     std::string overlay_error;
-                    if (!cursor_overlay->move(cursor_hint.x, cursor_hint.y, &overlay_error)) {
+                    if (!cursor_overlay->move(cursor_hint.x, cursor_hint.y, cursor_hint.pressed,
+                                              &overlay_error)) {
                         cursor_overlay.reset();
                         cursor_overlay_failed = true;
                         log("show-cursor hint failed: " + overlay_error);
@@ -6045,7 +6192,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if (found != other_videos.end()) { swap_video(found->second); pumping_extra = false; }
             if (!ok || *peer_left) { drain_peer(stats); return error->empty(); }
         }
-        if (!other_videos.empty() || !session_->video_send_ready())
+        if (!other_videos.empty() || screenshot_pending || !session_->video_send_ready())
             sleep_unless_stopping(std::chrono::milliseconds(1));
     }
 
@@ -8728,7 +8875,106 @@ void HostServer::stop_voice_call(HostServerStats& stats, const std::string& reas
     publish_stats(stats);
 }
 
+std::unique_ptr<IMicrophoneCapture> HostServer::create_voice_capture(
+    std::string& device_id, std::string* error) {
+    MicrophoneCaptureConfig microphone_config;
+    microphone_config.device_id = device_id;
+    std::unique_ptr<IMicrophoneCapture> capture =
+        config_.voice_capture ? config_.voice_capture(microphone_config, error)
+                              : create_microphone_capture(microphone_config, error);
+    if (!capture && !microphone_config.device_id.empty()) {
+        // A pinned device can be unplugged between calls. Capture falls back to
+        // the default communications microphone instead of failing; the
+        // operator log names the substitute so the recording route does not
+        // silently change.
+        log("voice call: microphone '" + microphone_config.device_id +
+            "' is unavailable; using the default communications device");
+        microphone_config.device_id.clear();
+        capture = config_.voice_capture
+                      ? config_.voice_capture(microphone_config, error)
+                      : create_microphone_capture(microphone_config, error);
+    }
+    if (capture) {
+        capture->start();
+        if (capture->failed()) {
+            if (error != nullptr) {
+                *error = capture->error();
+            }
+            capture->stop();
+            capture.reset();
+        }
+    }
+    device_id = microphone_config.device_id;
+    return capture;
+}
+
+void HostServer::sync_voice_microphone(HostServerStats& stats) {
+    std::string requested = settings_.voice_microphone;
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lock(voice_microphone_mutex_);
+        if (voice_microphone_pending_) {
+            requested = pending_voice_microphone_;
+            voice_microphone_pending_ = false;
+            have = true;
+        }
+    }
+    if (registry_) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->voice_microphone_valid) {
+            requested = registry_->voice_microphone;
+            have = true;
+        }
+    }
+    if (!have || requested == settings_.voice_microphone) {
+        return;
+    }
+    settings_.voice_microphone = requested;
+    if (!voice_capture_) {
+        return;
+    }
+    // A revoked call ends below in handle_voice_call_requests(); restarting
+    // its capture first would only open a device that is about to close.
+    if (!settings_.allow_microphone ||
+        (session_->permissions() & kPermissionMicrophone) == 0) {
+        return;
+    }
+    restart_voice_call_microphone(stats);
+}
+
+void HostServer::restart_voice_call_microphone(HostServerStats& stats) {
+    std::string device_id = settings_.voice_microphone;
+    std::string setup_error;
+    std::unique_ptr<IMicrophoneCapture> capture = create_voice_capture(device_id, &setup_error);
+    if (!capture) {
+        ++stats.voice_call_errors;
+        log("voice call: cannot switch the host microphone; keeping the previous device" +
+            (setup_error.empty() ? std::string() : ": " + setup_error));
+        return;
+    }
+    // The viewer built its decoder from the format in the start answer and the
+    // call keeps its sequence space, so a device that captures in a different
+    // format cannot take over mid-call.
+    const AudioInfo info = capture->info();
+    if (info.codec != voice_info_.codec || info.sample_rate != voice_info_.sample_rate ||
+        info.channels != voice_info_.channels ||
+        info.frame_samples != voice_info_.frame_samples) {
+        capture->stop();
+        ++stats.voice_call_errors;
+        log("voice call: the selected microphone uses a different format; keeping the "
+            "previous device");
+        return;
+    }
+    voice_capture_->stop();
+    voice_capture_ = std::move(capture);
+    voice_info_ = voice_capture_->info();
+    log("voice call: host microphone switched to " +
+        (device_id.empty() ? std::string("the default communications device")
+                           : "'" + device_id + "'"));
+}
+
 void HostServer::handle_voice_call_requests(HostServerStats& stats) {
+    sync_voice_microphone(stats);
     VoiceCallRequest request;
     while (session_->take_voice_call_request(request)) {
         if (!request.connect) {
@@ -8755,33 +9001,8 @@ void HostServer::handle_voice_call_requests(HostServerStats& stats) {
         std::string setup_error;
         std::unique_ptr<IMicrophoneCapture> capture;
         if (allowed) {
-            MicrophoneCaptureConfig microphone_config;
-            microphone_config.device_id = settings_.voice_microphone;
-            if (config_.voice_capture) {
-                capture = config_.voice_capture(microphone_config, &setup_error);
-            } else {
-                capture = create_microphone_capture(microphone_config, &setup_error);
-            }
-            if (!capture && !microphone_config.device_id.empty()) {
-                // A pinned device can be unplugged between calls. The call
-                // falls back to the default communications microphone instead
-                // of failing; the operator log names the substitute so the
-                // recording route does not silently change.
-                log("voice call: microphone '" + microphone_config.device_id +
-                    "' is unavailable; using the default communications device");
-                microphone_config.device_id.clear();
-                capture = config_.voice_capture
-                              ? config_.voice_capture(microphone_config, &setup_error)
-                              : create_microphone_capture(microphone_config, &setup_error);
-            }
-            if (capture) {
-                capture->start();
-                if (capture->failed()) {
-                    setup_error = capture->error();
-                    capture->stop();
-                    capture.reset();
-                }
-            }
+            std::string device_id = settings_.voice_microphone;
+            capture = create_voice_capture(device_id, &setup_error);
         } else {
             setup_error = "the microphone is not enabled for this session";
         }

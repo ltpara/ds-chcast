@@ -385,6 +385,109 @@ void main() {
     expect(find.text('dave'), findsOneWidget);
   });
 
+  testWidgets('shares can target an account group or everyone', (
+    tester,
+  ) async {
+    final List<AddressBookGrant> outgoing = <AddressBookGrant>[
+      const AddressBookGrant(username: 'bob'),
+      const AddressBookGrant(
+        username: '',
+        targetKind: 'group',
+        targetId: 'team',
+        targetName: 'Team',
+      ),
+      const AddressBookGrant(username: '', targetKind: 'everyone'),
+    ];
+    final List<String> shared = <String>[];
+    final List<String> revoked = <String>[];
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      loadGrants: (ServerSettings server, String token) async =>
+          AddressBookGrants(outgoing: List<AddressBookGrant>.of(outgoing)),
+      loadBooks: (ServerSettings server, String token) async =>
+          const <SharedAddressBook>[],
+      loadAccountGroups: (ServerSettings server, String token) async =>
+          const <ServerAccountGroup>[
+            ServerAccountGroup(id: 'team', name: 'Team'),
+            ServerAccountGroup(id: 'ops', name: 'Ops'),
+          ],
+      shareTarget:
+          (
+            ServerSettings server,
+            String token,
+            String kind,
+            String targetId, {
+            String permission = 'read',
+            String groupId = '',
+          }) async {
+            shared.add('$kind:$targetId@$permission@$groupId');
+            outgoing.removeWhere(
+              (AddressBookGrant grant) =>
+                  grant.targetKind == kind && grant.targetId == targetId,
+            );
+            outgoing.add(
+              AddressBookGrant(
+                username: '',
+                permission: permission,
+                groupId: groupId,
+                targetKind: kind,
+                targetId: targetId,
+                targetName: kind == 'group' ? 'Team' : '',
+              ),
+            );
+            return outgoing.last;
+          },
+      revokeTarget:
+          (
+            ServerSettings server,
+            String token,
+            String kind,
+            String targetId, {
+            String? groupId,
+          }) async {
+            revoked.add('$kind:$targetId@${groupId ?? ''}');
+            outgoing.removeWhere(
+              (AddressBookGrant grant) =>
+                  grant.targetKind == kind && grant.targetId == targetId,
+            );
+          },
+    );
+    await open(tester, dialog);
+
+    expect(find.text('bob'), findsOneWidget);
+    expect(find.text('账号组 · Team'), findsOneWidget);
+    expect(find.text('所有账号'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('shared-target')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('账号组').last);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('shared-target-group')), findsOneWidget);
+    await tester.ensureVisible(find.byKey(const Key('shared-grant')));
+    await tester.tap(find.byKey(const Key('shared-grant')));
+    await tester.pumpAndSettle();
+    expect(shared, <String>['group:team@read@']);
+
+    await tester.tap(find.byKey(const Key('shared-target')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('所有账号').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('shared-grant')));
+    await tester.pumpAndSettle();
+    expect(shared, <String>['group:team@read@', 'everyone:@read@']);
+
+    await tester.ensureVisible(find.byKey(const Key('shared-revoke-group-team')));
+    await tester.tap(find.byKey(const Key('shared-revoke-group-team')));
+    await tester.pumpAndSettle();
+    expect(revoked, <String>['group:team@']);
+    expect(find.text('账号组 · Team'), findsNothing);
+    await tester.tap(find.byKey(const Key('shared-revoke-everyone-')));
+    await tester.pumpAndSettle();
+    expect(revoked, <String>['group:team@', 'everyone:@']);
+    expect(find.text('bob'), findsOneWidget);
+  });
+
   testWidgets('an existing grant permission can be changed', (tester) async {
     final List<AddressBookGrant> outgoing = <AddressBookGrant>[
       const AddressBookGrant(username: 'bob'),

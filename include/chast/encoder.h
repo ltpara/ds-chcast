@@ -132,6 +132,10 @@ public:
     // application reacts to a new viewer or a lost reference frame.
     virtual Error encode(ID3D11Texture2D* nv12, uint64_t pts_ms, bool force_keyframe,
                          std::vector<EncodedPacket>& out) = 0;
+    virtual Error encode_cpu_bgra(const uint8_t*, UINT, UINT, uint64_t, bool,
+                                  std::vector<EncodedPacket>&) {
+        return Error(Status::Unsupported, "encoder has no CPU pixel input");
+    }
 
     // Encodes the last submitted image again, for frames whose desktop content
     // did not change (FrameInfo::nv12_updated is false). Same result as

@@ -32,6 +32,7 @@ import 'recording_archive_dialog.dart';
 import 'recovery_dialog.dart';
 import 'security_key_dialog.dart';
 import 'shared_books_dialog.dart';
+import 'trash_dialog.dart';
 import 'two_factor_dialog.dart';
 
 typedef HostLookup =
@@ -102,6 +103,7 @@ typedef AddressBookPeerWriter =
       String peerId, {
       String? name,
       List<String>? tags,
+      String? note,
       String? groupId,
       int? ifRevision,
     });
@@ -115,6 +117,8 @@ typedef AddressBookPeerOrderWriter =
     });
 typedef AddressBookPeerDeleter =
     Future<void> Function(ServerSettings server, String token, String peerId);
+typedef TrashDialogBuilder =
+    Widget Function(ServerSettings server, String token);
 typedef ViewerUpdateInstaller =
     Future<void> Function(SoftwareInfo update, String serverPublicKey);
 typedef RelayWaker =
@@ -150,6 +154,7 @@ class HomePage extends StatefulWidget {
     this.addressBookPeerWriter,
     this.addressBookPeerOrderWriter,
     this.addressBookPeerDeleter,
+    this.trashDialogBuilder,
     this.wakeSender,
     this.relayWaker,
     this.lanDiscovery,
@@ -185,6 +190,9 @@ class HomePage extends StatefulWidget {
   final AddressBookPeerWriter? addressBookPeerWriter;
   final AddressBookPeerOrderWriter? addressBookPeerOrderWriter;
   final AddressBookPeerDeleter? addressBookPeerDeleter;
+
+  /// Test seam for the recycle-bin dialog; product code opens [TrashDialog].
+  final TrashDialogBuilder? trashDialogBuilder;
   final WakeSender? wakeSender;
   final RelayWaker? relayWaker;
   final LanDiscovery? lanDiscovery;
@@ -376,6 +384,7 @@ class _HomePageState extends State<HomePage> {
           String peerId, {
           String? name,
           List<String>? tags,
+          String? note,
           String? groupId,
           int? ifRevision,
         }) {
@@ -385,6 +394,7 @@ class _HomePageState extends State<HomePage> {
             peerId,
             name: name,
             tags: tags,
+            note: note,
             groupId: groupId,
             ifRevision: ifRevision,
           );
@@ -1166,6 +1176,30 @@ class _HomePageState extends State<HomePage> {
     unawaited(_pushAccountPeer(updated, syncTags: true));
   }
 
+  Future<void> _editNote(Device device) async {
+    final String? note = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => _NoteDialog(note: device.note),
+    );
+    if (note == null) {
+      return;
+    }
+    final List<Device> devices = await _deviceStore.updateNote(
+      device.key,
+      note,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() => _devices = devices);
+    final Device updated = devices.firstWhere(
+      (Device item) => item.key == device.key,
+      orElse: () => device.copyWith(note: Device.cleanNote(note)),
+    );
+    _showSnack(updated.note.isEmpty ? tr('备注已清除') : tr('备注已保存'));
+    unawaited(_pushAccountPeer(updated, syncNote: true));
+  }
+
   Future<void> _moveDeviceToGroup(Device device) async {
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
@@ -1240,6 +1274,25 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         _showSnack(tr('分组已保存在本机，将在下次同步上传'));
       }
+    }
+  }
+
+  Future<void> _manageTrash() async {
+    final AccountSession? account = _account;
+    if (account == null || account.server != _server.url) {
+      _showSnack(tr('请先登录账号'));
+      return;
+    }
+    final bool changed =
+        await showDialog<bool>(
+          context: context,
+          builder: (BuildContext context) =>
+              widget.trashDialogBuilder?.call(_server, account.token) ??
+              TrashDialog(server: _server, token: account.token),
+        ) ??
+        false;
+    if (changed && mounted) {
+      await _syncAddressBook(announce: false);
     }
   }
 
@@ -1538,6 +1591,7 @@ class _HomePageState extends State<HomePage> {
             push.id,
             name: push.name,
             tags: push.tags,
+            note: push.note,
             groupId: push.groupId,
             ifRevision: push.revision > 0 ? push.revision : null,
           );
@@ -1590,9 +1644,11 @@ class _HomePageState extends State<HomePage> {
           item.copyWith(
             name: peer.name,
             tags: peer.tags,
+            note: peer.note,
             groupId: peer.groupId,
             revision: peer.revision,
             tagsCleared: false,
+            noteCleared: false,
             groupCleared: false,
             saved: true,
           ),
@@ -1681,6 +1737,7 @@ class _HomePageState extends State<HomePage> {
     }
     return device.copyWith(
       tagsCleared: push.tags == null ? device.tagsCleared : false,
+      noteCleared: push.note == null ? device.noteCleared : false,
       groupCleared: push.groupId == null ? device.groupCleared : false,
       revision: written[device.id]?.revision ?? device.revision,
     );
@@ -1720,9 +1777,11 @@ class _HomePageState extends State<HomePage> {
           item.copyWith(
             name: peer.name,
             tags: peer.tags,
+            note: peer.note,
             groupId: peer.groupId,
             revision: peer.revision,
             tagsCleared: false,
+            noteCleared: false,
             groupCleared: false,
             saved: true,
           ),
@@ -1763,6 +1822,7 @@ class _HomePageState extends State<HomePage> {
     Device device, {
     bool allowEmptyName = false,
     bool syncTags = false,
+    bool syncNote = false,
   }) async {
     final AccountSession? account = _account;
     final String? name = device.name.isNotEmpty || allowEmptyName
@@ -1773,7 +1833,11 @@ class _HomePageState extends State<HomePage> {
     final List<String>? tags = device.tags.isNotEmpty || syncTags
         ? device.tags
         : null;
-    if ((name == null && tags == null) ||
+    // Same rule for the note: only a note edit sends an empty value.
+    final String? note = device.note.isNotEmpty || syncNote
+        ? Device.cleanNote(device.note)
+        : null;
+    if ((name == null && tags == null && note == null) ||
         !device.viaServer ||
         device.server != _server.url ||
         account == null ||
@@ -1788,14 +1852,19 @@ class _HomePageState extends State<HomePage> {
         device.id,
         name: name,
         tags: tags,
+        note: note,
         ifRevision: device.revision > 0 ? device.revision : null,
       );
       List<Device> settled = await _deviceStore.setPeerRevision(
         device.key,
         written.revision,
       );
-      if (tags != null) {
-        settled = await _deviceStore.markPushSettled(device.key, tags: true);
+      if (tags != null || note != null) {
+        settled = await _deviceStore.markPushSettled(
+          device.key,
+          tags: tags != null,
+          note: note != null,
+        );
       }
       if (mounted) {
         setState(() => _devices = settled);
@@ -2116,6 +2185,7 @@ class _HomePageState extends State<HomePage> {
     final Iterable<String> fields = <String>[
       device.id,
       device.name,
+      device.note,
       ...device.tags,
       ...visibleTags,
       presence?.info?.alias ?? '',
@@ -2510,6 +2580,17 @@ class _HomePageState extends State<HomePage> {
                         style: TextButton.styleFrom(foregroundColor: kAccent),
                         icon: const Icon(Icons.folder_outlined, size: 16),
                         label: Text(tr('分组'), style: TextStyle(fontSize: 12)),
+                      ),
+                    if (_account != null && _account!.server == _server.url)
+                      TextButton.icon(
+                        key: const Key('address-book-trash'),
+                        onPressed: _manageTrash,
+                        style: TextButton.styleFrom(foregroundColor: kAccent),
+                        icon: const Icon(
+                          Icons.restore_from_trash_outlined,
+                          size: 16,
+                        ),
+                        label: Text(tr('回收站'), style: TextStyle(fontSize: 12)),
                       ),
                     TextButton.icon(
                       key: const Key('lan-scan'),
@@ -3101,6 +3182,7 @@ class _HomePageState extends State<HomePage> {
       onFavorite: () => _toggleFavorite(device),
       onWake: () => _wakeDevice(device),
       onLabels: device.viaServer ? () => _editLabels(device) : null,
+      onNote: () => _editNote(device),
       onTags: accountReady ? () => _editTags(device) : null,
       onGroup: accountReady ? () => _moveDeviceToGroup(device) : null,
       onMoveUp: onMoveUp,
@@ -4097,6 +4179,81 @@ class _TagsDialogState extends State<_TagsDialog> {
   }
 }
 
+/// Edits the plain-text note for one address-book entry.
+///
+/// The note is free text that travels with the account address book, so the
+/// dialog warns against storing credentials there; it is not encrypted.
+class _NoteDialog extends StatefulWidget {
+  const _NoteDialog({required this.note});
+
+  final String note;
+
+  @override
+  State<_NoteDialog> createState() => _NoteDialogState();
+}
+
+class _NoteDialogState extends State<_NoteDialog> {
+  late final TextEditingController _note;
+
+  @override
+  void initState() {
+    super.initState();
+    _note = TextEditingController(text: widget.note);
+  }
+
+  @override
+  void dispose() {
+    _note.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      title: Text(tr('设备备注')),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            TextField(
+              key: const Key('account-note'),
+              controller: _note,
+              autofocus: true,
+              minLines: 3,
+              maxLines: 6,
+              maxLength: 512,
+              decoration: InputDecoration(
+                labelText: tr('备注'),
+                hintText: tr('例如：机柜 A3，财务部专用'),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              tr('备注是纯文本，会随账号地址簿同步给同一账号的其他查看器；请勿填写密码等敏感信息。留空可清除。'),
+              style: mutedStyle(context, size: 11),
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
+        FilledButton(
+          key: const Key('account-note-save'),
+          onPressed: () => Navigator.of(context).pop(_note.text),
+          child: Text(tr('保存')),
+        ),
+      ],
+    );
+  }
+}
+
 /// Picks a group for one saved device; the empty id means ungrouped.
 class _GroupPickerDialog extends StatelessWidget {
   const _GroupPickerDialog({required this.groups, required this.selected});
@@ -4325,6 +4482,7 @@ class _DeviceCard extends StatelessWidget {
     required this.onWake,
     required this.onDelete,
     this.onLabels,
+    this.onNote,
     this.onTags,
     this.onGroup,
     this.onMoveUp,
@@ -4347,6 +4505,7 @@ class _DeviceCard extends StatelessWidget {
   final VoidCallback onWake;
   final VoidCallback onDelete;
   final VoidCallback? onLabels;
+  final VoidCallback? onNote;
   final VoidCallback? onTags;
   final VoidCallback? onGroup;
   final VoidCallback? onMoveUp;
@@ -4480,11 +4639,33 @@ class _DeviceCard extends StatelessWidget {
                         ],
                       ),
                       const SizedBox(height: 4),
-                      Text(
-                        detailText,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: mutedStyle(context, size: 10),
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: Text(
+                              detailText,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: mutedStyle(context, size: 10),
+                            ),
+                          ),
+                          if (device.note.isNotEmpty)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 4),
+                              child: Tooltip(
+                                message: device.note,
+                                child: Icon(
+                                  Icons.sticky_note_2_outlined,
+                                  key: Key('device-note-${device.id}'),
+                                  size: 12,
+                                  color: mutedStyle(
+                                    context,
+                                    size: 12,
+                                  ).color,
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                       const SizedBox(height: 3),
                       _presenceLine(context, presence, device),
@@ -4521,6 +4702,8 @@ class _DeviceCard extends StatelessWidget {
                       onWake();
                     } else if (value == 'labels') {
                       onLabels?.call();
+                    } else if (value == 'note') {
+                      onNote?.call();
                     } else if (value == 'tags') {
                       onTags?.call();
                     } else if (value == 'group') {
@@ -4582,6 +4765,11 @@ class _DeviceCard extends StatelessWidget {
                           PopupMenuItem<String>(
                             value: 'labels',
                             child: Text(tr('服务端别名/标签')),
+                          ),
+                        if (onNote != null)
+                          PopupMenuItem<String>(
+                            value: 'note',
+                            child: Text(tr('设备备注')),
                           ),
                         if (onTags != null)
                           PopupMenuItem<String>(

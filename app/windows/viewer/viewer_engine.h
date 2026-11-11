@@ -41,6 +41,7 @@ class ClipboardVirtualFiles;
 class DeviceIdentity;
 class FileReceiver;
 class PortForwardClient;
+class QuicSession;
 }
 
 namespace chast_viewer {
@@ -802,8 +803,10 @@ public:
     // cursor"). Returns false when no session is streaming. No input
     // permission is required: the hint is draw-only and never injected. Only
     // the newest position is kept, so a fast pointer does not build a backlog;
-    // visible=false hides the host-side pointer.
-    bool ShowCursor(int32_t x, int32_t y, bool visible);
+    // visible=false hides the host-side pointer. `pressed` marks the click edge
+    // (the pointer-down moment), which the host overlay draws as a ripple; it
+    // is not a held-button state.
+    bool ShowCursor(int32_t x, int32_t y, bool visible, bool pressed = false);
     // Queues stream preferences: encoder choice, frame-rate cap and quality
     // preset. Returns false when no session is running or a value is outside
     // its wire range. Accepted as soon as the session starts, before the first
@@ -1174,10 +1177,13 @@ private:
     // Shared validation and queueing for RequestBatchDownload and
     // RequestDirectoryDownload. `batch` tells the page which wording to use.
     bool QueueDownload(std::vector<DownloadRoot> roots, bool batch, bool show_hidden);
-    // Applies the newest screenshot request. Runs on the session thread after
-    // a picture was published, because the sink's readback and the decoder
-    // share one D3D11 device.
-    void ProcessScreenshot();
+    // Applies the newest screenshot request. Runs on the session thread: it
+    // first asks the host for its pre-encode frame and saves that PNG, and
+    // only falls back to `fallback` (the locally rendered sink) when the host
+    // refuses, fails or does not answer in time. `fallback` receives the
+    // directory the UI asked for.
+    void ProcessScreenshot(chast::QuicSession* session,
+                           const std::function<void(const std::string&)>& fallback);
     void SaveScreenshotFromSink(FrameSink* sink, const std::string& directory);
 
     FrameSink* sink_;
@@ -1227,12 +1233,17 @@ private:
     std::optional<uint32_t> record_stream_;
     std::optional<uint32_t> pending_record_keyframe_;
 
-    // Newest screenshot request; the session thread consumes it after the next
-    // published picture. A slot rather than a queue keeps a burst of taps from
-    // turning into a burst of full-resolution reads and PNG writes.
+    // Newest screenshot request; the session thread consumes it after asking
+    // the host for its raw frame. A slot rather than a queue keeps a burst of
+    // taps from turning into a burst of full-resolution transfers.
     mutable std::mutex screenshot_mutex_;
     std::optional<std::string> pending_screenshot_;
     std::optional<uint32_t> pending_screenshot_stream_;
+    bool pending_screenshot_sent_ = false;
+    // A newer tap arrived while the host answer was in flight: drop that
+    // answer and ask again, so the saved picture belongs to the newest target.
+    bool pending_screenshot_restart_ = false;
+    std::chrono::steady_clock::time_point pending_screenshot_deadline_{};
 
     // Newest privacy request, for the same reason as the display switch: the
     // operator wants the state they picked last, not a replay of every toggle.

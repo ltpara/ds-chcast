@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 63.
+// The chast wire protocol, version 72.
 //
 // One QUIC connection carries:
 //
@@ -23,13 +23,15 @@
 //   * one unidirectional `CPFW` stream per direction of a forwarded TCP
 //     connection, and
 //   * one `CTTY` uplink (input) plus one `CTTY` downlink (output) per remote
-//     terminal.
+//     terminal, and
+//   * one server-initiated unidirectional `CSHT` stream per screenshot answer.
 //
 // The streams are told apart by their packet magic, not by the order the
 // streams were opened: QUIC does not promise that the first bytes of a later
 // stream arrive after an earlier one. Video is `CFRM`, system audio is
 // `CAUD`, the microphone is `CMIC`, clipboard content is `CCLB`, file data
-// is `CFIL`, forwarded TCP bytes are `CPFW` and terminal bytes are `CTTY`.
+// is `CFIL`, forwarded TCP bytes are `CPFW`, terminal bytes are `CTTY`, and
+// screenshots are `CSHT`.
 //
 // QUIC streams give the media reliable, ordered delivery; the sequence number
 // is still carried so the receiver can report gaps and so a future version can
@@ -54,7 +56,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 69;
+inline constexpr uint16_t kProtocolVersion = 72;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -483,6 +485,20 @@ enum class ControlType : uint16_t {
     // FileCode::Conflict. Payload: transfer id (u32), decision (u8: 0 skip,
     // 1 overwrite, 2 cancel), three reserved zero bytes.
     FileConflictAnswer = 85,
+    // Viewer -> host (v70): ask for a screenshot of one streamed display from
+    // the host's pre-encode frame, so the saved picture is the full-resolution
+    // desktop rather than the decoded (possibly scaled) stream. Payload:
+    // request id (u64), stream id (u32, UINT32_MAX selects the focused stream), four
+    // reserved zero bytes. Answered by ScreenshotResponse chunks.
+    ScreenshotRequest = 86,
+    // Host -> viewer (v70): one slice of a PNG answer. Payload: request id
+    // (u64), code (u8, see ScreenshotCode), one reserved zero byte, reason
+    // length (u16), stream id (u32), width (u32), height (u32), PNG size
+    // (u32), chunk index (u32), chunk count (u32), UTF-8 reason, then the
+    // slice bytes. A non-Ok answer carries zero geometry, zero size and no
+    // slice; a successful one is split into fixed-size slices so no control
+    // message exceeds the transport's payload bound.
+    ScreenshotResponse = 87,
 };
 
 // ----- input -----
@@ -684,16 +700,19 @@ struct InputEvent {
     uint16_t modifiers = 0;
 };
 
-// ----- show cursor (protocol v68) -----
+// ----- show cursor (protocol v68, press flag v71) -----
 //
 // The viewer's pointer position for the host-side "show my cursor" hint.
 // Coordinates use the same virtual-desktop pixel space as InputEvent::mouse,
-// so the host overlay needs no per-display mapping. The hint is draw-only and
-// carries no button state: it can never actuate the host.
+// so the host overlay needs no per-display mapping. The hint is draw-only: it
+// carries no button state that could actuate the host. `pressed` is the
+// viewer's primary-button edge, carried so the overlay can ripple at the
+// click; it is set on the press itself, not on every move while held.
 struct ShowCursorHint {
     int32_t x = 0;
     int32_t y = 0;
     bool visible = false;
+    bool pressed = false;
 };
 std::vector<uint8_t> make_show_cursor(const ShowCursorHint& hint);
 bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint,
@@ -1026,10 +1045,10 @@ struct CursorUpdate {
     // which is also the space the viewer's own pointer is mapped to and what
     // ServerInfo::source_width/source_height describe. Independent of the
     // encoded picture size, so adaptive downscaling does not move the pointer.
-    // The sprite's top-left lands on them.
+    // The sprite's hotspot lands on them.
     int32_t x = 0;
     int32_t y = 0;
-    // The pixel inside the sprite that sits on (x, y).
+    // The pixel inside the sprite that sits on (x, y); top-left is x/y minus this.
     uint16_t hotspot_x = 0;
     uint16_t hotspot_y = 0;
     // Identity of `sprite`; stable across revisits, so an id the viewer
@@ -2094,6 +2113,60 @@ std::vector<uint8_t> make_voice_audio(const AudioHeader& header,
                                       const uint8_t* payload, size_t size);
 bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
                        const uint8_t** audio, size_t& audio_size, std::string* error);
+
+// ----- host screenshot (protocol v70) -----
+//
+// RustDesk answers a screenshot on the host from the capture loop's raw
+// frame, so the file keeps the desktop's full resolution and every pixel the
+// encoder has not yet visited. chast reuses the display service's retained
+// BGRA frame for the same purpose. In v72 PNG slices use a dedicated CSHT
+// unidirectional stream with a bounded send window, keeping control ordered
+// independently of a large picture.
+inline constexpr uint32_t kMaxScreenshotBytes = 24u * 1024u * 1024u;
+inline constexpr uint32_t kScreenshotCurrentStream = UINT32_MAX;
+inline constexpr uint32_t kScreenshotChunkBytes = 128u * 1024u;
+inline constexpr size_t kMaxScreenshotReasonBytes = 256;
+
+enum class ScreenshotCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // the stream is not being sent to this viewer
+    Unavailable = 2,  // no desktop frame has been captured for it yet
+    TooLarge = 3,     // the PNG exceeds kMaxScreenshotBytes
+    Failed = 4,       // the host could not encode or read back the frame
+};
+
+struct ScreenshotRequest {
+    uint64_t request_id = 0;
+    // Every stream id, including zero, is literal; the sentinel selects current.
+    uint32_t stream_id = kScreenshotCurrentStream;
+};
+
+struct ScreenshotResponse {
+    uint64_t request_id = 0;
+    ScreenshotCode code = ScreenshotCode::Ok;
+    // Resolved display id; zero is a valid original stream.
+    uint32_t stream_id = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    // Encoded PNG size, chunk index and chunk count. All zero on a non-Ok
+    // answer. Every slice is kScreenshotChunkBytes except the last.
+    uint32_t total = 0;
+    uint32_t index = 0;
+    uint32_t count = 0;
+    std::string reason;
+    std::vector<uint8_t> data;
+};
+
+// The makers reject a zero request id, unknown codes, a non-zero reserved
+// field and inconsistent chunk math; the parsers reject the same cases plus
+// trailing bytes and an overlong reason. The maker truncates an overlong
+// reason at a UTF-8 boundary, as the voice-call answer does.
+std::vector<uint8_t> make_screenshot_request(const ScreenshotRequest& request);
+bool parse_screenshot_request(const std::vector<uint8_t>& payload,
+                              ScreenshotRequest& request, std::string* error);
+std::vector<uint8_t> make_screenshot_response(const ScreenshotResponse& response);
+bool parse_screenshot_response(const std::vector<uint8_t>& payload,
+                               ScreenshotResponse& response, std::string* error);
 
 // ----- host control (protocol v38) -----
 //

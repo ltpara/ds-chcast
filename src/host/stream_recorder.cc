@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "host/stream_recorder.h"
+#include "chast/host_recording.h"
 #include "mp4_recorder.h"
 
 #include <atomic>
@@ -14,6 +15,9 @@ namespace {
 constexpr size_t kQueueBytes = 32 * 1024 * 1024;
 constexpr size_t kQueueFrames = 120;
 constexpr uint64_t kSegmentMs = 10 * 60 * 1000;
+// A segment may grow large between checks; this keeps the floor meaningful
+// without querying the volume on every frame.
+constexpr uint64_t kDiskCheckMs = 5000;
 namespace fs = std::filesystem;
 std::string utf8(const fs::path& path) {
     const auto value = path.u8string();
@@ -111,6 +115,7 @@ struct StreamRecorder::Impl {
             };
             VideoCodec codec = VideoCodec::H264;
             uint32_t width = 0, height = 0;
+            uint64_t next_disk_check = 0;
             const auto close = [&](uint64_t end) {
                 if (!recorder) return;
                 recorder->close(end);
@@ -130,6 +135,12 @@ struct StreamRecorder::Impl {
                     queued_bytes -= frame.bytes;
                 }
                 report_drops();
+                if (recorder && frame.packets.front().pts_ms >= next_disk_check) {
+                    next_disk_check = frame.packets.front().pts_ms + kDiskCheckMs;
+                    std::string reason;
+                    if (!recording_disk_available(utf8(directory), kMinRecordingFreeBytes, &reason))
+                        throw std::runtime_error(reason);
+                }
                 if (recorder && (active_generation != frame.generation || active_epoch != frame.epoch ||
                     codec != frame.codec || width != frame.width || height != frame.height)) {
                     close(frame.packets.front().pts_ms);
@@ -137,7 +148,14 @@ struct StreamRecorder::Impl {
                 for (const auto& packet : frame.packets) {
                     if (!recorder) {
                         if (!packet.idr) continue;
-                        if (directory.empty()) directory = create_directory();
+                        if (directory.empty()) {
+                            std::string reason;
+                            if (!recording_disk_available(options.directory, kMinRecordingFreeBytes,
+                                                          &reason))
+                                throw std::runtime_error(reason);
+                            directory = create_directory();
+                        }
+                        next_disk_check = packet.pts_ms + kDiskCheckMs;
                         char name[48];
                         std::snprintf(name, sizeof(name), "part-%04u.mp4", ++part);
                         const auto path = utf8(directory / name);

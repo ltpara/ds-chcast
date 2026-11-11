@@ -45,9 +45,8 @@ struct Subscription {
     bool consumed = false;
     uint64_t delivered_capture_ms = 0;
     VideoCodecMask decoding_codecs = kVideoCodecAll;
-    // RustDesk runs its pointer service beside the video service, so a slow
-    // encode never delays the cursor. The source invokes this right after a
-    // frame is captured, before encoding it.
+    // Desktop sources invoke this from their independent pointer worker;
+    // sources without a sampler publish captured cursor metadata before encode.
     std::mutex cursor_mutex;
     std::function<void(const CursorInfo&)> cursor_sink;
 };
@@ -62,6 +61,14 @@ struct DesktopStreamPool::Source {
     std::deque<std::function<void()>> commands;
     bool stopping = false;
     std::thread worker;
+    std::thread cursor_worker;
+    std::mutex pointer_mutex;
+    std::condition_variable pointer_wake;
+    bool pointer_stopping = false;
+    CursorSampler cursor_sampler;
+    std::vector<std::weak_ptr<Subscription>> pointer_subscribers;
+    std::shared_ptr<const CursorInfo> pointer_snapshot;
+    DisplayInfo pointer_display;
     FollowDesktop follow_desktop;
     std::unique_ptr<IDxgiCapturer> capture;
     std::unique_ptr<IVideoEncoder> encoder;
@@ -123,6 +130,10 @@ struct DesktopStreamPool::Source {
     std::mutex metadata_mutex;
 
     void publish_metadata() {
+        if (cursor_sampler && capture) {
+            std::lock_guard lock(pointer_mutex);
+            pointer_display = capture->display();
+        }
         Metadata next;
         if (image) next.cursor = image->cursor;
         next.encoder_recovery_pending = software_fallback && !encoder && image && !lost && !fatal;
@@ -143,12 +154,129 @@ struct DesktopStreamPool::Source {
     Source() { worker = std::thread([this] { run(); }); }
     ~Source() {
         {
+            std::lock_guard lock(pointer_mutex);
+            pointer_stopping = true;
+        }
+        pointer_wake.notify_one();
+        if (cursor_worker.joinable()) cursor_worker.join();
+        {
             std::lock_guard<std::mutex> lock(command_mutex);
             stopping = true;
         }
         wake.notify_one();
         worker.join();
         if (qos) qos->remove_display(reinterpret_cast<uintptr_t>(this));
+    }
+    bool copy_screenshot(std::vector<uint8_t>& bgra, uint32_t& width,
+                         uint32_t& height, std::string* failure) {
+        auto& source = *this;
+        if (source.image && source.image->frame.cpu_bgra) {
+            bgra = *source.image->frame.cpu_bgra;
+            width = source.image->frame.width;
+            height = source.image->frame.height;
+            return true;
+        }
+        if (!source.image || !source.image->bgra) {
+            if (failure) *failure = "no desktop frame has been captured yet";
+            return false;
+        }
+        if (source.image->frame.rotation_degrees != 0) {
+            if (failure) *failure = "the display rotation could not be applied on the GPU";
+            return false;
+        }
+        ComPtr<ID3D11Device> device;
+        ComPtr<ID3D11DeviceContext> context;
+        source.image->bgra->GetDevice(device.put());
+        if (device) device->GetImmediateContext(context.put());
+        if (!device || !context) {
+            if (failure) *failure = "the display has no GPU device";
+            return false;
+        }
+        ID3D11Texture2D* texture = source.image->bgra.get();
+        D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+        if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+            if (failure) *failure = "the captured frame is not BGRA8";
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC staging_desc = desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+        staging_desc.ArraySize = 1;
+        staging_desc.MipLevels = 1;
+        staging_desc.SampleDesc.Count = 1;
+        ComPtr<ID3D11Texture2D> staging;
+        if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, staging.put()))) {
+            if (failure) *failure = "the screenshot staging texture could not be created";
+            return false;
+        }
+        context->CopyResource(staging.get(), texture);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            if (failure) *failure = "the desktop frame could not be read back";
+            return false;
+        }
+        width = desc.Width;
+        height = desc.Height;
+        bgra.resize(static_cast<size_t>(width) * height * 4);
+        const bool copied = mapped.pData != nullptr;
+        if (copied) {
+            for (uint32_t row = 0; row < height; ++row) {
+                std::memcpy(bgra.data() + static_cast<size_t>(row) * width * 4,
+                            static_cast<const uint8_t*>(mapped.pData) +
+                                static_cast<size_t>(row) * mapped.RowPitch,
+                            static_cast<size_t>(width) * 4);
+            }
+        }
+        context->Unmap(staging.get(), 0);
+        if (!copied) {
+            bgra.clear();
+            width = height = 0;
+            if (failure) *failure = "the desktop frame could not be read back";
+        }
+        return copied;
+    }
+    void start_cursor() {
+        if (!cursor_sampler) return;
+        cursor_worker = std::thread([this] {
+            CursorInfo cursor;
+            for (;;) {
+                std::vector<std::shared_ptr<Subscription>> targets;
+                DisplayInfo display;
+                {
+                    std::lock_guard lock(pointer_mutex);
+                    if (pointer_stopping) break;
+                    display = pointer_display;
+                    std::erase_if(pointer_subscribers, [](const auto& weak) { return weak.expired(); });
+                    for (const auto& weak : pointer_subscribers)
+                        if (auto sub = weak.lock()) targets.push_back(std::move(sub));
+                }
+                if (cursor_sampler(display, cursor)) {
+                    {
+                        std::lock_guard lock(pointer_mutex);
+                        pointer_snapshot = std::make_shared<CursorInfo>(cursor);
+                    }
+                    for (const auto& sub : targets) {
+                        std::function<void(const CursorInfo&)> sink;
+                        { std::lock_guard lock(sub->cursor_mutex); sink = sub->cursor_sink; }
+                        if (sink) sink(cursor);
+                    }
+                } else {
+                    cursor.visible = false;
+                    { std::lock_guard lock(pointer_mutex); pointer_snapshot.reset(); }
+                    for (const auto& sub : targets) {
+                        std::function<void(const CursorInfo&)> sink;
+                        { std::lock_guard lock(sub->cursor_mutex); sink = sub->cursor_sink; }
+                        if (sink) sink(cursor);
+                    }
+                }
+                std::unique_lock lock(pointer_mutex);
+                if (pointer_wake.wait_for(lock, std::chrono::milliseconds(33),
+                                         [&] { return pointer_stopping; })) break;
+            }
+        });
     }
     template<class Function> auto call(Function function) -> decltype(function()) {
         using Result = decltype(function());
@@ -223,6 +351,7 @@ struct DesktopStreamPool::Source {
         keyframe = true;
     }
     void notify_cursor() {
+        if (cursor_sampler) return;
         if (!image) return;
         for (const auto& weak : subscribers) {
             auto sub = weak.lock();
@@ -354,6 +483,14 @@ struct DesktopStreamPool::Source {
                      variable_quality, now_ms());
         return result;
     }
+    Error encode_picture(IVideoEncoder& target, const Picture& picture, uint64_t pts,
+                         bool force, std::vector<EncodedPacket>& packets) {
+        if (picture.frame.cpu_bgra)
+            return target.encode_cpu_bgra(picture.frame.cpu_bgra->data(), picture.frame.width,
+                picture.frame.height, pts, force, packets);
+        return target.encode(target.bgra_input() ? picture.bgra.get() : picture.nv12.get(),
+                             pts, force, packets);
+    }
     bool build(EncoderConfig wanted, std::string* failure, bool strict_codec = false,
                VideoCodecMask additional = kVideoCodecAll) {
         wanted.width = image->frame.nv12_width;
@@ -385,7 +522,14 @@ struct DesktopStreamPool::Source {
             }
             wanted.framerate = source_fps(wanted.framerate);
             auto actual = wanted;
-            if (software_fallback) actual.backend = EncoderBackend::Software;
+            if (image->frame.cpu_bgra) {
+                if (wanted.backend != EncoderBackend::Auto && wanted.backend != EncoderBackend::Software) {
+                    *failure = "CPU capture requires an Auto or Software encoder";
+                    return false;
+                }
+                if (actual.codec != VideoCodec::H264 && actual.codec != VideoCodec::Vp9) continue;
+                actual.backend = EncoderBackend::Software;
+            } else if (software_fallback) actual.backend = EncoderBackend::Software;
             auto candidate = factory(capture->adapter_device().device, actual, failure);
             if (!candidate || !(common & video_codec_bit(candidate->codec())) ||
                 (strict_codec && candidate->codec() != requested)) continue;
@@ -399,7 +543,7 @@ struct DesktopStreamPool::Source {
         // Prove a replacement before changing the format used by live peers.
         // An unsupported new subscriber must never break the existing stream.
         std::vector<EncodedPacket> proof;
-        auto proved = next->encode(next->bgra_input() ? image->bgra.get() : image->nv12.get(), 0, true, proof);
+        auto proved = encode_picture(*next, *image, 0, true, proof);
         if (!proved.ok() || proof.empty() ||
             std::none_of(proof.begin(), proof.end(), [](const auto& packet) { return packet.idr; })) {
             *failure = "new shared codec produced no usable IDR: " + proved.to_string();
@@ -446,7 +590,7 @@ struct DesktopStreamPool::Source {
             *failure = "the recovering display requires software H.264";
             return false;
         }
-        if (chroma == VideoChroma::Yuv444 && !image->bgra) {
+        if (chroma == VideoChroma::Yuv444 && !image->bgra && !image->frame.cpu_bgra) {
             *failure = "the source has no original full-chroma image";
             return false;
         }
@@ -463,14 +607,21 @@ struct DesktopStreamPool::Source {
         }
         wanted.framerate = source_fps(wanted.framerate);
         auto actual = wanted;
-        if (software_fallback) actual.backend = EncoderBackend::Software;
+        if (image->frame.cpu_bgra) {
+            if ((wanted.backend != EncoderBackend::Auto && wanted.backend != EncoderBackend::Software) ||
+                (codec != VideoCodec::H264 && codec != VideoCodec::Vp9)) {
+                *failure = "CPU capture requires software H.264 or VP9";
+                return false;
+            }
+            actual.backend = EncoderBackend::Software;
+        } else if (software_fallback) actual.backend = EncoderBackend::Software;
         auto next = factory(capture->adapter_device().device, actual, failure);
         if (!next || next->codec() != codec || next->chroma() != chroma) {
             if (failure->empty()) *failure = "encoder cannot produce the negotiated format";
             return false;
         }
         std::vector<EncodedPacket> proof;
-        auto result = next->encode(next->bgra_input() ? image->bgra.get() : image->nv12.get(), 0, true, proof);
+        auto result = encode_picture(*next, *image, 0, true, proof);
         if (!result.ok() || std::none_of(proof.begin(), proof.end(), [](const auto& p) { return p.idr; })) {
             *failure = "candidate codec produced no usable IDR: " + result.to_string();
             return false;
@@ -547,7 +698,7 @@ struct DesktopStreamPool::Source {
         }
     }
     bool encode(bool repeat, bool force_update = false) {
-        if (!image || !image->nv12) return true;
+        if (!image || (!image->nv12 && !image->frame.cpu_bgra)) return true;
         if (!encoder || encoder->width() != image->frame.nv12_width ||
             encoder->height() != image->frame.nv12_height) {
             std::string failure;
@@ -566,7 +717,6 @@ struct DesktopStreamPool::Source {
         const uint64_t pts = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
         Error result = Error::success();
-        auto* input = encoder->bgra_input() ? next->bgra.get() : next->nv12.get();
         const bool updated = force_update ||
             (encoder->bgra_input() ? next->frame.desktop_updated : next->frame.nv12_updated);
         if (repeat) {
@@ -581,10 +731,10 @@ struct DesktopStreamPool::Source {
                 result.status() != Status::DeviceReset) {
                 next->packets.clear();
                 keyframe = true;
-                result = encoder->encode(input, pts, true, next->packets);
+                result = encode_picture(*encoder, *next, pts, true, next->packets);
             }
         } else {
-            result = encoder->encode(input, pts, keyframe, next->packets);
+            result = encode_picture(*encoder, *next, pts, keyframe, next->packets);
         }
         if (!result.ok()) {
             if (repeat) {
@@ -634,6 +784,12 @@ struct DesktopStreamPool::Source {
         for (const auto& packet : next->packets) {
             next->bytes += packet.data.size();
             next->idr = next->idr || packet.idr;
+        }
+        // Subscribers consume compressed packets. Keep raw CPU pixels only
+        // in the source's retained image, independent of a slow viewer queue.
+        if (next->frame.cpu_bgra) {
+            next->frame.cpu_image = true;
+            next->frame.cpu_bgra.reset();
         }
         if (next->idr) keyframe = false;
         if (repeat) {
@@ -738,14 +894,21 @@ struct DesktopStreamPool::Source {
             return;
         }
         if (result == CaptureResult::Frame) {
-            if (!capture->frame().nv12_texture || capture->frame().rotation_degrees) {
+            if (!capture->frame().has_video_image() || capture->frame().rotation_degrees) {
                 if (full || ++missing_nv12 < 3) return;
                 error = Error(Status::Unavailable, "capture produced no usable NV12 image");
                 fatal = true;
                 return;
             }
             missing_nv12 = 0;
+            const bool cpu_transition = capture->frame().cpu_bgra && image && !image->frame.cpu_bgra;
             remember();
+            if (cpu_transition && encoder) {
+                encoder.reset(); prepared = {}; have_input = false;
+                clear_queues();
+                needs_group_rebuild = global_codec;
+                if (needs_group_rebuild) return;
+            }
             notify_cursor();
             // Cursor-only wakes refresh the pointer but carry no new desktop
             // pixels. RustDesk's duplication reports the same wake as
@@ -822,6 +985,7 @@ public:
         display_count = source->capture->merged_display_count();
         sub->generation = source->generation;
         source->subscribers.push_back(sub);
+        { std::lock_guard lock(source->pointer_mutex); source->pointer_subscribers.push_back(sub); }
         source->keyframe = true;
     }
     ~Capture() override;
@@ -925,6 +1089,10 @@ Error DesktopStreamPool::refresh_display(IDxgiCapturer& capture, const DisplayIn
 
 std::shared_ptr<const CursorInfo> DesktopStreamPool::cursor_snapshot(const IDxgiCapturer& capture) {
     const auto& shared = static_cast<const Capture&>(capture);
+    if (shared.source->cursor_sampler) {
+        std::lock_guard lock(shared.source->pointer_mutex);
+        return shared.source->pointer_snapshot;
+    }
     return shared.source->read_metadata().cursor;
 }
 
@@ -1189,7 +1357,8 @@ std::shared_ptr<DesktopStreamPool::CodecPeer> DesktopStreamPool::connect_codecs(
 
 std::unique_ptr<IDxgiCapturer> DesktopStreamPool::subscribe(const std::wstring& key,
         CaptureFactory capture, EncoderFactory encoder, std::string* error, FollowDesktop follow_desktop,
-        VideoCodecMask decoding_codecs, std::shared_ptr<CodecPeer> peer, HostRecordingOptions recording) {
+        VideoCodecMask decoding_codecs, std::shared_ptr<CodecPeer> peer, HostRecordingOptions recording,
+        CursorSampler cursor_sampler) {
     if (!decoding_codecs || (decoding_codecs & ~kVideoCodecAll)) {
         *error = "the viewer advertised no valid video decoder";
         return nullptr;
@@ -1204,6 +1373,7 @@ std::unique_ptr<IDxgiCapturer> DesktopStreamPool::subscribe(const std::wstring& 
             source->qos = qos_;
             source->global_codec = peer != nullptr;
             source->follow_desktop = std::move(follow_desktop);
+            source->cursor_sampler = std::move(cursor_sampler);
             if (!source->follow(error)) return false;
             source->capture = capture(error);
             source->factory = std::move(encoder);
@@ -1212,6 +1382,7 @@ std::unique_ptr<IDxgiCapturer> DesktopStreamPool::subscribe(const std::wstring& 
             return source->capture != nullptr;
         });
         if (!ready) { sources_.erase(key); return nullptr; }
+        source->start_cursor();
         sources_[key] = source;
     }
     return source->call([&]() -> std::unique_ptr<IDxgiCapturer> {
@@ -1340,6 +1511,27 @@ void DesktopStreamPool::discard_backlog(IDxgiCapturer& capturer) {
 
 uint64_t DesktopStreamPool::capture_time(const IDxgiCapturer& capturer) {
     return dynamic_cast<const Capture&>(capturer).sub->delivered_capture_ms;
+}
+
+std::future<DesktopStreamPool::Screenshot> DesktopStreamPool::screenshot_async(IDxgiCapturer& capturer) {
+    auto source = dynamic_cast<Capture&>(capturer).source;
+    // Keep the source alive on this helper thread, never in a command whose
+    // destruction on the source thread could attempt to join itself.
+    return std::async(std::launch::async, [source] {
+        Screenshot result;
+        source->call([&] {
+            source->copy_screenshot(result.bgra, result.width, result.height, &result.error);
+        });
+        return result;
+    });
+}
+
+bool DesktopStreamPool::screenshot(IDxgiCapturer& capturer, std::vector<uint8_t>& bgra,
+                                   uint32_t& width, uint32_t& height, std::string* failure) {
+    auto result = screenshot_async(capturer).get();
+    bgra = std::move(result.bgra); width = result.width; height = result.height;
+    if (failure) *failure = std::move(result.error);
+    return !bgra.empty();
 }
 
 unsigned DesktopStreamPool::static_refresh_budget(VideoCodec codec, float quality,

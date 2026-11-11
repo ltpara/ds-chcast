@@ -1906,7 +1906,11 @@ std::vector<uint8_t> make_show_cursor(const ShowCursorHint& hint) {
     uint8_t* cursor = payload.data();
     put_u32(cursor, static_cast<uint32_t>(hint.x));
     put_u32(cursor, static_cast<uint32_t>(hint.y));
-    put_u8(cursor, hint.visible ? 0x01 : 0x00);
+    uint8_t flags = hint.visible ? 0x01 : 0x00;
+    if (hint.pressed && hint.visible) {
+        flags |= 0x02;
+    }
+    put_u8(cursor, flags);
     put_u8(cursor, 0);
     put_u8(cursor, 0);
     put_u8(cursor, 0);
@@ -1931,8 +1935,12 @@ bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint
         set_error(error, "ShowCursor carries trailing bytes");
         return false;
     }
-    if ((flags & ~0x01u) != 0) {
+    if ((flags & ~0x03u) != 0) {
         set_error(error, "ShowCursor carries unknown flags");
+        return false;
+    }
+    if ((flags & 0x02u) != 0 && (flags & 0x01u) == 0) {
+        set_error(error, "ShowCursor presses a hidden cursor");
         return false;
     }
     if (reserved0 != 0 || reserved1 != 0 || reserved2 != 0) {
@@ -1942,6 +1950,7 @@ bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint
     hint.x = static_cast<int32_t>(x);
     hint.y = static_cast<int32_t>(y);
     hint.visible = (flags & 0x01u) != 0;
+    hint.pressed = (flags & 0x02u) != 0;
     return true;
 }
 
@@ -3042,6 +3051,160 @@ bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
         return false;
     }
     *audio = data;
+    return true;
+}
+
+namespace {
+
+bool valid_screenshot_code(ScreenshotCode code) {
+    return code == ScreenshotCode::Ok || code == ScreenshotCode::Denied ||
+           code == ScreenshotCode::Unavailable || code == ScreenshotCode::TooLarge ||
+           code == ScreenshotCode::Failed;
+}
+
+uint32_t screenshot_chunk_count(uint32_t total) {
+    return (total + kScreenshotChunkBytes - 1) / kScreenshotChunkBytes;
+}
+
+size_t screenshot_chunk_size(uint32_t total, uint32_t index) {
+    const size_t start = static_cast<size_t>(index) * kScreenshotChunkBytes;
+    return std::min<size_t>(kScreenshotChunkBytes, total - start);
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_screenshot_request(const ScreenshotRequest& request) {
+    if (request.request_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(16);
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, request.request_id);
+    put_u32(cursor, request.stream_id);
+    put_u32(cursor, 0);
+    return make_control(ControlType::ScreenshotRequest, payload);
+}
+
+bool parse_screenshot_request(const std::vector<uint8_t>& payload,
+                              ScreenshotRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint32_t reserved = 0;
+    if (!reader.u64(request.request_id) || !reader.u32(request.stream_id) ||
+        !reader.u32(reserved) || !reader.at_end()) {
+        set_error(error, "malformed ScreenshotRequest");
+        return false;
+    }
+    if (request.request_id == 0) {
+        set_error(error, "ScreenshotRequest carries request id 0");
+        return false;
+    }
+    if (reserved != 0) {
+        set_error(error, "ScreenshotRequest has non-zero reserved bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_screenshot_response(const ScreenshotResponse& response) {
+    if (response.request_id == 0 || !valid_screenshot_code(response.code)) {
+        return {};
+    }
+    if (response.code == ScreenshotCode::Ok) {
+        if (response.width == 0 || response.height == 0 || response.total == 0 ||
+            response.total > kMaxScreenshotBytes ||
+            response.count != screenshot_chunk_count(response.total) ||
+            response.index >= response.count ||
+            response.data.size() != screenshot_chunk_size(response.total, response.index)) {
+            return {};
+        }
+    } else if (response.total != 0 || response.index != 0 || response.count != 0 ||
+               !response.data.empty()) {
+        return {};
+    }
+    const std::string reason = truncate_utf8_reason(response.reason, kMaxScreenshotReasonBytes);
+    if (reason.find('\0') != std::string::npos) {
+        return {};
+    }
+    const size_t size = 36 + reason.size() + response.data.size();
+    std::vector<uint8_t> payload(size);
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, response.request_id);
+    put_u8(cursor, static_cast<uint8_t>(response.code));
+    put_u8(cursor, 0);
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    put_u32(cursor, response.stream_id);
+    put_u32(cursor, response.width);
+    put_u32(cursor, response.height);
+    put_u32(cursor, response.total);
+    put_u32(cursor, response.index);
+    put_u32(cursor, response.count);
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+        cursor += reason.size();
+    }
+    if (!response.data.empty()) {
+        std::memcpy(cursor, response.data.data(), response.data.size());
+    }
+    return make_control(ControlType::ScreenshotResponse, payload);
+}
+
+bool parse_screenshot_response(const std::vector<uint8_t>& payload,
+                               ScreenshotResponse& response, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint8_t reserved = 0;
+    uint16_t reason_size = 0;
+    response = {};
+    if (!reader.u64(response.request_id) || !reader.u8(raw_code) ||
+        !reader.u8(reserved) || !reader.u16(reason_size) ||
+        !reader.u32(response.stream_id) || !reader.u32(response.width) ||
+        !reader.u32(response.height) || !reader.u32(response.total) ||
+        !reader.u32(response.index) || !reader.u32(response.count)) {
+        set_error(error, "truncated ScreenshotResponse");
+        return false;
+    }
+    response.code = static_cast<ScreenshotCode>(raw_code);
+    if (!valid_screenshot_code(response.code)) {
+        set_error(error, "ScreenshotResponse carries an unknown code");
+        return false;
+    }
+    if (response.request_id == 0) {
+        set_error(error, "ScreenshotResponse carries request id 0");
+        return false;
+    }
+    if (reserved != 0) {
+        set_error(error, "ScreenshotResponse has non-zero reserved bytes");
+        return false;
+    }
+    if (reason_size > kMaxScreenshotReasonBytes ||
+        !reader.string(response.reason, reason_size)) {
+        set_error(error, "ScreenshotResponse carries a malformed reason");
+        return false;
+    }
+    if (!response.reason.empty() &&
+        (!valid_utf8(response.reason) ||
+         response.reason.find('\0') != std::string::npos)) {
+        set_error(error, "ScreenshotResponse reason is not valid UTF-8");
+        return false;
+    }
+    if (response.code == ScreenshotCode::Ok) {
+        if (response.width == 0 || response.height == 0 || response.total == 0 ||
+            response.total > kMaxScreenshotBytes || response.count == 0 ||
+            response.count != screenshot_chunk_count(response.total) ||
+            response.index >= response.count) {
+            set_error(error, "ScreenshotResponse carries an unusable chunk layout");
+            return false;
+        }
+        const size_t slice = screenshot_chunk_size(response.total, response.index);
+        if (!reader.bytes(response.data, slice) || !reader.at_end()) {
+            set_error(error, "ScreenshotResponse chunk length does not match its layout");
+            return false;
+        }
+    } else if (response.width != 0 || response.height != 0 || response.total != 0 ||
+               response.index != 0 || response.count != 0 || !reader.at_end()) {
+        set_error(error, "ScreenshotResponse refusal carries picture data");
+        return false;
+    }
     return true;
 }
 

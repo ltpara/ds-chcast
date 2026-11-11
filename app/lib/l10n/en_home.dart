@@ -210,6 +210,13 @@ const Map<String, String> kEnglishHome = <String, String>{
   '设备会话': 'Device sessions',
   '设备地址无效：{p1}': 'Invalid device address: {p1}',
   '设备操作': 'Device actions',
+  '设备备注': 'Device note',
+  '备注': 'Note',
+  '备注已保存': 'Note saved',
+  '备注已清除': 'Note cleared',
+  '备注是纯文本，会随账号地址簿同步给同一账号的其他查看器；请勿填写密码等敏感信息。留空可清除。':
+      'Notes are plain text and sync with the account address book to other viewers signed in to the same account; do not store passwords or other secrets. Leave empty to clear.',
+  '例如：机柜 A3，财务部专用': 'For example: rack A3, finance use only',
   '访问令牌过长，最多 128 字节': 'The access token is too long; at most 128 bytes',
   '访问令牌（主机启用时填写）': 'Access token (when the host enables one)',
   '该条目已在其他设备修改，已刷新为服务器版本':

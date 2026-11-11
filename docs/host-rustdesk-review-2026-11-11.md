@@ -6,7 +6,7 @@
 
 当前发射端已有较完整的远程控制主干：服务运行、多用户会话、多屏共享采集编码、权限控制、硬件及软件编码、音视频、文件与剪贴板、终端、端口转发、隐私模式和录制均有具体实现。不能仅凭 RustDesk 的功能名称把这些列成缺失，也不能因存在同名处理函数便认定体验完全一致。
 
-优先值得补齐的是四项：**独立光标采样、发射端原始截图、OLE 虚拟文件源读取、录制状态驱动周期关键帧**。其次是未认证连接与正式会话名额隔离、便携提权连续性和通话中麦克风切换。AV1 软件 4:4:4、更多虚拟显示驱动、协作光标提示、远程打印及控制方向切换属于后续选项。
+独立光标采样、发射端原始截图（G02）、协作光标的颜色/姓名/点击波纹（G21，v71）、查看端录制的周期关键帧（G04，查看端 8 s 自请求）以及第三方 OLE 虚拟文件源读取（G03）已于 2026-11-11 补齐。优先值得继续处理的是未认证连接与正式会话名额隔离和便携提权连续性；OLE 读路径的真实 Office/资源管理器附件与旧版下载替代仍需实测。AV1 软件 4:4:4、更多虚拟显示驱动、远程打印及控制方向切换属于后续选项。
 
 这是“主要功能面的源码对照 + 有限构建/测试”，不是逐行证明，也不是全功能实机验收。尤其没有完成双机弱网、多品牌 GPU、真实 UAC/锁屏切换、虚拟显示驱动部署、Office 附件和长时间录制测试。下文“已有”只表示追踪到了实现路径，不代表全部边界场景已通过。
 
@@ -36,22 +36,22 @@
 | GPU 编码、CPU 回退、编解码能力协商 | [encoder_factory.cc](D:/ds-chcast/src/codec/encoder_factory.cc)、[encoder.h](D:/ds-chcast/include/chast/encoder.h) | [codec.rs](D:/rustdesk/libs/scrap/src/common/codec.rs)、[aom.rs](D:/rustdesk/libs/scrap/src/common/aom.rs) | 已有 VPL/FFmpeg 厂商硬编和 OpenH264/VP9 软件路径；软件 AV1/AV1 4:4:4 有差异，见 G08 |
 | 带宽自适应、静态刷新、慢订阅者处理 | [video_qos.cc](D:/ds-chcast/src/host/video_qos.cc)、[desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc) | [video_qos.rs](D:/rustdesk/src/server/video_qos.rs)、[static_refresh.rs](D:/rustdesk/src/server/video_service/static_refresh.rs) | 已有；本轮 video_qos 测试通过，不等于双机弱网体验已验证 |
 | HDR 桌面显示 | [hdr_pass.cc](D:/ds-chcast/src/capture/hdr_pass.cc) | [hdr.rs](D:/rustdesk/libs/scrap/src/dxgi/hdr.rs:1) | 都存在 HDR 桌面到 SDR 的处理；不能据此宣称任一方支持端到端 HDR |
-| 光标形状和位置 | [desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc:711)、[cursor.cc](D:/ds-chcast/src/capture/cursor.cc) | [input_service.rs](D:/rustdesk/src/server/input_service.rs:330) | 已有独立发送通道，但采样仍跟随视频节奏，见 G01 |
+| 光标形状和位置 | [desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc)、[cursor.cc](D:/ds-chcast/src/capture/cursor.cc) | [input_service.rs](D:/rustdesk/src/server/input_service.rs:330) | 已有独立采样线程（约 33 ms）与独立发送通道，见 G01 补记 |
 | 键鼠、Unicode、触控、笔、释放按键 | [input.cc](D:/ds-chcast/src/win/input.cc)、[protocol.h](D:/ds-chcast/include/chast/protocol.h) | [input_service.rs](D:/rustdesk/src/server/input_service.rs) | 有实现路径；IME、布局切换、触控实机组合未完整验证 |
 | SAS、锁屏、重启、阻止本地输入 | [sas.cc](D:/ds-chcast/src/win/sas.cc)、[host_server.cc](D:/ds-chcast/src/host/host_server.cc)、[input.cc](D:/ds-chcast/src/win/input.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs)、[input_service.rs](D:/rustdesk/src/server/input_service.rs) | 已有；依赖权限、服务与桌面状态，不能用便携提权差异否定全部能力 |
 | 系统音频、Opus、回声处理 | [shared_loopback.cc](D:/ds-chcast/src/host/shared_loopback.cc)、[audio_dsp.cc](D:/ds-chcast/src/audio/audio_dsp.cc) | [audio_service.rs](D:/rustdesk/src/server/audio_service.rs) | 已有；真实声卡与回声效果待验证 |
-| 双向语音及麦克风选择 | [host_server.cc](D:/ds-chcast/src/host/host_server.cc)、[main.cc](D:/ds-chcast/host/main.cc:3394) | [audio_service.rs](D:/rustdesk/src/server/audio_service.rs:51) | 已有设备选择；通话中换源未闭环，见 G07 |
+| 双向语音及麦克风选择 | [host_server.cc](D:/ds-chcast/src/host/host_server.cc)、[main.cc](D:/ds-chcast/host/main.cc:3394) | [audio_service.rs](D:/rustdesk/src/server/audio_service.rs:51) | 已有设备选择；通话中换源于 2026-11-11 补齐，真机验收见 G07 |
 | 摄像头 | [camera_relay.cc](D:/ds-chcast/src/host/camera_relay.cc)、[camera_capturer.cc](D:/ds-chcast/src/capture/camera_capturer.cc) | [video_service.rs](D:/rustdesk/src/server/video_service.rs) | 有枚举、权限与媒体发送路径；设备兼容性未作横向实测 |
 | 文本、HTML、RTF、图像剪贴板 | [clipboard.cc](D:/ds-chcast/src/clipboard/clipboard.cc)、[clipboard_win.cc](D:/ds-chcast/src/clipboard/clipboard_win.cc) | [clipboard_service.rs](D:/rustdesk/src/server/clipboard_service.rs)、[wf_cliprdr.c](D:/rustdesk/libs/clipboard/src/windows/wf_cliprdr.c) | 已有多格式路径；新增压缩改动仍在进行 |
-| 文件剪贴板、延迟读取及虚拟发布 | [clipboard_virtual.cc](D:/ds-chcast/src/clipboard/clipboard_virtual.cc)、[clipboard_local.cc](D:/ds-chcast/src/clipboard/clipboard_local.cc) | [wf_cliprdr.c](D:/rustdesk/libs/clipboard/src/windows/wf_cliprdr.c:3757) | 接收/发布侧已有虚拟文件；从第三方应用读取虚拟源仍缺，见 G03 |
+| 文件剪贴板、延迟读取及虚拟发布 | [clipboard_virtual.cc](D:/ds-chcast/src/clipboard/clipboard_virtual.cc)、[clipboard_local.cc](D:/ds-chcast/src/clipboard/clipboard_local.cc)、[clipboard_oledata.cc](D:/ds-chcast/src/clipboard/clipboard_oledata.cc) | [wf_cliprdr.c](D:/rustdesk/libs/clipboard/src/windows/wf_cliprdr.c:3757) | 接收/发布侧与第三方 OLE 虚拟源的延迟读取已有，见 G03；真实 Office 附件与旧版下载路径未实测 |
 | 文件浏览、分享目录、隐藏项、分页、续传 | [file_transfer.cc](D:/ds-chcast/src/clipboard/file_transfer.cc)、[host_server.cc](D:/ds-chcast/src/host/host_server.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs) | 已有；v69 覆盖冲突协商正在修改，暂不判定完成或缺失 |
-| 发射端原始截图 | [viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs:4097)、[video_service.rs](D:/rustdesk/src/server/video_service.rs:1502) | 我方现有为接收画面截图，缺少发射端原始像素请求，见 G02 |
-| 接收端录制与发射端录制 | [stream_recorder.cc](D:/ds-chcast/src/host/stream_recorder.cc)、[viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [video_service.rs](D:/rustdesk/src/server/video_service.rs:1067)、[connection.rs](D:/rustdesk/src/server/connection.rs:4016) | 两种录制已有；录制状态与周期关键帧协同可提升，见 G04 |
+| 发射端原始截图 | [desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc)、[host_server.cc](D:/ds-chcast/src/host/host_server.cc)、[viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs:4097)、[video_service.rs](D:/rustdesk/src/server/video_service.rs:1502) | 已有：v70 原始帧请求/响应，查看端失败时回退解码帧，见 G02 |
+| 接收端录制与发射端录制 | [stream_recorder.cc](D:/ds-chcast/src/host/stream_recorder.cc)、[viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [video_service.rs](D:/rustdesk/src/server/video_service.rs:1067)、[connection.rs](D:/rustdesk/src/server/connection.rs:4016) | 两种录制已有；查看端录制已自请求 8 s IDR，主机端录制状态消息仍见 G04 |
 | ConPTY 终端及持久会话 | [terminal_relay.cc](D:/ds-chcast/src/host/terminal_relay.cc) | [terminal_service.rs](D:/rustdesk/src/server/terminal_service.rs) | 已有；没有据此声称所有用户令牌/退出场景都已验证 |
 | TCP 端口转发 | [port_forward_relay.cc](D:/ds-chcast/src/host/port_forward_relay.cc) | [port_forward_mux.rs](D:/rustdesk/src/server/port_forward_mux.rs) | 已有；本轮不展开服务器中继实现 |
 | 虚拟显示、无头及隐私恢复 | [virtual_display.cc](D:/ds-chcast/src/host/virtual_display.cc)、[display_privacy.cc](D:/ds-chcast/src/host/display_privacy.cc) | [virtual_display_manager.rs](D:/rustdesk/src/virtual_display_manager.rs)、[win_virtual_display.rs](D:/rustdesk/src/privacy_mode/win_virtual_display.rs) | 已有；驱动供应与多 GPU 实测尚需补齐，见 G09 |
 | 防休眠、壁纸移除及恢复 | [power_request.cc](D:/ds-chcast/src/win/power_request.cc)、[wallpaper.cc](D:/ds-chcast/src/win/wallpaper.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs)、[windows.rs](D:/rustdesk/src/platform/windows.rs) | 已有；异常退出恢复仍应纳入验收 |
-| 协作光标提示 | [show_cursor.cc](D:/ds-chcast/src/win/show_cursor.cc)、[protocol.h](D:/ds-chcast/include/chast/protocol.h:693) | [whiteboard/mod.rs](D:/rustdesk/src/whiteboard/mod.rs:27)、[whiteboard/windows.rs](D:/rustdesk/src/whiteboard/windows.rs) | 有基础提示；缺颜色、姓名和点击反馈，见 G10 |
+| 协作光标提示 | [show_cursor.cc](D:/ds-chcast/src/win/show_cursor.cc)、[cursor_hint_paint.cc](D:/ds-chcast/src/win/cursor_hint_paint.cc)、[protocol.h](D:/ds-chcast/include/chast/protocol.h) | [whiteboard/mod.rs](D:/rustdesk/src/whiteboard/mod.rs:27)、[whiteboard/windows.rs](D:/rustdesk/src/whiteboard/windows.rs) | v71 起有颜色、姓名和点击波纹；自由标注仍缺，见 G10 |
 | 远程打印、控制方向切换 | [protocol.h](D:/ds-chcast/include/chast/protocol.h) | [printer_service.rs](D:/rustdesk/src/server/printer_service.rs)、[connection.rs](D:/rustdesk/src/server/connection.rs:3982) | 未找到我方对应协议和执行路径；属于产品扩展，见 G10 |
 
 ## 具体缺口与可提升点
@@ -68,6 +68,8 @@
 
 **验收。** 视频分别限制 5/15/30fps，给编码器注入约 300ms 阻塞，再令所有视频队列满；分别记录光标采样间隔和到达延迟。目标应接近独立约 30Hz 调度，且视频恢复、显示拔插和锁屏切换后无悬挂订阅。已有队列满测试不能替代低帧率和编码阻塞测试。
 
+**2026-11-11 补记（已修复）。** 显示源新增独立指针线程 `Source::start_cursor`（约 33 ms 轮询，先切入输入桌面，再调 `sample_desktop_cursor`），采样与捕获帧率、同步编码和发送队列解耦；`cursor_snapshot` 返回该线程维护的最新快照，未接入采样器的合成源保持原采集线程回调。`desktop_stream` 新增 5/30 fps + 300 ms 编码阻塞用例：5 fps 等待 14.45/46.22 ms、30 fps 62.37/16.01 ms，5 fps 下不再出现约 200 ms 的最坏间隔。
+
 ### G02 · A：缺少发射端原始像素截图请求
 
 **证据。** 我方 [SaveScreenshotFromSink](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) 从解码后的 FrameSink 读取 BGRA 再写 PNG。RustDesk [ScreenshotRequest:4097](D:/rustdesk/src/server/connection.rs:4097) 把请求交给视频服务，[截图处理:1502](D:/rustdesk/src/server/video_service.rs:1502) 从采集像素生成 PNG 并返回。我方没有对应的发射端请求/响应路径。
@@ -77,6 +79,8 @@
 **建议。** 增加携带请求 ID 和 display ID 的原始截图消息，在发射端权限和显示订阅检查后取得原始像素，异步编码并返回尺寸、格式和错误信息。限制频率、像素数与响应大小；处理中途显示移除、桌面切换及权限撤销。
 
 **验收。** 低码率、降低视频分辨率和静止画面情况下，仍能获得采集分辨率的截图；多屏目标正确，过期请求不返回其他桌面内容。此处不保证 HDR 原始数据或受保护内容可捕获。
+
+**状态（2026-11-11）。** 已实现主机侧原始帧截图：协议 v70 增加 `ScreenshotRequest`(86)/`ScreenshotResponse`(87)，请求带请求 ID 和显示流 ID。发射端在 `DesktopStreamPool::screenshot`（[desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc)）里经显示服务线程把该流保留的 BGRA 帧拷到 CPU，WIC 编码 PNG 后按 128 KiB 分片发送，总大小上界 24 MiB；不是目标流的请求返回 `Denied`，无帧或带旋转的帧返回 `Unavailable`。接收端 `ViewerEngine::ProcessScreenshot` 收齐后写文件，拒绝、不支持或 10 s 超时回退到解码帧截图。单屏 1080p 回环已由 `chast-host-control-test` 断言 PNG 尺寸与签名；旋屏、多屏和低码率下的采集分辨率仍有待实测。
 
 ### G03 · A：支持虚拟文件发布，但尚不能读取 OLE 虚拟文件源
 
@@ -88,6 +92,8 @@
 
 **验收。** 同时覆盖实际文件路径和仅提供 IStream 的测试源；复制后更换剪贴板、关闭源应用、取消大附件、连续复制同名附件时，不读错代次、不阻塞主线程。不能只测远端发布到资源管理器这一方向。
 
+**状态（2026-11-11）。** 已实现第三方 OLE 虚拟源读取：[clipboard_oledata.h](D:/ds-chcast/include/chast/clipboard_oledata.h) 解析 `CFSTR_FILEDESCRIPTORW`（名称、大小、目录、写时间），[clipboard_oledata.cc](D:/ds-chcast/src/clipboard/clipboard_oledata.cc) 经全局接口表（GIT）把 `IDataObject` 交给独立 COM 线程，按 `CFSTR_FILECONTENTS` + `TYMED_ISTREAM` 延迟读取，读时限定在描述符声明的范围内；支持可 seek 流和“顺序重放 + 最多 8 MiB 跳过”的不可 seek 流，20 s 无应答即判失败并唤醒等待者，`Cancel` 不 join 卡住的源调用。[clipboard_worker.cc](D:/ds-chcast/src/clipboard/clipboard_worker.cc) 在无 `CF_HDROP` 时回退到该路径，并把源直接交给现有 FileList 发布/`ClipboardFileRead` 通道；描述符哈希（名称、大小、属性、写时间）参与重新发布判定。`clipboard_oledata` 测试覆盖解析边界（分隔符名、缺大小、超限、截断）与读写（整段、跨偏移、空文件、目录、取消、不可 seek），`clipboard` 相关 6 个 CTest 与 `chast-host` 构建通过。边界：真实 Outlook/Explorer 虚拟附件未在本机实测；旧版 `.chast-clipboard/<index>` 下载路径没有本地路径可用，虚拟模式（默认开启）走 `ClipboardFileRead`。
+
 ### G04 · A：录制尚未驱动周期关键帧策略
 
 **证据。** [encoder.h:99](D:/ds-chcast/include/chast/encoder.h:99) 的 GOP 默认 0，即不主动周期 IDR；[stream_recorder.cc:175](D:/ds-chcast/src/host/stream_recorder.cc:175) 在等待 IDR、队列恢复和分段时请求关键帧，分段间隔为 10 分钟。接收端 [录制开启](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) 请求起始关键帧，但没有独立录制状态消息持续影响发射端 GOP。RustDesk [ClientRecordStatus:4016](D:/rustdesk/src/server/connection.rs:4016) 进入共享 QoS，编码器设置按录制状态选择 [Some(240):1115](D:/rustdesk/src/server/video_service.rs:1115)。240 是帧数，不是秒数。
@@ -95,6 +101,8 @@
 **影响。** 长 GOP 下，录像拖动可能需要从较远的关键帧开始解码，影响定位和恢复体验。这里没有证据表明现有录像必然损坏，也不保证每个硬件编码器始终不自发产生关键帧。
 
 **建议。** 增加接收端录制状态，与发射端本地录制共同决定有限 GOP；对每个共享显示源按录制订阅者计数，最后一个录制者退出后再恢复普通会话策略。具体帧数应结合帧率和带宽测量选择，不应直接照搬 240。
+
+**状态（2026-11-11）。** 发射端本地录制已按 8 s 时间预算请求 IDR（`stream_recorder.cc` 的 `kKeyframeMs`，取 240 帧@30 fps）；接收端改为在录像器打开期间按同一 8 s 节拍自行请求目标流 IDR（多显示 `DisplayKeyframeRequest`、单显示 `KeyframeRequest`），无需新协议，见 `display_video_receiver_test` 的周期请求断言。接收端录制状态消息仍未引入，主机端也不会因他方录制调整编码器 GOP。
 
 **验收。** 两个接收端分别开始/停止录制，测试共享源、编码器重建和分辨率变化；测量长录像随机 seek 延迟、关键帧间隔、额外码率和分段可播放性。
 
@@ -122,6 +130,8 @@
 
 **建议与验收。** 在保持桌面连接和呼叫身份的前提下替换麦克风源，重置回声处理所需状态；测试通话中 USB 设备拔插、默认设备变化、切换到不存在设备以及切回默认设备。已有设备枚举和选择功能应复用。
 
+**状态（2026-11-11）。** 已实现托盘换源即时生效（`HostServer::set_voice_microphone`，重启当前通话的采集，保留通话身份与包序号）；上述真机拔插与默认设备变化场景仍待验收。
+
 ### G08 · C：可选软件 AV1 与 AV1 4:4:4
 
 **证据。** [encoder.h:48](D:/ds-chcast/include/chast/encoder.h:48) 明确 AV1 由硬件产生，4:4:4 只允许 VP9；[encoder_factory.cc](D:/ds-chcast/src/codec/encoder_factory.cc) 已有 OpenH264/VP9 软件路径。RustDesk [aom.rs:95](D:/rustdesk/libs/scrap/src/common/aom.rs:95) 有 libaom 编码，I444 使用 profile 1，[codec.rs:403](D:/rustdesk/libs/scrap/src/common/codec.rs:403) 包含 VP9/AV1 的 I444 选择。
@@ -136,7 +146,7 @@
 
 ### G10 · C：协作提示与额外产品功能
 
-- **协作光标：** 我方 [ShowCursorHint](D:/ds-chcast/include/chast/protocol.h:693) 只有位置/可见性，显示固定箭头。RustDesk [CustomEvent](D:/rustdesk/src/whiteboard/mod.rs:27) 为 Cursor/Clear/Exit，光标带颜色、按键和文字，Windows 实现含姓名和点击波纹。可补姓名、颜色和点击反馈；不能据此写成“缺少自由绘画白板”。
+- **协作光标：** 我方 [ShowCursorHint](D:/ds-chcast/include/chast/protocol.h) 在 v71 已有位置、可见性和按下边沿；覆盖层按设备名取色、绘制姓名并在点击处播放 420 ms 波纹（`cursor_hint_paint.cc`）。RustDesk [CustomEvent](D:/rustdesk/src/whiteboard/mod.rs:27) 为 Cursor/Clear/Exit，另有 Clear/绘制标注。剩余差异是自由标注；不能据此写成“缺少自由绘画白板”。
 - **远程打印：** RustDesk [printer_service.rs](D:/rustdesk/src/server/printer_service.rs) 包含动态打印驱动适配器与作业处理；我方未找到对应端到端路径。它依赖驱动/运行时条件，不能声称当前本地 RustDesk 已开箱可用。只有明确打印需求时再立项。
 - **切换控制方向：** RustDesk [SwitchSidesRequest:3982](D:/rustdesk/src/server/connection.rs:3982) 拉起反向连接并关闭原会话；我方没有对应协调协议。实现需同时涉及两端、授权与连接恢复，不是给发射端加一个按钮即可。
 
@@ -181,7 +191,7 @@ ctest --test-dir build-review-clean -C Release -R '^video_qos$' --output-on-fail
 | 语音、声卡切换、摄像头拔插 | 正确换源、回声处理重置、错误回报和资源回收 |
 | 终端与端口转发退出/重连 | 正确身份、权限约束、持久化边界、通道关闭 |
 
-建议第一批按 G01 → G02 → G03 → G04 实施和验收；G05 可并行作为准入稳健性专项，G06/G09 则单独做权限和驱动方案设计。本轮仅新增审核报告，未实现这些建议，也没有修改现有业务代码或旧审核报告。
+首批建议中 G02（发射端原始截图）、G03（第三方 OLE 虚拟源读取）和 G04 的发射端部分已于 2026-11-11 落地，见各自“状态”段；其余按 G01 → G03 的剩余验收继续。G05 可并行作为准入稳健性专项，G06/G09 则单独做权限和驱动方案设计。
 
 ## 审核快照指纹
 

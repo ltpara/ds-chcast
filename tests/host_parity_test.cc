@@ -977,6 +977,10 @@ struct TwoDisplays {
             }
             return std::make_unique<host_test::Capture>(display.width == 800 ? right : left, display);
         };
+        fixture.config.cursor_sampler = [this](const DisplayInfo& display, CursorInfo& cursor) {
+            const auto state = display.width == 800 ? right : left;
+            std::lock_guard lock(state->cursor_mutex); cursor = state->pointer; return true;
+        };
         fixture.config.encoder_factory = [this](ID3D11Device*, const EncoderConfig& cfg, std::string*) {
             return std::make_unique<host_test::Encoder>(cfg.width == 800 ? right : left, cfg);
         };
@@ -1359,15 +1363,17 @@ void multiple_display_cursors() {
     CursorInfo left, right;
     left.visible = left.position_valid = left.shape_valid = true;
     left.position = {80, 60};
-    left.width = left.height = 2; left.content_id = 123;
-    left.bitmap.assign(16, 0x80);
+    left.width = left.height = 4; left.content_id = 123;
+    left.hotspot = {2, 3};
+    left.bitmap.assign(64, 0x80);
     right = left; right.visible = false; right.position.x = -560;
     f.left->set_cursor(left); f.right->set_cursor(right);
     auto viewer = f.fixture.connect(SessionMode::Desktop, kPermissionAll & ~kPermissionInput, {}, 0);
     auto other = f.fixture.connect(SessionMode::Desktop, kPermissionAll & ~kPermissionInput, {}, 1);
     CursorUpdate legacy;
     require(until([&] { return viewer->take_cursor_update(legacy); }) && legacy.visible &&
-            legacy.x == 80 && legacy.sprite == left.bitmap, "legacy viewer receives selected screen cursor");
+            legacy.x == 80 && legacy.y == 60 && legacy.hotspot_x == 2 && legacy.hotspot_y == 3 &&
+            legacy.sprite == left.bitmap, "legacy viewer receives selected screen hotspot and sprite");
     auto both = subscriptions(*viewer, {0, {1}, {}, {}});
     auto stream_id = [](const CaptureDisplaysResult& result, uint16_t index) {
         for (const auto& entry : result.streams) if (entry.display_index == index) return entry.stream_id;
@@ -1382,7 +1388,8 @@ void multiple_display_cursors() {
     };
     require(until([&] { drain(); return cursors.size() == 2; }) &&
             cursors[left_id].visible && !cursors[right_id].visible && cursors[left_id].x == 80 &&
-            cursors[right_id].x == -560 && cursors[left_id].sprite == left.bitmap &&
+            cursors[right_id].x == -560 && cursors[left_id].hotspot_x == 2 &&
+            cursors[left_id].hotspot_y == 3 && cursors[left_id].sprite == left.bitmap &&
             cursors[right_id].sprite == right.bitmap,
             "multi-stream activation snapshots each source including an already-delivered static shape");
     require(until([&] { return other->take_cursor_update(legacy); }) && !legacy.visible &&
@@ -2421,6 +2428,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--topology") {
         run("multiple display topology changes", multiple_display_topology);
         run("multiple display isolated recovery", multiple_display_recovery_isolation);
+        WSACleanup();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--cursors") {
+        run("multiple display cursor snapshots", multiple_display_cursors);
         WSACleanup();
         return failures ? 1 : 0;
     }

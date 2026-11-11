@@ -188,7 +188,21 @@ public:
     }
 
     CaptureResult capture(std::chrono::milliseconds timeout) override {
-        return active_->capture(timeout);
+        const auto result = active_->capture(timeout);
+        if (result == CaptureResult::Frame && config_.nv12.enabled &&
+            !active_->frame().has_video_image() && !external_device_) {
+            auto fallback = config_;
+            fallback.backend = CaptureBackend::GdiCpu;
+            std::string failure;
+            auto next = detail::create_gdi_capturer(active_->display(), fallback, &failure);
+            if (next) {
+                if (nv12_percent_ != 100) next->set_nv12_scale(nv12_percent_);
+                active_ = std::move(next);
+                implementation_ = "gdi-cpu fallback (GPU conversion unavailable)";
+                return active_->capture(timeout);
+            }
+        }
+        return result;
     }
     const FrameInfo& frame() const override { return active_->frame(); }
     const CursorInfo& cursor() const override { return active_->cursor(); }
@@ -1086,7 +1100,7 @@ std::unique_ptr<IDxgiCapturer> create_capturer_on_device(const DisplayInfo& disp
         }
         return nullptr;
     }
-    if (config.backend == CaptureBackend::Gdi) {
+    if (config.backend == CaptureBackend::Gdi || config.backend == CaptureBackend::GdiCpu) {
         return create_gdi_capturer_on_device(display, config, device, context, vendor_id, error);
     }
 
@@ -1110,6 +1124,7 @@ const char* capture_backend_name(CaptureBackend backend) {
     switch (backend) {
         case CaptureBackend::Dxgi: return "dxgi";
         case CaptureBackend::Gdi: return "gdi";
+        case CaptureBackend::GdiCpu: return "gdi-cpu";
         case CaptureBackend::Auto:
         default: return "auto";
     }
@@ -1124,6 +1139,7 @@ bool parse_capture_backend(std::string_view text, CaptureBackend& backend) {
         backend = CaptureBackend::Dxgi;
         return true;
     }
+    if (text == "gdi-cpu") { backend = CaptureBackend::GdiCpu; return true; }
     if (text == "gdi") {
         backend = CaptureBackend::Gdi;
         return true;
@@ -1183,7 +1199,7 @@ std::unique_ptr<IDxgiCapturer> create_capturer(size_t display_index, const Captu
 
 std::unique_ptr<IDxgiCapturer> create_capturer(const DisplayInfo& display,
                                                const CaptureConfig& config, std::string* error) {
-    if (config.backend == CaptureBackend::Gdi) {
+    if (config.backend == CaptureBackend::Gdi || config.backend == CaptureBackend::GdiCpu) {
         return detail::create_gdi_capturer(display, config, error);
     }
     if (config.backend == CaptureBackend::Auto) {

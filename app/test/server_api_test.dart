@@ -2234,8 +2234,116 @@ void main() {
     );
   });
 
-  test('address book groups are created, deleted and validated', () async {
+  test('address book trash lists, restores, purges and empties', () async {
     final List<String> requests = <String>[];
+    int trashReads = 0;
+    server.listen((HttpRequest request) async {
+      requests.add('${request.method} ${request.uri.path}');
+      request.response.headers.contentType = ContentType.json;
+      if (request.method == 'GET') {
+        trashReads++;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'peers': <Object?>[
+              <String, Object?>{
+                'id': 'studio',
+                'name': '工作室',
+                'tags': <String>['office'],
+                'note': '机柜 A3',
+                'group_id': 'work',
+                'deleted': true,
+                'revision': 4,
+              },
+            ],
+          }),
+        );
+      } else if (request.method == 'POST') {
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'id': 'studio',
+            'name': '工作室',
+            'tags': <String>['office'],
+            'note': '机柜 A3',
+            'revision': 5,
+          }),
+        );
+      } else if (request.uri.path.endsWith('/trash')) {
+        request.response.write(jsonEncode(<String, Object?>{'removed': 2}));
+      } else {
+        request.response.statusCode = HttpStatus.noContent;
+      }
+      await request.response.close();
+    });
+
+    final List<AddressBookPeer> trash = await ServerApi.addressBookTrash(
+      settings,
+      'account-token',
+    );
+    expect(requests.single, 'GET /v1/addressbook/trash');
+    expect(trash.single.id, 'studio');
+    expect(trash.single.name, '工作室');
+    expect(trash.single.tags, <String>['office']);
+    expect(trash.single.note, '机柜 A3');
+    expect(trash.single.deleted, isTrue);
+
+    final AddressBookPeer restored = await ServerApi.restoreAddressBookPeer(
+      settings,
+      'account-token',
+      'studio',
+    );
+    expect(requests.last, 'POST /v1/addressbook/trash/studio/restore');
+    expect(restored.revision, 5);
+    expect(restored.deleted, isFalse);
+
+    await ServerApi.purgeAddressBookPeer(settings, 'account-token', 'studio');
+    expect(requests.last, 'DELETE /v1/addressbook/trash/studio');
+
+    final int removed = await ServerApi.emptyAddressBookTrash(
+      settings,
+      'account-token',
+    );
+    expect(requests.last, 'DELETE /v1/addressbook/trash');
+    expect(removed, 2);
+    expect(trashReads, 1);
+
+    await expectLater(
+      ServerApi.restoreAddressBookPeer(settings, 'account-token', '  '),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('设备 ID'),
+        ),
+      ),
+    );
+  });
+
+  test('address book trash reports a missing entry', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.notFound;
+      await request.response.close();
+    });
+
+    for (final Future<void> call in <Future<void>>[
+      ServerApi.restoreAddressBookPeer(settings, 'account-token', 'studio'),
+      ServerApi.purgeAddressBookPeer(settings, 'account-token', 'studio'),
+    ]) {
+      await expectLater(
+        call,
+        throwsA(
+          isA<ServerApiException>()
+              .having((ServerApiException e) => e.statusCode, 'statusCode', 404)
+              .having(
+                (ServerApiException e) => e.message,
+                'message',
+                contains('回收站'),
+              ),
+        ),
+      );
+    }
+  });
+
+  test('address book groups are created, deleted and validated', () async {    final List<String> requests = <String>[];
     int deletes = 0;
     server.listen((HttpRequest request) async {
       final String body = await utf8.decoder.bind(request).join();
@@ -2547,6 +2655,146 @@ void main() {
       ),
     );
     expect(calls, 2);
+  });
+
+  test('group and everyone shares post targets and revoke by query', () async {
+    final List<String> methods = <String>[];
+    final List<String> paths = <String>[];
+    final List<Object?> bodies = <Object?>[];
+    final List<Map<String, String>> queries = <Map<String, String>>[];
+    server.listen((HttpRequest request) async {
+      methods.add(request.method);
+      paths.add(request.uri.path);
+      if (request.method == 'GET') {
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'groups': <Object?>[
+              <String, Object?>{'id': 'team', 'name': 'Team', 'role': 'admin'},
+            ],
+          }),
+        );
+      } else if (request.method == 'POST') {
+        final Object? body = jsonDecode(
+          await utf8.decoder.bind(request).join(),
+        );
+        bodies.add(body);
+        final Map<String, Object?> map = body! as Map<String, Object?>;
+        final String kind = map['target']! as String;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'target_kind': kind,
+            'target_id': map['target_id'] ?? '',
+            'target_name': kind == 'group' ? 'Team' : '',
+            'permission': map['permission'],
+            'created_at_ms': 40,
+          }),
+        );
+      } else {
+        queries.add(request.uri.queryParameters);
+        request.response.statusCode = HttpStatus.noContent;
+      }
+      await request.response.close();
+    });
+
+    final List<ServerAccountGroup> groups = await ServerApi.accountGroups(
+      settings,
+      'account-token',
+    );
+    expect(groups.single.id, 'team');
+    expect(groups.single.label, 'Team');
+    expect(groups.single.role, 'admin');
+
+    final AddressBookGrant groupGrant = await ServerApi.shareAddressBookTarget(
+      settings,
+      'account-token',
+      'group',
+      'team',
+      permission: 'write',
+    );
+    expect(bodies.last, <String, Object?>{
+      'target': 'group',
+      'target_id': 'team',
+      'permission': 'write',
+    });
+    expect(groupGrant.username, '');
+    expect(groupGrant.targetKind, 'group');
+    expect(groupGrant.targetId, 'team');
+    expect(groupGrant.targetName, 'Team');
+    expect(groupGrant.isTarget, isTrue);
+    expect(groupGrant.keySuffix, 'group-team');
+
+    final AddressBookGrant allGrant = await ServerApi.shareAddressBookTarget(
+      settings,
+      'account-token',
+      'everyone',
+      '',
+    );
+    expect(bodies.last, <String, Object?>{
+      'target': 'everyone',
+      'permission': 'read',
+    });
+    expect(allGrant.targetKind, 'everyone');
+
+    await ServerApi.unshareAddressBookTarget(
+      settings,
+      'account-token',
+      'group',
+      'team',
+      groupId: '',
+    );
+    expect(queries.last, <String, String>{
+      'kind': 'group',
+      'target_id': 'team',
+      'group_id': '',
+    });
+    await ServerApi.unshareAddressBookTarget(
+      settings,
+      'account-token',
+      'everyone',
+      '',
+    );
+    expect(queries.last, <String, String>{'kind': 'everyone'});
+    expect(methods, <String>['GET', 'POST', 'POST', 'DELETE', 'DELETE']);
+    expect(paths.first, '/v1/groups');
+    expect(paths.last, '/v1/addressbook/grants/targets');
+
+    await expectLater(
+      ServerApi.shareAddressBookTarget(settings, 'account-token', 'group', ' '),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('账号组'),
+        ),
+      ),
+    );
+    await expectLater(
+      ServerApi.shareAddressBookTarget(settings, 'account-token', 'user', 'x'),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('共享对象'),
+        ),
+      ),
+    );
+    await expectLater(
+      ServerApi.unshareAddressBookTarget(
+        settings,
+        'account-token',
+        'everyone',
+        'x',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('共享对象'),
+        ),
+      ),
+    );
   });
 
   test('address book permissions rank read below write below control', () {

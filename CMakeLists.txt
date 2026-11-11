@@ -271,6 +271,7 @@ add_library(chast.clipboard STATIC
     src/clipboard/clipboard_worker.cc
     src/clipboard/clipboard_virtual.cc
     src/clipboard/clipboard_local.cc
+    src/clipboard/clipboard_oledata.cc
     src/clipboard/clipboard_listener.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -317,6 +318,7 @@ add_library(chast.host STATIC
     src/host/display_privacy.cc
     src/host/desktop_stream.cc
     src/host/stream_recorder.cc
+    src/host/recording_disk.cc
     src/host/video_qos.cc
     src/host/shared_loopback.cc
     src/host/host_security.cc
@@ -330,6 +332,7 @@ add_library(chast.host STATIC
     src/win/power_request.cc
     src/win/sas.cc
     src/win/show_cursor.cc
+    src/win/cursor_hint_paint.cc
     src/win/wallpaper.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -506,6 +509,12 @@ if(CHAST_BUILD_TESTS)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer)
     target_link_libraries(chast-remote-cursor-test PRIVATE chast.dxgi)
 
+    # The host counterpart of the sprite: the click ripple, the viewer colour
+    # and label, and the premultiplied raster. Pure maths, no window.
+    add_executable(chast-cursor-hint-test tests/cursor_hint_paint_test.cc
+                   src/win/cursor_hint_paint.cc)
+    target_include_directories(chast-cursor-hint-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
     # Pure-logic checks for the wire format and the HID -> scan-code table.
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
@@ -551,6 +560,8 @@ if(CHAST_BUILD_TESTS)
     target_link_libraries(chast-host-parity-test PRIVATE chast.host.tray)
     add_executable(chast-desktop-stream-test tests/desktop_stream_test.cc)
     target_link_libraries(chast-desktop-stream-test PRIVATE chast.host)
+    add_executable(chast-recording-disk-test tests/recording_disk_test.cc)
+    target_link_libraries(chast-recording-disk-test PRIVATE chast.host)
     add_executable(chast-display-subscription-test tests/display_subscription_test.cc)
     target_link_libraries(chast-display-subscription-test PRIVATE chast.net chast.access)
     add_executable(chast-display-video-test tests/display_video_receiver_test.cc
@@ -594,6 +605,15 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-clipboard-listener-startup-test tests/clipboard_listener_startup_test.cc)
     target_include_directories(chast-clipboard-listener-startup-test PRIVATE include)
     target_link_libraries(chast-clipboard-listener-startup-test PRIVATE user32)
+
+    # OLE virtual file sources: descriptor parsing plus delayed reads from an
+    # in-process IDataObject, including a source whose streams cannot seek.
+    add_executable(chast-clipboard-oledata-test tests/clipboard_oledata_test.cc)
+    target_compile_definitions(chast-clipboard-oledata-test PRIVATE NOMINMAX)
+    target_link_libraries(chast-clipboard-oledata-test PRIVATE chast.net)
+    add_custom_command(TARGET chast-clipboard-oledata-test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-clipboard-oledata-test>)
 
     # OS login: the password request over loopback QUIC, the permission and
     # logon-state gates, the exact text handed to a synthetic injector, and the
@@ -727,6 +747,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME capture_transform COMMAND chast-capture-transform-test)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
+    add_test(NAME cursor_hint COMMAND chast-cursor-hint-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
     add_test(NAME keyboard COMMAND chast-keyboard-test)
     add_test(NAME protocol_fuzz COMMAND chast-protocol-fuzz-test)
@@ -739,6 +760,10 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_parity COMMAND chast-host-parity-test)
     add_test(NAME desktop_stream COMMAND chast-desktop-stream-test)
+    add_test(NAME shared_capturer COMMAND chast-shared-capturer-test)
+    set_tests_properties(shared_capturer PROPERTIES TIMEOUT 60)
+    add_test(NAME recording_disk COMMAND chast-recording-disk-test)
+    set_tests_properties(recording_disk PROPERTIES TIMEOUT 30)
     add_test(NAME display_subscriptions COMMAND chast-display-subscription-test)
     add_test(NAME display_video COMMAND chast-display-video-test)
     add_test(NAME viewer_display_streams COMMAND chast-display-video-test --engine)
@@ -758,6 +783,8 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(clipboard_listener PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     add_test(NAME clipboard_listener_startup COMMAND chast-clipboard-listener-startup-test)
     set_tests_properties(clipboard_listener_startup PROPERTIES TIMEOUT 10 SKIP_RETURN_CODE 77)
+    add_test(NAME clipboard_oledata COMMAND chast-clipboard-oledata-test)
+    set_tests_properties(clipboard_oledata PROPERTIES TIMEOUT 60)
     add_test(NAME host_login COMMAND chast-host-login-test)
     set_tests_properties(host_login PROPERTIES TIMEOUT 180)
     add_test(NAME block_input COMMAND chast-block-input-test)

@@ -58,10 +58,10 @@ public:
         display_.height = height_;
         display_.rotation_degrees = 0;
 
-        if (!device_) {
+        if (!device_ && config_.backend != CaptureBackend::GdiCpu) {
             detail::CaptureDevice created;
             Error err = detail::create_capture_device(display_.adapter_luid, created);
-            if (!err.ok()) return err;
+            if (!err.ok() && external_device_) return err;
             device_ = std::move(created.device);
             context_ = std::move(created.context);
             vendor_id_ = created.vendor_id;
@@ -86,26 +86,32 @@ public:
             return check_win32(FALSE, "SelectObject(capture DIB)");
         }
 
-        D3D11_TEXTURE2D_DESC texture{};
-        texture.Width = width_;
-        texture.Height = height_;
-        texture.MipLevels = 1;
-        texture.ArraySize = 1;
-        texture.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        texture.SampleDesc.Count = 1;
-        texture.Usage = D3D11_USAGE_DEFAULT;
-        texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        texture.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-        Error err = check(device_->CreateTexture2D(&texture, nullptr, texture_.put()),
-                          "CreateTexture2D(GDI upload)");
-        if (!err.ok()) return err;
-        ComPtr<IDXGIResource> resource = com_query<IDXGIResource>(texture_);
-        if (!resource) return Error(Status::CaptureFailed, "GDI upload texture has no DXGI resource");
-        err = check(resource->GetSharedHandle(&shared_handle_), "GetSharedHandle(GDI upload)");
-        if (!err.ok()) return err;
-
-        err = create_nv12_pass();
-        if (!err.ok()) return err;
+        if (device_) {
+            const auto upload = [&]() -> Error {
+                D3D11_TEXTURE2D_DESC texture{};
+                texture.Width = width_;
+                texture.Height = height_;
+                texture.MipLevels = 1;
+                texture.ArraySize = 1;
+                texture.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                texture.SampleDesc.Count = 1;
+                texture.Usage = D3D11_USAGE_DEFAULT;
+                texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                texture.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+                auto err = check(device_->CreateTexture2D(&texture, nullptr, texture_.put()),
+                                 "CreateTexture2D(GDI upload)");
+                if (!err.ok()) return err;
+                auto resource = com_query<IDXGIResource>(texture_);
+                if (!resource) return Error(Status::CaptureFailed, "GDI upload has no DXGI resource");
+                err = check(resource->GetSharedHandle(&shared_handle_), "GetSharedHandle(GDI upload)");
+                return err.ok() ? create_nv12_pass() : err;
+            }();
+            if (!upload.ok()) {
+                if (external_device_) return upload;
+                nv12_pass_.reset(); texture_.reset(); context_.reset(); device_.reset();
+                shared_handle_ = nullptr; vendor_id_ = 0;
+            }
+        }
 
         frame_.device = device_.get();
         frame_.context = context_.get();
@@ -139,7 +145,19 @@ public:
             last_error_ = check_win32(FALSE, "BitBlt(display)");
             return CaptureResult::ReinitNeeded;
         }
-        draw_cursor();
+        cursor_ = {};
+        if (config_.capture_cursor) sample_desktop_cursor(display_, cursor_);
+        if (!device_) {
+            const auto* begin = static_cast<const uint8_t*>(pixels_);
+            frame_.cpu_bgra = std::make_shared<const std::vector<uint8_t>>(
+                begin, begin + size_t(width_) * height_ * 4);
+            frame_.nv12_width = scaled_even(width_, nv12_percent_);
+            frame_.nv12_height = scaled_even(height_, nv12_percent_);
+            frame_.desktop_updated = frame_.nv12_updated = true;
+            frame_.frame_number = ++frame_number_;
+            next_capture_ = capture_started + std::chrono::milliseconds(33);
+            return CaptureResult::Frame;
+        }
 
         context_->UpdateSubresource(texture_.get(), 0, nullptr, pixels_, width_ * 4u, 0);
         frame_.desktop_updated = true;
@@ -176,7 +194,7 @@ public:
     AdapterDevice adapter_device() const override {
         return AdapterDevice{device_.get(), vendor_id_, display_.adapter_luid};
     }
-    const char* implementation() const noexcept override { return "gdi"; }
+    const char* implementation() const noexcept override { return device_ ? "gdi" : "gdi-cpu"; }
 
     Error reinitialize() override {
         DisplayInfo refreshed = display_;
@@ -229,7 +247,7 @@ public:
 
 private:
     Error create_nv12_pass() {
-        if (!config_.nv12.enabled) return Error::success();
+        if (!device_ || !config_.nv12.enabled) return Error::success();
         auto next = std::make_unique<detail::Nv12Pass>();
         Error err = next->initialize(device_.get(), context_.get(), width_, height_,
                                      scaled_even(width_, nv12_percent_),
@@ -248,25 +266,6 @@ private:
         frame_.nv12_height = 0;
         frame_.nv12_surface_width = 0;
         frame_.nv12_surface_height = 0;
-    }
-
-    void draw_cursor() {
-        cursor_ = {};
-        if (!config_.capture_cursor) return;
-        CURSORINFO info{};
-        info.cbSize = sizeof(info);
-        if (!GetCursorInfo(&info) || (info.flags & CURSOR_SHOWING) == 0 || !info.hCursor) return;
-        if (info.ptScreenPos.x < display_.rect.left || info.ptScreenPos.x >= display_.rect.right ||
-            info.ptScreenPos.y < display_.rect.top || info.ptScreenPos.y >= display_.rect.bottom) {
-            return;
-        }
-        ICONINFO icon{};
-        if (!GetIconInfo(info.hCursor, &icon)) return;
-        const int x = info.ptScreenPos.x - display_.rect.left - static_cast<int>(icon.xHotspot);
-        const int y = info.ptScreenPos.y - display_.rect.top - static_cast<int>(icon.yHotspot);
-        DrawIconEx(memory_dc_, x, y, info.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
-        if (icon.hbmMask) DeleteObject(icon.hbmMask);
-        if (icon.hbmColor) DeleteObject(icon.hbmColor);
     }
 
     void release_gdi() {

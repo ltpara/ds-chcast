@@ -324,6 +324,13 @@ struct HostServerConfig {
                                                std::string*)> camera_capture_factory = create_camera_capturer;
     std::function<InputDesktopStatus()> desktop_status = input_desktop_status;
     std::function<bool(std::string*, bool*)> follow_desktop = follow_input_desktop;
+    // Called on a dedicated pointer thread; custom media backends can inject
+    // their own sampler without sharing capture/encoder thread state.
+    std::function<bool(const DisplayInfo&, CursorInfo&)> cursor_sampler =
+        [](const DisplayInfo& display, CursorInfo& cursor) {
+            std::string error;
+            return follow_input_desktop(&error) && sample_desktop_cursor(display, cursor);
+        };
     // The tray keeps its identity in the user's store; the Windows service
     // worker uses the machine store so the fingerprint survives logins.
     IdentityScope identity_scope = IdentityScope::CurrentUser;
@@ -570,6 +577,13 @@ public:
     // multi-viewer host triggers the lock. Safe to call from the UI thread.
     void set_lock_after_session_end(bool enabled);
 
+    // Host microphone an active voice call sends. Changing it restarts that
+    // call's capture on the new device without ending the call: the viewer
+    // keeps its decoder and sequence numbering. Empty selects the default
+    // communications device. Safe to call from the UI thread; a listener also
+    // shares the choice with its workers so every live call follows it.
+    void set_voice_microphone(const std::string& device_id);
+
     // Queues one file to send to the current viewer. Only valid while a viewer
     // is streaming and file transfer is allowed; the host thread hashes the
     // file off the frame loop, offers it and streams it in budgeted chunks.
@@ -678,6 +692,16 @@ private:
     void drain_voice_call(HostServerStats& stats);
     void stop_voice_call(HostServerStats& stats, const std::string& reason,
                          bool notify);
+    // Applies the operator's microphone choice to the running call. Called on
+    // the session thread from handle_voice_call_requests(); the UI thread only
+    // queues the choice.
+    void sync_voice_microphone(HostServerStats& stats);
+    void restart_voice_call_microphone(HostServerStats& stats);
+    // Opens and starts a voice-call capture. A pinned device that is missing
+    // falls back to the default communications device, and `device_id` is
+    // rewritten to the one actually opened.
+    std::unique_ptr<IMicrophoneCapture> create_voice_capture(std::string& device_id,
+                                                             std::string* error);
     bool send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left);
     // Answers every pending HostActionRequest. The permission and the control
     // lease are checked here, not in the transport, so a viewer learns why an
@@ -1069,6 +1093,11 @@ private:
     uint64_t voice_next_seq_ = 0;
     uint64_t voice_request_id_ = 0;
     uint64_t voice_send_drops_ = 0;
+    // Microphone chosen from the tray. The UI thread queues it here; the
+    // session thread swaps the capture and clears the pending flag.
+    std::mutex voice_microphone_mutex_;
+    std::string pending_voice_microphone_;
+    bool voice_microphone_pending_ = false;
 
     mutable std::mutex status_mutex_;
     HostStatus status_;

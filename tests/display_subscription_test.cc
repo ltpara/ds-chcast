@@ -164,6 +164,34 @@ void transport() {
     check(until([&] { return pair.viewer->take_capture_displays_result(initial); }) &&
           initial.request_id == 0 && initial.streams.size() == 1,
           "initial subscriptions sent immediately after HelloAck survive handshake delivery");
+    check(pair.viewer->request_screenshot(0).ok(), "request literal stream zero screenshot");
+    ScreenshotRequest shot_request;
+    check(until([&] { return pair.host->take_screenshot_request(shot_request); }) && shot_request.stream_id == 0,
+          "stream zero is distinct from current-screen sentinel");
+    ScreenshotResponse shot;
+    shot.request_id = shot_request.request_id; shot.stream_id = 0;
+    shot.width = 1920; shot.height = 1080;
+    shot.total = 2 * 1024 * 1024;
+    shot.count = (shot.total + kScreenshotChunkBytes - 1) / kScreenshotChunkBytes;
+    for (uint32_t index = 0; index < shot.count; ++index) {
+        shot.index = index;
+        shot.data.assign(std::min(kScreenshotChunkBytes, shot.total - index * kScreenshotChunkBytes),
+                         static_cast<uint8_t>(index));
+        check(until([&] { return pair.host->send_screenshot_response(shot).ok(); }),
+              "dedicated screenshot stream drains bounded chunks");
+        if (index == 0) {
+            ScreenshotResult incomplete;
+            check(!pair.viewer->take_screenshot(incomplete), "partial screenshot remains incomplete");
+            check(pair.host->send_chat("control during screenshot").ok(), "queue control after first screenshot chunk");
+            std::string chat;
+            check(until([&] { return pair.viewer->take_chat(chat); }) && chat == "control during screenshot",
+                  "control arrives while screenshot stream is still open");
+        }
+    }
+    ScreenshotResult picture;
+    check(until([&] { return pair.viewer->take_screenshot(picture); }) && picture.png.size() == shot.total &&
+          picture.png.front() == 0 && picture.png.back() == static_cast<uint8_t>(shot.count - 1),
+          "multi-megabyte screenshot assembles with correct bytes and stream identity");
     for (uint32_t i = 1; i <= 4; ++i) {
         CaptureDisplaysRequest request;
         request.request_id = i;

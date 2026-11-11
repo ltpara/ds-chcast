@@ -444,8 +444,23 @@ void test_show_cursor() {
     trailing.push_back(0);
     check(!chast::parse_show_cursor(trailing, got, &error),
           "ShowCursor with trailing bytes is rejected");
+    sent.visible = true;
+    sent.x = 40;
+    sent.y = 50;
+    sent.pressed = true;
+    check(chast::parse_show_cursor(payload_of(chast::make_show_cursor(sent)), got, &error) &&
+              got.pressed && got.visible && got.x == 40,
+          "ShowCursor round-trips a pressed hint");
+    sent.pressed = false;
+    check(chast::parse_show_cursor(payload_of(chast::make_show_cursor(sent)), got, &error) &&
+              !got.pressed,
+          "ShowCursor round-trips a press that already ended");
+    std::vector<uint8_t> pressed_hidden = payload;
+    pressed_hidden[8] = 0x02;
+    check(!chast::parse_show_cursor(pressed_hidden, got, &error),
+          "a pressed hint for a hidden cursor is rejected");
     std::vector<uint8_t> unknown_flags = payload;
-    unknown_flags[8] = 0x02;
+    unknown_flags[8] = 0x04;
     check(!chast::parse_show_cursor(unknown_flags, got, &error),
           "ShowCursor with unknown flags is rejected");
     std::vector<uint8_t> reserved = payload;
@@ -3327,6 +3342,106 @@ void test_voice_call() {
           "VoiceAudio without a packet is rejected");
 }
 
+void test_screenshot_messages() {
+    std::string error;
+    chast::ScreenshotRequest request;
+    request.request_id = 7;
+    const std::vector<uint8_t> encoded = chast::make_screenshot_request(request);
+    check(!encoded.empty() &&
+              encoded[6] == static_cast<uint8_t>(chast::ControlType::ScreenshotRequest),
+          "ScreenshotRequest names its control type");
+    chast::ScreenshotRequest request_out;
+    check(chast::parse_screenshot_request(payload_of(encoded), request_out, &error) &&
+              request_out.request_id == 7 && request_out.stream_id == chast::kScreenshotCurrentStream,
+          "ScreenshotRequest round-trips the focused stream");
+    request.stream_id = 3;
+    check(chast::parse_screenshot_request(
+              payload_of(chast::make_screenshot_request(request)), request_out, &error) &&
+              request_out.stream_id == 3,
+          "ScreenshotRequest round-trips an explicit stream");
+    request.request_id = 0;
+    check(chast::make_screenshot_request(request).empty(),
+          "ScreenshotRequest with request id 0 is not encoded");
+    std::vector<uint8_t> reserved = payload_of(encoded);
+    reserved[15] = 1;
+    check(!chast::parse_screenshot_request(reserved, request_out, &error),
+          "ScreenshotRequest with non-zero reserved bytes is rejected");
+    check(!chast::parse_screenshot_request(std::vector<uint8_t>(8, 0), request_out, &error),
+          "a truncated ScreenshotRequest is rejected");
+
+    const uint32_t total = chast::kScreenshotChunkBytes * 2 + 10;
+    chast::ScreenshotResponse first;
+    first.request_id = 7;
+    first.stream_id = 3;
+    first.width = 3840;
+    first.height = 2160;
+    first.total = total;
+    first.index = 0;
+    first.count = 3;
+    first.data.assign(chast::kScreenshotChunkBytes, 0x5A);
+    chast::ScreenshotResponse response_out;
+    check(chast::parse_screenshot_response(
+              payload_of(chast::make_screenshot_response(first)), response_out, &error) &&
+              response_out.request_id == 7 && response_out.stream_id == 3 &&
+              response_out.width == 3840 && response_out.height == 2160 &&
+              response_out.total == total && response_out.index == 0 &&
+              response_out.count == 3 && response_out.data == first.data &&
+              response_out.code == chast::ScreenshotCode::Ok,
+          "ScreenshotResponse round-trips the first slice");
+    chast::ScreenshotResponse last = first;
+    last.index = 2;
+    last.data.assign(10, 0x11);
+    check(chast::parse_screenshot_response(
+              payload_of(chast::make_screenshot_response(last)), response_out, &error) &&
+              response_out.index == 2 && response_out.data.size() == 10,
+          "ScreenshotResponse round-trips a short final slice");
+    chast::ScreenshotResponse wrong_slice = first;
+    wrong_slice.data.assign(100, 0);
+    check(chast::make_screenshot_response(wrong_slice).empty(),
+          "a ScreenshotResponse slice must fill its chunk");
+    chast::ScreenshotResponse bad_count = first;
+    bad_count.count = 4;
+    check(chast::make_screenshot_response(bad_count).empty(),
+          "a ScreenshotResponse chunk count must cover the PNG size");
+    chast::ScreenshotResponse too_large = first;
+    too_large.total = chast::kMaxScreenshotBytes + 1;
+    too_large.count = (too_large.total + chast::kScreenshotChunkBytes - 1) /
+                      chast::kScreenshotChunkBytes;
+    check(chast::make_screenshot_response(too_large).empty(),
+          "a ScreenshotResponse above the size bound is not encoded");
+
+    chast::ScreenshotResponse denied;
+    denied.request_id = 7;
+    denied.code = chast::ScreenshotCode::Denied;
+    denied.reason = "the display is not being streamed to this viewer";
+    check(chast::parse_screenshot_response(
+              payload_of(chast::make_screenshot_response(denied)), response_out, &error) &&
+              response_out.code == chast::ScreenshotCode::Denied &&
+              response_out.reason == denied.reason && response_out.data.empty() &&
+              response_out.total == 0,
+          "ScreenshotResponse round-trips a refusal");
+    chast::ScreenshotResponse with_pixels = denied;
+    with_pixels.total = 100;
+    with_pixels.count = 1;
+    with_pixels.data.assign(100, 0);
+    check(chast::make_screenshot_response(with_pixels).empty(),
+          "a refused ScreenshotResponse carries no picture");
+    std::vector<uint8_t> bad_code = payload_of(chast::make_screenshot_response(denied));
+    bad_code[8] = 9;
+    check(!chast::parse_screenshot_response(bad_code, response_out, &error),
+          "ScreenshotResponse with an unknown code is rejected");
+    std::vector<uint8_t> trailing = payload_of(chast::make_screenshot_response(denied));
+    trailing.push_back(0);
+    check(!chast::parse_screenshot_response(trailing, response_out, &error),
+          "ScreenshotResponse with trailing bytes is rejected");
+    chast::ScreenshotResponse long_reason = denied;
+    long_reason.reason.assign(chast::kMaxScreenshotReasonBytes + 40, 'x');
+    check(chast::parse_screenshot_response(
+              payload_of(chast::make_screenshot_response(long_reason)), response_out, &error) &&
+              response_out.reason.size() == chast::kMaxScreenshotReasonBytes,
+          "ScreenshotResponse truncates an overlong reason");
+}
+
 void test_cursor_update() {
     std::string error;
     chast::CursorUpdate update;
@@ -5037,6 +5152,7 @@ int main(int argc, char** argv) {
     test_terminal();
     test_camera();
     test_voice_call();
+    test_screenshot_messages();
     test_cursor_update();
     test_stream_info();
     test_input_events();

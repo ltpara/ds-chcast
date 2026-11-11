@@ -341,6 +341,16 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     unawaited(ViewerBridge.showCursor(x: x, y: y, visible: true));
   }
 
+  void _onCursorHintPress(Offset frame) {
+    if (!_showMyCursor || _texture == null) return;
+    final (int x, int y) = _point(frame);
+    _cursorHintSentMs = DateTime.now().millisecondsSinceEpoch;
+    _cursorHintOnHost = true;
+    unawaited(
+      ViewerBridge.showCursor(x: x, y: y, visible: true, pressed: true),
+    );
+  }
+
   void _hideCursorHint() {
     if (!_cursorHintOnHost) return;
     _cursorHintOnHost = false;
@@ -573,6 +583,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           onDevicePointer: _device,
                           onDeviceCancel: _device,
                           onCursorHint: _onCursorHint,
+                          onCursorHintPress: _onCursorHintPress,
                           onCursorHintExit: _hideCursorHint,
                         );
                       },

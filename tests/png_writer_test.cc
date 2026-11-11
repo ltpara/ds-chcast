@@ -134,6 +134,58 @@ void test_round_trip(const std::filesystem::path& directory) {
     }
 }
 
+void test_memory_encode(const std::filesystem::path& directory) {
+    constexpr uint32_t kWidth = 4;
+    constexpr uint32_t kHeight = 2;
+    std::vector<uint8_t> source(static_cast<size_t>(kWidth) * kHeight * 4);
+    for (uint32_t y = 0; y < kHeight; ++y) {
+        for (uint32_t x = 0; x < kWidth; ++x) {
+            uint8_t* pixel = source.data() + (static_cast<size_t>(y) * kWidth + x) * 4;
+            pixel[0] = static_cast<uint8_t>(30 + x * 10);
+            pixel[1] = static_cast<uint8_t>(60 + y * 20);
+            pixel[2] = static_cast<uint8_t>(90 + x * 5);
+            pixel[3] = 0;
+        }
+    }
+
+    std::vector<uint8_t> png;
+    std::string error;
+    check(chast::encode_png_bgra(source.data(), kWidth, kHeight, kWidth * 4, png, &error) &&
+              error.empty() && png.size() > 8 &&
+              std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8) == 0,
+          "a BGRA image is encoded to PNG bytes in memory");
+
+    const std::filesystem::path path = directory / "memory" / "shot.png";
+    check(chast::write_png_file(path.string(), png.data(), png.size(), &error) &&
+              error.empty() && std::filesystem::file_size(path) == png.size(),
+          "the encoded bytes are written to a file");
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> decoded;
+    check(decode_png(path, width, height, decoded, error) && width == kWidth &&
+              height == kHeight && decoded.size() == source.size() &&
+              decoded[0] == source[0] && decoded[1] == source[1] &&
+              decoded[2] == source[2] && decoded[3] == 0xFF,
+          "the in-memory PNG decodes to the encoded pixels");
+
+    std::vector<uint8_t> empty;
+    check(!chast::encode_png_bgra(nullptr, 1, 1, 4, empty, &error) && empty.empty() &&
+              !error.empty(),
+          "null pixels are not encoded");
+    check(!chast::encode_png_bgra(source.data(), 0, 1, 4, empty, &error) && !error.empty(),
+          "a zero width image is not encoded");
+    check(!chast::encode_png_bgra(source.data(), kWidth, kHeight, kWidth * 4 - 1, empty,
+                                  &error) && !error.empty(),
+          "a short stride is not encoded");
+    check(!chast::write_png_file("", png.data(), png.size(), &error) && !error.empty(),
+          "an empty PNG file name is refused");
+    check(!chast::write_png_file(path.string(), nullptr, 4, &error) && !error.empty(),
+          "null PNG bytes are refused");
+    check(!chast::write_png_file(path.string(), png.data(), 0, &error) && !error.empty(),
+          "empty PNG bytes are refused");
+}
+
 void test_unicode_directory(const std::filesystem::path& directory) {
     const uint8_t source[4] = {0x7F, 0x40, 0x20, 0};
     const std::filesystem::path path = directory / L"截图" / L"shot.png";
@@ -188,6 +240,7 @@ int main() {
     test_validation();
     if (!directory.empty()) {
         test_round_trip(directory);
+        test_memory_encode(directory);
         test_unicode_directory(directory);
     } else {
         std::printf("FAIL could not create a temp directory\n");

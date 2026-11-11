@@ -3,6 +3,84 @@
 #include <algorithm>
 #include <cstring>
 
+namespace chast {
+bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor) {
+    CURSORINFO info{sizeof(info)};
+    if (!GetCursorInfo(&info)) return false;
+    CursorInfo next;
+    next.position_valid = true;
+    next.visible = (info.flags & CURSOR_SHOWING) && info.hCursor &&
+        info.ptScreenPos.x >= display.rect.left && info.ptScreenPos.x < display.rect.right &&
+        info.ptScreenPos.y >= display.rect.top && info.ptScreenPos.y < display.rect.bottom;
+    next.position = {info.ptScreenPos.x - display.rect.left, info.ptScreenPos.y - display.rect.top};
+    if (info.hCursor) {
+        ICONINFO icon{};
+        if (!GetIconInfo(info.hCursor, &icon)) return false;
+        struct Bitmaps {
+            HBITMAP color, mask;
+            ~Bitmaps() { if (color) DeleteObject(color); if (mask) DeleteObject(mask); }
+        } bitmaps{icon.hbmColor, icon.hbmMask};
+        BITMAP size{};
+        if (!GetObjectW(icon.hbmColor ? icon.hbmColor : icon.hbmMask, sizeof(size), &size)) return false;
+        const UINT width = size.bmWidth;
+        const UINT height = icon.hbmColor ? size.bmHeight : size.bmHeight / 2;
+        if (!width || !height || width > 510 || height > 510) return false;
+        HDC dc = CreateCompatibleDC(nullptr);
+        if (!dc) return false;
+        BITMAPINFO format{};
+        format.bmiHeader = {sizeof(BITMAPINFOHEADER), static_cast<LONG>(width),
+            -static_cast<LONG>(height), 1, 32, BI_RGB};
+        void* pixels = nullptr;
+        HBITMAP dib = CreateDIBSection(dc, &format, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        if (!dib) { DeleteDC(dc); return false; }
+        const auto previous = SelectObject(dc, dib);
+        const size_t bytes = static_cast<size_t>(width) * height * 4;
+        std::memset(pixels, 0, bytes);
+        const bool black_ok = DrawIconEx(dc, 0, 0, info.hCursor, width, height, 0, nullptr, DI_NORMAL) != FALSE;
+        GdiFlush();
+        detail::CursorBitmap bitmap;
+        bitmap.width = width; bitmap.height = height;
+        bitmap.color.assign(static_cast<uint8_t*>(pixels), static_cast<uint8_t*>(pixels) + bytes);
+        bitmap.invert.resize(bytes / 4);
+        std::memset(pixels, 255, bytes);
+        const bool white_ok = DrawIconEx(dc, 0, 0, info.hCursor, width, height, 0, nullptr, DI_NORMAL) != FALSE;
+        GdiFlush();
+        const auto* white = static_cast<const uint8_t*>(pixels);
+        for (size_t i = 0; i < bytes / 4; ++i) {
+            auto* black = bitmap.color.data() + i * 4;
+            const int difference = int(white[i * 4]) - black[0];
+            if (difference < 0) {
+                bitmap.invert[i] = 1;
+                std::memset(black, 0, 4);
+            } else black[3] = static_cast<uint8_t>(255 - difference);
+        }
+        SelectObject(dc, previous); DeleteObject(dib); DeleteDC(dc);
+        if (!black_ok || !white_ok) return false;
+        detail::CursorBitmap outlined;
+        if (detail::outline_cursor(bitmap, width, height, outlined)) {
+            bitmap = std::move(outlined);
+            next.origin_offset = {1, 1};
+        }
+        // GetCursorInfo reports the screen hotspot. Preserve that coordinate:
+        // viewers subtract the sprite hotspot (including the outline offset).
+        next.hotspot = {static_cast<LONG>(icon.xHotspot) + next.origin_offset.x,
+                        static_cast<LONG>(icon.yHotspot) + next.origin_offset.y};
+        next.width = bitmap.width; next.height = bitmap.height; next.pitch = next.width * 4;
+        next.bitmap = std::move(bitmap.color); next.invert = std::move(bitmap.invert);
+        next.outlined = bitmap.outlined;
+        next.shape_type = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
+        next.shape_valid = true;
+        next.content_id = detail::cursor_content_id(next.width, next.height, next.hotspot, next.bitmap);
+        detail::cursor_shape_cache().put(next);
+    }
+    next.revision = cursor.revision + (next.position.x != cursor.position.x ||
+        next.position.y != cursor.position.y || next.visible != cursor.visible ||
+        next.content_id != cursor.content_id || next.position_valid != cursor.position_valid);
+    cursor = std::move(next);
+    return true;
+}
+} // namespace chast
+
 namespace chast::detail {
 
 // Pointer decoding. DXGI reports pointer shapes in three formats whose alpha

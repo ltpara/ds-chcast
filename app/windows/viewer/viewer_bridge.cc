@@ -1528,14 +1528,18 @@ void ViewerBridge::HandleMethodCall(
         int64_t x = 0;
         int64_t y = 0;
         bool visible = false;
+        bool pressed = false;
         if (args == nullptr || !map_int(*args, "x", &x) || !map_int(*args, "y", &y) ||
             !map_bool(*args, "visible", &visible) || x < INT32_MIN || x > INT32_MAX ||
             y < INT32_MIN || y > INT32_MAX) {
             result->Error("bad_args", "showCursor wants x, y and visible");
             return;
         }
+        // Older Dart callers send only the pointer position; a missing press
+        // flag means "no click edge".
+        (void)map_bool(*args, "pressed", &pressed);
         const bool queued = viewer_ != nullptr && viewer_->ShowCursor(
-            static_cast<int32_t>(x), static_cast<int32_t>(y), visible);
+            static_cast<int32_t>(x), static_cast<int32_t>(y), visible, pressed);
         result->Success(flutter::EncodableValue(queued));
         return;
     }

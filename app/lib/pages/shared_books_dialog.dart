@@ -34,6 +34,28 @@ typedef SharedBooksLoader =
       ServerSettings settings,
       String token,
     );
+typedef ShareTargetAction =
+    Future<AddressBookGrant> Function(
+      ServerSettings settings,
+      String token,
+      String kind,
+      String targetId, {
+      String permission,
+      String groupId,
+    });
+typedef TargetRevokeAction =
+    Future<void> Function(
+      ServerSettings settings,
+      String token,
+      String kind,
+      String targetId, {
+      String? groupId,
+    });
+typedef AccountGroupsLoader =
+    Future<List<ServerAccountGroup>> Function(
+      ServerSettings settings,
+      String token,
+    );
 typedef SharedPeerUpdater =
     Future<AddressBookPeer> Function(
       ServerSettings settings,
@@ -109,6 +131,9 @@ class SharedBooksDialog extends StatefulWidget {
     this.loadGrants,
     this.share,
     this.revoke,
+    this.shareTarget,
+    this.revokeTarget,
+    this.loadAccountGroups,
     this.loadBooks,
     this.updatePeer,
     this.deletePeer,
@@ -127,6 +152,9 @@ class SharedBooksDialog extends StatefulWidget {
   final SharedGrantsLoader? loadGrants;
   final SharedGrantAction? share;
   final SharedRevokeAction? revoke;
+  final ShareTargetAction? shareTarget;
+  final TargetRevokeAction? revokeTarget;
+  final AccountGroupsLoader? loadAccountGroups;
   final SharedBooksLoader? loadBooks;
   final SharedPeerUpdater? updatePeer;
   final SharedPeerDeleter? deletePeer;
@@ -146,6 +174,10 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   List<SharedAddressBook> _books = const <SharedAddressBook>[];
   String _permission = 'read';
   String _scopeGroup = '';
+  String _targetKind = 'user';
+  String _targetGroup = '';
+  List<ServerAccountGroup> _accountGroups = const <ServerAccountGroup>[];
+  bool _groupsLoading = false;
   bool _loading = true;
   bool _busy = false;
   String _error = '';
@@ -165,6 +197,28 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
       return tr('整本地址簿');
     }
     return tr('分组 {p1}', <String, Object?>{'p1': _groupName(grant.groupId)});
+  }
+
+  String _grantTargetLabel(AddressBookGrant grant) {
+    if (grant.targetKind == 'everyone') {
+      return tr('所有账号');
+    }
+    if (grant.targetKind == 'group') {
+      return tr('账号组 · {p1}', <String, Object?>{
+        'p1': grant.targetName.isEmpty ? grant.targetId : grant.targetName,
+      });
+    }
+    return grant.username;
+  }
+
+  IconData _grantTargetIcon(AddressBookGrant grant) {
+    if (grant.targetKind == 'everyone') {
+      return Icons.groups_rounded;
+    }
+    if (grant.targetKind == 'group') {
+      return Icons.group_work_outlined;
+    }
+    return Icons.person_outline_rounded;
   }
 
   bool _canWritePeer(SharedAddressBook book, AddressBookPeer peer) {
@@ -283,6 +337,23 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   }
 
   Future<void> _share() async {
+    if (_targetKind != 'user') {
+      if (_targetKind == 'group' && _targetGroup.isEmpty) {
+        setState(() => _error = tr('请选择账号组'));
+        return;
+      }
+      await _perform(() async {
+        await (widget.shareTarget ?? ServerApi.shareAddressBookTarget)(
+          widget.server,
+          widget.account.token,
+          _targetKind,
+          _targetKind == 'group' ? _targetGroup : '',
+          permission: _permission,
+          groupId: _scopeGroup,
+        );
+      }, tr('共享失败'));
+      return;
+    }
     final String username = _username.text.trim();
     if (username.isEmpty) {
       setState(() => _error = tr('请输入要共享的用户名'));
@@ -300,11 +371,56 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
     }, tr('共享失败'));
   }
 
+  Future<void> _loadGroups() async {
+    if (_groupsLoading) {
+      return;
+    }
+    setState(() => _groupsLoading = true);
+    try {
+      final List<ServerAccountGroup> groups =
+          await (widget.loadAccountGroups ?? ServerApi.accountGroups)(
+            widget.server,
+            widget.account.token,
+          );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _accountGroups = groups;
+        _groupsLoading = false;
+        if (_targetGroup.isEmpty && groups.isNotEmpty) {
+          _targetGroup = groups.first.id;
+        }
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _groupsLoading = false;
+        _error = tr('读取账号组失败：{error}', <String, Object?>{'error': error});
+      });
+    }
+  }
+
   Future<void> _changePermission(
     AddressBookGrant grant,
     String permission,
   ) async {
     if (permission == grant.permission) {
+      return;
+    }
+    if (grant.isTarget) {
+      await _perform(() async {
+        await (widget.shareTarget ?? ServerApi.shareAddressBookTarget)(
+          widget.server,
+          widget.account.token,
+          grant.targetKind,
+          grant.targetId,
+          permission: permission,
+          groupId: grant.groupId,
+        );
+      }, tr('修改权限失败'));
       return;
     }
     await _perform(() async {
@@ -319,6 +435,18 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   }
 
   Future<void> _revoke(AddressBookGrant grant) async {
+    if (grant.isTarget) {
+      await _perform(() async {
+        await (widget.revokeTarget ?? ServerApi.unshareAddressBookTarget)(
+          widget.server,
+          widget.account.token,
+          grant.targetKind,
+          grant.targetId,
+          groupId: grant.groupId,
+        );
+      }, tr('撤销共享失败'));
+      return;
+    }
     await _perform(() async {
       await (widget.revoke ?? ServerApi.unshareAddressBook)(
         widget.server,
@@ -737,12 +865,12 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                           ListTile(
                             dense: true,
                             contentPadding: EdgeInsets.zero,
-                            leading: const Icon(
-                              Icons.person_outline_rounded,
+                            leading: Icon(
+                              _grantTargetIcon(grant),
                               size: 18,
                             ),
                             title: Text(
-                              grant.username,
+                              _grantTargetLabel(grant),
                               style: const TextStyle(fontSize: 12.5),
                             ),
                             subtitle: Text(
@@ -755,7 +883,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               children: <Widget>[
                                 DropdownButton<String>(
                                   key: Key(
-                                    'shared-permission-${grant.username}'
+                                    'shared-permission-${grant.keySuffix}'
                                     '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
                                   ),
                                   value: grant.permission,
@@ -784,7 +912,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                 ),
                                 IconButton(
                                   key: Key(
-                                    'shared-revoke-${grant.username}'
+                                    'shared-revoke-${grant.keySuffix}'
                                     '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
                                   ),
                                   tooltip: tr('撤销共享'),
@@ -841,27 +969,121 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
-                          Expanded(
-                            child: TextField(
-                              key: const Key('shared-username'),
-                              controller: _username,
-                              autocorrect: false,
-                              enableSuggestions: false,
-                              decoration: InputDecoration(
-                                isDense: true,
-                                labelText: tr('共享给用户名'),
-                                prefixIcon: Icon(
-                                  Icons.person_add_alt_1,
-                                  size: 17,
-                                ),
-                              ),
-                              onSubmitted: (_) {
-                                if (!_busy) {
-                                  _share();
-                                }
-                              },
-                            ),
+                          Text(
+                            tr('共享对象'),
+                            style: mutedStyle(context, size: 11.5),
                           ),
+                          const SizedBox(width: 8),
+                          DropdownButton<String>(
+                            key: const Key('shared-target'),
+                            value: _targetKind,
+                            underline: const SizedBox.shrink(),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            items: <DropdownMenuItem<String>>[
+                              DropdownMenuItem<String>(
+                                value: 'user',
+                                child: Text(tr('用户')),
+                              ),
+                              DropdownMenuItem<String>(
+                                value: 'group',
+                                child: Text(tr('账号组')),
+                              ),
+                              DropdownMenuItem<String>(
+                                value: 'everyone',
+                                child: Text(tr('所有账号')),
+                              ),
+                            ],
+                            onChanged: _busy
+                                ? null
+                                : (String? value) {
+                                    if (value == null) {
+                                      return;
+                                    }
+                                    setState(() => _targetKind = value);
+                                    if (value == 'group' &&
+                                        _accountGroups.isEmpty) {
+                                      _loadGroups();
+                                    }
+                                  },
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: <Widget>[
+                          if (_targetKind == 'user')
+                            Expanded(
+                              child: TextField(
+                                key: const Key('shared-username'),
+                                controller: _username,
+                                autocorrect: false,
+                                enableSuggestions: false,
+                                decoration: InputDecoration(
+                                  isDense: true,
+                                  labelText: tr('共享给用户名'),
+                                  prefixIcon: Icon(
+                                    Icons.person_add_alt_1,
+                                    size: 17,
+                                  ),
+                                ),
+                                onSubmitted: (_) {
+                                  if (!_busy) {
+                                    _share();
+                                  }
+                                },
+                              ),
+                            )
+                          else if (_targetKind == 'group')
+                            Expanded(
+                              child: _groupsLoading
+                                  ? Text(
+                                      tr('正在读取账号组…'),
+                                      style: mutedStyle(context, size: 12),
+                                    )
+                                  : DropdownButton<String>(
+                                      key: const Key('shared-target-group'),
+                                      value: _accountGroups.any(
+                                        (ServerAccountGroup group) =>
+                                            group.id == _targetGroup,
+                                      )
+                                          ? _targetGroup
+                                          : null,
+                                      isExpanded: true,
+                                      underline: const SizedBox.shrink(),
+                                      hint: Text(tr('选择账号组')),
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: theme.colorScheme.onSurface,
+                                      ),
+                                      items: <DropdownMenuItem<String>>[
+                                        for (final ServerAccountGroup group
+                                            in _accountGroups)
+                                          DropdownMenuItem<String>(
+                                            value: group.id,
+                                            child: Text(group.label),
+                                          ),
+                                      ],
+                                      onChanged: _busy
+                                          ? null
+                                          : (String? value) {
+                                              if (value != null) {
+                                                setState(
+                                                  () => _targetGroup = value,
+                                                );
+                                              }
+                                            },
+                                    ),
+                            )
+                          else
+                            Expanded(
+                              child: Text(
+                                tr('服务器上的每个账号都能读取这本地址簿；可随时撤销。'),
+                                style: mutedStyle(context, size: 11.5),
+                              ),
+                            ),
                           const SizedBox(width: 8),
                           DropdownButton<String>(
                             key: const Key('shared-permission'),

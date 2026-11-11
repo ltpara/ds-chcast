@@ -1499,8 +1499,18 @@ u16 权限掩码在 `kPermissionRemoteConfig = 0x8000` 之后已经没有空闲�
   关闭或偏好切到关闭时发送隐藏。自动化：`chast-protocol-test` 的往返/负坐标/
   隐藏/截断/尾随/未知标志/保留位用例；`display_window_preferences_test` 断言
   独立显示器窗口的精确桌面坐标、离开隐藏和偏好关闭后停发；`flutter analyze`
-  无问题；`display_menu` 与 `view_prefs` 定向 57/57。边界：RustDesk 式白板绘制未实现；覆盖层在真实
+  无问题；`display_menu` 与 `view_prefs` 定向 57/57。边界：自由标注绘制未实现；覆盖层在真实
   多屏、混合 DPI 和负坐标下的目视位置，以及 Windows 10 实机，待人工验证。
+- **G21 协作光标补强（v71）**：`ShowCursor` 增加按下边沿标志（flags bit1，
+  仅可见时合法，未知位拒绝），它不是按住状态；查看端在按下瞬间绕过节流
+  发送一次，主机覆盖层按查看端设备名哈希取色、在提示旁绘制姓名标签，并在
+  点击处播放 420 ms 扩散波纹（纹理由 `SetTimer` 驱动，覆盖层仍分层、点击
+  穿透、不激活）。逐像素绘制抽成 `src/win/cursor_hint_paint.cc`，新增
+  `cursor_hint` 测试覆盖取色稳定性、表面布局、预乘 alpha 不变量、波纹环
+  位置/消隐和姓名阴影；`protocol` 增加按下边沿往返与“隐藏+按下”拒绝用例。
+  自动化：`chast-protocol-test`、`chast-cursor-hint-test`、`host_multi`、
+  `host_control`、`quic_stream_options` 5/5，Windows 原生与观看端 Release
+  构建通过。
 - **G22 主机语音麦克风选择**：`host.ini` 新增 `voice_microphone=`（空表示
   跟随系统默认通信麦克风）。安全设置“高级”页新增下拉与刷新，托盘新增
   “上行语音麦克风”子菜单；两份入口都保留已拔出但仍固定的设备 ID，

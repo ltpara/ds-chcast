@@ -85,6 +85,49 @@ void main() {
     expect((await store.load()).single.tags, isEmpty);
   });
 
+  test('a note survives a reload, is cleaned and can be cleared', () async {
+    await store.save(
+      Device(
+        id: 'devbox',
+        server: 'http://127.0.0.1:8443',
+        note: '  机柜\u0000 A3 ',
+        addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+      ),
+    );
+    final Device saved = (await store.load()).single;
+    expect(saved.note, '机柜 A3');
+    expect(saved.noteCleared, isFalse);
+
+    await store.updateNote(saved.key, '  三层机房 12U ');
+    final Device updated = (await store.load()).single;
+    expect(updated.note, '三层机房 12U');
+    expect(updated.noteCleared, isFalse);
+
+    await store.updateNote(saved.key, '   ');
+    final Device cleared = (await store.load()).single;
+    expect(cleared.note, isEmpty);
+    expect(cleared.noteCleared, isTrue);
+  });
+
+  test('touch keeps the note of an existing saved entry', () async {
+    await store.save(
+      Device(
+        id: 'devbox',
+        server: 'http://127.0.0.1:8443',
+        note: '财务部专用',
+        addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+      ),
+    );
+    await store.touch(
+      Device(
+        id: 'devbox',
+        server: 'http://127.0.0.1:8443',
+        addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+      ),
+    );
+    expect((await store.load()).single.note, '财务部专用');
+  });
+
   test('touch keeps the tags of an existing saved entry', () async {
     await store.save(
       Device(

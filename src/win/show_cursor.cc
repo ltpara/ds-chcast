@@ -6,10 +6,15 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <thread>
+#include <vector>
+
+#include "win/cursor_hint_paint.h"
 
 namespace chast {
 
@@ -24,99 +29,48 @@ constexpr DWORD kDefaultDesktopAccess =
 
 constexpr UINT kMoveMessage = WM_APP + 0x61;
 constexpr UINT kHideMessage = WM_APP + 0x62;
-constexpr BYTE kHintAlpha = 235;
+constexpr UINT_PTR kRippleTimer = 0x61;
+constexpr int kRippleDurationMs = 420;
+constexpr int kRippleFrameMs = 15;
+constexpr int kMaxLabelChars = 48;
 
 struct MoveRequest {
     int32_t x;
     int32_t y;
+    bool pressed;
     std::string* error;
 };
 
-// The arrow is painted into a 32bpp DIB and handed to the window with
-// UpdateLayeredWindow, so every pixel outside the shape is fully transparent.
-// SetLayeredWindowAttributes with LWA_ALPHA cannot do that: it tints the whole
-// window rectangle and leaves a black square behind the icon.
-constexpr int kDesignSize = 32;
-constexpr int kSamplesPerAxis = 4;
-constexpr double kOutlineWidth = 1.4;
-
-// Design-space arrow polygon, tip first, in the 32x32 cursor grid Windows
-// uses at 100% scaling.
-constexpr double kArrow[7][2] = {
-    {1.5, 1.0},  {1.5, 23.0}, {7.0, 17.5}, {11.0, 27.5},
-    {15.5, 25.5}, {11.5, 16.0}, {19.0, 16.0},
+struct LabelRaster {
+    std::vector<uint8_t> mask;
+    int width = 0;
+    int height = 0;
 };
 
-bool point_in_polygon(double x, double y) {
-    constexpr int kVertices = 7;
-    bool inside = false;
-    for (int i = 0, j = kVertices - 1; i < kVertices; j = i++) {
-        const double xi = kArrow[i][0];
-        const double yi = kArrow[i][1];
-        const double xj = kArrow[j][0];
-        const double yj = kArrow[j][1];
-        if (((yi > y) != (yj > y)) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
-            inside = !inside;
+std::wstring to_wide_label(const std::string& label) {
+    if (label.empty()) {
+        return {};
+    }
+    const int size =
+        MultiByteToWideChar(CP_UTF8, 0, label.data(), static_cast<int>(label.size()), nullptr, 0);
+    if (size <= 0) {
+        return {};
+    }
+    std::wstring text(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, label.data(), static_cast<int>(label.size()), text.data(),
+                        size);
+    std::wstring cleaned;
+    cleaned.reserve(std::min<size_t>(text.size(), kMaxLabelChars));
+    for (const wchar_t character : text) {
+        if (character < 0x20 || character == 0x7f) {
+            continue;
+        }
+        cleaned.push_back(character);
+        if (cleaned.size() >= kMaxLabelChars) {
+            break;
         }
     }
-    return inside;
-}
-
-double segment_distance(double x, double y, double x1, double y1, double x2, double y2) {
-    const double dx = x2 - x1;
-    const double dy = y2 - y1;
-    const double length_sq = dx * dx + dy * dy;
-    double t = length_sq > 0.0 ? ((x - x1) * dx + (y - y1) * dy) / length_sq : 0.0;
-    if (t < 0.0) t = 0.0;
-    if (t > 1.0) t = 1.0;
-    const double offset_x = x1 + t * dx - x;
-    const double offset_y = y1 + t * dy - y;
-    return std::sqrt(offset_x * offset_x + offset_y * offset_y);
-}
-
-double outline_distance(double x, double y) {
-    constexpr int kVertices = 7;
-    double nearest = segment_distance(x, y, kArrow[0][0], kArrow[0][1], kArrow[1][0],
-                                      kArrow[1][1]);
-    for (int i = 1; i < kVertices; ++i) {
-        const int j = (i + 1) % kVertices;
-        const double distance =
-            segment_distance(x, y, kArrow[i][0], kArrow[i][1], kArrow[j][0], kArrow[j][1]);
-        if (distance < nearest) {
-            nearest = distance;
-        }
-    }
-    return nearest;
-}
-
-void paint_arrow(void* raw_bits, int width, int height) {
-    auto* bits = static_cast<uint32_t*>(raw_bits);
-    constexpr int kSamples = kSamplesPerAxis * kSamplesPerAxis;
-    const double scale_x = static_cast<double>(kDesignSize) / width;
-    const double scale_y = static_cast<double>(kDesignSize) / height;
-    for (int py = 0; py < height; ++py) {
-        for (int px = 0; px < width; ++px) {
-            int covered = 0;
-            int white = 0;
-            for (int sy = 0; sy < kSamplesPerAxis; ++sy) {
-                for (int sx = 0; sx < kSamplesPerAxis; ++sx) {
-                    const double x = (px + (sx + 0.5) / kSamplesPerAxis) * scale_x;
-                    const double y = (py + (sy + 0.5) / kSamplesPerAxis) * scale_y;
-                    if (!point_in_polygon(x, y)) {
-                        continue;
-                    }
-                    ++covered;
-                    if (outline_distance(x, y) >= kOutlineWidth) {
-                        ++white;
-                    }
-                }
-            }
-            // Premultiplied BGRA: white fill, black stroke, nothing outside.
-            const uint32_t alpha = static_cast<uint32_t>(kHintAlpha) * covered / kSamples;
-            const uint32_t color = static_cast<uint32_t>(kHintAlpha) * white / kSamples;
-            bits[py * width + px] = (alpha << 24) | (color << 16) | (color << 8) | color;
-        }
-    }
+    return cleaned;
 }
 
 std::string win32_error(DWORD code) {
@@ -146,6 +100,74 @@ std::string win32_error(DWORD code) {
     return out;
 }
 
+// Renders the viewer name as white text on black and keeps the red channel as
+// glyph coverage. GDI writes no alpha into a DIB, so the painter tints the
+// mask instead of copying the pixels.
+bool render_label(const std::wstring& text, int font_height, LabelRaster* out,
+                  std::string* error) {
+    if (text.empty()) {
+        return true;
+    }
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (dc == nullptr) {
+        *error = "CreateCompatibleDC: " + win32_error(GetLastError());
+        return false;
+    }
+    HFONT font = CreateFontW(-font_height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (font == nullptr) {
+        *error = "CreateFontW: " + win32_error(GetLastError());
+        DeleteDC(dc);
+        return false;
+    }
+    const HGDIOBJ previous_font = SelectObject(dc, font);
+    SIZE extent{};
+    if (!GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &extent) ||
+        extent.cx <= 0 || extent.cy <= 0 || extent.cx > 4096 || extent.cy > 256) {
+        *error = "the viewer name cannot be measured";
+        SelectObject(dc, previous_font);
+        DeleteObject(font);
+        DeleteDC(dc);
+        return false;
+    }
+    const int width = extent.cx + 2;
+    const int height = extent.cy + 2;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        *error = "CreateDIBSection: " + win32_error(GetLastError());
+        SelectObject(dc, previous_font);
+        DeleteObject(font);
+        DeleteDC(dc);
+        return false;
+    }
+    const HGDIOBJ previous_bitmap = SelectObject(dc, bitmap);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    TextOutW(dc, 1, 1, text.c_str(), static_cast<int>(text.size()));
+    out->width = width;
+    out->height = height;
+    out->mask.resize(static_cast<size_t>(width) * height);
+    const auto* pixels = static_cast<const uint32_t*>(bits);
+    for (size_t i = 0; i < out->mask.size(); ++i) {
+        out->mask[i] = static_cast<uint8_t>((pixels[i] >> 16) & 0xFFu);
+    }
+    SelectObject(dc, previous_bitmap);
+    DeleteObject(bitmap);
+    SelectObject(dc, previous_font);
+    DeleteObject(font);
+    DeleteDC(dc);
+    return true;
+}
+
 }  // namespace
 
 struct CursorHintOverlay::Impl {
@@ -158,12 +180,24 @@ struct CursorHintOverlay::Impl {
     HDC surface_dc = nullptr;
     HBITMAP surface_bitmap = nullptr;
     HGDIOBJ previous_bitmap = nullptr;
+    void* surface_bits = nullptr;
     int cursor_width = 0;
     int cursor_height = 0;
     POINT hotspot{};
+    CursorHintLayout layout;
+    uint32_t color = 0xFFFFFF;
+    LabelRaster label;
 
-    void run();
-    bool move(HWND hwnd, int32_t x, int32_t y, std::string* error);
+    int32_t position_x = 0;
+    int32_t position_y = 0;
+    bool ripple_active = false;
+    std::chrono::steady_clock::time_point ripple_start{};
+
+    void run(std::wstring label_text, std::string label_key);
+    bool place(HWND hwnd, int32_t x, int32_t y, bool pressed, std::string* error);
+    double ripple_progress() const;
+    bool render(HWND hwnd, double ripple, std::string* error);
+    void tick(HWND hwnd);
     void hide(HWND hwnd);
     void release_surface();
 
@@ -183,28 +217,30 @@ void CursorHintOverlay::Impl::release_surface() {
     surface_dc = nullptr;
     surface_bitmap = nullptr;
     previous_bitmap = nullptr;
+    surface_bits = nullptr;
 }
 
-bool CursorHintOverlay::Impl::move(HWND hwnd, int32_t x, int32_t y, std::string* error) {
-    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    constexpr int kMaxVirtualExtent = 32768;
-    constexpr int kMaxVirtualOffset = 65536;
-    if (width <= 0 || height <= 0 || width > kMaxVirtualExtent ||
-        height > kMaxVirtualExtent || left < -kMaxVirtualOffset ||
-        left > kMaxVirtualOffset || top < -kMaxVirtualOffset || top > kMaxVirtualOffset) {
-        *error = "the virtual desktop metrics are unavailable";
-        return false;
-    }
-    if (x < left) x = left;
-    if (y < top) y = top;
-    if (x > left + width - 1) x = left + width - 1;
-    if (y > top + height - 1) y = top + height - 1;
+bool CursorHintOverlay::Impl::render(HWND hwnd, double ripple, std::string* error) {
+    CursorHintSurface surface;
+    surface.width = layout.width;
+    surface.height = layout.height;
+    surface.arrow_x = layout.arrow_x;
+    surface.arrow_y = layout.arrow_y;
+    surface.arrow_width = cursor_width;
+    surface.arrow_height = cursor_height;
+    surface.tip_x = layout.tip_x;
+    surface.tip_y = layout.tip_y;
+    surface.color = color;
+    surface.ripple = ripple;
+    surface.label_mask = label.mask.empty() ? nullptr : label.mask.data();
+    surface.label_width = label.width;
+    surface.label_height = label.height;
+    surface.label_x = layout.label_x;
+    surface.label_y = layout.label_y;
+    paint_cursor_hint(static_cast<uint32_t*>(surface_bits), surface);
 
-    POINT destination{x - hotspot.x, y - hotspot.y};
-    SIZE size{cursor_width, cursor_height};
+    POINT destination{position_x - layout.tip_x, position_y - layout.tip_y};
+    SIZE size{layout.width, layout.height};
     POINT source{0, 0};
     BLENDFUNCTION blend{};
     blend.BlendOp = AC_SRC_OVER;
@@ -234,12 +270,72 @@ bool CursorHintOverlay::Impl::move(HWND hwnd, int32_t x, int32_t y, std::string*
     return true;
 }
 
+double CursorHintOverlay::Impl::ripple_progress() const {
+    if (!ripple_active) {
+        return -1.0;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - ripple_start)
+                             .count();
+    return std::min(1.0, static_cast<double>(elapsed) / kRippleDurationMs);
+}
+
+bool CursorHintOverlay::Impl::place(HWND hwnd, int32_t x, int32_t y, bool pressed,
+                                    std::string* error) {
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    constexpr int kMaxVirtualExtent = 32768;
+    constexpr int kMaxVirtualOffset = 65536;
+    if (width <= 0 || height <= 0 || width > kMaxVirtualExtent ||
+        height > kMaxVirtualExtent || left < -kMaxVirtualOffset ||
+        left > kMaxVirtualOffset || top < -kMaxVirtualOffset || top > kMaxVirtualOffset) {
+        *error = "the virtual desktop metrics are unavailable";
+        return false;
+    }
+    if (x < left) x = left;
+    if (y < top) y = top;
+    if (x > left + width - 1) x = left + width - 1;
+    if (y > top + height - 1) y = top + height - 1;
+    position_x = x;
+    position_y = y;
+    // A click restarts the wave even if the previous one is still fading; the
+    // following moves keep it running, so the ring follows the pointer.
+    if (pressed) {
+        ripple_active = true;
+        ripple_start = std::chrono::steady_clock::now();
+        SetTimer(hwnd, kRippleTimer, kRippleFrameMs, nullptr);
+    }
+    return render(hwnd, ripple_progress(), error);
+}
+
+void CursorHintOverlay::Impl::tick(HWND hwnd) {
+    if (!ripple_active) {
+        KillTimer(hwnd, kRippleTimer);
+        return;
+    }
+    const double progress = ripple_progress();
+    std::string error;
+    if (!render(hwnd, progress, &error)) {
+        ripple_active = false;
+        KillTimer(hwnd, kRippleTimer);
+        return;
+    }
+    if (progress >= 1.0) {
+        ripple_active = false;
+        KillTimer(hwnd, kRippleTimer);
+    }
+}
+
 void CursorHintOverlay::Impl::hide(HWND hwnd) {
+    KillTimer(hwnd, kRippleTimer);
+    ripple_active = false;
     ShowWindow(hwnd, SW_HIDE);
     visible = false;
 }
 
-void CursorHintOverlay::Impl::run() {
+void CursorHintOverlay::Impl::run(std::wstring label_text, std::string label_key) {
     HDESK desktop = OpenDesktopW(L"Default", 0, FALSE, kDefaultDesktopAccess);
     if (desktop == nullptr) {
         create_error = "OpenDesktopW(Default): " + win32_error(GetLastError());
@@ -257,10 +353,21 @@ void CursorHintOverlay::Impl::run() {
 
     cursor_width = GetSystemMetrics(SM_CXCURSOR);
     cursor_height = GetSystemMetrics(SM_CYCURSOR);
-    if (cursor_width <= 0) cursor_width = kDesignSize;
-    if (cursor_height <= 0) cursor_height = kDesignSize;
-    hotspot = POINT{static_cast<LONG>(std::lround(1.5 * cursor_width / kDesignSize)),
-                    static_cast<LONG>(std::lround(1.0 * cursor_height / kDesignSize))};
+    if (cursor_width <= 0) cursor_width = 32;
+    if (cursor_height <= 0) cursor_height = 32;
+    hotspot = POINT{static_cast<LONG>(std::lround(1.5 * cursor_width / 32)),
+                    static_cast<LONG>(std::lround(1.0 * cursor_height / 32))};
+    color = cursor_hint_color(label_key);
+
+    const int font_height = std::max(11, cursor_height * 14 / 32);
+    std::string label_error;
+    if (!render_label(label_text, font_height, &label, &label_error)) {
+        // A name that cannot be drawn must not hide the pointer; fall back to
+        // the bare arrow.
+        label = LabelRaster{};
+    }
+    layout = cursor_hint_layout(cursor_width, cursor_height, hotspot.x, hotspot.y, label.width,
+                                label.height);
 
     surface_dc = CreateCompatibleDC(nullptr);
     if (surface_dc == nullptr) {
@@ -270,21 +377,20 @@ void CursorHintOverlay::Impl::run() {
     }
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = cursor_width;
-    info.bmiHeader.biHeight = -cursor_height;
+    info.bmiHeader.biWidth = layout.width;
+    info.bmiHeader.biHeight = -layout.height;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    surface_bitmap = CreateDIBSection(surface_dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (surface_bitmap == nullptr || bits == nullptr) {
+    surface_bitmap =
+        CreateDIBSection(surface_dc, &info, DIB_RGB_COLORS, &surface_bits, nullptr, 0);
+    if (surface_bitmap == nullptr || surface_bits == nullptr) {
         create_error = "CreateDIBSection: " + win32_error(GetLastError());
         release_surface();
         SetEvent(ready);
         return;
     }
     previous_bitmap = SelectObject(surface_dc, surface_bitmap);
-    paint_arrow(bits, cursor_width, cursor_height);
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -332,12 +438,17 @@ LRESULT CALLBACK CursorHintOverlay::Impl::window_proc(HWND hwnd, UINT message, W
         case kMoveMessage:
             if (impl != nullptr) {
                 auto* request = reinterpret_cast<MoveRequest*>(lparam);
-                impl->move(hwnd, request->x, request->y, request->error);
+                impl->place(hwnd, request->x, request->y, request->pressed, request->error);
             }
             return 0;
         case kHideMessage:
             if (impl != nullptr) {
                 impl->hide(hwnd);
+            }
+            return 0;
+        case WM_TIMER:
+            if (impl != nullptr && wparam == kRippleTimer) {
+                impl->tick(hwnd);
             }
             return 0;
         case WM_CLOSE:
@@ -366,7 +477,8 @@ CursorHintOverlay::~CursorHintOverlay() {
     }
 }
 
-std::unique_ptr<CursorHintOverlay> CursorHintOverlay::create(std::string* error) {
+std::unique_ptr<CursorHintOverlay> CursorHintOverlay::create(std::string* error,
+                                                             const std::string& label) {
     std::unique_ptr<CursorHintOverlay> overlay(new CursorHintOverlay());
     Impl& impl = *overlay->impl_;
     impl.ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -374,8 +486,10 @@ std::unique_ptr<CursorHintOverlay> CursorHintOverlay::create(std::string* error)
         *error = "CreateEvent: " + win32_error(GetLastError());
         return nullptr;
     }
+    const std::wstring wide_label = to_wide_label(label);
+    const std::string label_key = label;
     try {
-        impl.thread = std::thread([&impl] { impl.run(); });
+        impl.thread = std::thread([&impl, wide_label, label_key] { impl.run(wide_label, label_key); });
     } catch (const std::exception& e) {
         *error = std::string("cursor hint thread: ") + e.what();
         return nullptr;
@@ -392,8 +506,8 @@ std::unique_ptr<CursorHintOverlay> CursorHintOverlay::create(std::string* error)
     return overlay;
 }
 
-bool CursorHintOverlay::move(int32_t x, int32_t y, std::string* error) {
-    MoveRequest request{x, y, error};
+bool CursorHintOverlay::move(int32_t x, int32_t y, bool pressed, std::string* error) {
+    MoveRequest request{x, y, pressed, error};
     SendMessageW(impl_->window, kMoveMessage, 0, reinterpret_cast<LPARAM>(&request));
     return error->empty();
 }

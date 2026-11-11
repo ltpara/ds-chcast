@@ -101,6 +101,117 @@ void codec_admission_rollback() {
           "failed admission leaks no pipelines or off-thread GPU resources");
 }
 
+void independent_cursor_sampling() {
+    for (auto fps : {5u, 30u}) {
+        DesktopStreamPool pool;
+        auto state = std::make_shared<host_test::MediaState>();
+        state->moving = true;
+        std::string error;
+        auto capture = pool.subscribe(L"independent-pointer", [state](std::string*) {
+            return std::make_unique<host_test::Capture>(state);
+        }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+            return std::make_unique<host_test::Encoder>(state, config);
+        }, &error, {}, kVideoCodecAll, {}, {},
+        [state](const DisplayInfo&, CursorInfo& cursor) {
+            std::lock_guard lock(state->cursor_mutex);
+            cursor = state->pointer;
+            return true;
+        });
+        check(capture != nullptr, "create independently sampled pointer source");
+        frame(*capture);
+        EncoderConfig config; config.framerate = fps;
+        auto encoder = DesktopStreamPool::encoder(*capture, config, &error);
+        check(encoder != nullptr, "configure video for pointer isolation test");
+        auto received = std::make_shared<std::atomic<LONG>>(0);
+        DesktopStreamPool::set_cursor_sink(*capture, [received](const CursorInfo& cursor) {
+            received->store(cursor.position.x);
+        });
+        auto move_and_wait = [&](LONG position) {
+            CursorInfo cursor; cursor.position_valid = cursor.visible = true;
+            cursor.position.x = position;
+            const auto start = std::chrono::steady_clock::now();
+            state->set_cursor(cursor);
+            while (received->load() != position && std::chrono::steady_clock::now() - start < 150ms)
+                std::this_thread::sleep_for(1ms);
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            std::printf("     independent cursor %u FPS: %.2f ms\n", fps,
+                std::chrono::duration<double, std::milli>(elapsed).count());
+            check(received->load() == position && elapsed < 150ms,
+                  "pointer arrives before a low-FPS capture tick or blocked encoder returns");
+        };
+        move_and_wait(1);
+        state->encode_delay_ms = 300;
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!state->encoding_delayed && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+        check(state->encoding_delayed, "video encoder is blocked for 300 ms");
+        move_and_wait(2);
+        state->encode_delay_ms = 0;
+        DesktopStreamPool::set_cursor_sink(*capture, {});
+    }
+}
+
+void cpu_encoding_without_device() {
+    std::vector<uint8_t> pixels(64 * 48 * 4, 255);
+    for (auto codec : {VideoCodec::H264, VideoCodec::Vp9}) {
+        EncoderConfig config;
+        config.width = 64; config.height = 48; config.framerate = 30;
+        config.gop_size = 0; config.codec = codec; config.backend = EncoderBackend::Software;
+        for (auto chroma : {VideoChroma::Yuv420, VideoChroma::Yuv444}) {
+            if (codec == VideoCodec::H264 && chroma == VideoChroma::Yuv444) continue;
+            config.chroma = chroma;
+            std::string error;
+            auto encoder = create_encoder(nullptr, config, &error);
+            check(encoder != nullptr, "software encoder opens with no D3D device");
+            std::vector<EncodedPacket> packets;
+            check(encoder->encode_cpu_bgra(pixels.data(), 64, 48, 0, true, packets).ok() &&
+                !packets.empty() && packets.front().idr, "CPU BGRA produces an initial IDR");
+            packets.clear();
+            check(encoder->encode_cpu_bgra(pixels.data(), 64, 48, 33, false, packets).ok(),
+                  "CPU BGRA encodes subsequent delta input");
+            packets.clear();
+            check(encoder->encode_repeat(66, true, packets).ok() && !packets.empty() && packets.front().idr,
+                  "CPU repeat honors an on-demand IDR without a capture device");
+        }
+    }
+}
+
+void cpu_capture_pipeline() {
+    const auto displays = enumerate_displays();
+    if (displays.empty()) { std::printf("skip CPU GDI pipeline: no display\n"); return; }
+    CaptureConfig config; config.backend = CaptureBackend::GdiCpu; config.nv12.enabled = true;
+    config.capture_cursor = false;
+    DesktopStreamPool pool;
+    std::string error;
+    auto capture = pool.subscribe(L"cpu-gdi", [&](std::string* out) {
+        return create_shared_capturer(displays.front(), config, out);
+    }, create_encoder, &error);
+    if (!capture) { std::printf("     CPU GDI: %s\n", error.c_str()); }
+    check(capture != nullptr, "shared GDI CPU capture opens without GPU resources");
+    frame(*capture);
+    check(capture->frame().cpu_bgra && !capture->frame().nv12_texture && !capture->adapter_device().device,
+          "shared CPU frame has pixels and no GPU texture or device");
+    EncoderConfig encoder_config; encoder_config.codec = VideoCodec::H264; encoder_config.gop_size = 0;
+    auto encoder = DesktopStreamPool::encoder(*capture, encoder_config, &error);
+    if (!encoder) std::printf("     CPU encoder: %s\n", error.c_str());
+    check(encoder && encoder->backend() == EncoderBackend::Software,
+          "Auto selects software H.264 for CPU-only capture");
+    std::vector<EncodedPacket> packets;
+    check(encoder->encode(nullptr, 0, true, packets).ok() && !packets.empty() && packets.front().idr,
+          "shared CPU pipeline delivers an encoded keyframe");
+    std::vector<uint8_t> screenshot;
+    uint32_t width = 0, height = 0;
+    check(DesktopStreamPool::screenshot(*capture, screenshot, width, height, &error) &&
+          screenshot.size() == size_t(width) * height * 4, "CPU screenshot reads retained BGRA directly");
+    auto pending = DesktopStreamPool::screenshot_async(*capture);
+    encoder.reset();
+    capture.reset();
+    const auto detached = pending.get();
+    check(detached.error.empty() && detached.width == width && detached.height == height &&
+          detached.bgra.size() == screenshot.size(),
+          "pending screenshot retains its source safely after the last viewer unsubscribes");
+}
+
 void full_color_voting() {
     DesktopStreamPool pool;
     auto state = std::make_shared<host_test::MediaState>();
@@ -791,6 +902,9 @@ int main() {
             check(encoder_a->framerate() == 60 && media_a->encoder_created == 1,
                   "leaving viewer restores remaining rate without rebuilding encoder");
         }
+        independent_cursor_sampling();
+        cpu_encoding_without_device();
+        cpu_capture_pipeline();
         codec_admission_rollback();
         cursor_only_wake();
         cursor_sink_while_full();

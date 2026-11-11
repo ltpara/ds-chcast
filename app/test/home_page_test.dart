@@ -120,15 +120,30 @@ class _MemoryDevices extends DeviceStore {
   }
 
   @override
+  Future<List<Device>> updateNote(String key, String note) async {
+    final int index = devices.indexWhere((Device device) => device.key == key);
+    if (index >= 0) {
+      final String clean = Device.cleanNote(note);
+      devices[index] = devices[index].copyWith(
+        note: clean,
+        noteCleared: clean.isEmpty,
+      );
+    }
+    return List<Device>.of(devices);
+  }
+
+  @override
   Future<List<Device>> markPushSettled(
     String key, {
     bool tags = false,
+    bool note = false,
     bool group = false,
   }) async {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
       devices[index] = devices[index].copyWith(
         tagsCleared: tags ? false : null,
+        noteCleared: note ? false : null,
         groupCleared: group ? false : null,
       );
     }
@@ -187,6 +202,22 @@ class _MemoryAccount extends AccountSessionStore {
 
   @override
   Future<void> clear() async => session = null;
+}
+
+class _FakeTrashDialog extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('fake-trash'),
+      actions: <Widget>[
+        TextButton(
+          key: const Key('fake-trash-close'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
 }
 
 class _MemoryServers extends ServerSettingsStore {
@@ -1048,6 +1079,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -1671,6 +1703,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -1768,6 +1801,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -2127,6 +2161,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -2169,6 +2204,114 @@ void main() {
     expect(devices.devices.single.tags, isEmpty);
     expect(pushes, <String>['lab|实验室|office+共享', 'lab|实验室|']);
     expect(find.textContaining('#'), findsNothing);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a device note is edited locally, uploaded and cleared', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final _MemoryAccount accounts = _MemoryAccount(
+      AccountSession(
+        server: 'http://127.0.0.1:8443',
+        username: 'alice',
+        token: 'tok',
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        bookRevision: 1,
+      ),
+    );
+    final _MemoryDevices devices = _MemoryDevices(<Device>[
+      Device(
+        id: 'lab',
+        name: '实验室',
+        server: 'http://127.0.0.1:8443',
+        saved: true,
+        addedAt: DateTime.now(),
+      ),
+    ]);
+    final List<String> pushes = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: devices,
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: accounts,
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return const BatchLookupResult(hosts: <String, HostInfo>{});
+          },
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async {
+                expect(since, 0);
+                return const AddressBookSnapshot(
+                  revision: 2,
+                  peers: <AddressBookPeer>[
+                    AddressBookPeer(id: 'lab', name: '实验室', revision: 2),
+                  ],
+                );
+              },
+          addressBookPeerWriter:
+              (
+                ServerSettings server,
+                String token,
+                String peerId, {
+                String? name,
+                List<String>? tags,
+                String? note,
+                String? groupId,
+                int? ifRevision,
+              }) async {
+                pushes.add('$peerId|${note ?? '-'}');
+                return AddressBookPeer(
+                  id: peerId,
+                  revision: 3,
+                  note: note ?? '',
+                );
+              },
+        ),
+      ),
+    );
+    for (int i = 0; i < 6; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(pushes, isEmpty);
+    expect(find.byKey(const Key('device-note-lab')), findsNothing);
+
+    await tester.tap(find.byTooltip('设备操作'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('设备备注'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('account-note')),
+      '  机柜 A3  ',
+    );
+    await tester.tap(find.byKey(const Key('account-note-save')));
+    await tester.pumpAndSettle();
+
+    expect(devices.devices.single.note, '机柜 A3');
+    expect(devices.devices.single.noteCleared, isFalse);
+    expect(pushes, <String>['lab|机柜 A3']);
+    expect(find.byKey(const Key('device-note-lab')), findsOneWidget);
+
+    await tester.tap(find.byTooltip('设备操作'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('设备备注'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('account-note')), '');
+    await tester.tap(find.byKey(const Key('account-note-save')));
+    await tester.pumpAndSettle();
+
+    expect(devices.devices.single.note, isEmpty);
+    expect(pushes, <String>['lab|机柜 A3', 'lab|']);
+    expect(find.byKey(const Key('device-note-lab')), findsNothing);
 
     await tester.pumpWidget(const SizedBox());
   });
@@ -2237,6 +2380,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -2368,6 +2512,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -2491,6 +2636,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -2607,6 +2753,7 @@ void main() {
                   String peerId, {
                   String? name,
                   List<String>? tags,
+                  String? note,
                   String? groupId,
                   int? ifRevision,
                 }) async {
@@ -2687,6 +2834,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async => AddressBookPeer(id: peerId),
@@ -3178,6 +3326,7 @@ void main() {
                   String peerId, {
                   String? name,
                   List<String>? tags,
+                  String? note,
                   String? groupId,
                   int? ifRevision,
                 }) async {
@@ -3302,6 +3451,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -3475,6 +3625,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -3559,6 +3710,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async => AddressBookPeer(id: peerId),
@@ -3577,6 +3729,89 @@ void main() {
     await tester.tap(find.text('关闭'));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('group-row-work')), findsNothing);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('the trash button opens the recycle bin and resyncs after a change', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    int fetches = 0;
+    final _MemoryAccount accounts = _MemoryAccount(
+      AccountSession(
+        server: 'http://127.0.0.1:8443',
+        username: 'alice',
+        token: 'tok',
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        bookRevision: 2,
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[
+            Device(
+              id: 'studio',
+              name: '工作室',
+              server: 'http://127.0.0.1:8443',
+              saved: true,
+              addedAt: DateTime.now(),
+            ),
+          ]),
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: accounts,
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return const BatchLookupResult(hosts: <String, HostInfo>{});
+          },
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async {
+                fetches++;
+                return const AddressBookSnapshot(
+                  revision: 2,
+                  peers: <AddressBookPeer>[
+                    AddressBookPeer(id: 'studio', name: '工作室'),
+                  ],
+                );
+              },
+          addressBookPeerWriter:
+              (
+                ServerSettings server,
+                String token,
+                String peerId, {
+                String? name,
+                List<String>? tags,
+                String? note,
+                String? groupId,
+                int? ifRevision,
+              }) async => AddressBookPeer(id: peerId),
+          trashDialogBuilder: (ServerSettings server, String token) =>
+              _FakeTrashDialog(),
+        ),
+      ),
+    );
+    for (int i = 0; i < 6; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(find.byKey(const Key('address-book-trash')), findsOneWidget);
+    final int before = fetches;
+    await tester.tap(find.byKey(const Key('address-book-trash')));
+    await tester.pumpAndSettle();
+    expect(find.text('fake-trash'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('fake-trash-close')));
+    await tester.pumpAndSettle();
+    expect(find.text('fake-trash'), findsNothing);
+    expect(fetches, greaterThan(before));
 
     await tester.pumpWidget(const SizedBox());
   });
@@ -3987,6 +4222,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {
@@ -4108,6 +4344,7 @@ void main() {
                 String peerId, {
                 String? name,
                 List<String>? tags,
+                String? note,
                 String? groupId,
                 int? ifRevision,
               }) async {

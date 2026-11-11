@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -435,23 +436,37 @@ int main() {
                                std::chrono::seconds(5)),
                       "the host reports the restored block");
 
+                check(viewer->request_screenshot(0).ok(),
+                      "the viewer asks for a host screenshot");
+                chast::ScreenshotResult shot;
+                check(wait_for([&] { return viewer->take_screenshot(shot); },
+                               std::chrono::seconds(10)) &&
+                          shot.code == chast::ScreenshotCode::Ok && shot.width != 0 &&
+                          shot.height != 0 && shot.png.size() > 8 &&
+                          std::memcmp(shot.png.data(), "\x89PNG\r\n\x1a\n", 8) == 0,
+                      "the host answers with a PNG of its pre-encode frame");
+
                 auto await_read = [&](size_t ticket) {
                     return wait_for([&] { return clipboard->has_started(ticket); },
                                     std::chrono::seconds(5));
                 };
                 clipboard->release(1);
                 check(await_read(2), "clipboard polling resumes after the slow baseline");
-                check(viewer->clipboard_contents_received() == 0,
-                      "the delayed baseline is never sent to the viewer");
+                chast::ClipboardContent received;
+                check(wait_for([&] { return viewer->take_clipboard_content(received); },
+                               std::chrono::seconds(5)) &&
+                          received.text() == "session baseline",
+                      "the delayed opening baseline is sent once to the viewer");
 
                 clipboard->set("first local copy");
                 clipboard->release(2);
                 check(await_read(3), "the next clipboard read observes the local copy");
                 clipboard->release(3);
-                chast::ClipboardContent received;
                 check(wait_for([&] { return viewer->take_clipboard_content(received); },
                                std::chrono::seconds(5)) && received.text() == "first local copy",
                       "a local clipboard change is sent after the baseline");
+                check(viewer->clipboard_contents_received() == 2,
+                      "the baseline is not repeated with the first change");
 
                 check(await_read(4), "a clipboard poll is blocked before revocation");
                 host->set_permissions(chast::kPermissionAll & ~chast::kPermissionClipboard);
@@ -468,8 +483,12 @@ int main() {
                 check(await_read(5), "restoration starts a fresh clipboard baseline");
                 clipboard->release(5);
                 check(await_read(6), "polling follows the restored baseline");
-                check(viewer->clipboard_contents_received() == 1,
-                      "neither the stale read nor copies made while revoked are sent");
+                check(wait_for([&] { return viewer->take_clipboard_content(received); },
+                               std::chrono::seconds(5)) &&
+                          received.text() == "copy while permission was off",
+                      "restoration sends the current item, not the revoked read");
+                check(viewer->clipboard_contents_received() == 3,
+                      "neither the stale read nor copies made while revoked are replayed");
 
                 chast::ClipboardContent remote;
                 const std::string remote_text = "viewer copy";
@@ -485,7 +504,7 @@ int main() {
                 check(await_read(7), "a stale read is replaced after the viewer write");
                 clipboard->release(7);
                 check(await_read(8), "polling resumes after the viewer write");
-                check(viewer->clipboard_contents_received() == 1,
+                check(viewer->clipboard_contents_received() == 3,
                       "the old snapshot and viewer write are not echoed back");
 
                 clipboard->set("copy after restoration");
@@ -530,8 +549,12 @@ int main() {
                     check(wait_for([&] { return clipboard->has_started(12); },
                                    std::chrono::seconds(5)),
                           "the new session starts polling after its baseline");
-                    check(viewer->clipboard_contents_received() == 0,
-                          "an old session's clipboard result never reaches the new viewer");
+                    chast::ClipboardContent fresh;
+                    check(wait_for([&] { return viewer->take_clipboard_content(fresh); },
+                                   std::chrono::seconds(5)) &&
+                              fresh.text() == "copy after restoration" &&
+                              viewer->clipboard_contents_received() == 1,
+                          "the new session sends only its own baseline, not the old result");
                     viewer->finish_client({}, std::chrono::seconds(5));
                     viewer.reset();
                 }

@@ -10447,7 +10447,7 @@ int run_weak_network(const Options& options) {
           "the last announcement matched the running target");
     check(received.latency.valid && received.latency.replies > 0,
           "the latency probe survived the relay");
-    check(received.max_frame_age_ms >= 0.0 && received.max_frame_age_ms < 15000.0,
+    check(received.max_frame_age_ms >= 0.0 && received.max_frame_age_ms < 3000.0,
           "the worst frame age stayed within the weak-link budget");
 
     check(to_viewer.received > 0 && to_viewer.forwarded > 0,

@@ -45,6 +45,8 @@ constexpr auto kReceiveTimeout = std::chrono::milliseconds(250);
 constexpr auto kMediaPoll = std::chrono::milliseconds(10);
 constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
+
+
 constexpr auto kProbeInterval = std::chrono::seconds(1);
 // Matches GpuFrameSink's cap. Checking the announced size here fails the
 // session with a clear reason before a decoder and shared textures exist;
@@ -631,7 +633,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     { std::lock_guard lock(record_mutex_); record_stream_.reset(); pending_record_keyframe_.reset(); }
     {
         std::lock_guard lock(screenshot_mutex_);
-        pending_screenshot_.reset(); pending_screenshot_stream_.reset();
+        pending_screenshot_.reset();
+        pending_screenshot_stream_.reset();
+        pending_screenshot_sent_ = false;
+        pending_screenshot_restart_ = false;
     }
     stop_requested_.store(false, std::memory_order_release);
     {
@@ -843,7 +848,7 @@ bool ViewerEngine::SetDisplayFollow(bool cursor, bool window) {
     return true;
 }
 
-bool ViewerEngine::ShowCursor(int32_t x, int32_t y, bool visible) {
+bool ViewerEngine::ShowCursor(int32_t x, int32_t y, bool visible, bool pressed) {
     if (!running_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -857,6 +862,7 @@ bool ViewerEngine::ShowCursor(int32_t x, int32_t y, bool visible) {
     hint.x = x;
     hint.y = y;
     hint.visible = visible;
+    hint.pressed = pressed && visible;
     std::lock_guard<std::mutex> lock(cursor_hint_mutex_);
     pending_show_cursor_ = hint;
     return true;
@@ -1485,30 +1491,92 @@ bool ViewerEngine::SaveScreenshot(std::string directory) {
     std::lock_guard<std::mutex> lock(screenshot_mutex_);
     pending_screenshot_ = std::move(directory);
     pending_screenshot_stream_ = target;
+    if (pending_screenshot_sent_) {
+        pending_screenshot_restart_ = true;
+    }
     return true;
 }
 
-void ViewerEngine::ProcessScreenshot() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        // The button is disabled until the first picture, but a tap can land
-        // between streaming and the first decoded frame; keep the request for
-        // the next pass instead of reporting a failure.
-        if (status_.published == 0) {
-            return;
-        }
-    }
-    std::optional<std::string> directory;
+void ViewerEngine::ProcessScreenshot(
+    chast::QuicSession* session,
+    const std::function<void(const std::string&)>& fallback) {
+    std::string directory;
+    chast::ScreenshotResult result;
+    bool have_result = false;
     {
         std::lock_guard<std::mutex> lock(screenshot_mutex_);
-        directory = std::move(pending_screenshot_);
+        if (!pending_screenshot_) {
+            return;
+        }
+        if (pending_screenshot_restart_) {
+            // The newer tap replaced the target while this answer was in
+            // flight; its slices cannot be attributed to the new request.
+            if (session != nullptr) {
+                session->cancel_screenshot();
+            }
+            pending_screenshot_sent_ = false;
+            pending_screenshot_restart_ = false;
+        }
+        if (!pending_screenshot_sent_) {
+            if (session != nullptr) {
+                const uint32_t stream = pending_screenshot_stream_.value_or(chast::kScreenshotCurrentStream);
+                const chast::Error sent = session->request_screenshot(stream);
+                if (sent.ok()) {
+                    pending_screenshot_sent_ = true;
+                    pending_screenshot_deadline_ =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                    return;
+                }
+                std::fprintf(stderr,
+                             "viewer: host screenshot unavailable (%s); saving the rendered picture\n",
+                             sent.to_string().c_str());
+            }
+        } else if (session != nullptr && session->take_screenshot(result)) {
+            have_result = true;
+        } else if (std::chrono::steady_clock::now() < pending_screenshot_deadline_) {
+            return;
+        } else {
+            if (session != nullptr) {
+                session->cancel_screenshot();
+            }
+            std::fprintf(stderr,
+                         "viewer: host screenshot timed out; saving the rendered picture\n");
+        }
+        directory = std::move(*pending_screenshot_);
         pending_screenshot_.reset();
-    }
-    if (!directory) {
-        return;
+        pending_screenshot_sent_ = false;
     }
 
-    SaveScreenshotFromSink(sink_, *directory);
+    if (have_result && result.code == chast::ScreenshotCode::Ok && !result.png.empty()) {
+        const std::string folder =
+            directory.empty() ? default_screenshot_directory() : directory;
+        std::string path = screenshot_file_path(folder);
+        std::string error;
+        if (!chast::write_png_file(path, result.png.data(), result.png.size(), &error)) {
+            path.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!path.empty()) {
+                status_.screenshot_path = path;
+            }
+            status_.screenshot_error = error;
+            ++status_.screenshot_updates;
+        }
+        if (error.empty()) {
+            std::fprintf(stderr, "viewer: screenshot saved to %s (%ux%u from host)\n",
+                         path.c_str(), result.width, result.height);
+        } else {
+            std::fprintf(stderr, "viewer: screenshot failed: %s\n", error.c_str());
+        }
+        return;
+    }
+    if (have_result) {
+        std::fprintf(stderr,
+                     "viewer: host screenshot refused (%s); saving the rendered picture\n",
+                     result.reason.empty() ? "no reason" : result.reason.c_str());
+    }
+    fallback(directory);
 }
 
 void ViewerEngine::SaveScreenshotFromSink(FrameSink* sink, const std::string& directory) {
@@ -3456,15 +3524,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             record_wanted_.store(false);
                             record_error = "the recorded display was unsubscribed";
                         }
-                        std::optional<std::string> directory;
                         std::optional<uint32_t> target;
+                        bool screenshot_pending = false;
                         {
                             std::lock_guard lock(screenshot_mutex_);
-                            directory.swap(pending_screenshot_); target = pending_screenshot_stream_;
+                            target = pending_screenshot_stream_;
+                            screenshot_pending = pending_screenshot_.has_value();
                         }
-                        if (directory) {
-                            auto save = [this, path = *directory](FrameSink* sink) { SaveScreenshotFromSink(sink, path); };
-                            if (!target || !display_receiver.WithFrame(*target, save)) save(nullptr);
+                        if (screenshot_pending) {
+                            ProcessScreenshot(
+                                session.get(),
+                                [this, target, &display_receiver](const std::string& directory) {
+                                    auto save = [this, path = directory](FrameSink* sink) {
+                                        SaveScreenshotFromSink(sink, path);
+                                    };
+                                    if (!target) {
+                                        save(nullptr);
+                                    } else if (!display_receiver.WithFrame(*target, save)) {
+                                        save(nullptr);
+                                    }
+                                });
                         }
                     }
                     if (!record_wanted_.load() && recorder) {
@@ -8616,6 +8695,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     drain_ticket_renew();
                     if (!poll_displays()) break;
+
+
                     if (!apply_stream_updates()) {
                         break;
                     }
@@ -8790,7 +8871,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             break;
                         }
                         sync_status(false);
-                        if (!multiple_displays) ProcessScreenshot();
+                        if (!multiple_displays) {
+                            ProcessScreenshot(session.get(), [this](const std::string& directory) {
+                                SaveScreenshotFromSink(sink_, directory);
+                            });
+                        }
                         continue;
                     }
                     if (received_frame.status() == chast::Status::Unavailable) {
@@ -8947,7 +9032,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // Pictures arrive through gpu_handler while decode() runs,
                     // so `frames` stays empty on this path.
                     sync_status(false);
-                    ProcessScreenshot();
+                    ProcessScreenshot(session.get(), [this](const std::string& directory) {
+                        SaveScreenshotFromSink(sink_, directory);
+                    });
                 }
                 // A clipboard file list cannot finish on a closed session;
                 // files that never landed are removed from the staging folder.

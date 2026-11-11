@@ -1,6 +1,6 @@
 #pragma once
 
-// Public capture surface. Everything below is GPU-resident: a captured frame
+// Public capture surface. The preferred path is GPU-resident: a captured frame
 // is an ID3D11Texture2D owned by the capturer, valid until the next capture,
 // and reaches the encoder without a round trip through system memory.
 //
@@ -23,7 +23,9 @@
 // (for example after an access-denied driver/session transition), the GDI
 // fallback captures through a DIB and uploads the frame to this same D3D11
 // surface contract. Consumers therefore keep using the normal NV12 and encoder
-// pipeline even though that fallback frame crosses system memory once.
+// pipeline even though that fallback frame crosses system memory once. If
+// D3D/video conversion is unavailable, FrameInfo::cpu_bgra carries the immutable
+// system-memory image directly to a software encoder instead.
 
 #include <windows.h>
 #include <d3d11.h>
@@ -109,6 +111,7 @@ enum class CaptureBackend {
     Auto,  // Desktop Duplication first, GDI when duplication cannot be opened.
     Dxgi,  // Require Desktop Duplication.
     Gdi,   // Force BitBlt capture and upload to D3D11.
+    GdiCpu, // BitBlt system-memory frames, independent of D3D/video processors.
 };
 
 const char* capture_backend_name(CaptureBackend backend);
@@ -128,6 +131,10 @@ struct CaptureConfig {
 
 // Pixel source of the current frame.
 struct FrameInfo {
+    // Optional immutable, tightly packed BGRA fallback. Retained by subscribers
+    // just like a COM texture, so the next capture cannot overwrite a frame.
+    std::shared_ptr<const std::vector<uint8_t>> cpu_bgra;
+    bool cpu_image = false; // metadata-only subscribers need not retain raw pixels
     ID3D11Texture2D* texture = nullptr;  // capturer-owned, valid until next capture()
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -167,6 +174,7 @@ struct FrameInfo {
     UINT nv12_height = 0;
     UINT nv12_surface_width = 0;
     UINT nv12_surface_height = 0;
+    bool has_video_image() const { return nv12_texture || cpu_bgra || cpu_image; }
 };
 
 struct CursorInfo {
@@ -209,6 +217,11 @@ struct CursorInfo {
     // Increments whenever the shape or position changes.
     uint64_t revision = 0;
 };
+
+// Samples the OS pointer without acquiring a desktop frame or touching D3D.
+// The caller owns `cursor` and calls from a thread on the input desktop.
+// position is the OS hotspot relative to the display rect's origin.
+bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor);
 
 enum class CaptureResult {
     Frame,       // FrameInfo and CursorInfo describe the newest state

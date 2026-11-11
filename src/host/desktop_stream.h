@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include "chast/capture.h"
@@ -25,6 +26,7 @@ public:
     using EncoderFactory = std::function<std::unique_ptr<IVideoEncoder>(
         ID3D11Device*, const EncoderConfig&, std::string*)>;
     using FollowDesktop = std::function<bool(std::string*, bool*)>;
+    using CursorSampler = std::function<bool(const DisplayInfo&, CursorInfo&)>;
     class CodecPeer {
     public:
         ~CodecPeer();
@@ -68,7 +70,8 @@ public:
     std::unique_ptr<IDxgiCapturer> subscribe(const std::wstring& key,
         CaptureFactory capture, EncoderFactory encoder, std::string* error,
         FollowDesktop follow_desktop = {}, VideoCodecMask decoding_codecs = kVideoCodecAll,
-        std::shared_ptr<CodecPeer> peer = {}, HostRecordingOptions recording = {});
+        std::shared_ptr<CodecPeer> peer = {}, HostRecordingOptions recording = {},
+        CursorSampler cursor_sampler = {});
 private:
     std::mutex mutex_;
     std::map<std::wstring, std::weak_ptr<Source>> sources_;
@@ -95,6 +98,20 @@ public:
     // Resume this subscriber at a fresh IDR after network backpressure.
     static void discard_backlog(IDxgiCapturer& capture);
     static uint64_t capture_time(const IDxgiCapturer& capture);
+    // Copies this subscription's retained raw frame into BGRA8 memory for a
+    // host-side screenshot. Runs between capture ticks on the display service
+    // thread, so no encode or session loop touches the GPU while it copies.
+    // False means no frame has been captured yet or the GPU frame cannot be
+    // read back (for example a rotation the capture path could not apply).
+    static bool screenshot(IDxgiCapturer& capture, std::vector<uint8_t>& bgra,
+                           uint32_t& width, uint32_t& height, std::string* error);
+    struct Screenshot {
+        std::vector<uint8_t> bgra;
+        uint32_t width = 0, height = 0;
+        std::string error;
+    };
+    // Queues GPU readback; the session loop can keep handling control/input.
+    static std::future<Screenshot> screenshot_async(IDxgiCapturer& capture);
     // RustDesk static_refresh::max_repeat_frames: how many times an idle
     // monitor may repeat its last picture so rate control can refine it.
     // 0 disables static refinement for that format.
@@ -103,9 +120,8 @@ public:
                                           const std::string& implementation = {});
     // Latest pointer state, independent of this subscriber's video backlog.
     static std::shared_ptr<const CursorInfo> cursor_snapshot(const IDxgiCapturer& capture);
-    // Install this subscriber's pointer sink. The display service invokes it
-    // on its own thread right after a frame is captured, before encoding it,
-    // so pointer delivery does not wait for video or for the session loop.
+    // With a CursorSampler, the pointer thread invokes sinks independently of
+    // video capture/encoding. Sources without a sampler use capture updates.
     static void set_cursor_sink(IDxgiCapturer& capture,
                                 std::function<void(const CursorInfo&)> sink);
     // Reconcile a source with a fresh OS enumeration once for all subscribers.

@@ -598,6 +598,7 @@ struct QuicSession::Impl {
         // that arrives after the queue was reset for a new connection carries
         // the old value and must not touch the new counters.
         uint64_t generation = 0;
+        bool screenshot = false;
     };
 
     Role role = Role::Server;
@@ -625,6 +626,8 @@ struct QuicSession::Impl {
     // every accepted session, including one the application already holds, so
     // the cap is enforced before another handshake begins.
     std::shared_ptr<std::atomic<size_t>> live_clients;
+    std::shared_ptr<std::atomic<size_t>> authenticated_clients;
+    bool authenticated_slot = false;
     std::mutex accept_mutex;
     std::condition_variable accept_cv;
     std::deque<std::unique_ptr<QuicSession>> accepted_sessions;
@@ -1022,6 +1025,25 @@ struct QuicSession::Impl {
     std::deque<VoiceCallResponse> voice_responses;
     std::deque<std::vector<uint8_t>> voice_audio;
     size_t buffered_voice_bytes = 0;
+    // Host screenshot (protocol v70). The host queues a bounded number of
+    // requests; the client assembles one answer at a time in a buffer that the
+    // message parser and the chunk layout both bound.
+    std::deque<ScreenshotRequest> screenshot_requests;
+    struct ScreenshotStream { HQUIC stream; ControlParser parser; };
+    std::vector<ScreenshotStream> screenshot_streams;
+    HQUIC outgoing_screenshot = nullptr;
+    uint64_t outgoing_screenshot_request = 0;
+    uint32_t outgoing_screenshot_next = 0;
+    uint64_t next_screenshot_request_id = 0;
+    uint64_t client_screenshot_request_id = 0;
+    uint32_t screenshot_total = 0;
+    uint32_t screenshot_count = 0;
+    uint32_t screenshot_next = 0;
+    uint32_t screenshot_stream = 0;
+    uint32_t screenshot_width = 0;
+    uint32_t screenshot_height = 0;
+    std::vector<uint8_t> screenshot_bytes;
+    std::deque<ScreenshotResult> screenshots;
     std::deque<FileOffer> file_offers;
     uint64_t file_offers_seen = 0;
     std::deque<FileChunk> file_chunks;
@@ -1149,11 +1171,13 @@ struct QuicSession::Impl {
     std::mutex send_mutex;
     std::condition_variable send_cv;
     size_t in_flight_bytes = 0;
+    size_t screenshot_in_flight_bytes = 0;
     size_t in_flight_sends = 0;
     uint64_t send_generation = 0;
 
     ~Impl() {
         close();
+        if (authenticated_slot) authenticated_clients->fetch_sub(1);
         if (live_clients) {
             live_clients->fetch_sub(1);
         }
@@ -1329,6 +1353,7 @@ struct QuicSession::Impl {
         }
         target.owns_transport = false;
         target.live_clients = live_clients;
+        target.authenticated_clients = authenticated_clients;
         target.connection = incoming;
         api->SetCallbackHandler(incoming,
                                 reinterpret_cast<void*>(&Impl::connection_callback), &target);
@@ -1590,6 +1615,7 @@ struct QuicSession::Impl {
             PortForward,
             Terminal,
             Camera,
+            Screenshot,
             Reject,
             Bad
         };
@@ -1597,6 +1623,7 @@ struct QuicSession::Impl {
         HQUIC port_forward_pause = nullptr;
         HQUIC terminal_pause = nullptr;
         std::optional<FileResult> file_rejection;
+        std::vector<std::pair<ControlType, std::vector<uint8_t>>> screenshot_messages;
         {
             std::lock_guard<std::mutex> lock(mutex);
             std::vector<uint8_t>* pending = nullptr;
@@ -1618,7 +1645,24 @@ struct QuicSession::Impl {
                 // Not even the magic is complete; keep waiting.
                 return;
             }
-            if (std::memcmp(pending->data(), "CFRM", 4) == 0) {
+            if (std::memcmp(pending->data(), "CSHT", 4) == 0) {
+                if (role != Role::Client || screenshot_streams.size() >= 2 ||
+                    client_screenshot_request_id == 0) {
+                    one_shot_streams.push_back(stream);
+                    kind = Kind::Reject;
+                } else {
+                    ScreenshotStream entry{stream, {}};
+                    std::string error;
+                    if (!entry.parser.push(pending->data() + 4, pending->size() - 4,
+                                           screenshot_messages, &error)) {
+                        one_shot_streams.push_back(stream);
+                        kind = Kind::Reject;
+                    } else {
+                        screenshot_streams.push_back(std::move(entry));
+                        kind = Kind::Screenshot;
+                    }
+                }
+            } else if (std::memcmp(pending->data(), "CFRM", 4) == 0) {
                 HQUIC expected = nullptr;
                 if (role == Role::Client && video.compare_exchange_strong(expected, stream)) {
                     received.push(std::move(*pending));
@@ -1999,6 +2043,13 @@ struct QuicSession::Impl {
                 // the application once the queue drained below half.
                 api->StreamReceiveSetEnabled(terminal_pause, FALSE);
             }
+        }
+        for (const auto& message : screenshot_messages) {
+            if (message.first != ControlType::ScreenshotResponse) {
+                api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                break;
+            }
+            handle_control(message.first, message.second);
         }
         if (kind == Kind::Reject) {
             api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
@@ -2440,6 +2491,29 @@ struct QuicSession::Impl {
     // Returns false when the handle belongs to neither, so the caller can
     // classify it from its first bytes.
     bool route_bulk_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
+        bool screenshot = false, valid = true;
+        std::vector<std::pair<ControlType, std::vector<uint8_t>>> messages;
+        {
+            std::lock_guard lock(mutex);
+            for (auto& entry : screenshot_streams) {
+                if (entry.stream != stream) continue;
+                screenshot = true;
+                std::string error;
+                for (uint32_t i = 0; i < event.RECEIVE.BufferCount && valid; ++i) {
+                    const auto& buffer = event.RECEIVE.Buffers[i];
+                    valid = entry.parser.push(buffer.Buffer, buffer.Length, messages, &error);
+                }
+                break;
+            }
+        }
+        if (screenshot) {
+            for (const auto& message : messages) {
+                if (message.first != ControlType::ScreenshotResponse) { valid = false; break; }
+                handle_control(message.first, message.second);
+            }
+            if (!valid) api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            return true;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex);
             for (HQUIC handle : microphone_handles) {
@@ -2586,6 +2660,11 @@ struct QuicSession::Impl {
             }
         }
         handles.insert(handles.end(), one_shot_streams.begin(), one_shot_streams.end());
+        for (const auto& entry : screenshot_streams) handles.push_back(entry.stream);
+        screenshot_streams.clear();
+        outgoing_screenshot = nullptr;
+        outgoing_screenshot_request = 0;
+        outgoing_screenshot_next = 0;
         clipboard_streams.clear();
         pending_clipboard_bytes = 0;
         clipboard_contents.clear();
@@ -2704,7 +2783,7 @@ struct QuicSession::Impl {
             case QUIC_STREAM_EVENT_SEND_COMPLETE: {
                 auto* pending = static_cast<PendingSend*>(event.SEND_COMPLETE.ClientContext);
                 if (pending) {
-                    release_send(pending->bytes.size(), pending->generation);
+                    release_send(pending->bytes.size(), pending->generation, pending->screenshot);
                     delete pending;
                 }
                 break;
@@ -2793,7 +2872,9 @@ struct QuicSession::Impl {
                 std::vector<HQUIC> bulk_aborts;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    bool bulk = false;
+                    bool bulk = std::any_of(screenshot_streams.begin(), screenshot_streams.end(),
+                        [stream](const auto& entry) { return entry.stream == stream; }) ||
+                        std::find(one_shot_streams.begin(), one_shot_streams.end(), stream) != one_shot_streams.end();
                     for (auto& entry : clipboard_streams) {
                         if (entry.stream == stream) {
                             entry.finished = true;
@@ -2910,6 +2991,14 @@ struct QuicSession::Impl {
                 std::vector<HQUIC> to_close;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    for (auto it = screenshot_streams.begin(); it != screenshot_streams.end(); ++it) {
+                        if (it->stream == stream) {
+                            screenshot_streams.erase(it);
+                            to_close.push_back(stream);
+                            break;
+                        }
+                    }
+                    if (outgoing_screenshot == stream) outgoing_screenshot = nullptr;
                     if (stream == video.load()) {
                         video_shutdown_complete = true;
                     } else if (stream == audio.load()) {
@@ -4341,6 +4430,98 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::ScreenshotRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                ScreenshotRequest request;
+                if (!parse_screenshot_request(payload, request, &error)) {
+                    control_protocol_failure("ScreenshotRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // A viewer sends one request at a time; the queue only
+                    // absorbs a rapid double click. Past it the newest request
+                    // is dropped, because the screen has moved on anyway.
+                    if (screenshot_requests.size() < 4) {
+                        screenshot_requests.push_back(request);
+                    }
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::ScreenshotResponse: {
+                if (role != Role::Client) {
+                    break;
+                }
+                ScreenshotResponse response;
+                if (!parse_screenshot_response(payload, response, &error)) {
+                    control_protocol_failure("ScreenshotResponse: " + error);
+                    break;
+                }
+                bool mismatched = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (response.request_id != client_screenshot_request_id) {
+                        // Slices for a request the viewer abandoned are stale,
+                        // not an error: the cancel and the answer cross.
+                        break;
+                    }
+                    if (response.code != ScreenshotCode::Ok) {
+                        ScreenshotResult result;
+                        result.stream_id = response.stream_id;
+                        result.code = response.code;
+                        result.reason = std::move(response.reason);
+                        client_screenshot_request_id = 0;
+                        screenshot_bytes.clear();
+                        while (screenshots.size() >= 2) screenshots.pop_front();
+                        screenshots.push_back(std::move(result));
+                        break;
+                    }
+                    if (response.index == 0) {
+                        screenshot_bytes.clear();
+                        screenshot_total = response.total;
+                        screenshot_count = response.count;
+                        screenshot_next = 0;
+                        screenshot_stream = response.stream_id;
+                        screenshot_width = response.width;
+                        screenshot_height = response.height;
+                    } else if (response.index != screenshot_next ||
+                               response.total != screenshot_total ||
+                               response.count != screenshot_count ||
+                               response.stream_id != screenshot_stream ||
+                               response.width != screenshot_width ||
+                               response.height != screenshot_height) {
+                        mismatched = true;
+                    }
+                    if (!mismatched) {
+                        screenshot_bytes.insert(screenshot_bytes.end(), response.data.begin(),
+                                                response.data.end());
+                        ++screenshot_next;
+                        if (screenshot_next == screenshot_count) {
+                            if (screenshot_bytes.size() != screenshot_total) {
+                                mismatched = true;
+                            } else {
+                                ScreenshotResult result;
+                                result.stream_id = screenshot_stream;
+                                result.width = screenshot_width;
+                                result.height = screenshot_height;
+                                result.png = std::move(screenshot_bytes);
+                                client_screenshot_request_id = 0;
+                                while (screenshots.size() >= 2) screenshots.pop_front();
+                                screenshots.push_back(std::move(result));
+                                screenshot_bytes.clear();
+                            }
+                        }
+                    }
+                }
+                if (mismatched) {
+                    control_protocol_failure("ScreenshotResponse: slices do not form one picture");
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::DisplayCursorUpdate: {
                 if (role != Role::Client || !desktop_subscription_ready()) break;
                 DisplayCursorUpdate update;
@@ -5051,7 +5232,7 @@ struct QuicSession::Impl {
 
     // ----- sending -----
 
-    void release_send(size_t bytes, uint64_t generation) {
+    void release_send(size_t bytes, uint64_t generation, bool screenshot = false) {
         {
             std::lock_guard<std::mutex> lock(send_mutex);
             // The queue was reset for a new connection: this completion
@@ -5061,6 +5242,7 @@ struct QuicSession::Impl {
             }
             --in_flight_sends;
             in_flight_bytes -= bytes;
+            if (screenshot) screenshot_in_flight_bytes -= bytes;
         }
         send_cv.notify_all();
     }
@@ -5073,6 +5255,7 @@ struct QuicSession::Impl {
             std::lock_guard<std::mutex> lock(send_mutex);
             ++send_generation;
             in_flight_bytes = 0;
+            screenshot_in_flight_bytes = 0;
             in_flight_sends = 0;
         }
         send_cv.notify_all();
@@ -5126,7 +5309,8 @@ struct QuicSession::Impl {
     // Callback replies and real-time media never wait for transport capacity.
     Error send_bytes_impl(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags,
                           bool wait_for_capacity,
-                          std::chrono::steady_clock::time_point deadline = kNoSendDeadline) {
+                          std::chrono::steady_clock::time_point deadline = kNoSendDeadline,
+                          bool screenshot = false) {
         if (!stream) {
             return Error(Status::Unavailable, "no stream is open");
         }
@@ -5155,7 +5339,10 @@ struct QuicSession::Impl {
             if (transport_down.load()) {
                 return Error(Status::Unavailable, "connection closed before send");
             }
+            if (screenshot && screenshot_in_flight_bytes + bytes.size() > 512u * 1024u)
+                return Error(Status::WaitTimeout, "screenshot send window is full");
             ++in_flight_sends;
+            if (screenshot) screenshot_in_flight_bytes += bytes.size();
             in_flight_bytes += bytes.size();
             generation = send_generation;
         }
@@ -5163,12 +5350,13 @@ struct QuicSession::Impl {
         auto* pending = new PendingSend;
         pending->bytes = std::move(bytes);
         pending->generation = generation;
+        pending->screenshot = screenshot;
         pending->buffer.Buffer = pending->bytes.data();
         pending->buffer.Length = static_cast<uint32_t>(pending->bytes.size());
         const QUIC_STATUS status =
             api->StreamSend(stream, &pending->buffer, 1, flags, pending);
         if (QUIC_FAILED(status)) {
-            release_send(pending->bytes.size(), pending->generation);
+            release_send(pending->bytes.size(), pending->generation, pending->screenshot);
             delete pending;
             // A send that aborts is the stream or connection already closing,
             // which for the host means the viewer is gone. Not a failure.
@@ -5567,6 +5755,17 @@ struct QuicSession::Impl {
             voice_responses.clear();
             voice_audio.clear();
             buffered_voice_bytes = 0;
+            screenshot_requests.clear();
+            next_screenshot_request_id = 0;
+            client_screenshot_request_id = 0;
+            screenshot_total = 0;
+            screenshot_count = 0;
+            screenshot_next = 0;
+            screenshot_stream = 0;
+            screenshot_width = 0;
+            screenshot_height = 0;
+            screenshot_bytes.clear();
+            screenshots.clear();
             unclassified.clear();
             transport_failed = false;
             transport_status = Status::Ok;
@@ -5825,6 +6024,8 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     impl.server_config = config;
     if (config.max_clients > 1) {
         impl.live_clients = std::make_shared<std::atomic<size_t>>(0);
+        if (config.max_authenticated_clients)
+            impl.authenticated_clients = std::make_shared<std::atomic<size_t>>(0);
     }
 
     QUIC_STATUS status = MsQuicOpen2(&impl.api);
@@ -5840,6 +6041,8 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     }
 
     QUIC_SETTINGS settings{};
+    settings.SendBufferingEnabled = FALSE;
+    settings.IsSet.SendBufferingEnabled = TRUE;
     settings.IdleTimeoutMs = config.idle_timeout_ms;
     settings.IsSet.IdleTimeoutMs = TRUE;
     settings.KeepAliveIntervalMs = kKeepAliveMs;
@@ -6008,6 +6211,8 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
     }
 
     QUIC_SETTINGS settings{};
+    settings.SendBufferingEnabled = FALSE;
+    settings.IsSet.SendBufferingEnabled = TRUE;
     settings.IdleTimeoutMs = config.idle_timeout_ms;
     settings.IsSet.IdleTimeoutMs = TRUE;
     settings.KeepAliveIntervalMs = kKeepAliveMs;
@@ -6192,6 +6397,13 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
                        "the viewer stopped waiting for approval");
             }
 
+            if (refusal.empty() && impl.authenticated_clients && !impl.authenticated_slot) {
+                const auto count = impl.authenticated_clients->fetch_add(1) + 1;
+                if (count > impl.server_config.max_authenticated_clients) {
+                    impl.authenticated_clients->fetch_sub(1);
+                    refuse(AccessDenial::Declined, "the host's viewer limit has been reached");
+                } else impl.authenticated_slot = true;
+            }
             if (refusal.empty()) {
                 if (!impl.server_config.authenticate) {
                     impl.consume_token();
@@ -6891,6 +7103,113 @@ bool QuicSession::take_display_keyframe_request(uint32_t& stream_id) {
     stream_id = impl_->display_keyframe_requests.front();
     impl_->display_keyframe_requests.pop_front();
     return true;
+}
+
+bool QuicSession::take_screenshot_request(ScreenshotRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->role != Impl::Role::Server || impl_->screenshot_requests.empty()) {
+        return false;
+    }
+    request = impl_->screenshot_requests.front();
+    impl_->screenshot_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_screenshot_response(const ScreenshotResponse& response) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server)
+        return Error(Status::InvalidCall, "send_screenshot_response is a server operation");
+    auto payload = make_screenshot_response(response);
+    if (payload.empty()) return Error(Status::InvalidCall, "invalid screenshot response");
+    std::lock_guard lock(impl.mutex);
+    if (!impl.announced) return Error(Status::InvalidCall, "the stream is not open");
+    HQUIC stream = impl.outgoing_screenshot;
+    if (!stream) {
+        if (response.index != 0) return Error(Status::Unavailable, "screenshot stream ended");
+        const auto opened = impl.api->StreamOpen(impl.connection.load(),
+            QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, &Impl::stream_callback, &impl, &stream);
+        if (QUIC_FAILED(opened)) return quic_error(opened, "QUIC StreamOpen(screenshot)");
+        impl.one_shot_streams.push_back(stream);
+        impl.outgoing_screenshot = stream;
+        impl.outgoing_screenshot_request = response.request_id;
+        impl.outgoing_screenshot_next = 0;
+        const uint16_t priority = 0;
+        impl.api->SetParam(stream, QUIC_PARAM_STREAM_PRIORITY, sizeof(priority), &priority);
+    }
+    if (impl.outgoing_screenshot_request != response.request_id ||
+        impl.outgoing_screenshot_next != response.index)
+        return Error(Status::InvalidCall, "screenshot slices are out of order");
+    auto message = std::move(payload);
+    if (response.index == 0) message.insert(message.begin(), {'C', 'S', 'H', 'T'});
+    const bool last = response.code != ScreenshotCode::Ok || response.index + 1 == response.count;
+    const auto flags = static_cast<QUIC_SEND_FLAGS>((response.index == 0 ? QUIC_SEND_FLAG_START : 0) |
+                                                   (last ? QUIC_SEND_FLAG_FIN : 0));
+    auto sent = impl.send_bytes_impl(stream, std::move(message), flags, false, kNoSendDeadline, true);
+    if (sent.ok()) {
+        ++impl.outgoing_screenshot_next;
+        if (last) impl.outgoing_screenshot = nullptr;
+    } else if (sent.status() != Status::WaitTimeout) {
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.outgoing_screenshot = nullptr;
+    }
+    return sent;
+}
+
+Error QuicSession::request_screenshot(uint32_t stream_id) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_screenshot is a client operation");
+    }
+    ScreenshotRequest request;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if (impl.client_screenshot_request_id != 0) {
+            return Error(Status::InvalidCall, "a screenshot is already pending");
+        }
+        request.request_id = ++impl.next_screenshot_request_id;
+        request.stream_id = stream_id;
+        impl.client_screenshot_request_id = request.request_id;
+        // A timed-out request may still have delivered its last slice; never
+        // hand that picture to the next request.
+        impl.screenshots.clear();
+    }
+    const Error sent = impl.send_bytes(impl.control.load(), make_screenshot_request(request),
+                                       QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.client_screenshot_request_id == request.request_id) {
+            impl.client_screenshot_request_id = 0;
+        }
+    }
+    return sent;
+}
+
+bool QuicSession::take_screenshot(ScreenshotResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->screenshots.empty()) {
+        return false;
+    }
+    result = std::move(impl_->screenshots.front());
+    impl_->screenshots.pop_front();
+    return true;
+}
+
+void QuicSession::cancel_screenshot() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->role != Impl::Role::Client) {
+        return;
+    }
+    for (const auto& entry : impl_->screenshot_streams)
+        impl_->api->StreamShutdown(entry.stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    impl_->client_screenshot_request_id = 0;
+    impl_->screenshot_total = 0;
+    impl_->screenshot_count = 0;
+    impl_->screenshot_next = 0;
+    impl_->screenshot_bytes.clear();
+    impl_->screenshots.clear();
 }
 
 bool QuicSession::take_display_switch_result(uint16_t& display_index, DisplaySwitchCode& code,

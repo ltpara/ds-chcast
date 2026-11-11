@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <utility>
 #include <vector>
 
@@ -70,71 +71,17 @@ private:
     HRESULT error_ = E_FAIL;
 };
 
-}  // namespace
+bool valid_image(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t stride) {
+    return pixels != nullptr && width != 0 && height != 0 &&
+           stride >= static_cast<uint64_t>(width) * 4;
+}
 
-bool write_png_bgra(const std::string& path, const uint8_t* pixels, uint32_t width,
-                    uint32_t height, uint32_t stride, std::string* error) {
-    if (path.empty() || pixels == nullptr || width == 0 || height == 0 ||
-        stride < width * 4) {
-        set_error(error, "invalid BGRA image");
-        return false;
-    }
-
-    std::error_code ec;
-    const std::filesystem::path target(
-        std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
-    if (target.has_parent_path()) {
-        std::filesystem::create_directories(target.parent_path(), ec);
-        if (ec) {
-            set_error(error, "cannot create the screenshot directory: " + ec.message());
-            return false;
-        }
-    }
-    const std::wstring wide_path = widen(path);
-    if (wide_path.empty()) {
-        set_error(error, "the file name is not valid UTF-8");
-        return false;
-    }
-
-    ComScope com;
-    if (!com.ok()) {
-        set_error(error, fail("COM initialisation", com.error()));
-        return false;
-    }
-
-    ComPtr<IWICImagingFactory> factory;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(factory.put()));
-    if (FAILED(hr) || !factory) {
-        set_error(error, fail("WIC factory creation", hr));
-        return false;
-    }
-
-    ComPtr<IWICStream> stream;
-    hr = factory->CreateStream(stream.put());
-    if (SUCCEEDED(hr)) {
-        hr = stream->InitializeFromFilename(wide_path.c_str(), GENERIC_WRITE);
-    }
-    if (FAILED(hr)) {
-        set_error(error, fail("opening the PNG file", hr));
-        return false;
-    }
-
-    ComPtr<IWICBitmapEncoder> encoder;
-    if (SUCCEEDED(hr)) {
-        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.put());
-    }
-    if (SUCCEEDED(hr)) {
-        hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
-    }
-    if (FAILED(hr)) {
-        set_error(error, fail("PNG encoder setup", hr));
-        return false;
-    }
-
+bool write_frame(IWICImagingFactory* factory, IWICBitmapEncoder* encoder,
+                 const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t stride,
+                 std::string* error) {
     ComPtr<IWICBitmapFrameEncode> frame;
     ComPtr<IPropertyBag2> frame_properties;
-    hr = encoder->CreateNewFrame(frame.put(), frame_properties.put());
+    HRESULT hr = encoder->CreateNewFrame(frame.put(), frame_properties.put());
     if (SUCCEEDED(hr)) {
         hr = frame->Initialize(frame_properties.get());
     }
@@ -181,11 +128,187 @@ bool write_png_bgra(const std::string& path, const uint8_t* pixels, uint32_t wid
     if (SUCCEEDED(hr)) {
         hr = frame->Commit();
     }
-    if (SUCCEEDED(hr)) {
-        hr = encoder->Commit();
-    }
     if (FAILED(hr)) {
         set_error(error, fail("writing the PNG", hr));
+        return false;
+    }
+    return true;
+}
+
+bool create_encoder(IWICImagingFactory* factory, IWICStream* stream,
+                    ComPtr<IWICBitmapEncoder>& encoder, std::string* error) {
+    HRESULT hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.put());
+    if (SUCCEEDED(hr)) {
+        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+    }
+    if (FAILED(hr)) {
+        set_error(error, fail("PNG encoder setup", hr));
+        return false;
+    }
+    return true;
+}
+
+bool create_directories(const std::string& path, std::string* error) {
+    std::error_code ec;
+    const std::filesystem::path target(
+        std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
+    if (target.has_parent_path()) {
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) {
+            set_error(error, "cannot create the screenshot directory: " + ec.message());
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool write_png_bgra(const std::string& path, const uint8_t* pixels, uint32_t width,
+                    uint32_t height, uint32_t stride, std::string* error) {
+    if (path.empty() || !valid_image(pixels, width, height, stride)) {
+        set_error(error, "invalid BGRA image");
+        return false;
+    }
+    if (!create_directories(path, error)) {
+        return false;
+    }
+    const std::wstring wide_path = widen(path);
+    if (wide_path.empty()) {
+        set_error(error, "the file name is not valid UTF-8");
+        return false;
+    }
+
+    ComScope com;
+    if (!com.ok()) {
+        set_error(error, fail("COM initialisation", com.error()));
+        return false;
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.put()));
+    if (FAILED(hr) || !factory) {
+        set_error(error, fail("WIC factory creation", hr));
+        return false;
+    }
+
+    ComPtr<IWICStream> stream;
+    hr = factory->CreateStream(stream.put());
+    if (SUCCEEDED(hr)) {
+        hr = stream->InitializeFromFilename(wide_path.c_str(), GENERIC_WRITE);
+    }
+    if (FAILED(hr)) {
+        set_error(error, fail("opening the PNG file", hr));
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (!create_encoder(factory.get(), stream.get(), encoder, error)) {
+        return false;
+    }
+    if (!write_frame(factory.get(), encoder.get(), pixels, width, height, stride, error)) {
+        return false;
+    }
+    hr = encoder->Commit();
+    if (FAILED(hr)) {
+        set_error(error, fail("writing the PNG", hr));
+        return false;
+    }
+    return true;
+}
+
+bool encode_png_bgra(const uint8_t* pixels, uint32_t width, uint32_t height,
+                     uint32_t stride, std::vector<uint8_t>& png, std::string* error) {
+    png.clear();
+    if (!valid_image(pixels, width, height, stride)) {
+        set_error(error, "invalid BGRA image");
+        return false;
+    }
+
+    ComScope com;
+    if (!com.ok()) {
+        set_error(error, fail("COM initialisation", com.error()));
+        return false;
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.put()));
+    if (FAILED(hr) || !factory) {
+        set_error(error, fail("WIC factory creation", hr));
+        return false;
+    }
+
+    // WIC writes through this stream; the HGLOBAL is freed with it.
+    ComPtr<IStream> memory;
+    hr = CreateStreamOnHGlobal(nullptr, TRUE, memory.put());
+    ComPtr<IWICStream> stream;
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateStream(stream.put());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = stream->InitializeFromIStream(memory.get());
+    }
+    if (FAILED(hr)) {
+        set_error(error, fail("opening the PNG memory stream", hr));
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (!create_encoder(factory.get(), stream.get(), encoder, error)) {
+        return false;
+    }
+    if (!write_frame(factory.get(), encoder.get(), pixels, width, height, stride, error)) {
+        return false;
+    }
+    hr = encoder->Commit();
+    if (FAILED(hr)) {
+        set_error(error, fail("writing the PNG", hr));
+        return false;
+    }
+
+    LARGE_INTEGER begin{};
+    hr = memory->Seek(begin, STREAM_SEEK_SET, nullptr);
+    STATSTG stat{};
+    if (SUCCEEDED(hr)) {
+        hr = memory->Stat(&stat, STATFLAG_NONAME);
+    }
+    if (FAILED(hr) || stat.cbSize.QuadPart == 0) {
+        set_error(error, fail("reading the PNG size", hr));
+        return false;
+    }
+    png.resize(static_cast<size_t>(stat.cbSize.QuadPart));
+    ULONG read = 0;
+    hr = memory->Read(png.data(), static_cast<ULONG>(png.size()), &read);
+    if (FAILED(hr) || read != png.size()) {
+        png.clear();
+        set_error(error, fail("reading the PNG bytes", hr));
+        return false;
+    }
+    return true;
+}
+
+bool write_png_file(const std::string& path, const uint8_t* data, size_t size,
+                    std::string* error) {
+    if (path.empty() || data == nullptr || size == 0) {
+        set_error(error, "invalid PNG file");
+        return false;
+    }
+    if (!create_directories(path, error)) {
+        return false;
+    }
+    std::ofstream file(
+        std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(path.data()),
+                                            path.size())),
+        std::ios::binary | std::ios::trunc);
+    if (!file) {
+        set_error(error, "cannot create the screenshot file");
+        return false;
+    }
+    file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    if (!file) {
+        set_error(error, "cannot write the screenshot file");
         return false;
     }
     return true;

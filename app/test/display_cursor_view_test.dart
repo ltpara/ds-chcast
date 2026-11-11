@@ -98,7 +98,7 @@ void main() {
       final origin = tester.getTopLeft(find.byType(Texture));
       expect(
         tester.getTopLeft(find.byType(RawImage)),
-        origin + const Offset(-2.5, 10),
+        origin + const Offset(-3.75, 8.5),
       );
       expect(tester.getSize(find.byType(RawImage)), const Size(5, 5));
       await tester.tapAt(origin + const Offset(1, 12));
@@ -123,7 +123,7 @@ void main() {
       expect(texture.cursor, same(initialImage));
       expect(
         tester.getTopLeft(find.byType(RawImage)),
-        origin + const Offset(20, 10),
+        origin + const Offset(18.75, 8.5),
       );
       shape = 6;
       await controller.refresh();

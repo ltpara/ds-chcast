@@ -253,7 +253,21 @@ void engine_transport() {
     a->release();
     check(until([&] { return left->frames == 1; }), "first native output resumes");
     check(viewer.FocusDisplay(9) && !viewer.FocusDisplay(999), "focus accepts only subscribed sources");
-    check(viewer.SaveScreenshot("") && viewer.FocusDisplay(7) && until([&] { return right->screenshots == 1; }) &&
+    // The engine now asks the host for the pre-encode frame of the display it
+    // was focused on when the picture was requested. The test host refuses, so
+    // the saved picture comes from the pinned sink and the refusal names 9.
+    check(viewer.SaveScreenshot("") && viewer.FocusDisplay(7) && until([&] {
+        ScreenshotRequest request;
+        if (!host->take_screenshot_request(request)) return false;
+        check(request.stream_id == 9, "screenshot request names the display focused when requested");
+        ScreenshotResponse refusal;
+        refusal.request_id = request.request_id;
+        refusal.code = ScreenshotCode::Denied;
+        refusal.stream_id = request.stream_id;
+        refusal.reason = "the test host keeps its own picture";
+        check(host->send_screenshot_response(refusal).ok(), "send screenshot refusal through QUIC");
+        return true;
+    }) && until([&] { return right->screenshots == 1; }) &&
           left->screenshots == 0 && legacy->screenshots == 0,
           "screenshot stays pinned to its chosen display when focus changes");
     streams.erase(streams.begin());
@@ -301,6 +315,19 @@ void engine_transport() {
           until([&] { const auto s = viewer.Snapshot();
               return s.recording && !s.record_path.empty() && s.record_samples == 0; }),
           "recorder ignores the newly focused display and records only its pinned stream");
+    // Starting recording demands an IDR; elapsed recording time alone does
+    // not. Keep the stream static beyond the former eight-second cadence.
+    std::this_thread::sleep_for(100ms);
+    uint32_t requested_id = 0;
+    while (host->take_display_keyframe_request(requested_id)) {}
+    const auto recording_deadline = std::chrono::steady_clock::now() + 8500ms;
+    bool unsolicited_idr = false;
+    while (std::chrono::steady_clock::now() < recording_deadline) {
+        while (host->take_display_keyframe_request(requested_id))
+            unsolicited_idr = unsolicited_idr || requested_id == 11;
+        std::this_thread::sleep_for(5ms);
+    }
+    check(!unsolicited_idr, "recording preserves infinite P frames without timed IDR requests");
     // The muxer retains the newest sample until the next source timestamp (or
     // close) gives it a duration. Only the previous sample is written so far.
     check(encoded(13, 640, 1033) && encoded(11, 800, 1033) &&

@@ -2519,6 +2519,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     unawaited(ViewerBridge.showCursor(x: x, y: y, visible: true));
   }
 
+  /// The press edge skips the move throttle: a click that lands between two
+  /// samples still ripples on the host at once, and the following moves
+  /// throttle from this send instead of stacking another hint.
+  void _onCursorHintPress(Offset frame, {DisplayVideoStream? display}) {
+    if (!_showMyCursor) {
+      return;
+    }
+    final (int x, int y) = _desktopPoint(frame, display);
+    _cursorHintSentMs = DateTime.now().millisecondsSinceEpoch;
+    _cursorHintOnHost = true;
+    unawaited(
+      ViewerBridge.showCursor(x: x, y: y, visible: true, pressed: true),
+    );
+  }
+
   void _hideCursorHint() {
     if (!_cursorHintOnHost) {
       return;
@@ -3832,6 +3847,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         onDevicePointer: (e, p) => _onDevicePointer(e, p, display: stream),
         onDeviceCancel: (e, p) => _onDeviceCancel(e, p, display: stream),
         onCursorHint: (p) => _onCursorHint(p, display: stream),
+        onCursorHintPress: (p) => _onCursorHintPress(p, display: stream),
         onCursorHintExit: _hideCursorHint,
       ),
     );
@@ -5972,6 +5988,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onDevicePointer: _inputActive ? _onDevicePointer : null,
                       onDeviceCancel: _inputActive ? _onDeviceCancel : null,
                       onCursorHint: _onCursorHint,
+                      onCursorHintPress: _onCursorHintPress,
                       onCursorHintExit: _hideCursorHint,
                       onFocusRequested: _focus.requestFocus,
                       overlayBuilder:

@@ -313,13 +313,18 @@ bool check_host_recorder() {
     recorder.submit(VideoCodec::H264, 2560, 1440, 2, {{key, 7000, true, true}});
     const bool bounded = std::chrono::steady_clock::now() - begin < 1s;
     const bool periodic = recorder.needs_keyframe(7000 + 10 * 60 * 1000);
+    // Infinite P frames: recording alone must not create periodic IDRs.
+    // A new segment is a separate demand for an independently playable file.
+    const bool no_periodic_idr = !recorder.needs_keyframe(7000 + 8000) &&
+                                !recorder.needs_keyframe(7000 + 10 * 60 * 1000 - 1);
     recorder.submit(VideoCodec::H264, 2560, 1440, 2, {{key, 607000, true, true}});
     {
         std::lock_guard lock(mutex); resume = true;
     }
     wake.notify_one();
     recorder.finish(608000);
-    if (!requested_idr || !bounded || !periodic || !errors.empty() || saved.size() != 4) return false;
+    if (!requested_idr || !bounded || !periodic || !no_periodic_idr ||
+        !errors.empty() || saved.size() != 4) return false;
     if (!check_segment(saved[0], VideoCodec::H264, {0}, 1) ||
         !check_segment(saved[1], VideoCodec::H264, {0, 33}, 1) ||
         !check_segment(saved[2], VideoCodec::H264, {0}, 1) ||

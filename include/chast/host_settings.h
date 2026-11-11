@@ -130,8 +130,8 @@ struct HostSettings {
     // WASAPI id. Empty follows the default communications microphone. A
     // pinned device that has disappeared at call time falls back to the
     // default and the host logs it, because a call should not fail just
-    // because a headset was unplugged. The choice is read when a call starts,
-    // so changing it never interrupts a running call.
+    // because a headset was unplugged. Changing it restarts the capture of a
+    // running call on the new device; the call itself stays up.
     std::string voice_microphone;
     // Cancel the viewer's microphone out of the loopback capture. Needs a live
     // microphone playback reference; with no CMIC stream it stays bypassed.

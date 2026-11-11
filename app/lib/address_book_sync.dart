@@ -11,6 +11,7 @@ class AddressBookPush {
     required this.id,
     this.name,
     this.tags,
+    this.note,
     this.groupId,
     this.revision = 0,
   });
@@ -18,6 +19,7 @@ class AddressBookPush {
   final String id;
   final String? name;
   final List<String>? tags;
+  final String? note;
   final String? groupId;
 
   /// Server revision the edit is based on; zero means the peer is new locally
@@ -44,8 +46,9 @@ class AddressBookPlan {
 /// Merges the server address book into the local device list.
 ///
 /// Pull rules: a server peer missing locally becomes a saved device; a saved
-/// device with no local name takes the server name, and empty local tags take
-/// the server tags; an unsaved recent entry is promoted to the address book.
+/// device with no local name takes the server name, empty local tags take
+/// the server tags, and an empty local note takes the server note; an unsaved
+/// recent entry is promoted to the address book.
 ///
 /// Deletion rules: a tombstone from [tombstones] removes the matching saved
 /// device and blocks it from the push list, so a peer deleted on another
@@ -56,11 +59,12 @@ class AddressBookPlan {
 /// touches unsaved recents, which were never part of the account book.
 ///
 /// Push rules: every saved device of [serverUrl] missing from the server is
-/// uploaded, and a non-empty local name or tag list wins over a different
-/// server value. Empty tags or group normally mean "no preference" and are
-/// never uploaded; [Device.tagsCleared] and [Device.groupCleared] record an
-/// explicit offline clear and push the empty value until it succeeds. A clear
-/// whose server row already matches is settled without an upload.
+/// uploaded, and a non-empty local name, tag list or note wins over a
+/// different server value. Empty tags, note or group normally mean "no
+/// preference" and are never uploaded; [Device.tagsCleared],
+/// [Device.noteCleared] and [Device.groupCleared] record an explicit offline
+/// clear and push the empty value until it succeeds. A clear whose server row
+/// already matches is settled without an upload.
 ///
 /// Group rules: the server group wins while the local entry is ungrouped, and
 /// a local group id that no longer exists on the server is dropped. A live
@@ -118,6 +122,7 @@ AddressBookPlan planAddressBookSync({
         name: peer.name,
         server: serverUrl,
         tags: peer.tags,
+        note: Device.cleanNote(peer.note),
         groupId: peer.groupId,
         position: peer.position,
         revision: peer.revision,
@@ -132,6 +137,7 @@ AddressBookPlan planAddressBookSync({
     bool promoted = false;
     String name = old.name;
     List<String> tags = old.tags;
+    String note = old.note;
     String groupId = old.groupId;
     if (peer.name.isNotEmpty && old.name.isEmpty) {
       name = peer.name;
@@ -139,6 +145,10 @@ AddressBookPlan planAddressBookSync({
     }
     if (peer.tags.isNotEmpty && old.tags.isEmpty && !old.tagsCleared) {
       tags = peer.tags;
+      changed = true;
+    }
+    if (peer.note.isNotEmpty && old.note.isEmpty && !old.noteCleared) {
+      note = Device.cleanNote(peer.note);
       changed = true;
     }
     if (peer.groupId.isNotEmpty && old.groupId.isEmpty && !old.groupCleared) {
@@ -155,6 +165,7 @@ AddressBookPlan planAddressBookSync({
       merged[index] = old.copyWith(
         name: name,
         tags: tags,
+        note: note,
         groupId: groupId,
         position: peer.position,
         revision: peer.revision,
@@ -180,6 +191,7 @@ AddressBookPlan planAddressBookSync({
         id: device.id,
         name: device.name,
         tags: device.tags.isEmpty ? null : device.tags,
+        note: device.note.isEmpty ? null : Device.cleanNote(device.note),
         groupId: device.groupId.isEmpty ? null : device.groupId,
       ));
       continue;
@@ -194,6 +206,15 @@ AddressBookPlan planAddressBookSync({
     } else {
       tags = null;
     }
+    final String? note;
+    if (device.noteCleared && peer.note.isNotEmpty) {
+      note = '';
+    } else if (device.note.isNotEmpty &&
+        Device.cleanNote(device.note) != peer.note) {
+      note = Device.cleanNote(device.note);
+    } else {
+      note = null;
+    }
     final String? groupId;
     if (device.groupCleared && peer.groupId.isNotEmpty) {
       groupId = '';
@@ -202,11 +223,12 @@ AddressBookPlan planAddressBookSync({
     } else {
       groupId = null;
     }
-    if (name != null || tags != null || groupId != null) {
+    if (name != null || tags != null || note != null || groupId != null) {
       pushes.add(AddressBookPush(
         id: device.id,
         name: name,
         tags: tags,
+        note: note,
         groupId: groupId,
         revision: peer.revision,
       ));
@@ -236,6 +258,9 @@ Device _normalizeDevice(
   if (result.tags.isNotEmpty && result.tagsCleared) {
     result = result.copyWith(tagsCleared: false);
   }
+  if (result.note.isNotEmpty && result.noteCleared) {
+    result = result.copyWith(noteCleared: false);
+  }
   if (result.groupId.isNotEmpty && result.groupCleared) {
     result = result.copyWith(groupCleared: false);
   }
@@ -262,6 +287,9 @@ Device _settleConfirmedClear(
   Device result = device;
   if (result.tagsCleared && (peer == null || peer.tags.isEmpty)) {
     result = result.copyWith(tagsCleared: false);
+  }
+  if (result.noteCleared && (peer == null || peer.note.isEmpty)) {
+    result = result.copyWith(noteCleared: false);
   }
   if (result.groupCleared && (peer == null || peer.groupId.isEmpty)) {
     result = result.copyWith(groupCleared: false);

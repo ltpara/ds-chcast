@@ -17,9 +17,11 @@ class Device {
     this.name = '',
     this.server = '',
     this.tags = const <String>[],
+    this.note = '',
     this.groupId = '',
     this.position = 0,
     this.tagsCleared = false,
+    this.noteCleared = false,
     this.groupCleared = false,
     this.saved = false,
     this.favorite = false,
@@ -40,6 +42,10 @@ class Device {
   /// can be merged with the server copy on the next sync.
   final List<String> tags;
 
+  /// Account address-book free-text reminder, synced like the name. It is
+  /// plain text on the server, so it must not hold credentials.
+  final String note;
+
   /// Account address-book group. Empty means ungrouped. The group name lives
   /// on the server; only the id is cached locally for sync.
   final String groupId;
@@ -52,6 +58,11 @@ class Device {
   /// intent to clear the server copy, not "no local preference". Cleared once
   /// the upload succeeds.
   final bool tagsCleared;
+
+  /// The user cleared the note while offline; same lifecycle as
+  /// [tagsCleared]. Without it an empty note would mean "no preference" and
+  /// a server copy could never be removed.
+  final bool noteCleared;
 
   /// The user moved the peer out of its group while offline. Same lifecycle
   /// as [tagsCleared].
@@ -91,9 +102,11 @@ class Device {
     String? name,
     String? server,
     List<String>? tags,
+    String? note,
     String? groupId,
     int? position,
     bool? tagsCleared,
+    bool? noteCleared,
     bool? groupCleared,
     bool? saved,
     bool? favorite,
@@ -107,9 +120,11 @@ class Device {
       name: name ?? this.name,
       server: server ?? this.server,
       tags: tags ?? this.tags,
+      note: note ?? this.note,
       groupId: groupId ?? this.groupId,
       position: position ?? this.position,
       tagsCleared: tagsCleared ?? this.tagsCleared,
+      noteCleared: noteCleared ?? this.noteCleared,
       groupCleared: groupCleared ?? this.groupCleared,
       saved: saved ?? this.saved,
       favorite: favorite ?? this.favorite,
@@ -125,9 +140,11 @@ class Device {
     'name': name,
     'server': server,
     'tags': tags,
+    'note': note,
     'groupId': groupId,
     'position': position,
     'tagsCleared': tagsCleared,
+    'noteCleared': noteCleared,
     'groupCleared': groupCleared,
     'saved': saved,
     'favorite': favorite,
@@ -155,6 +172,19 @@ class Device {
     return tags;
   }
 
+  /// Trims and collapses a note to what the server can store, so a local edit
+  /// and the server echo never differ on whitespace or control characters.
+  static String cleanNote(String value) {
+    final String trimmed = value
+        .replaceAll(RegExp(r'[\x00-\x1f\x7f]'), '')
+        .trim();
+    final List<int> runes = trimmed.runes.toList(growable: false);
+    if (runes.length <= 512) {
+      return trimmed;
+    }
+    return String.fromCharCodes(runes.take(512));
+  }
+
   static Device? fromJson(Object? value) {
     if (value is! Map) {
       return null;
@@ -175,6 +205,7 @@ class Device {
     }
     final Object? rawName = value['name'];
     final Object? rawTags = value['tags'];
+    final Object? rawNote = value['note'];
     final Object? rawRevision = value['revision'];
     final Object? rawPosition = value['position'];
     final Object? rawLastUsed = value['lastUsed'];
@@ -188,11 +219,13 @@ class Device {
           for (final Object? tag in rawTags)
             if (tag is String) tag,
       ]),
+      note: rawNote is String ? cleanNote(rawNote) : '',
       groupId: value['groupId']?.toString().trim() ?? '',
       position: rawPosition is num && rawPosition >= 0
           ? rawPosition.toInt()
           : 0,
       tagsCleared: value['tagsCleared'] == true,
+      noteCleared: value['noteCleared'] == true,
       groupCleared: value['groupCleared'] == true,
       saved: value['saved'] == true,
       favorite: value['favorite'] == true,
@@ -345,8 +378,10 @@ class DeviceStore {
           name: device.name.isEmpty ? old.name : device.name,
           server: device.server,
           tags: tags,
+          note: device.note.isEmpty ? old.note : Device.cleanNote(device.note),
           groupId: old.groupId,
           tagsCleared: tags.isEmpty ? old.tagsCleared : false,
+          noteCleared: device.note.isEmpty ? old.noteCleared : false,
           groupCleared: old.groupCleared,
           saved: old.saved || device.saved,
           favorite: old.favorite,
@@ -362,6 +397,7 @@ class DeviceStore {
             name: device.name,
             server: device.server,
             tags: Device.cleanTags(device.tags),
+            note: Device.cleanNote(device.note),
             saved: false,
             favorite: device.favorite,
             mac: device.mac,
@@ -396,8 +432,10 @@ class DeviceStore {
           name: device.name.isEmpty ? old.name : device.name,
           server: device.server,
           tags: tags,
+          note: device.note.isEmpty ? old.note : Device.cleanNote(device.note),
           groupId: groupId,
           tagsCleared: tags.isEmpty ? old.tagsCleared : false,
+          noteCleared: device.note.isEmpty ? old.noteCleared : false,
           groupCleared: groupId.isEmpty ? old.groupCleared : false,
           saved: true,
           favorite: old.favorite,
@@ -413,6 +451,7 @@ class DeviceStore {
             name: device.name,
             server: device.server,
             tags: Device.cleanTags(device.tags),
+            note: Device.cleanNote(device.note),
             groupId: device.groupId.trim(),
             saved: true,
             favorite: device.favorite,
@@ -505,15 +544,34 @@ class DeviceStore {
     });
   }
 
+  /// Stores the address-book note locally. An empty value records an explicit
+  /// clear intent so the next sync removes the server copy instead of letting
+  /// the pull restore it.
+  Future<List<Device>> updateNote(String key, String note) async {
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        final String clean = Device.cleanNote(note);
+        devices[index] = devices[index].copyWith(
+          note: clean,
+          noteCleared: clean.isEmpty,
+        );
+      }
+      return _save(devices);
+    });
+  }
+
   /// Records that a clear intent reached the server, so the next sync does not
   /// replay it over a newer edit from another device.
   Future<List<Device>> markPushSettled(
     String key, {
     bool tags = false,
+    bool note = false,
     bool group = false,
   }) async {
     return withStoreLock(_file(), () async {
-      if (!tags && !group) {
+      if (!tags && !note && !group) {
         return load();
       }
       final List<Device> devices = await load();
@@ -521,6 +579,7 @@ class DeviceStore {
       if (index >= 0) {
         devices[index] = devices[index].copyWith(
           tagsCleared: tags ? false : null,
+          noteCleared: note ? false : null,
           groupCleared: group ? false : null,
         );
       }

@@ -41,6 +41,22 @@ const Map<String, String> kEnglishDialogs = <String, String>{
   '删除分组“{p2}”？组内设备会移到未分组，子分组会上移一层，都不会被删除。':
       'Delete group "{p2}"? Its devices move to Ungrouped and child groups move up one level; nothing is deleted.',
   '地址簿分组': 'Address book groups',
+  '地址簿回收站': 'Address book trash',
+  '回收站': 'Trash',
+  '回收站是空的。删除的设备会先放到这里，可随时恢复。':
+      'The trash is empty. Deleted devices land here and can be restored at any time.',
+  '恢复': 'Restore',
+  '永久删除': 'Delete permanently',
+  '清空回收站': 'Empty trash',
+  '已恢复“{p1}”': 'Restored "{p1}"',
+  '永久删除“{p1}”？此操作无法撤销。':
+      'Delete "{p1}" permanently? This cannot be undone.',
+  '永久删除回收站中的 {count} 个条目？此操作无法撤销。':
+      'Delete all {count} entries in the trash permanently? This cannot be undone.',
+  '已清空回收站（{count} 个条目）': 'Emptied the trash ({count} entries)',
+  '回收站已在别处修改，已刷新列表':
+      'The trash was changed elsewhere; the list has been refreshed',
+  '回收站中没有这个条目': 'That entry is no longer in the trash',
   '新建分组': 'New group',
   '编辑': 'Edit',
   '编辑分组': 'Edit group',
@@ -189,4 +205,19 @@ const Map<String, String> kEnglishDialogs = <String, String>{
   '确认启用': 'Confirm and enable',
   '请输入身份验证器中的 6 位验证码': 'Enter the 6-digit code from the authenticator',
   '读取两步验证状态失败：{error}': 'Failed to read the two-factor status: {error}',
+  '共享对象': 'Share with',
+  '用户': 'User',
+  '账号组': 'Account group',
+  '所有账号': 'Everyone',
+  '选择账号组': 'Choose an account group',
+  '请选择账号组': 'Choose an account group',
+  '正在读取账号组…': 'Loading account groups…',
+  '服务器上的每个账号都能读取这本地址簿；可随时撤销。':
+      'Every account on the server can read this address book; revoke it at any time.',
+  '账号组 · {p1}': 'Account group · {p1}',
+  '读取账号组失败：{error}': 'Failed to load account groups: {error}',
+  '需要账号组成员身份': 'Account group membership is required',
+  '账号组或分组不存在': 'Account group or address book group not found',
+  '共享对象无效': 'Share target is invalid',
+  '该共享对象没有地址簿授权': 'That target has no address book grant',
 };

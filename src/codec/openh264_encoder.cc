@@ -10,6 +10,7 @@
 
 #include <d3d11.h>
 #include <wels/codec_api.h>
+#include <libyuv.h>
 
 #include <algorithm>
 #include <cstring>
@@ -60,6 +61,9 @@ public:
                  std::vector<EncodedPacket>& out) override;
     Error encode_repeat(uint64_t pts_ms, bool force_keyframe,
                         std::vector<EncodedPacket>& out) override;
+    Error encode_cpu_bgra(const uint8_t* pixels, UINT width, UINT height,
+                          uint64_t pts_ms, bool force_keyframe,
+                          std::vector<EncodedPacket>& out) override;
     Error set_rate(UINT bits_per_second, UINT framerate,
                    bool* keyframe_required) override;
 
@@ -88,6 +92,7 @@ private:
     EncoderConfig config_;
     ISVCEncoder* encoder_ = nullptr;
     std::vector<uint8_t> i420_;
+    std::vector<uint8_t> scaled_;
     UINT width_ = 0;
     UINT height_ = 0;
     UINT bitrate_ = 0;
@@ -99,10 +104,6 @@ private:
 };
 
 Error OpenH264Encoder::initialize() {
-    if (device_.is_null()) {
-        return Error(Status::InvalidCall,
-                     "OpenH264 encoding needs a D3D11 capture device");
-    }
     if (config_.width == 0 || config_.height == 0 || (config_.width & 1) != 0 ||
         (config_.height & 1) != 0 ||
         config_.width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
@@ -119,14 +120,11 @@ Error OpenH264Encoder::initialize() {
                    : hardware_bitrate(width_, height_, config_.quality_ratio, true);
     bitrate_ = clamp_bitrate(bitrate_, framerate_);
 
-    device_->GetImmediateContext(context_.put());
-    if (context_.is_null()) {
-        return Error(Status::CaptureFailed,
-                     "D3D11 device returned no immediate context");
-    }
-    Error staging = create_staging_texture();
-    if (!staging.ok()) {
-        return staging;
+    if (device_) {
+        device_->GetImmediateContext(context_.put());
+        if (context_.is_null()) return Error(Status::CaptureFailed, "D3D11 device returned no immediate context");
+        Error staging = create_staging_texture();
+        if (!staging.ok()) return staging;
     }
 
     const size_t luma = static_cast<size_t>(width_) * height_;
@@ -234,7 +232,7 @@ Error OpenH264Encoder::create_staging_texture() {
 
 Error OpenH264Encoder::device_lost() const {
     if (device_.is_null()) {
-        return Error(Status::DeviceRemoved, "the capture device is gone");
+        return Error::success();
     }
     const HRESULT hr = device_->GetDeviceRemovedReason();
     return FAILED(hr) ? check(hr, "D3D11 device check") : Error::success();
@@ -310,7 +308,7 @@ Error OpenH264Encoder::encode(ID3D11Texture2D* nv12, uint64_t pts_ms,
     if (!encoder_) {
         return Error(Status::NotCurrentlyAvailable, "the encoder is not open");
     }
-    if (!nv12) {
+    if (!nv12 || !device_) {
         return Error(Status::InvalidCall, "the encoder needs a texture");
     }
     Error lost = device_lost();
@@ -321,6 +319,28 @@ Error OpenH264Encoder::encode(ID3D11Texture2D* nv12, uint64_t pts_ms,
     if (!read.ok()) {
         return read;
     }
+    const auto result = send(pts_ms, force_keyframe, out);
+    have_input_ = result.ok();
+    return result;
+}
+
+Error OpenH264Encoder::encode_cpu_bgra(const uint8_t* pixels, UINT width, UINT height,
+                                      uint64_t pts_ms, bool force_keyframe,
+                                      std::vector<EncodedPacket>& out) {
+    if (!encoder_ || !pixels || !width || !height || width > 16384 || height > 16384)
+        return Error(Status::InvalidCall, "invalid OpenH264 CPU image");
+    if (width != width_ || height != height_) {
+        scaled_.resize(size_t(width_) * height_ * 4);
+        if (libyuv::ARGBScale(pixels, width * 4, width, height, scaled_.data(), width_ * 4,
+                              width_, height_, libyuv::kFilterBox))
+            return Error(Status::CaptureFailed, "OpenH264 CPU scaling failed");
+        pixels = scaled_.data();
+    }
+    const size_t luma = size_t(width_) * height_;
+    if (libyuv::ARGBToI420(pixels, width_ * 4, i420_.data(), width_,
+            i420_.data() + luma, width_ / 2, i420_.data() + luma + luma / 4,
+            width_ / 2, width_, height_))
+        return Error(Status::CaptureFailed, "OpenH264 CPU color conversion failed");
     const auto result = send(pts_ms, force_keyframe, out);
     have_input_ = result.ok();
     return result;

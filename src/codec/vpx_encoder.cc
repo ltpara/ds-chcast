@@ -23,12 +23,12 @@ public:
         if (image_) vpx_img_free(image_);
     }
     Error initialize() {
-        if (!device_ || config_.codec != VideoCodec::Vp9 || !config_.width || !config_.height ||
+        if (config_.codec != VideoCodec::Vp9 || !config_.width || !config_.height ||
             config_.width > 8192 || config_.height > 8192 ||
             uint64_t(config_.width) * config_.height > 7680ull * 4320ull ||
             (config_.chroma != VideoChroma::Yuv420 && config_.chroma != VideoChroma::Yuv444))
             return Error(Status::InvalidCall, "invalid VP9 source or format");
-        device_->GetImmediateContext(context_.put());
+        if (device_) device_->GetImmediateContext(context_.put());
         if (vpx_codec_enc_config_default(vpx_codec_vp9_cx(), &settings_, 0) != VPX_CODEC_OK)
             return Error(Status::Unsupported, "VP9 encoder configuration is unavailable");
         fps_ = (std::clamp)(config_.framerate, 1u, 60u);
@@ -73,8 +73,29 @@ public:
     }
     Error encode_repeat(uint64_t pts, bool force, std::vector<EncodedPacket>& out) override {
         if (!have_input_) return Error(Status::NotCurrentlyAvailable, "VP9 has no previous image");
+        if (!device_) return send(pts, force, out);
         const auto alive = check(device_->GetDeviceRemovedReason(), "VP9 capture device");
         return alive.ok() ? send(pts, force, out) : alive;
+    }
+    Error encode_cpu_bgra(const uint8_t* pixels, UINT width, UINT height, uint64_t pts,
+                          bool force, std::vector<EncodedPacket>& out) override {
+        if (!pixels || !width || !height || width > 16384 || height > 16384)
+            return Error(Status::InvalidCall, "invalid VP9 CPU image");
+        if (width != config_.width || height != config_.height) {
+            scaled_.resize(size_t(config_.width) * config_.height * 4);
+            if (libyuv::ARGBScale(pixels, width * 4, width, height, scaled_.data(),
+                config_.width * 4, config_.width, config_.height, libyuv::kFilterBox))
+                return Error(Status::CaptureFailed, "VP9 CPU scaling failed");
+            pixels = scaled_.data();
+        }
+        const auto convert = config_.chroma == VideoChroma::Yuv444
+            ? libyuv::ARGBToI444 : libyuv::ARGBToI420;
+        if (convert(pixels, config_.width * 4, image_->planes[0], image_->stride[0],
+            image_->planes[1], image_->stride[1], image_->planes[2], image_->stride[2],
+            config_.width, config_.height))
+            return Error(Status::CaptureFailed, "VP9 CPU color conversion failed");
+        have_input_ = true;
+        return send(pts, force, out);
     }
     Error set_rate(UINT bits, UINT fps, bool* keyframe) override {
         if (keyframe) *keyframe = false;
@@ -101,7 +122,7 @@ private:
             vpx_codec_error(&codec_) + (detail ? std::string("; ") + detail : ""));
     }
     Error copy(ID3D11Texture2D* texture) {
-        if (!texture) return Error(Status::InvalidCall, "VP9 capture texture is missing");
+        if (!texture || !device_) return Error(Status::InvalidCall, "VP9 capture texture or device is missing");
         const auto alive = check(device_->GetDeviceRemovedReason(), "VP9 capture device");
         if (!alive.ok()) return alive;
         D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);

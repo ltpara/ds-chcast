@@ -138,6 +138,9 @@ struct QuicServerConfig {
     // listener keeps the registration, configuration and certificate alive for
     // as long as any accepted session exists.
     uint32_t max_clients = 1;
+    // Consumed after authentication and approval; max_clients separately
+    // bounds all transports, including peers that have not sent Hello.
+    uint32_t max_authenticated_clients = 0;
     // How long a connection may stay open without sending its Hello. A silent
     // peer would otherwise hold a session slot forever: the server keepalive
     // keeps the idle timeout from firing. On expiry the connection is shut
@@ -309,6 +312,17 @@ struct FileUploadState {
     bool compressed = false;     // the sender picked the v2 block stream
     bool finished = false;       // stream ended and every chunk was taken
     std::string error;           // set when the stream broke
+};
+
+// A completed host screenshot. `png` is the file the host encoded from its raw
+// frame; a refusal leaves it empty and explains itself in `reason`.
+struct ScreenshotResult {
+    uint32_t stream_id = 0;
+    ScreenshotCode code = ScreenshotCode::Ok;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string reason;
+    std::vector<uint8_t> png;
 };
 
 // One forwarded TCP connection, named on this side by an opaque handle. The
@@ -832,6 +846,26 @@ public:
     bool take_display_stream_update(DisplayStreamInfo& info);
     Error request_display_keyframe(uint32_t stream_id);
     bool take_display_keyframe_request(uint32_t& stream_id);
+    // Host side (v70): pops the next ScreenshotRequest the viewer queued. The
+    // host answers with PNG slices from the pre-encode frame of `stream_id`
+    // (kScreenshotCurrentStream selects the focused stream).
+    bool take_screenshot_request(ScreenshotRequest& request);
+    // Sends one ScreenshotResponse slice. Never waits: WaitTimeout means the
+    // send queue was full and the caller should retry the same slice on a
+    // later pass, Unavailable means the session ended.
+    Error send_screenshot_response(const ScreenshotResponse& response);
+    // Viewer side (v70): asks the host for the raw frame of `stream_id`
+    // (kScreenshotCurrentStream selects current). One request at a time;
+    // InvalidCall while another is outstanding. The answer arrives through
+    // take_screenshot().
+    Error request_screenshot(uint32_t stream_id = kScreenshotCurrentStream);
+    // Pops a completed answer. The transport assembles the slices into the
+    // full PNG before queueing it, and bounds the assembly by
+    // kMaxScreenshotBytes.
+    bool take_screenshot(ScreenshotResult& result);
+    // Forgets an outstanding request, for a viewer that gave up waiting. Late
+    // slices for it are ignored.
+    void cancel_screenshot();
     // Pops the newest DisplaySwitchResult. The reason is the host's UTF-8
     // explanation, empty when it has none.
     bool take_display_switch_result(uint16_t& display_index, DisplaySwitchCode& code,

@@ -77,6 +77,7 @@ class RemoteView extends StatefulWidget {
     this.onDevicePointer,
     this.onDeviceCancel,
     this.onCursorHint,
+    this.onCursorHintPress,
     this.onCursorHintExit,
     this.onFocusRequested,
     this.overlayBuilder,
@@ -127,6 +128,10 @@ class RemoteView extends StatefulWidget {
   /// remote control is off, because the hint is draw-only. [onCursorHintExit]
   /// fires when the pointer leaves the picture so the host can hide it.
   final ValueChanged<Offset>? onCursorHint;
+  /// The primary-button press edge at the given position. It is sent ahead of
+  /// the throttled moves so the host overlay can ripple at the click instead
+  /// of at the next move sample.
+  final ValueChanged<Offset>? onCursorHintPress;
   final VoidCallback? onCursorHintExit;
   final VoidCallback? onFocusRequested;
   final Widget Function(Size drawn)? overlayBuilder;
@@ -308,7 +313,12 @@ class _RemoteViewState extends State<RemoteView> {
         onExit: (_) => widget.onCursorHintExit?.call(),
         child: Listener(
           behavior: HitTestBehavior.opaque,
-          onPointerDown: (_) => widget.onFocusRequested?.call(),
+          onPointerDown: (PointerDownEvent event) {
+            widget.onFocusRequested?.call();
+            if (event.buttons & kPrimaryMouseButton != 0) {
+              widget.onCursorHintPress?.call(_toFrame(event.localPosition, box));
+            }
+          },
           onPointerMove: (PointerMoveEvent event) =>
               widget.onCursorHint?.call(_toFrame(event.localPosition, box)),
           onPointerHover: (PointerHoverEvent event) =>
@@ -331,6 +341,9 @@ class _RemoteViewState extends State<RemoteView> {
           if (_isDevicePointer(event)) {
             widget.onDevicePointer?.call(event, position);
             return;
+          }
+          if (event.buttons & kPrimaryMouseButton != 0) {
+            widget.onCursorHintPress?.call(position);
           }
           _syncButtons(event.buttons, position);
         },

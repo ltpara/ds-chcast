@@ -84,10 +84,45 @@ void run() {
           "closing the merged capture leaves the individual GPU reader usable");
 }
 
+// A04: the CPU-only backend must publish pixels without a D3D device, and two
+// readers on it still own their scale. Runs after run() so the GPU-keyed source
+// is gone and the backend policy check does not reject the new source.
+void cpu_readers() {
+    const std::vector<chast::DisplayInfo> displays = chast::enumerate_displays();
+    if (displays.empty()) {
+        skip("CPU shared capture needs an attached output");
+        return;
+    }
+    chast::CaptureConfig config;
+    config.backend = chast::CaptureBackend::GdiCpu;
+    config.nv12.enabled = true;
+    std::string error;
+    std::unique_ptr<chast::IDxgiCapturer> a =
+        chast::create_shared_capturer(displays[0], config, &error);
+    std::unique_ptr<chast::IDxgiCapturer> b =
+        chast::create_shared_capturer(displays[0], config, &error);
+    if (!a || !b) {
+        const std::string reason = "CPU shared capture unavailable: " + error;
+        skip(reason.c_str());
+        return;
+    }
+    check(frame(*a) && frame(*b), "CPU-only readers produce frames");
+    check(a->frame().cpu_bgra && !a->frame().nv12_texture &&
+              !a->adapter_device().device && !a->frame().device,
+          "CPU-only frames carry no GPU texture or device");
+    check(std::string(a->implementation()) == "gdi-cpu",
+          "the CPU-only reader reports the gdi-cpu backend");
+    const UINT width = a->frame().nv12_width;
+    check(b->set_nv12_scale(50).ok() && frame(*b) && width > 0 &&
+              b->frame().nv12_width < width && a->frame().nv12_width == width,
+          "a CPU-only reader scales without changing another reader's image");
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     run();
+    cpu_readers();
     return failures ? 1 : 0;
 }

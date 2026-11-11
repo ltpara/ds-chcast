@@ -73,7 +73,7 @@ public:
         device_ = ComPtr<ID3D11Device>(device ? device : adapter.device);
         device_.add_ref();
         if (context) { context_ = ComPtr<ID3D11DeviceContext>(context); context_.add_ref(); }
-        else device_->GetImmediateContext(context_.put());
+        else if (device_) device_->GetImmediateContext(context_.put());
         auto threads = com_query<ID3D10Multithread>(device_);
         if (threads) threads->SetMultithreadProtected(TRUE);
         vendor_ = device ? vendor : adapter.vendor_id;
@@ -84,6 +84,7 @@ public:
         return Error::success();
     }
     CaptureResult capture(std::chrono::milliseconds timeout) override {
+        if (cpu_fallback_) return capture_cpu(timeout);
         std::lock_guard<std::mutex> lock(source_->mutex);
         if (source_->lost || generation_ != source_->generation) return CaptureResult::ReinitNeeded;
         if (seen_ == source_->sequence && !dirty_) {
@@ -95,21 +96,37 @@ public:
             }
             if (result == CaptureResult::NoNewFrame) return result;
             const auto& incoming = source_->capture->frame();
-            if (!incoming.texture) return CaptureResult::NoNewFrame;
-            // A pointer-only wake leaves the desktop image untouched. Keeping
-            // the retained copy is not just cheaper: it is what lets every
-            // reader report the wake as pointer-only instead of new pixels.
-            if (incoming.desktop_updated || !source_->texture) {
-                error_ = surface(incoming.device, incoming.texture, source_->texture, source_->handle);
-                if (!error_.ok()) return CaptureResult::FatalError;
-                incoming.context->CopyResource(source_->texture.get(), incoming.texture);
-                if (incoming.desktop_updated) ++source_->desktop_sequence;
+            if (incoming.cpu_bgra && !external_) {
+                source_->frame = incoming;
+                source_->cursor = source_->capture->cursor();
+                ++source_->sequence;
+                ++source_->desktop_sequence;
+            } else {
+                if (!incoming.texture) return CaptureResult::NoNewFrame;
+                // A pointer-only wake leaves the desktop image untouched. Keeping
+                // the retained copy is not just cheaper: it is what lets every
+                // reader report the wake as pointer-only instead of new pixels.
+                if (incoming.desktop_updated || !source_->texture) {
+                    error_ = surface(incoming.device, incoming.texture, source_->texture, source_->handle);
+                    if (!error_.ok()) return CaptureResult::FatalError;
+                    incoming.context->CopyResource(source_->texture.get(), incoming.texture);
+                    if (incoming.desktop_updated) ++source_->desktop_sequence;
+                }
+                source_->frame = incoming;
+                source_->frame.texture = source_->texture.get();
+                source_->frame.shared_handle = source_->handle;
+                source_->cursor = source_->capture->cursor();
+                ++source_->sequence;
             }
-            source_->frame = incoming;
-            source_->frame.texture = source_->texture.get();
-            source_->frame.shared_handle = source_->handle;
-            source_->cursor = source_->capture->cursor();
-            ++source_->sequence;
+        }
+        if (source_->frame.cpu_bgra && !external_) {
+            frame_ = source_->frame;
+            frame_.nv12_width = (std::max)(2u, (frame_.width * percent_ + 50) / 100) & ~1u;
+            frame_.nv12_height = (std::max)(2u, (frame_.height * percent_ + 50) / 100) & ~1u;
+            cursor_ = config_.capture_cursor ? source_->cursor : CursorInfo{};
+            display_ = source_->capture->display();
+            seen_ = source_->sequence; dirty_ = false;
+            return CaptureResult::Frame;
         }
         if (!source_->texture) { dirty_ = false; return CaptureResult::NoNewFrame; }
         const auto& incoming = source_->frame;
@@ -166,12 +183,12 @@ public:
                 const UINT h = std::max<UINT>(2, (desc.Height * percent_ + 50) / 100) & ~1u;
                 error_ = next->initialize(device_.get(), context_.get(), desc.Width, desc.Height,
                                           w, h, config_.nv12.colorimetry);
-                if (!error_.ok()) return CaptureResult::FatalError;
+                if (!error_.ok()) return fallback_cpu(timeout);
                 nv12_ = std::move(next);
                 width_ = desc.Width; height_ = desc.Height;
             }
             error_ = nv12_->convert(texture_.get(), &frame_.nv12_texture);
-            if (!error_.ok()) return CaptureResult::FatalError;
+            if (!error_.ok()) return fallback_cpu(timeout);
             frame_.nv12_shared_handle = nv12_->shared_handle();
             frame_.nv12_width = nv12_->width();
             frame_.nv12_height = nv12_->height();
@@ -185,14 +202,18 @@ public:
         seen_desktop_ = source_->desktop_sequence;
         return CaptureResult::Frame;
     }
-    const FrameInfo& frame() const override { return frame_; }
-    const CursorInfo& cursor() const override { return cursor_; }
-    const DisplayInfo& display() const override { return display_; }
-    AdapterDevice adapter_device() const override { return {device_.get(), vendor_, display_.adapter_luid}; }
+    const FrameInfo& frame() const override { return cpu_fallback_ ? cpu_fallback_->frame() : frame_; }
+    const CursorInfo& cursor() const override { return cpu_fallback_ ? cpu_fallback_->cursor() : cursor_; }
+    const DisplayInfo& display() const override { return cpu_fallback_ ? cpu_fallback_->display() : display_; }
+    AdapterDevice adapter_device() const override {
+        if (cpu_fallback_ || frame_.cpu_bgra) return {};
+        return {device_.get(), vendor_, display_.adapter_luid};
+    }
     const char* implementation() const noexcept override {
-        return source_->capture->implementation();
+        return cpu_fallback_ ? "gdi-cpu fallback" : source_->capture->implementation();
     }
     Error reinitialize() override {
+        if (cpu_fallback_) return cpu_fallback_->reinitialize();
         std::lock_guard<std::mutex> lock(source_->mutex);
         if (generation_ == source_->generation) {
             source_->texture.reset();
@@ -214,6 +235,8 @@ public:
     }
     Error set_nv12_scale(UINT percent) override {
         if (percent < 1 || percent > 100) return Error(Status::InvalidCall, "scale must be 1..100");
+        if (cpu_fallback_) return cpu_fallback_->set_nv12_scale(percent);
+        if (!device_ || frame_.cpu_bgra) { percent_ = percent; dirty_ = true; return Error::success(); }
         if (config_.nv12.enabled) {
             std::lock_guard<std::mutex> lock(source_->mutex);
             const UINT width = frame_.width ? frame_.width : display_.width;
@@ -232,9 +255,21 @@ public:
         percent_ = percent; dirty_ = true;
         return Error::success();
     }
-    UINT nv12_scale_percent() const override { return percent_; }
-    const Error& last_error() const override { return error_; }
+    UINT nv12_scale_percent() const override { return cpu_fallback_ ? cpu_fallback_->nv12_scale_percent() : percent_; }
+    const Error& last_error() const override { return cpu_fallback_ ? cpu_fallback_->last_error() : error_; }
 private:
+    CaptureResult capture_cpu(std::chrono::milliseconds timeout) { return cpu_fallback_->capture(timeout); }
+    CaptureResult fallback_cpu(std::chrono::milliseconds timeout) {
+        if (external_) return CaptureResult::FatalError;
+        auto config = config_; config.backend = CaptureBackend::GdiCpu;
+        std::string error;
+        auto next = create_capturer(display_, config, &error);
+        if (!next) return CaptureResult::FatalError;
+        if (!next->set_nv12_scale(percent_).ok()) return CaptureResult::FatalError;
+        cpu_fallback_ = std::move(next);
+        return capture_cpu(timeout);
+    }
+    std::unique_ptr<IDxgiCapturer> cpu_fallback_;
     std::shared_ptr<Source> source_;
     CaptureConfig config_;
     ComPtr<ID3D11Device> device_;

@@ -3114,17 +3114,21 @@ class ViewerBridge {
 
   /// Draws the viewer pointer on the host desktop ("show my cursor"). The
   /// coordinates are captured-desktop pixels like the mouse events; the hint
-  /// is draw-only and needs no input permission. Returns false when no
-  /// session is streaming.
+  /// is draw-only and needs no input permission. [pressed] marks the click
+  /// edge the host draws as a ripple; it is sent on pointer-down only, not for
+  /// every move while a button is held. Returns false when no session is
+  /// streaming.
   static Future<bool> showCursor({
     required int x,
     required int y,
     required bool visible,
+    bool pressed = false,
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>('showCursor', {
       'x': x,
       'y': y,
       'visible': visible,
+      'pressed': pressed,
     });
     return queued ?? false;
   }

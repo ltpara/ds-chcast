@@ -383,6 +383,31 @@ void test_connection_cap(const std::filesystem::path& dir) {
     stop_host(host);
 }
 
+void test_pending_does_not_take_viewer_slot(const std::filesystem::path& dir) {
+    for (auto limit : {1u, 2u}) {
+        const auto port = free_udp_port();
+        std::string error;
+        auto host = start_host(port, limit, false, dir, &error);
+        check(host != nullptr, "start host for independent pending/authenticated quotas");
+        if (!host) continue;
+        std::vector<std::unique_ptr<chast::QuicSession>> pending;
+        for (unsigned i = 0; i < limit; ++i) {
+            chast::QuicClientConfig config;
+            config.host = "127.0.0.1"; config.port = port;
+            config.pinned_fingerprint = host->status().fingerprint;
+            auto peer = chast::QuicSession::create_client(config, &error);
+            check(peer && peer->connect(std::chrono::seconds(3)).ok(), "pending peer completes TLS without Hello");
+            pending.push_back(std::move(peer));
+        }
+        chast::ServerInfo info;
+        auto viewer = connect_viewer(port, host->status().fingerprint,
+            chast::SessionMode::FileTransfer, "abababababababab", &info, &error);
+        check(viewer != nullptr, "silent pre-auth peers do not consume a legitimate viewer slot");
+        if (viewer) finish_viewer(*viewer);
+        viewer.reset(); pending.clear(); stop_host(host);
+    }
+}
+
 void test_duplicate_audit_ref(const std::filesystem::path& dir) {
     const std::filesystem::path spool = dir / L"duplicate.audit.jsonl";
     const uint16_t port = free_udp_port();
@@ -696,6 +721,7 @@ int main() {
     const std::filesystem::path dir = temp_dir();
     test_two_viewers(dir);
     test_connection_cap(dir);
+    test_pending_does_not_take_viewer_slot(dir);
     test_duplicate_audit_ref(dir);
     test_input_lease(dir);
     test_denied_audit(dir, 1);

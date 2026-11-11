@@ -297,7 +297,10 @@
     不动，1 s 内重复切换回答 `Busy`；统计新增请求/生效/失败计数。
   - 编码器：H.264 的纯码率变化走
     `mfxExtEncoderResetOption{StartNewSequence=OFF}` 的连续 reset，参考帧
-    保留、不插 IDR（初始化关闭 HRD/VUI 计时，SPS 不随码率变化）；帧率变化、
+    保留、不插 IDR（初始化关闭 HRD/VUI 计时，SPS 不随码率变化）。连续 reset
+    只改 `TargetKbps`，CPB 尺寸/初始延迟/`MaxKbps` 保持初始化值：mfx-gen
+    (VDENC AVC) 对这几项变化返回 `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM`，一旦回落
+    到普通 reset 就会插入 IDR；帧率变化、
     首帧前与编码器替换仍要求 IDR，主机只按 `set_rate` 的
     `keyframe_required` 决定是否强制关键帧。mfx-gen 的 HEVC VDEnc 拒绝
     `MFXVideoENCODE_Reset`（连原样参数也返回 -14），`MfxEncoder` 改为同一
@@ -2947,7 +2950,8 @@
      摄像头/终端面板、单目标端口转发等不是缺口；白板仅在 RustDesk CLI 内部
      工具中出现，不计入（**2026-11-11 更正**：固定提交 `7423dce` 已有
      `show_my_cursor` Flutter 工具栏和主机 `src/whiteboard` 覆盖层，旧判断
-     过期，登记为 G21；同日已实现光标部分，协议 v68，白板绘制仍未实现）。
+     过期，登记为 G21；同日已实现光标部分，协议 v68；v71 再补齐颜色、姓名
+     与点击涟漪，自由绘制仍未实现）。
      初轮对照仅做源码与文档登记；实现与验证见第 162 条。边界：本轮不改变
      ENV/DEV/PLAT-01～03 的既有处置与状态。
 124. **P1 · DEV-12 出站 SOCKS5/HTTP(S) 代理（2026-11-05 完成）**：新增
@@ -3553,7 +3557,12 @@
      2026-11-11 RustDesk 二次比对登记的 G21/G22/G23 同日实现。v68 新增
      `ControlType::ShowCursor`（83），查看端工具栏开关按设备保存并按 33 ms
      节流发送，主机在独立线程创建分层、点击穿透、不激活的覆盖层绘制指针，
-     断线/关闭隐藏，坐标不进入注入器；RustDesk 式白板绘制未实现。主机语音
+     断线/关闭隐藏，坐标不进入注入器。**v71 补齐协作光标**：`ShowCursor`
+     增加按下边沿标志（只在可见时合法，不是按住状态），查看端在按下瞬间绕过
+     节流发送；主机覆盖层按查看端设备名哈希取色、绘制姓名标签，并在点击处
+     播放 420 ms 扩散波纹，箭头/波纹/标签仍只为绘制，不进入注入器；逐像素
+     光栅抽成 `src/win/cursor_hint_paint.cc`，`cursor_hint` 测试覆盖取色、
+     布局、预乘 alpha、波纹几何与标签阴影。自由绘制/标注工具仍未实现。主机语音
      呼叫新增 `host.ini voice_microphone=`、设置页下拉/刷新和托盘“上行语音
      麦克风”子菜单，呼叫开始时读取，固定设备缺失时记日志并回退默认通信
      设备；通话中不切换。新增默认关闭的 `host.ini remove_wallpaper=` 与托盘
@@ -3562,7 +3571,7 @@
      `host_voice` 通过（合成采集与注入壁纸移除器，未改真实桌面），
      `chast-host` Release 构建通过，`flutter analyze` 无问题，
      `display_menu`/`view_prefs` 定向 57/57。边界：本机无物理麦克风，真实
-     录音与设备切换未验；壁纸视觉切换、异常断电恢复、白板绘制和真实多屏/
+     录音与设备切换未验；壁纸视觉切换、异常断电恢复、自由标注和真实多屏/
      混合 DPI 覆盖层位置待人工验证。三项均不改变零拷贝媒体路径。详见
      `docs/rustdesk-gap-tasks-2026-11-01.md` 的同日小节。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、

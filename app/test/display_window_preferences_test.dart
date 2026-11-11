@@ -117,10 +117,13 @@ void main() {
     view.onCursorHint!(const Offset(100, 50));
     await tester.pump();
     expect(cursors, hasLength(1));
-    expect(cursors.single, {'x': -1180, 'y': -50, 'visible': true});
+    expect(cursors.single, {'x': -1180, 'y': -50, 'visible': true, 'pressed': false});
+    view.onCursorHintPress!(const Offset(100, 50));
+    await tester.pump();
+    expect(cursors.last, {'x': -1180, 'y': -50, 'visible': true, 'pressed': true});
     view.onCursorHintExit!();
     await tester.pump();
-    expect(cursors.last, {'x': 0, 'y': 0, 'visible': false});
+    expect(cursors.last, {'x': 0, 'y': 0, 'visible': false, 'pressed': false});
 
     // Another window changes unrelated settings after this one loaded them.
     ViewPreferences.update(

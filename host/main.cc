@@ -3393,9 +3393,12 @@ void handle_command(int id) {
         const std::string selected = index == 0 ? std::string() : g_app->tray_voice_mics[index - 1];
         g_app->settings.voice_microphone = selected;
         save_settings();
+        if (g_app->server) {
+            g_app->server->set_voice_microphone(selected);
+        }
         append_log_line(selected.empty()
-                            ? tr(L"上行语音麦克风已设为系统默认（下次语音呼叫生效）")
-                            : tr(L"上行语音麦克风已更新（下次语音呼叫生效）"));
+                            ? tr(L"上行语音麦克风已设为系统默认（通话中会立即切换）")
+                            : tr(L"上行语音麦克风已更新（通话中会立即切换）"));
         return;
     }
     switch (id) {

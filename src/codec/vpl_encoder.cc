@@ -1103,7 +1103,12 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
         mfxExtBuffer* buffers[3] = {&signal.Header, &sequence.Header, &option.Header};
         candidate.ExtParam = buffers;
         candidate.NumExtParam = 3;
-        set_cbr_rate(candidate.mfx, kbps);
+        // Only the target rate may move in a continuous sequence. mfx-gen
+        // treats a changed CPB size, initial delay or MaxKbps as a configuration
+        // change that needs StartNewSequence=ON, and the viewer would then wait
+        // for an IDR on a bitrate-only vote. The buffer keeps the size it was
+        // opened with; its duration simply follows the new rate.
+        candidate.mfx.TargetKbps = static_cast<mfxU16>(kbps);
         mfxStatus sts = MFXVideoENCODE_Query(session_, &candidate, &candidate);
         if (sts >= MFX_ERR_NONE && option.StartNewSequence == MFX_CODINGOPTION_OFF) {
             sts = MFXVideoENCODE_Reset(session_, &candidate);

@@ -289,6 +289,9 @@ inline std::shared_ptr<MediaState> use_media(HostServerConfig& config) {
     config.capture_factory = [state](const DisplayInfo& display, const CaptureConfig&, std::string*) {
         return std::make_unique<Capture>(state, display);
     };
+    config.cursor_sampler = [state](const DisplayInfo&, CursorInfo& cursor) {
+        std::lock_guard lock(state->cursor_mutex); cursor = state->pointer; return true;
+    };
     config.encoder_factory = [state](ID3D11Device*, const EncoderConfig& cfg, std::string*) {
         return std::make_unique<Encoder>(state, cfg);
     };

@@ -1,5 +1,10 @@
 #include "chast/clipboard_worker.h"
 
+#include "chast/clipboard_oledata.h"
+
+#include <windows.h>
+#include <ole2.h>
+
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -30,6 +35,13 @@ struct ClipboardWorker::State {
 ClipboardWorker::ClipboardWorker(ClipboardBackend backend) : state_(std::make_shared<State>()) {
     state_->backend = std::move(backend);
     std::thread([state = state_] {
+        // OleGetClipboard needs an initialized apartment; the delayed reads it
+        // hands out run on the OLE adapter's own thread.
+        const HRESULT ole = OleInitialize(nullptr);
+        struct Apartment {
+            HRESULT result;
+            ~Apartment() { if (SUCCEEDED(result)) OleUninitialize(); }
+        } apartment{ole};
         std::unique_ptr<VirtualClipboard> native_files;
         std::unique_lock lock(state->mutex);
         while (true) {
@@ -63,8 +75,28 @@ ClipboardWorker::ClipboardWorker(ClipboardBackend backend) : state_(std::make_sh
                             if (!snapshot.local_files) snapshot.state = ClipboardReadState::Failed;
                         }
                     } else if (current() && files == ClipboardReadState::Empty) {
-                        snapshot.state = backend.read ? backend.read(snapshot.content)
-                            : read_clipboard_state(snapshot.content, &snapshot.error);
+                        // A copy from an application that only offers an OLE
+                        // file descriptor has no CF_HDROP paths; read it
+                        // through its delayed streams instead. A stubbed file
+                        // backend owns the clipboard in tests, so it is never
+                        // bypassed.
+                        std::vector<ClipboardFileEntry> virtual_entries;
+                        std::shared_ptr<ClipboardVirtualFiles> virtual_files;
+                        const ClipboardReadState ole = backend.read_files
+                            ? ClipboardReadState::Empty
+                            : read_ole_clipboard_files_state(
+                                  virtual_entries, virtual_files, &snapshot.error);
+                        if (current() && ole == ClipboardReadState::Content) {
+                            snapshot.state = ClipboardReadState::Content;
+                            snapshot.has_files = true;
+                            snapshot.entries = std::move(virtual_entries);
+                            snapshot.local_files = std::move(virtual_files);
+                        } else if (ole == ClipboardReadState::Failed) {
+                            snapshot.state = ClipboardReadState::Failed;
+                        } else {
+                            snapshot.state = backend.read ? backend.read(snapshot.content)
+                                : read_clipboard_state(snapshot.content, &snapshot.error);
+                        }
                     }
                 } else if (!current()) {
                     if (job.files) job.files->Cancel();
