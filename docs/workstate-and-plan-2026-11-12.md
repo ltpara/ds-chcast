@@ -4,10 +4,9 @@
 
 ## 1. 分支与提交基线
 
-- 仓库：`ltpara/ds-chcast`；分支：`main`；最近已提交基线：`ca51be2`（`chast: draw cursor hint overlay with per-pixel transparency`），协议 **v71**。
-- 本次提交范围：`server/**`（Go 服务端、管理台静态资源、`server/README.md`、`go.mod`/`go.sum`）与本文档。
-- 工作区同时存在并行工作流的未提交改动（协议 v72、`src/**`、`include/chast/protocol.h`、`app/**`、`host/**`、原生测试与部分对照文档）；这些文件不属于本次提交，也未被修改或回退。
-- `docs/status-and-plan-2026-11-09.md` 与 `docs/rustdesk-full-parity-2026-11-07.md` 由两条工作流共同编辑（含 CRLF 规范化），本次未纳入提交；本工作流的增量摘要见本文第 3 节。
+- 仓库：`ltpara/ds-chcast`；分支：`main`；最近已提交基线：`c625c14`（`chast: checkpoint protocol v72 native and viewer work`），协议 **v72**。
+- 本次提交分两次完成：`a3e17a7` 提交 `server/**`（Go 服务端、管理台静态资源、`server/README.md`、`go.mod`/`go.sum`）与本文档；`c625c14` 提交剩余全部工作树内容（协议 v70–v72 原生代码、`include/**`、`src/**`、`host/**`、`app/**`、原生测试、`CMakeLists.txt`、`tools/` 与相关文档）。
+- 工作区现仅剩未跟踪的运行时文件（`mp4_recorder_*.mp4`、`server/host.pid`），未纳入提交。
 
 ## 2. 本次提交的服务端能力
 
@@ -32,19 +31,20 @@
 - `gofmt -l internal/account internal/api internal/webadmin` 干净；`go vet ./internal/account/ ./internal/api/ ./internal/webadmin/` 通过。
 - `go test ./internal/account/ ./internal/api/ ./internal/webadmin/ -count=1` 通过（最近一次：35.10 s / 59.92 s / 0.059 s）。
 - 管理台脚本 `node --check`（Qoder 内置 Node）通过。
+- 原生：`build/Release` 下全部二进制的时间戳均晚于当前工作树的原生源码（最后构建 2026-11-12 00:23），`chast-protocol-test` 复跑通过；`flutter analyze` 无问题（6.9 s）。
 - 最近一轮真实二进制冒烟：账号审计用户名过滤 24/24 通过（匿名 401、非法 `limit` 400、账号+动作+limit、未知账号空结果、CSV 仅目标账号、admin 令牌过滤、内嵌控制台资源）。
-- 边界说明：本轮未重跑完整 `go test ./...`（全仓库），也未运行 Flutter/原生构建；这些属于并行工作流范围或需在其 v72 合并后统一复验。
+- 边界说明：本轮未重跑完整 `go test ./...`、完整原生 `ctest` 与 Flutter 全量测试；切换机器后建议先执行本文第 6 节与完整套件复验。
 
-## 4. 未提交内容与边界
+## 4. 工作区与边界
 
-- 并行工作流：协议 v72 相关原生代码、采集/QUIC/查看端引擎、`app/**`、`host/**`、原生测试及其对照文档均未提交，因此 GitHub 上 `main` 的协议版本仍是 v71。
-- 文档：`docs/status-and-plan-2026-11-09.md` 与 `docs/rustdesk-full-parity-2026-11-07.md` 含两条工作流的编辑与行尾规范化，未纳入本次提交；本次增量以本文与 `server/README.md` 为准。
+- 协议 v70–v72 原生代码、`app/**`、`host/**`、原生测试与对照文档已在 `c625c14` 提交，GitHub 上 `main` 的协议版本现为 **v72**；`docs/status-and-plan-2026-11-09.md` 与 `docs/rustdesk-full-parity-2026-11-07.md` 也随该提交一并保存（含 CRLF 行尾规范化）。
+- 未提交内容：仅运行时产物（`mp4_recorder_*.mp4`、`server/host.pid`），保持未跟踪。
 - 环境限制：本机只有单显示器、Intel GPU，无合成输入/锁屏/断网；临时服务器无 SMTP/SMS；自动化浏览器在早期原生 `confirm` 后卡死，管理台仍以静态断言与 HTTP 冒烟替代真实点击。
 - 运行时文件（`chast-server-identity.key`、`chast-server-state.json`、`*.pid`、`mp4_recorder_*.mp4` 等）保持未跟踪、未提交。
 
 ## 5. 后续计划
 
-1. **G19 收尾（需与并行工作流协调）**：AV1 4:4:4、远程打印、Switch Sides 三项都涉及 `include/chast/protocol.h`、`src/**`、`app/**`，属于并行工作流文件。待其 v72 提交后，选择一项按其协议节奏实施；优先评估远程打印（主机端生成 + 查看端查看，不改变零拷贝媒体路径）。
+1. **G19 收尾**：协议 v72 已提交，三项（AV1 4:4:4、远程打印、Switch Sides）可直接在 `main` 上按需要推进；优先评估远程打印（主机端生成 + 查看端查看，不改变零拷贝媒体路径）。
 2. **S20 共享密码**：需要用户先决定密钥交换/加密取舍（服务端托管 vs 端到端），决定后实现账号级共享密码、审计与查看端入口。
 3. **环境验收清单**（代码已具备，缺真实环境）：真实 SMTP/SMS 发信、AD/OpenLDAP + 证书链/StartTLS、企业 IdP（Keycloak/Entra）、硬件认证器、多设备策略回执收敛、双机会话与真实中继网络。
 4. **服务端候选增量（不触协议，可与并行工作流并行）**：账号目录增加邮箱/手机过滤与排序；会话列表分页与在线状态；审计导出按主机/分组组合过滤；策略对象导入/导出；地址簿共享的组/Everyone 撤销审计细化。
