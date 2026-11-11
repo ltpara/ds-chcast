@@ -27,18 +27,24 @@ const (
 	maxPolicyPriority    = 10000
 )
 
+// MaxPolicyAssignmentBatch caps one device-scope bulk call. The console uses
+// the same number so a pasted list is refused before it reaches the API.
+const MaxPolicyAssignmentBatch = 200
+
 var (
-	ErrInvalidPolicyObjectName = errors.New("policy object name is required and must be at most 64 characters")
-	ErrPolicyObjectExists      = errors.New("a policy object with this name already exists")
-	ErrUnknownPolicyObject     = errors.New("unknown policy object")
-	ErrPolicyObjectInUse       = errors.New("policy object still has assignments")
-	ErrPolicyObjectQuota       = errors.New("policy object quota reached")
-	ErrInvalidPolicyScope      = errors.New("policy scope must be all, group or device")
-	ErrUnknownPolicyScope      = errors.New("policy scope references an unknown group")
-	ErrPolicyAssignmentExists  = errors.New("this scope already has a policy assignment")
-	ErrUnknownPolicyAssignment = errors.New("unknown policy assignment")
-	ErrPolicyAssignmentQuota   = errors.New("policy assignment quota reached")
-	ErrInvalidPolicyPriority   = errors.New("policy priority must be between -10000 and 10000")
+	ErrInvalidPolicyObjectName      = errors.New("policy object name is required and must be at most 64 characters")
+	ErrPolicyObjectExists           = errors.New("a policy object with this name already exists")
+	ErrUnknownPolicyObject          = errors.New("unknown policy object")
+	ErrPolicyObjectInUse            = errors.New("policy object still has assignments")
+	ErrPolicyObjectQuota            = errors.New("policy object quota reached")
+	ErrInvalidPolicyScope           = errors.New("policy scope must be all, group or device")
+	ErrUnknownPolicyScope           = errors.New("policy scope references an unknown group")
+	ErrPolicyAssignmentExists       = errors.New("this scope already has a policy assignment")
+	ErrUnknownPolicyAssignment      = errors.New("unknown policy assignment")
+	ErrPolicyAssignmentQuota        = errors.New("policy assignment quota reached")
+	ErrInvalidPolicyPriority        = errors.New("policy priority must be between -10000 and 10000")
+	ErrInvalidPolicyAssignmentBatch = fmt.Errorf(
+		"policy assignment batch must list 1 to %d device ids", MaxPolicyAssignmentBatch)
 )
 
 // PolicyObject is a named, reusable policy template. Its version increments on
@@ -447,6 +453,108 @@ func (s *Store) CreatePolicyAssignment(policyID, scopeKind, scopeValue string, p
 	return s.policyAssignmentLocked(id)
 }
 
+// PolicyAssignmentBatch is the outcome of one device-scope bulk assignment:
+// every requested device lands in Created or Skipped, never both. Skipped
+// devices already carry an assignment, which the single-device endpoint would
+// answer with ErrPolicyAssignmentExists.
+type PolicyAssignmentBatch struct {
+	PolicyID   string
+	PolicyName string
+	Created    []PolicyAssignment
+	Skipped    []string
+}
+
+// CreateDevicePolicyAssignments binds one policy to many devices in a single
+// transaction, so a quota failure or an insert error leaves no half-applied
+// batch behind. Devices that already have an assignment are skipped rather
+// than failing the call.
+func (s *Store) CreateDevicePolicyAssignments(policyID string, devices []string, priority int, actor string) (PolicyAssignmentBatch, error) {
+	policyID = strings.TrimSpace(policyID)
+	if len(devices) == 0 || len(devices) > MaxPolicyAssignmentBatch {
+		return PolicyAssignmentBatch{}, ErrInvalidPolicyAssignmentBatch
+	}
+	if priority < -maxPolicyPriority || priority > maxPolicyPriority {
+		return PolicyAssignmentBatch{}, ErrInvalidPolicyPriority
+	}
+	actor = normalizeText(actor, maxName)
+	now := s.now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batch := PolicyAssignmentBatch{
+		PolicyID: policyID,
+		Created:  make([]PolicyAssignment, 0, len(devices)),
+		Skipped:  make([]string, 0),
+	}
+	err := s.db.QueryRow(`SELECT name FROM policy_objects WHERE id = ?`, policyID).Scan(&batch.PolicyName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PolicyAssignmentBatch{}, ErrUnknownPolicyObject
+	}
+	if err != nil {
+		return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: check policy object: %w", s.path, err)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: begin policy assignment batch: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	seen := make(map[string]bool, len(devices))
+	for _, deviceID := range devices {
+		deviceID = strings.TrimSpace(deviceID)
+		if seen[deviceID] {
+			continue
+		}
+		if !registry.ValidID(deviceID) {
+			return PolicyAssignmentBatch{}, ErrInvalidPolicyScope
+		}
+		seen[deviceID] = true
+		id, err := newRandomHex(8)
+		if err != nil {
+			return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: generate assignment id: %w", s.path, err)
+		}
+		res, err := tx.Exec(
+			`INSERT INTO policy_assignments
+				(id, policy_id, scope_kind, scope_value, priority, created_at, created_by)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(scope_kind, scope_value) DO NOTHING`,
+			id, policyID, PolicyScopeDevice, deviceID, priority, unixMillis(now), actor,
+		)
+		if err != nil {
+			return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: create policy assignment batch: %w", s.path, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return PolicyAssignmentBatch{}, err
+		}
+		if affected == 0 {
+			batch.Skipped = append(batch.Skipped, deviceID)
+			continue
+		}
+		batch.Created = append(batch.Created, PolicyAssignment{
+			ID:         id,
+			PolicyID:   policyID,
+			PolicyName: batch.PolicyName,
+			ScopeKind:  PolicyScopeDevice,
+			ScopeValue: deviceID,
+			Priority:   priority,
+			CreatedAt:  now,
+			CreatedBy:  actor,
+		})
+	}
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM policy_assignments`).Scan(&count); err != nil {
+		return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: count policy assignments: %w", s.path, err)
+	}
+	if count > maxPolicyAssignments {
+		return PolicyAssignmentBatch{}, ErrPolicyAssignmentQuota
+	}
+	if err := tx.Commit(); err != nil {
+		return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: commit policy assignment batch: %w", s.path, err)
+	}
+	return batch, nil
+}
+
 func (s *Store) policyAssignmentLocked(id string) (PolicyAssignment, error) {
 	var (
 		assignment PolicyAssignment
@@ -521,16 +629,16 @@ func (s *Store) DeletePolicyAssignment(id string) error {
 // resolvedPolicy is one assignment winner plus the template fields needed to
 // materialise a device policy.
 type resolvedPolicy struct {
-	assignmentID   string
-	policyID       string
-	policyName     string
-	policyVersion  uint32
-	priority       int
-	scopeKind      string
-	mode           string
-	ceiling        uint32
-	userIDs        []string
-	groupIDs       []string
+	assignmentID  string
+	policyID      string
+	policyName    string
+	policyVersion uint32
+	priority      int
+	scopeKind     string
+	mode          string
+	ceiling       uint32
+	userIDs       []string
+	groupIDs      []string
 }
 
 // resolveDevicePolicyLocked picks the assignment that governs peerID. Manual

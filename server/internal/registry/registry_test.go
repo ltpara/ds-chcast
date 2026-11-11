@@ -919,6 +919,117 @@ func TestLabelsPersistAndSurviveRegistration(t *testing.T) {
 	}
 }
 
+func TestDisableDropsLeaseAndBlocksRegistration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	reg.SetRelay("devbox", 41000, "")
+	record, dropped, hadLease, err := reg.SetDisabled("devbox", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.Disabled || !hadLease || dropped.ID != "devbox" || dropped.RelayPort != 41000 {
+		t.Fatalf("disable = %+v dropped=%+v lease=%v", record, dropped, hadLease)
+	}
+	if _, ok := reg.Lookup("devbox"); ok {
+		t.Fatal("the live lease survived the disable")
+	}
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); !errors.Is(err, ErrIdentityDisabled) {
+		t.Fatalf("registration while disabled: %v", err)
+	}
+	if _, _, found, err := reg.SetDisabled("missing", true); err != nil || found {
+		t.Fatalf("disable an unknown peer: found=%v err=%v", found, err)
+	}
+
+	// The block is durable: a restarted server still refuses the host.
+	reloaded, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	record, ok := reloaded.Identity("devbox")
+	if !ok || !record.Disabled {
+		t.Fatalf("disabled flag after reopen: %+v ok=%v", record, ok)
+	}
+	if _, err := reloaded.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); !errors.Is(err, ErrIdentityDisabled) {
+		t.Fatalf("registration after restart while disabled: %v", err)
+	}
+	if _, _, _, err := reloaded.SetDisabled("devbox", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloaded.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatalf("registration after enable: %v", err)
+	}
+}
+
+func TestDisabledIdentityCannotMigrateToNewID(t *testing.T) {
+	reg, err := NewPersistent(time.Minute, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "old", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := reg.SetDisabled("old", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Register(RegisterRequest{ID: "new", OldID: "old", PublicKey: pub, TTL: time.Minute}); !errors.Is(err, ErrIdentityDisabled) {
+		t.Fatalf("migration of a disabled identity: %v", err)
+	}
+	if _, ok := reg.Identity("new"); ok {
+		t.Fatal("the disabled identity escaped to a new id")
+	}
+}
+
+func TestOwnerPersistsAndRegistrationKeepsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := reg.SetOwner("devbox", " alice ")
+	if err != nil || !found {
+		t.Fatalf("set owner: %v %v", found, err)
+	}
+	if record.Owner != "alice" {
+		t.Fatalf("owner = %q", record.Owner)
+	}
+	if _, found, err := reg.SetOwner("missing", "alice"); err != nil || found {
+		t.Fatalf("owner for an unknown peer: found=%v err=%v", found, err)
+	}
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, Hostname: "Renamed", TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if record, _ := reg.Identity("devbox"); record.Owner != "alice" {
+		t.Fatalf("owner after renewal = %q", record.Owner)
+	}
+	reloaded, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	if record, ok := reloaded.Identity("devbox"); !ok || record.Owner != "alice" {
+		t.Fatalf("owner after reopen: %+v ok=%v", record, ok)
+	}
+	if record, _, err := reloaded.SetOwner("devbox", ""); err != nil || record.Owner != "" {
+		t.Fatalf("clear owner: %+v err=%v", record, err)
+	}
+}
+
 func TestStoreUpgradesPreLabelSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	db, err := sql.Open("sqlite", path)

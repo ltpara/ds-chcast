@@ -202,6 +202,10 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
 	var (
 		events []account.ConnectionEvent
 		err    error
@@ -209,12 +213,12 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	if groupID != "" {
-		events, err = s.cfg.Accounts.ConnectionsForGroupBefore(
-			groupID, username, host, beforeID, limit)
+		events, err = s.cfg.Accounts.ConnectionsForGroupBeforeRange(
+			groupID, username, host, bounds, beforeID, limit)
 	} else if host != "" {
-		events, err = s.cfg.Accounts.ConnectionsForHostBefore(host, beforeID, limit)
+		events, err = s.cfg.Accounts.ConnectionsForHostBeforeRange(host, bounds, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.ConnectionsForBefore(username, beforeID, limit)
+		events, err = s.cfg.Accounts.ConnectionsForBeforeRange(username, bounds, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account connection audit query", "error", err)

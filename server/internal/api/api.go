@@ -33,6 +33,8 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
+	"github.com/ltpara/ds-chcast/server/internal/ldapauth"
 	"github.com/ltpara/ds-chcast/server/internal/oidc"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
@@ -96,11 +98,24 @@ type Config struct {
 	// the shared carrier, but never punch. The admin console flips it at
 	// runtime, so lookups read the current value instead of a startup copy.
 	RelayOnly *atomic.Bool
+	// LANMask classifies observed peer addresses like hbbs's -m. A LAN host and
+	// a WAN viewer (or the reverse) are reported as symmetric so both sides
+	// start on the relay. Nil disables the rule.
+	LANMask *lanmask.Mask
+	// LANLocalIP is the local address of this server's relay handed to a LAN
+	// peer. It only applies to leases on the local manager, never to a
+	// standalone relay node, whose own host stays advertised.
+	LANLocalIP string
 	// WakeRelays maps target IDs to operator-approved relay IDs. Missing or
 	// empty entries disable server-relayed wake for that target.
 	WakeRelays map[string][]string
 	// Blocker throttles registration attempts per IP. Nil disables it.
 	Blocker *abuse.Blocker
+	// RegisterThrottle rejects repeated signed registrations of one host id in
+	// a short burst, mirroring hbbs's per-peer TOO_FREQUENT answer. It runs
+	// after signature checks, so an unauthenticated caller cannot spend an
+	// id's budget. Nil disables it.
+	RegisterThrottle *abuse.IDWindow
 	// PunchLog backs the admin punch-request listing; nil disables exposure.
 	PunchLog *punchlog.Log
 	// IPChanges audits short-lived public address changes. Nil disables it.
@@ -129,9 +144,11 @@ type Config struct {
 	// sits behind a trusted proxy (for example X-Forwarded-For). Empty means
 	// the TCP peer address is used.
 	ProxyHeader string
-	// GeoIP labels client addresses for login audit and session lists. Nil
-	// leaves locations empty, so only IPs are recorded.
-	GeoIP *geoip.Locator
+	// GeoIP labels client addresses for login audit, session lists and relay
+	// region selection. It is usually a *geoip.Reloader so the console can swap
+	// the table at runtime. Nil leaves locations empty, so only IPs are
+	// recorded.
+	GeoIP geoip.Table
 	// TLS reports whether clients reach this API over HTTPS.
 	TLS bool
 	// PunchReadBuffer is the kernel-reported SO_RCVBUF of the rendezvous
@@ -174,6 +191,14 @@ type Config struct {
 	WebAuthnOrigins []string
 	// OIDC enables viewer single sign-on. Nil leaves the OIDC routes at 503.
 	OIDC *oidc.Provider
+	// LDAP enables directory login. When set, a login that no local password
+	// matches is retried through the directory, and an account linked to a
+	// directory entry skips the local password entirely, so a directory-side
+	// disable takes effect on the next login. Nil disables the directory.
+	LDAP *ldapauth.Authenticator
+	// LDAPAutoCreate links a first-time directory user to a new account. It
+	// only applies when LDAP is set.
+	LDAPAutoCreate bool
 	// Mailer delivers password-reset messages. Nil disables self-service
 	// recovery, while other account routes keep working.
 	Mailer Mailer
@@ -262,6 +287,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/hosts/{id}", s.unregister)
 	mux.HandleFunc("DELETE /v1/identities/{id}", s.resetIdentity)
 	mux.HandleFunc("PATCH /v1/identities/{id}", s.updateIdentity)
+	mux.HandleFunc("POST /v1/identities/bulk", s.bulkDevices)
 	mux.HandleFunc("POST /v1/account/login", s.login)
 	mux.HandleFunc("POST /v1/account/login/sms", s.requestLoginSMSCode)
 	mux.HandleFunc("POST /v1/account/login/email", s.requestLoginEmailCode)
@@ -299,6 +325,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/addressbook/grants", s.addressBookGrants)
 	mux.HandleFunc("POST /v1/addressbook/grants", s.shareAddressBook)
 	mux.HandleFunc("DELETE /v1/addressbook/grants/{username}", s.unshareAddressBook)
+	mux.HandleFunc("DELETE /v1/addressbook/grants/targets", s.unshareAddressBookTarget)
 	mux.HandleFunc("GET /v1/addressbook/shared", s.sharedAddressBooks)
 	mux.HandleFunc("GET /v1/addressbook/shared/{owner}/grants", s.sharedAddressBookGrants)
 	mux.HandleFunc("POST /v1/addressbook/shared/{owner}/grants", s.shareSharedAddressBook)
@@ -308,6 +335,10 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/addressbook/shared/{owner}/peers", s.addSharedAddressBookPeer)
 	mux.HandleFunc("PATCH /v1/addressbook/peers/{id}", s.updateAddressBookPeer)
 	mux.HandleFunc("DELETE /v1/addressbook/peers/{id}", s.deleteAddressBookPeer)
+	mux.HandleFunc("GET /v1/addressbook/trash", s.addressBookTrash)
+	mux.HandleFunc("DELETE /v1/addressbook/trash", s.emptyAddressBookTrash)
+	mux.HandleFunc("POST /v1/addressbook/trash/{id}/restore", s.restoreAddressBookPeer)
+	mux.HandleFunc("DELETE /v1/addressbook/trash/{id}", s.purgeAddressBookPeer)
 	mux.HandleFunc("PATCH /v1/addressbook/groups/{id}", s.updateAddressBookGroup)
 	mux.HandleFunc("DELETE /v1/addressbook/groups/{id}", s.deleteAddressBookGroup)
 	mux.HandleFunc("GET /v1/server", s.serverInfo)
@@ -349,11 +380,16 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/accounts/{username}", s.adminDeleteAccount)
 	mux.HandleFunc("POST /v1/accounts/{username}/ban", s.adminSetAccountBan)
 	mux.HandleFunc("DELETE /v1/accounts/{username}/ban", s.adminSetAccountBan)
+	mux.HandleFunc("POST /v1/accounts/{username}/permissions", s.adminSetAccountSessionCap)
 	mux.HandleFunc("POST /v1/accounts/{username}/password", s.adminResetAccountPassword)
 	mux.HandleFunc("POST /v1/accounts/{username}/email", s.adminSetAccountEmail)
 	mux.HandleFunc("POST /v1/accounts/{username}/phone", s.adminSetAccountPhone)
+	mux.HandleFunc("POST /v1/accounts/{username}/recover", s.adminSendAccountResetEmail)
 	mux.HandleFunc("POST /v1/accounts/{username}/sms", s.adminSendAccountSMSCode)
 	mux.HandleFunc("POST /v1/accounts/{username}/2fa/reset", s.adminResetAccountTwoFactor)
+	mux.HandleFunc("GET /v1/accounts/{username}/sessions", s.adminAccountSessions)
+	mux.HandleFunc("POST /v1/accounts/{username}/sessions/revoke-all", s.adminRevokeAccountSessions)
+	mux.HandleFunc("DELETE /v1/accounts/{username}/sessions/{id}", s.adminRevokeAccountSession)
 	mux.HandleFunc("GET /v1/groups", s.listAccountGroups)
 	mux.HandleFunc("POST /v1/groups", s.createAccountGroup)
 	mux.HandleFunc("GET /v1/groups/{id}", s.accountGroupDetail)
@@ -378,6 +414,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/policies/{id}", s.deletePolicyObject)
 	mux.HandleFunc("GET /v1/policy-assignments", s.listPolicyAssignments)
 	mux.HandleFunc("POST /v1/policy-assignments", s.createPolicyAssignment)
+	mux.HandleFunc("POST /v1/policy-assignments/bulk", s.bulkPolicyAssignments)
 	mux.HandleFunc("DELETE /v1/policy-assignments/{id}", s.deletePolicyAssignment)
 	mux.HandleFunc("POST /v1/access-tickets", s.issueAccessTicket)
 	mux.HandleFunc("POST /v1/emergency-access", s.issueEmergencyAccess)
@@ -608,6 +645,19 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.cfg.RegisterThrottle != nil {
+		if ok, retry := s.cfg.RegisterThrottle.Allow(req.ID); !ok {
+			seconds := int((retry + time.Second - 1) / time.Second)
+			if seconds < 1 {
+				seconds = 1
+			}
+			s.cfg.Logger.Warn("registration throttled", "id", req.ID, "ip", clientAddr)
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			writeError(w, http.StatusTooManyRequests, "too frequent registration attempts for this id; retry later")
+			return
+		}
+	}
+
 	// Remember the old lease before Register drops it so its relay slot can be
 	// released exactly the way an explicit unregister would.
 	previous, hadPrevious := registry.Host{}, false
@@ -644,6 +694,10 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "old id belongs to another public key")
 			return
 		}
+		if errors.Is(err, registry.ErrIdentityDisabled) {
+			writeError(w, http.StatusForbidden, "host identity is disabled by an administrator")
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -674,10 +728,16 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Registry.SetPolicy(req.ID, true, policy.PolicyVersion)
 		host.Managed, host.PolicyVersion = true, policy.PolicyVersion
 	}
-	relayEndpoint, relays, carrier, carrierV6, err := s.assignRelay(req.ID, req.PublicKey, host)
+	relayEndpoint, relays, carrier, carrierV6, err := s.assignRelay(req.ID, req.PublicKey, host, s.clientLocation(clientAddr))
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "no relay port is available")
 		return
+	}
+	// The register reply addresses the host itself. A host on the server's LAN
+	// is given the local relay address so it never has to hairpin through the
+	// public one; every other host keeps the advertised endpoint.
+	if lease, ok := s.cfg.Registry.Lookup(req.ID); ok && s.cfg.LANMask.Contains(net.ParseIP(clientAddr)) {
+		relayEndpoint, relays, carrier = s.localRelayForHost(lease, relayEndpoint, relays, carrier)
 	}
 	resp := registerResponse{
 		ID:              req.ID,
@@ -754,7 +814,7 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return
 	}
-	resp, ok := s.hostLookup(id, time.Now(), s.relayOnly())
+	resp, ok := s.hostLookup(id, time.Now(), s.relayOnly(), net.ParseIP(s.clientIP(r)))
 	if !ok {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return
@@ -795,13 +855,14 @@ func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	relayOnly := s.relayOnly()
+	viewerIP := net.ParseIP(s.clientIP(r))
 	resp := batchLookupResponse{
 		Hosts:    make([]lookupResponse, 0, len(ids)),
 		Software: s.software(),
 	}
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
 	for _, id := range ids {
-		host, ok := s.hostLookup(id, now, relayOnly)
+		host, ok := s.hostLookup(id, now, relayOnly, viewerIP)
 		if !ok {
 			resp.Missing = append(resp.Missing, id)
 			continue
@@ -849,7 +910,9 @@ func parseIDs(raw string) ([]string, error) {
 }
 
 // hostLookup builds the response shared by the single and batch endpoints.
-func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupResponse, bool) {
+// viewerIP is the address that asked, which together with the host's observed
+// address decides the LAN/WAN forced-relay rule.
+func (s *server) hostLookup(id string, now time.Time, relayOnly bool, viewerIP net.IP) (lookupResponse, bool) {
 	host, live := s.cfg.Registry.Lookup(id)
 	if !live {
 		record, ok := s.cfg.Registry.Identity(id)
@@ -909,6 +972,7 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
 	}
+	viewerLAN := s.cfg.LANMask.Contains(viewerIP)
 	if resp.Online {
 		switch {
 		case relayOnly:
@@ -929,14 +993,20 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 			resp.Candidates = append(resp.Candidates, host.LocalAddrsV6...)
 			resp.Candidates = dedupe(resp.Candidates)
 		}
+		// hbbs's peer_is_lan ^ is_lan: a LAN host and a WAN viewer cannot open
+		// a hole to each other, so both sides are told the peer is symmetric
+		// and start on the relay.
+		if s.lanXOR(host, viewerIP) {
+			resp.NATType = "symmetric"
+		}
 		resp.CarrierToken = host.CarrierToken
-		resp.Carrier = s.carrierEndpoint(host)
+		resp.Carrier = s.carrierEndpointFor(host, viewerLAN)
 		resp.CarrierV6 = s.carrierEndpointV6(host)
 		resp.Transport = s.transport(host, carrierLinked, len(resp.Candidates) > 0)
 	}
 	if host.RelayPort != 0 {
-		resp.Relay = net.JoinHostPort(s.relayHostFor(host), strconv.Itoa(host.RelayPort))
-		resp.Relays = s.relayEndpoints(host, host.RelayPort)
+		resp.Relay = net.JoinHostPort(s.relayHostForViewer(host, viewerLAN), strconv.Itoa(host.RelayPort))
+		resp.Relays = s.relayEndpoints(host, host.RelayPort, viewerLAN)
 	}
 	if !host.LastSeen.IsZero() {
 		resp.LastSeenMS = now.Sub(host.LastSeen).Milliseconds()
@@ -1005,19 +1075,23 @@ func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
 }
 
 type identityLabelsRequest struct {
-	Alias *string   `json:"alias"`
-	Tags  *[]string `json:"tags"`
+	Alias    *string   `json:"alias"`
+	Tags     *[]string `json:"tags"`
+	Disabled *bool     `json:"disabled"`
+	Owner    *string   `json:"owner"`
 }
 
 type identityLabelsResponse struct {
-	ID    string   `json:"id"`
-	Alias string   `json:"alias,omitempty"`
-	Tags  []string `json:"tags,omitempty"`
+	ID       string   `json:"id"`
+	Alias    string   `json:"alias,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Disabled bool     `json:"disabled"`
+	Owner    string   `json:"owner,omitempty"`
 }
 
-// updateIdentity sets operator-managed display labels. Unlike host-reported
-// metadata, these survive host renewals and are never accepted from the host
-// registration body.
+// updateIdentity sets operator-managed device state: display labels, the
+// disabled block and the owner account name. Unlike host-reported metadata,
+// these survive host renewals and are never accepted from a registration body.
 func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	principal, ok := s.deviceActor(w, r, consoleWrite, id)
@@ -1034,22 +1108,176 @@ func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Alias == nil && req.Tags == nil {
-		writeError(w, http.StatusBadRequest, "alias or tags is required")
+	if req.Alias == nil && req.Tags == nil && req.Disabled == nil && req.Owner == nil {
+		writeError(w, http.StatusBadRequest, "alias, tags, disabled or owner is required")
 		return
 	}
-	record, found, err := s.cfg.Registry.SetLabels(id, req.Alias, req.Tags)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not persist identity labels")
-		return
-	}
+	record, found := s.cfg.Registry.Identity(id)
 	if !found {
 		writeError(w, http.StatusNotFound, "host identity is unknown")
 		return
 	}
-	s.recordAudit(r, actor, account.AuditDeviceLabels,
-		"labels for "+id+" alias="+record.Alias, true)
-	writeJSON(w, http.StatusOK, identityLabelsResponse{ID: record.ID, Alias: record.Alias, Tags: record.Tags})
+	if req.Alias != nil || req.Tags != nil {
+		updated, ok, err := s.cfg.Registry.SetLabels(id, req.Alias, req.Tags)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not persist identity labels")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "host identity is unknown")
+			return
+		}
+		record = updated
+		s.recordAudit(r, actor, account.AuditDeviceLabels,
+			"labels for "+id+" alias="+record.Alias, true)
+	}
+	if req.Owner != nil {
+		owner := strings.TrimSpace(*req.Owner)
+		if owner != "" {
+			if s.cfg.Accounts == nil {
+				writeError(w, http.StatusBadRequest, "accounts are not enabled")
+				return
+			}
+			if _, err := s.cfg.Accounts.FindUser(owner); err != nil {
+				if errors.Is(err, account.ErrUnknownUser) {
+					writeError(w, http.StatusBadRequest, "owner must be an existing account")
+					return
+				}
+				s.cfg.Logger.Error("device owner lookup", "id", id, "owner", owner, "error", err)
+				writeError(w, http.StatusInternalServerError, "could not read the owner account")
+				return
+			}
+		}
+		updated, ok, err := s.cfg.Registry.SetOwner(id, owner)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not persist the device owner")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "host identity is unknown")
+			return
+		}
+		record = updated
+		s.recordAudit(r, actor, account.AuditDeviceOwner,
+			"owner for "+id+" set to "+record.Owner, true)
+	}
+	if req.Disabled != nil {
+		previous, found, err := s.setDeviceDisabled(r, actor, id, *req.Disabled)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not persist the device state")
+			return
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, "host identity is unknown")
+			return
+		}
+		record = previous
+	}
+	writeJSON(w, http.StatusOK, identityLabelsResponse{
+		ID: record.ID, Alias: record.Alias, Tags: record.Tags,
+		Disabled: record.Disabled, Owner: record.Owner,
+	})
+}
+
+// setDeviceDisabled applies the administrative disable flag and its side
+// effects: the live lease is released when the device is disabled and every
+// change is audited. Both the single-device PATCH and the bulk endpoint use it.
+func (s *server) setDeviceDisabled(r *http.Request, actor, id string, disabled bool) (registry.Identity, bool, error) {
+	previous, dropped, hadLease, err := s.cfg.Registry.SetDisabled(id, disabled)
+	if err != nil {
+		return registry.Identity{}, false, err
+	}
+	if !hadLease && previous.ID == "" {
+		return registry.Identity{}, false, nil
+	}
+	if disabled {
+		if hadLease {
+			s.releaseLease(id, dropped)
+		}
+		s.recordAudit(r, actor, account.AuditDeviceDisable, "disabled "+id, true)
+		s.cfg.Logger.Info("device disabled", "id", id, "actor", actor)
+	} else {
+		s.recordAudit(r, actor, account.AuditDeviceEnable, "enabled "+id, true)
+		s.cfg.Logger.Info("device enabled", "id", id, "actor", actor)
+	}
+	return previous, true, nil
+}
+
+type deviceBulkRequest struct {
+	IDs      []string `json:"ids"`
+	Disabled *bool    `json:"disabled"`
+}
+
+type deviceBulkResponse struct {
+	Disabled bool     `json:"disabled"`
+	Updated  []string `json:"updated"`
+	Missing  []string `json:"missing"`
+}
+
+// bulkDevices disables or enables several devices in one call. Unknown ids are
+// reported back instead of failing the whole request, so a console selection
+// that went stale still applies to the devices that remain.
+func (s *server) bulkDevices(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.consolePrincipalFor(w, r, consoleWrite, account.TokenResourceDevices)
+	if !ok {
+		return
+	}
+	var req deviceBulkRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Disabled == nil {
+		writeError(w, http.StatusBadRequest, "disabled is required")
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids are required")
+		return
+	}
+	if len(req.IDs) > maxBatchIDs {
+		writeError(w, http.StatusBadRequest, "at most "+strconv.Itoa(maxBatchIDs)+" ids are allowed")
+		return
+	}
+	ids := make([]string, 0, len(req.IDs))
+	seen := make(map[string]bool, len(req.IDs))
+	for _, id := range req.IDs {
+		id = strings.TrimSpace(id)
+		if !registry.ValidID(id) {
+			writeError(w, http.StatusBadRequest, "ids must be host ids")
+			return
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if principal.GroupID != "" {
+		for _, id := range ids {
+			if !s.deviceInScope(w, principal, id) {
+				return
+			}
+		}
+	}
+	resp := deviceBulkResponse{Disabled: *req.Disabled, Updated: []string{}, Missing: []string{}}
+	for _, id := range ids {
+		if _, found, err := s.setDeviceDisabled(r, principal.Actor, id, *req.Disabled); err != nil {
+			s.cfg.Logger.Error("bulk device state", "id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "could not persist the device state")
+			return
+		} else if !found {
+			resp.Missing = append(resp.Missing, id)
+			continue
+		}
+		resp.Updated = append(resp.Updated, id)
+	}
+	if *req.Disabled {
+		s.cfg.Logger.Info("devices disabled", "count", len(resp.Updated), "actor", principal.Actor)
+	} else {
+		s.cfg.Logger.Info("devices enabled", "count", len(resp.Updated), "actor", principal.Actor)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
@@ -1132,6 +1360,9 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.Blocker != nil {
 		out["registration_blocked"] = s.cfg.Blocker.Stats()
+	}
+	if s.cfg.RegisterThrottle != nil {
+		out["registration_throttle"] = s.cfg.RegisterThrottle.Stats()
 	}
 	if s.cfg.PunchLog != nil {
 		out["punch_requests"] = s.cfg.PunchLog.Stats()
@@ -1239,6 +1470,50 @@ func (s *server) relayHostFor(host registry.Host) string {
 	return s.cfg.RelayHost
 }
 
+// relayHostForViewer picks the relay host a viewer should dial. A viewer on the
+// server's LAN dials the local address of a local lease so it never depends on
+// NAT hairpin; a standalone node lease keeps its own host.
+func (s *server) relayHostForViewer(host registry.Host, lan bool) string {
+	if lan && host.RelayNode == "" && s.cfg.LANLocalIP != "" {
+		return s.cfg.LANLocalIP
+	}
+	return s.relayHostFor(host)
+}
+
+// hostOnLAN reports whether any observed public candidate of the host falls
+// inside the operator's LAN mask.
+func (s *server) hostOnLAN(host registry.Host) bool {
+	return s.cfg.LANMask.ContainsAddr(host.Candidate) || s.cfg.LANMask.ContainsAddr(host.CandidateV6)
+}
+
+// lanXOR is hbbs's peer_is_lan ^ is_lan: one peer inside the mask and the
+// other outside cannot punch to each other, so both are forced onto the relay.
+func (s *server) lanXOR(host registry.Host, viewerIP net.IP) bool {
+	if !s.cfg.LANMask.Enabled() {
+		return false
+	}
+	return s.hostOnLAN(host) != s.cfg.LANMask.Contains(viewerIP)
+}
+
+// localRelayForHost rewrites the register reply for a host on the server's
+// LAN. A local lease is reachable on LANLocalIP, which avoids a hairpin
+// through the public address; the public endpoints stay in relays as fallback.
+func (s *server) localRelayForHost(host registry.Host, endpoint string, relays []string, carrier string) (string, []string, string) {
+	if host.RelayNode != "" || s.cfg.LANLocalIP == "" {
+		return endpoint, relays, carrier
+	}
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return endpoint, relays, carrier
+	}
+	local := net.JoinHostPort(s.cfg.LANLocalIP, port)
+	relays = dedupe(append([]string{local}, relays...))
+	if _, carrierPort, err := net.SplitHostPort(carrier); err == nil {
+		carrier = net.JoinHostPort(s.cfg.LANLocalIP, carrierPort)
+	}
+	return local, relays, carrier
+}
+
 func (s *server) relayServers() []string {
 	var addrs []string
 	if s.cfg.RelayAddrs != nil {
@@ -1258,9 +1533,10 @@ func (s *server) relayServers() []string {
 
 // relayEndpoints lists every address that reaches the lease's relay port. A
 // standalone node advertises only its leased endpoint; the local manager can
-// be reached through each configured host name, including a second family.
-func (s *server) relayEndpoints(host registry.Host, port int) []string {
-	primary := s.relayHostFor(host)
+// be reached through each configured host name, including a second family. A
+// LAN viewer gets the local address first, with the public ones still listed.
+func (s *server) relayEndpoints(host registry.Host, port int, lan bool) []string {
+	primary := s.relayHostForViewer(host, lan)
 	hosts := []string{primary}
 	if host.RelayNode == "" {
 		for _, addr := range s.relayServers() {
@@ -1381,6 +1657,11 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 		counterPair("chast_register_blocked_total", "Registration attempts rejected per client IP.",
 			`reason="rate"`, blocked.RateBlocked, `reason="ids"`, blocked.IDBlocked)
 		gauge("chast_registration_tracked_ips", "Client addresses tracked by the registration blocker.", blocked.TrackedIPs)
+	}
+	if s.cfg.RegisterThrottle != nil {
+		throttle := s.cfg.RegisterThrottle.Stats()
+		counter("chast_register_id_throttled_total", "Signed registrations refused because one id renewed too often.", "", throttle.Throttled)
+		gauge("chast_registration_tracked_ids", "Host ids tracked by the per-id registration throttle.", throttle.TrackedIDs)
 	}
 	if s.cfg.IPChanges != nil {
 		changes := s.cfg.IPChanges.Stats()
@@ -1506,6 +1787,10 @@ func (s *server) transport(host registry.Host, carrierLinked, direct bool) strin
 // lease carries its own endpoint; a local lease uses the relay host assigned
 // to this host.
 func (s *server) carrierEndpoint(host registry.Host) string {
+	return s.carrierEndpointFor(host, false)
+}
+
+func (s *server) carrierEndpointFor(host registry.Host, lan bool) string {
 	if host.RelayNode != "" {
 		return host.Carrier
 	}
@@ -1516,7 +1801,7 @@ func (s *server) carrierEndpoint(host registry.Host) string {
 	if port == 0 {
 		return ""
 	}
-	return net.JoinHostPort(s.relayHostFor(host), strconv.Itoa(port))
+	return net.JoinHostPort(s.relayHostForViewer(host, lan), strconv.Itoa(port))
 }
 
 // carrierEndpointV6 names the IPv6 endpoint of the same shared carrier. A
@@ -1536,11 +1821,12 @@ func (s *server) carrierEndpointV6(host registry.Host) string {
 // When every node is unavailable it falls back to the in-process relay so a
 // single-node outage does not stop new sessions, matching hbbs's relay list
 // with chast's local fallback.
-func (s *server) assignRelay(id, publicKey string, host registry.Host) (string, []string, string, string, error) {
+func (s *server) assignRelay(id, publicKey string, host registry.Host, region string) (string, []string, string, string, error) {
 	if s.cfg.RelayPool != nil {
 		// The node lease outlives the host lease so a brief hbbs outage does
-		// not tear down a working relay path.
-		lease, err := s.cfg.RelayPool.Provision(id, publicKey, host.CarrierToken, host.Managed, 2*s.cfg.TTL, host.RelayNode)
+		// not tear down a working relay path. A host that moves networks is
+		// leased a node in its new region on the next registration.
+		lease, err := s.cfg.RelayPool.Provision(id, publicKey, host.CarrierToken, host.Managed, 2*s.cfg.TTL, host.RelayNode, region)
 		if err == nil {
 			nodeHost, _, splitErr := splitRelayEndpoint(lease.Relay)
 			if splitErr == nil {

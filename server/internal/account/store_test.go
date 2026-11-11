@@ -486,6 +486,110 @@ func TestAddressBookIsPerUserAndPersists(t *testing.T) {
 	}
 }
 
+// TestAddressBookNotes covers the free-text note: normalization, partial
+// updates, optimistic concurrency, tombstones and the shared-write path.
+func TestAddressBookNotes(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := store.CreateUser("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	name := "工作区"
+	note := "  机柜 A3\t管理员在 4 楼  "
+	peer, err := store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Name: &name, Note: &note}, 0)
+	if err != nil {
+		t.Fatalf("add peer with note: %v", err)
+	}
+	// Control characters are dropped and the value is trimmed, so a note can
+	// never smuggle a column separator or a newline into a plain-text field.
+	if peer.Note != "机柜 A3管理员在 4 楼" {
+		t.Fatalf("normalized note = %q", peer.Note)
+	}
+	firstRevision := peer.Revision
+
+	renamed := "Devbox"
+	peer, err = store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Name: &renamed}, firstRevision)
+	if err != nil || peer.Name != "Devbox" || peer.Note != "机柜 A3管理员在 4 楼" {
+		t.Fatalf("rename kept note = %+v, %v", peer, err)
+	}
+	if peer.Revision <= firstRevision {
+		t.Fatalf("note edit did not advance revision: %d", peer.Revision)
+	}
+	currentRevision := peer.Revision
+
+	stale := "覆盖"
+	if _, err := store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Note: &stale}, firstRevision); !errors.Is(err, ErrPeerConflict) {
+		t.Fatalf("stale note write = %v", err)
+	}
+	peers, err := store.Peers(alice.ID)
+	if err != nil || len(peers) != 1 || peers[0].Note != "机柜 A3管理员在 4 楼" {
+		t.Fatalf("peers after conflict = %+v, %v", peers, err)
+	}
+
+	long := strings.Repeat("备", maxNote+10)
+	peer, err = store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Note: &long}, currentRevision)
+	if err != nil || len([]rune(peer.Note)) != maxNote {
+		t.Fatalf("capped note runes = %d, %v", len([]rune(peer.Note)), err)
+	}
+	currentRevision = peer.Revision
+
+	// A group move must carry the note along with the entry.
+	moved, err := store.SetPeerGroupAt(alice.ID, "devbox", "", currentRevision)
+	if err != nil || moved.Note != peer.Note {
+		t.Fatalf("group move note = %q, %v", moved.Note, err)
+	}
+	cleared := ""
+	if peer, err = store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Note: &cleared}, moved.Revision); err != nil || peer.Note != "" {
+		t.Fatalf("clear note = %+v, %v", peer, err)
+	}
+
+	sharedNote := "同事的提醒"
+	peer, err = store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Note: &sharedNote}, peer.Revision)
+	if err != nil {
+		t.Fatalf("restore note: %v", err)
+	}
+	if removed, err := store.DeletePeer(alice.ID, "devbox"); err != nil || !removed {
+		t.Fatalf("delete peer = %v, %v", removed, err)
+	}
+	snapshot, err := store.Snapshot(alice.ID, 0)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	var tombstone *Peer
+	for i := range snapshot.Changes {
+		if snapshot.Changes[i].ID == "devbox" {
+			tombstone = &snapshot.Changes[i]
+		}
+	}
+	if tombstone == nil || !tombstone.Deleted || tombstone.Note != sharedNote {
+		t.Fatalf("tombstone = %+v", tombstone)
+	}
+	revived, err := store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{Name: &name}, 0)
+	if err != nil || revived.Note != sharedNote {
+		t.Fatalf("revived peer = %+v, %v", revived, err)
+	}
+
+	if _, err := store.ShareBook(alice.ID, "bob", "write"); err != nil {
+		t.Fatalf("share book: %v", err)
+	}
+	shared := "共享备注"
+	if _, err := store.UpdateSharedPeerEditAt(bob.ID, "alice", "devbox", PeerEdit{Note: &shared}, revived.Revision); err != nil {
+		t.Fatalf("shared note write: %v", err)
+	}
+	books, err := store.SharedBooks(bob.ID)
+	if err != nil || len(books) != 1 || len(books[0].Peers) != 1 || books[0].Peers[0].Note != "共享备注" {
+		t.Fatalf("shared note = %+v, %v", books, err)
+	}
+	added, err := store.AddSharedPeerNoteScoped(bob.ID, "alice", "newbox", "", "新增", nil, "新增备注", 0)
+	if err != nil || added.Note != "新增备注" {
+		t.Fatalf("shared add with note = %+v, %v", added, err)
+	}
+}
+
 func TestAddressBookRevisionsAndTombstones(t *testing.T) {
 	store := openTemp(t, "state.db")
 	alice, err := store.CreateUser("alice", "correct horse")
@@ -548,7 +652,7 @@ func TestAddressBookRevisionsAndTombstones(t *testing.T) {
 	}
 	tombstone := snapshot.Changes[0]
 	if tombstone.ID != "studio" || !tombstone.Deleted || tombstone.Revision != 3 ||
-		tombstone.Name != "" || len(tombstone.Tags) != 0 {
+		tombstone.Name != "Studio" || len(tombstone.Tags) != 1 || tombstone.Tags[0] != "office" {
 		t.Fatalf("tombstone = %+v", tombstone)
 	}
 	// A full history request also surfaces the tombstone; only the current row
@@ -588,6 +692,133 @@ func TestAddressBookRevisionsAndTombstones(t *testing.T) {
 	}
 	if _, err := store.Snapshot("missing-user", 0); !errors.Is(err, ErrUnknownUser) {
 		t.Fatalf("unknown user snapshot error = %v", err)
+	}
+}
+
+func TestAddressBookTrashRestoreAndPurge(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	group := "work"
+	if _, err := store.UpsertGroup(alice.ID, group, "Work"); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	name := "工作室"
+	tags := []string{"lab"}
+	note := "机柜 A3"
+	peer, err := store.UpdatePeerEditAt(alice.ID, "devbox", PeerEdit{
+		Name: &name, Tags: &tags, Note: &note, GroupID: &group,
+	}, 0)
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+
+	if removed, err := store.DeletePeer(alice.ID, "devbox"); err != nil || !removed {
+		t.Fatalf("delete peer = %v, %v", removed, err)
+	}
+	if peers, err := store.Peers(alice.ID); err != nil || len(peers) != 0 {
+		t.Fatalf("live peers after delete = %+v, %v", peers, err)
+	}
+	trash, err := store.Trash(alice.ID)
+	if err != nil || len(trash) != 1 {
+		t.Fatalf("trash = %+v, %v", trash, err)
+	}
+	entry := trash[0]
+	if entry.ID != "devbox" || !entry.Deleted || entry.Name != name ||
+		entry.Note != note || len(entry.Tags) != 1 || entry.Tags[0] != "lab" ||
+		entry.GroupID != group || entry.Revision == peer.Revision {
+		t.Fatalf("trash entry = %+v", entry)
+	}
+
+	restored, err := store.RestorePeer(alice.ID, "devbox")
+	if err != nil || restored.Deleted || restored.Name != name || restored.Note != note ||
+		len(restored.Tags) != 1 || restored.Tags[0] != "lab" ||
+		restored.GroupID != group || restored.Revision == entry.Revision {
+		t.Fatalf("restored = %+v, %v", restored, err)
+	}
+	if peers, err := store.Peers(alice.ID); err != nil || len(peers) != 1 || peers[0].ID != "devbox" {
+		t.Fatalf("peers after restore = %+v, %v", peers, err)
+	}
+	if trash, err := store.Trash(alice.ID); err != nil || len(trash) != 0 {
+		t.Fatalf("trash after restore = %+v, %v", trash, err)
+	}
+	if _, err := store.RestorePeer(alice.ID, "devbox"); !errors.Is(err, ErrUnknownPeer) {
+		t.Fatalf("restore live peer = %v", err)
+	}
+	if _, err := store.RestorePeer(alice.ID, "nope"); !errors.Is(err, ErrUnknownPeer) {
+		t.Fatalf("restore missing peer = %v", err)
+	}
+	if _, err := store.RestorePeer(alice.ID, "bad id"); !errors.Is(err, ErrInvalidPeerID) {
+		t.Fatalf("restore invalid id = %v", err)
+	}
+	// Purging a live entry is refused so the trash API cannot bypass delete.
+	if removed, err := store.PurgePeer(alice.ID, "devbox"); err != nil || removed {
+		t.Fatalf("purge live peer = %v, %v", removed, err)
+	}
+	if peers, err := store.Peers(alice.ID); err != nil || len(peers) != 1 {
+		t.Fatalf("peers after refused purge = %+v, %v", peers, err)
+	}
+
+	// A group deleted while an entry sat in the trash is dropped on restore.
+	if _, err := store.DeletePeer(alice.ID, "devbox"); err != nil {
+		t.Fatalf("delete before group removal: %v", err)
+	}
+	if _, err := store.DeleteGroup(alice.ID, group); err != nil {
+		t.Fatalf("delete group: %v", err)
+	}
+	ungrouped, err := store.RestorePeer(alice.ID, "devbox")
+	if err != nil || ungrouped.GroupID != "" || ungrouped.Name != name {
+		t.Fatalf("restore with dead group = %+v, %v", ungrouped, err)
+	}
+
+	// Purge removes one entry for good; EmptyTrash drops the rest but never
+	// touches live entries.
+	if removed, err := store.DeletePeer(alice.ID, "devbox"); err != nil || !removed {
+		t.Fatalf("delete for purge = %v, %v", removed, err)
+	}
+	second := "lab"
+	if _, err := store.UpdatePeer(alice.ID, "labbox", &second, nil); err != nil {
+		t.Fatalf("second peer: %v", err)
+	}
+	if removed, err := store.DeletePeer(alice.ID, "labbox"); err != nil || !removed {
+		t.Fatalf("delete second peer = %v, %v", removed, err)
+	}
+	if trash, err := store.Trash(alice.ID); err != nil || len(trash) != 2 {
+		t.Fatalf("trash before purge = %+v, %v", trash, err)
+	}
+	if removed, err := store.PurgePeer(alice.ID, "labbox"); err != nil || !removed {
+		t.Fatalf("purge peer = %v, %v", removed, err)
+	}
+	if removed, err := store.PurgePeer(alice.ID, "labbox"); err != nil || removed {
+		t.Fatalf("second purge = %v, %v", removed, err)
+	}
+	kept := "kept"
+	keptPeer, err := store.UpdatePeer(alice.ID, "keepbox", &kept, nil)
+	if err != nil {
+		t.Fatalf("kept peer: %v", err)
+	}
+	if dropped, err := store.EmptyTrash(alice.ID); err != nil || dropped != 1 {
+		t.Fatalf("empty trash = %d, %v", dropped, err)
+	}
+	if trash, err := store.Trash(alice.ID); err != nil || len(trash) != 0 {
+		t.Fatalf("trash after empty = %+v, %v", trash, err)
+	}
+	if peers, err := store.Peers(alice.ID); err != nil || len(peers) != 1 ||
+		peers[0].ID != keptPeer.ID {
+		t.Fatalf("live peers after empty = %+v, %v", peers, err)
+	}
+	if _, err := store.RestorePeer(alice.ID, "devbox"); !errors.Is(err, ErrUnknownPeer) {
+		t.Fatalf("restore purged peer = %v", err)
+	}
+	// Each user has an independent trash.
+	bob, err := store.CreateUser("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if trash, err := store.Trash(bob.ID); err != nil || len(trash) != 0 {
+		t.Fatalf("bob trash = %+v, %v", trash, err)
 	}
 }
 
@@ -1278,6 +1509,157 @@ func TestSharedAddressBookPermissions(t *testing.T) {
 	}
 }
 
+func TestAddressBookTargetGrants(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := store.CreateUser("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	carol, err := store.CreateUser("carol", "correct horse")
+	if err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	name := "工作区"
+	tags := []string{"lab"}
+	if _, err := store.UpdatePeer(alice.ID, "devbox", &name, &tags); err != nil {
+		t.Fatalf("seed alice peer: %v", err)
+	}
+	if _, err := store.CreateGroup("team", "Team", "", 0, 0); err != nil {
+		t.Fatalf("create account group: %v", err)
+	}
+	if _, err := store.AddGroupMember("team", "alice", RoleAdmin); err != nil {
+		t.Fatalf("add alice to group: %v", err)
+	}
+	if _, err := store.AddGroupMember("team", "bob", RoleReadonly); err != nil {
+		t.Fatalf("add bob to group: %v", err)
+	}
+
+	if _, err := store.ShareBookTarget(alice.ID, "user", "bob", "", ""); !errors.Is(err, ErrInvalidShareTarget) {
+		t.Fatalf("user kind in target table = %v", err)
+	}
+	if _, err := store.ShareBookTarget(alice.ID, ShareTargetGroup, "nope", "", ""); !errors.Is(err, ErrUnknownAccountGroup) {
+		t.Fatalf("unknown target group = %v", err)
+	}
+	if _, err := store.ShareBookTarget(carol.ID, ShareTargetGroup, "team", "", ""); !errors.Is(err, ErrShareTargetMember) {
+		t.Fatalf("share to a group carol does not belong to = %v", err)
+	}
+	if _, err := store.ShareBookTarget(alice.ID, ShareTargetGroup, "team", "owner", ""); !errors.Is(err, ErrInvalidPermission) {
+		t.Fatalf("invalid target permission = %v", err)
+	}
+	if _, err := store.ShareBookTarget(alice.ID, ShareTargetGroup, "team", "", "bad id"); !errors.Is(err, ErrInvalidGroupID) {
+		t.Fatalf("invalid target scope = %v", err)
+	}
+	grant, err := store.ShareBookTarget(alice.ID, " GROUP ", "team", "WRITE", "")
+	if err != nil || grant.TargetKind != ShareTargetGroup || grant.TargetID != "team" ||
+		grant.TargetName != "Team" || grant.Permission != PermissionWrite {
+		t.Fatalf("share to group = %+v, %v", grant, err)
+	}
+
+	books, err := store.SharedBooks(bob.ID)
+	if err != nil || len(books) != 1 || books[0].Owner != "alice" ||
+		books[0].Permission != PermissionWrite || len(books[0].Peers) != 1 {
+		t.Fatalf("member shared book = %+v, %v", books, err)
+	}
+	if books, err = store.SharedBooks(carol.ID); err != nil || len(books) != 0 {
+		t.Fatalf("non-member shared book = %+v, %v", books, err)
+	}
+	if books, err = store.SharedBooks(alice.ID); err != nil || len(books) != 0 {
+		t.Fatalf("owner shared own book = %+v, %v", books, err)
+	}
+	edited := "组授权改名"
+	if _, err := store.UpdateSharedPeer(bob.ID, "alice", "devbox", &edited, nil); err != nil {
+		t.Fatalf("member shared write: %v", err)
+	}
+
+	outgoing, incoming, err := store.Grants(alice.ID)
+	if err != nil || len(outgoing) != 1 || len(incoming) != 0 ||
+		outgoing[0].TargetKind != ShareTargetGroup || outgoing[0].TargetName != "Team" ||
+		outgoing[0].Username != "" || outgoing[0].Permission != PermissionWrite {
+		t.Fatalf("alice target grants = %+v/%+v, %v", outgoing, incoming, err)
+	}
+	if outgoing, incoming, err = store.Grants(bob.ID); err != nil ||
+		len(outgoing) != 0 || len(incoming) != 1 ||
+		incoming[0].Username != "alice" || incoming[0].TargetKind != ShareTargetGroup ||
+		incoming[0].TargetName != "Team" {
+		t.Fatalf("bob target grants = %+v/%+v, %v", outgoing, incoming, err)
+	}
+
+	// Membership drives access: removing bob revokes the book immediately.
+	if err := store.RemoveGroupMember("team", "bob"); err != nil {
+		t.Fatalf("remove bob from group: %v", err)
+	}
+	if books, err = store.SharedBooks(bob.ID); err != nil || len(books) != 0 {
+		t.Fatalf("shared book after removal = %+v, %v", books, err)
+	}
+	if _, err := store.UpdateSharedPeer(bob.ID, "alice", "devbox", nil, nil); !errors.Is(err, ErrUnknownShare) {
+		t.Fatalf("write after group removal = %v", err)
+	}
+
+	// Everyone reaches every account except the owner.
+	if _, err := store.ShareBookTarget(alice.ID, ShareTargetEveryone, "", PermissionRead, ""); err != nil {
+		t.Fatalf("share with everyone: %v", err)
+	}
+	for _, user := range []User{bob, carol} {
+		if books, err = store.SharedBooks(user.ID); err != nil || len(books) != 1 ||
+			books[0].Owner != "alice" || books[0].Permission != PermissionRead {
+			t.Fatalf("everyone shared book for %s = %+v, %v", user.Username, books, err)
+		}
+	}
+	if books, err = store.SharedBooks(alice.ID); err != nil || len(books) != 0 {
+		t.Fatalf("owner shared own book through everyone = %+v, %v", books, err)
+	}
+
+	// A scoped everyone grant only exposes that group.
+	if err := store.UnshareBookTarget(alice.ID, ShareTargetEveryone, ""); err != nil {
+		t.Fatalf("revoke everyone grant: %v", err)
+	}
+	if err := store.UnshareBookTarget(alice.ID, ShareTargetEveryone, ""); !errors.Is(err, ErrUnknownShare) {
+		t.Fatalf("revoke absent everyone grant = %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "lab", "Lab"); err != nil {
+		t.Fatalf("create address book group: %v", err)
+	}
+	if _, err := store.SetPeerGroup(alice.ID, "devbox", "lab"); err != nil {
+		t.Fatalf("group peer: %v", err)
+	}
+	if _, err := store.ShareBookTarget(alice.ID, ShareTargetEveryone, "", PermissionRead, "lab"); err != nil {
+		t.Fatalf("scoped everyone grant: %v", err)
+	}
+	if books, err = store.SharedBooks(carol.ID); err != nil || len(books) != 1 ||
+		len(books[0].Peers) != 1 || len(books[0].Groups) != 1 ||
+		books[0].Peers[0].GroupID != "lab" {
+		t.Fatalf("scoped everyone book = %+v, %v", books, err)
+	}
+	if err := store.UnshareBookTargetScope(alice.ID, ShareTargetEveryone, "", ""); !errors.Is(err, ErrUnknownShare) {
+		t.Fatalf("revoke wrong scope = %v", err)
+	}
+
+	// Deleting the scoped address-book group revokes its target grants.
+	if removed, err := store.DeleteGroup(alice.ID, "lab"); err != nil || !removed {
+		t.Fatalf("delete address book group = %v, %v", removed, err)
+	}
+	if books, err = store.SharedBooks(carol.ID); err != nil || len(books) != 0 {
+		t.Fatalf("shared book after group delete = %+v, %v", books, err)
+	}
+
+	// Re-sharing to the account group and then deleting that group also
+	// clears the grant from the owner's outgoing list.
+	if _, err := store.ShareBookTarget(alice.ID, ShareTargetGroup, "team", PermissionRead, ""); err != nil {
+		t.Fatalf("re-share to group: %v", err)
+	}
+	if err := store.DeleteAccountGroup("team"); err != nil {
+		t.Fatalf("delete account group: %v", err)
+	}
+	if outgoing, incoming, err = store.Grants(alice.ID); err != nil ||
+		len(outgoing) != 0 || len(incoming) != 0 {
+		t.Fatalf("grants after group delete = %+v/%+v, %v", outgoing, incoming, err)
+	}
+}
+
 func TestSharedGrantsSurviveReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	store, err := Open(path)
@@ -1715,6 +2097,102 @@ func TestRevokeOtherSessionsKeepsCurrent(t *testing.T) {
 	}
 	if _, err := store.Authenticate(firstToken); err != nil {
 		t.Fatalf("empty token revoked the current session: %v", err)
+	}
+}
+
+func TestListUsersPage(t *testing.T) {
+	store := openTemp(t, "state.db")
+	seed := []struct {
+		name string
+		role string
+	}{
+		{"alice", RoleAdmin},
+		{"bob", RoleUser},
+		{"bob_1", RoleUser},
+		{"carol", RoleReadonly},
+		{"dave", RoleOperator},
+	}
+	for _, user := range seed {
+		if _, err := store.CreateUserWithRole(user.name, "correct horse", "", "", user.role); err != nil {
+			t.Fatalf("create %s: %v", user.name, err)
+		}
+	}
+
+	users, total, err := store.ListUsersPage("", "", 2, 0)
+	if err != nil || total != 5 || len(users) != 2 ||
+		users[0].Username != "alice" || users[1].Username != "bob" {
+		t.Fatalf("first page = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage("", "", 2, 4)
+	if err != nil || total != 5 || len(users) != 1 || users[0].Username != "dave" {
+		t.Fatalf("last page = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage("", "", 0, 0)
+	if err != nil || total != 5 || len(users) != 5 {
+		t.Fatalf("unlimited = %d users total=%d err=%v", len(users), total, err)
+	}
+
+	users, total, err = store.ListUsersPage("AR", "", 10, 0)
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "carol" {
+		t.Fatalf("case-insensitive query = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage("", RoleOperator, 10, 0)
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "dave" {
+		t.Fatalf("role filter = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage("bob", RoleUser, 10, 0)
+	if err != nil || total != 2 || len(users) != 2 {
+		t.Fatalf("query+role = %+v total=%d err=%v", users, total, err)
+	}
+	// LIKE wildcards in the search text are literals, not patterns.
+	users, total, err = store.ListUsersPage("_", "", 10, 0)
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "bob_1" {
+		t.Fatalf("underscore query = %+v total=%d err=%v", users, total, err)
+	}
+	if _, total, err = store.ListUsersPage("%", "", 10, 0); err != nil || total != 0 {
+		t.Fatalf("percent query total=%d err=%v", total, err)
+	}
+	if _, _, err := store.ListUsersPage("", "owner", 10, 0); !errors.Is(err, ErrInvalidRole) {
+		t.Fatalf("invalid role = %v", err)
+	}
+}
+
+func TestRevokeAllSessions(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := store.CreateUser("bob", "correct horse"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	_, firstToken, _, err := store.LoginWithDevice("alice", "correct horse", "device-a", "Office PC")
+	if err != nil {
+		t.Fatalf("first login: %v", err)
+	}
+	_, secondToken, _, err := store.LoginWithDevice("alice", "correct horse", "device-b", "Laptop")
+	if err != nil {
+		t.Fatalf("second login: %v", err)
+	}
+	_, bobToken, _, err := store.Login("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("bob login: %v", err)
+	}
+
+	revoked, err := store.RevokeAllSessions(alice.ID)
+	if err != nil || revoked != 2 {
+		t.Fatalf("revoke all = %d, %v; want 2", revoked, err)
+	}
+	for name, token := range map[string]string{"first": firstToken, "second": secondToken} {
+		if _, err := store.Authenticate(token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("%s session survived: %v", name, err)
+		}
+	}
+	if _, err := store.Authenticate(bobToken); err != nil {
+		t.Fatalf("another user's session was revoked: %v", err)
+	}
+	if revoked, err := store.RevokeAllSessions(alice.ID); err != nil || revoked != 0 {
+		t.Fatalf("second revoke all = %d, %v; want 0", revoked, err)
 	}
 }
 
@@ -2364,5 +2842,87 @@ func TestAuditEventsForFiltersByAction(t *testing.T) {
 	none, err := store.AuditEventsFor(AuditLogout, 10)
 	if err != nil || len(none) != 0 {
 		t.Fatalf("filtered logout events = %+v, %v", none, err)
+	}
+}
+
+func TestAuditEventsForBeforeRangeFiltersByUser(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	for _, username := range []string{"alice", "alice2", "bob"} {
+		if _, err := store.CreateUser(username, "correct horse"); err != nil {
+			t.Fatalf("create %s: %v", username, err)
+		}
+	}
+	if _, err := store.CreateGroup("team", "Team", "", 0, 0); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if _, err := store.AddGroupMember("team", "alice2", "readonly"); err != nil {
+		t.Fatalf("add group member: %v", err)
+	}
+	for _, event := range []AuditEvent{
+		{Username: "alice", Action: AuditLogin, Success: true},
+		{Username: "alice", Action: AuditLogin, Detail: "invalid credentials"},
+		{Username: "alice2", Action: AuditLogin, Success: true},
+		{Username: "bob", Action: AuditPasswordChange, Success: true},
+	} {
+		if err := store.AppendAudit(event); err != nil {
+			t.Fatalf("append audit: %v", err)
+		}
+	}
+	user := func(events []AuditEvent) []string {
+		names := make([]string, 0, len(events))
+		for _, event := range events {
+			names = append(names, event.Username+"/"+event.Action)
+		}
+		return names
+	}
+	alice, err := store.AuditEventsForBeforeRange("", "alice", TimeBounds{}, 0, 10)
+	if err != nil {
+		t.Fatalf("list alice audit: %v", err)
+	}
+	if got := user(alice); len(got) != 2 || got[0] != "alice/login" || got[1] != "alice/login" {
+		t.Fatalf("alice events = %v", got)
+	}
+	if alice[0].Detail != "invalid credentials" {
+		t.Fatalf("newest alice event = %+v", alice[0])
+	}
+	// Surrounding whitespace from a query string must not hide the account.
+	trimmed, err := store.AuditEventsForBeforeRange("", "  alice  ", TimeBounds{}, 0, 10)
+	if err != nil || len(trimmed) != 2 {
+		t.Fatalf("trimmed alice events = %+v, %v", trimmed, err)
+	}
+	// Exact match: "alice" does not also return "alice2".
+	other, err := store.AuditEventsForBeforeRange("", "bob", TimeBounds{}, 0, 10)
+	if err != nil || len(other) != 1 || other[0].Action != AuditPasswordChange {
+		t.Fatalf("bob events = %+v, %v", other, err)
+	}
+	combo, err := store.AuditEventsForBeforeRange(AuditLogin, "alice", TimeBounds{}, 0, 10)
+	if err != nil || len(combo) != 2 {
+		t.Fatalf("alice login events = %+v, %v", combo, err)
+	}
+	empty, err := store.AuditEventsForBeforeRange(AuditPasswordChange, "alice", TimeBounds{}, 0, 10)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("alice password changes = %+v, %v", empty, err)
+	}
+	// The cursor pages through one user's trail without leaking others.
+	first, err := store.AuditEventsForBeforeRange("", "alice", TimeBounds{}, 0, 1)
+	if err != nil || len(first) != 1 || first[0].Detail != "invalid credentials" {
+		t.Fatalf("alice first page = %+v, %v", first, err)
+	}
+	second, err := store.AuditEventsForBeforeRange("", "alice", TimeBounds{}, first[0].ID, 1)
+	if err != nil || len(second) != 1 || second[0].Detail != "" {
+		t.Fatalf("alice second page = %+v, %v", second, err)
+	}
+	// The group trail composes with the same account filter.
+	group, err := store.AuditEventsForGroupBeforeRange("team", "", "alice2", TimeBounds{}, 0, 10)
+	if err != nil || len(group) != 1 || group[0].Username != "alice2" {
+		t.Fatalf("group alice2 events = %+v, %v", group, err)
+	}
+	outsider, err := store.AuditEventsForGroupBeforeRange("team", "", "bob", TimeBounds{}, 0, 10)
+	if err != nil || len(outsider) != 0 {
+		t.Fatalf("group bob events = %+v, %v", outsider, err)
 	}
 }

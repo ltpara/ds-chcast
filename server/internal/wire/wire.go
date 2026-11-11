@@ -26,11 +26,16 @@ const (
 	TypeKeepaliveAck       = "keepalive_ack"
 	TypePunchRequest       = "punch_request"
 	TypePunchPeer          = "punch_peer"
-	TypePunch              = "punch"
-	TypePunchProbe         = "punch_probe"
-	TypePunchAck           = "punch_ack"
-	TypeNatProbe           = "nat_probe"
-	TypeNatProbeAck        = "nat_probe_ack"
+	// TypeRelayHint carries the host's relay decision back to the viewer that
+	// asked to punch. RustDesk forwards the same decision as RelayResponse: the
+	// viewer joins the relay at once instead of finishing a punch window the
+	// peer has already given up on.
+	TypeRelayHint   = "relay_hint"
+	TypePunch       = "punch"
+	TypePunchProbe  = "punch_probe"
+	TypePunchAck    = "punch_ack"
+	TypeNatProbe    = "nat_probe"
+	TypeNatProbeAck = "nat_probe_ack"
 	// TypeTCPPunch coordinates a TCP hole punch: agents announce themselves on
 	// the server's TCP punch port and learn the endpoint the server observed
 	// for their peer, mirroring RustDesk's punch-hole TCP channel.
@@ -39,6 +44,9 @@ const (
 	// TypeRendezvousProof answers its per-connection challenge.
 	TypeRendezvousControl = "rendezvous_control"
 	TypeRendezvousProof   = "rendezvous_proof"
+	// TypeLocalAddr is the host's answer to a punch that asked for current LAN
+	// candidates. RustDesk carries the same answer in LocalAddr.
+	TypeLocalAddr = "local_addr"
 	// TypeTCPDirect is the signed hello of a punched TCP link itself.
 	TypeTCPDirect      = "tcp_direct"
 	TypeRelayHello     = "relay_hello"
@@ -53,6 +61,14 @@ const (
 // MaxControlSize bounds a control datagram. The agents use the same limit when
 // reading, so a malformed length cannot turn into a large allocation.
 const MaxControlSize = 2048
+
+// SignalWSPath and SignalWSSubprotocol name the WebSocket signalling endpoint.
+// It carries the same framed wire messages as the raw TCP punch port, for
+// networks where only the HTTP(S) port is allowed out.
+const (
+	SignalWSPath        = "/chast-signal"
+	SignalWSSubprotocol = "chast-signal.v1"
+)
 
 type Message struct {
 	Multiplex bool   `json:"multiplex,omitempty"`
@@ -77,8 +93,14 @@ type Message struct {
 	// LocalAddrsV6 mirrors LocalAddrs for IPv6. RustDesk carries the same split
 	// as socket_addr/socket_addr_v6; a dual-stack agent reports both.
 	LocalAddrsV6 []string `json:"local_addrs_v6,omitempty"`
-	IsLocal      bool     `json:"is_local,omitempty"`
-	NATType      string   `json:"nat_type,omitempty"`
+	// WantLocalAddrs asks the host to answer with a signed local_addr carrying
+	// the LAN candidates its socket holds right now. The rendezvous service
+	// sets it on a punch_peer for a viewer on the host's own network, where an
+	// address that changed since the last keepalive would break the direct
+	// path. RustDesk uses a separate FetchLocalAddr round trip for this.
+	WantLocalAddrs bool   `json:"want_local_addrs,omitempty"`
+	IsLocal        bool   `json:"is_local,omitempty"`
+	NATType        string `json:"nat_type,omitempty"`
 	// UpnpPort is the external UDP port an agent mapped on its gateway. It is
 	// only a hint: the peer still has to be reached through the NAT, but a
 	// stable mapping can rescue symmetric NATs where the observed source port
@@ -98,10 +120,10 @@ type Message struct {
 	Transport      string `json:"transport,omitempty"`
 	TransportProof string `json:"transport_proof,omitempty"`
 	Timestamp      int64  `json:"timestamp,omitempty"`
-	Relay       string `json:"relay,omitempty"`
-	OK          bool   `json:"ok"`
-	Error       string `json:"error,omitempty"`
-	ExpiresMS   int64  `json:"expires_ms,omitempty"`
+	Relay          string `json:"relay,omitempty"`
+	OK             bool   `json:"ok"`
+	Error          string `json:"error,omitempty"`
+	ExpiresMS      int64  `json:"expires_ms,omitempty"`
 }
 
 var ErrNotControl = errors.New("not a control datagram")

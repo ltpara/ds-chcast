@@ -22,6 +22,7 @@ type adminAccountReply struct {
 
 type adminAccountListReply struct {
 	Users []adminAccountReply `json:"users"`
+	Total int                 `json:"total"`
 }
 
 func TestAdminAccountsAuthorization(t *testing.T) {
@@ -292,6 +293,266 @@ func TestAdminAccountBanAndUnban(t *testing.T) {
 			!events[0].Success || events[0].Detail != detail {
 			t.Fatalf("%s audit = %+v, %v", action, events, err)
 		}
+	}
+}
+
+// TestAdminAccountDirectoryPagingAndCSV covers the console account table's
+// server-side paging: q/role filters, limit/offset with a total, the unchanged
+// whole-list default, and a CSV export that always covers the whole filter.
+func TestAdminAccountDirectoryPagingAndCSV(t *testing.T) {
+	s := testutil.Start(t)
+	seed := []struct {
+		name string
+		role string
+	}{
+		{"alice", account.RoleAdmin},
+		{"bob", account.RoleUser},
+		{"carol", account.RoleReadonly},
+		{"dave", account.RoleOperator},
+	}
+	for _, user := range seed {
+		if _, err := s.Accounts.CreateUserWithRole(user.name, "correct horse", "", "", user.role); err != nil {
+			t.Fatalf("create %s: %v", user.name, err)
+		}
+	}
+	if err := s.Accounts.SetSessionPermissionCap("bob", 4); err != nil {
+		t.Fatalf("bob session cap: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse")
+	plain := login(t, s.URL, "bob", "correct horse")
+
+	list := func(query string) adminAccountListReply {
+		t.Helper()
+		status, data := request(t, http.MethodGet, s.URL+"/v1/accounts?"+query, "", admin.Token)
+		if status != http.StatusOK {
+			t.Fatalf("list %q: %d %s", query, status, data)
+		}
+		var reply adminAccountListReply
+		if err := json.Unmarshal(data, &reply); err != nil {
+			t.Fatalf("list %q reply: %v", query, err)
+		}
+		return reply
+	}
+	names := func(reply adminAccountListReply) string {
+		out := make([]string, 0, len(reply.Users))
+		for _, user := range reply.Users {
+			out = append(out, user.Username)
+		}
+		return strings.Join(out, ",")
+	}
+
+	if reply := list(""); reply.Total != 4 || names(reply) != "alice,bob,carol,dave" {
+		t.Fatalf("default list = %+v", reply)
+	}
+	if reply := list("limit=2&offset=0"); reply.Total != 4 || names(reply) != "alice,bob" {
+		t.Fatalf("first page = %+v", reply)
+	}
+	if reply := list("limit=2&offset=2"); reply.Total != 4 || names(reply) != "carol,dave" {
+		t.Fatalf("second page = %+v", reply)
+	}
+	if reply := list("q=CAR"); reply.Total != 1 || names(reply) != "carol" {
+		t.Fatalf("query page = %+v", reply)
+	}
+	if reply := list("role=operator"); reply.Total != 1 || names(reply) != "dave" || reply.Users[0].Role != account.RoleOperator {
+		t.Fatalf("role page = %+v", reply)
+	}
+	for _, query := range []string{"role=owner", "limit=1001", "offset=-1", "limit=x"} {
+		if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts?"+query, "", admin.Token); status != http.StatusBadRequest {
+			t.Fatalf("bad query %q: %d %s", query, status, body)
+		}
+	}
+
+	csvLines := func(query string, token string) []string {
+		t.Helper()
+		status, data := request(t, http.MethodGet, s.URL+"/v1/accounts?"+query, "", token)
+		if status != http.StatusOK {
+			t.Fatalf("csv %q: %d %s", query, status, data)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		for i := range lines {
+			lines[i] = strings.TrimSuffix(lines[i], "\r")
+		}
+		return lines
+	}
+	all := csvLines("format=csv&limit=1", admin.Token)
+	if len(all) != 5 || all[0] != "id,username,role,email,phone,permission_ceiling,banned,created_at" {
+		t.Fatalf("csv = %v", all)
+	}
+	if !strings.Contains(all[2], ",bob,user,,,4,false,") {
+		t.Fatalf("bob csv row = %q", all[2])
+	}
+	filtered := csvLines("format=csv&role=user&q=bob", admin.Token)
+	if len(filtered) != 2 || !strings.Contains(filtered[1], ",bob,user,") {
+		t.Fatalf("filtered csv = %v", filtered)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts?format=csv", "", plain.Token); status != http.StatusForbidden {
+		t.Fatalf("csv as ordinary user: %d %s", status, body)
+	}
+}
+
+// TestAdminAccountSessions covers the console's per-account login view: an
+// admin lists another account's live sessions, cuts one or all of them, cannot
+// cut the session it is calling with, and every cut is audited.
+func TestAdminAccountSessions(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse")
+	adminSecond := login(t, s.URL, "alice", "correct horse")
+	deviceLogin := func(username, password, deviceID string) loginReply {
+		t.Helper()
+		status, data := request(t, http.MethodPost, s.URL+"/v1/account/login",
+			`{"username":"`+username+`","password":"`+password+`","device_id":"`+deviceID+`"}`, "")
+		if status != http.StatusOK {
+			t.Fatalf("login %s/%s: %d %s", username, deviceID, status, data)
+		}
+		var reply loginReply
+		if err := json.Unmarshal(data, &reply); err != nil {
+			t.Fatalf("login reply: %v", err)
+		}
+		return reply
+	}
+	bobFirst := deviceLogin("bob", "battery staple", "bob-a")
+	bobSecond := deviceLogin("bob", "battery staple", "bob-b")
+
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts/bob/sessions", "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("sessions without credentials: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts/bob/sessions", "", bobFirst.Token); status != http.StatusForbidden {
+		t.Fatalf("sessions as ordinary user: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts/nobody/sessions", "", admin.Token); status != http.StatusNotFound {
+		t.Fatalf("sessions for unknown account: %d %s", status, body)
+	}
+
+	for name, token := range map[string]string{"admin": admin.Token, "server key": testutil.ServerKey} {
+		status, data := request(t, http.MethodGet, s.URL+"/v1/accounts/bob/sessions", "", token)
+		if status != http.StatusOK {
+			t.Fatalf("sessions with %s: %d %s", name, status, data)
+		}
+		var list accountSessionsReply
+		if err := json.Unmarshal(data, &list); err != nil {
+			t.Fatalf("sessions reply: %v", err)
+		}
+		if len(list.Sessions) != 2 {
+			t.Fatalf("%s sessions = %+v, want 2", name, list.Sessions)
+		}
+		for _, session := range list.Sessions {
+			if session.Current || session.ID == "" {
+				t.Fatalf("%s session = %+v, want a live non-current row", name, session)
+			}
+		}
+	}
+
+	status, data := request(t, http.MethodGet, s.URL+"/v1/accounts/bob/sessions", "", admin.Token)
+	if status != http.StatusOK {
+		t.Fatalf("list bob sessions: %d %s", status, data)
+	}
+	var list accountSessionsReply
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatalf("list reply: %v", err)
+	}
+	revokedID := ""
+	for _, session := range list.Sessions {
+		if session.DeviceID == "bob-a" {
+			revokedID = session.ID
+		}
+	}
+	if revokedID == "" {
+		t.Fatalf("bob-a session missing: %+v", list.Sessions)
+	}
+
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/accounts/bob/sessions/"+revokedID, "", admin.Token); status != http.StatusNoContent {
+		t.Fatalf("revoke bob session: %d %s", status, body)
+	}
+	status, data = request(t, http.MethodGet, s.URL+"/v1/accounts/bob/sessions", "", admin.Token)
+	if err := json.Unmarshal(data, &list); err != nil || status != http.StatusOK {
+		t.Fatalf("sessions after revoke: %d %s (%v)", status, data, err)
+	}
+	if len(list.Sessions) != 1 || list.Sessions[0].ID == revokedID {
+		t.Fatalf("sessions after revoke = %+v", list.Sessions)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", bobFirst.Token); status != http.StatusUnauthorized {
+		t.Fatalf("revoked token still works: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", bobSecond.Token); status != http.StatusOK {
+		t.Fatalf("kept token was revoked: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/accounts/bob/sessions/"+revokedID, "", admin.Token); status != http.StatusNotFound {
+		t.Fatalf("repeated revoke: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/accounts/bob/sessions/unknown", "", admin.Token); status != http.StatusNotFound {
+		t.Fatalf("unknown session revoke: %d %s", status, body)
+	}
+
+	// The caller's own current session is listed but cannot be cut.
+	status, data = request(t, http.MethodGet, s.URL+"/v1/accounts/alice/sessions", "", admin.Token)
+	if err := json.Unmarshal(data, &list); err != nil || status != http.StatusOK {
+		t.Fatalf("alice sessions: %d %s (%v)", status, data, err)
+	}
+	var currentID string
+	if len(list.Sessions) != 2 {
+		t.Fatalf("alice sessions = %+v, want 2", list.Sessions)
+	}
+	for _, session := range list.Sessions {
+		if session.Current {
+			currentID = session.ID
+		}
+	}
+	if currentID == "" {
+		t.Fatalf("caller session not marked current: %+v", list.Sessions)
+	}
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/accounts/alice/sessions/"+currentID, "", admin.Token); status != http.StatusConflict {
+		t.Fatalf("revoke calling session: %d %s", status, body)
+	}
+
+	if status, data := request(t, http.MethodPost,
+		s.URL+"/v1/accounts/bob/sessions/revoke-all", "", admin.Token); status != http.StatusOK ||
+		!strings.Contains(string(data), `"revoked":1`) {
+		t.Fatalf("revoke all bob sessions: %d %s", status, data)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", bobSecond.Token); status != http.StatusUnauthorized {
+		t.Fatalf("remaining bob token survived revoke-all: %d %s", status, body)
+	}
+
+	if status, data := request(t, http.MethodPost,
+		s.URL+"/v1/accounts/alice/sessions/revoke-all", "", admin.Token); status != http.StatusOK ||
+		!strings.Contains(string(data), `"revoked":1`) {
+		t.Fatalf("revoke all own sessions: %d %s", status, data)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", admin.Token); status != http.StatusOK {
+		t.Fatalf("calling session was revoked: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", adminSecond.Token); status != http.StatusUnauthorized {
+		t.Fatalf("other own session survived: %d %s", status, body)
+	}
+
+	events, err := s.Accounts.AuditEventsFor(account.AuditSessionRevoke, 10)
+	if err != nil {
+		t.Fatalf("audit events: %v", err)
+	}
+	var toldBob, toldAlice bool
+	for _, event := range events {
+		if event.Username != "alice" || !event.Success {
+			continue
+		}
+		if strings.Contains(event.Detail, "for bob") {
+			toldBob = true
+		}
+		if strings.Contains(event.Detail, "for alice") {
+			toldAlice = true
+		}
+	}
+	if !toldBob || !toldAlice {
+		t.Fatalf("admin session audit missing: %+v", events)
 	}
 }
 

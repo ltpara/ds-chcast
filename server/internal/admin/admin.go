@@ -24,6 +24,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/auditarchive"
 	"github.com/ltpara/ds-chcast/server/internal/configpush"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
@@ -48,6 +49,7 @@ ip-blocker(ib) [ip] | ib -
 ip-changes(ic) [id|start] [count] | ic <id> - | ic -
 relay-servers(rs) [host1,host2 | -]
 rendezvous-servers(rv) [url1,url2 | serial <n> <url1,url2|-> | clear]
+reload-geo(rg)
 test-geo(tg) <ip1> [ip2]
 relay-only(aur) [Y|N]
 user list | user add <name> [password] | user passwd <name> [password] | user del <name>
@@ -76,13 +78,16 @@ type SMS interface {
 }
 
 type Config struct {
-	Listen     string
-	Registry   *registry.Registry
-	Relay      *relay.Manager
-	Punch      *punchlog.Log
-	Blocker    *abuse.Blocker
-	Accounts   *account.Store
-	IPChanges  *ipchange.Tracker
+	Listen    string
+	Registry  *registry.Registry
+	Relay     *relay.Manager
+	Punch     *punchlog.Log
+	Blocker   *abuse.Blocker
+	Accounts  *account.Store
+	IPChanges *ipchange.Tracker
+	// GeoIP is the reloadable location table behind reload-geo. Nil disables
+	// the command.
+	GeoIP      *geoip.Reloader
 	RelayAddrs *relayaddr.List
 	RelayPool  *relaypool.Pool
 	RelayOnly  *atomic.Bool
@@ -253,6 +258,8 @@ func (c *Console) execute(line string) string {
 		return c.rendezvousText(fields[1:])
 	case "test-geo", "tg":
 		return c.testGeoText(fields[1:])
+	case "reload-geo", "rg":
+		return c.reloadGeoText()
 	case "relay-only", "aur":
 		return c.relayOnlyText(fields[1:])
 	case "user", "users":
@@ -707,6 +714,17 @@ func (c *Console) rendezvousText(args []string) string {
 		}
 		return fmt.Sprintf("serial=%d\n", next)
 	}
+}
+
+func (c *Console) reloadGeoText() string {
+	if c.cfg.GeoIP == nil {
+		return "geoip is not configured\n"
+	}
+	prefixes, err := c.cfg.GeoIP.Reload()
+	if err != nil {
+		return fmt.Sprintf("reload failed: %v\n", err)
+	}
+	return fmt.Sprintf("loaded %d prefixes from %s\n", prefixes, c.cfg.GeoIP.Path())
 }
 
 func (c *Console) testGeoText(args []string) string {

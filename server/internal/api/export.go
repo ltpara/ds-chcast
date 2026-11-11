@@ -136,7 +136,12 @@ func (e *csvExport) done() {
 
 func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
+	user := strings.TrimSpace(r.URL.Query().Get("user"))
 	group := strings.TrimSpace(r.URL.Query().Get("group"))
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
 	export := s.newCSVExport(w, "chast-audit", "audit", []string{
 		"id", "created_at", "username", "action", "detail",
 		"client_ip", "location", "success", "host_id",
@@ -148,9 +153,9 @@ func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 			err    error
 		)
 		if group != "" {
-			events, err = s.cfg.Accounts.AuditEventsForGroupBefore(group, action, before, exportBatch)
+			events, err = s.cfg.Accounts.AuditEventsForGroupBeforeRange(group, action, user, bounds, before, exportBatch)
 		} else {
-			events, err = s.cfg.Accounts.AuditEventsForBefore(action, before, exportBatch)
+			events, err = s.cfg.Accounts.AuditEventsForBeforeRange(action, user, bounds, before, exportBatch)
 		}
 		if err != nil {
 			export.fail(err, "could not read the audit log")
@@ -185,6 +190,10 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	group := strings.TrimSpace(r.URL.Query().Get("group"))
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
 	export := s.newCSVExport(w, "chast-connections", "connection", []string{
 		"id", "started_at", "ended_at", "duration_ms", "username", "peer_id",
 		"host_id", "audit_ref", "source", "direction", "client_ip", "location",
@@ -197,12 +206,12 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 			err    error
 		)
 		if group != "" {
-			events, err = s.cfg.Accounts.ConnectionsForGroupBefore(
-				group, username, host, before, exportEventBatch)
+			events, err = s.cfg.Accounts.ConnectionsForGroupBeforeRange(
+				group, username, host, bounds, before, exportEventBatch)
 		} else if host != "" {
-			events, err = s.cfg.Accounts.ConnectionsForHostBefore(host, before, exportEventBatch)
+			events, err = s.cfg.Accounts.ConnectionsForHostBeforeRange(host, bounds, before, exportEventBatch)
 		} else {
-			events, err = s.cfg.Accounts.ConnectionsForBefore(username, before, exportEventBatch)
+			events, err = s.cfg.Accounts.ConnectionsForBeforeRange(username, bounds, before, exportEventBatch)
 		}
 		if err != nil {
 			export.fail(err, "could not read the connection log")
@@ -243,6 +252,10 @@ func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	group := strings.TrimSpace(r.URL.Query().Get("group"))
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
 	export := s.newCSVExport(w, "chast-file-transfers", "file transfer", []string{
 		"id", "occurred_at", "username", "peer_id", "host_id", "audit_ref",
 		"source", "direction", "name", "size", "files", "client_ip", "location",
@@ -255,12 +268,12 @@ func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request) {
 			err    error
 		)
 		if group != "" {
-			events, err = s.cfg.Accounts.FileTransfersForGroupBefore(
-				group, username, host, before, exportEventBatch)
+			events, err = s.cfg.Accounts.FileTransfersForGroupBeforeRange(
+				group, username, host, bounds, before, exportEventBatch)
 		} else if host != "" {
-			events, err = s.cfg.Accounts.FileTransfersForHostBefore(host, before, exportEventBatch)
+			events, err = s.cfg.Accounts.FileTransfersForHostBeforeRange(host, bounds, before, exportEventBatch)
 		} else {
-			events, err = s.cfg.Accounts.FileTransfersForBefore(username, before, exportEventBatch)
+			events, err = s.cfg.Accounts.FileTransfersForBeforeRange(username, bounds, before, exportEventBatch)
 		}
 		if err != nil {
 			export.fail(err, "could not read the file transfer log")

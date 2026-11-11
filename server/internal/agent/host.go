@@ -240,6 +240,9 @@ type HostAgent struct {
 	observedRelay *net.UDPAddr
 	natType       string
 	upnpPort      int
+	// relayHintNonce is the punch whose relay decision was already sent, so a
+	// repeated punch notification does not duplicate the control datagram.
+	relayHintNonce string
 
 	// remote is guarded by mu: both read loops use it. It is the source of the
 	// last datagram that came from a viewer path (direct or via the relay).
@@ -1283,6 +1286,9 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 		if !fromPunch || h.cfg.Proxy != nil {
 			return
 		}
+		if msg.WantLocalAddrs {
+			h.answerLocalAddr(msg.Nonce, src)
+		}
 		conn := h.conn.LocalAddr().(*net.UDPAddr)
 		connIP := conn.IP
 		var v4Peer, v6Peer *net.UDPAddr
@@ -1312,6 +1318,13 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 		h.mu.Lock()
 		symmetric := h.natType == NATSymmetric
 		h.mu.Unlock()
+		// When the v4 punch is hopeless and no other family or local path can
+		// carry the session, tell the viewer now. RustDesk's host makes the
+		// same call by answering with a relay it created, so the viewer does
+		// not spend its remaining window probing a hole that cannot open.
+		if (symmetric || msg.NATType == NATSymmetric) && v4Peer != nil && v6Peer == nil && len(locals) == 0 {
+			h.sendRelayHint(msg.Nonce)
+		}
 		if v4Peer != nil {
 			h.rememberPunchPeer(v4Peer)
 			if symmetric || msg.NATType == NATSymmetric {
@@ -1403,6 +1416,53 @@ func (h *HostAgent) sendPunches(peer *net.UDPAddr, nonce string) {
 		case <-time.After(gap):
 		}
 		gap = nextPunchGap(gap)
+	}
+}
+
+// sendRelayHint tells the rendezvous service that this punch ends on the relay,
+// so it can pass the decision to the viewer that is still probing. One message
+// per punch is enough; a repeated punch notification carries the same nonce.
+func (h *HostAgent) sendRelayHint(nonce string) {
+	punch := h.getPunch()
+	if punch == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.relayHintNonce == nonce {
+		h.mu.Unlock()
+		return
+	}
+	h.relayHintNonce = nonce
+	h.mu.Unlock()
+	msg := wire.Encode(wire.Message{Type: wire.TypeRelayHint, HostID: h.cfg.ID, Nonce: nonce})
+	if _, err := h.conn.WriteToUDP(msg, punch); err != nil {
+		h.log.Debug("relay hint write failed", "error", err)
+	}
+}
+
+// answerLocalAddr reports the LAN candidates the punch socket holds now. The
+// rendezvous service asks when a viewer on the host's own network is punching,
+// because an address change after the last keepalive would otherwise make the
+// viewer probe a stale endpoint. The answer is signed over the exact list and
+// echoes the punch nonce, so only the request that asked can consume it.
+func (h *HostAgent) answerLocalAddr(nonce string, to *net.UDPAddr) {
+	v4, v6 := splitByFamily(localCandidates(h.conn.LocalAddr().(*net.UDPAddr)))
+	h.localAddrs, h.localAddrsV6 = v4, v6
+	addrs := make([]string, 0, len(v4)+len(v6))
+	addrs = append(append(addrs, v4...), v6...)
+	h.log.Debug("LAN candidates refreshed", "nonce", nonce, "addrs", addrs)
+	ts := time.Now().Unix()
+	msg := wire.Encode(wire.Message{
+		Type:         wire.TypeLocalAddr,
+		HostID:       h.cfg.ID,
+		Nonce:        nonce,
+		Timestamp:    ts,
+		LocalAddrs:   v4,
+		LocalAddrsV6: v6,
+		Signature:    identity.Sign(h.priv, identity.LocalAddrMessage(h.cfg.ID, nonce, addrs, ts)),
+	})
+	if _, err := h.conn.WriteToUDP(msg, to); err != nil {
+		h.log.Debug("LAN candidate answer failed", "error", err)
 	}
 }
 

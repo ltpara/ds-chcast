@@ -158,11 +158,15 @@ func (s *server) issueAccessTicket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return
 	}
+	if record.Disabled {
+		writeError(w, http.StatusForbidden, "device is disabled")
+		return
+	}
 	if record.Fingerprint == "" {
 		writeError(w, http.StatusConflict, "host fingerprint is not available")
 		return
 	}
-	admission, err := s.cfg.Accounts.CheckDeviceAdmission(peerID, user.ID)
+	admission, err := s.deviceAdmission(peerID, user.ID, user.Username)
 	if err != nil {
 		s.cfg.Logger.Error("access ticket admission", "id", peerID, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not check the device policy")
@@ -275,7 +279,7 @@ func (s *server) attachLookupTicket(w http.ResponseWriter, r *http.Request,
 		}
 		requested = uint32(value)
 	}
-	admission, err := s.cfg.Accounts.CheckDeviceAdmission(peerID, subject.UserID)
+	admission, err := s.deviceAdmission(peerID, subject.UserID, subject.Username)
 	if err != nil {
 		s.cfg.Logger.Error("lookup access ticket admission", "id", peerID, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not check the device policy")
@@ -403,7 +407,7 @@ func (s *server) attachLookupTransport(w http.ResponseWriter, r *http.Request,
 	if s.cfg.Accounts == nil {
 		return true
 	}
-	admission, err := s.cfg.Accounts.CheckDeviceAdmission(peerID, subject.UserID)
+	admission, err := s.deviceAdmission(peerID, subject.UserID, subject.Username)
 	if err != nil {
 		s.cfg.Logger.Error("lookup transport admission", "id", peerID, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not check the device policy")

@@ -33,6 +33,8 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
+	"github.com/ltpara/ds-chcast/server/internal/ldapauth"
 	"github.com/ltpara/ds-chcast/server/internal/logging"
 	"github.com/ltpara/ds-chcast/server/internal/mail"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
@@ -50,6 +52,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/software"
 	"github.com/ltpara/ds-chcast/server/internal/tracing"
 	"github.com/ltpara/ds-chcast/server/internal/webauthn"
+	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
 func main() {
@@ -74,6 +77,7 @@ func run() error {
 		relayServers     = flag.String("relay-servers", "", "comma-separated relay host names or IPs without ports; empty uses --advertise")
 		relayNodes       = flag.String("relay-nodes", "", "comma-separated standalone relay node URLs, e.g. http://relay1:8447")
 		relayNodeKey     = flag.String("relay-node-key", "", "control key shared with every --relay-nodes entry")
+		relayNodeRegions = flag.String("relay-node-regions", "", "comma-separated url=region pairs tying a relay node to the GeoIP labels it serves, e.g. http://relay1:8447=Europe/Berlin")
 		relayNodeCA      = flag.String("relay-node-ca", "", "PEM CA bundle for HTTPS relay nodes; empty uses the system roots")
 		relayNodeCert    = flag.String("relay-node-client-cert", "", "client certificate presented to relay nodes requiring mTLS")
 		relayNodeKeyID   = flag.String("relay-node-client-key", "", "private key for --relay-node-client-cert")
@@ -110,6 +114,16 @@ func run() error {
 		oidcScopes       = flag.String("oidc-scopes", "openid profile email", "space-separated scopes requested from --oidc-issuer")
 		oidcName         = flag.String("oidc-name", "", "provider name shown in viewer login dialogs; empty uses the issuer host")
 		oidcAutoCreate   = flag.Bool("oidc-auto-create", true, "link unknown identity provider subjects to new viewer accounts")
+		ldapURL          = flag.String("ldap-url", "", "LDAP or AD server URL (ldap:// or ldaps://); together with --ldap-base-dn it enables directory login")
+		ldapBindDN       = flag.String("ldap-bind-dn", "", "service account DN used to search the directory; empty searches anonymously")
+		ldapBindPassword = flag.String("ldap-bind-password", "", "service account password for --ldap-bind-dn; prefer an env file over the command line")
+		ldapBaseDN       = flag.String("ldap-base-dn", "", "search root for directory logins, e.g. ou=people,dc=example,dc=com")
+		ldapFilter       = flag.String("ldap-filter", "(uid=%s)", "directory search filter; exactly one %s receives the escaped login name")
+		ldapEmailAttr    = flag.String("ldap-email-attr", "mail", "directory attribute copied to a new account as its recovery address")
+		ldapStartTLS     = flag.Bool("ldap-starttls", false, "upgrade an ldap:// connection with StartTLS before binding")
+		ldapInsecure     = flag.Bool("ldap-insecure", false, "skip certificate verification for --ldap-url TLS; test deployments only")
+		ldapTimeout      = flag.Duration("ldap-timeout", 8*time.Second, "deadline for one directory login")
+		ldapAutoCreate   = flag.Bool("ldap-auto-create", true, "link a directory user to a new account on first login")
 		auditRetention   = flag.Int("audit-retention-days", 0, "delete audit, connection and file-transfer history older than this many days; 0 keeps the row caps only")
 		auditArchive     = flag.String("audit-archive-dir", "", "append audit, connection and file-transfer history to JSONL files in this directory; empty disables the archive")
 		archiveEvery     = flag.Duration("audit-archive-interval", time.Hour, "how often new history rows are appended to the archive")
@@ -152,8 +166,11 @@ func run() error {
 		loginWindow      = flag.Duration("login-window", 10*time.Minute, "window for counting failed account logins")
 		loginLockout     = flag.Duration("login-lockout", time.Minute, "how long a locked username and client IP stay refused")
 		proxyHeader      = flag.String("proxy-header", "", "header carrying the client IP behind a trusted proxy, e.g. X-Forwarded-For")
+		relayProxyHeader = flag.String("relay-proxy-header", "", "WebSocket handshake header trusted as the viewer IP for relay and shared-carrier sessions behind a reverse proxy, e.g. X-Real-IP; empty uses the socket address")
 		geoIPFile        = flag.String("geoip-file", "", "CIDR-to-location table used to label login IPs; empty records IPs only")
 		relayOnly        = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
+		lanMask          = flag.String("lan-mask", "", "comma-separated CIDRs identifying this server's LAN, e.g. 192.168.0.0/16; LAN/WAN pairs are forced onto the relay like hbbs -m; empty disables the rule")
+		lanLocalIP       = flag.String("local-ip", "", "LAN address of this server's relay handed to LAN peers when --lan-mask is set; empty auto-detects")
 		wakeRelayPolicy  = flag.String("wake-relay-policy", "", "JSON file mapping wake target IDs to authorized relay IDs; empty disables relayed wake")
 		adminListen      = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
 		adminToken       = flag.String("admin-token", "", "secret the admin console requires; empty generates and logs one at startup")
@@ -176,6 +193,8 @@ func run() error {
 		regWindow      = flag.Duration("register-window", time.Minute, "registration rate window")
 		regMaxIDs      = flag.Int("register-max-ids", 300, "distinct IDs per IP per ID window; 0 disables the check")
 		regIDWindow    = flag.Duration("register-id-window", 24*time.Hour, "distinct ID window per IP")
+		regThrottle    = flag.Int("register-id-throttle", 3, "signed registrations accepted for one host id within --register-id-throttle-window; 0 disables the per-id throttle")
+		regThrottleWin = flag.Duration("register-id-throttle-window", 6*time.Second, "silence after which the per-id registration burst resets; at least 1s when the throttle is on")
 		verbose        = flag.Bool("verbose", false, "debug logging")
 		logFile        = flag.String("log-file", "", "also append logs to this file; empty writes to stderr only")
 		logMaxSize     = flag.Int64("log-max-size", logging.DefaultMaxSize>>20, "rotate --log-file after this many MiB")
@@ -358,6 +377,34 @@ func run() error {
 		log.Info("account single sign-on enabled",
 			"issuer", oidcIssuerURL, "name", oidcProvider.Name(), "auto_create", *oidcAutoCreate)
 	}
+	ldapURLValue := strings.TrimSpace(*ldapURL)
+	ldapBaseValue := strings.TrimSpace(*ldapBaseDN)
+	var ldapAuth *ldapauth.Authenticator
+	if ldapURLValue != "" || ldapBaseValue != "" {
+		if ldapURLValue == "" || ldapBaseValue == "" {
+			return errors.New("--ldap-url and --ldap-base-dn must be set together")
+		}
+		ldapAuth, err = ldapauth.New(ldapauth.Config{
+			URL:                ldapURLValue,
+			BindDN:             strings.TrimSpace(*ldapBindDN),
+			BindPassword:       *ldapBindPassword,
+			BaseDN:             ldapBaseValue,
+			Filter:             *ldapFilter,
+			EmailAttr:          *ldapEmailAttr,
+			StartTLS:           *ldapStartTLS,
+			InsecureSkipVerify: *ldapInsecure,
+			Timeout:            *ldapTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("--ldap-url: %w", err)
+		}
+		if *ldapInsecure {
+			log.Warn("directory TLS verification is disabled", "url", ldapURLValue)
+		}
+		log.Info("account directory login enabled",
+			"url", ldapURLValue, "base_dn", ldapBaseValue,
+			"anonymous_search", strings.TrimSpace(*ldapBindDN) == "", "auto_create", *ldapAutoCreate)
+	}
 
 	var (
 		mailSender    *mail.Sender
@@ -457,6 +504,12 @@ func run() error {
 	if *regMaxIDs > 0 && *regIDWindow < time.Minute {
 		return errors.New("--register-id-window must be at least 1m")
 	}
+	if *regThrottle < 0 {
+		return errors.New("--register-id-throttle must not be negative")
+	}
+	if *regThrottle > 0 && *regThrottleWin < time.Second {
+		return errors.New("--register-id-throttle-window must be at least 1s")
+	}
 	if *recordingsQuota < 0 || *recordingsMax < 0 || *recordingsDays < 0 {
 		return errors.New("--recordings-quota-mb, --recordings-max-mb and --recordings-retention-days must not be negative")
 	}
@@ -540,6 +593,26 @@ func run() error {
 	if *hostTTL < 10*time.Second {
 		return errors.New("--host-ttl must be at least 10s")
 	}
+	lanMaskValue, err := lanmask.Parse(*lanMask)
+	if err != nil {
+		return fmt.Errorf("--lan-mask: %w", err)
+	}
+	lanLocalHost := ""
+	if lanMaskValue.Enabled() {
+		lanLocalHost = strings.TrimSpace(*lanLocalIP)
+		if lanLocalHost == "" {
+			// hbbs defaults local-ip to the machine's own LAN address; that is
+			// the address a LAN peer of a local relay can reach.
+			if detected, derr := netutil.DetectAdvertise(); derr == nil {
+				lanLocalHost = detected
+			} else {
+				log.Warn("--local-ip could not be detected; LAN peers keep the advertised relay address", "error", derr)
+			}
+		}
+		log.Info("LAN mask enabled", "lan_mask", *lanMask, "local_ip", lanLocalHost)
+	} else if strings.TrimSpace(*lanLocalIP) != "" {
+		log.Warn("--local-ip has no effect without --lan-mask")
+	}
 	relayHosts := []string{advertised}
 	if *relayServers != "" {
 		relayHosts = strings.Split(*relayServers, ",")
@@ -565,6 +638,13 @@ func run() error {
 	}
 	if *relayNodes == "" && *relayNodeKey != "" {
 		return errors.New("--relay-node-key requires --relay-nodes")
+	}
+	if *relayNodeRegions != "" && *relayNodes == "" {
+		return errors.New("--relay-node-regions requires --relay-nodes")
+	}
+	relayRegions, err := parseRelayNodeRegions(*relayNodeRegions)
+	if err != nil {
+		return fmt.Errorf("--relay-node-regions: %w", err)
 	}
 	relayTLS, err := netutil.ClientTLSConfig(*relayNodeCA, *relayNodeCert, *relayNodeKeyID)
 	if err != nil {
@@ -686,11 +766,15 @@ func run() error {
 		log.Warn("persistent state disabled; viewer accounts and address books are unavailable")
 	}
 	var geoLocator *geoip.Locator
+	var geoTable geoip.Table
+	var geoReloader *geoip.Reloader
 	if *geoIPFile != "" {
 		geoLocator, err = geoip.Load(*geoIPFile)
 		if err != nil {
 			return fmt.Errorf("--geoip-file: %w", err)
 		}
+		geoReloader = geoip.NewReloader(*geoIPFile, geoLocator)
+		geoTable = geoReloader
 		log.Info("geoip table loaded", "path", *geoIPFile, "prefixes", geoLocator.Len())
 	}
 	relayOnlyFlag := &atomic.Bool{}
@@ -713,6 +797,13 @@ func run() error {
 			MaxIDs:       *regMaxIDs,
 		})
 	}
+	var registerThrottle *abuse.IDWindow
+	if *regThrottle > 0 {
+		registerThrottle = abuse.NewIDWindow(abuse.IDWindowConfig{
+			Window: *regThrottleWin,
+			Max:    *regThrottle,
+		})
+	}
 	relayAddr := func(port int) string {
 		return net.JoinHostPort(advertised, strconv.Itoa(port))
 	}
@@ -725,6 +816,7 @@ func run() error {
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
 		relay.WithTracer(tracer),
+		relay.WithProxyHeader(*relayProxyHeader),
 	}
 	if transportVerifier != nil {
 		relayOpts = append(relayOpts, relay.WithTransportVerifier(transportVerifier))
@@ -760,6 +852,7 @@ func run() error {
 	if *relayNodes != "" {
 		pool, err = relaypool.New(relaypool.Config{
 			Nodes:    strings.Split(*relayNodes, ","),
+			Regions:  relayRegions,
 			Key:      *relayNodeKey,
 			Interval: *relayHealth,
 			Logger:   log,
@@ -770,7 +863,8 @@ func run() error {
 		}
 		pool.Start()
 		defer pool.Close()
-		log.Info("relay nodes configured", "nodes", pool.NodeURLs(), "health_interval", *relayHealth)
+		log.Info("relay nodes configured", "nodes", pool.NodeURLs(),
+			"regions", *relayNodeRegions, "health_interval", *relayHealth)
 	}
 
 	meetOpts := []rendezvous.Option{
@@ -781,6 +875,7 @@ func run() error {
 		rendezvous.WithLinkKey(*linkKey),
 		rendezvous.WithTracer(tracer),
 		rendezvous.WithRelayOnly(func() bool { return relayOnlyFlag.Load() }),
+		rendezvous.WithLAN(lanMaskValue, lanLocalHost),
 		rendezvous.WithHostCarrierLinked(func(id string) bool {
 			host, ok := reg.Lookup(id)
 			if !ok {
@@ -1034,6 +1129,7 @@ func run() error {
 			Relay:       relayManager,
 			Punch:       punchLog,
 			Blocker:     blocker,
+			GeoIP:       geoReloader,
 			Accounts:    accounts,
 			IPChanges:   ipChanges,
 			RelayAddrs:  relayAddrs,
@@ -1082,10 +1178,13 @@ func run() error {
 		WakeRelays:        wakeRelays,
 		TTL:               *hostTTL,
 		RelayOnly:         relayOnlyFlag,
+		LANMask:           lanMaskValue,
+		LANLocalIP:        lanLocalHost,
 		Blocker:           blocker,
+		RegisterThrottle:  registerThrottle,
 		Accounts:          accounts,
 		Recordings:        recordingArchive,
-		GeoIP:             geoLocator,
+		GeoIP:             geoTable,
 		PunchLog:          punchLog,
 		IPChanges:         ipChanges,
 		RelayAddrs:        relayAddrs,
@@ -1120,8 +1219,17 @@ func run() error {
 		WebAuthnRPID:               relyingParty,
 		WebAuthnOrigins:            webauthnOrigins,
 		OIDC:                       oidcProvider,
+		LDAP:                       ldapAuth,
+		LDAPAutoCreate:             *ldapAutoCreate,
 		Tracer:                     tracer,
 	})
+	// The signalling WebSocket rides the HTTP listener so it passes any proxy
+	// that already admits the API; the raw TCP punch port stays for direct
+	// egress.
+	root := http.NewServeMux()
+	root.Handle(wire.SignalWSPath, meet.SignalHandler())
+	root.Handle("/", handler)
+	handler = root
 	httpServer := &http.Server{
 		Addr:              *httpListen,
 		Handler:           handler,
@@ -1179,6 +1287,8 @@ func run() error {
 		"punch_log_max", *punchLogMax,
 		"register_max", *regMax,
 		"register_max_ids", *regMaxIDs,
+		"register_id_throttle", *regThrottle,
+		"register_id_throttle_window", *regThrottleWin,
 		"rmem", *rmem,
 		"punch_read_buffer", meet.ReadBuffer(),
 		"relay_read_buffer", relayManager.ReadBuffer(),
@@ -1284,6 +1394,32 @@ func checkRoleKeys(serverKey, linkKey, hostKey string) error {
 		return errors.New("--link-key must differ from --host-key")
 	}
 	return nil
+}
+
+// parseRelayNodeRegions turns "url=region,url=region" into the pool's region
+// map. Labels are compared with the GeoIP table's location text, so a typo
+// here only disables the preference instead of failing registration.
+func parseRelayNodeRegions(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	out := make(map[string]string)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		nodeURL, region, ok := strings.Cut(item, "=")
+		nodeURL, region = strings.TrimSpace(nodeURL), strings.TrimSpace(region)
+		if !ok || nodeURL == "" || region == "" {
+			return nil, fmt.Errorf("entry %q must be url=region", item)
+		}
+		if _, duplicate := out[nodeURL]; duplicate {
+			return nil, fmt.Errorf("relay node %q is listed twice", nodeURL)
+		}
+		out[nodeURL] = region
+	}
+	return out, nil
 }
 
 // checkServerKey keeps the default deployment authenticated. An empty key is

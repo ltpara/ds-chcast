@@ -527,23 +527,30 @@ func (s *Store) RecordDevicePolicyReceipt(peerID string, version uint32, applied
 // current policy. It is intentionally stateless: lease issuance, clock bounds
 // and transport credentials belong to the next G02 slices. An empty userID is
 // never admitted by a restricted policy because there is no subject to match.
+// The effective ceiling intersects the device policy with the account-wide cap,
+// so an account limited to view-only stays limited on every device.
 func (s *Store) CheckDeviceAdmission(peerID, userID string) (DeviceAdmission, error) {
 	peerID = strings.TrimSpace(peerID)
 	if !registry.ValidID(peerID) {
 		return DeviceAdmission{}, ErrInvalidPeerID
 	}
+	userID = strings.TrimSpace(userID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	accountCap, err := s.accountPermissionCapLocked(userID)
+	if err != nil {
+		return DeviceAdmission{}, err
+	}
 	var (
 		mode    string
 		ceiling int64
 		version uint32
 	)
-	err := s.db.QueryRow(
+	err = s.db.QueryRow(
 		`SELECT mode, permission_ceiling, policy_version FROM device_policies WHERE peer_id = ?`, peerID,
 	).Scan(&mode, &ceiling, &version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return DeviceAdmission{Managed: false, Allowed: true, Reason: "unmanaged"}, nil
+		return DeviceAdmission{Managed: false, Allowed: true, Reason: "unmanaged", PermissionCeiling: accountCap}, nil
 	}
 	if err != nil {
 		return DeviceAdmission{}, fmt.Errorf("account store %s: read device admission: %w", s.path, err)
@@ -551,14 +558,13 @@ func (s *Store) CheckDeviceAdmission(peerID, userID string) (DeviceAdmission, er
 	admission := DeviceAdmission{
 		Managed:           true,
 		PolicyVersion:     version,
-		PermissionCeiling: uint32(ceiling),
+		PermissionCeiling: intersectPermissionCeilings(uint32(ceiling), accountCap),
 	}
 	if mode == DevicePolicyOpen {
 		admission.Allowed = true
 		admission.Reason = "policy open"
 		return admission, nil
 	}
-	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		admission.Reason = "no account subject"
 		return admission, nil

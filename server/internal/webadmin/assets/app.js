@@ -17,6 +17,13 @@
     editing: null,
     timer: 0,
     devicesLoading: false,
+    deviceSelection: new Set(),
+    deviceList: [],
+    deviceOffset: 0,
+    deviceLimit: 200,
+    deviceTotal: 0,
+    pendingBulk: '',
+    bulkTimer: 0,
     auditTab: 'events',
     auditBefore: 0,
     auditRows: [],
@@ -38,6 +45,23 @@
     policyObjects: [],
     policyAssignments: [],
     policyObjectEditing: null,
+    accountCapUser: null,
+    accountRecoveryUser: null,
+    accountSessionsUser: null,
+    accountLimit: 50,
+    accountOffset: 0,
+    // Set by probeSingleSignOn when the server has an identity provider.
+    oidc: { enabled: false, name: '' },
+    // Bumped to abandon an in-flight SSO poll (logout, another login).
+    oidcGen: 0,
+    // Self-service state: GET /v1/account, its sessions, and the pending
+    // TOTP secret between start and enable.
+    accountInfo: null,
+    accountSessions: [],
+    account2faPending: null,
+    // Security keys: null until loaded; enabled=false when the server has no
+    // WebAuthn relying party configured (the list route answers 503).
+    accountKeys: null,
   };
 
   class ApiError extends Error {
@@ -273,6 +297,44 @@
     }
   }
 
+  // WebAuthn carries binary fields as unpadded base64url; the browser API
+  // wants ArrayBuffers in both directions.
+  function base64urlBytes(value) {
+    let text = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (text.length % 4) text += '=';
+    const raw = atob(text);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+    return bytes;
+  }
+
+  function bytesBase64url(value) {
+    const bytes = new Uint8Array(value);
+    let text = '';
+    for (let i = 0; i < bytes.length; i += 1) text += String.fromCharCode(bytes[i]);
+    return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // postJSON is the unauthenticated login-side request: it keeps the error
+  // body so a caller can word a refusal itself instead of locking the console.
+  async function postJSON(path, body) {
+    const resp = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
+    const data = readJSON(await resp.text());
+    if (!resp.ok) {
+      const message = (data && data.error) || resp.status + ' ' + resp.statusText;
+      const error = new ApiError(message, resp.status);
+      // OIDC poll failures carry a machine-readable code next to the text.
+      if (data && data.code) error.code = data.code;
+      throw error;
+    }
+    return data;
+  }
+
   // refreshSession rotates the account pair. It runs on every expired access
   // token, so a console stays usable for the refresh token's lifetime.
   async function refreshSession() {
@@ -350,31 +412,10 @@
     }
   }
 
-  async function unlockAccount(username, password, code) {
-    const body = { username, password };
-    if (code) {
-      // Six digits is a TOTP code; anything else is treated as a printed
-      // recovery code so a lost authenticator does not lock operators out.
-      if (/^\d{6}$/.test(code)) body.totp_code = code;
-      else body.recovery_code = code;
-    }
-    const resp = await fetch('/v1/account/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      cache: 'no-store',
-    });
-    const data = readJSON(await resp.text());
-    if (resp.status === 401) {
-      const factor = resp.headers.get('X-Chast-2FA');
-      const message = factor === 'required' ? '该账号启用了两步验证，请输入验证码。'
-        : factor === 'invalid' ? '两步验证码不正确。'
-          : (data && data.error) || '用户名或密码不正确。';
-      throw new ApiError(message, 401);
-    }
-    if (!resp.ok) {
-      throw new ApiError((data && data.error) || resp.status + ' ' + resp.statusText, resp.status);
-    }
+  // adoptAccountSession applies a completed account login (password or
+  // security key): a session without a console role or group grant is revoked
+  // instead of being kept around unused.
+  async function adoptAccountSession(data, username) {
     const user = data && data.user ? data.user : {};
     if (!ROLE_RANK[user.role] && !(await hasGroupConsoleAccess(data.token))) {
       // The session is valid but useless here; revoke it right away.
@@ -396,7 +437,316 @@
     await enterConsole();
   }
 
+  async function unlockAccount(username, password, code, codeKind) {
+    const body = { username, password };
+    const value = (code || '').trim();
+    if (value) {
+      // "auto" keeps the original guess: six digits is a TOTP code and
+      // anything else is a printed recovery code. An explicit choice lets the
+      // operator use the email or SMS second factor instead.
+      const kind = codeKind || 'auto';
+      if (kind === 'totp') body.totp_code = value;
+      else if (kind === 'email') body.email_code = value;
+      else if (kind === 'sms') body.sms_code = value;
+      else if (kind === 'recovery') body.recovery_code = value;
+      else if (/^\d{6}$/.test(value)) body.totp_code = value;
+      else body.recovery_code = value;
+    }
+    const resp = await fetch('/v1/account/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
+    const data = readJSON(await resp.text());
+    if (resp.status === 401) {
+      const factor = resp.headers.get('X-Chast-2FA');
+      const message = factor === 'required' ? '该账号启用了两步验证，请输入验证码。'
+        : factor === 'invalid' ? '两步验证码不正确。'
+          : '用户名或密码不正确。';
+      throw new ApiError(message, 401);
+    }
+    // Account login keeps its operator-facing wording in the console instead of
+    // echoing the server's English sentences.
+    if (resp.status === 403) throw new ApiError('该账号已被封禁。', 403);
+    if (resp.status === 429) throw new ApiError('尝试次数过多，请稍后再试。', 429);
+    if (resp.status === 503) {
+      // Accounts missing and an unreachable directory share the status but not
+      // the fix, so the server's sentence picks the wording.
+      const detail = data && data.error ? String(data.error) : '';
+      if (detail.includes('directory')) {
+        throw new ApiError('目录（LDAP/AD）服务暂时不可用，请稍后再试或联系管理员。', 503);
+      }
+      throw new ApiError('服务器未启用账号登录。', 503);
+    }
+    if (!resp.ok) {
+      throw new ApiError('登录失败（' + resp.status + '）。', resp.status);
+    }
+    await adoptAccountSession(data, username);
+  }
+
+  // sendLoginCode asks the server to mail or text a one-time second-factor
+  // code. The password is verified server-side before anything is sent, so
+  // this only saves typing when the second factor is not an authenticator.
+  async function sendLoginCode() {
+    const kind = $('login-code-kind').value;
+    if (kind !== 'email' && kind !== 'sms') {
+      $('login-note').textContent = '先在验证码类型中选择“邮箱验证码”或“短信验证码”。';
+      return;
+    }
+    const username = $('login-username').value.trim();
+    const password = $('login-password').value;
+    if (!username || !password) {
+      $('login-note').textContent = '请先填写用户名和密码。';
+      return;
+    }
+    try {
+      await postJSON(
+        kind === 'email' ? '/v1/account/login/email' : '/v1/account/login/sms',
+        { username, password },
+      );
+      $('login-note').textContent = '如果该账号登记了找回' +
+        (kind === 'email' ? '邮箱' : '手机') + '并启用了两步验证，验证码已发送。';
+    } catch (err) {
+      if (err.status === 401) {
+        $('login-note').textContent = '用户名或密码不正确。';
+        return;
+      }
+      if (err.status === 403) {
+        $('login-note').textContent = '该账号已被封禁。';
+        return;
+      }
+      if (err.status === 429) {
+        $('login-note').textContent = '验证码请求过于频繁，请稍后再试。';
+        return;
+      }
+      if (err.status === 503) {
+        $('login-note').textContent = kind === 'email'
+          ? '服务器未配置邮件发送，无法发送验证码。'
+          : '服务器未配置短信发送，无法发送验证码。';
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // unlockWithSecurityKey runs the browser half of the WebAuthn ceremony the
+  // account API already serves. A password turns it into password + key; an
+  // empty password asks for a passwordless (discoverable) credential instead.
+  async function unlockWithSecurityKey() {
+    const username = $('login-username').value.trim();
+    const password = $('login-password').value;
+    if (!username) {
+      $('login-note').textContent = '请先填写用户名。';
+      return;
+    }
+    if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials) {
+      $('login-note').textContent = '当前页面不能使用安全密钥（需要 HTTPS 或 localhost）。';
+      return;
+    }
+    const twoFactor = Boolean(password);
+    const beginPath = twoFactor
+      ? '/v1/account/login/webauthn/begin'
+      : '/v1/account/login/webauthn/passwordless/begin';
+    let begin;
+    try {
+      begin = await postJSON(beginPath, twoFactor ? { username, password } : { username });
+    } catch (err) {
+      if (err.status === 401) throw new ApiError('用户名或密码不正确。', 401);
+      if (err.status === 503) throw new ApiError('服务器未配置安全密钥登录。', 503);
+      if (err.status === 429) throw new ApiError('尝试次数过多，请稍后再试。', 429);
+      throw err;
+    }
+    if (!begin || !begin.challenge) {
+      // The server answers 202 without a challenge when the account has no
+      // registered key, so this route cannot be used to enumerate accounts.
+      $('login-note').textContent = '该账号没有可用的安全密钥，请用密码登录。';
+      return;
+    }
+    if (!Array.isArray(begin.credentials) || begin.credentials.length === 0) {
+      $('login-note').textContent = '该账号没有可用的安全密钥，请用密码登录。';
+      return;
+    }
+    let assertion = null;
+    try {
+      assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge: base64urlBytes(begin.challenge),
+          rpId: begin.rp_id,
+          timeout: Number(begin.timeout_ms) || 60000,
+          userVerification: 'preferred',
+          allowCredentials: begin.credentials.map((cred) => ({
+            type: 'public-key',
+            id: base64urlBytes(cred.id),
+          })),
+        },
+      });
+    } catch (err) {
+      if (err && err.name === 'NotAllowedError') {
+        $('login-note').textContent = '已取消或超时，未使用安全密钥。';
+        return;
+      }
+      $('login-note').textContent = '安全密钥失败：' + ((err && err.message) || String(err));
+      return;
+    }
+    if (!assertion || !assertion.response) return;
+    const response = assertion.response;
+    const finishPath = twoFactor
+      ? '/v1/account/login/webauthn/finish'
+      : '/v1/account/login/webauthn/passwordless/finish';
+    let data;
+    try {
+      data = await postJSON(finishPath, {
+        username,
+        credential_id: bytesBase64url(assertion.rawId),
+        client_data_json: bytesBase64url(response.clientDataJSON),
+        authenticator_data: bytesBase64url(response.authenticatorData),
+        signature: bytesBase64url(response.signature),
+        device_name: 'webadmin',
+      });
+    } catch (err) {
+      if (err.status === 401) throw new ApiError('安全密钥验证未被接受。', 401);
+      if (err.status === 429) throw new ApiError('尝试次数过多，请稍后再试。', 429);
+      throw err;
+    }
+    $('login-password').value = '';
+    $('login-totp').value = '';
+    await adoptAccountSession(data, username);
+  }
+
+  // probeSingleSignOn reveals the SSO button only when the server has an
+  // identity provider configured; an unconfigured server answers 200 with
+  // enabled=false, so any failure here just leaves the button hidden.
+  async function probeSingleSignOn() {
+    try {
+      const resp = await fetch('/v1/account/oidc', { cache: 'no-store' });
+      if (!resp.ok) return;
+      const data = readJSON(await resp.text());
+      if (!data || !data.enabled) return;
+      state.oidc = { enabled: true, name: String(data.name || '') };
+      const control = $('login-oidc');
+      control.textContent = state.oidc.name
+        ? '使用 ' + state.oidc.name + ' 登录'
+        : '使用单点登录';
+      control.classList.remove('hidden');
+    } catch {
+      /* the button simply stays hidden */
+    }
+  }
+
+  function showSingleSignOnLink(url) {
+    const note = $('login-note');
+    note.textContent = '浏览器拦截了登录窗口，请点击此链接打开单点登录页面：';
+    const link = el('a', '', '打开单点登录');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    note.appendChild(link);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function singleSignOnError(err) {
+    switch (err && err.code) {
+      case 'oidc_expired': return '单点登录已过期，请重试。';
+      case 'no_account': return '该身份未关联任何管理台账号，请联系管理员。';
+      case 'account_banned': return '该账号已被封禁。';
+      case 'email_taken': return '该身份的邮箱已被其他账号使用，请联系管理员。';
+      default: return '单点登录未能完成，请改用密码登录。';
+    }
+  }
+
+  // unlockWithSingleSignOn opens the provider page in a new tab, then polls
+  // for the session the browser callback created. The tab is opened before the
+  // first request so the click still counts as the popup-blocker gesture.
+  async function unlockWithSingleSignOn() {
+    if (!state.oidc.enabled) {
+      $('login-note').textContent = '服务器未配置单点登录。';
+      return;
+    }
+    const gen = ++state.oidcGen;
+    let tab = null;
+    try {
+      tab = window.open('', '_blank');
+    } catch {
+      tab = null;
+    }
+    let begin;
+    try {
+      begin = await postJSON('/v1/account/oidc/begin', {
+        device_id: '',
+        device_name: 'webadmin',
+        client: 'console',
+      });
+    } catch (err) {
+      if (tab) tab.close();
+      if (err.status === 503) {
+        throw new ApiError('单点登录暂不可用，请稍后再试或改用密码登录。', 503);
+      }
+      throw err;
+    }
+    let target = null;
+    try {
+      target = new URL(begin && begin.auth_url ? begin.auth_url : '');
+    } catch {
+      target = null;
+    }
+    if (!begin || !begin.state || !target ||
+        (target.protocol !== 'https:' && target.protocol !== 'http:')) {
+      if (tab) tab.close();
+      $('login-note').textContent = '单点登录地址无效，请联系管理员。';
+      return;
+    }
+    $('login-note').textContent = '正在等待浏览器中的单点登录完成…';
+    if (tab) {
+      // The provider page must not be able to script this console.
+      try {
+        tab.opener = null;
+      } catch {
+        /* about:blank always allows this */
+      }
+      tab.location.replace(target.toString());
+    } else {
+      showSingleSignOnLink(target.toString());
+    }
+    const deadline = Date.now() + (Number(begin.expires_in_ms) || 600000);
+    while (state.oidcGen === gen && Date.now() < deadline) {
+      await sleep(1500);
+      if (state.oidcGen !== gen) return;
+      if (tab && tab.closed) {
+        $('login-note').textContent = '登录窗口已关闭，单点登录已取消。';
+        return;
+      }
+      let data;
+      try {
+        data = await postJSON('/v1/account/oidc/poll', { state: begin.state });
+      } catch (err) {
+        if (err.status === 503) {
+          throw new ApiError('单点登录暂不可用，请稍后再试。', 503);
+        }
+        if (err.status === 404 || err.status === 401) {
+          $('login-note').textContent = singleSignOnError(err);
+          return;
+        }
+        throw err;
+      }
+      if (data && data.status === 'pending') continue;
+      if (data && data.token) {
+        if (tab && !tab.closed) tab.close();
+        await adoptAccountSession(data, '');
+        return;
+      }
+    }
+    if (state.oidcGen === gen) {
+      $('login-note').textContent = '单点登录超时，请重试。';
+    }
+  }
+
   async function enterConsole() {
+    // Any login that wins the console cancels a still-running SSO poll.
+    state.oidcGen++;
     $('login-form').classList.add('hidden');
     $('session-bar').classList.remove('hidden');
     $('login-note').textContent = '';
@@ -441,6 +791,7 @@
       devices: read && !restricted,
       policies: admin,
       accounts: admin,
+      mine: Boolean(state.auth && state.auth.mode === 'account'),
       tokens: tokenAdmin,
       groups: true,
       recordings: read && !restricted,
@@ -459,6 +810,8 @@
 
   function lock(message) {
     stopTimer();
+    // A pending SSO poll must not sign the operator back in after a logout.
+    state.oidcGen++;
     const auth = state.auth;
     if (auth && auth.mode === 'account' && auth.token) {
       fetch('/v1/account/logout', {
@@ -473,6 +826,9 @@
     state.auditGen++;
     state.recordingRows = [];
     state.recordingGen++;
+    state.deviceOffset = 0;
+    state.deviceTotal = 0;
+    state.deviceSelection.clear();
     state.groups = [];
     state.groupsLoaded = false;
     state.groupEditing = null;
@@ -484,6 +840,7 @@
     state.policyObjectEditing = null;
     state.tokens = [];
     state.tokenSecret = '';
+    resetMine();
     clear($('group-rows'));
     clear($('policy-rows'));
     clear($('policy-object-rows'));
@@ -502,6 +859,8 @@
     if (groupDialog.open) groupDialog.close();
     const tokenSecretDialog = $('token-secret-dialog');
     if (tokenSecretDialog.open) tokenSecretDialog.close();
+    const accountCapDialog = $('account-cap-dialog');
+    if (accountCapDialog.open) accountCapDialog.close();
     $('token-secret-value').textContent = '';
     clearSession();
     $('workspace').classList.add('hidden');
@@ -510,6 +869,7 @@
     $('server-key').value = '';
     $('login-password').value = '';
     $('login-totp').value = '';
+    $('login-code-kind').value = 'auto';
     $('login-note').textContent = message || '已断开连接。';
     syncLoginMode();
   }
@@ -551,6 +911,7 @@
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'policies') loadPolicies().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
+    else if (tab === 'mine') loadMine().catch(reportError);
     else if (tab === 'tokens') loadTokens().catch(reportError);
     else if (tab === 'groups') loadGroups().catch(reportError);
     else if (tab === 'recordings') loadRecordings(true).catch(reportError);
@@ -762,7 +1123,8 @@
       const query = $('device-query').value.trim();
       if (query) params.set('q', query);
       if ($('device-online').checked) params.set('online', '1');
-      params.set('limit', '1000');
+      params.set('limit', String(state.deviceLimit));
+      params.set('offset', String(state.deviceOffset));
       const data = await api('/v1/identities?' + params.toString());
       renderDevices(data || {});
     } catch (err) {
@@ -774,20 +1136,108 @@
 
   function renderDevices(data) {
     const peers = Array.isArray(data.identities) ? data.identities : [];
+    state.deviceList = peers;
+    const known = new Set(peers.map((peer) => peer.id));
+    Array.from(state.deviceSelection).forEach((id) => {
+      if (!known.has(id)) state.deviceSelection.delete(id);
+    });
     const total = data.total === undefined ? peers.length : data.total;
     const online = data.online === undefined ? 0 : data.online;
-    let summary = '共 ' + total + ' 台，在线 ' + online + ' 台';
-    if (peers.length < total) summary += '（显示前 ' + peers.length + ' 台）';
-    $('device-summary').textContent = summary;
+    state.deviceTotal = total;
+    // A deletion or filter change can leave the offset past the last page;
+    // fall back once instead of showing an empty table with a positive total.
+    if (!peers.length && total > 0 && state.deviceOffset > 0) {
+      state.deviceOffset = Math.max(0, Math.floor((total - 1) / state.deviceLimit) * state.deviceLimit);
+      loadDevices().catch(reportError);
+      return;
+    }
+    $('device-summary').textContent = '共 ' + total + ' 台，在线 ' + online + ' 台';
+    updateDevicePager(total, peers.length);
 
     const body = $('device-rows');
     clear(body);
     peers.forEach((peer) => body.appendChild(deviceRow(peer)));
     $('device-empty').classList.toggle('hidden', peers.length > 0);
+    updateDeviceSelection();
+  }
+
+  function updateDevicePager(total, shown) {
+    if (total === 0) {
+      $('device-page').textContent = '没有设备';
+    } else {
+      $('device-page').textContent = '第 ' + (state.deviceOffset + 1) + '–' +
+        (state.deviceOffset + shown) + ' 台，共 ' + total + ' 台';
+    }
+    $('device-prev').disabled = state.deviceOffset <= 0;
+    $('device-next').disabled = state.deviceOffset + state.deviceLimit >= total;
+  }
+
+  function updateDeviceSelection() {
+    resetBulkPrompt();
+    const count = state.deviceSelection.size;
+    $('device-selection').textContent = count ? '已选择 ' + count + ' 台' : '未选择设备';
+    const writable = can('operator');
+    $('device-bulk-disable').disabled = !writable || count === 0;
+    $('device-bulk-enable').disabled = !writable || count === 0;
+    $('device-bulk-clear').disabled = count === 0;
+    const all = $('device-select-all');
+    const visible = state.deviceList.length;
+    const selected = state.deviceList.filter((peer) => state.deviceSelection.has(peer.id)).length;
+    all.checked = visible > 0 && selected === visible;
+    all.indeterminate = selected > 0 && selected < visible;
+    all.disabled = !writable || visible === 0;
+  }
+
+  function resetBulkPrompt() {
+    state.pendingBulk = '';
+    clearTimeout(state.bulkTimer);
+    $('device-bulk-disable').textContent = '批量禁用';
+    $('device-bulk-enable').textContent = '批量启用';
+  }
+
+  // The second click confirms: a native confirm() blocks the page, and a bulk
+  // disable is destructive enough to want the explicit repeat.
+  async function bulkSetDisabled(button, disabled) {
+    const ids = Array.from(state.deviceSelection);
+    if (!ids.length) return;
+    const action = disabled ? '禁用' : '启用';
+    if (state.pendingBulk !== (disabled ? 'disable' : 'enable')) {
+      resetBulkPrompt();
+      state.pendingBulk = disabled ? 'disable' : 'enable';
+      button.textContent = '确认' + action + ' ' + ids.length + ' 台';
+      state.bulkTimer = setTimeout(() => resetBulkPrompt(), 6000);
+      return;
+    }
+    resetBulkPrompt();
+    const result = await api('/v1/identities/bulk', {
+      method: 'POST',
+      body: { ids, disabled },
+    });
+    const updated = Array.isArray(result && result.updated) ? result.updated.length : 0;
+    const missing = Array.isArray(result && result.missing) ? result.missing.length : 0;
+    state.deviceSelection.clear();
+    toast('已' + action + ' ' + updated + ' 台设备' + (missing ? '，' + missing + ' 台不存在' : ''));
+    await loadDevices();
   }
 
   function deviceRow(peer) {
     const tr = document.createElement('tr');
+
+    const pick = document.createElement('input');
+    pick.type = 'checkbox';
+    pick.checked = state.deviceSelection.has(peer.id);
+    pick.title = '选择 ' + peer.id;
+    pick.addEventListener('change', () => {
+      if (pick.checked) {
+        state.deviceSelection.add(peer.id);
+      } else {
+        state.deviceSelection.delete(peer.id);
+      }
+      updateDeviceSelection();
+    });
+    const pickCell = cell(pick);
+    pickCell.className = 'check-col';
+    tr.appendChild(pickCell);
 
     const id = cell(peer.id);
     id.className = 'mono';
@@ -795,6 +1245,7 @@
     tr.appendChild(id);
 
     tr.appendChild(cell(peer.alias || '—'));
+    tr.appendChild(cell(peer.owner || '—'));
 
     const tags = el('span');
     if (Array.isArray(peer.tags) && peer.tags.length) {
@@ -808,7 +1259,11 @@
     tr.appendChild(cell(peer.platform || '—'));
     tr.appendChild(cell(peer.version || '—'));
     tr.appendChild(cell(peer.metadata_signature ? pill('已签名', 'ok') : pill('未签名')));
-    tr.appendChild(cell(peer.online ? pill('在线', 'ok') : pill('离线')));
+    if (peer.disabled) {
+      tr.appendChild(cell(pill('已禁用', 'bad')));
+    } else {
+      tr.appendChild(cell(peer.online ? pill('在线', 'ok') : pill('离线')));
+    }
 
     const where = el('div', 'stack');
     if (peer.relay) where.appendChild(el('div', 'mono', '中继 ' + peer.relay));
@@ -826,6 +1281,20 @@
     const edit = button('编辑', 'small');
     edit.addEventListener('click', () => openDeviceDialog(peer));
     actions.appendChild(edit);
+
+    const toggle = button(peer.disabled ? '启用设备' : '禁用设备',
+      'small' + (peer.disabled ? '' : ' danger'));
+    toggle.addEventListener('click', () => withButton(toggle, async () => {
+      if (!peer.disabled && !window.confirm('禁用设备 ' + peer.id +
+        '？\n将立即释放当前租约并拒绝再次注册，直到重新启用。')) return;
+      await api('/v1/identities/' + encodeURIComponent(peer.id), {
+        method: 'PATCH',
+        body: { disabled: !peer.disabled },
+      });
+      toast((peer.disabled ? '已启用 ' : '已禁用 ') + peer.id);
+      await loadDevices();
+    }));
+    actions.appendChild(toggle);
 
     const reset = button('重置身份', 'small danger');
     reset.addEventListener('click', () => withButton(reset, async () => {
@@ -855,6 +1324,7 @@
     state.editing = peer;
     $('device-dialog-id').textContent = peer.id + (peer.fingerprint ? ' · ' + peer.fingerprint : '');
     $('device-alias').value = peer.alias || '';
+    $('device-owner').value = peer.owner || '';
     $('device-tags').value = Array.isArray(peer.tags) ? peer.tags.join(', ') : '';
     $('device-dialog').showModal();
     $('device-alias').focus();
@@ -864,12 +1334,13 @@
     const peer = state.editing;
     if (!peer) return;
     const alias = $('device-alias').value.trim();
+    const owner = $('device-owner').value.trim();
     const tags = $('device-tags').value.split(',')
       .map((tag) => tag.trim())
       .filter((tag) => tag.length > 0);
     await api('/v1/identities/' + encodeURIComponent(peer.id), {
       method: 'PATCH',
-      body: { alias, tags },
+      body: { alias, tags, owner },
     });
     $('device-dialog').close();
     state.editing = null;
@@ -1287,6 +1758,16 @@
     });
   }
 
+  const POLICY_ASSIGNMENT_BATCH_LIMIT = 200;
+
+  // splitDeviceIDs accepts the separators an operator is likely to paste from
+  // a spreadsheet and drops duplicates so one pasted row cannot create two
+  // assignments for the same device.
+  function splitDeviceIDs(text) {
+    const ids = String(text || '').split(/[\s,，、]+/).map((id) => id.trim()).filter(Boolean);
+    return Array.from(new Set(ids));
+  }
+
   async function openPolicyAssignmentDialog() {
     if (!state.policyObjects.length) {
       toast('请先创建策略对象', true);
@@ -1337,9 +1818,10 @@
       hint.textContent = '组内设备会匹配该分配；分组在“分组”页签维护。';
     } else {
       input.removeAttribute('list');
-      input.placeholder = 'devbox';
-      label.textContent = '设备 ID';
-      hint.textContent = '只覆盖这一台设备；手动设置的设备策略仍然优先。';
+      input.placeholder = 'devbox, lab-pc-2';
+      label.textContent = '设备 ID（可填多个）';
+      hint.textContent = '多台设备用逗号、空格或换行分隔，每台生成一条分配；已有设备分配的会跳过并提示，一次最多 ' +
+        POLICY_ASSIGNMENT_BATCH_LIMIT + ' 台。手动设置的设备策略仍然优先。';
     }
   }
 
@@ -1350,9 +1832,15 @@
       return;
     }
     const kind = $('policy-assignment-scope').value;
-    const value = kind === 'all' ? '' : $('policy-assignment-value').value.trim();
-    if (kind !== 'all' && !value) {
+    const values = kind === 'device'
+      ? splitDeviceIDs($('policy-assignment-value').value)
+      : [kind === 'all' ? '' : $('policy-assignment-value').value.trim()];
+    if (kind !== 'all' && !values[0]) {
       toast('请填写范围值', true);
+      return;
+    }
+    if (kind === 'device' && values.length > POLICY_ASSIGNMENT_BATCH_LIMIT) {
+      toast('一次最多为 ' + POLICY_ASSIGNMENT_BATCH_LIMIT + ' 台设备创建分配', true);
       return;
     }
     const priority = Number($('policy-assignment-priority').value || 0);
@@ -1362,9 +1850,33 @@
     }
     const submit = $('policy-assignment-form').querySelector('button[type="submit"]');
     await withButton(submit, async () => {
+      if (kind === 'device') {
+        // One transactional call for the whole pasted list; devices that
+        // already hold an assignment come back in skipped instead of failing
+        // the batch. The server keeps the same 200-device cap as the form.
+        const result = await api('/v1/policy-assignments/bulk', {
+          method: 'POST',
+          body: { policy_id: policyID, devices: values, priority },
+        });
+        const created = (result && result.created) || [];
+        const skipped = (result && result.skipped) || [];
+        if (created.length > 0) $('policy-assignment-dialog').close();
+        if (!skipped.length) {
+          toast(created.length > 1
+            ? '已为 ' + created.length + ' 台设备创建策略分配'
+            : '已创建设备策略分配');
+        } else {
+          const shown = skipped.slice(0, 3).join('、') + (skipped.length > 3 ? ' 等' : '');
+          toast(created.length > 0
+            ? '创建 ' + created.length + ' 条、跳过 ' + skipped.length + ' 条：' + shown
+            : '这些设备已有分配：' + shown, true);
+        }
+        if (created.length > 0) await loadPolicies();
+        return;
+      }
       await api('/v1/policy-assignments', {
         method: 'POST',
-        body: { policy_id: policyID, scope_kind: kind, scope_value: value, priority },
+        body: { policy_id: policyID, scope_kind: kind, scope_value: values[0], priority },
       });
       $('policy-assignment-dialog').close();
       toast('已创建策略分配');
@@ -1383,15 +1895,48 @@
   // ---------- accounts ----------
 
   async function loadAccounts() {
-    const data = await api('/v1/accounts');
-    renderAccounts(Array.isArray(data && data.users) ? data.users : []);
+    const params = new URLSearchParams();
+    const query = ($('account-query').value || '').trim();
+    if (query) params.set('q', query);
+    if ($('account-role-filter').value) params.set('role', $('account-role-filter').value);
+    params.set('limit', String(state.accountLimit));
+    params.set('offset', String(state.accountOffset));
+    const data = await api('/v1/accounts?' + params.toString());
+    renderAccounts(Array.isArray(data && data.users) ? data.users : [],
+      data && data.total === undefined ? null : data.total);
   }
 
-  function renderAccounts(users) {
+  function renderAccounts(users, total) {
     const body = $('account-rows');
     clear(body);
     users.forEach((user) => body.appendChild(accountRow(user)));
     $('account-empty').classList.toggle('hidden', users.length > 0);
+    if (total === null) total = users.length;
+    // A deleted account or a narrower filter can leave the offset past the
+    // last page; fall back once instead of showing an empty page.
+    if (!users.length && total > 0 && state.accountOffset > 0) {
+      state.accountOffset = Math.max(0, Math.floor((total - 1) / state.accountLimit) * state.accountLimit);
+      loadAccounts().catch(reportError);
+      return;
+    }
+    if (total === 0) {
+      $('account-page').textContent = '没有账号';
+    } else {
+      $('account-page').textContent = '第 ' + (state.accountOffset + 1) + '–' +
+        (state.accountOffset + users.length) + ' 个，共 ' + total + ' 个';
+    }
+    $('account-prev').disabled = state.accountOffset <= 0;
+    $('account-next').disabled = state.accountOffset + state.accountLimit >= total;
+  }
+
+  async function exportAccounts() {
+    const params = new URLSearchParams();
+    const query = ($('account-query').value || '').trim();
+    if (query) params.set('q', query);
+    if ($('account-role-filter').value) params.set('role', $('account-role-filter').value);
+    params.set('format', 'csv');
+    await downloadCSV('/v1/accounts?' + params.toString(),
+      'chast-accounts-' + csvStamp() + '.csv', '已导出账号 CSV');
   }
 
   function accountRow(user) {
@@ -1423,8 +1968,23 @@
 
     tr.appendChild(cell(fmtTime(user.created_at_ms)));
     tr.appendChild(cell(user.banned ? pill('已封禁', 'bad') : pill('正常', 'ok')));
+    tr.appendChild(cell(ceilingCell(user.permission_ceiling || 0)));
+    const contact = [user.email, user.phone].filter(Boolean).join(' / ') || '—';
+    tr.appendChild(cell(contact));
 
     const actions = el('div', 'actions-wrap');
+
+    const recovery = button('找回方式', 'small');
+    recovery.addEventListener('click', () => openAccountRecoveryDialog(user));
+    actions.appendChild(recovery);
+
+    const permissions = button('会话权限', 'small');
+    permissions.addEventListener('click', () => openAccountCapDialog(user));
+    actions.appendChild(permissions);
+
+    const sessions = button('登录会话', 'small');
+    sessions.addEventListener('click', () => openAccountSessionsDialog(user));
+    actions.appendChild(sessions);
 
     const ban = button(user.banned ? '解封' : '封禁', 'small' + (user.banned ? '' : ' danger'));
     ban.addEventListener('click', () => withButton(ban, async () => {
@@ -1495,6 +2055,183 @@
       }
       await loadAccounts();
     });
+  }
+
+  // openAccountCapDialog edits the account-wide session ceiling. It intersects
+  // with each device policy, so the effective mask can only get narrower.
+  function openAccountCapDialog(user) {
+    state.accountCapUser = user;
+    $('account-cap-title').textContent = '会话权限 · ' + user.username;
+    $('account-cap-note').textContent =
+      '该账号在所有设备上的新会话都受此上限约束；设备策略更严格时取交集。' +
+      '已签发的接入票据最长 60 秒后失效。';
+    $('account-cap-ceiling').value = String(user.permission_ceiling || 0);
+    applyPolicyCeiling($('account-cap-ceiling'), $('account-cap-hint'));
+    $('account-cap-dialog').showModal();
+    $('account-cap-ceiling').focus();
+  }
+
+  async function saveAccountCap() {
+    const user = state.accountCapUser;
+    if (!user) return;
+    const ceiling = Number($('account-cap-ceiling').value || 0);
+    if (!Number.isInteger(ceiling) || ceiling < 0 || ceiling > 0xffffffff) {
+      toast('权限上限必须是 0..4294967295 的整数', true);
+      return;
+    }
+    const submit = $('account-cap-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/accounts/' + encodeURIComponent(user.username) + '/permissions', {
+        method: 'POST',
+        body: { permission_ceiling: ceiling },
+      });
+      $('account-cap-dialog').close();
+      toast('已更新 ' + user.username + ' 的会话权限');
+      await loadAccounts();
+    });
+  }
+
+  // openAccountSessionsDialog shows every live login of one account so an
+  // operator can cut a stale device without banning the account. Revoking a
+  // session deletes its access and refresh token; the device signs in again
+  // on its next unlock unless the account is banned.
+  function openAccountSessionsDialog(user) {
+    state.accountSessionsUser = user;
+    $('account-sessions-title').textContent = '登录会话 · ' + user.username;
+    $('account-sessions-note').textContent =
+      '这里列出该账号当前仍然有效的登录（管理台与其他设备）。撤销后该设备的令牌立即失效；' +
+      '封禁账号会让全部会话一次性失效。';
+    clear($('account-session-rows'));
+    $('account-session-empty').classList.add('hidden');
+    $('account-sessions-revoke-all').disabled = true;
+    $('account-sessions-dialog').showModal();
+    loadAccountSessions().catch(reportError);
+  }
+
+  async function loadAccountSessions() {
+    const user = state.accountSessionsUser;
+    if (!user) return [];
+    const data = await api('/v1/accounts/' + encodeURIComponent(user.username) + '/sessions');
+    const sessions = data && Array.isArray(data.sessions) ? data.sessions : [];
+    const body = $('account-session-rows');
+    clear(body);
+    sessions.forEach((session) => body.appendChild(adminSessionRow(user, session)));
+    $('account-session-empty').classList.toggle('hidden', sessions.length > 0);
+    $('account-sessions-revoke-all').disabled = sessions.length === 0;
+    return sessions;
+  }
+
+  function adminSessionRow(user, session) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(session.device_name || session.device_id || '未知设备'));
+    tr.appendChild(cell(session.login_ip || '—'));
+    tr.appendChild(cell(session.location || '—'));
+    tr.appendChild(cell(fmtTime(session.created_at_ms)));
+    tr.appendChild(cell(fmtTime(session.expires_at_ms)));
+    tr.appendChild(cell(session.current ? pill('当前会话', 'ok') : pill('有效', '')));
+
+    const actions = el('div', 'actions-wrap');
+    const revoke = button('撤销', 'small danger');
+    revoke.disabled = Boolean(session.current);
+    revoke.addEventListener('click', () => withButton(revoke, async () => {
+      await api('/v1/accounts/' + encodeURIComponent(user.username) + '/sessions/' +
+        encodeURIComponent(session.id), { method: 'DELETE' });
+      toast('已撤销该设备的登录会话');
+      await loadAccountSessions();
+    }));
+    actions.appendChild(revoke);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  // revokeAllAccountSessions signs the account out everywhere. When the
+  // operator is viewing their own account the server keeps the calling
+  // session, so the console does not lock itself out.
+  async function revokeAllAccountSessions(event) {
+    const user = state.accountSessionsUser;
+    if (!user) return;
+    await withButton(event.currentTarget, async () => {
+      const reply = await api('/v1/accounts/' + encodeURIComponent(user.username) +
+        '/sessions/revoke-all', { method: 'POST' });
+      const revoked = (reply && reply.revoked) || 0;
+      toast(revoked > 0 ? '已退出 ' + revoked + ' 个登录会话' : '没有需要退出的会话');
+      await loadAccountSessions();
+    });
+  }
+
+  // openAccountRecoveryDialog repairs an account's recovery address or texts
+  // a reset code without the user's password. The server audits every change
+  // under the operator's name.
+  function openAccountRecoveryDialog(user) {
+    state.accountRecoveryUser = user;
+    $('account-recovery-title').textContent = '找回方式 · ' + user.username;
+    $('account-recovery-note').textContent =
+      '清空输入即移除该找回方式。发送重置短信使用已保存的手机号，' +
+      '要求账号登记了手机且服务器配置了短信网关；先保存再发送。';
+    $('account-recovery-email').value = user.email || '';
+    $('account-recovery-phone').value = user.phone || '';
+    $('account-recovery-email-send').disabled = !user.email;
+    $('account-recovery-sms').disabled = !user.phone;
+    $('account-recovery-dialog').showModal();
+  }
+
+  async function saveAccountRecovery() {
+    const user = state.accountRecoveryUser;
+    if (!user) return;
+    const email = $('account-recovery-email').value.trim();
+    const phone = $('account-recovery-phone').value.trim();
+    const submit = $('account-recovery-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      const changed = [];
+      if (email !== (user.email || '')) {
+        await api('/v1/accounts/' + encodeURIComponent(user.username) + '/email', {
+          method: 'POST',
+          body: { email },
+        });
+        changed.push('邮箱');
+      }
+      if (phone !== (user.phone || '')) {
+        await api('/v1/accounts/' + encodeURIComponent(user.username) + '/phone', {
+          method: 'POST',
+          body: { phone },
+        });
+        changed.push('手机');
+      }
+      $('account-recovery-dialog').close();
+      toast(changed.length
+        ? '已更新 ' + user.username + ' 的找回' + changed.join('与')
+        : '没有改变');
+      await loadAccounts();
+    });
+  }
+
+  async function sendAccountResetEmail() {
+    const user = state.accountRecoveryUser;
+    if (!user) return;
+    try {
+      await api('/v1/accounts/' + encodeURIComponent(user.username) + '/recover', { method: 'POST' });
+    } catch (err) {
+      if (err.status === 503) throw new ApiError('服务器未配置邮件发送，无法发送重置邮件。', 503);
+      if (err.status === 400) throw new ApiError('该账号还没有找回邮箱，请先保存邮箱。', 400);
+      if (err.status === 429) throw new ApiError('重置邮件请求过于频繁，请稍后再试。', 429);
+      if (err.status === 502) throw new ApiError('重置邮件发送失败，请稍后再试。', 502);
+      throw err;
+    }
+    toast('重置邮件已发送到 ' + user.username + ' 的找回邮箱');
+  }
+
+  async function sendAccountResetSMS() {
+    const user = state.accountRecoveryUser;
+    if (!user) return;
+    try {
+      await api('/v1/accounts/' + encodeURIComponent(user.username) + '/sms', { method: 'POST' });
+    } catch (err) {
+      if (err.status === 503) throw new ApiError('服务器未配置短信网关，无法发送重置短信。', 503);
+      if (err.status === 400) throw new ApiError('该账号还没有找回手机，请先保存手机号。', 400);
+      if (err.status === 502) throw new ApiError('短信发送失败，请稍后再试。', 502);
+      throw err;
+    }
+    toast('重置短信已发送到 ' + user.username + ' 的找回手机');
   }
 
   // ---------- API tokens ----------
@@ -2080,6 +2817,7 @@
       filterKey: 'action',
       filterPlaceholder: '动作（可选，如 login）',
       hasHost: false,
+      hasUser: true,
       columns: ['时间', '用户', '动作', '详情', '客户端 IP', '地点', '结果'],
       row(event) {
         return [
@@ -2180,8 +2918,10 @@
     const spec = AUDIT[tab];
     $('audit-filter').placeholder = spec.filterPlaceholder;
     $('audit-host').classList.toggle('hidden', !spec.hasHost);
+    $('audit-user').classList.toggle('hidden', !spec.hasUser);
     $('audit-filter').value = '';
     $('audit-host').value = '';
+    $('audit-user').value = '';
     loadAudit(true).catch(reportError);
   }
 
@@ -2191,10 +2931,22 @@
     if (group) params.set('group', group);
     const filter = $('audit-filter').value.trim();
     if (filter) params.set(spec.filterKey, filter);
+    if (spec.hasUser) {
+      const user = $('audit-user').value.trim();
+      if (user) params.set('user', user);
+    }
     if (spec.hasHost) {
       const host = $('audit-host').value.trim();
       if (host) params.set('host', host);
     }
+    // datetime-local is wall-clock time in the operator's zone; the report API
+    // takes unix milliseconds, so convert here and let the server stay zone-free.
+    [['since', 'audit-since'], ['until', 'audit-until']].forEach(([key, id]) => {
+      const raw = $(id).value;
+      if (!raw) return;
+      const ms = Date.parse(raw);
+      if (Number.isFinite(ms)) params.set(key, String(ms));
+    });
     return params;
   }
 
@@ -2248,42 +3000,62 @@
       (state.auditBefore ? '，还有更多' : state.auditRows.length ? '，已到末尾' : '');
   }
 
-  async function exportAudit() {
-    const spec = AUDIT[state.auditTab];
-    const params = auditParams(spec);
-    params.set('format', 'csv');
-    const target = spec.path + '?' + params.toString();
+  async function downloadCSV(target, filename, message) {
     let resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
     if (resp.status === 401 && await refreshSession()) {
       resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
     }
     if (!resp.ok) {
-      let message = resp.status + ' ' + resp.statusText;
+      let detail = resp.status + ' ' + resp.statusText;
       try {
         const data = await resp.json();
-        if (data && data.error) message = data.error;
+        if (data && data.error) detail = data.error;
       } catch {
         /* not JSON */
       }
       if (resp.status === 401) lock('服务器密钥无效或已更改，请重新连接。');
-      throw new ApiError(message, resp.status);
+      throw new ApiError(detail, resp.status);
     }
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
     anchor.href = url;
-    anchor.download = 'chast-' + state.auditTab + '-' + stamp + '.csv';
+    anchor.download = filename;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast('已导出 CSV');
+    toast(message);
+  }
+
+  function csvStamp() {
+    return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  }
+
+  async function exportAudit() {
+    const spec = AUDIT[state.auditTab];
+    const params = auditParams(spec);
+    params.set('format', 'csv');
+    await downloadCSV(spec.path + '?' + params.toString(),
+      'chast-' + state.auditTab + '-' + csvStamp() + '.csv', '已导出 CSV');
+  }
+
+  // The device list pages 200 rows at a time; the export deliberately ignores
+  // paging and carries every filtered identity (online and offline).
+  async function exportDevices() {
+    const params = new URLSearchParams();
+    const query = $('device-query').value.trim();
+    if (query) params.set('q', query);
+    if ($('device-online').checked) params.set('online', '1');
+    params.set('format', 'csv');
+    await downloadCSV('/v1/identities?' + params.toString(),
+      'chast-devices-' + csvStamp() + '.csv', '已导出设备 CSV');
   }
 
   // ---------- events ----------
 
   let deviceInputTimer = 0;
+  let accountInputTimer = 0;
 
   function syncLoginMode() {
     const account = $('login-mode').value === 'account';
@@ -2306,9 +3078,13 @@
             $('login-note').textContent = '请输入用户名与密码。';
             return;
           }
-          await unlockAccount(username, password, $('login-totp').value.trim());
+          await unlockAccount(
+            username, password,
+            $('login-totp').value, $('login-code-kind').value,
+          );
           $('login-password').value = '';
           $('login-totp').value = '';
+          $('login-code-kind').value = 'auto';
         } else {
           await unlockKey($('server-key').value.trim());
         }
@@ -2317,7 +3093,7 @@
         // A rejected server key has already been explained by lock().
         if (err.status === 401 && mode === 'key') return;
         const message = err.message || String(err);
-        if (err.status === 401 || err.status === 403) {
+        if (err.status === 401 || err.status === 403 || err.status === 429 || err.status === 503) {
           $('login-note').textContent = message;
           toast(message, true);
           return;
@@ -2326,6 +3102,48 @@
         toast(message, true);
       }
     });
+
+    $('login-webauthn').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      try {
+        await unlockWithSecurityKey();
+        toast('已连接');
+      } catch (err) {
+        const message = err.message || String(err);
+        if (err.status === 401 || err.status === 403 || err.status === 429 || err.status === 503) {
+          $('login-note').textContent = message;
+          toast(message, true);
+          return;
+        }
+        lock('无法完成安全密钥登录：' + message);
+        toast(message, true);
+      }
+    }));
+
+    $('login-oidc').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      try {
+        await unlockWithSingleSignOn();
+        toast('已连接');
+      } catch (err) {
+        const message = err.message || String(err);
+        if (err.status === 401 || err.status === 403 || err.status === 429 || err.status === 503) {
+          $('login-note').textContent = message;
+          toast(message, true);
+          return;
+        }
+        lock('无法完成单点登录：' + message);
+        toast(message, true);
+      }
+    }));
+
+    $('login-send-code').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      try {
+        await sendLoginCode();
+      } catch (err) {
+        const message = err.message || String(err);
+        $('login-note').textContent = message;
+        toast(message, true);
+      }
+    }));
 
     $('logout').addEventListener('click', () => {
       lock('已断开连接。');
@@ -2338,13 +3156,48 @@
 
     $('device-query').addEventListener('input', () => {
       clearTimeout(deviceInputTimer);
+      state.deviceOffset = 0;
       deviceInputTimer = setTimeout(() => loadDevices().catch(reportError), 250);
     });
-    $('device-online').addEventListener('change', () => loadDevices().catch(reportError));
+    $('device-online').addEventListener('change', () => {
+      state.deviceOffset = 0;
+      loadDevices().catch(reportError);
+    });
     $('device-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
       await loadDevices();
       toast('已刷新');
     }));
+    $('device-prev').addEventListener('click', () => {
+      state.deviceOffset = Math.max(0, state.deviceOffset - state.deviceLimit);
+      loadDevices().catch(reportError);
+    });
+    $('device-next').addEventListener('click', () => {
+      state.deviceOffset += state.deviceLimit;
+      loadDevices().catch(reportError);
+    });
+    $('device-export').addEventListener('click', (event) => withButton(event.currentTarget, exportDevices));
+    $('device-select-all').addEventListener('change', (event) => {
+      if (event.currentTarget.checked) {
+        state.deviceList.forEach((peer) => state.deviceSelection.add(peer.id));
+      } else {
+        state.deviceSelection.clear();
+      }
+      $('device-rows').querySelectorAll('input[type=checkbox]').forEach((box, index) => {
+        if (state.deviceList[index]) box.checked = state.deviceSelection.has(state.deviceList[index].id);
+      });
+      updateDeviceSelection();
+    });
+    $('device-bulk-disable').addEventListener('click', (event) =>
+      withButton(event.currentTarget, () => bulkSetDisabled(event.currentTarget, true)));
+    $('device-bulk-enable').addEventListener('click', (event) =>
+      withButton(event.currentTarget, () => bulkSetDisabled(event.currentTarget, false)));
+    $('device-bulk-clear').addEventListener('click', () => {
+      state.deviceSelection.clear();
+      $('device-rows').querySelectorAll('input[type=checkbox]').forEach((box) => {
+        box.checked = false;
+      });
+      updateDeviceSelection();
+    });
 
     $('device-form').addEventListener('submit', (event) => {
       event.preventDefault();
@@ -2373,6 +3226,38 @@
     $('policy-delete').addEventListener('click', (event) => withButton(event.currentTarget, deletePolicy));
     $('policy-dialog').addEventListener('close', () => {
       state.policyEditing = null;
+    });
+
+    $('account-cap-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveAccountCap();
+    });
+    $('account-cap-ceiling').addEventListener('input', () =>
+      applyPolicyCeiling($('account-cap-ceiling'), $('account-cap-hint')));
+    $('account-cap-cancel').addEventListener('click', () => $('account-cap-dialog').close());
+    $('account-cap-dialog').addEventListener('close', () => {
+      state.accountCapUser = null;
+    });
+
+    $('account-sessions-revoke-all').addEventListener('click', revokeAllAccountSessions);
+    $('account-sessions-close').addEventListener('click', () =>
+      $('account-sessions-dialog').close());
+    $('account-sessions-dialog').addEventListener('close', () => {
+      state.accountSessionsUser = null;
+    });
+
+    $('account-recovery-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveAccountRecovery();
+    });
+    $('account-recovery-cancel').addEventListener('click', () =>
+      $('account-recovery-dialog').close());
+    $('account-recovery-email-send').addEventListener('click', (event) =>
+      withButton(event.currentTarget, sendAccountResetEmail));
+    $('account-recovery-sms').addEventListener('click', (event) =>
+      withButton(event.currentTarget, sendAccountResetSMS));
+    $('account-recovery-dialog').addEventListener('close', () => {
+      state.accountRecoveryUser = null;
     });
 
     $('policy-object-create').addEventListener('click', () => openPolicyObjectDialog(null));
@@ -2407,6 +3292,25 @@
       await loadAccounts();
       toast('已刷新');
     }));
+    $('account-query').addEventListener('input', () => {
+      clearTimeout(accountInputTimer);
+      state.accountOffset = 0;
+      accountInputTimer = setTimeout(() => loadAccounts().catch(reportError), 250);
+    });
+    $('account-role-filter').addEventListener('change', () => {
+      state.accountOffset = 0;
+      loadAccounts().catch(reportError);
+    });
+    $('account-prev').addEventListener('click', () => {
+      state.accountOffset = Math.max(0, state.accountOffset - state.accountLimit);
+      loadAccounts().catch(reportError);
+    });
+    $('account-next').addEventListener('click', () => {
+      state.accountOffset += state.accountLimit;
+      loadAccounts().catch(reportError);
+    });
+    $('account-export').addEventListener('click', (event) =>
+      withButton(event.currentTarget, exportAccounts));
 
     $('token-create').addEventListener('submit', (event) => {
       event.preventDefault();
@@ -2423,6 +3327,61 @@
         return;
       }
       copyText(state.tokenSecret);
+    });
+
+    $('mine-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadMine();
+      toast('已刷新');
+    }));
+    $('mine-sessions-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadMine();
+      toast('已刷新');
+    }));
+    $('mine-password-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      changeMinePassword(event).catch(reportError);
+    });
+    $('mine-email-form').addEventListener('submit', (event) => {
+      saveMineContact('email', false, event).catch(reportError);
+    });
+    $('mine-email-clear').addEventListener('click', (event) => {
+      withButton(event.currentTarget, () => saveMineContact('email', true, null).catch(reportError));
+    });
+    $('mine-phone-form').addEventListener('submit', (event) => {
+      saveMineContact('phone', false, event).catch(reportError);
+    });
+    $('mine-phone-clear').addEventListener('click', (event) => {
+      withButton(event.currentTarget, () => saveMineContact('phone', true, null).catch(reportError));
+    });
+    $('mine-2fa-start').addEventListener('submit', (event) => {
+      event.preventDefault();
+      startMineTwoFactor(event).catch(reportError);
+    });
+    $('mine-2fa-enable').addEventListener('submit', (event) => {
+      event.preventDefault();
+      enableMineTwoFactor(event).catch(reportError);
+    });
+    $('mine-2fa-cancel').addEventListener('click', cancelMineTwoFactor);
+    $('mine-2fa-disable').addEventListener('submit', (event) => {
+      event.preventDefault();
+      disableMineTwoFactor(event).catch(reportError);
+    });
+    $('mine-recovery').addEventListener('submit', (event) => {
+      event.preventDefault();
+      generateMineRecoveryCodes(event).catch(reportError);
+    });
+    $('mine-recovery-copy').addEventListener('click', () => {
+      copyText($('mine-recovery-list').textContent);
+    });
+    $('mine-recovery-download').addEventListener('click', () => {
+      downloadMineRecoveryCodes();
+    });
+    $('mine-key-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      registerMineSecurityKey(event).catch(reportError);
+    });
+    $('mine-sessions-revoke-others').addEventListener('click', (event) => {
+      withButton(event.currentTarget, revokeOtherMineSessions);
     });
     $('token-secret-dialog').addEventListener('close', () => {
       state.tokenSecret = '';
@@ -2484,15 +3443,20 @@
       $('audit-filter').placeholder = AUDIT.events.filterPlaceholder;
       $('audit-host').classList.add('hidden');
       $('audit-host').value = '';
+      $('audit-user').classList.remove('hidden');
+      $('audit-user').value = '';
       $('audit-filter').value = 'emergency_access';
       loadAudit(true).catch(reportError);
     });
     $('audit-csv').addEventListener('click', (event) => withButton(event.currentTarget, exportAudit));
     $('audit-group').addEventListener('change', () => loadAudit(true).catch(reportError));
-    [$('audit-filter'), $('audit-host')].forEach((input) => {
+    [$('audit-filter'), $('audit-host'), $('audit-user')].forEach((input) => {
       input.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') loadAudit(true).catch(reportError);
       });
+    });
+    [$('audit-since'), $('audit-until')].forEach((input) => {
+      input.addEventListener('change', () => loadAudit(true).catch(reportError));
     });
 
     $('server-copy').addEventListener('click', () => {
@@ -2533,12 +3497,502 @@
     }
   }
 
+  // ---------- my account ----------
+
+  function resetMine() {
+    state.accountInfo = null;
+    state.accountSessions = [];
+    state.account2faPending = null;
+    state.accountKeys = null;
+    $('mine-2fa-secret').textContent = '';
+    $('mine-2fa-uri').textContent = '';
+    $('mine-recovery-list').textContent = '';
+    $('mine-recovery-codes').classList.add('hidden');
+    $('mine-2fa-recovery-note').textContent = '';
+    $('mine-2fa-state').textContent = '';
+    $('mine-keys-state').textContent = '';
+    $('mine-email').value = '';
+    $('mine-phone').value = '';
+    $('mine-email-password').value = '';
+    $('mine-phone-password').value = '';
+    clear($('mine-summary'));
+    clear($('mine-session-rows'));
+    clear($('mine-key-rows'));
+  }
+
+  async function loadMine(silent) {
+    if (!state.auth || state.auth.mode !== 'account') {
+      renderMine();
+      return;
+    }
+    try {
+      const [info, sessions, keys] = await Promise.all([
+        api('/v1/account'),
+        api('/v1/account/sessions'),
+        api('/v1/account/webauthn/credentials')
+          .then((data) => ({ enabled: true, credentials: (data && data.credentials) || [] }))
+          .catch((err) => {
+            if (err && err.status === 503) return { enabled: false, credentials: [] };
+            throw err;
+          }),
+      ]);
+      state.accountInfo = info || null;
+      state.accountSessions = sessions && Array.isArray(sessions.sessions) ? sessions.sessions : [];
+      state.accountKeys = keys;
+      renderMine();
+    } catch (err) {
+      if (!silent) throw err;
+    }
+  }
+
+  function renderMine() {
+    const info = state.accountInfo;
+    const twoFactor = Boolean(info && info.two_factor);
+    const pending = state.account2faPending;
+    $('mine-2fa-off').classList.toggle('hidden', twoFactor || Boolean(pending));
+    $('mine-2fa-pending').classList.toggle('hidden', twoFactor || !pending);
+    $('mine-2fa-on').classList.toggle('hidden', !twoFactor);
+    $('mine-2fa-state').textContent = twoFactor ? '已启用' : (pending ? '待确认' : '未启用');
+
+    const user = info && info.user ? info.user : {};
+    const keys = state.accountKeys;
+    const summary = $('mine-summary');
+    clear(summary);
+    const rows = [
+      ['用户名', user.username || (state.auth && state.auth.username) || '—'],
+      ['角色', rolePill(user.role || (state.auth && state.auth.role) || '')],
+      ['邮箱', user.email || '—'],
+      ['手机', user.phone || '—'],
+      ['两步验证', twoFactor ? '已启用' : '未启用'],
+      ['恢复码', twoFactor ? (Number(info.recovery_codes) || 0) + ' 枚未使用' : '—'],
+      ['安全密钥', keys && keys.enabled ? (keys.credentials.length ? keys.credentials.length + ' 枚' : '未登记') : '—'],
+    ];
+    rows.forEach(([label, value]) => {
+      summary.appendChild(el('dt', '', label));
+      const dd = el('dd');
+      if (value instanceof Node) dd.appendChild(value);
+      else dd.textContent = String(value);
+      summary.appendChild(dd);
+    });
+
+    if (twoFactor) {
+      $('mine-2fa-recovery-note').textContent = (Number(info.recovery_codes) || 0)
+        ? '恢复码剩余 ' + info.recovery_codes + ' 枚。'
+        : '还没有恢复码；建议生成一组，验证器丢失时用它登录。';
+    }
+    $('mine-email').value = user.email || '';
+    $('mine-phone').value = user.phone || '';
+    if (pending) {
+      $('mine-2fa-secret').textContent = pending.secret;
+      $('mine-2fa-uri').textContent = pending.otpauth_uri;
+    }
+    renderMineKeys();
+    renderMineSessions();
+  }
+
+  function keyAlgorithmLabel(alg) {
+    switch (Number(alg)) {
+      case -7: return 'ES256';
+      case -257: return 'RS256';
+      case -8: return 'EdDSA';
+      default: return 'alg ' + (alg || 0);
+    }
+  }
+
+  function renderMineKeys() {
+    const keys = state.accountKeys;
+    const enabled = Boolean(keys && keys.enabled);
+    $('mine-keys-on').classList.toggle('hidden', !enabled);
+    $('mine-keys-off').classList.toggle('hidden', enabled);
+    $('mine-keys-state').textContent = enabled
+      ? (keys.credentials.length ? keys.credentials.length + ' 枚' : '未登记')
+      : '服务器未配置';
+    const body = $('mine-key-rows');
+    clear(body);
+    if (!enabled) return;
+    keys.credentials.forEach((cred) => body.appendChild(mineKeyRow(cred)));
+    $('mine-key-empty').classList.toggle('hidden', keys.credentials.length !== 0);
+  }
+
+  function mineKeyRow(cred) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(cred.name || '未命名安全密钥'));
+    tr.appendChild(cell(keyAlgorithmLabel(cred.alg)));
+    tr.appendChild(cell(fmtTime(cred.created_at_ms)));
+    tr.appendChild(cell(cred.last_used_at_ms ? fmtTime(cred.last_used_at_ms) : '—'));
+    const actions = el('div', 'actions-wrap');
+    const remove = button('删除', 'small danger');
+    remove.addEventListener('click', () => withButton(remove, async () => {
+      const password = $('mine-key-password').value;
+      if (!password) {
+        toast('请先在下方输入当前密码，再删除安全密钥', true);
+        return;
+      }
+      if (!window.confirm('删除安全密钥“' + (cred.name || '未命名安全密钥') + '”？删除后它将不能再用于登录。')) return;
+      try {
+        await api('/v1/account/webauthn/credentials/remove', {
+          method: 'POST',
+          body: { password, credential_id: cred.id },
+        });
+      } catch (err) {
+        if (err.status === 403) throw new ApiError('当前密码不正确。', 403);
+        if (err.status === 404) throw new ApiError('该安全密钥已不存在。', 404);
+        throw err;
+      }
+      $('mine-key-password').value = '';
+      toast('安全密钥已删除');
+      await loadMine();
+    }));
+    actions.appendChild(remove);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  async function registerMineSecurityKey(event) {
+    event.preventDefault();
+    const keys = state.accountKeys;
+    if (!keys || !keys.enabled) {
+      toast('服务器未配置 WebAuthn，无法登记安全密钥', true);
+      return;
+    }
+    const password = $('mine-key-password').value;
+    if (!password) {
+      toast('请输入当前密码', true);
+      return;
+    }
+    let begin;
+    try {
+      begin = await api('/v1/account/webauthn/register/begin', {
+        method: 'POST',
+        body: { password },
+      });
+    } catch (err) {
+      if (err.status === 403) throw new ApiError('当前密码不正确。', 403);
+      if (err.status === 503) throw new ApiError('服务器未配置 WebAuthn。', 503);
+      throw err;
+    }
+    if (!begin || !begin.challenge || !begin.rp_id || !begin.user_id) {
+      throw new Error('服务器返回的安全密钥参数不完整');
+    }
+    let credential = null;
+    try {
+      credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: base64urlBytes(begin.challenge),
+          rp: { id: begin.rp_id, name: 'chast' },
+          user: {
+            id: base64urlBytes(begin.user_id),
+            name: begin.username,
+            displayName: begin.display_name || begin.username,
+          },
+          pubKeyCredParams: [
+            { type: 'public-key', alg: -7 },
+            { type: 'public-key', alg: -257 },
+            { type: 'public-key', alg: -8 },
+          ],
+          timeout: Number(begin.timeout_ms) || 60000,
+          attestation: 'none',
+          authenticatorSelection: { userVerification: 'preferred', residentKey: 'preferred' },
+          excludeCredentials: (begin.exclude_credentials || []).map((cred) => ({
+            type: 'public-key',
+            id: base64urlBytes(cred.id),
+          })),
+        },
+      });
+    } catch (err) {
+      if (err && err.name === 'NotAllowedError') {
+        toast('已取消或超时，未登记安全密钥', true);
+        return;
+      }
+      if (err && err.name === 'InvalidStateError') {
+        toast('这枚安全密钥已经登记过了', true);
+        return;
+      }
+      throw new Error('安全密钥失败：' + ((err && err.message) || String(err)));
+    }
+    if (!credential || !credential.response) {
+      toast('浏览器没有返回安全密钥凭据', true);
+      return;
+    }
+    const name = $('mine-key-name').value.trim().slice(0, 64);
+    try {
+      await api('/v1/account/webauthn/register/finish', {
+        method: 'POST',
+        body: {
+          name,
+          client_data_json: bytesBase64url(credential.response.clientDataJSON),
+          attestation_object: bytesBase64url(credential.response.attestationObject),
+        },
+      });
+    } catch (err) {
+      if (err.status === 403) throw new ApiError('安全密钥验证未被接受，请重试。', 403);
+      if (err.status === 409) throw new ApiError('这枚安全密钥已经登记过了。', 409);
+      throw err;
+    }
+    $('mine-key-password').value = '';
+    $('mine-key-name').value = '';
+    toast('安全密钥已登记');
+    await loadMine();
+  }
+
+  function renderMineSessions() {
+    const body = $('mine-session-rows');
+    clear(body);
+    state.accountSessions.forEach((session) => body.appendChild(mineSessionRow(session)));
+    $('mine-session-empty').classList.toggle('hidden', state.accountSessions.length !== 0);
+    $('mine-sessions-revoke-others').disabled =
+      !state.accountSessions.some((session) => !session.current);
+  }
+
+  function mineSessionRow(session) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(session.device_name || session.device_id || '未知设备'));
+    tr.appendChild(cell(session.login_ip || '—'));
+    tr.appendChild(cell(session.location || '—'));
+    tr.appendChild(cell(fmtTime(session.created_at_ms)));
+    tr.appendChild(cell(fmtTime(session.expires_at_ms)));
+    tr.appendChild(cell(session.current ? pill('当前会话', 'ok') : pill('其他设备', '')));
+
+    const actions = el('div', 'actions-wrap');
+    const rename = button('重命名', 'small');
+    rename.addEventListener('click', () => withButton(rename, async () => {
+      const name = window.prompt('设备名称（用于在会话列表里区分设备）', session.device_name || '');
+      if (name === null) return;
+      const trimmed = name.trim();
+      if (!trimmed) {
+        toast('设备名称不能为空', true);
+        return;
+      }
+      await api('/v1/account/sessions/' + encodeURIComponent(session.id), {
+        method: 'PATCH',
+        body: { device_name: trimmed.slice(0, 64) },
+      });
+      toast('已重命名会话');
+      await loadMine();
+    }));
+    actions.appendChild(rename);
+    if (!session.current) {
+      const revoke = button('撤销', 'small danger');
+      revoke.addEventListener('click', () => withButton(revoke, async () => {
+        if (!window.confirm('撤销这台设备的登录会话？')) return;
+        await api('/v1/account/sessions/' + encodeURIComponent(session.id), { method: 'DELETE' });
+        toast('已撤销会话');
+        await loadMine();
+      }));
+      actions.appendChild(revoke);
+    }
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  async function saveMineContact(kind, clear, event) {
+    if (event) event.preventDefault();
+    const isEmail = kind === 'email';
+    const value = $(isEmail ? 'mine-email' : 'mine-phone').value.trim();
+    const password = $(isEmail ? 'mine-email-password' : 'mine-phone-password').value;
+    if (!password) {
+      toast('请输入当前密码', true);
+      return;
+    }
+    if (!clear && !value) {
+      toast(isEmail ? '请输入找回邮箱' : '请输入找回手机', true);
+      return;
+    }
+    if (clear && !window.confirm(isEmail ? '清除找回邮箱？' : '清除找回手机？')) return;
+    try {
+      await api(isEmail ? '/v1/account/email' : '/v1/account/phone', {
+        method: 'POST',
+        body: isEmail
+          ? { email: clear ? '' : value, password }
+          : { phone: clear ? '' : value, password },
+      });
+    } catch (err) {
+      if (err.status === 403) throw new ApiError('当前密码不正确。', 403);
+      if (err.status === 409) {
+        throw new ApiError(isEmail ? '该邮箱已被其他账号使用。' : '该手机号已被其他账号使用。', 409);
+      }
+      if (err.status === 400) {
+        throw new ApiError((isEmail ? '邮箱' : '手机号') + '格式不正确：' + err.message, 400);
+      }
+      throw err;
+    }
+    $(isEmail ? 'mine-email-password' : 'mine-phone-password').value = '';
+    if (clear) toast(isEmail ? '已清除找回邮箱' : '已清除找回手机');
+    else toast(isEmail ? '已保存找回邮箱' : '已保存找回手机');
+    await loadMine();
+  }
+
+  async function changeMinePassword(event) {
+    event.preventDefault();
+    const current = $('mine-password-current').value;
+    const next = $('mine-password-new').value;
+    if (!current || !next) {
+      toast('请填写当前密码与新密码', true);
+      return;
+    }
+    if (next !== $('mine-password-confirm').value) {
+      toast('两次输入的新密码不一致', true);
+      return;
+    }
+    try {
+      await api('/v1/account/password', {
+        method: 'POST',
+        body: { current_password: current, new_password: next },
+      });
+    } catch (err) {
+      if (err.status === 403) throw new ApiError('当前密码不正确。', 403);
+      if (err.status === 400) throw new ApiError('新密码不符合要求：' + err.message, 400);
+      throw err;
+    }
+    $('mine-password-current').value = '';
+    $('mine-password-new').value = '';
+    $('mine-password-confirm').value = '';
+    toast('密码已修改，其他会话已撤销');
+    await loadMine();
+  }
+
+  async function startMineTwoFactor(event) {
+    event.preventDefault();
+    const password = $('mine-2fa-password').value;
+    if (!password) {
+      toast('请输入当前密码', true);
+      return;
+    }
+    let data;
+    try {
+      data = await api('/v1/account/2fa/start', { method: 'POST', body: { password } });
+    } catch (err) {
+      if (err.status === 403) throw new ApiError('当前密码不正确。', 403);
+      if (err.status === 409) throw new ApiError('两步验证已启用。', 409);
+      throw err;
+    }
+    $('mine-2fa-password').value = '';
+    state.account2faPending = {
+      secret: (data && data.secret) || '',
+      otpauth_uri: (data && data.otpauth_uri) || '',
+    };
+    renderMine();
+  }
+
+  function cancelMineTwoFactor() {
+    state.account2faPending = null;
+    $('mine-2fa-enable-password').value = '';
+    $('mine-2fa-enable-code').value = '';
+    renderMine();
+  }
+
+  async function enableMineTwoFactor(event) {
+    event.preventDefault();
+    const password = $('mine-2fa-enable-password').value;
+    const code = $('mine-2fa-enable-code').value.trim();
+    if (!password || !code) {
+      toast('请输入当前密码与验证码', true);
+      return;
+    }
+    try {
+      await api('/v1/account/2fa/enable', { method: 'POST', body: { password, code } });
+    } catch (err) {
+      if (err.status === 400) throw new ApiError('绑定已失效，请重新开始。', 400);
+      if (err.status === 403) throw new ApiError('当前密码或验证码不正确。', 403);
+      throw err;
+    }
+    state.account2faPending = null;
+    $('mine-2fa-enable-password').value = '';
+    $('mine-2fa-enable-code').value = '';
+    $('mine-2fa-password').value = '';
+    toast('两步验证已启用');
+    await loadMine();
+  }
+
+  async function disableMineTwoFactor(event) {
+    event.preventDefault();
+    const password = $('mine-2fa-disable-password').value;
+    const code = $('mine-2fa-disable-code').value.trim();
+    if (!password || !code) {
+      toast('请输入当前密码与验证码', true);
+      return;
+    }
+    try {
+      await api('/v1/account/2fa/disable', { method: 'POST', body: { password, code } });
+    } catch (err) {
+      if (err.status === 400) throw new ApiError('两步验证未启用。', 400);
+      if (err.status === 403) throw new ApiError('密码或验证码不正确。', 403);
+      throw err;
+    }
+    $('mine-2fa-disable-password').value = '';
+    $('mine-2fa-disable-code').value = '';
+    $('mine-recovery-list').textContent = '';
+    $('mine-recovery-codes').classList.add('hidden');
+    toast('两步验证已停用');
+    await loadMine();
+  }
+
+  async function generateMineRecoveryCodes(event) {
+    event.preventDefault();
+    const password = $('mine-recovery-password').value;
+    const code = $('mine-recovery-code').value.trim();
+    if (!password || !code) {
+      toast('请输入当前密码与验证码', true);
+      return;
+    }
+    let data;
+    try {
+      data = await api('/v1/account/2fa/recovery', { method: 'POST', body: { password, code } });
+    } catch (err) {
+      if (err.status === 400) throw new ApiError('两步验证未启用。', 400);
+      if (err.status === 403) throw new ApiError('密码或验证码不正确。', 403);
+      throw err;
+    }
+    $('mine-recovery-password').value = '';
+    $('mine-recovery-code').value = '';
+    const codes = data && Array.isArray(data.codes) ? data.codes : [];
+    $('mine-recovery-list').textContent = codes.join('\n');
+    $('mine-recovery-codes').classList.toggle('hidden', codes.length === 0);
+    toast('已生成 ' + codes.length + ' 枚恢复码');
+    await loadMine();
+  }
+
+  // downloadMineRecoveryCodes saves the one-time list as a text file so it can
+  // be printed or stored offline before the panel is hidden again.
+  function downloadMineRecoveryCodes() {
+    const text = $('mine-recovery-list').textContent;
+    if (!text.trim()) {
+      toast('没有可下载的恢复码', true);
+      return;
+    }
+    const username = state.auth.username || 'account';
+    const header = 'chast recovery codes for ' + username +
+      '\nEach code works once. Keep this file offline.\n\n';
+    const blob = new Blob([header + text + '\n'], { type: 'text/plain' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'chast-recovery-codes-' + username + '.txt';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(link.href);
+    toast('恢复码已下载');
+  }
+
+  async function revokeOtherMineSessions() {
+    const others = state.accountSessions.filter((session) => !session.current).length;
+    if (!others) {
+      toast('没有其他会话', true);
+      return;
+    }
+    if (!window.confirm('撤销其他 ' + others + ' 个登录会话？')) return;
+    const data = await api('/v1/account/sessions/revoke-others', { method: 'POST' });
+    toast('已撤销 ' + ((data && data.revoked) || 0) + ' 个会话');
+    await loadMine();
+  }
+
   // ---------- boot ----------
 
   function boot() {
     bindEvents();
     syncLoginMode();
-    $('login-note').textContent = '使用服务器密钥，或以账号登录：readonly / operator / admin 可使用完整管理台，仅有分组授权的账号只能查看所属分组。';
+    probeSingleSignOn();
+    $('login-note').textContent = '使用服务器密钥，或以账号登录：readonly / operator / admin 可使用完整管理台，仅有分组授权的账号只能查看所属分组；已注册安全密钥的账号可点“使用安全密钥登录”，服务器配置了单点登录时还可点“使用单点登录”。';
     const saved = readSession();
     if (!saved) return;
     state.auth = saved;

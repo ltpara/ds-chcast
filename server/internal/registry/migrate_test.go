@@ -50,7 +50,7 @@ func TestRegistrySchemaMigrationRecordsLatest(t *testing.T) {
 	}
 }
 
-func TestRegistrySchemaMigrationAddsWakeTargets(t *testing.T) {
+func TestRegistrySchemaMigrationAddsPeerColumns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -106,7 +106,7 @@ func TestRegistrySchemaMigrationAddsWakeTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	found := false
+	columns := make(map[string]bool)
 	for rows.Next() {
 		var (
 			cid, notNull, pk int
@@ -116,15 +116,15 @@ func TestRegistrySchemaMigrationAddsWakeTargets(t *testing.T) {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
 			t.Fatal(err)
 		}
-		if name == "wake_targets" {
-			found = true
-		}
+		columns[name] = true
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if !found {
-		t.Fatal("wake_targets column was not added to the v1 schema")
+	for _, want := range []string{"wake_targets", "disabled", "owner"} {
+		if !columns[want] {
+			t.Fatalf("%s column was not added to the v1 schema", want)
+		}
 	}
 }
 

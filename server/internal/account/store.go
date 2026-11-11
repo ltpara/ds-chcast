@@ -47,6 +47,7 @@ const (
 	maxName           = 128
 	maxTag            = 32
 	maxTags           = 16
+	maxNote           = 512
 	maxDeviceID       = 64
 	maxDeviceName     = 128
 	sessionIDBytes    = 12
@@ -82,6 +83,8 @@ var (
 	ErrUnknownShare       = errors.New("address book is not shared")
 	ErrInvalidPermission  = errors.New("permission must be read, write or control")
 	ErrPermissionDenied   = errors.New("address book permission is insufficient")
+	ErrInvalidShareTarget = errors.New("share target must be a group or everyone")
+	ErrShareTargetMember  = errors.New("only a group member may share an address book with that group")
 
 	ErrTwoFactorRequired    = errors.New("two-factor code required")
 	ErrInvalidTwoFactorCode = errors.New("two-factor code was not accepted")
@@ -103,6 +106,9 @@ var (
 
 	ErrOIDCAccountNotFound = errors.New("no account is linked to this identity provider subject")
 	ErrInvalidOIDCIdentity = errors.New("identity provider issuer and subject are required")
+
+	ErrLDAPAccountNotFound = errors.New("no account is available for this directory login")
+	ErrLDAPNameTaken       = errors.New("directory login name belongs to a local account")
 )
 
 // Shared address-book permissions, weakest first. Read may list the book,
@@ -186,6 +192,9 @@ type Peer struct {
 	Tags      []string  `json:"tags,omitempty"`
 	GroupID   string    `json:"group_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Note is the owner's free-text reminder for this entry. It is stored and
+	// synced as plain text like the name, so it must not hold credentials.
+	Note string `json:"note,omitempty"`
 	// Position orders peers inside their group; clients use it for manual
 	// ordering. Equal positions fall back to peer id order.
 	Position int64 `json:"position,omitempty"`
@@ -194,7 +203,9 @@ type Peer struct {
 	// only later changes, including deletion tombstones.
 	Revision int64 `json:"revision,omitempty"`
 	// Deleted marks a tombstone. Peers never returns them; Snapshot does so
-	// an offline viewer can learn about deletions it missed.
+	// an offline viewer can learn about deletions it missed. A tombstone keeps
+	// the last name, tags, note and group for the trash; Trash lists them and
+	// RestorePeer revives the row.
 	Deleted bool `json:"deleted,omitempty"`
 }
 
@@ -234,7 +245,20 @@ type Grant struct {
 	Permission string    `json:"permission"`
 	GroupID    string    `json:"group_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+	// TargetKind is empty for a grant addressed to one user. "group" and
+	// "everyone" grants live in address_book_target_grants; Username stays
+	// empty for them and TargetName carries the display label.
+	TargetKind string `json:"target_kind,omitempty"`
+	TargetID   string `json:"target_id,omitempty"`
+	TargetName string `json:"target_name,omitempty"`
 }
+
+// Address-book share targets. Direct user grants keep using
+// address_book_grants; only these two kinds are stored in the target table.
+const (
+	ShareTargetGroup    = "group"
+	ShareTargetEveryone = "everyone"
+)
 
 // SharedScope is one grant the signed-in grantee holds on another account's
 // book. A whole-book grant appears with an empty GroupID.
@@ -852,6 +876,70 @@ func (s *Store) ListUsers() ([]User, error) {
 		out = append(out, user)
 	}
 	return out, rows.Err()
+}
+
+// ListUsersPage filters the account list by a username substring and an exact
+// role. An empty role matches every account and limit <= 0 returns every
+// match, so existing callers keep the old whole-table listing. The second
+// result is the total row count under the same filter.
+func (s *Store) ListUsersPage(query, role string, limit, offset int) ([]User, int, error) {
+	query = strings.ToLower(strings.TrimSpace(query))
+	role = strings.TrimSpace(role)
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if query != "" {
+		clauses = append(clauses, `LOWER(username) LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+likeEscape(query)+"%")
+	}
+	if role != "" {
+		if !ValidRole(role) {
+			return nil, 0, ErrInvalidRole
+		}
+		clauses = append(clauses, "role = ?")
+		args = append(args, role)
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = " WHERE " + strings.Join(clauses, " AND ")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("account store %s: count users: %w", s.path, err)
+	}
+	statement := `SELECT id, username, role, created_at, banned, email, phone FROM users` + where +
+		` ORDER BY username`
+	pageArgs := append([]any{}, args...)
+	if limit > 0 {
+		statement += ` LIMIT ? OFFSET ?`
+		pageArgs = append(pageArgs, limit, offset)
+	}
+	rows, err := s.db.Query(statement, pageArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("account store %s: list users: %w", s.path, err)
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		var (
+			user    User
+			created int64
+			banned  bool
+		)
+		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &created, &banned, &user.Email, &user.Phone); err != nil {
+			return nil, 0, err
+		}
+		user.CreatedAt = timeFromMillis(created)
+		user.Banned = banned
+		out = append(out, user)
+	}
+	return out, total, rows.Err()
+}
+
+// likeEscape makes a user-supplied substring literal inside a LIKE pattern.
+func likeEscape(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
 }
 
 func (s *Store) FindUser(username string) (User, error) {
@@ -1926,6 +2014,35 @@ func (s *Store) RevokeOtherSessions(userID, currentToken string) (int, error) {
 	return int(affected), nil
 }
 
+// RevokeAllSessions deletes every live login of the user and reports how many
+// were removed. Administration uses it on another account; an account ending
+// its own logins still goes through RevokeOtherSessions so the caller keeps
+// the session it is using.
+func (s *Store) RevokeAllSessions(userID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: begin revoke all sessions: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM refresh_tokens WHERE user_id = ?`, userID); err != nil {
+		return 0, fmt.Errorf("account store %s: revoke all refresh tokens: %w", s.path, err)
+	}
+	res, err := tx.Exec(`DELETE FROM user_tokens WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: revoke all sessions: %w", s.path, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: revoke all sessions: %w", s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("account store %s: commit revoke all sessions: %w", s.path, err)
+	}
+	return int(affected), nil
+}
+
 // RenameSession updates the display name of one live login. false means the
 // id does not belong to this user or the session already expired. An empty or
 // control-only name is rejected instead of silently clearing the device label.
@@ -2002,7 +2119,7 @@ func (s *Store) Peers(userID string) ([]Peer, error) {
 
 func (s *Store) peersLocked(userID string) ([]Peer, error) {
 	rows, err := s.db.Query(
-		`SELECT peer_id, name, tags, group_id, position, updated_at, revision FROM address_book
+		`SELECT peer_id, name, tags, note, group_id, position, updated_at, revision FROM address_book
 		 WHERE user_id = ? AND deleted = 0 ORDER BY position, peer_id`,
 		userID,
 	)
@@ -2017,7 +2134,7 @@ func (s *Store) peersLocked(userID string) ([]Peer, error) {
 			tags      string
 			updatedAt int64
 		)
-		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision); err != nil {
+		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.Note, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision); err != nil {
 			return nil, err
 		}
 		peer.Tags = decodeTags(tags)
@@ -2079,7 +2196,7 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	rows, err := s.db.Query(
-		`SELECT peer_id, name, tags, group_id, position, updated_at, revision, deleted FROM address_book
+		`SELECT peer_id, name, tags, note, group_id, position, updated_at, revision, deleted FROM address_book
 		 WHERE user_id = ? AND revision > ? ORDER BY revision, peer_id`,
 		userID, since,
 	)
@@ -2095,7 +2212,7 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 			updatedAt int64
 			deleted   bool
 		)
-		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision, &deleted); err != nil {
+		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.Note, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision, &deleted); err != nil {
 			return Snapshot{}, err
 		}
 		peer.Tags = decodeTags(tags)
@@ -2168,6 +2285,16 @@ func nextRevision(tx *sql.Tx, userID string) (int64, error) {
 	return revision, nil
 }
 
+// PeerEdit is one partial address-book write. A nil field keeps the stored
+// value; an empty name, tag list, note or group id clears that field.
+type PeerEdit struct {
+	Name     *string
+	Tags     *[]string
+	GroupID  *string
+	Position *int64
+	Note     *string
+}
+
 // UpdatePeer applies a partial address-book edit. Nil fields keep the previous
 // value; an empty name or tag list clears that field. Editing a tombstoned
 // peer revives it with a new revision.
@@ -2186,42 +2313,53 @@ func (s *Store) UpdatePeerWithGroup(userID, peerID string, name *string, tags *[
 // inside the write transaction; otherwise ErrPeerConflict is returned and
 // nothing changes. Zero keeps the previous last-writer-wins behavior.
 func (s *Store) UpdatePeerWithGroupAt(userID, peerID string, name *string, tags *[]string, groupID *string, ifRevision int64) (Peer, error) {
-	return s.UpdatePeerAt(userID, peerID, name, tags, groupID, nil, ifRevision)
+	return s.UpdatePeerEditAt(userID, peerID, PeerEdit{Name: name, Tags: tags, GroupID: groupID}, ifRevision)
 }
 
 // UpdatePeerAt is UpdatePeerWithGroupAt with an optional manual position.
 // A nil position keeps the stored one; a negative value is rejected.
 func (s *Store) UpdatePeerAt(userID, peerID string, name *string, tags *[]string, groupID *string, position *int64, ifRevision int64) (Peer, error) {
+	return s.UpdatePeerEditAt(userID, peerID,
+		PeerEdit{Name: name, Tags: tags, GroupID: groupID, Position: position}, ifRevision)
+}
+
+// UpdatePeerEditAt applies a partial edit, including the free-text note, in one
+// revision. The note is trimmed and capped like a name; it never affects any
+// connection or permission decision.
+func (s *Store) UpdatePeerEditAt(userID, peerID string, edit PeerEdit, ifRevision int64) (Peer, error) {
 	if !registry.ValidID(peerID) {
 		return Peer{}, ErrInvalidPeerID
 	}
-	if groupID != nil && *groupID != "" && !registry.ValidID(*groupID) {
+	if edit.GroupID != nil && *edit.GroupID != "" && !registry.ValidID(*edit.GroupID) {
 		return Peer{}, ErrInvalidGroupID
 	}
-	if position != nil && *position < 0 {
+	if edit.Position != nil && *edit.Position < 0 {
 		return Peer{}, ErrInvalidPosition
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updatePeerLocked(userID, peerID, name, tags, groupID, position, ifRevision)
+	return s.updatePeerLocked(userID, peerID, edit, ifRevision)
 }
 
-func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]string, groupID *string, position *int64, ifRevision int64) (Peer, error) {
-	var cleanName string
+func (s *Store) updatePeerLocked(userID, peerID string, edit PeerEdit, ifRevision int64) (Peer, error) {
+	var cleanName, cleanNote string
 	var cleanTags []string
-	if name != nil {
-		cleanName = normalizeText(*name, maxName)
+	if edit.Name != nil {
+		cleanName = normalizeText(*edit.Name, maxName)
 	}
-	if tags != nil {
-		cleanTags = normalizeTags(*tags)
+	if edit.Note != nil {
+		cleanNote = normalizeText(*edit.Note, maxNote)
+	}
+	if edit.Tags != nil {
+		cleanTags = normalizeTags(*edit.Tags)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Peer{}, fmt.Errorf("account store %s: begin address book update: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	if groupID != nil && *groupID != "" {
-		live, err := liveGroupLocked(tx, userID, *groupID)
+	if edit.GroupID != nil && *edit.GroupID != "" {
+		live, err := liveGroupLocked(tx, userID, *edit.GroupID)
 		if err != nil {
 			return Peer{}, err
 		}
@@ -2230,6 +2368,7 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 		}
 	}
 	updatedName := ""
+	updatedNote := ""
 	var existingTags string
 	updatedGroup := ""
 	var (
@@ -2238,9 +2377,9 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 		deleted         bool
 	)
 	err = tx.QueryRow(
-		`SELECT name, tags, group_id, position, revision, deleted FROM address_book WHERE user_id = ? AND peer_id = ?`,
+		`SELECT name, tags, note, group_id, position, revision, deleted FROM address_book WHERE user_id = ? AND peer_id = ?`,
 		userID, peerID,
-	).Scan(&updatedName, &existingTags, &updatedGroup, &updatedPosition, &currentRevision, &deleted)
+	).Scan(&updatedName, &existingTags, &updatedNote, &updatedGroup, &updatedPosition, &currentRevision, &deleted)
 	found := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Peer{}, fmt.Errorf("account store %s: read address book entry: %w", s.path, err)
@@ -2249,17 +2388,20 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 		return Peer{}, ErrPeerConflict
 	}
 	updatedTags := decodeTags(existingTags)
-	if name != nil {
+	if edit.Name != nil {
 		updatedName = cleanName
 	}
-	if tags != nil {
+	if edit.Note != nil {
+		updatedNote = cleanNote
+	}
+	if edit.Tags != nil {
 		updatedTags = cleanTags
 	}
-	if groupID != nil {
-		updatedGroup = *groupID
+	if edit.GroupID != nil {
+		updatedGroup = *edit.GroupID
 	}
-	if position != nil {
-		updatedPosition = *position
+	if edit.Position != nil {
+		updatedPosition = *edit.Position
 	}
 	revision, err := nextRevision(tx, userID)
 	if err != nil {
@@ -2267,13 +2409,13 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 	}
 	now := s.now().UTC()
 	if _, err := tx.Exec(
-		`INSERT INTO address_book (user_id, peer_id, name, tags, group_id, position, updated_at, revision, deleted)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false)
+		`INSERT INTO address_book (user_id, peer_id, name, tags, note, group_id, position, updated_at, revision, deleted)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, false)
 		 ON CONFLICT(user_id, peer_id) DO UPDATE SET
-			name = excluded.name, tags = excluded.tags, group_id = excluded.group_id,
-			position = excluded.position, updated_at = excluded.updated_at,
-			revision = excluded.revision, deleted = false`,
-		userID, peerID, updatedName, encodeTags(updatedTags), updatedGroup, updatedPosition,
+			name = excluded.name, tags = excluded.tags, note = excluded.note,
+			group_id = excluded.group_id, position = excluded.position,
+			updated_at = excluded.updated_at, revision = excluded.revision, deleted = false`,
+		userID, peerID, updatedName, encodeTags(updatedTags), updatedNote, updatedGroup, updatedPosition,
 		unixMillis(now), revision,
 	); err != nil {
 		return Peer{}, fmt.Errorf("account store %s: update address book entry: %w", s.path, err)
@@ -2285,6 +2427,7 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 		ID:        peerID,
 		Name:      updatedName,
 		Tags:      updatedTags,
+		Note:      updatedNote,
 		GroupID:   updatedGroup,
 		UpdatedAt: now,
 		Position:  updatedPosition,
@@ -2329,10 +2472,10 @@ func (s *Store) SetPeerGroupAt(userID, peerID, groupID string, ifRevision int64)
 		updatedAt int64
 	)
 	err = tx.QueryRow(
-		`SELECT peer_id, name, tags, group_id, position, updated_at, revision FROM address_book
+		`SELECT peer_id, name, tags, note, group_id, position, updated_at, revision FROM address_book
 		 WHERE user_id = ? AND peer_id = ? AND deleted = 0`,
 		userID, peerID,
-	).Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision)
+	).Scan(&peer.ID, &peer.Name, &tags, &peer.Note, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Peer{}, ErrUnknownPeer
 	}
@@ -2721,6 +2864,12 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 	); err != nil {
 		return false, fmt.Errorf("account store %s: revoke group grants: %w", s.path, err)
 	}
+	if _, err := tx.Exec(
+		`DELETE FROM address_book_target_grants WHERE owner_user_id = ? AND group_id = ?`,
+		userID, groupID,
+	); err != nil {
+		return false, fmt.Errorf("account store %s: revoke group target grants: %w", s.path, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("account store %s: commit address book group delete: %w", s.path, err)
 	}
@@ -2742,8 +2891,10 @@ func liveGroupLocked(tx *sql.Tx, userID, groupID string) (bool, error) {
 	return !deleted, nil
 }
 
-// DeletePeer writes a tombstone instead of dropping the row. false means
-// there was no live entry, preserving the previous 404 behaviour.
+// DeletePeer writes a tombstone instead of dropping the row. The name, tags,
+// note and group are retained so the entry can be restored from the trash;
+// PurgePeer removes it for good. false means there was no live entry,
+// preserving the previous 404 behaviour.
 func (s *Store) DeletePeer(userID, peerID string) (bool, error) {
 	if !registry.ValidID(peerID) {
 		return false, ErrInvalidPeerID
@@ -2790,7 +2941,7 @@ func (s *Store) deletePeerLocked(userID, peerID string, ifRevision int64) (bool,
 		return false, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
 	}
 	if _, err := tx.Exec(
-		`UPDATE address_book SET name = '', tags = '', updated_at = ?, revision = ?, deleted = 1
+		`UPDATE address_book SET updated_at = ?, revision = ?, deleted = 1
 		 WHERE user_id = ? AND peer_id = ?`,
 		unixMillis(s.now().UTC()), revision, userID, peerID,
 	); err != nil {
@@ -2800,6 +2951,152 @@ func (s *Store) deletePeerLocked(userID, peerID string, ifRevision int64) (bool,
 		return false, fmt.Errorf("account store %s: commit address book delete: %w", s.path, err)
 	}
 	return true, nil
+}
+
+// Trash lists the user's tombstoned entries newest first. Deleting keeps the
+// entry's name, tags, note and group, so the trash shows what can be restored.
+// The list is separate from Snapshot: viewers only need tombstones to drop
+// deleted peers, not their contents.
+func (s *Store) Trash(userID string) ([]Peer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT peer_id, name, tags, note, group_id, position, updated_at, revision
+		 FROM address_book WHERE user_id = ? AND deleted = 1
+		 ORDER BY updated_at DESC, peer_id`,
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: list address book trash: %w", s.path, err)
+	}
+	defer rows.Close()
+	peers := make([]Peer, 0)
+	for rows.Next() {
+		var (
+			peer      Peer
+			tags      string
+			updatedAt int64
+		)
+		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.Note, &peer.GroupID,
+			&peer.Position, &updatedAt, &peer.Revision); err != nil {
+			return nil, fmt.Errorf("account store %s: read address book trash: %w", s.path, err)
+		}
+		peer.Tags = decodeTags(tags)
+		peer.UpdatedAt = timeFromMillis(updatedAt)
+		peer.Deleted = true
+		peers = append(peers, peer)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("account store %s: read address book trash: %w", s.path, err)
+	}
+	return peers, nil
+}
+
+// RestorePeer revives one tombstoned entry with the fields it had when it was
+// deleted. A group deleted in the meantime is dropped so the restored entry
+// does not point at a dead group. Restoring an entry that is already live (or
+// was purged) returns ErrUnknownPeer.
+func (s *Store) RestorePeer(userID, peerID string) (Peer, error) {
+	if !registry.ValidID(peerID) {
+		return Peer{}, ErrInvalidPeerID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Peer{}, fmt.Errorf("account store %s: begin address book restore: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	var groupID string
+	err = tx.QueryRow(
+		`SELECT group_id FROM address_book WHERE user_id = ? AND peer_id = ? AND deleted = 1`,
+		userID, peerID,
+	).Scan(&groupID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Peer{}, ErrUnknownPeer
+	}
+	if err != nil {
+		return Peer{}, fmt.Errorf("account store %s: read address book trash entry: %w", s.path, err)
+	}
+	if groupID != "" {
+		live, err := liveGroupLocked(tx, userID, groupID)
+		if err != nil {
+			return Peer{}, err
+		}
+		if !live {
+			groupID = ""
+		}
+	}
+	revision, err := nextRevision(tx, userID)
+	if err != nil {
+		return Peer{}, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
+	}
+	now := s.now().UTC()
+	if _, err := tx.Exec(
+		`UPDATE address_book SET deleted = 0, group_id = ?, updated_at = ?, revision = ?
+		 WHERE user_id = ? AND peer_id = ?`,
+		groupID, unixMillis(now), revision, userID, peerID,
+	); err != nil {
+		return Peer{}, fmt.Errorf("account store %s: restore address book entry: %w", s.path, err)
+	}
+	var (
+		peer Peer
+		tags string
+	)
+	if err := tx.QueryRow(
+		`SELECT peer_id, name, tags, note, group_id, position FROM address_book
+		 WHERE user_id = ? AND peer_id = ?`,
+		userID, peerID,
+	).Scan(&peer.ID, &peer.Name, &tags, &peer.Note, &peer.GroupID, &peer.Position); err != nil {
+		return Peer{}, fmt.Errorf("account store %s: read restored address book entry: %w", s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Peer{}, fmt.Errorf("account store %s: commit address book restore: %w", s.path, err)
+	}
+	peer.Tags = decodeTags(tags)
+	peer.UpdatedAt = now
+	peer.Revision = revision
+	return peer, nil
+}
+
+// PurgePeer permanently removes one tombstoned entry. A live or missing entry
+// is left alone (false), so the trash API cannot destroy a live peer.
+func (s *Store) PurgePeer(userID, peerID string) (bool, error) {
+	if !registry.ValidID(peerID) {
+		return false, ErrInvalidPeerID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		`DELETE FROM address_book WHERE user_id = ? AND peer_id = ? AND deleted = 1`,
+		userID, peerID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("account store %s: purge address book entry: %w", s.path, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("account store %s: purge address book entry: %w", s.path, err)
+	}
+	return affected > 0, nil
+}
+
+// EmptyTrash permanently removes every tombstoned entry and reports how many
+// rows were dropped. Live entries are never touched.
+func (s *Store) EmptyTrash(userID string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		`DELETE FROM address_book WHERE user_id = ? AND deleted = 1`, userID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: empty address book trash: %w", s.path, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: empty address book trash: %w", s.path, err)
+	}
+	return affected, nil
 }
 
 // ShareBook lets granteeUsername access the owner's live address book at the
@@ -2875,6 +3172,150 @@ func (s *Store) shareBookLocked(ownerID, granteeUsername, permission, groupID st
 		GroupID:    groupID,
 		CreatedAt:  timeFromMillis(created),
 	}, nil
+}
+
+// ShareBookTarget grants the owner's book to an operator-managed account
+// group or to every account. A group target requires the owner to belong to
+// that group, so a normal account cannot broadcast its book into a scope it
+// cannot see. Everyone grants are still stored per owner and revocable here.
+func (s *Store) ShareBookTarget(ownerID, targetKind, targetID, permission, groupID string) (Grant, error) {
+	targetKind, targetID, err := normalizeShareTarget(targetKind, targetID)
+	if err != nil {
+		return Grant{}, err
+	}
+	permission, err = normalizePermission(permission)
+	if err != nil {
+		return Grant{}, err
+	}
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return Grant{}, ErrInvalidGroupID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var targetName string
+	if targetKind == ShareTargetGroup {
+		err := s.db.QueryRow(
+			`SELECT name FROM account_groups WHERE id = ?`, targetID,
+		).Scan(&targetName)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Grant{}, ErrUnknownAccountGroup
+		}
+		if err != nil {
+			return Grant{}, fmt.Errorf("account store %s: look up share target group: %w", s.path, err)
+		}
+		var role string
+		err = s.db.QueryRow(
+			`SELECT role FROM account_group_members WHERE group_id = ? AND user_id = ?`,
+			targetID, ownerID,
+		).Scan(&role)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Grant{}, ErrShareTargetMember
+		}
+		if err != nil {
+			return Grant{}, fmt.Errorf("account store %s: read share target membership: %w", s.path, err)
+		}
+	}
+	if groupID != "" {
+		live, err := s.groupLiveLocked(ownerID, groupID)
+		if err != nil {
+			return Grant{}, err
+		}
+		if !live {
+			return Grant{}, ErrUnknownGroup
+		}
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO address_book_target_grants
+			(owner_user_id, target_kind, target_id, group_id, permission, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(owner_user_id, target_kind, target_id, group_id)
+		 DO UPDATE SET permission = excluded.permission`,
+		ownerID, targetKind, targetID, groupID, permission, unixMillis(s.now().UTC()),
+	); err != nil {
+		return Grant{}, fmt.Errorf("account store %s: share address book with target: %w", s.path, err)
+	}
+	var created int64
+	if err := s.db.QueryRow(
+		`SELECT created_at FROM address_book_target_grants
+		 WHERE owner_user_id = ? AND target_kind = ? AND target_id = ? AND group_id = ?`,
+		ownerID, targetKind, targetID, groupID,
+	).Scan(&created); err != nil {
+		return Grant{}, fmt.Errorf("account store %s: read target grant: %w", s.path, err)
+	}
+	return Grant{
+		TargetKind: targetKind,
+		TargetID:   targetID,
+		TargetName: targetName,
+		Permission: permission,
+		GroupID:    groupID,
+		CreatedAt:  timeFromMillis(created),
+	}, nil
+}
+
+// UnshareBookTarget revokes every scope granted to one target.
+func (s *Store) UnshareBookTarget(ownerID, targetKind, targetID string) error {
+	targetKind, targetID, err := normalizeShareTarget(targetKind, targetID)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteTargetGrantLocked(ownerID, targetKind, targetID, nil)
+}
+
+// UnshareBookTargetScope revokes one target grant: the whole-book scope when
+// groupID is empty, otherwise that address-book group.
+func (s *Store) UnshareBookTargetScope(ownerID, targetKind, targetID, groupID string) error {
+	targetKind, targetID, err := normalizeShareTarget(targetKind, targetID)
+	if err != nil {
+		return err
+	}
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return ErrInvalidGroupID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteTargetGrantLocked(ownerID, targetKind, targetID, &groupID)
+}
+
+func (s *Store) deleteTargetGrantLocked(ownerID, targetKind, targetID string, groupID *string) error {
+	query := `DELETE FROM address_book_target_grants
+		WHERE owner_user_id = ? AND target_kind = ? AND target_id = ?`
+	args := []any{ownerID, targetKind, targetID}
+	if groupID != nil {
+		query += ` AND group_id = ?`
+		args = append(args, *groupID)
+	}
+	res, err := s.db.Exec(query, args...)
+	if err != nil {
+		return fmt.Errorf("account store %s: unshare address book target: %w", s.path, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrUnknownShare
+	}
+	return nil
+}
+
+func normalizeShareTarget(targetKind, targetID string) (string, string, error) {
+	targetKind = strings.ToLower(strings.TrimSpace(targetKind))
+	targetID = strings.TrimSpace(targetID)
+	switch targetKind {
+	case ShareTargetGroup:
+		if !registry.ValidID(targetID) {
+			return "", "", ErrInvalidAccountGroupID
+		}
+		return targetKind, targetID, nil
+	case ShareTargetEveryone:
+		return targetKind, "", nil
+	default:
+		return "", "", ErrInvalidShareTarget
+	}
 }
 
 func (s *Store) groupLiveLocked(userID, groupID string) (bool, error) {
@@ -2956,7 +3397,8 @@ func (s *Store) unshareBookLocked(ownerID, granteeUsername string) error {
 }
 
 // Grants lists both directions: users with access to this book, and owners
-// whose books this user can access.
+// whose books this user can access. Target grants (account group, everyone)
+// carry TargetKind so the owner can tell them apart and revoke them.
 func (s *Store) Grants(userID string) (outgoing, incoming []Grant, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2968,6 +3410,17 @@ func (s *Store) Grants(userID string) (outgoing, incoming []Grant, err error) {
 	); err != nil {
 		return nil, nil, err
 	}
+	ownerTargets, err := s.targetGrantsLocked(
+		`SELECT '', t.target_kind, t.target_id, COALESCE(g.name, ''), t.permission, t.group_id, t.created_at
+		 FROM address_book_target_grants t
+		 LEFT JOIN account_groups g ON g.id = t.target_id
+		 WHERE t.owner_user_id = ? ORDER BY t.target_kind, g.name, t.group_id`,
+		userID,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	outgoing = append(outgoing, ownerTargets...)
 	if incoming, err = s.grantsLocked(
 		`SELECT u.username, g.permission, g.group_id, g.created_at FROM address_book_grants g
 		 JOIN users u ON u.id = g.owner_user_id
@@ -2976,7 +3429,46 @@ func (s *Store) Grants(userID string) (outgoing, incoming []Grant, err error) {
 	); err != nil {
 		return nil, nil, err
 	}
+	granteeTargets, err := s.targetGrantsLocked(
+		`SELECT u.username, t.target_kind, t.target_id, COALESCE(g.name, ''), t.permission, t.group_id, t.created_at
+		 FROM address_book_target_grants t
+		 JOIN users u ON u.id = t.owner_user_id
+		 LEFT JOIN account_groups g ON g.id = t.target_id
+		 WHERE t.owner_user_id <> ?
+		   AND (t.target_kind = 'everyone' OR (t.target_kind = 'group' AND t.target_id IN (
+				SELECT group_id FROM account_group_members WHERE user_id = ?)))
+		 ORDER BY u.username COLLATE NOCASE, t.group_id`,
+		userID, userID,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	incoming = append(incoming, granteeTargets...)
 	return outgoing, incoming, nil
+}
+
+func (s *Store) targetGrantsLocked(query string, args ...any) ([]Grant, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: list address book target grants: %w", s.path, err)
+	}
+	defer rows.Close()
+	out := make([]Grant, 0)
+	for rows.Next() {
+		var (
+			grant   Grant
+			created int64
+		)
+		if err := rows.Scan(
+			&grant.Username, &grant.TargetKind, &grant.TargetID, &grant.TargetName,
+			&grant.Permission, &grant.GroupID, &created,
+		); err != nil {
+			return nil, err
+		}
+		grant.CreatedAt = timeFromMillis(created)
+		out = append(out, grant)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) grantsLocked(query, userID string) ([]Grant, error) {
@@ -3007,16 +3499,6 @@ func (s *Store) grantsLocked(query, userID string) ([]Grant, error) {
 func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(
-		`SELECT u.id, u.username, g.group_id, g.permission, u.book_revision
-		 FROM address_book_grants g
-		 JOIN users u ON u.id = g.owner_user_id
-		 WHERE g.grantee_user_id = ? ORDER BY u.username COLLATE NOCASE, g.group_id`,
-		userID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("account store %s: list shared books: %w", s.path, err)
-	}
 	type ownerBook struct {
 		id       string
 		username string
@@ -3027,31 +3509,61 @@ func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 		owners []*ownerBook
 		index  = make(map[string]*ownerBook)
 	)
-	for rows.Next() {
-		var (
-			id         string
-			username   string
-			groupID    string
-			permission string
-			revision   int64
-		)
-		if err := rows.Scan(&id, &username, &groupID, &permission, &revision); err != nil {
-			rows.Close()
-			return nil, err
+	collect := func(rows *sql.Rows) error {
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				id         string
+				username   string
+				groupID    string
+				permission string
+				revision   int64
+			)
+			if err := rows.Scan(&id, &username, &groupID, &permission, &revision); err != nil {
+				return err
+			}
+			book, ok := index[id]
+			if !ok {
+				book = &ownerBook{id: id, username: username, revision: revision}
+				index[id] = book
+				owners = append(owners, book)
+			}
+			book.scopes = append(book.scopes, SharedScope{GroupID: groupID, Permission: permission})
 		}
-		book, ok := index[id]
-		if !ok {
-			book = &ownerBook{id: id, username: username, revision: revision}
-			index[id] = book
-			owners = append(owners, book)
-		}
-		book.scopes = append(book.scopes, SharedScope{GroupID: groupID, Permission: permission})
+		return rows.Err()
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
+	direct, err := s.db.Query(
+		`SELECT u.id, u.username, g.group_id, g.permission, u.book_revision
+		 FROM address_book_grants g
+		 JOIN users u ON u.id = g.owner_user_id
+		 WHERE g.grantee_user_id = ? ORDER BY u.username COLLATE NOCASE, g.group_id`,
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: list shared books: %w", s.path, err)
+	}
+	if err := collect(direct); err != nil {
 		return nil, err
 	}
-	rows.Close()
+	// Account-group and everyone grants resolve through membership, so a
+	// recipient sees the book as soon as they join the group and loses it when
+	// they leave. The owner is never a grantee of their own book.
+	targets, err := s.db.Query(
+		`SELECT u.id, u.username, t.group_id, t.permission, u.book_revision
+		 FROM address_book_target_grants t
+		 JOIN users u ON u.id = t.owner_user_id
+		 WHERE t.owner_user_id <> ?
+		   AND (t.target_kind = 'everyone' OR (t.target_kind = 'group' AND t.target_id IN (
+				SELECT group_id FROM account_group_members WHERE user_id = ?)))
+		 ORDER BY u.username COLLATE NOCASE, t.group_id`,
+		userID, userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: list targeted shared books: %w", s.path, err)
+	}
+	if err := collect(targets); err != nil {
+		return nil, err
+	}
 	out := make([]SharedBook, 0, len(owners))
 	for _, item := range owners {
 		peers, err := s.peersLocked(item.id)
@@ -3074,7 +3586,11 @@ func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 			if scope.GroupID != "" {
 				continue
 			}
-			whole = scope.Permission
+			// Direct and target grants for the same book merge: keep the
+			// strongest whole-book permission rather than the last row read.
+			if permissionRank(scope.Permission) > permissionRank(whole) {
+				whole = scope.Permission
+			}
 		}
 		parents := make(map[string]string, len(groups))
 		for _, group := range groups {
@@ -3179,6 +3695,44 @@ func (s *Store) sharedGrantsLocked(granteeID, ownerUsername string) (sharedGrant
 		return sharedGrants{}, err
 	}
 	rows.Close()
+	// Target grants resolve live: membership in the target account group (or
+	// the everyone target) is checked at read time, and the owner never
+	// receives their own book through a target grant.
+	if ownerID != granteeID {
+		targets, err := s.db.Query(
+			`SELECT group_id, permission FROM address_book_target_grants
+			 WHERE owner_user_id = ? AND (
+				target_kind = 'everyone' OR (target_kind = 'group' AND target_id IN (
+					SELECT group_id FROM account_group_members WHERE user_id = ?)))`,
+			ownerID, granteeID,
+		)
+		if err != nil {
+			return sharedGrants{}, fmt.Errorf("account store %s: read shared target grants: %w", s.path, err)
+		}
+		for targets.Next() {
+			var (
+				groupID    string
+				permission string
+			)
+			if err := targets.Scan(&groupID, &permission); err != nil {
+				targets.Close()
+				return sharedGrants{}, err
+			}
+			found = true
+			if groupID == "" {
+				if permissionRank(permission) > permissionRank(out.whole) {
+					out.whole = permission
+				}
+				continue
+			}
+			scoped = append(scoped, SharedScope{GroupID: groupID, Permission: permission})
+		}
+		if err := targets.Err(); err != nil {
+			targets.Close()
+			return sharedGrants{}, err
+		}
+		targets.Close()
+	}
 	if !found {
 		return sharedGrants{}, ErrUnknownShare
 	}
@@ -3315,7 +3869,31 @@ func (s *Store) UpdateSharedPeerAt(granteeID, ownerUsername, peerID string, name
 	if err := grants.require(PermissionWrite, groupID); err != nil {
 		return Peer{}, err
 	}
-	return s.updatePeerLocked(grants.ownerID, peerID, name, tags, nil, nil, ifRevision)
+	return s.updatePeerLocked(grants.ownerID, peerID, PeerEdit{Name: name, Tags: tags}, ifRevision)
+}
+
+// UpdateSharedPeerEditAt applies a partial edit, including the note, through a
+// write or control grant. Group and position stay owner-side controls.
+func (s *Store) UpdateSharedPeerEditAt(granteeID, ownerUsername, peerID string, edit PeerEdit, ifRevision int64) (Peer, error) {
+	if !registry.ValidID(peerID) {
+		return Peer{}, ErrInvalidPeerID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grants, err := s.sharedGrantsLocked(granteeID, ownerUsername)
+	if err != nil {
+		return Peer{}, err
+	}
+	groupID, err := s.peerGroupLocked(grants.ownerID, peerID)
+	if err != nil {
+		return Peer{}, err
+	}
+	if err := grants.require(PermissionWrite, groupID); err != nil {
+		return Peer{}, err
+	}
+	edit.GroupID = nil
+	edit.Position = nil
+	return s.updatePeerLocked(grants.ownerID, peerID, edit, ifRevision)
 }
 
 func (s *Store) DeleteSharedPeer(granteeID, ownerUsername, peerID string) (bool, error) {
@@ -3359,6 +3937,12 @@ func (s *Store) AddSharedPeer(granteeID, ownerUsername, peerID, name string, tag
 // entry gets the same 409 protection as an update (it has no peer revision of
 // its own to compare).
 func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, name string, tags []string, ifRevision int64) (Peer, error) {
+	return s.AddSharedPeerNoteScoped(granteeID, ownerUsername, peerID, groupID, name, tags, "", ifRevision)
+}
+
+// AddSharedPeerNoteScoped is AddSharedPeerScoped with the optional note that
+// a grantee wrote for the new entry.
+func (s *Store) AddSharedPeerNoteScoped(granteeID, ownerUsername, peerID, groupID, name string, tags []string, note string, ifRevision int64) (Peer, error) {
 	if !registry.ValidID(peerID) {
 		return Peer{}, ErrInvalidPeerID
 	}
@@ -3398,7 +3982,8 @@ func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, n
 			return Peer{}, ErrPeerConflict
 		}
 	}
-	return s.updatePeerLocked(grants.ownerID, peerID, &name, &tags, groupArg, nil, 0)
+	return s.updatePeerLocked(grants.ownerID, peerID,
+		PeerEdit{Name: &name, Tags: &tags, Note: &note, GroupID: groupArg}, 0)
 }
 
 // ShareBookAs lets a grantee with whole-book control permission manage

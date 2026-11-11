@@ -15,9 +15,17 @@ func TestSchemaVersionMatchesMigrations(t *testing.T) {
 
 // seedAuditEventTables recreates the pre-v8 history tables so migrations that
 // only add columns can run against a database seeded without a full baseline.
+// The minimal users table is here because later additive migrations (v16 onward)
+// alter it; the fixture marks the baseline applied without creating it.
 func seedAuditEventTables(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, statement := range []string{
+		`CREATE TABLE users (
+			id            TEXT PRIMARY KEY,
+			username      TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL DEFAULT 0
+		)`,
 		`CREATE TABLE audit_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			created_at INTEGER NOT NULL,

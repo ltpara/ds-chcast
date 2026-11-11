@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,8 +129,17 @@ type oidcBeginReply struct {
 
 func beginOIDC(t *testing.T, base string) oidcBeginReply {
 	t.Helper()
-	status, data := request(t, http.MethodPost, base+"/v1/account/oidc/begin",
-		`{"device_id":"dev-1","device_name":"workstation"}`, "")
+	return beginOIDCWithClient(t, base, "")
+}
+
+func beginOIDCWithClient(t *testing.T, base, client string) oidcBeginReply {
+	t.Helper()
+	body := `{"device_id":"dev-1","device_name":"workstation"`
+	if client != "" {
+		body += `,"client":"` + client + `"`
+	}
+	body += `}`
+	status, data := request(t, http.MethodPost, base+"/v1/account/oidc/begin", body, "")
 	if status != http.StatusOK {
 		t.Fatalf("oidc begin: %d %s", status, data)
 	}
@@ -246,6 +256,56 @@ func TestOIDCPollReportsUnknownState(t *testing.T) {
 		`{"state":"not-issued"}`, "")
 	if status != http.StatusNotFound {
 		t.Fatalf("unknown state: %d %s", status, data)
+	}
+}
+
+func TestOIDCCallbackPageNamesTheStartingClient(t *testing.T) {
+	idp := newFakeIdentityProvider(t)
+	server := testutil.StartWith(t, testutil.Options{OIDC: idp.provider(t, true)})
+
+	viewer := beginOIDC(t, server.URL)
+	authURL, _ := url.Parse(viewer.AuthURL)
+	idp.nonce = authURL.Query().Get("nonce")
+	status, data := request(t, http.MethodGet,
+		server.URL+"/v1/account/oidc/callback?state="+url.QueryEscape(viewer.State)+"&code=test-code", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("viewer callback: %d %s", status, data)
+	}
+	if page := string(data); strings.Contains(page, "admin console") {
+		t.Fatalf("viewer page mentions the console: %s", page)
+	}
+
+	console := beginOIDCWithClient(t, server.URL, "console")
+	authURL, _ = url.Parse(console.AuthURL)
+	idp.nonce = authURL.Query().Get("nonce")
+	status, data = request(t, http.MethodGet,
+		server.URL+"/v1/account/oidc/callback?state="+url.QueryEscape(console.State)+"&code=test-code", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("console callback: %d %s", status, data)
+	}
+	if page := string(data); !strings.Contains(page, "chast admin console") {
+		t.Fatalf("console page does not point back to the console: %s", page)
+	}
+
+	rejected := beginOIDCWithClient(t, server.URL, "console")
+	status, data = request(t, http.MethodGet,
+		server.URL+"/v1/account/oidc/callback?state="+url.QueryEscape(rejected.State)+"&error=access_denied", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("rejected console callback: %d %s", status, data)
+	}
+	if page := string(data); !strings.Contains(page, "return to the chast admin console") {
+		t.Fatalf("rejected console page = %s", page)
+	}
+
+	other := beginOIDCWithClient(t, server.URL, "someone-else")
+	status, data = request(t, http.MethodGet,
+		server.URL+"/v1/account/oidc/callback?state="+url.QueryEscape(other.State)+"&error=access_denied", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("unknown client callback: %d %s", status, data)
+	}
+	page := string(data)
+	if strings.Contains(page, "admin console") || strings.Contains(page, "someone-else") {
+		t.Fatalf("unknown client leaked into page: %s", page)
 	}
 }
 

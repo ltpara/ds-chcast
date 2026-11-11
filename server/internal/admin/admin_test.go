@@ -5,11 +5,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
@@ -344,5 +347,42 @@ func TestHandleRejectsRemotePeer(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("non-loopback connection was not closed")
+	}
+}
+
+func TestReloadGeoCommand(t *testing.T) {
+	s := testutil.Start(t)
+	path := filepath.Join(t.TempDir(), "geoip.txt")
+	if err := os.WriteFile(path, []byte("203.0.113.0/24 Osaka\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locator, err := geoip.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := startConsole(t, Config{Relay: s.Relay, GeoIP: geoip.NewReloader(path, locator)})
+
+	if out := send(t, c, "h"); !strings.Contains(out, "reload-geo(rg)") {
+		t.Fatalf("help missing reload-geo:\n%s", out)
+	}
+	if out := send(t, c, "rg"); !strings.Contains(out, "loaded 1 prefixes from "+path) {
+		t.Fatalf("reload output = %q", out)
+	}
+	if err := os.WriteFile(path, []byte("203.0.113.0/24 Tokyo\n198.51.100.0/24 Lab\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out := send(t, c, "reload-geo"); !strings.Contains(out, "loaded 2 prefixes") {
+		t.Fatalf("second reload output = %q", out)
+	}
+	if err := os.WriteFile(path, []byte("broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out := send(t, c, "rg"); !strings.Contains(out, "reload failed") {
+		t.Fatalf("failed reload output = %q", out)
+	}
+
+	without := startConsole(t, Config{Relay: s.Relay})
+	if out := send(t, without, "rg"); !strings.Contains(out, "not configured") {
+		t.Fatalf("unconfigured output = %q", out)
 	}
 }

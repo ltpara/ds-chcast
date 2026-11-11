@@ -71,12 +71,81 @@ func exportCSV(t *testing.T, url string) [][]string {
 		t.Fatalf("export %s: %d %s", url, status, body)
 	}
 	prefix := "chast-audit"
-	if strings.Contains(url, "/connections") {
+	if strings.Contains(url, "/v1/identities") {
+		prefix = "chast-devices"
+	} else if strings.Contains(url, "/connections") {
 		prefix = "chast-connections"
 	} else if strings.Contains(url, "/file-transfers") {
 		prefix = "chast-file-transfers"
 	}
 	return decodeExport(t, header, body, prefix)
+}
+
+// TestDeviceInventoryCSVExport covers the console's offline asset inventory:
+// every durable identity, including disabled and offline ones, with the same
+// search/online filters as the JSON list and no pagination cut-off.
+func TestDeviceInventoryCSVExport(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "inv-one", "one secret", "INV1", "lab-pc", "windows", "1.2.3", now),
+		testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register inv-one: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "inv-two", "two secret", "INV2", now), testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register inv-two: %d %s", status, body)
+	}
+	if err := s.Registry.Touch("inv-one", "203.0.113.9:5555", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/identities/inv-one",
+		`{"alias":"=cmd, 展厅","tags":["lab","vip"]}`, testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("labels: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/identities/inv-two",
+		`{"disabled":true}`, testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("disable inv-two: %d %s", status, body)
+	}
+
+	if status, _, body := exportGet(t, s.URL+"/v1/identities?format=xml", testutil.ServerKey); status != http.StatusBadRequest {
+		t.Fatalf("bad format = %d %s", status, body)
+	}
+
+	status, header, body := exportGet(t, s.URL+"/v1/identities?format=csv", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("device export: %d %s", status, body)
+	}
+	rows := decodeExport(t, header, body, "chast-devices")
+	if got := strings.Join(rows[0], ","); got !=
+		"id,alias,owner,tags,hostname,platform,version,fingerprint,online,disabled,relay,candidate,last_seen_at" {
+		t.Fatalf("header = %q", got)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d: %v", len(rows), rows)
+	}
+	one := exportRow(t, rows, 0, "inv-one")
+	// The leading "=" is defused so a spreadsheet cannot run the alias as a
+	// formula; the comma stays quoted and is restored by the CSV parser.
+	if one[1] != "'=cmd, 展厅" || one[3] != "lab;vip" || one[4] != "lab-pc" ||
+		one[5] != "windows" || one[6] != "1.2.3" || one[7] != "INV1" ||
+		one[8] != "true" || one[9] != "false" {
+		t.Fatalf("inv-one row = %v", one)
+	}
+	if one[10] == "" || one[11] != "203.0.113.9:5555" || one[12] == "" {
+		t.Fatalf("inv-one live row = %v", one)
+	}
+	two := exportRow(t, rows, 0, "inv-two")
+	if two[8] != "false" || two[9] != "true" || two[10] != "" || two[11] != "" || two[12] == "" {
+		t.Fatalf("inv-two row = %v", two)
+	}
+
+	// limit/offset belong to the paged JSON view; the download always carries
+	// the whole filtered population.
+	filtered := exportCSV(t, s.URL+"/v1/identities?format=csv&online=1&limit=1&offset=1")
+	if len(filtered) != 2 || filtered[1][0] != "inv-one" {
+		t.Fatalf("filtered export = %v", filtered)
+	}
 }
 
 func TestCSVExportPagesPastStorePageCaps(t *testing.T) {

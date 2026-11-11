@@ -58,6 +58,7 @@ func run() error {
 		tlsClientCA  = flag.String("tls-client-ca", "", "PEM CA bundle; when set, HTTPS clients must present a certificate signed by it (mTLS)")
 		adminListen  = flag.String("admin-listen", "127.0.0.1:8449", "loopback-only relay console; empty disables it")
 		adminToken   = flag.String("admin-token", "", "secret the relay console requires; empty generates and logs one at startup")
+		proxyHeader  = flag.String("relay-proxy-header", "", "WebSocket handshake header trusted as the viewer IP for relay and shared-carrier sessions behind a reverse proxy, e.g. X-Real-IP; empty uses the socket address")
 
 		singleBandwidth = flag.Float64("relay-single-bandwidth", 128, "per-session relay bandwidth in Mbit/s; 0 disables the limit")
 		totalBandwidth  = flag.Float64("relay-total-bandwidth", 1024, "total relay bandwidth in Mbit/s; 0 disables the limit")
@@ -165,6 +166,7 @@ func run() error {
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
 		relay.WithTracer(tracer),
+		relay.WithProxyHeader(*proxyHeader),
 	}
 	var transportVerifier *acl.TransportVerifier
 	if *accessIssuer != "" || *accessKeyID != "" || *accessKey != "" {

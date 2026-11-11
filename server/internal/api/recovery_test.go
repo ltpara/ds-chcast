@@ -360,3 +360,52 @@ func TestPasswordRecoveryUnavailable(t *testing.T) {
 		t.Fatalf("complete without store: %d %s", status, data)
 	}
 }
+
+func TestAdminSendResetEmail(t *testing.T) {
+	mailer := &fakeMailer{}
+	s := testutil.StartWith(t, testutil.Options{Mailer: mailer, RecoveryTTL: 10 * time.Minute})
+	if _, err := s.Accounts.CreateUserWithEmail("alice", "correct horse", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Accounts.CreateUserWithEmail("carol", "battery staple", "carol@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse").Token
+
+	status, data := request(t, http.MethodPost, s.URL+"/v1/accounts/carol/recover", "", admin)
+	if status != http.StatusAccepted {
+		t.Fatalf("admin recover carol: %d %s", status, data)
+	}
+	msgs := mailer.messages()
+	if len(msgs) != 1 {
+		t.Fatalf("reset mails = %d", len(msgs))
+	}
+	if msg := msgs[0]; msg.To != "carol@example.com" || msg.Username != "carol" ||
+		msg.Token == "" || msg.TTL != 10*time.Minute {
+		t.Fatalf("reset mail = %+v", msg)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/accounts/carol/recover", "", admin); status != http.StatusTooManyRequests {
+		t.Fatalf("throttled admin recover: %d %s", status, data)
+	}
+	if got := len(mailer.messages()); got != 1 {
+		t.Fatalf("mails after throttled request = %d", got)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/accounts/bob/recover", "", admin); status != http.StatusBadRequest {
+		t.Fatalf("admin recover without address: %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/accounts/ghost/recover", "", admin); status != http.StatusNotFound {
+		t.Fatalf("admin recover unknown account: %d %s", status, data)
+	}
+	bobToken := login(t, s.URL, "bob", "battery staple").Token
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/accounts/carol/recover", "", bobToken); status != http.StatusForbidden {
+		t.Fatalf("admin recover as ordinary user: %d %s", status, data)
+	}
+
+	noMail := testutil.StartWith(t, testutil.Options{})
+	if status, data := request(t, http.MethodPost, noMail.URL+"/v1/accounts/alice/recover", "", testutil.ServerKey); status != http.StatusServiceUnavailable {
+		t.Fatalf("admin recover without mailer: %d %s", status, data)
+	}
+}

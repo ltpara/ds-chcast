@@ -70,9 +70,20 @@ func (p *tcpPuncher) serveHostControl(conn net.Conn, hello wire.Message) {
 	}
 	host, exists := p.srv.reg.Lookup(hello.HostID)
 	pub, keyErr := identity.ParsePublicKey(host.PublicKey)
-	if !exists || keyErr != nil || proof.Type != wire.TypeRendezvousProof ||
-		proof.HostID != hello.HostID || proof.Nonce != nonce || proof.TID != hello.Nonce ||
-		!identity.Verify(pub, identity.RendezvousControlMessage("host", hello.HostID, hello.Nonce, nonce), proof.Signature) {
+	reason := ""
+	switch {
+	case !exists:
+		reason = "host is not registered"
+	case keyErr != nil:
+		reason = "registered key is unusable"
+	case proof.Type != wire.TypeRendezvousProof || proof.HostID != hello.HostID ||
+		proof.Nonce != nonce || proof.TID != hello.Nonce:
+		reason = "proof does not answer this challenge"
+	case !identity.Verify(pub, identity.RendezvousControlMessage("host", hello.HostID, hello.Nonce, nonce), proof.Signature):
+		reason = "proof signature did not verify"
+	}
+	if reason != "" {
+		p.srv.log.Debug("rendezvous control proof refused", "host", hello.HostID, "reason", reason)
 		_ = link.write(wire.Encode(wire.Message{Type: wire.TypeRendezvousControl, Error: "punch authentication failed"}))
 		return
 	}

@@ -34,6 +34,7 @@ type peerReply struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Tags        []string `json:"tags"`
+	Note        string   `json:"note"`
 	GroupID     string   `json:"group_id"`
 	Position    int64    `json:"position"`
 	UpdatedAtMS int64    `json:"updated_at_ms"`
@@ -57,6 +58,10 @@ type addressBookReply struct {
 	Changes      []peerReply  `json:"changes"`
 	Groups       []groupReply `json:"groups"`
 	GroupChanges []groupReply `json:"group_changes"`
+}
+
+type addressBookTrashReply struct {
+	Peers []peerReply `json:"peers"`
 }
 
 func login(t *testing.T, base, username, password string) loginReply {
@@ -257,7 +262,7 @@ func TestAccountLoginAndAddressBook(t *testing.T) {
 	}
 
 	status, body = request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/studio",
-		`{"tags":["lab"]}`, reply.Token)
+		`{"tags":["lab"],"note":"  机柜 A3  "}`, reply.Token)
 	if status != http.StatusOK {
 		t.Fatalf("partial address book update: %d %s", status, body)
 	}
@@ -265,7 +270,7 @@ func TestAccountLoginAndAddressBook(t *testing.T) {
 		t.Fatalf("partial peer reply: %v", err)
 	}
 	if studio.Name != "工作室" || len(studio.Tags) != 1 || studio.Tags[0] != "lab" ||
-		studio.Revision != 2 {
+		studio.Note != "机柜 A3" || studio.Revision != 2 {
 		t.Fatalf("partial update lost fields: %+v", studio)
 	}
 	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/studio", `{}`, reply.Token); status != http.StatusBadRequest {
@@ -287,7 +292,8 @@ func TestAccountLoginAndAddressBook(t *testing.T) {
 		t.Fatalf("address book reply: %v", err)
 	}
 	if len(book.Peers) != 2 || book.Peers[0].ID != "lab" || book.Peers[1].ID != "studio" ||
-		book.Peers[0].Revision != 3 || book.Peers[1].Revision != 2 || book.Revision != 3 {
+		book.Peers[0].Revision != 3 || book.Peers[1].Revision != 2 || book.Revision != 3 ||
+		book.Peers[1].Note != "机柜 A3" {
 		t.Fatalf("address book = %+v revision=%d", book.Peers, book.Revision)
 	}
 
@@ -306,7 +312,8 @@ func TestAccountLoginAndAddressBook(t *testing.T) {
 		t.Fatalf("incremental peers = %+v revision=%d", incremental.Peers, incremental.Revision)
 	}
 	if len(incremental.Changes) != 1 || incremental.Changes[0].ID != "studio" ||
-		!incremental.Changes[0].Deleted || incremental.Changes[0].Revision != 4 {
+		!incremental.Changes[0].Deleted || incremental.Changes[0].Revision != 4 ||
+		incremental.Changes[0].Name != "工作室" || incremental.Changes[0].Note != "机柜 A3" {
 		t.Fatalf("incremental changes = %+v", incremental.Changes)
 	}
 	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook?since=4", "", reply.Token)
@@ -325,6 +332,80 @@ func TestAccountLoginAndAddressBook(t *testing.T) {
 	}
 	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/peers/bad%20id", "", reply.Token); status != http.StatusBadRequest {
 		t.Fatalf("delete invalid peer: %d %s", status, body)
+	}
+
+	// A deleted entry stays restorable in the trash with the fields it had.
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook/trash", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("read trash: %d %s", status, body)
+	}
+	var trash addressBookTrashReply
+	if err := json.Unmarshal(body, &trash); err != nil {
+		t.Fatalf("trash reply: %v", err)
+	}
+	if len(trash.Peers) != 1 || trash.Peers[0].ID != "studio" || !trash.Peers[0].Deleted ||
+		trash.Peers[0].Name != "工作室" || trash.Peers[0].Note != "机柜 A3" ||
+		len(trash.Peers[0].Tags) != 1 || trash.Peers[0].Tags[0] != "lab" {
+		t.Fatalf("trash = %+v", trash.Peers)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/addressbook/trash", "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("trash without token: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodPost, s.URL+"/v1/addressbook/trash/studio/restore", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("restore peer: %d %s", status, body)
+	}
+	var restored peerReply
+	if err := json.Unmarshal(body, &restored); err != nil {
+		t.Fatalf("restore reply: %v", err)
+	}
+	if restored.ID != "studio" || restored.Deleted || restored.Name != "工作室" ||
+		restored.Note != "机柜 A3" || restored.Revision != 5 {
+		t.Fatalf("restored peer = %+v", restored)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/trash/studio/restore", "", reply.Token); status != http.StatusNotFound {
+		t.Fatalf("restore live peer: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/trash/bad%20id/restore", "", reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("restore invalid peer: %d %s", status, body)
+	}
+
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/peers/studio", "", reply.Token); status != http.StatusNoContent {
+		t.Fatalf("delete restored peer: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/peers/lab", "", reply.Token); status != http.StatusNoContent {
+		t.Fatalf("delete lab peer: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/trash/studio", "", reply.Token); status != http.StatusNoContent {
+		t.Fatalf("purge peer: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/trash/studio", "", reply.Token); status != http.StatusNotFound {
+		t.Fatalf("purge missing peer: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/trash/bad%20id", "", reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("purge invalid peer: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/trash/studio/restore", "", reply.Token); status != http.StatusNotFound {
+		t.Fatalf("restore purged peer: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodDelete, s.URL+"/v1/addressbook/trash", "", reply.Token)
+	if status != http.StatusOK || !strings.Contains(string(body), `"removed":1`) {
+		t.Fatalf("empty trash: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/trash", "", reply.Token); status != http.StatusOK ||
+		!strings.Contains(string(body), `"removed":0`) {
+		t.Fatalf("second empty trash: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("book after purges: %d %s", status, body)
+	}
+	book = addressBookReply{}
+	if err := json.Unmarshal(body, &book); err != nil {
+		t.Fatalf("book after purges reply: %v", err)
+	}
+	if len(book.Peers) != 0 || len(book.Changes) != 0 || book.Revision != 7 {
+		t.Fatalf("book after purges = %+v revision=%d", book.Changes, book.Revision)
 	}
 
 	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/logout", "", reply.Token); status != http.StatusNoContent {
@@ -688,6 +769,9 @@ type grantReply struct {
 	Permission  string `json:"permission"`
 	GroupID     string `json:"group_id"`
 	CreatedAtMS int64  `json:"created_at_ms"`
+	TargetKind  string `json:"target_kind"`
+	TargetID    string `json:"target_id"`
+	TargetName  string `json:"target_name"`
 }
 
 type grantsReply struct {
@@ -1131,6 +1215,116 @@ func TestSharedAddressBookAPI(t *testing.T) {
 			`{"name":"x","if_revision":`+invalid+`}`, alice.Token); status != http.StatusBadRequest {
 			t.Fatalf("if_revision=%s: %d %s", invalid, status, body)
 		}
+	}
+}
+
+func TestAddressBookTargetGrantsAPI(t *testing.T) {
+	s := testutil.Start(t)
+	for _, username := range []string{"alice", "bob", "carol"} {
+		if _, err := s.Accounts.CreateUser(username, "correct horse"); err != nil {
+			t.Fatalf("create %s: %v", username, err)
+		}
+	}
+	if _, err := s.Accounts.CreateGroup("team", "Team", "", 0, 0); err != nil {
+		t.Fatalf("create account group: %v", err)
+	}
+	if _, err := s.Accounts.AddGroupMember("team", "alice", account.RoleAdmin); err != nil {
+		t.Fatalf("add alice to group: %v", err)
+	}
+	if _, err := s.Accounts.AddGroupMember("team", "bob", account.RoleReadonly); err != nil {
+		t.Fatalf("add bob to group: %v", err)
+	}
+	alice := login(t, s.URL, "alice", "correct horse")
+	bob := login(t, s.URL, "bob", "correct horse")
+	carol := login(t, s.URL, "carol", "correct horse")
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/studio",
+		`{"name":"工作室"}`, alice.Token); status != http.StatusOK {
+		t.Fatalf("seed alice peer: %d %s", status, body)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		body  string
+		want  int
+	}{
+		{"missing target", alice.Token, `{"target":"group"}`, http.StatusBadRequest},
+		{"unknown kind", alice.Token, `{"target":"team"}`, http.StatusBadRequest},
+		{"unknown group", alice.Token, `{"target":"group","target_id":"nope"}`, http.StatusNotFound},
+		{"non-member", carol.Token, `{"target":"group","target_id":"team"}`, http.StatusForbidden},
+		{"username and target", alice.Token, `{"username":"bob","target":"everyone"}`, http.StatusBadRequest},
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/grants",
+			tc.body, tc.token); status != tc.want {
+			t.Fatalf("%s: %d %s, want %d", tc.name, status, body, tc.want)
+		}
+	}
+
+	status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/grants",
+		`{"target":"group","target_id":"team","permission":"write"}`, alice.Token)
+	var grant grantReply
+	if err := json.Unmarshal(body, &grant); err != nil || status != http.StatusOK ||
+		grant.Username != "" || grant.TargetKind != "group" || grant.TargetID != "team" ||
+		grant.TargetName != "Team" || grant.Permission != "write" || grant.CreatedAtMS == 0 {
+		t.Fatalf("share to group: %d %s (%v)", status, body, err)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook/grants", "", bob.Token)
+	var grants grantsReply
+	if err := json.Unmarshal(body, &grants); err != nil || status != http.StatusOK ||
+		len(grants.Outgoing) != 0 || len(grants.Incoming) != 1 ||
+		grants.Incoming[0].Username != "alice" ||
+		grants.Incoming[0].TargetKind != "group" ||
+		grants.Incoming[0].TargetName != "Team" {
+		t.Fatalf("bob target grants: %d %s (%v) %+v", status, body, err, grants)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", bob.Token)
+	var shared sharedBooksReply
+	if err := json.Unmarshal(body, &shared); err != nil || status != http.StatusOK ||
+		len(shared.Books) != 1 || shared.Books[0].Owner != "alice" ||
+		shared.Books[0].Permission != "write" || len(shared.Books[0].Peers) != 1 {
+		t.Fatalf("bob shared group book: %d %s (%v) %+v", status, body, err, shared)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", carol.Token); status != http.StatusOK ||
+		!strings.Contains(string(body), `"books":[]`) {
+		t.Fatalf("carol shared group book: %d %s", status, body)
+	}
+
+	targetURL := s.URL + "/v1/addressbook/grants/targets"
+	if status, body := request(t, http.MethodDelete, targetURL+"?kind=group&target_id=team", "", alice.Token); status != http.StatusNoContent {
+		t.Fatalf("revoke group grant: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, targetURL+"?kind=group&target_id=team", "", alice.Token); status != http.StatusNotFound {
+		t.Fatalf("revoke absent group grant: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", bob.Token); status != http.StatusOK ||
+		!strings.Contains(string(body), `"books":[]`) {
+		t.Fatalf("bob book after revoke: %d %s", status, body)
+	}
+
+	status, body = request(t, http.MethodPost, s.URL+"/v1/addressbook/grants", `{"target":"everyone"}`, alice.Token)
+	if err := json.Unmarshal(body, &grant); err != nil || status != http.StatusOK ||
+		grant.TargetKind != "everyone" || grant.Permission != "read" {
+		t.Fatalf("share with everyone: %d %s (%v)", status, body, err)
+	}
+	for _, token := range []string{bob.Token, carol.Token} {
+		if status, body := request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", token); status != http.StatusOK ||
+			strings.Contains(string(body), `"books":[]`) {
+			t.Fatalf("everyone shared book: %d %s", status, body)
+		}
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/addressbook/grants", "", alice.Token); status != http.StatusOK ||
+		!strings.Contains(string(body), `"target_kind":"everyone"`) {
+		t.Fatalf("alice outgoing everyone grant: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, targetURL+"?kind=everyone&group_id=bad%20id", "", alice.Token); status != http.StatusBadRequest {
+		t.Fatalf("revoke invalid scope: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, targetURL+"?kind=everyone", "", alice.Token); status != http.StatusNoContent {
+		t.Fatalf("revoke everyone grant: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", carol.Token); status != http.StatusOK ||
+		!strings.Contains(string(body), `"books":[]`) {
+		t.Fatalf("book after everyone revoke: %d %s", status, body)
 	}
 }
 
@@ -2571,5 +2765,52 @@ func TestLoginRecordsGeoIPLocation(t *testing.T) {
 	}
 	if view.Sessions[0].LoginIP != "127.0.0.1" || view.Sessions[0].Location != "Local lab" {
 		t.Fatalf("sessions view origin = %+v", view.Sessions[0])
+	}
+}
+
+func TestGeoIPReloadChangesLoginLocation(t *testing.T) {
+	table := filepath.Join(t.TempDir(), "geoip.txt")
+	if err := os.WriteFile(table, []byte("127.0.0.0/8\tLocal lab\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locator, err := geoip.Load(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloader := geoip.NewReloader(table, locator)
+	s := testutil.StartWith(t, testutil.Options{GeoIP: reloader})
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	login := func() {
+		t.Helper()
+		status, body := request(t, http.MethodPost, s.URL+"/v1/account/login",
+			`{"username":"alice","password":"correct horse"}`, "")
+		if status != http.StatusOK {
+			t.Fatalf("login: %d %s", status, body)
+		}
+	}
+	location := func() string {
+		t.Helper()
+		events, err := s.Accounts.AuditEvents(10)
+		if err != nil || len(events) == 0 {
+			t.Fatalf("audit events = %+v, %v", events, err)
+		}
+		return events[0].Location
+	}
+
+	login()
+	if got := location(); got != "Local lab" {
+		t.Fatalf("location before reload = %q", got)
+	}
+	if err := os.WriteFile(table, []byte("127.0.0.0/8\tMuseum\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloader.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	login()
+	if got := location(); got != "Museum" {
+		t.Fatalf("location after reload = %q", got)
 	}
 }

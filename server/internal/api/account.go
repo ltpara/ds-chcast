@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/ldapauth"
 )
 
 const accountUnavailable = "accounts require persistent server state"
@@ -110,6 +111,7 @@ type addressBookPeer struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
+	Note        string   `json:"note,omitempty"`
 	GroupID     string   `json:"group_id,omitempty"`
 	Position    int64    `json:"position,omitempty"`
 	UpdatedAtMS int64    `json:"updated_at_ms"`
@@ -138,6 +140,7 @@ type addressBookResponse struct {
 type addressBookPeerRequest struct {
 	Name       *string   `json:"name"`
 	Tags       *[]string `json:"tags"`
+	Note       *string   `json:"note"`
 	GroupID    *string   `json:"group_id"`
 	Position   *int64    `json:"position"`
 	IfRevision *int64    `json:"if_revision"`
@@ -154,6 +157,7 @@ type sharedAddressBookPeerRequest struct {
 	ID         string   `json:"id"`
 	Name       string   `json:"name"`
 	Tags       []string `json:"tags"`
+	Note       string   `json:"note"`
 	GroupID    string   `json:"group_id"`
 	IfRevision *int64   `json:"if_revision"`
 }
@@ -163,6 +167,11 @@ type addressBookGrantView struct {
 	Permission  string `json:"permission"`
 	GroupID     string `json:"group_id,omitempty"`
 	CreatedAtMS int64  `json:"created_at_ms"`
+	// TargetKind is empty for a grant addressed to one user. "group" and
+	// "everyone" grants leave Username empty and carry a display label.
+	TargetKind string `json:"target_kind,omitempty"`
+	TargetID   string `json:"target_id,omitempty"`
+	TargetName string `json:"target_name,omitempty"`
 }
 
 type addressBookGrantsResponse struct {
@@ -174,6 +183,10 @@ type shareAddressBookRequest struct {
 	Username   string `json:"username"`
 	Permission string `json:"permission"`
 	GroupID    string `json:"group_id"`
+	// Target switches the grant from a user to "group" (TargetID names the
+	// account group) or "everyone". Username must then stay empty.
+	Target   string `json:"target"`
+	TargetID string `json:"target_id"`
 }
 
 type sharedAddressBookScope struct {
@@ -222,6 +235,7 @@ func viewAddressBookPeer(peer account.Peer) addressBookPeer {
 		ID:          peer.ID,
 		Name:        peer.Name,
 		Tags:        peer.Tags,
+		Note:        peer.Note,
 		GroupID:     peer.GroupID,
 		Position:    peer.Position,
 		UpdatedAtMS: peer.UpdatedAt.UnixMilli(),
@@ -248,6 +262,9 @@ func viewAddressBookGrant(grant account.Grant) addressBookGrantView {
 		Permission:  grant.Permission,
 		GroupID:     grant.GroupID,
 		CreatedAtMS: grant.CreatedAt.UnixMilli(),
+		TargetKind:  grant.TargetKind,
+		TargetID:    grant.TargetID,
+		TargetName:  grant.TargetName,
 	}
 }
 
@@ -274,10 +291,29 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		writeLoginLocked(w, retry)
 		return
 	}
+	if s.cfg.LDAP != nil {
+		linked, err := s.cfg.Accounts.LDAPLinked(req.Username)
+		if err != nil {
+			s.auditLogin(r, req.Username, "internal error", false)
+			s.cfg.Logger.Error("account directory link", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not complete the login")
+			return
+		}
+		// A linked account signs in only through the directory, so disabling
+		// it there locks it out here even if a local password was ever set.
+		if linked {
+			s.loginDirectory(w, r, req, key)
+			return
+		}
+	}
 	user, token, _, refresh, _, err := s.cfg.Accounts.LoginWithRefreshFactors(
 		req.Username, req.Password, req.DeviceID, req.DeviceName,
 		req.TOTPCode, req.RecoveryCode, req.SMSCode, req.EmailCode,
 	)
+	if errors.Is(err, account.ErrInvalidCredentials) && s.cfg.LDAP != nil {
+		s.loginDirectory(w, r, req, key)
+		return
+	}
 	if errors.Is(err, account.ErrTwoFactorRequired) {
 		s.auditLogin(r, req.Username, "two-factor required", false)
 		w.Header().Set(twoFactorHeader, "required")
@@ -316,11 +352,6 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not complete the login")
 		return
 	}
-	s.cfg.LoginLimiter.Success(key)
-	ip := s.clientIP(r)
-	if err := s.cfg.Accounts.SetSessionOrigin(token, ip, s.clientLocation(ip)); err != nil {
-		s.cfg.Logger.Error("account session origin", "error", err)
-	}
 	detail := "password"
 	if strings.TrimSpace(req.TOTPCode) != "" {
 		detail = "password+two-factor"
@@ -331,11 +362,80 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	} else if strings.TrimSpace(req.EmailCode) != "" {
 		detail = "password+email-code"
 	}
+	s.finishLogin(w, r, req, key, user, token, refresh, detail)
+}
+
+// loginDirectory authenticates the password against the directory and issues
+// the session of the linked local account. A directory outage answers 503 and
+// does not count as a failed login, so a temporary outage cannot lock people
+// out; a rejected bind is counted like a wrong local password.
+func (s *server) loginDirectory(w http.ResponseWriter, r *http.Request, req loginRequest, key string) {
+	identity, err := s.cfg.LDAP.Authenticate(r.Context(), req.Username, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, ldapauth.ErrInvalidCredentials):
+			if retry, allowed := s.cfg.LoginLimiter.Failure(key); !allowed {
+				s.auditLogin(r, req.Username, "directory credentials invalid; locked out", false)
+				writeLoginLocked(w, retry)
+				return
+			}
+			s.auditLogin(r, req.Username, "directory credentials invalid", false)
+			writeError(w, http.StatusUnauthorized, "username or password was not accepted")
+		case errors.Is(err, ldapauth.ErrDirectoryUnavailable):
+			s.auditLogin(r, req.Username, "directory unavailable", false)
+			s.cfg.Logger.Warn("account directory unavailable", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "the directory is unavailable")
+		default:
+			s.auditLogin(r, req.Username, "internal error", false)
+			s.cfg.Logger.Error("account directory login", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not complete the login")
+		}
+		return
+	}
+	user, token, _, refresh, _, err := s.cfg.Accounts.LoginLDAP(
+		identity.DN, req.Username, identity.Email, req.DeviceID, req.DeviceName,
+		s.cfg.LDAPAutoCreate,
+	)
+	switch {
+	case errors.Is(err, account.ErrAccountBanned):
+		s.auditLogin(r, req.Username, "account banned", false)
+		writeError(w, http.StatusForbidden, "account is banned")
+		return
+	case errors.Is(err, account.ErrLDAPNameTaken):
+		s.auditLogin(r, req.Username, "directory name is used by a local account", false)
+		writeError(w, http.StatusUnauthorized, "username or password was not accepted")
+		return
+	case errors.Is(err, account.ErrLDAPAccountNotFound):
+		s.auditLogin(r, req.Username, "directory account has no local account", false)
+		writeError(w, http.StatusUnauthorized, "username or password was not accepted")
+		return
+	case errors.Is(err, account.ErrInvalidUsername):
+		s.auditLogin(r, req.Username, "directory login name is not usable", false)
+		s.cfg.Logger.Warn("directory login name rejected", "user", req.Username)
+		writeError(w, http.StatusUnauthorized, "username or password was not accepted")
+		return
+	case err != nil:
+		s.auditLogin(r, req.Username, "internal error", false)
+		s.cfg.Logger.Error("account directory login", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not complete the login")
+		return
+	}
+	s.finishLogin(w, r, req, key, user, token, refresh, "directory")
+}
+
+// finishLogin records the session origin, audits the sign-in and writes the
+// token pair. detail names the factor that proved the identity.
+func (s *server) finishLogin(w http.ResponseWriter, r *http.Request, req loginRequest, key string, user account.User, token, refresh, detail string) {
+	s.cfg.LoginLimiter.Success(key)
+	ip := s.clientIP(r)
+	if err := s.cfg.Accounts.SetSessionOrigin(token, ip, s.clientLocation(ip)); err != nil {
+		s.cfg.Logger.Error("account session origin", "error", err)
+	}
 	if device := strings.TrimSpace(req.DeviceName); device != "" {
 		detail += " device=" + device
 	}
 	s.auditLogin(r, user.Username, detail, true)
-	s.cfg.Logger.Info("account login", "user", user.Username)
+	s.cfg.Logger.Info("account login", "user", user.Username, "method", detail)
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:              token,
 		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
@@ -859,17 +959,41 @@ func (s *server) shareAddressBook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Username) == "" {
-		writeError(w, http.StatusBadRequest, "username is required")
+	if strings.TrimSpace(req.Username) == "" && strings.TrimSpace(req.Target) == "" {
+		writeError(w, http.StatusBadRequest, "username or target is required")
 		return
 	}
-	grant, err := s.cfg.Accounts.ShareBookScoped(user.ID, req.Username, req.Permission, req.GroupID)
+	var (
+		grant account.Grant
+		err   error
+	)
+	if target := strings.TrimSpace(req.Target); target != "" {
+		if strings.TrimSpace(req.Username) != "" {
+			writeError(w, http.StatusBadRequest, "username and target are mutually exclusive")
+			return
+		}
+		grant, err = s.cfg.Accounts.ShareBookTarget(user.ID, target, req.TargetID, req.Permission, req.GroupID)
+	} else {
+		grant, err = s.cfg.Accounts.ShareBookScoped(user.ID, req.Username, req.Permission, req.GroupID)
+	}
 	switch {
 	case errors.Is(err, account.ErrInvalidPermission):
 		writeError(w, http.StatusBadRequest, account.ErrInvalidPermission.Error())
 		return
+	case errors.Is(err, account.ErrInvalidShareTarget):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidShareTarget.Error())
+		return
+	case errors.Is(err, account.ErrInvalidAccountGroupID):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidAccountGroupID.Error())
+		return
 	case errors.Is(err, account.ErrInvalidGroupID):
 		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupID.Error())
+		return
+	case errors.Is(err, account.ErrUnknownAccountGroup):
+		writeError(w, http.StatusNotFound, "account group is unknown")
+		return
+	case errors.Is(err, account.ErrShareTargetMember):
+		writeError(w, http.StatusForbidden, "account group membership is required")
 		return
 	case errors.Is(err, account.ErrUnknownGroup):
 		writeError(w, http.StatusNotFound, "address book group is unknown")
@@ -886,6 +1010,45 @@ func (s *server) shareAddressBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, viewAddressBookGrant(grant))
+}
+
+// unshareAddressBookTarget revokes group or everyone grants. The address-book
+// scope is optional: without group_id every scope for the target is removed.
+func (s *server) unshareAddressBookTarget(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	query := r.URL.Query()
+	var err error
+	if query.Has("group_id") {
+		err = s.cfg.Accounts.UnshareBookTargetScope(
+			user.ID, query.Get("kind"), query.Get("target_id"), query.Get("group_id"),
+		)
+	} else {
+		err = s.cfg.Accounts.UnshareBookTarget(
+			user.ID, query.Get("kind"), query.Get("target_id"),
+		)
+	}
+	switch {
+	case errors.Is(err, account.ErrUnknownShare):
+		writeError(w, http.StatusNotFound, "address book is not shared with that target")
+		return
+	case errors.Is(err, account.ErrInvalidShareTarget):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidShareTarget.Error())
+		return
+	case errors.Is(err, account.ErrInvalidAccountGroupID):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidAccountGroupID.Error())
+		return
+	case errors.Is(err, account.ErrInvalidGroupID):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupID.Error())
+		return
+	case err != nil:
+		s.cfg.Logger.Error("address book unshare target", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not revoke the address book share")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) unshareAddressBook(w http.ResponseWriter, r *http.Request) {
@@ -1003,8 +1166,8 @@ func (s *server) addSharedAddressBookPeer(w http.ResponseWriter, r *http.Request
 	if req.IfRevision != nil {
 		ifRevision = *req.IfRevision
 	}
-	peer, err := s.cfg.Accounts.AddSharedPeerScoped(
-		user.ID, r.PathValue("owner"), req.ID, req.GroupID, req.Name, req.Tags, ifRevision,
+	peer, err := s.cfg.Accounts.AddSharedPeerNoteScoped(
+		user.ID, r.PathValue("owner"), req.ID, req.GroupID, req.Name, req.Tags, req.Note, ifRevision,
 	)
 	if s.sharedAddressBookError(w, "shared address book add", err) {
 		return
@@ -1022,8 +1185,8 @@ func (s *server) updateSharedAddressBookPeer(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Name == nil && req.Tags == nil {
-		writeError(w, http.StatusBadRequest, "name or tags is required")
+	if req.Name == nil && req.Tags == nil && req.Note == nil {
+		writeError(w, http.StatusBadRequest, "name, tags or note is required")
 		return
 	}
 	if req.IfRevision != nil && *req.IfRevision <= 0 {
@@ -1034,8 +1197,9 @@ func (s *server) updateSharedAddressBookPeer(w http.ResponseWriter, r *http.Requ
 	if req.IfRevision != nil {
 		ifRevision = *req.IfRevision
 	}
-	peer, err := s.cfg.Accounts.UpdateSharedPeerAt(
-		user.ID, r.PathValue("owner"), r.PathValue("id"), req.Name, req.Tags, ifRevision,
+	peer, err := s.cfg.Accounts.UpdateSharedPeerEditAt(
+		user.ID, r.PathValue("owner"), r.PathValue("id"),
+		account.PeerEdit{Name: req.Name, Tags: req.Tags, Note: req.Note}, ifRevision,
 	)
 	if s.sharedAddressBookError(w, "shared address book write", err) {
 		return
@@ -1103,6 +1267,10 @@ func (s *server) shareSharedAddressBook(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "username is required")
 		return
 	}
+	if strings.TrimSpace(req.Target) != "" {
+		writeError(w, http.StatusBadRequest, "group and everyone targets are only supported on your own address book")
+		return
+	}
 	grant, err := s.cfg.Accounts.ShareBookScopedAs(
 		user.ID, r.PathValue("owner"), req.Username, req.Permission, req.GroupID,
 	)
@@ -1143,8 +1311,9 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Name == nil && req.Tags == nil && req.GroupID == nil && req.Position == nil {
-		writeError(w, http.StatusBadRequest, "name, tags, group_id or position is required")
+	if req.Name == nil && req.Tags == nil && req.Note == nil &&
+		req.GroupID == nil && req.Position == nil {
+		writeError(w, http.StatusBadRequest, "name, tags, note, group_id or position is required")
 		return
 	}
 	if req.Position != nil && *req.Position < 0 {
@@ -1164,7 +1333,7 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 		peer account.Peer
 		err  error
 	)
-	if req.Name == nil && req.Tags == nil && req.Position == nil {
+	if req.Name == nil && req.Tags == nil && req.Note == nil && req.Position == nil {
 		groupID := strings.TrimSpace(*req.GroupID)
 		peer, err = s.cfg.Accounts.SetPeerGroupAt(user.ID, peerID, groupID, ifRevision)
 	} else {
@@ -1173,7 +1342,14 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 			trimmed := strings.TrimSpace(*req.GroupID)
 			groupID = &trimmed
 		}
-		peer, err = s.cfg.Accounts.UpdatePeerAt(user.ID, peerID, req.Name, req.Tags, groupID, req.Position, ifRevision)
+		peer, err = s.cfg.Accounts.UpdatePeerEditAt(user.ID, peerID,
+			account.PeerEdit{
+				Name:     req.Name,
+				Tags:     req.Tags,
+				Note:     req.Note,
+				GroupID:  groupID,
+				Position: req.Position,
+			}, ifRevision)
 	}
 	switch {
 	case errors.Is(err, account.ErrInvalidPeerID):
@@ -1316,6 +1492,88 @@ func (s *server) deleteAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// addressBookTrash lists deleted entries kept for restore. It is a separate
+// read from the incremental snapshot because viewers never need tombstone
+// contents to drop a deleted peer.
+type addressBookTrashResponse struct {
+	Peers []addressBookPeer `json:"peers"`
+}
+
+func (s *server) addressBookTrash(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	peers, err := s.cfg.Accounts.Trash(user.ID)
+	if err != nil {
+		s.cfg.Logger.Error("address book trash read", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read the address book trash")
+		return
+	}
+	view := make([]addressBookPeer, 0, len(peers))
+	for _, peer := range peers {
+		view = append(view, viewAddressBookPeer(peer))
+	}
+	writeJSON(w, http.StatusOK, addressBookTrashResponse{Peers: view})
+}
+
+func (s *server) restoreAddressBookPeer(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	peer, err := s.cfg.Accounts.RestorePeer(user.ID, r.PathValue("id"))
+	switch {
+	case errors.Is(err, account.ErrInvalidPeerID):
+		writeError(w, http.StatusBadRequest, "peer id is invalid")
+		return
+	case errors.Is(err, account.ErrUnknownPeer):
+		writeError(w, http.StatusNotFound, "address book trash entry is unknown")
+		return
+	case err != nil:
+		s.cfg.Logger.Error("address book restore", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not restore the address book entry")
+		return
+	}
+	writeJSON(w, http.StatusOK, viewAddressBookPeer(peer))
+}
+
+func (s *server) purgeAddressBookPeer(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	removed, err := s.cfg.Accounts.PurgePeer(user.ID, r.PathValue("id"))
+	if errors.Is(err, account.ErrInvalidPeerID) {
+		writeError(w, http.StatusBadRequest, "peer id is invalid")
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Error("address book purge", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not purge the address book entry")
+		return
+	}
+	if !removed {
+		writeError(w, http.StatusNotFound, "address book trash entry is unknown")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) emptyAddressBookTrash(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	removed, err := s.cfg.Accounts.EmptyTrash(user.ID)
+	if err != nil {
+		s.cfg.Logger.Error("address book trash empty", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not empty the address book trash")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"removed": removed})
 }
 
 func (s *server) accountUser(w http.ResponseWriter, r *http.Request) (account.User, bool) {

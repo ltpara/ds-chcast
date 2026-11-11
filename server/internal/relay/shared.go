@@ -32,6 +32,9 @@ type SharedCarrier struct {
 	transport *transportGuard
 	policy    *Policy
 	log       *slog.Logger
+	// proxyHeader mirrors Manager.proxyHeader: a WebSocket handshake header
+	// trusted as the viewer IP when the carrier is behind a reverse proxy.
+	proxyHeader string
 
 	mu       sync.Mutex
 	hosts    map[string]*sharedHost
@@ -110,19 +113,20 @@ func listenSharedCarrier(bind string, bind6 net.IP) ([]net.Listener, error) {
 }
 
 func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, transport *transportGuard,
-	policy *Policy, log *slog.Logger) (*SharedCarrier, error) {
+	policy *Policy, log *slog.Logger, proxyHeader string) (*SharedCarrier, error) {
 	lns, err := listenSharedCarrier(bind, bind6)
 	if err != nil {
 		return nil, err
 	}
 	sc := &SharedCarrier{
-		lns:       lns,
-		addrs:     make([]string, 0, len(lns)),
-		auth:      auth,
-		transport: transport,
-		policy:    policy,
-		log:       log,
-		hosts:     make(map[string]*sharedHost),
+		lns:         lns,
+		addrs:       make([]string, 0, len(lns)),
+		auth:        auth,
+		transport:   transport,
+		policy:      policy,
+		log:         log,
+		proxyHeader: proxyHeader,
+		hosts:       make(map[string]*sharedHost),
 	}
 	for _, ln := range lns {
 		sc.addrs = append(sc.addrs, ln.Addr().String())
@@ -248,7 +252,7 @@ func (sc *SharedCarrier) handle(conn net.Conn) {
 		sc.serveViewer(&carrierViewer{
 			conn: conn,
 			ws:   ws,
-			peer: conn.RemoteAddr().String(),
+			peer: wsPeer(conn, ws, sc.proxyHeader),
 		}, hello)
 	case strings.HasPrefix(string(prefix), "CHAS"):
 		line, err := carrier.ReadLine(br, 64)

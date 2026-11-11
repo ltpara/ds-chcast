@@ -1678,6 +1678,24 @@ func (v *ViewerAgent) fallBackToRelay(reason string) {
 	v.reportPath()
 }
 
+// noteRelayHint acts on the host's relay decision, the counterpart of
+// RustDesk's RelayResponse. A path that already answered or an established
+// carrier session is left alone: the hint only ends a punch that the peer has
+// already classified as impossible, which is what a symmetric NAT does.
+func (v *ViewerAgent) noteRelayHint(msg wire.Message) {
+	if msg.Nonce == "" || msg.Nonce != v.nonce {
+		return
+	}
+	if msg.HostID != "" && msg.HostID != v.cfg.HostID {
+		return
+	}
+	if v.directOK.Load() || v.tcpActive.Load() || v.carrierMode {
+		return
+	}
+	v.log.Info("host chose the relay; ending the direct attempt")
+	v.fallBackToRelay("host chose the relay")
+}
+
 func (v *ViewerAgent) handleControl(src *net.UDPAddr, data []byte) {
 	msg, err := wire.Decode(data)
 	if err != nil {
@@ -1739,6 +1757,8 @@ func (v *ViewerAgent) handleControl(src *net.UDPAddr, data []byte) {
 				v.punched.Store(true)
 			}
 		}
+	case wire.TypeRelayHint:
+		v.noteRelayHint(msg)
 	case wire.TypeBusy:
 		v.log.Warn("relay is busy", "error", msg.Error)
 	case wire.TypeRelayViewerAck:

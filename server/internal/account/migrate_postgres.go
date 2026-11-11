@@ -26,8 +26,61 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[11].Apply = applyRevokedAccessKidsPostgres
 	list[12].Apply = applyPolicyObjectsPostgres
 	list[13].Apply = applyDevicePolicyVersionSequencePostgres
+	list[14].Apply = applyAddressBookTargetGrantsPostgres
+	list[15].Apply = applySessionPermissionCapsPostgres
+	list[16].Apply = applyLDAPIdentitiesPostgres
 	return list
 }()
+
+// applyLDAPIdentitiesPostgres mirrors the SQLite directory link table.
+func applyLDAPIdentitiesPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS ldap_identities (
+			dn         TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at BIGINT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS ldap_identities_user ON ldap_identities(user_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL ldap identity link: %w", err)
+		}
+	}
+	return nil
+}
+
+// applySessionPermissionCapsPostgres mirrors the SQLite account session cap
+// column; PostgreSQL needs its own idempotent ALTER syntax.
+func applySessionPermissionCapsPostgres(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS
+		session_permission_ceiling BIGINT NOT NULL DEFAULT 0`)
+	if err != nil {
+		return fmt.Errorf("migrate PostgreSQL account session caps: %w", err)
+	}
+	return nil
+}
+
+// applyAddressBookTargetGrantsPostgres mirrors the SQLite target grant table.
+func applyAddressBookTargetGrantsPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS address_book_target_grants (
+			owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			target_kind   TEXT NOT NULL,
+			target_id     TEXT NOT NULL DEFAULT '',
+			group_id      TEXT NOT NULL DEFAULT '',
+			permission    TEXT NOT NULL DEFAULT 'read',
+			created_at    BIGINT NOT NULL,
+			PRIMARY KEY (owner_user_id, target_kind, target_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS address_book_target_grants_target
+			ON address_book_target_grants(target_kind, target_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL address book target grants: %w", err)
+		}
+	}
+	return nil
+}
 
 // applyPolicyObjectsPostgres mirrors the SQLite migration. PostgreSQL needs
 // its own ALTER syntax because ensureColumn reads PRAGMA table_info.
@@ -311,6 +364,7 @@ func applyAccountPostgresBaseline(db *sql.DB) error {
 			peer_id    TEXT NOT NULL,
 			name       TEXT NOT NULL DEFAULT '',
 			tags       TEXT NOT NULL DEFAULT '',
+			note       TEXT NOT NULL DEFAULT '',
 			updated_at BIGINT NOT NULL,
 			revision   BIGINT NOT NULL DEFAULT 0,
 			deleted    BOOLEAN NOT NULL DEFAULT false,
@@ -467,6 +521,8 @@ func applyAccountPostgresBaseline(db *sql.DB) error {
 			location TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE file_events ADD COLUMN IF NOT EXISTS
 			route TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE address_book ADD COLUMN IF NOT EXISTS
+			note TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

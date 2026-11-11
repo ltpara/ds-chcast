@@ -291,3 +291,49 @@ func TestWebSocketHandshakeRefusal(t *testing.T) {
 		t.Fatal("a wrong subprotocol was accepted")
 	}
 }
+
+func TestUpgradeServerRetainsHandshakeHeaders(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() {
+		server.Close()
+		client.Close()
+	})
+	request := strings.Replace(testWSRequest, "Host: 127.0.0.1\r\n",
+		"Host: 127.0.0.1\r\nX-Real-IP: 203.0.113.9\r\n"+
+			"X-Forwarded-For: 198.51.100.4, 10.0.0.1\r\n", 1)
+	type result struct {
+		ws  *WSConn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ws, err := UpgradeServer(server, bufio.NewReader(server))
+		done <- result{ws, err}
+	}()
+	if _, err := io.WriteString(client, request); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	cr := bufio.NewReader(client)
+	for {
+		line, err := cr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("upgrade: %v", res.err)
+	}
+	if got := res.ws.Header("X-Real-IP"); got != "203.0.113.9" {
+		t.Fatalf("X-Real-IP = %q", got)
+	}
+	if got := res.ws.Header("x-forwarded-for"); got != "198.51.100.4, 10.0.0.1" {
+		t.Fatalf("X-Forwarded-For = %q", got)
+	}
+	if got := res.ws.Header("X-Absent"); got != "" {
+		t.Fatalf("absent header = %q", got)
+	}
+}

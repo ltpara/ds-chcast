@@ -141,6 +141,86 @@ func TestAuditLocationRouteAndBatch(t *testing.T) {
 	}
 }
 
+func TestAuditUserFilter(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "correct horse"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	login(t, s.URL, "alice", "correct horse")
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/login",
+		`{"username":"bob","password":"wrong horse"}`, ""); status != http.StatusUnauthorized {
+		t.Fatalf("failed bob login: %d %s", status, body)
+	}
+	login(t, s.URL, "bob", "correct horse")
+
+	type eventReply struct {
+		Username string `json:"username"`
+		Action   string `json:"action"`
+		Success  bool   `json:"success"`
+	}
+	type auditReply struct {
+		Events []eventReply `json:"events"`
+	}
+	list := func(query string) auditReply {
+		t.Helper()
+		status, body := request(t, http.MethodGet, s.URL+"/v1/audit"+query, "", testutil.ServerKey)
+		if status != http.StatusOK {
+			t.Fatalf("audit%s: %d %s", query, status, body)
+		}
+		var reply auditReply
+		if err := json.Unmarshal(body, &reply); err != nil {
+			t.Fatalf("audit%s reply: %v", query, err)
+		}
+		return reply
+	}
+
+	alice := list("?user=alice")
+	if len(alice.Events) != 1 || alice.Events[0].Username != "alice" ||
+		alice.Events[0].Action != "login" || !alice.Events[0].Success {
+		t.Fatalf("alice events = %+v", alice.Events)
+	}
+	// A failed attempt and a successful login both hang off bob's trail.
+	bob := list("?user=bob")
+	if len(bob.Events) != 2 {
+		t.Fatalf("bob events = %+v", bob.Events)
+	}
+	for _, event := range bob.Events {
+		if event.Username != "bob" || event.Action != "login" {
+			t.Fatalf("bob event leaked another account: %+v", event)
+		}
+	}
+	if !bob.Events[0].Success || bob.Events[1].Success {
+		t.Fatalf("bob events out of order: %+v", bob.Events)
+	}
+	// Whitespace from a hand-built query is trimmed like the other filters.
+	if padded := list("?user=+bob+"); len(padded.Events) != 2 {
+		t.Fatalf("padded bob events = %+v", padded.Events)
+	}
+	if combo := list("?user=bob&action=login&limit=1"); len(combo.Events) != 1 {
+		t.Fatalf("bob login page = %+v", combo.Events)
+	}
+	if unknown := list("?user=carol"); len(unknown.Events) != 0 {
+		t.Fatalf("unknown user returned %+v", unknown.Events)
+	}
+
+	rows := exportCSV(t, s.URL+"/v1/audit?format=csv&user=bob")
+	if len(rows) != 3 {
+		t.Fatalf("csv rows = %v", rows)
+	}
+	for _, row := range rows[1:] {
+		if row[2] != "bob" {
+			t.Fatalf("csv row leaked another account: %v", row)
+		}
+	}
+	rows = exportCSV(t, s.URL+"/v1/audit?format=csv&user=bob&action=login")
+	if len(rows) != 3 || rows[1][3] != "login" || rows[2][3] != "login" {
+		t.Fatalf("csv action rows = %v", rows)
+	}
+}
+
 func TestAuditWithoutGeoIPRecordsIPOnly(t *testing.T) {
 	s := testutil.Start(t)
 	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {

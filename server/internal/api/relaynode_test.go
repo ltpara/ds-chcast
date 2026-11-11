@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
 
@@ -562,6 +565,45 @@ func (n *stubNode) leaseRequestCount() int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.requests
+}
+
+// TestRegistrationLeasesRelayInHostRegion ties the GeoIP label of the
+// registering host to --relay-node-regions: the host lands on the node that
+// serves its own region instead of the round-robin first node.
+func TestRegistrationLeasesRelayInHostRegion(t *testing.T) {
+	europe := newStubNode(t, "relay-eu.example", "relay-eu.example:8448")
+	america := newStubNode(t, "relay-us.example", "relay-us.example:8448")
+	table := filepath.Join(t.TempDir(), "geoip.txt")
+	if err := os.WriteFile(table, []byte("127.0.0.1/32 Europe/Berlin\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locator, err := geoip.Load(table)
+	if err != nil {
+		t.Fatalf("load geoip: %v", err)
+	}
+	s := testutil.StartWith(t, testutil.Options{
+		RelayNodes:       []string{europe.url, america.url},
+		RelayNodeRegions: map[string]string{europe.url: "Europe/Berlin"},
+		RelayNodeHealth:  20 * time.Millisecond,
+		GeoIP:            locator,
+	})
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "devbox", "correct horse", "AB12", time.Now().Unix()), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	var reply struct {
+		Relay string `json:"relay"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if !hasHostPrefix(reply.Relay, "relay-eu.example:") {
+		t.Fatalf("regional relay = %q, want relay-eu.example", reply.Relay)
+	}
+	if america.leaseRequestCount() != 0 {
+		t.Fatalf("out-of-region node received %d lease requests", america.leaseRequestCount())
+	}
 }
 
 func localPortAssigned(s *testutil.Server, id string, port int) bool {

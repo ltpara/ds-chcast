@@ -156,6 +156,81 @@ func TestPolicyAssignmentValidation(t *testing.T) {
 	}
 }
 
+// TestDevicePolicyAssignmentBatch covers the transactional bulk path: input is
+// bounded, duplicate ids collapse, existing assignments are reported as
+// skipped instead of failing the call, and an over-quota batch rolls back
+// completely so no partial list is left behind.
+func TestDevicePolicyAssignmentBatch(t *testing.T) {
+	store := openGroupStore(t)
+	policy := mustCreatePolicy(t, store, "profile", DevicePolicyOpen, 4, nil, nil)
+
+	if _, err := store.CreateDevicePolicyAssignments(policy.ID, nil, 0, "root"); !errors.Is(err, ErrInvalidPolicyAssignmentBatch) {
+		t.Fatalf("empty batch = %v", err)
+	}
+	tooMany := make([]string, MaxPolicyAssignmentBatch+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("device%04d", i)
+	}
+	if _, err := store.CreateDevicePolicyAssignments(policy.ID, tooMany, 0, "root"); !errors.Is(err, ErrInvalidPolicyAssignmentBatch) {
+		t.Fatalf("oversized batch = %v", err)
+	}
+	if _, err := store.CreateDevicePolicyAssignments(policy.ID, []string{"devbox"}, maxPolicyPriority+1, "root"); !errors.Is(err, ErrInvalidPolicyPriority) {
+		t.Fatalf("bad priority = %v", err)
+	}
+	if _, err := store.CreateDevicePolicyAssignments("nope", []string{"devbox"}, 0, "root"); !errors.Is(err, ErrUnknownPolicyObject) {
+		t.Fatalf("unknown policy = %v", err)
+	}
+	if _, err := store.CreateDevicePolicyAssignments(policy.ID, []string{"devbox", "bad id"}, 0, "root"); !errors.Is(err, ErrInvalidPolicyScope) {
+		t.Fatalf("bad device id = %v", err)
+	}
+	if assignments, err := store.PolicyAssignments(); err != nil || len(assignments) != 0 {
+		t.Fatalf("failed batches wrote rows = %+v %v", assignments, err)
+	}
+
+	batch, err := store.CreateDevicePolicyAssignments(policy.ID, []string{"devbox", "laptop", "devbox"}, 7, "root")
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if batch.PolicyName != "profile" || len(batch.Created) != 2 || len(batch.Skipped) != 0 ||
+		batch.Created[0].ScopeValue != "devbox" || batch.Created[1].ScopeValue != "laptop" ||
+		batch.Created[0].Priority != 7 || batch.Created[0].CreatedBy != "root" ||
+		batch.Created[0].ScopeKind != PolicyScopeDevice {
+		t.Fatalf("batch = %+v", batch)
+	}
+	second, err := store.CreateDevicePolicyAssignments(policy.ID, []string{"devbox", "desk"}, 7, "root")
+	if err != nil || len(second.Created) != 1 || len(second.Skipped) != 1 || second.Skipped[0] != "devbox" {
+		t.Fatalf("second batch = %+v %v", second, err)
+	}
+	assignments, err := store.PolicyAssignments()
+	if err != nil || len(assignments) != 3 {
+		t.Fatalf("assignments = %+v %v", assignments, err)
+	}
+
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatalf("begin quota seed: %v", err)
+	}
+	for i := 0; i < maxPolicyAssignments-3; i++ {
+		if _, err := tx.Exec(
+			`INSERT INTO policy_assignments (id, policy_id, scope_kind, scope_value, priority, created_at)
+			 VALUES (?, ?, 'device', ?, 0, 0)`,
+			fmt.Sprintf("quota%04d", i), policy.ID, fmt.Sprintf("seed%04d", i),
+		); err != nil {
+			tx.Rollback()
+			t.Fatalf("seed assignment %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit quota seed: %v", err)
+	}
+	if _, err := store.CreateDevicePolicyAssignments(policy.ID, []string{"alpha", "beta"}, 0, "root"); !errors.Is(err, ErrPolicyAssignmentQuota) {
+		t.Fatalf("batch quota = %v", err)
+	}
+	if assignments, err := store.PolicyAssignments(); err != nil || len(assignments) != maxPolicyAssignments {
+		t.Fatalf("quota rollback left %d rows (%v)", len(assignments), err)
+	}
+}
+
 func TestPolicyObjectAndAssignmentQuotas(t *testing.T) {
 	store := openGroupStore(t)
 	tx, err := store.db.Begin()

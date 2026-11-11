@@ -154,7 +154,8 @@ func (s *Store) Load() ([]Identity, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT id, public_key, fingerprint, hostname, platform, version,
-		metadata_signature, alias, tags, wake_targets, created_at, last_seen FROM peers ORDER BY id`)
+		metadata_signature, alias, tags, wake_targets, disabled, owner, created_at, last_seen
+		FROM peers ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("state %s: load peers: %w", s.path, err)
 	}
@@ -164,11 +165,12 @@ func (s *Store) Load() ([]Identity, error) {
 		var (
 			record              Identity
 			tags, wakeTargets   string
+			disabled            int
 			createdAt, lastSeen int64
 		)
 		if err := rows.Scan(&record.ID, &record.PublicKey, &record.Fingerprint,
 			&record.Hostname, &record.Platform, &record.Version, &record.MetadataSignature,
-			&record.Alias, &tags, &wakeTargets, &createdAt, &lastSeen); err != nil {
+			&record.Alias, &tags, &wakeTargets, &disabled, &record.Owner, &createdAt, &lastSeen); err != nil {
 			return nil, fmt.Errorf("state %s: read peer: %w", s.path, err)
 		}
 		if !ValidID(record.ID) {
@@ -184,6 +186,7 @@ func (s *Store) Load() ([]Identity, error) {
 		record.LastSeen = timeFromMillis(lastSeen)
 		record.Tags = decodeTags(tags)
 		record.WakeTargets = decodeList(wakeTargets)
+		record.Disabled = disabled != 0
 		out = append(out, record)
 	}
 	if err := rows.Err(); err != nil {
@@ -204,10 +207,16 @@ func (s *Store) Save(record Identity) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Both dialects store the flag as 0/1 so one scan type works everywhere;
+	// pgx would reject a Go bool bound to an INTEGER column.
+	disabled := 0
+	if record.Disabled {
+		disabled = 1
+	}
 	_, err := s.db.Exec(`INSERT INTO peers
 		(id, public_key, fingerprint, hostname, platform, version, metadata_signature,
-		 alias, tags, wake_targets, created_at, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 alias, tags, wake_targets, disabled, owner, created_at, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			public_key = excluded.public_key,
 			fingerprint = excluded.fingerprint,
@@ -218,10 +227,13 @@ func (s *Store) Save(record Identity) error {
 			alias = excluded.alias,
 			tags = excluded.tags,
 			wake_targets = excluded.wake_targets,
+			disabled = excluded.disabled,
+			owner = excluded.owner,
 			last_seen = excluded.last_seen`,
 		record.ID, record.PublicKey, record.Fingerprint, record.Hostname,
 		record.Platform, record.Version, record.MetadataSignature, record.Alias,
 		encodeTags(record.Tags), encodeList(record.WakeTargets),
+		disabled, record.Owner,
 		unixMillis(record.CreatedAt), unixMillis(record.LastSeen))
 	if err != nil {
 		return fmt.Errorf("state %s: save peer %s: %w", s.path, record.ID, err)

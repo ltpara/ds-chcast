@@ -251,3 +251,146 @@ func TestViewerPunchRequiresNonce(t *testing.T) {
 	}
 	t.Fatal("punch with the matching nonce was not accepted")
 }
+
+// The host's relay decision ends an auto punch without waiting for the direct
+// timeout, mirroring the RelayResponse path in RustDesk.
+func TestViewerRelayHintEndsDirectAttempt(t *testing.T) {
+	out, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	direct := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+	v := &ViewerAgent{
+		out:    out,
+		ctx:    ctx,
+		log:    quietLogger(),
+		cfg:    ViewerConfig{Mode: ModeAuto, HostID: "devbox"},
+		nonce:  "viewer-nonce-1234",
+		direct: direct,
+		remote: direct,
+		relay:  relay.LocalAddr().(*net.UDPAddr),
+	}
+	v.noteRelayHint(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: "viewer-nonce-1234",
+	})
+	if !v.fellBack {
+		t.Fatal("the relay hint did not end the direct attempt")
+	}
+	v.mu.Lock()
+	remote := cloneAddr(v.remote)
+	v.mu.Unlock()
+	if !sameAddr(remote, v.relay) {
+		t.Fatalf("remote after hint = %v, want relay %v", remote, v.relay)
+	}
+}
+
+func TestViewerRelayHintIgnoresLiveOrForeignSession(t *testing.T) {
+	direct := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+	relay := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002}
+	newViewer := func(mode string) *ViewerAgent {
+		return &ViewerAgent{
+			ctx:    context.Background(),
+			log:    quietLogger(),
+			cfg:    ViewerConfig{Mode: mode, HostID: "devbox"},
+			nonce:  "viewer-nonce-1234",
+			direct: direct,
+			remote: direct,
+			relay:  relay,
+		}
+	}
+
+	for name, test := range map[string]struct {
+		mode   string
+		mutate func(*ViewerAgent)
+		msg    wire.Message
+	}{
+		"foreign nonce": {
+			msg: wire.Message{Type: wire.TypeRelayHint, HostID: "devbox", Nonce: "ffffffffffffffff"},
+		},
+		"foreign host": {
+			msg: wire.Message{Type: wire.TypeRelayHint, HostID: "other", Nonce: "viewer-nonce-1234"},
+		},
+		"direct already answered": {
+			mutate: func(v *ViewerAgent) { v.directOK.Store(true) },
+			msg:    wire.Message{Type: wire.TypeRelayHint, HostID: "devbox", Nonce: "viewer-nonce-1234"},
+		},
+		"direct mode": {
+			mode: ModeDirect,
+			msg:  wire.Message{Type: wire.TypeRelayHint, HostID: "devbox", Nonce: "viewer-nonce-1234"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mode := test.mode
+			if mode == "" {
+				mode = ModeAuto
+			}
+			v := newViewer(mode)
+			if test.mutate != nil {
+				test.mutate(v)
+			}
+			v.noteRelayHint(test.msg)
+			if v.fellBack {
+				t.Fatal("the hint changed a path it should not touch")
+			}
+			v.mu.Lock()
+			remote := cloneAddr(v.remote)
+			v.mu.Unlock()
+			if !sameAddr(remote, direct) {
+				t.Fatalf("remote = %v, want the direct attempt", remote)
+			}
+		})
+	}
+}
+
+// The hint must travel through the same read loop as the other rendezvous
+// control messages, so a viewer never needs a second socket to hear it.
+func TestViewerAppliesRelayHintFromRendezvousSocket(t *testing.T) {
+	out, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	meet, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meet.Close()
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	direct := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+	v := &ViewerAgent{
+		out:    out,
+		ctx:    ctx,
+		log:    quietLogger(),
+		cfg:    ViewerConfig{Mode: ModeAuto, HostID: "devbox"},
+		nonce:  "viewer-nonce-1234",
+		punch:  meet.LocalAddr().(*net.UDPAddr),
+		direct: direct,
+		remote: direct,
+		relay:  relay.LocalAddr().(*net.UDPAddr),
+	}
+	go v.readLoop()
+	meet.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: "viewer-nonce-1234",
+	}), out.LocalAddr().(*net.UDPAddr))
+	deadline := time.Now().Add(2 * time.Second)
+	for !v.fellBack {
+		if time.Now().After(deadline) {
+			t.Fatal("the relay hint did not reach the agent")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

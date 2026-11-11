@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
@@ -37,6 +38,17 @@ func recv(t *testing.T, conn *net.UDPConn) wire.Message {
 		t.Fatalf("decode: %v", err)
 	}
 	return msg
+}
+
+func expectNoMessage(t *testing.T, conn *net.UDPConn, wait time.Duration) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(wait))
+	buf := make([]byte, 2048)
+	n, _, err := conn.ReadFromUDP(buf)
+	if err == nil {
+		msg, _ := wire.Decode(buf[:n])
+		t.Fatalf("unexpected datagram: %+v", msg)
+	}
 }
 
 func startMeet(t *testing.T, opts ...Option) (*Server, *registry.Registry, *net.UDPAddr, ed25519.PrivateKey) {
@@ -135,6 +147,108 @@ func TestKeepaliveAndPunchExchange(t *testing.T) {
 	}
 	if notify.Nonce != nonce || notify.ExpiresMS <= 0 {
 		t.Fatalf("host notification: %+v", notify)
+	}
+}
+
+// A host that classifies the punch as impossible answers with relay_hint; the
+// service forwards that decision to the exact socket that asked to punch, once.
+func TestHostRelayHintReachesTheViewer(t *testing.T) {
+	_, _, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	keepalive(t, host, meetAddr, priv)
+
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	if reply := recv(t, viewer); reply.Type != wire.TypePunchPeer || !reply.OK || reply.Relay == "" {
+		t.Fatalf("punch reply: %+v", reply)
+	}
+	if notify := recv(t, host); notify.Type != wire.TypePunchPeer {
+		t.Fatalf("host notification: %+v", notify)
+	}
+
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	hint := recv(t, viewer)
+	if hint.Type != wire.TypeRelayHint || hint.Nonce != nonce || hint.HostID != "devbox" {
+		t.Fatalf("relay hint: %+v", hint)
+	}
+	// The decision is single-shot: a repeated hint is not forwarded again.
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	expectNoMessage(t, viewer, 300*time.Millisecond)
+}
+
+// Only the registered host address may turn a punch into a relay decision, and
+// only for a nonce that viewer is actually waiting on.
+func TestRelayHintRequiresHostSourceAndPendingPunch(t *testing.T) {
+	_, _, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	stranger := listenUDP(t)
+	keepalive(t, host, meetAddr, priv)
+
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	recv(t, viewer)
+	recv(t, host)
+
+	stranger.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	expectNoMessage(t, viewer, 250*time.Millisecond)
+
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: "ffffffffffffffff",
+	}), meetAddr)
+	expectNoMessage(t, viewer, 250*time.Millisecond)
+
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypeRelayHint, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	if hint := recv(t, viewer); hint.Type != wire.TypeRelayHint || hint.Nonce != nonce {
+		t.Fatalf("relay hint after rejected sources: %+v", hint)
+	}
+}
+
+// Relay-only hides direct candidates in lookups and refuses TCP punch
+// coordination; the UDP punch port has to refuse too, or a viewer could still
+// open a direct path the operator disabled.
+func TestRelayOnlyRefusesPunchCoordination(t *testing.T) {
+	active := true
+	_, _, meetAddr, priv := startMeet(t, WithRelayOnly(func() bool { return active }))
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	keepalive(t, host, meetAddr, priv)
+
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	reply := recv(t, viewer)
+	if reply.OK || reply.Error == "" || reply.Type != wire.TypePunchPeer {
+		t.Fatalf("relay-only punch reply: %+v", reply)
+	}
+	if reply.Relay != "192.0.2.1:41000" {
+		t.Fatalf("relay-only reply did not offer the relay: %+v", reply)
+	}
+	expectNoMessage(t, host, 300*time.Millisecond)
+
+	active = false
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	if reply := recv(t, viewer); !reply.OK || reply.Candidate == "" {
+		t.Fatalf("punch after relay-only was disabled: %+v", reply)
+	}
+	if notify := recv(t, host); notify.Type != wire.TypePunchPeer || notify.Nonce != nonce {
+		t.Fatalf("host notification after relay-only was disabled: %+v", notify)
 	}
 }
 
@@ -543,23 +657,44 @@ func TestPunchForwardsViewerLocalAddrsOnSameNetwork(t *testing.T) {
 // The mismatch case cannot be exercised through the server without moving the
 // host's observed address away from its socket, so it is checked directly.
 func TestViewerLocalAddrsRequireSamePublicAddress(t *testing.T) {
+	s := &Server{}
 	host := registry.Host{Candidate: "198.51.100.7:5000"}
 	same := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 40000}
 	other := &net.UDPAddr{IP: net.ParseIP("198.51.100.8"), Port: 40000}
-	v4, v6 := viewerLocalAddrs(host, same,
+	v4, v6 := s.viewerLocalAddrs(host, same,
 		[]string{"192.168.1.20:55000"},
 		[]string{"[fd00::20]:55000"})
 	if len(v4) != 1 || len(v6) != 1 {
 		t.Fatalf("same address was not forwarded: %v %v", v4, v6)
 	}
-	if v4, v6 := viewerLocalAddrs(host, other,
+	if v4, v6 := s.viewerLocalAddrs(host, other,
 		[]string{"192.168.1.20:55000"},
 		[]string{"[fd00::20]:55000"}); len(v4) != 0 || len(v6) != 0 {
 		t.Fatalf("candidates crossed networks: %v %v", v4, v6)
 	}
-	if v4, v6 := viewerLocalAddrs(registry.Host{}, same,
+	if v4, v6 := s.viewerLocalAddrs(registry.Host{}, same,
 		[]string{"192.168.1.20:55000"}, nil); len(v4) != 0 || len(v6) != 0 {
 		t.Fatalf("candidates forwarded without an observed host address: %v %v", v4, v6)
+	}
+}
+
+// With the LAN mask, two different observed addresses on the same network are
+// one intranet, so the viewer's LAN candidates reach the host.
+func TestViewerLocalAddrsAcceptBothPeersOnTheLAN(t *testing.T) {
+	mask, err := lanmask.Parse("198.51.100.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{lanMask: mask}
+	host := registry.Host{Candidate: "198.51.100.7:5000"}
+	peer := &net.UDPAddr{IP: net.ParseIP("198.51.100.8"), Port: 40000}
+	v4, _ := s.viewerLocalAddrs(host, peer, []string{"192.168.1.20:55000"}, nil)
+	if len(v4) != 1 || v4[0] != "192.168.1.20:55000" {
+		t.Fatalf("LAN pair did not forward local candidates: %v", v4)
+	}
+	wan := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 40000}
+	if v4, _ := s.viewerLocalAddrs(host, wan, []string{"192.168.1.20:55000"}, nil); len(v4) != 0 {
+		t.Fatalf("a WAN viewer received LAN candidates: %v", v4)
 	}
 }
 

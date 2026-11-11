@@ -8,6 +8,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -18,6 +19,11 @@ func openHostControl(t *testing.T, meet *Server, id string, priv ed25519.Private
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
+	return conn, hostControlHandshake(t, meet, conn, id, priv)
+}
+
+func hostControlHandshake(t *testing.T, meet *Server, conn net.Conn, id string, priv ed25519.PrivateKey) wire.Message {
+	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	hello := wire.Message{Type: wire.TypeRendezvousControl, HostID: id, Nonce: "client-connection-nonce"}
 	writeAnnounce(conn, hello)
@@ -41,7 +47,8 @@ func openHostControl(t *testing.T, meet *Server, id string, priv ed25519.Private
 	if err != nil {
 		t.Fatal(err)
 	}
-	return conn, ack
+	_ = conn.SetDeadline(time.Time{})
+	return ack
 }
 
 func TestHostControlAuthenticatesBeforeBecomingOnline(t *testing.T) {
@@ -194,8 +201,9 @@ func TestTCPRetryReusesSessionAndDisconnectCleansUp(t *testing.T) {
 	}
 }
 
-func TestTCPLocalAddressOnlyReturnedForSameObservedIP(t *testing.T) {
+func TestTCPLocalAddressOnlyReturnedForSameNetwork(t *testing.T) {
 	peer := &tcpWait{observed: "198.51.100.1:45000", local: "192.168.1.2:35000"}
+	p := &tcpPuncher{srv: &Server{}}
 	for _, tc := range []struct {
 		observed, want string
 		local          bool
@@ -203,9 +211,20 @@ func TestTCPLocalAddressOnlyReturnedForSameObservedIP(t *testing.T) {
 		{"198.51.100.1:50000", "192.168.1.2:35000", true},
 		{"198.51.100.2:50000", "198.51.100.1:45000", false},
 	} {
-		got := tcpPeerResult(peer, &tcpWait{observed: tc.observed})
+		got := p.peerResult(peer, &tcpWait{observed: tc.observed})
 		if got.peer != tc.want || got.local != tc.local {
 			t.Fatalf("peer result = %+v", got)
 		}
+	}
+	// With the LAN mask both observed addresses on the same network count as
+	// one intranet, even when they differ.
+	mask, err := lanmask.Parse("198.51.100.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.srv.lanMask = mask
+	got := p.peerResult(peer, &tcpWait{observed: "198.51.100.9:50000"})
+	if got.peer != "192.168.1.2:35000" || !got.local {
+		t.Fatalf("masked peer result = %+v", got)
 	}
 }

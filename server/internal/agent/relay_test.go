@@ -108,3 +108,75 @@ func TestRelayChallengeAcceptedFromAdvertisedAddress(t *testing.T) {
 		t.Fatal("challenge from an unadvertised address produced a reply")
 	}
 }
+
+// When the viewer's NAT makes the v4 punch hopeless and no IPv6 or local path
+// exists, the host reports the relay decision to the rendezvous service, which
+// forwards it to the viewer. One message per punch is enough.
+func TestHostHintsRelayForSymmetricViewer(t *testing.T) {
+	h, _ := testHostAgent(t)
+	meet, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meet.Close()
+	meetAddr := meet.LocalAddr().(*net.UDPAddr)
+	h.mu.Lock()
+	h.punch = meetAddr
+	h.mu.Unlock()
+
+	msg := wire.Encode(wire.Message{
+		Type:      wire.TypePunchPeer,
+		Candidate: "203.0.113.7:40000",
+		NATType:   NATSymmetric,
+		Nonce:     "viewer-nonce-1234",
+	})
+	h.handleControl(msg, meetAddr)
+
+	meet.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, wire.MaxControlSize)
+	n, _, err := meet.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("relay hint was not sent: %v", err)
+	}
+	hint, err := wire.Decode(buf[:n])
+	if err != nil || hint.Type != wire.TypeRelayHint || hint.HostID != "devbox" ||
+		hint.Nonce != "viewer-nonce-1234" {
+		t.Fatalf("relay hint = %+v, err=%v", hint, err)
+	}
+
+	// A repeated punch notification for the same nonce must not duplicate it.
+	h.handleControl(msg, meetAddr)
+	meet.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, _, err := meet.ReadFromUDP(buf); err == nil {
+		t.Fatal("the same punch produced a second relay hint")
+	}
+}
+
+// A local path keeps the direct attempt alive: the relay decision would throw
+// away a punch that does not traverse the symmetric mapping.
+func TestHostSkipsRelayHintWithLocalPath(t *testing.T) {
+	h, _ := testHostAgent(t)
+	meet, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meet.Close()
+	meetAddr := meet.LocalAddr().(*net.UDPAddr)
+	h.mu.Lock()
+	h.punch = meetAddr
+	h.mu.Unlock()
+
+	h.handleControl(wire.Encode(wire.Message{
+		Type:       wire.TypePunchPeer,
+		Candidate:  "203.0.113.7:40000",
+		LocalAddrs: []string{"192.168.1.9:40000"},
+		NATType:    NATSymmetric,
+		Nonce:      "viewer-nonce-1234",
+	}), meetAddr)
+
+	meet.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, wire.MaxControlSize)
+	if _, _, err := meet.ReadFromUDP(buf); err == nil {
+		t.Fatal("a local candidate still produced a relay hint")
+	}
+}

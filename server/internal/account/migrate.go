@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 14
+const accountSchemaVersion = 17
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -28,6 +28,66 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 12, Name: "revoked access ticket keys", Apply: applyRevokedAccessKids},
 	{Version: 13, Name: "policy objects and assignments", Apply: applyPolicyObjects},
 	{Version: 14, Name: "device policy version sequence", Apply: applyDevicePolicyVersionSequence},
+	{Version: 15, Name: "address book target grants", Apply: applyAddressBookTargetGrants},
+	{Version: 16, Name: "account session permission caps", Apply: applySessionPermissionCaps},
+	{Version: 17, Name: "ldap identities", Apply: applyLDAPIdentities},
+}
+
+// applyLDAPIdentities links a directory entry's DN to the local account that
+// signed in through it. The link is what makes the directory authoritative for
+// that account: a linked login never falls back to the local password.
+func applyLDAPIdentities(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS ldap_identities (
+			dn         TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS ldap_identities_user ON ldap_identities(user_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create ldap identity link: %w", err)
+		}
+	}
+	return nil
+}
+
+// applySessionPermissionCaps adds the account-wide session permission ceiling.
+// It is intersected with the device policy ceiling when a ticket is issued, so
+// an account can be limited to, say, view-only across every managed device
+// without editing each policy. Zero keeps the account uncapped.
+func applySessionPermissionCaps(db *sql.DB) error {
+	if err := ensureColumn(db, "users", "session_permission_ceiling",
+		"session_permission_ceiling INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate users.session_permission_ceiling: %w", err)
+	}
+	return nil
+}
+
+// applyAddressBookTargetGrants adds grants addressed to an operator-managed
+// account group or to every account. User-addressed grants stay in
+// address_book_grants so the long-standing unique key and query shape keep
+// working; this table only resolves the extra targets at read time, which
+// means group membership changes take effect without rewriting grants.
+func applyAddressBookTargetGrants(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS address_book_target_grants (
+			owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			target_kind   TEXT NOT NULL,
+			target_id     TEXT NOT NULL DEFAULT '',
+			group_id      TEXT NOT NULL DEFAULT '',
+			permission    TEXT NOT NULL DEFAULT 'read',
+			created_at    INTEGER NOT NULL,
+			PRIMARY KEY (owner_user_id, target_kind, target_id, group_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS address_book_target_grants_target
+			ON address_book_target_grants(target_kind, target_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create address book target grants: %w", err)
+		}
+	}
+	return nil
 }
 
 // applyPolicyObjects adds the authoring layer above device_policies: named
@@ -476,6 +536,7 @@ func applyAccountBaseline(db *sql.DB) error {
 			peer_id    TEXT NOT NULL,
 			name       TEXT NOT NULL DEFAULT '',
 			tags       TEXT NOT NULL DEFAULT '',
+			note       TEXT NOT NULL DEFAULT '',
 			updated_at INTEGER NOT NULL,
 			revision   INTEGER NOT NULL DEFAULT 0,
 			deleted    INTEGER NOT NULL DEFAULT 0,
@@ -582,6 +643,7 @@ func applyAccountBaseline(db *sql.DB) error {
 		{"address_book", "revision", "revision INTEGER NOT NULL DEFAULT 0"},
 		{"address_book", "deleted", "deleted INTEGER NOT NULL DEFAULT 0"},
 		{"address_book", "group_id", "group_id TEXT NOT NULL DEFAULT ''"},
+		{"address_book", "note", "note TEXT NOT NULL DEFAULT ''"},
 		{"address_book_grants", "permission", "permission TEXT NOT NULL DEFAULT 'read'"},
 		{"user_tokens", "session_id", "session_id TEXT NOT NULL DEFAULT ''"},
 		{"user_tokens", "device_id", "device_id TEXT NOT NULL DEFAULT ''"},

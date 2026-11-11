@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
 
@@ -187,6 +188,19 @@ func TestAutoPathThroughAgents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := testutil.Start(t)
+	testRoundTrip(t, ctx, s, ModeAuto)
+}
+
+// Both agents run on loopback, so the hbbs LAN rule sees a same-network pair
+// and must leave it on the direct path rather than forcing the relay.
+func TestLANMaskKeepsSameNetworkDirect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mask, err := lanmask.Parse("127.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testutil.StartWith(t, testutil.Options{LANMask: mask, LANLocalIP: "127.0.0.1"})
 	testRoundTrip(t, ctx, s, ModeAuto)
 }
 

@@ -47,13 +47,18 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "online must be 0 or 1")
 		return
 	}
-	limit, ok := intQuery(w, r, "limit", 200, 1, 1000)
+	csv, ok := exportRequest(w, r)
 	if !ok {
 		return
 	}
-	offset, ok := intQuery(w, r, "offset", 0, 0, 1_000_000)
-	if !ok {
-		return
+	limit, offset := 200, 0
+	if !csv {
+		if limit, ok = intQuery(w, r, "limit", 200, 1, 1000); !ok {
+			return
+		}
+		if offset, ok = intQuery(w, r, "offset", 0, 0, 1_000_000); !ok {
+			return
+		}
 	}
 	var groupDevices map[string]bool
 	if principal.GroupID != "" {
@@ -70,6 +75,8 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	out := identityListResponse{Identities: make([]identityListEntry, 0)}
+	export := s.newCSVExport(w, "chast-devices", "device", identityExportHeader)
+	rows := make([][]string, 0, exportEventBatch)
 	for _, record := range s.cfg.Registry.Identities() {
 		if groupDevices != nil && !groupDevices[record.ID] {
 			continue
@@ -86,12 +93,6 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 		if online {
 			out.Online++
 		}
-		if out.Total <= offset {
-			continue
-		}
-		if len(out.Identities) >= limit {
-			continue
-		}
 		entry := identityListEntry{Identity: record, Online: online}
 		lastSeen := record.LastSeen
 		if online {
@@ -104,9 +105,60 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 		if !lastSeen.IsZero() {
 			entry.LastSeenMS = now.Sub(lastSeen).Milliseconds()
 		}
+		if csv {
+			rows = append(rows, identityExportRow(entry, lastSeen))
+			if len(rows) >= exportEventBatch {
+				if !export.write(rows) {
+					return
+				}
+				rows = rows[:0]
+			}
+			continue
+		}
+		if out.Total <= offset {
+			continue
+		}
+		if len(out.Identities) >= limit {
+			continue
+		}
 		out.Identities = append(out.Identities, entry)
 	}
+	if csv {
+		if len(rows) > 0 && !export.write(rows) {
+			return
+		}
+		export.done()
+		return
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// identityExportHeader matches identityExportRow column for column.
+var identityExportHeader = []string{
+	"id", "alias", "owner", "tags", "hostname", "platform", "version",
+	"fingerprint", "online", "disabled", "relay", "candidate", "last_seen_at",
+}
+
+func identityExportRow(entry identityListEntry, lastSeen time.Time) []string {
+	seen := ""
+	if !lastSeen.IsZero() {
+		seen = lastSeen.UTC().Format(time.RFC3339)
+	}
+	return []string{
+		entry.ID,
+		entry.Alias,
+		entry.Owner,
+		strings.Join(entry.Tags, ";"),
+		entry.Hostname,
+		entry.Platform,
+		entry.Version,
+		entry.Fingerprint,
+		strconv.FormatBool(entry.Online),
+		strconv.FormatBool(entry.Disabled),
+		entry.Relay,
+		entry.Candidate,
+		seen,
+	}
 }
 
 func identityMatches(record registry.Identity, query string) bool {

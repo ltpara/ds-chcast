@@ -17,7 +17,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 )
 
-func startSharedRelay(t *testing.T, id, secret string) (*Manager, *registry.Registry, string, string, string) {
+func startSharedRelay(t *testing.T, id, secret string, opts ...Option) (*Manager, *registry.Registry, string, string, string) {
 	t.Helper()
 	priv := identity.PrivateKeyFromSecret(secret)
 	reg := registry.New(time.Minute)
@@ -29,7 +29,7 @@ func startSharedRelay(t *testing.T, id, secret string) (*Manager, *registry.Regi
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog)
+	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog, opts...)
 	if err != nil {
 		t.Fatalf("manager: %v", err)
 	}

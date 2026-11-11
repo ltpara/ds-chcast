@@ -34,6 +34,9 @@ var (
 	// caller has already proven the new id with the presented key, so this is
 	// an attempt to move an identity it does not own.
 	ErrMigrationDenied = errors.New("old id belongs to another public key")
+	// ErrIdentityDisabled means an operator blocked this peer. The key binding
+	// is kept so enabling the device restores the same identity.
+	ErrIdentityDisabled = errors.New("host identity is disabled")
 )
 
 const challengeTTL = 30 * time.Second
@@ -63,6 +66,14 @@ type Identity struct {
 	Tags              []string  `json:"tags,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	LastSeen          time.Time `json:"last_seen,omitempty"`
+	// Disabled is an operator block: a disabled host cannot register, its live
+	// lease is dropped, and the console reports it as disabled. The record and
+	// key binding stay so enabling it restores the same identity.
+	Disabled bool `json:"disabled,omitempty"`
+	// Owner is the account username that may connect even when the device
+	// policy's allow list would refuse everyone else. Empty means no owner.
+	// Like Alias and Tags it is operator-managed, never host-reported.
+	Owner string `json:"owner,omitempty"`
 	// WakeTargets are the directed broadcast endpoints on the host's LAN as
 	// last reported by the agent. They are internal routing hints for wake
 	// relays, not public metadata: never marshal them into lookup responses.
@@ -259,6 +270,11 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 			if old.PublicKey != req.PublicKey {
 				return Host{}, ErrMigrationDenied
 			}
+			// A disabled device must not escape the block by moving to a new
+			// id it owns; only an operator may clear the flag first.
+			if old.Disabled {
+				return Host{}, ErrIdentityDisabled
+			}
 			if existing, exists := r.identities[req.ID]; exists {
 				// A retry after the server already moved the record. The new
 				// record is authoritative; only the leftover old binding goes.
@@ -289,6 +305,9 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 	if exists {
 		if record.PublicKey != req.PublicKey {
 			return Host{}, ErrKeyMismatch
+		}
+		if record.Disabled {
+			return Host{}, ErrIdentityDisabled
 		}
 		updated := applyRegistrationMetadata(record, req)
 		updated.LastSeen = now
@@ -605,6 +624,52 @@ func (r *Registry) SetLabels(id string, alias *string, tags *[]string) (Identity
 	return record, true, nil
 }
 
+// SetOwner assigns the account username that may always connect to this
+// device. An empty owner clears the assignment. The registry stores the name;
+// the API is responsible for proving the account exists.
+func (r *Registry) SetOwner(id, owner string) (Identity, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.identities[id]
+	if !ok {
+		return Identity{}, false, nil
+	}
+	record.Owner = normalizeMetadata(owner, maxOwner)
+	if err := r.storeIdentityLocked(record); err != nil {
+		return Identity{}, true, err
+	}
+	return record, true, nil
+}
+
+// SetDisabled blocks or restores a device. Disabling drops the live lease
+// immediately, so lookups and relay sessions stop without waiting for the TTL;
+// the returned lease lets the caller release its relay slot. Re-enabling does
+// not create a lease — the host has to register again.
+func (r *Registry) SetDisabled(id string, disabled bool) (Identity, Host, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.identities[id]
+	if !ok {
+		return Identity{}, Host{}, false, nil
+	}
+	if record.Disabled != disabled {
+		record.Disabled = disabled
+		if err := r.storeIdentityLocked(record); err != nil {
+			return Identity{}, Host{}, true, err
+		}
+	}
+	var dropped Host
+	hadLease := false
+	if disabled {
+		if host, live := r.hosts[id]; live {
+			dropped = *host
+			hadLease = true
+			delete(r.hosts, id)
+		}
+	}
+	return record, dropped, hadLease, nil
+}
+
 // Identities returns every durable peer record sorted by ID, including peers
 // that are currently offline. The admin console uses it as the peer list.
 func (r *Registry) Identities() []Identity {
@@ -898,6 +963,7 @@ const (
 	maxPlatform = 64
 	maxVersion  = 64
 	maxAlias    = 128
+	maxOwner    = 64
 	maxTag      = 32
 	maxTags     = 16
 )

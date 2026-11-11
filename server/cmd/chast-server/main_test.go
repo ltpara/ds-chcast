@@ -57,6 +57,29 @@ func TestCheckServerKey(t *testing.T) {
 	}
 }
 
+func TestParseRelayNodeRegions(t *testing.T) {
+	regions, err := parseRelayNodeRegions(" http://relay1:8447= Europe/Berlin , https://relay2:8447=us-east ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regions["http://relay1:8447"] != "Europe/Berlin" || regions["https://relay2:8447"] != "us-east" {
+		t.Fatalf("regions = %v", regions)
+	}
+	if empty, err := parseRelayNodeRegions("  "); err != nil || empty != nil {
+		t.Fatalf("empty regions = %v, %v", empty, err)
+	}
+	for _, raw := range []string{
+		"http://relay1:8447",
+		"http://relay1:8447=",
+		"=Europe/Berlin",
+		"http://relay1:8447=Europe/Berlin,http://relay1:8447=us-east",
+	} {
+		if _, err := parseRelayNodeRegions(raw); err == nil {
+			t.Fatalf("parseRelayNodeRegions(%q) accepted an invalid entry", raw)
+		}
+	}
+}
+
 func TestNewLoggerWithoutFile(t *testing.T) {
 	log, sink, err := newLogger(slog.LevelInfo, logging.Config{})
 	if err != nil {

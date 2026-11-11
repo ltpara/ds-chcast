@@ -906,6 +906,75 @@ func TestRegistrationBlocker(t *testing.T) {
 	}
 }
 
+func TestRegistrationIDThrottle(t *testing.T) {
+	throttle := abuse.NewIDWindow(abuse.IDWindowConfig{Window: 2 * time.Second, Max: 2})
+	s := testutil.StartWith(t, testutil.Options{RegisterThrottle: throttle})
+	body := registerBody(t, "devbox", "correct horse", "", time.Now().Unix())
+	for i := 0; i < 2; i++ {
+		if resp, data := registerRaw(t, s.URL, body); resp.StatusCode != http.StatusOK {
+			t.Fatalf("registration %d: %d %s", i+1, resp.StatusCode, data)
+		}
+	}
+	resp, data := registerRaw(t, s.URL, body)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("throttled registration: %d %s", resp.StatusCode, data)
+	}
+	retry, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || retry < 1 || retry > 2 {
+		t.Fatalf("Retry-After = %q (%v)", resp.Header.Get("Retry-After"), err)
+	}
+	if !strings.Contains(string(data), "too frequent registration attempts for this id") {
+		t.Fatalf("throttled body: %s", data)
+	}
+
+	// A caller without the host key must not consume the id's budget: the
+	// handler verifies the signature before consulting the throttle. Bumping
+	// the signed timestamp after signing makes the signature invalid.
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(registerBody(t, "devbox", "correct horse", "", time.Now().Unix())), &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["timestamp"] = int64(fields["timestamp"].(float64)) + 1
+	tampered, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := registerRaw(t, s.URL, string(tampered)); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("tampered signature reply: %d", resp.StatusCode)
+	}
+
+	// Another id keeps registering while devbox waits out its burst.
+	other := registerBody(t, "other", "another horse", "", time.Now().Unix())
+	if resp, data := registerRaw(t, s.URL, other); resp.StatusCode != http.StatusOK {
+		t.Fatalf("second id: %d %s", resp.StatusCode, data)
+	}
+
+	_, statsBody := request(t, http.MethodGet, s.URL+"/v1/stats", "", testutil.ServerKey)
+	var stats struct {
+		RegistrationThrottle struct {
+			TrackedIDs int    `json:"tracked_ids"`
+			Throttled  uint64 `json:"throttled"`
+		} `json:"registration_throttle"`
+	}
+	if err := json.Unmarshal(statsBody, &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.RegistrationThrottle.TrackedIDs != 2 || stats.RegistrationThrottle.Throttled != 1 {
+		t.Fatalf("stats: %+v", stats.RegistrationThrottle)
+	}
+
+	_, metrics := request(t, http.MethodGet, s.URL+"/metrics", "", testutil.ServerKey)
+	text := string(metrics)
+	for _, want := range []string{
+		"chast_register_id_throttled_total 1",
+		"chast_registration_tracked_ids 2",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestRegistrationIDFlood(t *testing.T) {
 	blocker := abuse.New(abuse.Config{Window: time.Minute, MaxPerWindow: 50, IDWindow: time.Hour, MaxIDs: 1})
 	s := testutil.StartWith(t, testutil.Options{Registration: blocker})

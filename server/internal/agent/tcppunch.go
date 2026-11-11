@@ -132,6 +132,11 @@ func (v *ViewerAgent) tcpPunchRound(ctx context.Context) (net.Conn, *bufio.Reade
 	started := time.Now()
 	announce, err := tcpDialReuseContext(ctx, nil, v.tcpPunch, tcpPunchWindow)
 	if err != nil {
+		// The raw punch port did not open; the signalling WebSocket rides the
+		// HTTP(S) listener that the API already reached.
+		if ctx.Err() == nil {
+			return v.tcpPunchRoundWS(ctx)
+		}
 		return nil, nil, false
 	}
 	defer announce.Close()
@@ -142,12 +147,62 @@ func (v *ViewerAgent) tcpPunchRound(ctx context.Context) (net.Conn, *bufio.Reade
 		return nil, nil, false
 	}
 	nonce := newNonce()
+	reply, err := coordinateTCP(ctx, announce, v.viewerPunchMessage(nonce, ""), punchRequestStep)
+	if err != nil || !reply.OK || reply.Type != wire.TypeTCPPunch || reply.Nonce != nonce {
+		v.log.Debug("TCP punch coordination failed", "error", err, "reply", reply.Error)
+		return nil, nil, false
+	}
+	return v.finishTCPPunch(ctx, started, nonce, local, reply, func() { announce.Close() })
+}
+
+// tcpPunchRoundWS coordinates over the signalling WebSocket when the raw punch
+// port is unreachable. The announce names the port of a dedicated punch socket
+// because the WebSocket's own address belongs to the HTTP connection; the
+// server pairs that port with the observed IP, as hbbs does for its WS path.
+func (v *ViewerAgent) tcpPunchRoundWS(ctx context.Context) (net.Conn, *bufio.Reader, bool) {
+	if ctx.Err() != nil {
+		return nil, nil, false
+	}
+	started := time.Now()
+	dialCtx, cancel := context.WithTimeout(ctx, tcpPunchWindow)
+	signal, err := dialSignal(dialCtx, v.cfg.ServerURL, v.cfg.Proxy, v.cfg.TLS)
+	cancel()
+	if err != nil {
+		v.log.Debug("signalling WebSocket unavailable", "error", err)
+		return nil, nil, false
+	}
+	defer signal.Close()
+	// A reader goroutine may still be blocked on the frame reader when the
+	// round ends; not closing over its buffer avoids a use-after-close.
+	stopClose := context.AfterFunc(ctx, func() { signal.Close() })
+	defer stopClose()
+	reserved, local, err := reservePunchPort()
+	if err != nil {
+		return nil, nil, false
+	}
+	defer reserved.Close()
+	nonce := newNonce()
+	reply, err := coordinateTCP(ctx, signal, v.viewerPunchMessage(nonce, local.String()), punchRequestStep)
+	if err != nil || !reply.OK || reply.Type != wire.TypeTCPPunch || reply.Nonce != nonce {
+		v.log.Debug("signalling punch coordination failed", "error", err, "reply", reply.Error)
+		return nil, nil, false
+	}
+	return v.finishTCPPunch(ctx, started, nonce, local, reply, func() {
+		signal.Close()
+		reserved.Close()
+	})
+}
+
+// viewerPunchMessage builds the announce both coordination transports share.
+// candidate is the punch socket the caller will dial from, or empty when the
+// coordination connection itself is that socket.
+func (v *ViewerAgent) viewerPunchMessage(nonce, candidate string) wire.Message {
 	ts := time.Now().Unix()
 	v.mu.Lock()
 	ownNAT := v.ownNAT
 	v.mu.Unlock()
 	msg := wire.Message{Type: wire.TypeTCPPunch, Role: wire.RoleViewer,
-		HostID: v.cfg.HostID, Nonce: nonce, Timestamp: ts, NATType: ownNAT}
+		HostID: v.cfg.HostID, Nonce: nonce, Timestamp: ts, NATType: ownNAT, Candidate: candidate}
 	if credential := v.transportCredentialFor(acl.TransportAudiencePunch); credential != nil {
 		msg.Transport = credential.Ticket
 		msg.TransportProof = identity.Sign(v.transportKey,
@@ -155,11 +210,13 @@ func (v *ViewerAgent) tcpPunchRound(ctx context.Context) (net.Conn, *bufio.Reade
 	} else if key := punchAPIKey(v.cfg); key != "" {
 		msg.Auth = identity.PunchAuth(key, v.cfg.HostID, nonce, ts)
 	}
-	reply, err := coordinateTCP(ctx, announce, msg, punchRequestStep)
-	if err != nil || !reply.OK || reply.Type != wire.TypeTCPPunch || reply.Nonce != nonce {
-		v.log.Debug("TCP punch coordination failed", "error", err, "reply", reply.Error)
-		return nil, nil, false
-	}
+	return msg
+}
+
+// finishTCPPunch dials the host from the punch socket's port after the server
+// released the peer endpoint. RustDesk drops the rendezvous socket before
+// connecting from its port; release drops both coordination transports.
+func (v *ViewerAgent) finishTCPPunch(ctx context.Context, started time.Time, nonce string, local *net.TCPAddr, reply wire.Message, release func()) (net.Conn, *bufio.Reader, bool) {
 	hostAddr := resolveTCP(reply.Candidate)
 	if hostAddr == nil {
 		return nil, nil, false
@@ -170,8 +227,7 @@ func (v *ViewerAgent) tcpPunchRound(ctx context.Context) (net.Conn, *bufio.Reade
 	}
 	v.mu.Unlock()
 	wait := v.connectWait(time.Since(started), reply.IsLocal)
-	// RustDesk drops the rendezvous socket before connecting from its port.
-	announce.Close()
+	release()
 	connectCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	deadline, _ := connectCtx.Deadline()
@@ -408,11 +464,23 @@ func (h *HostAgent) declineTCPPunch(nonce string, endpoint *net.TCPAddr) {
 	defer cancel()
 	conn, err := h.cfg.Proxy.DialContext(ctx, "tcp", endpoint.String())
 	if err != nil {
+		// The viewer may have announced over the signalling WebSocket because
+		// the raw punch port is unreachable; answer on the same surface.
+		if signal, signalErr := dialSignal(ctx, h.cfg.ServerURL, h.cfg.Proxy, h.cfg.TLS); signalErr == nil {
+			defer signal.Close()
+			_ = signal.SetWriteDeadline(time.Now().Add(tcpPunchReplyWait))
+			h.writeDecline(signal, nonce)
+		}
 		return
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
+	_ = conn.SetWriteDeadline(time.Now().Add(tcpPunchReplyWait))
+	h.writeDecline(conn, nonce)
+}
+
+func (h *HostAgent) writeDecline(conn net.Conn, nonce string) {
 	ts := time.Now().Unix()
 	reason := "host requires relay for IPv4 TCP"
 	_ = writeHandshake(conn, wire.Message{Type: wire.TypeTCPPunch, Role: wire.RoleHost,
@@ -427,6 +495,9 @@ func (h *HostAgent) declineTCPPunch(nonce string, endpoint *net.TCPAddr) {
 func (h *HostAgent) runTCPPunch(nonce string, endpoint, peer *net.TCPAddr, localPeer bool) {
 	announce, err := tcpDialReuseContext(h.ctx, nil, endpoint, tcpPunchDialWait)
 	if err != nil {
+		if h.ctx.Err() == nil {
+			h.runTCPPunchWS(nonce, peer, localPeer)
+		}
 		return
 	}
 	defer announce.Close()
@@ -436,6 +507,42 @@ func (h *HostAgent) runTCPPunch(nonce string, endpoint, peer *net.TCPAddr, local
 	if !ok {
 		return
 	}
+	if !h.reportTCPPunch(announce, nonce, local, peer, localPeer) {
+		return
+	}
+	announce.Close()
+	h.runTCPPunchWindow(nonce, local, peer)
+}
+
+// runTCPPunchWS announces over the signalling WebSocket when the raw punch
+// port is unreachable. A dedicated socket holds the punch port because the
+// WebSocket's address belongs to the HTTP connection; the server pairs that
+// port with the observed IP for the viewer.
+func (h *HostAgent) runTCPPunchWS(nonce string, peer *net.TCPAddr, localPeer bool) {
+	signal, err := dialSignal(h.ctx, h.cfg.ServerURL, h.cfg.Proxy, h.cfg.TLS)
+	if err != nil {
+		h.log.Debug("signalling WebSocket unavailable", "error", err)
+		return
+	}
+	defer signal.Close()
+	reserved, local, err := reservePunchPort()
+	if err != nil {
+		return
+	}
+	defer reserved.Close()
+	if !h.reportTCPPunch(signal, nonce, local, peer, localPeer) {
+		return
+	}
+	h.log.Debug("TCP punch reported over the signalling WebSocket", "punch", local.String())
+	signal.Close()
+	reserved.Close()
+	h.runTCPPunchWindow(nonce, local, peer)
+}
+
+// reportTCPPunch pre-punches the peer and reports the punch socket. The
+// pre-punch must precede the report so the host's mapping exists before the
+// viewer starts dialing.
+func (h *HostAgent) reportTCPPunch(announce net.Conn, nonce string, local, peer *net.TCPAddr, localPeer bool) bool {
 	if !localPeer {
 		if pc, err := tcpDialReuseContext(h.ctx, local, peer, tcpPrePunch); err == nil {
 			pc.Close()
@@ -443,15 +550,11 @@ func (h *HostAgent) runTCPPunch(nonce string, endpoint, peer *net.TCPAddr, local
 	}
 	ts := time.Now().Unix()
 	_ = announce.SetWriteDeadline(time.Now().Add(tcpPunchReplyWait))
-	if err := writeHandshake(announce, wire.Message{
+	return writeHandshake(announce, wire.Message{
 		Type: wire.TypeTCPPunch, Role: wire.RoleHost, HostID: h.cfg.ID,
 		Nonce: nonce, Timestamp: ts, Candidate: local.String(),
 		Signature: identity.Sign(h.priv, identity.TCPPunchLocalMessage(h.cfg.ID, nonce, local.String(), ts)),
-	}); err != nil {
-		return
-	}
-	announce.Close()
-	h.runTCPPunchWindow(nonce, local, peer)
+	}) == nil
 }
 
 func (h *HostAgent) runTCPPunchWindow(nonce string, local, peer *net.TCPAddr) {

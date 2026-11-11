@@ -3,6 +3,7 @@ package registry
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/ltpara/ds-chcast/server/internal/schemamig"
 )
@@ -10,11 +11,12 @@ import (
 // registrySchemaVersion is the schema generation this binary writes. Databases
 // created before registry_schema_migrations existed are upgraded by the
 // idempotent baseline migration.
-const registrySchemaVersion = 2
+const registrySchemaVersion = 3
 
 var registryMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyRegistryBaseline},
 	{Version: 2, Name: "wake targets", Apply: ensurePeerColumns},
+	{Version: 3, Name: "administrative state", Apply: applyRegistryAdminState},
 }
 
 func applyRegistryBaseline(db *sql.DB) error {
@@ -37,6 +39,24 @@ func applyRegistryBaseline(db *sql.DB) error {
 	}
 	if err := ensurePeerColumns(db); err != nil {
 		return fmt.Errorf("upgrade schema: %w", err)
+	}
+	return nil
+}
+
+// applyRegistryAdminState adds the operator-managed device columns: the
+// disabled block and the owner account name. A database created by an older
+// binary already has the peers table, so they are added in place.
+func applyRegistryAdminState(db *sql.DB) error {
+	for _, column := range []string{
+		`disabled INTEGER NOT NULL DEFAULT 0`,
+		`owner TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(`ALTER TABLE peers ADD COLUMN ` + column); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("add administrative state: %w", err)
+		}
 	}
 	return nil
 }

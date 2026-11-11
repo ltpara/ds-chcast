@@ -23,6 +23,10 @@ import (
 type Config struct {
 	// Nodes are http:// or https:// base URLs, without a path.
 	Nodes []string
+	// Regions maps a node URL to the GeoIP location label it serves, so a
+	// registering host is leased a node in its own region first. Nodes without
+	// a label stay in the rotation and are used when no labeled node matches.
+	Regions map[string]string
 	// Key is the control key shared with every node (--relay-node-key).
 	Key string
 	// Interval is the health probe period. Zero defaults to 10s.
@@ -46,6 +50,7 @@ type Lease struct {
 
 type NodeStatus struct {
 	URL     string `json:"url"`
+	Region  string `json:"region,omitempty"`
 	Healthy bool   `json:"healthy"`
 	Checked bool   `json:"checked"`
 	Leases  int    `json:"leases"`
@@ -77,6 +82,7 @@ type Pool struct {
 
 type nodeState struct {
 	url     string
+	region  string
 	healthy bool
 	checked bool
 	leases  int
@@ -120,6 +126,7 @@ func New(cfg Config) (*Pool, error) {
 	}
 	seen := make(map[string]bool)
 	nodes := make([]*nodeState, 0, len(cfg.Nodes))
+	byURL := make(map[string]*nodeState, len(cfg.Nodes))
 	for _, raw := range cfg.Nodes {
 		normalized, err := normalizeNode(raw)
 		if err != nil {
@@ -129,7 +136,27 @@ func New(cfg Config) (*Pool, error) {
 			continue
 		}
 		seen[normalized] = true
-		nodes = append(nodes, &nodeState{url: normalized, linked: make(map[string]struct{})})
+		state := &nodeState{url: normalized, linked: make(map[string]struct{})}
+		nodes = append(nodes, state)
+		byURL[normalized] = state
+	}
+	for raw, region := range cfg.Regions {
+		label := strings.TrimSpace(region)
+		if label == "" {
+			continue
+		}
+		normalized, err := normalizeNode(raw)
+		if err != nil {
+			return nil, fmt.Errorf("relay node region %q: %w", raw, err)
+		}
+		node := byURL[normalized]
+		if node == nil {
+			return nil, fmt.Errorf("relay node region %q is not one of Config.Nodes", raw)
+		}
+		if node.region != "" && !strings.EqualFold(node.region, label) {
+			return nil, fmt.Errorf("relay node %q is labeled both %q and %q", node.url, node.region, label)
+		}
+		node.region = label
 	}
 	if len(nodes) == 0 {
 		return nil, errors.New("relay pool needs at least one node URL")
@@ -272,12 +299,13 @@ func (p *Pool) markFailed(node *nodeState, err error) {
 
 // Provision asks a node for a lease. The host's previous node is tried first
 // so a renewal keeps its port and does not disturb a live viewer; otherwise
-// every usable node is offered once in round-robin order. A failed attempt
-// marks the node unhealthy until the next probe.
-func (p *Pool) Provision(id, publicKey, carrierToken string, managed bool, ttl time.Duration, preferred string) (Lease, error) {
+// nodes in the host's region are offered before the rest, each group in
+// round-robin order. A failed attempt marks the node unhealthy until the next
+// probe.
+func (p *Pool) Provision(id, publicKey, carrierToken string, managed bool, ttl time.Duration, preferred, region string) (Lease, error) {
 	p.mu.Lock()
 	closed := p.closed
-	order := p.candidateOrderLocked(preferred)
+	order := p.candidateOrderLocked(preferred, region)
 	p.mu.Unlock()
 	if closed {
 		return Lease{}, errors.New("relay pool is closed")
@@ -314,7 +342,7 @@ func (p *Pool) Provision(id, publicKey, carrierToken string, managed bool, ttl t
 	return Lease{}, fmt.Errorf("all relay nodes failed: %w", lastErr)
 }
 
-func (p *Pool) candidateOrderLocked(preferred string) []*nodeState {
+func (p *Pool) candidateOrderLocked(preferred, region string) []*nodeState {
 	order := make([]*nodeState, 0, len(p.nodes))
 	seen := make(map[*nodeState]bool, len(p.nodes))
 	if preferred != "" {
@@ -330,13 +358,26 @@ func (p *Pool) candidateOrderLocked(preferred string) []*nodeState {
 	}
 	start := p.cursor % len(p.nodes)
 	p.cursor++
-	for i := 0; i < len(p.nodes); i++ {
-		node := p.nodes[(start+i)%len(p.nodes)]
-		if !seen[node] && p.usableLocked(node) {
+	region = strings.TrimSpace(region)
+	appendRound := func(matching bool) {
+		for i := 0; i < len(p.nodes); i++ {
+			node := p.nodes[(start+i)%len(p.nodes)]
+			if seen[node] || !p.usableLocked(node) {
+				continue
+			}
+			// Without a region every usable node is in the single round;
+			// with one, the matching nodes go first and the rest follow.
+			if region != "" && strings.EqualFold(strings.TrimSpace(node.region), region) != matching {
+				continue
+			}
 			order = append(order, node)
 			seen[node] = true
 		}
 	}
+	if region != "" {
+		appendRound(true)
+	}
+	appendRound(false)
 	return order
 }
 
@@ -478,6 +519,7 @@ func (p *Pool) Status() Status {
 	for _, node := range p.nodes {
 		status := NodeStatus{
 			URL:     node.url,
+			Region:  node.region,
 			Healthy: node.healthy,
 			Checked: node.checked,
 			Leases:  node.leases,
@@ -503,6 +545,7 @@ func (p *Pool) Preview() (NodeStatus, bool) {
 		if node.healthy {
 			return NodeStatus{
 				URL:     node.url,
+				Region:  node.region,
 				Healthy: true,
 				Checked: node.checked,
 				Leases:  node.leases,

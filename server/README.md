@@ -11,37 +11,38 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | `RegisterPk` 首次登记 ID 公钥 | `POST /v1/hosts` + Ed25519 注册签名 | 公钥与 ID 永久绑定，续约必须用同一私钥签名 |
 | `Peer` 记录持久化 | SQLite `chast-server-state.db`（`peers` 表）或 `--postgres-dsn` 指定的 PostgreSQL + 服务器签名 `binding` | 离线仍可查询身份、主机名/平台/版本与最近在线时间；旧 JSON 状态自动一次性导入；状态库带前向版本化迁移（P2-21）；PostgreSQL 后端与账号/审计共用同一 DSN |
 | 地址簿批量在线查询 | `GET /v1/hosts?ids=<id,...>` | 一次最多 200 个 ID、自动去重；未知 ID 列入 `missing`，整批查询不因个别失效条目失败 |
-| 对等记录别名与标签 | `PATCH /v1/identities/{id}` + 管理台 `alias`/`tags` | 运营者维护的展示名称与标签持久化到 SQLite，主机续约不会覆盖；单机与批量查询随记录返回，查看器地址簿在配置 server-key 后可从设备菜单直接编辑 |
+| 对等记录别名、标签、禁用与所有者 | `PATCH /v1/identities/{id}` + 管理台 `alias`/`tags`/`disabled`/`owner` | 运营者维护的展示名称、标签、集中禁用标记与所有者账号持久化到 SQLite（注册表 schema v3，Postgres 同步），主机续约不会覆盖；禁用立即释放租约与中继槽位，随后该 ID 的注册返回 403，单机/批量 lookup、接入票据、传输凭证与远程唤醒一律拒绝，重新启用后主机需重新注册；所有者账号即使不在设备策略允许列表中也可 lookup、取票并完成传输准入（封禁账号仍被拒），留空即清除；单机与批量查询随记录返回，查看器地址簿在配置 server-key 后可从设备菜单直接编辑名称与标签；管理台设备页支持勾选多台后一次禁用/启用（`POST /v1/identities/bulk`，二次点击确认，未知 ID 回显为 `missing`） |
 | 用户账号与账号地址簿 | `POST /v1/account/login` 等 + 管理台 `user`/`ab`/`audit` | PBKDF2-SHA256 密码换取 30 min 访问令牌与 720 h 刷新令牌（库中只存令牌哈希），刷新即轮换、重放即撤销整个会话；可选 TOTP 两步验证与一次性恢复码、设备会话改名/撤销与持久化账号安全审计；每个用户拥有独立的名称/标签地址簿，账号令牌与运营者 server-key 互不通用；查看器侧栏可登录并自动续期同步该地址簿，设备菜单可编辑账号标签；可选找回邮箱与一次性密码重置令牌（库中只存 SHA-256、默认 30 min、单账号仅一个有效令牌、成功即吊销全部会话）与可选找回手机与 8 位短信验证码（只存 SHA-256、默认 10 min、单账号单活、5 次错误即作废、成功后同样吊销全部会话），找回请求固定返回 202 以防账号枚举 |
 | WebAuthn 安全密钥 | `--webauthn-rp-id`/`--webauthn-origin` + `/v1/account/webauthn/*` 与 `/v1/account/login/webauthn/*` | Windows Hello / FIDO2 平台认证器可作为登录第二因素（密码 + 断言）或免密码登录（用户名选中已注册凭据后直接断言）；服务端只存 COSE 公钥，挑战 32 字节、5 分钟单活并在登录成功时与令牌同一事务消费，重放必然失败；两种登录使用独立 purpose，互不替换也互不重放；支持 ES256/RS256/EdDSA，attestation 接受 `none`/`packed` 但不校验证书链；查看器账号对话框可注册/命名/删除，登录页提供“使用安全密钥”与“使用安全密钥登录”；未配置时相关接口返回 503 |
+| LDAP/AD 目录登录 | `--ldap-url`/`--ldap-base-dn` + `POST /v1/account/login` | 服务账号 bind + search 找到条目后用用户密码重新 bind；首次登录建号（随机本地密码，找回邮箱取 `mail`），DN 作为身份持久化在 `ldap_identities`（账号 schema v17，SQLite/Postgres 同步）；已链接目录的账号只接受目录密码，目录侧禁用/锁定在下次登录生效，本地封禁优先；目录不可达返回 503 且不计入失败锁定；支持 StartTLS/LDAPS、可配置过滤模板（登录名转义）与匿名检索 |
 | 登录地点（GeoIP） | `--geoip-file` + 审计 `location` / 会话 `location` | 可选离线表，每行 `CIDR 地点`，按最长前缀把登录 IP 映射为地点（IPv4、IPv6 与 IPv4-mapped 归一）；写入账号安全审计与设备会话列表，管理台与查看器会话对话框显示；缺省不解析，只记录 IP |
 | 日志轮转与归档 | `--log-file` + `--log-max-size`/`--log-max-backups`/`--log-max-age`/`--log-compress` | slog 文本日志同时写 stderr 与文件；按大小轮转为时间戳文件，可选 gzip，按数量与年龄清理旧归档；`chast-relay` 同名旗标 |
 | 请求链路 tracing | `--trace-endpoint` + `--trace-sample`/`--trace-service` | HTTP 请求 span（`service.name`、路由、方法、状态码、≥500 标记错误）以及 punch、relay 会话 span；服务端以 `host_id` 派生 trace ID，把同一主机的会合与中继会话归入一条 trace；接受上游 W3C `traceparent` 并在响应回写；默认关闭，collector 不可达或队列满时丢弃 span，不阻塞业务；`chast-server` 覆盖 API（含 429）、会合与中继数据面，`chast-relay` 覆盖节点控制面与中继会话 |
 | HTTPS 与 mTLS | `--tls-cert`/`--tls-key` 或 `--acme-domain` + `--tls-client-ca`；代理与隧道 `--tls-ca`/`--tls-client-cert`/`--tls-client-key` | 服务端与节点控制面可直接 HTTPS；给出客户端 CA 时要求并校验客户端证书。证书既可来自文件，也可由内建 ACME（HTTP-01）自动申请与续期；证书文件与客户端 CA 都在替换后自动热加载（最迟 5 秒，坏文件保留旧内容），ACME 模式下的客户端 CA 同样热加载。代理、`chast-tunnel` 与节点池可信任私有 CA 并出示客户端证书，未配置时行为不变 |
-| 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤 |
-| 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤，同样保留最新 10000 条 |
+| 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名与起止时间过滤 |
+| 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名与起止时间过滤，同样保留最新 10000 条 |
 | 录制归档（可选上传） | `--recordings-dir` + `/v1/account/recordings` + 管理台 `recordings` | 查看器结束本地录制后可按设置把 MP4 上传到账号（原始字节流，元数据在查询串）；服务端按账号隔离存储、校验 SHA-256、限制单文件与账号配额，并在审计中记录上传/删除；账号可列出、下载和删除自己的录制，超过保留天数的文件随每 6 小时清理；运营者经 `readonly` 即可跨账号列出/下载，`operator` 可删除，删除审计记在属主名下并注明操作者 |
-| Web 管理台（RustDesk 仅在 Pro 侧提供） | `GET /admin/`（与 HTTP API 同端口的内嵌页面） | 无需额外进程或前端构建：登录只输入 server-key（存于浏览器 `sessionStorage`，不设 cookie 或服务端会话），覆盖总览、设备（全量含离线、搜索/在线过滤、别名标签、重置身份）、账号（创建/角色/封禁/密码/2FA/删除）、录制（跨账号列出/按用户过滤/下载/删除）、三类审计分页与 CSV 下载、服务器与软件更新信息；401 自动锁屏，调用仍是同源 Bearer `/v1/*` |
+| Web 管理台（RustDesk 仅在 Pro 侧提供） | `GET /admin/`（与 HTTP API 同端口的内嵌页面） | 无需额外进程或前端构建：可用部署 server-key，或用账号密码（可带 TOTP/恢复码）登录；账号角色决定可见页签，仅有分组授权的账号只能查看所属分组；已注册安全密钥的账号可改用“使用安全密钥登录”（填写密码时为密码+断言，密码留空为免密码通行密钥，需要 HTTPS 或 localhost 且服务端配置 `--webauthn-rp-id`/`--webauthn-origin`）；服务端配置 `--oidc-*` 时登录页另有“使用 <提供方> 登录”走 OIDC 授权码流程（新标签页打开身份提供方，回调后页面轮询取会话）；凭据存于浏览器 `sessionStorage`，不设 cookie 或服务端会话。覆盖总览、设备（全量含离线、搜索/在线过滤、每页 200 台的上一页/下一页与范围提示、别名标签、所有者、单台与多选批量禁用/启用、重置身份、按当前过滤导出 CSV）、账号（创建/角色/封禁/密码/2FA/删除）、我的账号（账号登录者自助改密码、找回邮箱/手机、启停 TOTP、生成恢复码、登记/删除安全密钥、查看/重命名/撤销登录会话）、录制（跨账号列出/按用户过滤/下载/删除）、三类审计分页、起止时间过滤与 CSV 下载、服务器与软件更新信息；401 自动锁屏，调用仍是同源 Bearer `/v1/*` |
 | 主机入站审计 | `POST /v1/hosts/{id}/audit` + `GET /v1/audit/connections?host=` + `GET /v1/audit/file-transfers?host=` | 查看器每会话生成 `audit_ref` 随 Hello 传给主机（协议 v25）；主机把会话与入站上传写 JSONL spool，`chast-tunnel host --audit-spool` 用主机 Ed25519 密钥逐条签名上报。服务端按引用合并两侧，会话一条主记录（`source`=viewer/host/both），文件保留主机逐文件行；运营者可按主机过滤 |
 | 地址簿分组 | `/v1/addressbook/groups/{id}` + peer `group_id` | 每个账号可创建、改名、删除分组；分组可嵌套（`parent_id`，成环/深度超 8 拒绝）并手工排序（`position`）；条目通过 `group_id` 归组，删除分组只解除归组且每个被移动条目各自推进修订号；查看器“我的设备”按分组树缩进展示并支持组内排序 |
 | 地址簿搜索与筛选 | 查看器本地 | 名称/ID/标签的大小写不敏感子串搜索；标签芯片多选按并集匹配，筛选同时收窄分组标题与成员计数，可一键清除 |
-| 按分组共享与分组 ACL | `/v1/addressbook/grants`、`/v1/addressbook/shared/{owner}/...` | 授权可选 `group_id`（空为整本）；读取按授权范围过滤条目与分组，读写权限只作用于被授权分组，整本 `control` 才能管理授权；删除分组时同一事务撤销其授权 |
+| 按分组共享与分组 ACL | `/v1/addressbook/grants`、`/v1/addressbook/shared/{owner}/...` | 授权可选 `group_id`（空为整本）；读取按授权范围过滤条目与分组，读写权限只作用于被授权分组，整本 `control` 才能管理授权；删除分组时同一事务撤销其授权；授权目标还可为账号组或 Everyone，按成员关系实时生效 |
 | 离线清空标签/分组 | 查看器本地意图 + 同步 `PATCH` | 清空全部标签或移出分组会持久化显式意图；离线期间不被服务端旧值回填，恢复后上传空值，成功或服务端已匹配才撤销意图 |
-| Wake-on-LAN | 查看器本地广播 + 跨子网中继 | 设备菜单可为已保存或最近设备填写 MAC：默认向 `255.255.255.255:9` 发送 102 字节魔法包；勾选“通过连接服务转发”时改为 `POST /v1/hosts/{id}/wake`，作业只投递给允许名单（`--wake-relay-policy`）内、与目标最后上报链路有交集且带 `--wake-relay` 的主机代理；目标未上报链路或运营者未授权代理时返回 409。MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
+| Wake-on-LAN | 查看器本地广播 + 跨子网中继 | 设备菜单可为已保存或最近设备填写 MAC：默认向 `255.255.255.255:9` 发送 102 字节魔法包；勾选“通过连接服务转发”时改为 `POST /v1/hosts/{id}/wake`，作业只投递给允许名单（`--wake-relay-policy`）内、与目标最后上报链路有交集且带 `--wake-relay` 的主机代理；目标未上报链路或运营者未授权代理时返回 409。MAC 规范化后只写入本地 `devices.json`，不随账号同步；被运营者禁用的设备同样返回 409（device is disabled） |
 | `PeerDiscovery` 局域网发现 | `chast-tunnel host --lan-discovery` + `chast-tunnel discover` | 主机在 UDP 21129 应答 `CHASTL1` ping，返回 ID/主机名/用户名/平台/版本/MAC；`discover` 向受限广播、各网卡定向广播与回环探测，并按 ID 合并同一主机的多个来源地址。无认证、只暴露展示元数据、不授权连接；主机侧默认开启，可 `--lan-discovery=false` 关闭 |
 | `SoftwareUpdate` | `--software-version`/`--software-url`（+ 可选 `--software-dir`）+ `chast-tunnel host --auto-update` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；设置 `--software-dir` 时由服务端在 `/software/{name}` 只读托管发布文件，并在通告中附 SHA-256、大小与服务器 Ed25519 签名；主机代理可固定服务器公钥后自动校验、暂存并启动安装器，未开启时只记提示；查看器固定服务器身份后可“下载并安装”，由随包 `chast-tunnel apply-update` 在查看器退出后换入并重启 |
 | `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 请求按 RustDesk 的节奏发三次，等待窗口 3 s/6 s/9 s；交换观察地址后双方用带事务号的 `punch_probe`/`punch_ack` 确认回程（20→200 ms 退避，3 s 窗口），只收到单向来包不算成功 |
 | NAT 类型测试 | `nat_probe`（会合与中继两个观察点） | 查看者用同一套接字向两个服务器端口取公网端口：一致为 `asymmetric`，不同为 `symmetric`；对称 NAT 把 v4 直连窗口缩到 1 s，但 IPv6 与同网段候选仍照常并行探测 |
 | IPv6 打洞 | `self_v6` + `candidate_v6`/`local_addrs_v6` | 双栈代理分别保活与探测 v4/v6，跨族候选随 `punch_peer` 一起交换；只上报本机确有全局 IPv6 源地址的候选 |
-| `FetchLocalAddr` | `local_addrs` + `nat_type` | 主机上报局域网候选与 NAT 分类 |
-| TCP 打洞（RustDesk `PunchHole` 的 TCP 通道） | `--tcp-punch-listen` + `tcp_punch` + `--mode tcp` | 双方在同一 TCP 端口报到，服务器只把对方观察地址回给各自；主机从同一本地端口预打洞后监听，链路用载体帧承载数据报。UDP 被封或对称 NAT 下仍可直连，`auto` 里与 UDP 并行竞争 |
+| `FetchLocalAddr` | `want_local_addrs` + `local_addr` | 主机上报局域网候选与 NAT 分类；同网段打洞还要主机按本次 nonce 回取当前候选 |
+| TCP 打洞（RustDesk `PunchHole` 的 TCP 通道） | `--tcp-punch-listen` + `tcp_punch` + `--mode tcp` | 双方在同一 TCP 端口报到，服务器只把对方观察地址回给各自；主机从同一本地端口预打洞后监听，链路用载体帧承载数据报。原始协调口不可达时同一协议改走 HTTP(S) 的 `/chast-signal` WebSocket。UDP 被封或对称 NAT 下仍可直连，`auto` 里与 UDP 并行竞争 |
 | UPnP 端口映射 | `--upnp` + `upnp_port`（keepalive、punch、查询） | 代理向本地 IGD 申请 UDP 端口映射并每 15 min 续租，服务端把映射外部端口随双方候选转发；缺省关闭，只有 IPv4 |
 | `RequestRelay`（uuid 配对） | 按主机分配 UDP 中继端口 | 查看者直接连该端口，主机侧代理回连中继 |
 | 共享中继端口按 UUID 复用 | `--carrier-listen` TCP/WebSocket 共享载体 | 一个端口承载所有主机链路，查看者凭随机令牌选择主机 |
 | 中继按 uuid 配对 TCP 流 | 透明转发 UDP 数据报或载体帧 | 不需要拆 QUIC 流，握手与加密都在端点上 |
 | `IP_CHANGES` 短期地址审计 | `ic` 管理命令 + `chast_ip_change_*` | 首次观察只建基线；窗口内出现多个地址的主机列入审计 |
 | `relay-servers` 与 `get_relay_server` 轮换 | `--relay-servers` + `rs`/`tg` + 注册 `relays` | 每个中继端口按租约地址重新绑定监听，回包源地址与查看者拨号地址一致 |
-| `check_relay_servers` + 独立 hbbr 进程 | `--relay-nodes` + `chast-relay` | hbbs 探测节点健康并向其申请租约；节点独立承担 UDP/TCP 中继与共享载体，故障时切换或回退本机 |
+| `check_relay_servers` + 独立 hbbr 进程 | `--relay-nodes` + `chast-relay` | hbbs 探测节点健康并向其申请租约；节点独立承担 UDP/TCP 中继与共享载体，故障时切换或回退本机；`--relay-node-regions` 可让主机按来源 IP 的 `--geoip-file` 位置优先租用同区域节点 |
 | `blacklist.txt`/`blocklist.txt`、带宽限制与降级 | 中继策略 + `ba/br/b`、`Ba/Br/B`、`sb/tb/ls/dt/t/u` | 单会话与总带宽、黑名单慢速档、阻断名单、自动降级；本机中继与独立节点共用同一实现，名单可落盘 |
 
 ## 设计约束
@@ -127,7 +128,8 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   `upnp_port` 拼出的外部端点），查看者回 `punch_ack` 才算回程可用；与主机
   处于同一公网地址的查看者还会带来其局域网候选，这些地址与公网候选并行
   探测，且不受对称 NAT 短路影响——局域网路径不经过 NAT；
-- 主机主动建立独立 TCP 会合控制链路接收服务端签名 `tcp_punch`，UDP 为备用。
+- 主机主动建立独立 TCP 会合控制链路接收服务端签名 `tcp_punch`，UDP 为备用；
+  原始 TCP 控制口拨号失败时改走 HTTP(S) 的 `/chast-signal` WebSocket，签名挑战与保活不变。
   主机先复用协调端口预拨最多 30 ms，再签名报到，服务端此后才释放查看者。
   关闭协调连接后复用端口监听，不反复反拨；同网段使用签名内网端点。
   控制链路不依赖查看者 carrier 会话、令牌或配额；
@@ -160,9 +162,13 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   1/2/4/8/15 s 重试序列，最多五次，身份/鉴权失败停止。启动错误通过 JSON
   `error` 事件的 `retryable` 字段传递，不解析日志文本；
 - `punch_request` 同时上报本机局域网候选（`local_addrs`/`local_addrs_v6`）。
-  服务器只在查看者与主机的观察公网地址一致时把它们转给主机，因此同网段的
-  双方即使路由器不支持 hairpin 也能建立直连；跨网段时这些地址不会离开服务器，
-  主机也不会去探测陌生内网；
+  服务器只在查看者与主机的观察公网地址一致，或配置 `--lan-mask` 后双方观察
+  地址都在该网段内时把它们转给主机，因此同网段的双方即使路由器不支持
+  hairpin 也能建立直连；跨网段时这些地址不会离开服务器，主机也不会去探测
+  陌生内网；一端在网段内、另一端在公网时按 hbbs 判为必须中继。同网段时
+  服务器还在给主机的 `punch_peer` 上置 `want_local_addrs`，主机立即回签名
+  `local_addr`，服务器校验后把当前候选补发给查看者；缓存回复先照常下发，
+  所以刷新失败只损失新鲜度，不延长打洞窗口；
 - `relay` 优先 UDP 中继，主机只报告 `transport=carrier` 时改用载体；
   `carrier` 模式强制 `CHASTT-V2` 共享载体，链路断开按 0.5 s→5 s 退避重连，
   空闲每 30 s 发空帧保活；有 `carrier_v6` 时两个端点按本地地址族排序、
@@ -187,10 +193,11 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | `keepalive_auth` | 主机 → 会合 | `host_id`, `nonce`, `candidate`, `local_addrs`, `nat_type`, `upnp_port`, `signature` | 签名应答并上报候选 |
 | `keepalive_ack` | 会合 → 主机 | `ok`, `candidate`, `relay`, `local_addrs`, `nat_type`, `error` | 认证结果与中继地址 |
 | `punch_request` | 查看者 → 会合 | `host_id`, `nonce`, `nat_type`, `self_v6`, `local_addrs`, `local_addrs_v6`, `upnp_port`（可选） | 请求与主机交换候选地址；局域网地址只在与主机同一观察公网时转发 |
-| `punch_peer` | 会合 → 双方 | `nonce`, `candidate`, `candidate_v6`, `local_addrs`, `local_addrs_v6`, `relay`, `public_key`, `binding`, `nat_type`, `upnp_port`（可选） | 对方地址（含同网段局域网候选）、身份绑定与 UPnP 映射端口 |
+| `punch_peer` | 会合 → 双方 | `nonce`, `candidate`, `candidate_v6`, `local_addrs`, `local_addrs_v6`, `relay`, `public_key`, `binding`, `nat_type`, `is_local`, `want_local_addrs`, `upnp_port`（可选） | 对方地址（含同网段局域网候选）、身份绑定与 UPnP 映射端口；`want_local_addrs` 要求主机回取当前内网候选 |
 | `punch` | 代理 ↔ 代理 | `nonce` | 旧式打洞探针；收到即说明路径可用 |
 | `punch_probe` | 代理 ↔ 代理 | `nonce`, `tid` | 带事务号的打洞探针；主机只对已通知的查看者来源应答 |
 | `punch_ack` | 代理 → 代理 | `tid` | 回显事务号，证明回程可达；只有本轮 `tid` 才确认直连 |
+| `local_addr` | 主机 → 会合 | `host_id`, `nonce`, `local_addrs`, `local_addrs_v6`, `timestamp`, `signature` | 应答 `want_local_addrs`：签名上报当前内网候选；服务器校验来源、签名与 60 s 时间窗后把刷新候选重发给同一查看者 |
 | `nat_probe` | 查看者 → 会合/中继 | `nonce` | 用同一套接字向两个服务器端口取公网映射 |
 | `nat_probe_ack` | 会合/中继 → 查看者 | `nonce`, `candidate` | 该端口观察到的源地址 |
 | `relay_hello` | 主机 → 中继 | `host_id` | 请求中继挑战 |
@@ -223,6 +230,13 @@ payload`，payload 是完整控制报文），不是 UDP 数据报：
    实际连接预算单独计算。完整算法、测试及实现差异见
    [打洞对照](../docs/nat-traversal-2026-11-07.md)。服务器与代理应同时升级。
 
+原始 TCP 协调口不可达时，控制链路和双方报到改走 HTTP(S) 监听器上的
+`GET /chast-signal` WebSocket（子协议 `chast-signal.v1`），每条 binary message
+承载同样的载体帧；三向签名挑战、20/60 s 保活和触发校验完全复用。WS 报到只附带
+本机打洞端口（`candidate`），服务器把观察 IP 与该端口组成对端端点；同网段仍
+下发完整内网端点。代理只放行 HTTP(S) 时，这条回退让 TCP 打洞协调仍可达；
+反代需要转发 `/chast-signal` 的 `Upgrade`。原始 TCP 口能连通时不会启用回退。
+
 ### 共享载体（TCP 8445 / WebSocket）
 
 `--carrier-listen 0.0.0.0:8445`（空值禁用）让所有主机共用一个 TCP 端口；
@@ -248,7 +262,11 @@ WebSocket 查看者可以放在 TLS 终止的 HTTP 反向代理之后：代理�
 `GET /chast` 路径，或把 `/carrier/chast` 之类的前缀改写到 `/chast`。2026-10-31
 回环用例 `TestSharedCarrierWebSocketThroughTLSProxy` 在 Go 反向代理后完成了
 wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）；真实 nginx/CDN 仍需
-部署复核。原始 TCP 的主机与查看者链路不是 HTTP，HTTP 反代无法承载，需要 L4
+部署复核。代理后的连接若要让中继策略（黑白名单、限速、审计和统计里的查看者
+地址）看到真实客户端 IP，设置 `--relay-proxy-header X-Real-IP` 或
+`X-Forwarded-For`；该开关默认关闭，只作用于中继端口与共享载体的 WS 握手，
+仅替换 IP 并保留代理连接的端口。直接暴露的监听不要开启，否则客户端可以伪造
+来源地址。原始 TCP 的主机与查看者链路不是 HTTP，HTTP 反代无法承载，需要 L4
 转发（如 nginx stream）或直接暴露；共享载体监听本身不终止 TLS。
 
 已认证的主机链路也计入在线判定：即使 UDP keepalive 全部丢失，查询仍返回
@@ -263,12 +281,13 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`tcp_punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
-| `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、TCP 打洞协调地址 `tcp_punch`、`transport`、`relay_only` 与可选的 `software`；共享载体（`carrier`/`carrier_v6`）与令牌只在该主机在线时返回 |
-| `GET` | `/v1/hosts?ids=<id,...>` | 配置了 server-key 时需要 Bearer server-key | 批量查询，逗号分隔、最多 200 个 ID；返回 `hosts` 数组（字段同单机查询）、`missing` 未知 ID 列表与顶层 `software` |
-| `PATCH` | `/v1/identities/{id}` | Bearer server-key | 设置或清除运营者别名/标签；省略字段保持不变，`""`/`[]` 表示清除 |
-| `GET` | `/v1/identities?q=&online=&limit=&offset=` | Bearer server-key | 全量持久身份（含离线）：`identities`（注册表字段 + `online`、在线时的 `relay`/`candidate`、`last_seen_ms`）、过滤后的 `total` 与 `online`；`q` 对 ID/指纹/主机名/平台/版本/别名/标签做大小写不敏感子串匹配，`online=1`（或 `true`）只返回在线；`limit` 1–1000 默认 200、`offset` 0–1000000 |
-| `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code`、`recovery_code`、`sms_code` 或 `email_code`） | 返回 `token`、`expires_in_ms`（30 min）、`refresh_token`、`refresh_expires_in_ms`（720 h）与 `user`；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码、恢复码、短信码或邮件码返回 401 与 `X-Chast-2FA: invalid`；多种验证码同时提供时优先 TOTP，其次恢复码，再次短信码，最后邮件码；密码正确但账号被封禁返回 403 `account is banned`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
+| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`tcp_punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software`；被运营者禁用的 ID（含从禁用 ID 迁移）返回 403 |
+| `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签/所有者、候选、NAT、租约中继/会合地址、TCP 打洞协调地址 `tcp_punch`、`transport`、`relay_only` 与可选的 `software`；共享载体（`carrier`/`carrier_v6`）与令牌只在该主机在线时返回；被禁用的设备返回 403 |
+| `GET` | `/v1/hosts?ids=<id,...>` | 配置了 server-key 时需要 Bearer server-key | 批量查询，逗号分隔、最多 200 个 ID；返回 `hosts` 数组（字段同单机查询）、`missing` 未知 ID 列表、`denied` 被策略或禁用拒绝的 ID 列表与顶层 `software` |
+| `PATCH` | `/v1/identities/{id}` | Bearer server-key | 设置或清除运营者别名/标签、集中禁用标记（`disabled`）与所有者账号（`owner`）；省略字段保持不变，`""`/`[]` 表示清除，`owner` 必须是已存在账号；禁用会立即释放租约与中继槽位并拒绝该 ID 的后续注册/lookup/票据/唤醒，失败详情见下表 |
+| `POST` | `/v1/identities/bulk` | Bearer server-key | 一次禁用或启用多台设备：`ids`（1–200 个，去重）与必填 `disabled`；返回 `updated`、`missing`（记录不存在，不使整批失败）与回显的 `disabled`；每台设备走与单机 PATCH 相同的租约释放与 `device_disable`/`device_enable` 审计；分组范围令牌只能操作组内设备，越界整批 403 |
+| `GET` | `/v1/identities?q=&online=&limit=&offset=` | Bearer server-key | 全量持久身份（含离线）：`identities`（注册表字段 + `online`、在线时的 `relay`/`candidate`、`last_seen_ms`）、过滤后的 `total` 与 `online`；`q` 对 ID/指纹/主机名/平台/版本/别名/标签做大小写不敏感子串匹配，`online=1`（或 `true`）只返回在线；`limit` 1–1000 默认 200、`offset` 0–1000000；`format=csv` 时按同一 `q`/`online` 过滤导出全部身份（忽略分页），列为 ID/别名/所有者/标签/主机名/平台/版本/指纹/在线/禁用/中继/候选/最近在线，表头与审计导出一样做公式注入转义 |
+| `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code`、`recovery_code`、`sms_code` 或 `email_code`；配置 `--ldap-*` 时密码也可以是目录密码） | 返回 `token`、`expires_in_ms`（30 min）、`refresh_token`、`refresh_expires_in_ms`（720 h）与 `user`；配置目录后，本地密码不匹配时改走 LDAP bind+search，已链接目录的账号只接受目录密码（目录侧禁用立即生效）；目录不可达返回 503 `the directory is unavailable` 且不计失败，目录拒绝按错误密码计数并同样在达到阈值后 429；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码、恢复码、短信码或邮件码返回 401 与 `X-Chast-2FA: invalid`；多种验证码同时提供时优先 TOTP，其次恢复码，再次短信码，最后邮件码；密码正确但账号被封禁返回 403 `account is banned`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
 | `POST` | `/v1/account/login/sms` | 用户名 + 密码 | 为启用两步验证且绑定了找回手机的账号发送 8 位短信登录码，成功返回 202 `{"status":"accepted"}`；未启用两步验证、未绑手机与网关失败同样 202，不泄露账号状态；密码错误 401、封禁 403；同一客户端 IP+用户名每分钟最多请求一次（429），被限流的请求不会替换已发出的验证码；验证码默认 10 分钟（`--sms-ttl`）有效、5 次错误后作废，登录成功时在签发令牌的同一事务中消费 |
 | `POST` | `/v1/account/login/email` | 用户名 + 密码 | 为启用两步验证且绑定了找回邮箱的账号发送 8 位邮件登录码，成功返回 202 `{"status":"accepted"}`；未启用两步验证、未绑邮箱与 SMTP 发信失败同样 202，不泄露账号状态；密码错误 401、封禁 403；同一客户端 IP+用户名每分钟最多请求一次（429），被限流的请求不会替换已发出的验证码；验证码默认 30 分钟（`--recovery-ttl`）有效、5 次错误后作废，登录成功时在签发令牌的同一事务中消费 |
 | `POST` | `/v1/account/refresh` | `refresh_token` | 轮换同一会话的访问/刷新令牌，返回与登录相同的字段；旧访问令牌立即失效；已轮换的刷新令牌再次提交视为泄漏/重放，返回 401 并撤销整个会话；过期或未知令牌返回 401；结果写入 `session_refresh` 审计 |
@@ -297,7 +316,7 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/account/sessions/revoke-others` | Bearer account token | 保留当前会话令牌并撤销该账号全部其他会话，返回 `{"revoked":N}`；无其他会话时为 0 |
 | `PATCH` | `/v1/account/sessions/{id}` | Bearer account token | 提交 `device_name` 改名本账号的一个会话（去空白/控制字符、最长 128 字符），返回 204；空名为 400，不存在、已过期或属于他人为 404 |
 | `DELETE` | `/v1/account/sessions/{id}` | Bearer account token | 撤销本账号的一个会话，返回 204；不存在或属于他人返回 404；撤销当前会话会使本设备令牌失效 |
-| `GET` | `/v1/accounts` | Bearer server-key 或 admin 账号令牌 | 列出全部账号（`id`、`username`、`role`、可选 `email`/`phone`、`created_at_ms`，被封禁时带 `banned:true`）；普通账号令牌返回 403，未启用账号存储返回 503 |
+| `GET` | `/v1/accounts` | Bearer server-key 或 admin 账号令牌 | 列出账号（`id`、`username`、`role`、`permission_ceiling`（0 表示不限制）、可选 `email`/`phone`、`created_at_ms`，被封禁时带 `banned:true`）并返回匹配总数 `total`；可选 `q`（用户名子串，大小写不敏感，`%`/`_` 按字面量）、`role`（精确角色，非法角色 400）、`limit`（0–1000）与 `offset`，省略或为 0 的 `limit` 返回全部；`format=csv` 导出全部匹配行（忽略 `limit`/`offset`，列 `id,username,role,email,phone,permission_ceiling,banned,created_at`）；普通账号令牌返回 403，未启用账号存储返回 503 |
 | `POST` | `/v1/accounts` | Bearer server-key 或 admin 账号令牌 | 提交 `username`、`password`（省略时生成一次性随机密码并在响应中返回）、可选 `role`（`admin`/`user`，默认 `user`）与可选 `email`/`phone`；重复用户名/邮箱/手机 409，非法用户名/密码/角色/邮箱/手机 400 |
 | `PATCH` | `/v1/accounts/{username}` | Bearer server-key 或 admin 账号令牌 | 修改 `role`；不允许自我降级，目标为最后一个 admin 时返回 409，未知账号 404 |
 | `DELETE` | `/v1/accounts/{username}` | Bearer server-key 或 admin 账号令牌 | 删除账号及其令牌与地址簿，返回 204；目标为最后一个 admin 且库中还有其他账号时 409，未知账号 404 |
@@ -306,16 +325,22 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/accounts/{username}/password` | Bearer server-key 或 admin 账号令牌 | 重置密码（空 body 生成一次性随机密码并在响应中返回）并吊销该账号全部会话；未知账号 404 |
 | `POST` | `/v1/accounts/{username}/email` | Bearer server-key 或 admin 账号令牌 | 提交 `email` 设置或清除（空串）账号的找回邮箱；重复邮箱 409、非法邮箱 400、未知账号 404，写入 `account_email` 审计 |
 | `POST` | `/v1/accounts/{username}/phone` | Bearer server-key 或 admin 账号令牌 | 提交 `phone` 设置或清除（空串）账号的找回手机并作废未用验证码；重复手机 409、非法号码 400、未知账号 404，写入 `account_phone` 审计 |
+| `POST` | `/v1/accounts/{username}/recover` | Bearer server-key 或 admin 账号令牌 | 为账号签发密码重置令牌并发邮件，返回 202 `{"status":"sent"}`；令牌只出现在邮件与链接中，审计记 `account_recover`；同一账号 10 分钟节流 429，未知账号 404，无找回邮箱 400，邮件失败 502，未配置邮件 503 |
 | `POST` | `/v1/accounts/{username}/sms` | Bearer server-key 或 admin 账号令牌 | 为账号签发一个短信验证码并交给网关，返回 202 `{"status":"sent"}`，响应与审计都不含验证码；未知账号或未设手机 400，网关失败 502，未配置短信 503 |
 | `POST` | `/v1/accounts/{username}/2fa/reset` | Bearer server-key 或 admin 账号令牌 | 清除账号的两步验证密钥，返回 204；未知账号 404 |
+| `POST` | `/v1/accounts/{username}/permissions` | Bearer server-key 或 admin 账号令牌 | 提交 `permission_ceiling` 设置该账号的会话权限上限（0 表示不限制），返回更新后的账号；与设备策略上限取交集，下次签发接入票据时生效（已签发票据最长 60 秒后失效）；未知账号 404，负数或超出 32 位 400，写入 `account_session_cap` 审计 |
+| `GET` | `/v1/accounts/{username}/sessions` | Bearer server-key 或 admin 账号令牌 | 列出该账号当前有效的登录会话（`id`、`device_id`/`device_name`、`created_at_ms`、`expires_at_ms`、`login_ip`、`location`、`current`）；调用者查看自己的账号时当前会话带 `current:true`，未知账号 404，普通账号令牌 403 |
+| `DELETE` | `/v1/accounts/{username}/sessions/{id}` | Bearer server-key 或 admin 账号令牌 | 撤销该账号的一个登录会话（访问与刷新令牌一并删除），返回 204；会话不属于该账号或已过期 404，撤销调用者自身当前会话 409；写入 `session_revoke` 审计 |
+| `POST` | `/v1/accounts/{username}/sessions/revoke-all` | Bearer server-key 或 admin 账号令牌 | 撤销该账号的全部登录会话并返回 `{"revoked":N}`；调用者以该账号登录时保留调用会话（相当于“其他设备全部退出”）；写入 `session_revoke` 审计 |
 | `GET` | `/v1/addressbook?since=N` | Bearer account token | 返回当前 `revision`、存活条目 `peers`、存活分组 `groups`，以及 `since` 之后的条目变更/墓碑 `changes` 与分组变更 `group_changes`；省略 `since` 时从 0 开始，越界值回落到全量历史 |
 | `PATCH` | `/v1/addressbook/peers/{id}` | Bearer account token | 添加或部分更新名称/标签/`group_id`/`position`；省略字段保持不变，`""`/`[]` 清除，标签去重，`position` 必须非负；只带 `group_id` 时要求条目与目标分组都存在；可选正整数 `if_revision` 作为条目级并发令牌，过期/缺失/已删除返回 409，省略时仍为最后写入者优先 |
 | `DELETE` | `/v1/addressbook/peers/{id}` | Bearer account token | 删除条目；不存在返回 404 |
 | `PATCH` | `/v1/addressbook/groups/{id}` | Bearer account token | 创建、改名、改上级或排序分组；名称去除首尾空白且最长 64 字符，重复使用同一 ID 会复活已删除分组；`parent_id` 空串表示根，上级须为同一账号的存活分组，挂到自己/后代之下或深度超 8 返回 400；`position` 必须非负；可选正整数 `if_revision` 作为分组级并发令牌，过期/缺失返回 409 |
 | `DELETE` | `/v1/addressbook/groups/{id}` | Bearer account token | 删除分组并写分组墓碑，子分组上移到被删组的上级，组内存活条目逐个解除归组并推进修订，同一事务撤销该分组的共享授权；可选 `?if_revision` 校验，不存在返回 404 |
-| `GET` | `/v1/addressbook/grants` | Bearer account token | 返回授出 `outgoing` 与收到 `incoming` 两组授权；每项含 `username`、`permission` 与可选的 `group_id`（空表示整本） |
-| `POST` | `/v1/addressbook/grants` | Bearer account token | 提交 `username`、`permission` 与可选 `group_id` 授权整本或某个分组；同一范围重复提交幂等并可改权限；未知用户/分组 404、非法分组 ID 400、自共享 400 |
+| `GET` | `/v1/addressbook/grants` | Bearer account token | 返回授出 `outgoing` 与收到 `incoming` 两组授权；每项含 `username`、`permission` 与可选的 `group_id`（空表示整本）；`target_kind` 为 `group`/`everyone` 时 `username` 为空，`target_id`/`target_name` 标明账号组 |
+| `POST` | `/v1/addressbook/grants` | Bearer account token | 提交 `username`、`permission` 与可选 `group_id` 授权整本或某个分组；同一范围重复提交幂等并可改权限；未知用户/分组 404、非法分组 ID 400、自共享 400。可用 `target` 改为 `group`（配 `target_id`，要求调用者是该组成员）或 `everyone`，此时不能再带 `username` |
 | `DELETE` | `/v1/addressbook/grants/{username}` | Bearer account token | 不带查询参数撤销该用户全部授权；带 `?group_id=<id>`（可为空串）只撤销该范围；不存在 404 |
+| `DELETE` | `/v1/addressbook/grants/targets` | Bearer account token | 撤销账号组/Everyone 授权：`?kind=group&target_id=<id>` 或 `?kind=everyone`；带 `group_id` 只撤销该范围；不存在 404 |
 | `GET` | `/v1/addressbook/shared` | Bearer account token | 授权给我的地址簿：`books[].peers`/`groups` 只含授权范围，`scopes` 列出整本与分组权限，`permission` 为最高权限 |
 | `POST` | `/v1/addressbook/shared/{owner}/peers` | Bearer account token | 在属主地址簿新增条目，可选 `group_id`；需要整本或目标分组的读写权限；可选 `if_revision`（属主地址簿修订号），409 时需重新读取 |
 | `PATCH` | `/v1/addressbook/shared/{owner}/peers/{id}` | Bearer account token | 修改属主条目；需要整本或该条目所属分组的读写权限，可选 `if_revision`，409 时需重新读取 |
@@ -328,13 +353,13 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/hosts/{id}/audit` | 主机 Ed25519 签名（按 `audit_ref`） | 主机上报一条入站审计：`kind`（`session`/`file`）、`audit_ref`、时间/方向/文件名/大小/结果/说明，以及 `signature`。签名覆盖域分隔的规范消息 `chast-host-audit-v1`；未知主机 404、签名无效 401、时间偏差超过 2 分钟或字段非法 400。会话与查看器记录按引用合并，文件保存为主机逐文件行；返回 201 与规范化后的记录 |
 | `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、TCP 打洞协调地址（`tcp_punch`）、共享载体（`carrier`/`carrier_v6`）、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
-| `GET` | `/v1/audit?limit=N&action=<action>&before_id=<id>&format=json\|csv` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤，`before_id` 取上一页返回的 `next_before_id` 续页；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数），未启用账号存储返回 503 |
+| `GET` | `/v1/audit?limit=N&action=<action>&user=<name>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤，`user` 按用户名精确过滤（含未知账号的失败登录，可与管理台分组过滤叠加），`before_id` 取上一页返回的 `next_before_id` 续页；`since`/`until` 按 `created_at` 收窄为闭区间，接受 unix 毫秒或 RFC3339，任一端可省略，负数、无法解析或 `since` 晚于 `until` 返回 400；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数，保留 `action`/`user` 与时间窗），未启用账号存储返回 503 |
 | `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail` 与 `direction`；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大或方向非法返回 400 |
 | `GET` | `/v1/account/connections?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的连接记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
-| `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>&before_id=<id>&format=json\|csv` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；`format=csv` 下载整表并沿用 `username`/`host` 过滤，忽略分页参数；未启用账号存储返回 503 |
+| `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；`since`/`until` 按 `started_at` 收窄为闭区间（unix 毫秒或 RFC3339，任一端可省略，非法窗口返回 400）；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；`format=csv` 下载整表并沿用 `username`/`host` 与时间窗，忽略分页参数；未启用账号存储返回 503 |
 | `POST` | `/v1/account/file-transfers` | Bearer account token | 查看器上报一个轮询窗口内结束的文件传输：`peer_id`、`direction`（`upload`/`download`）、可选 `name`/`size`、`files`（默认 1）、`success`、可选 `detail` 与 `occurred_at_ms`；返回 201；空对端、未知方向、负大小或文件数越界返回 400 |
 | `GET` | `/v1/account/file-transfers?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的文件传输记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
-| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>&before_id=<id>&format=json\|csv` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；主机逐文件行与查看器汇总行并存；`format=csv` 下载整表并沿用过滤，忽略分页参数；未启用账号存储返回 503 |
+| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；`since`/`until` 按 `occurred_at` 收窄为闭区间（unix 毫秒或 RFC3339，任一端可省略，非法窗口返回 400）；主机逐文件行与查看器汇总行并存；`format=csv` 下载整表并沿用过滤与时间窗，忽略分页参数；未启用账号存储返回 503 |
 | `POST` | `/v1/account/recordings?name=<文件名>&peer_id=<id>&started_ms=<毫秒>&duration_ms=<毫秒>` | Bearer account token | 上传一段查看器录制：请求体为 MP4 原始字节，元数据在查询串（文件名可为 UTF-8，响应与下载用 RFC 5987 名称）；服务端边写边算 SHA-256，超出 `--recordings-max-mb` 或账号配额返回 413，空请求体返回 400，成功返回 201 与录制记录、`usage_bytes`、`quota_bytes`；未启用归档返回 503 |
 | `GET` | `/v1/account/recordings` | Bearer account token | 当前账号的上传录制，最新在前，附带 `usage_bytes`、`quota_bytes` 与 `max_upload_bytes`（0 表示不限） |
 | `GET` | `/v1/account/recordings/{id}` | Bearer account token | 下载自己的录制，`video/mp4` 附件；只按账号隔离，未知 ID 或文件已缺失返回 404 |
@@ -344,7 +369,7 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `DELETE` | `/v1/recordings/{id}` | Bearer server-key 或 `operator` 及以上账号令牌 | 运营者删除任意账号的录制（元数据与文件），返回 204；未知 ID 返回 404 并记一条失败审计；成功写 `recording_delete` 审计，记在录制属主名下并在 `detail` 注明 `by=<操作者>`；未启用归档返回 503 |
 | `GET` | `/metrics` | 配置了 server-key 时需要 | Prometheus 文本格式指标 |
 | `GET` | `/healthz` | 无 | 存活检查 |
-| `GET`/`HEAD` | `/admin/` | 无（页面内以 server-key 调用 `/v1/*`） | 内嵌 Web 管理台：只提供 `index.html`、`app.js`、`style.css`，其他路径一律 404；响应带 CSP（仅同源、无内联脚本/样式）、`nosniff`、`no-store`、`no-referrer` 与 `X-Frame-Options: DENY`；`GET /admin` 以 301 跳到 `/admin/` |
+| `GET`/`HEAD` | `/admin/` | 无（页面先用 server-key 或账号令牌调用 `/v1/*`；账号可用安全密钥或 OIDC 单点登录） | 内嵌 Web 管理台：只提供 `index.html`、`app.js`、`style.css`，其他路径一律 404；响应带 CSP（仅同源、无内联脚本/样式）、`nosniff`、`no-store`、`no-referrer` 与 `X-Frame-Options: DENY`；`GET /admin` 以 301 跳到 `/admin/` |
 | `GET`/`HEAD` | `/software/{name}` | 无 | 仅设置 `--software-dir` 时注册：公布该目录下单层发布文件（名称限 `[A-Za-z0-9._-]`，无目录列表，其他路径一律 404），带 `application/octet-stream` 与附件名，支持 Range/ETag/Last-Modified |
 
 主机私钥由 `--key` 派生（`SHA-256("chast-host-identity-v1\n" + key)` 作为
@@ -544,11 +569,12 @@ MAC），目标端口 9。MAC 接受 `AA:BB:CC:DD:EE:FF`、`AA-BB-...` 与无分
 16 字节随机盐、32 字节派生密钥）保存，格式为自描述的
 `pbkdf2-sha256$210000$<salt>$<hash>`；登录令牌是 32 字节随机值，数据库只存
 其 SHA-256，修改密码会删除该用户全部令牌。用户名大小写不敏感，地址簿按
-用户隔离，删除用户时令牌与地址簿随外键级联删除。账号分 `admin` 与 `user`
-两种角色：首个创建的账号（以及旧库升级时最早创建的账号）为 `admin`，其余
-默认 `user`。`/v1/accounts*` 管理接口同时接受 server-key 与 admin 账号令牌，
-普通账号令牌返回 403；支持列出、创建（可生成一次性密码）、改角色、删除、
-封禁/解封、重置密码与清除两步验证。系统始终保留至少一个可用 admin：最后一个
+用户隔离，删除用户时令牌与地址簿随外键级联删除。账号分 `admin`、`operator`、
+`readonly` 与 `user` 四种角色：首个创建的账号（以及旧库升级时最早创建的账号）
+为 `admin`，其余默认 `user`。`/v1/accounts*` 管理接口同时接受 server-key 与
+admin 账号令牌，普通账号令牌返回 403；支持列出、创建（可生成一次性密码）、
+改角色、删除、封禁/解封、重置密码、清除两步验证，以及查看并撤销任一账号的
+登录会话（单个设备或全部退出，调用者自己的当前会话除外）。系统始终保留至少一个可用 admin：最后一个
 admin 不能降级或封禁；只有当库中还有别的账号时也不能删除最后一个 admin
 （删除全部账号后，下一个新建账号会重新成为 admin）。封禁会立即吊销该账号
 全部访问与刷新令牌，密码正确时登录返回 403，但错误密码仍按普通失败处理，
@@ -635,10 +661,13 @@ admin 不能降级或封禁；只有当库中还有别的账号时也不能删�
 服务器错误日志，不改变原操作响应，避免状态文件繁忙时把用户锁在门外。表内最多
 保留 10000 条，超出后按 ID 删除最旧记录；配置 `--audit-retention-days` 后还会
 按时间清理。运营者可用 `GET /v1/audit`（Bearer server-key）或管理台
-`audit [count]` 按时间倒序读取；HTTP 版本支持 `action` 精确过滤、`limit`
-（默认 50、最大 200）与 `before_id` 游标续页（该页已满时返回
-`next_before_id`），管理台默认 20 条、最多 200 条。`audit prune <days>` 立即
-按时间清理账号安全审计、连接和文件传输三类历史。
+`audit [count]` 按时间倒序读取；HTTP 版本支持 `action` 精确过滤、`user`
+按账号精确过滤（失败登录同样命中，可与分组过滤叠加）、`limit`
+（默认 50、最大 200）、`before_id` 游标续页（该页已满时返回
+`next_before_id`）与 `since`/`until` 时间窗（闭区间，unix 毫秒或 RFC3339），
+管理台默认 20 条、最多 200 条，审计页签还提供账号输入框，并可在审计/连接/文件
+三个页签用起止时间输入框收窄范围。`audit prune <days>` 立即按时间清理账号
+安全审计、连接和文件传输三类历史。
 
 连接审计与账号安全审计分开存放：查看器在会话结束时（首帧到达后才开始计时，
 纯握手失败不计入）向 `POST /v1/account/connections` 上报对端 ID、起止时间、
@@ -679,7 +708,8 @@ server-key）或管理台 `connections [count]` 查看全部账号并可按用�
 `/v1/audit/file-transfers` 上加 `format=csv` 即返回
 `text/csv; charset=utf-8` 附件，`Content-Disposition` 的文件名带 UTC 时间戳。
 导出按主键分批读取并逐批写出（chunked，不预先计算长度），沿用
-`action`/`username`/`host` 过滤，忽略 `limit` 与 `before_id`；账号审计每批
+`action`/`username`/`host` 过滤与 `since`/`until` 时间窗，忽略 `limit` 与
+`before_id`；账号审计每批
 500 行，连接与文件传输每批 200 行（与存储层单页上限一致）。表头在首页查询
 成功后才发送，没有匹配行时返回仅含表头的 CSV；写出中途失败只记服务器日志
 并关闭连接，客户端看到的是被截断的下载。时间列是 UTC RFC3339Nano，
@@ -831,11 +861,12 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   查询的 `candidates` 会把公网观察地址与局域网地址去重合并。局域网地址仅为
   提示，服务端不会用它替代观察地址。
 - 同网段直达：查看者在 `punch_request` 里上报自己的局域网候选，服务器**仅在
-  观察到的公网 IPv4 地址与主机一致时**把它们转给主机。主机把局域网候选与
-  公网候选并行探测，且不看对称 NAT 结论——局域网路径不经过 NAT，这正是
-  路由器不支持 hairpin 时唯一可行的直连。跨公网地址上报的局域网候选不会
-  转发，避免让主机探测陌生内网；这对应 RustDesk 的 `FetchLocalAddr` 同网段
-  路径。
+  观察到的公网 IPv4 地址与主机一致，或双方观察地址都在 `--lan-mask` 网段内
+  时**把它们转给主机。主机把局域网候选与公网候选并行探测，且不看对称 NAT
+  结论——局域网路径不经过 NAT，这正是路由器不支持 hairpin 时唯一可行的直连。
+  跨公网地址上报的局域网候选不会转发，避免让主机探测陌生内网；一端在网段内、
+  另一端不在时服务端改写为 `symmetric` 并下发内网中继地址。这对应 RustDesk
+  的 `FetchLocalAddr` 同网段路径与 `-m` 规则。
 - 双方从**同一个**数据套接字向对方候选地址发 `punch_probe`，每轮使用一个新
   事务号；只有该事务号以 `punch_ack` 回来（或真实主机数据到达）才算直连
   成功，单向来包不锁定。探测间隔从 20 ms 按 1.5× 退避到 200 ms，窗口 3 s，
@@ -867,10 +898,11 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   状态的一部分；备份时应停服，或用 SQLite 的在线备份接口，不要只复制主文件。
   状态库带前向版本化迁移：账号与对等记录分别在 `schema_migrations`/
   `registry_schema_migrations` 记录版本，启动只执行未应用的步骤；账号库当前
-  为 v14（v3 增加分组嵌套与排序，v4 增加录制元数据，v5 增加刷新令牌重放
+  为 v16（v3 增加分组嵌套与排序，v4 增加录制元数据，v5 增加刷新令牌重放
   标记，v6 增加 OIDC 身份关联，v7 增加账号组，v8 增加审计地点/路由，v9 增加
   主机审计身份与去重，v10 增加设备策略，v11 增加机器令牌，v12 增加退役签发
-  `kid`，v13 增加策略对象/分配，v14 增加按设备单调策略版本序列）；没有版本表
+  `kid`，v13 增加策略对象/分配，v14 增加按设备单调策略版本序列，v15 增加
+  地址簿组/全员共享目标，v16 增加账号级会话权限上限）；没有版本表
   的旧库会自动补跑基线并补记 v1，版本高于当前二进制时服务端拒绝启动并提示
   升级（`schema version N is newer than this binary supports (M)`）。升级前
   应停止旧实例；只支持前向迁移，降级需从备份恢复。
@@ -925,7 +957,8 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   读取或清空，清空不重置累计变更计数。
 - **滥用限制**：会合端口对 `punch_request` 做按 IP 的固定窗口限速；HTTP API
   有按 IP 的令牌桶（`--api-rate`/`--api-burst`，超限 `429`）；注册另有按 IP
-  的速率与不同 ID 数量限制（`--register-*`，超限 `429` + `Retry-After: 1`）；
+  的速率与不同 ID 数量限制（`--register-*`，超限 `429` + `Retry-After: 1`）
+  和按 ID 的连续注册节流（`--register-id-throttle`，超限 `429` + `Retry-After`）；
   中继端口与共享载体在已有活跃查看者时拒绝新来源，并对握手/空闲超时强制
   关闭；所有计数暴露在 `/v1/stats` 与 `/metrics`。管理通道只绑定回环，不
   接受远程来源。
@@ -995,6 +1028,14 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   全部端点。多网卡或 NAT 多映射时，每个地址都必须路由到同一实例，且中继
   端口能按该地址绑定（也可用解析到本机的 DNS 名）；`rs`/`tg` 用于运行时
   查看、替换与预览，`aur` 仍控制是否强制中继。
+- `--lan-mask`（逗号分隔 CIDR，可多项；裸地址按 /32 或 /128）打开 hbbs `-m`
+  的网段规则：用观察到的双方地址做掩码判定，双方都在网段内（或观察 IP 相同）
+  视为同内网，只给同内网配对交换内网候选并下发内网中继地址；一端在网段内、
+  另一端不在时把交换的 NAT 类型改写为 `symmetric`，主机据此跳过 IPv4 打洞并
+  回传 `relay_hint`，查询、UDP 打洞与 TCP 协调三处判定一致。`--local-ip` 是
+  本实例内网中继地址，只对命中网段的一侧生效（独立中继节点租约仍用节点自己
+  的地址），留空时按 `--advertise` 探测结果推导；未设 `--lan-mask` 时行为
+  不变，只提示 `--local-ip` 未生效。
 - `--punch-listen [::]:8444` 用一个双栈 socket 同时服务 IPv4 与 IPv6；
   `--advertise-v6` 指定下发的 IPv6 会合地址，留空时按注册连接的本地地址
   推导（只有连接本身走 IPv6 才会下发）。注册、单机/批量查询与 `/v1/server`
@@ -1057,6 +1098,21 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `Retry-After: 1`，计入 `chast_http_rate_limited_total`。默认按 TCP 对端
   计费；前置可信代理时用 `--proxy-header X-Forwarded-For` 取最后一跳地址，
   **仅在代理会覆盖该头时启用**，否则客户端可伪造来源绕过限流。
+- `--relay-proxy-header`（默认空）让中继端口与共享载体的 WebSocket 握手信任
+  指定头（如 `X-Real-IP`，也接受逗号列表的 `X-Forwarded-For`）作为查看者 IP，
+  供中继黑白名单、限速、审计和统计使用；只替换 IP，端口仍取代理连接本身，
+  传输凭据的重放绑定不受影响。空值使用 socket 对端地址；**仅当中继/载体 WS
+  只能由会覆盖该头的反向代理访问时启用**，直接暴露时开启会被客户端伪造来源。
+  `chast-relay` 同名旗标，作用于它自己的中继与共享载体监听。
+- `--register-id-throttle`（默认 3）与 `--register-id-throttle-window`（默认
+  6s）按主机 ID 限制连续注册，对齐 hbbs 对同一 peer 的回 `TOO_FREQUENT`：
+  签名与元数据校验通过后计数，窗口内第 4 次起返回 `429` 与 `Retry-After`，
+  静默满窗口后重置；`--register-id-throttle 0` 关闭。计数只在认证通过的请求
+  上累计，未持有主机私钥的请求返回 `401` 且不消耗配额。状态经 `/v1/stats`
+  的 `registration_throttle` 与 `/metrics` 的
+  `chast_register_id_throttled_total`/`chast_registration_tracked_ids` 暴露。
+  主机续约间隔为 `--host-ttl` 的一半（最少 5 s），因此 `--host-ttl` 低于约
+  13 s 时续约会落进同一窗口，需调大 `--register-id-throttle` 或设为 0。
 - `--login-max-failures`（默认 5）、`--login-window`（默认 10m）与
   `--login-lockout`（默认 1m）控制账号登录失败锁定：同一用户名+客户端 IP
   在窗口内达到失败次数后锁定该键，锁定期间登录返回 `429` 与 `Retry-After`。
@@ -1085,6 +1141,18 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   设置，缺一即关闭，相关接口返回 503。每个 origin 的主机必须等于 rp-id 或是其
   子域，clientDataJSON 里的 origin 必须与白名单逐字匹配。查看器以 Windows
   Hello 平台认证器完成注册与断言，服务端只保存 COSE 公钥，不校验证书链。
+- `--ldap-url`（默认空，关闭目录登录）指定 `ldap://` 或 `ldaps://` 服务器，
+  必须与 `--ldap-base-dn` 同时设置；`--ldap-bind-dn`/`--ldap-bind-password`
+  是检索用的服务账号（都空则匿名检索），`--ldap-filter` 默认 `(uid=%s)`，
+  其中唯一的 `%s` 接收转义后的登录名（AD 常用
+  `(sAMAccountName=%s)`），`--ldap-email-attr`（默认 `mail`）在首次建号时
+  复制为找回邮箱。`--ldap-starttls` 在 `ldap://` 上先升级 TLS，
+  `--ldap-insecure` 跳过证书校验（仅测试环境），`--ldap-timeout`（默认 8s）
+  限制单次登录。登录先用本地密码，失败后再做目录 bind+search；已被目录
+  接管的账号反过来只接受目录密码，目录侧禁用/锁定在下次登录生效。目录
+  不可达返回 503 且不计入失败锁定，错误密码按本地失败计数。
+  `--ldap-auto-create`（默认 true）在首次登录建号（随机本地密码、角色
+  user，空库首个为 admin）；已存在的同名本地账号不会被目录接管。
 - `--audit-retention-days`（默认 0，只保留行数上限）在启动时与每 6 小时按时间
   清理 `audit_events`、`connection_events` 与 `file_events` 中早于该天数的行，
   启动清理后只在确有删除时记录一行日志；管理台 `audit prune <days>` 可随时
@@ -1136,7 +1204,8 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   （`login_ip`/`location`），管理台审计与查看器设备会话对话框都会显示。
   留空、文件未命中或未配置时地点为空，行为与之前相同。服务端不做在线查询，
   也不内置地点数据：识别效果取决于运维提供的表；来源地址同样受
-  `--proxy-header` 影响，启用前应确认代理会覆盖该头。
+  `--proxy-header` 影响，启用前应确认代理会覆盖该头。管理台 `rg`
+  （`reload-geo`）重新读取同一路径并原子换表，失败保留旧表，无需重启。
 - `--log-file`（默认空）在 stderr 之外再把 slog 文本日志追加到文件；留空只写
   stderr。`--log-max-size`（默认 100，单位 MiB）写满后把当前文件重命名为
   `<name>.<20060102-150405.000000000>` 并新建，`--log-compress`（默认开）把
@@ -1306,17 +1375,24 @@ hbbs 侧：
 chast-server ... \
   --relay-nodes http://relay-1:8447,https://relay-2:8447 \
   --relay-node-key "$CHAST_RELAY_NODE_KEY" \
+  --relay-node-regions "http://relay-1:8447=Europe/Berlin,https://relay-2:8447=us-east" \
+  --geoip-file /etc/chast/geoip.txt \
   --relay-node-health 10s
 ```
 
 - 注册时先向该主机上次使用的节点续租，保持端口和查看者不变；首选节点不可用
   时按轮询尝试其余健康节点；全部失败则记录警告并回退本机
   `--relay-servers`/`--carrier-listen`。切换节点或回退时异步释放旧租约。
+- `--relay-node-regions` 把节点与 `--geoip-file` 的位置文本绑定：主机注册时用
+  其来源 IP 的位置在健康节点中优先选择同区域的节点，再回退其余节点；没打标签
+  的节点照常参与轮询，标签写错只会失去偏好、不会让注册失败。标签比较忽略大小
+  写和首尾空格，同一 URL 不能配两个不同标签。主机换网后在下一次注册时按新位置
+  重新挑选；为了不打断在线查看者，上次使用的节点仍排在最前。
 - 健康探测每 `--relay-node-health`（默认 10 s）请求 `/healthz`，缓存 RTT、
   租约数和共享载体已连接的主机列表。节点失效后 `rs` 显示 `status=down` 与
   最近错误；已有租约要等主机下一次注册刷新才会迁移，已有查看者不迁移。
-- `/v1/server` 与 `/v1/stats` 增加 `relay_nodes`（节点 URL、健康、租约、
-  载体链接数、RTT）；`/metrics` 增加 `chast_relay_nodes` 与
+- `/v1/server` 与 `/v1/stats` 增加 `relay_nodes`（节点 URL、区域标签、健康、
+  租约、载体链接数、RTT）；`/metrics` 增加 `chast_relay_nodes` 与
   `chast_relay_nodes_healthy`。管理通道 `hosts` 增加 `node=`，`rs` 先列
   节点再列本机地址，`tg` 优先返回下一个健康节点。
 - 中继治理：`--relay-single-bandwidth`（默认 128）、`--relay-total-bandwidth`
@@ -1344,6 +1420,7 @@ chast-server ... \
 chast-server ... --admin-listen 127.0.0.1:8446 \
   --register-max 30 --register-window 60s \
   --register-max-ids 300 --register-id-window 24h \
+  --register-id-throttle 3 --register-id-throttle-window 6s \
   --punch-log-max 100000
 ```
 
@@ -1386,6 +1463,7 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   | `ip-changes`/`ic [id\|start] [count]`、`ic <id> -`、`ic -` | 分页查看、单主机详情/删除或清空 IP 变更审计 |
   | `relay-servers`/`rs [a,b \| -]` | 查看节点状态与本机地址列表，替换或重置本机列表（仅影响后续分配） |
   | `test-geo`/`tg <ip1> [ip2]` | 校验 IP 参数并预览下一次分配：优先下一个健康节点，否则本机轮换地址 |
+  | `reload-geo`/`rg` | 重新读取 `--geoip-file` 并原子换表，输出前缀数与路径；文件损坏时保留旧表并输出错误，未配置时提示 |
   | `relay-only`/`aur [Y\|N]` | 查看或切换强制中继（即时生效，无需重启） |
   | `blacklist-add`/`ba <ip[ip...]>`、`blacklist-remove`/`br <ip\|all>`、`blacklist`/`b [ip]` | 黑名单：命中地址按 `--relay-blacklist-speed` 限速；`b` 列出或查询 |
   | `blocklist-add`/`Ba <ip[ip...]>`、`blocklist-remove`/`Br <ip\|all>`、`blocklist`/`B [ip]` | 阻断名单：命中地址的新会话被拒，已有会话在 1 s 内断开 |
@@ -1413,7 +1491,8 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   输出每个节点的 `status`/`leases`/`linked`/`rtt_ms` 与可选 `error`，再列本机
   地址。`tg` 与 hbbs 的 `test-geo` 形式一致，优先返回下一个健康节点的
   `next=<node URL>`（不消耗节点轮换），没有健康节点时退回本机地址并消耗一次
-  轮换。
+  轮换。`rg` 与 hbbs 的 `reload-geo` 对应：重新解析启动时的 `--geoip-file`，
+  成功后新登录地点与中继区域选择立即使用新表，失败保留旧表；未配置时提示。
 - 计数：`/v1/stats` 的 `registration_blocked`、`punch_requests`、
   `ip_changes`（`tracked`/`changes`）、`relay_servers` 与 `relay_nodes`；
   `/metrics` 的 `chast_register_blocked_total{reason}`、
@@ -1437,48 +1516,96 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
 同一 HTTP 监听还提供内嵌管理台，适合没有 SSH/回环终端的环境：
 
 - 浏览器打开 `https://<http-listen>/admin/`（默认监听 `0.0.0.0:8443`，
-  本机可开 `http://127.0.0.1:8443/admin/`）。登录方式有两种：
+  本机可开 `http://127.0.0.1:8443/admin/`）。登录方式有三种：
   - **服务器密钥**：输入 `--server-key`，等价于超级管理员，跳过全部角色检查。
   - **账号**：用户名 + 密码（+ 两步验证码或恢复码），调用
     `POST /v1/account/login` 取得访问/刷新令牌。仅 `readonly`、`operator`、
     `admin` 角色可以进入管理台；`user` 账号登录后会被立即登出并提示无权限。
+    两步验证框可选“自动识别 / 验证器 / 邮箱验证码 / 短信验证码 / 恢复码”；
+    选择邮箱或短信后可点“发送验证码”，页面调用
+    `POST /v1/account/login/email` 或 `/login/sms`（同样校验密码并计入登录
+    锁定）发一次性码，未配置 SMTP/短信网关时提示 503。登录被拒时页面统一用
+    中文提示（401 凭据/验证码、403 封禁、429 锁定、503 未启用账号库），
+    429/503 也保留登录表单而不是锁屏。
     访问令牌过期时页面自动调用 `/v1/account/refresh` 轮换，刷新令牌有效期内
     无需重新输入密码；退出时调用 `/v1/account/logout`。
+  - **单点登录**：服务端配置 `--oidc-issuer`/`--oidc-client-id`/
+    `--oidc-redirect-url` 后，登录页显示“使用 <提供方名称> 登录”。页面调用
+    `/v1/account/oidc/begin` 在新标签页打开身份提供方，浏览器回调完成后轮询
+    `/v1/account/oidc/poll` 取得访问/刷新令牌，再走与账号登录相同的角色/分组
+    校验；首次登录是否自动建号由 `--oidc-auto-create` 决定。弹窗被拦截时
+    页面会给出可点击的登录链接。管理台在 begin 时附带 `client: "console"`
+    提示，浏览器回调页据此把结尾文案改为“可关闭本页并返回 chast 管理台”，
+    查看器发起的登录仍显示“返回 chast 查看器”。
   凭据只放在浏览器 `sessionStorage`，关闭标签页即清除；页面不写 cookie、
   不在服务端建会话，所有请求仍是同源 `Authorization: Bearer` 调用公开 API。
   凭据失效或服务端拒绝时，任一 401 都会回到登录界面。
 - 控制台角色（`readonly` < `operator` < `admin`）：
   - `readonly`：总览、设备、录制、审计、服务器五个页签只读，可翻页与导出
     CSV，录制可跨账号列出、按属主过滤并下载；设备行显示“只读”且没有
-    编辑/重置按钮。
+    编辑/重置按钮；账号登录时另有只作用于本人的“我的账号”页签。
   - `operator`：在只读之上可编辑别名/标签、重置身份、移除租约，并可删除
     任意账号的录制；这些写操作分别写入 `device_labels`、`device_reset`、
     `device_lease_remove`、`recording_delete` 审计并记录操作者用户名，其中
     录制删除记在属主名下并在 `detail` 注明操作者。
   - `admin`：多出“账号”页签，可创建账号并指定角色、改角色、封禁/解封、
-    重置密码（可生成一次性密码）、重置两步验证与删除；最后一个 admin 的
-    保护与 API 一致。
+    重置密码（可生成一次性密码）、重置两步验证与删除，并可设置账号的
+    “会话权限”（对该账号在受管设备上的新会话生效，与设备策略取交集）；
+    账号表另有“找回方式”列与对话框：管理员可不经用户密码设置或清除
+    找回邮箱/手机（`POST /v1/accounts/{username}/email|phone`），并对已登记
+    手机或邮箱的账号发送重置短信/重置邮件（`POST /v1/accounts/{username}/sms|recover`，
+    未配置网关或邮件时提示 503）；最后一个 admin 的保护与 API 一致。
   - 服务器密钥在任何页签都不受限制；主机注册、查询、指标等
     host-only 接口仍只接受服务器密钥。
-- 页面分八个页签：总览（注册/身份/中继/打洞计数、中继节点健康、带宽与名单
+- 页面分九个页签：总览（注册/身份/中继/打洞计数、中继节点健康、带宽与名单
   策略、端口分配）、设备（`GET /v1/identities` 全量含离线；ID/主机名/别名/
   标签搜索与仅在线过滤；按角色提供编辑别名/标签、重置身份或只释放租约）、
   设备策略（策略对象、策略分配与逐设备生效结果三块；手动设备覆盖优先于分配，
-  表格显示来源与主机回执）、账号（仅 admin）、分组（账号组与设备成员关系）、
+  表格显示来源与主机回执）、账号（仅 admin）、我的账号（仅账号登录：概要、
+  修改密码、账号找回、两步验证与恢复码、安全密钥、登录会话）、分组（账号组与设备成员关系）、
   录制（跨账号列出、按属主过滤、查看用量与单文件上限、下载与按角色删除）、
   审计（账号安全事件、连接、文件传输三类，`before_id` 游标翻页与 `format=csv`
   下载）、服务器（版本、公钥、TTL、TLS/中继模式、软件更新签名与会合服务器
   列表）。
+- “我的账号”页签直接调用账号自助接口：`GET /v1/account` 显示角色、邮箱/手机
+  与 2FA/恢复码状态；`POST /v1/account/password` 改密（原密码错误提示，成功后
+  其他设备会话被撤销，当前令牌保留）；两步验证按 `2fa/start` → `2fa/enable`
+  展示密钥与 `otpauth://` 链接，已启用时可用 `2fa/disable` 关闭、用
+  `2fa/recovery` 生成一次性恢复码（面板可“下载文件”，保存为
+  `chast-recovery-codes-<用户名>.txt`）；登录会话来自 `GET /v1/account/sessions`，
+  当前会话标记“当前会话”，可 `PATCH` 改名、`DELETE` 撤销其他设备，或按
+  `sessions/revoke-others` 一键撤销其余会话。server-key 登录没有账号主体，
+  该页签保持隐藏。
+- “账号找回”一栏调用 `POST /v1/account/email` 与 `POST /v1/account/phone`：
+  保存或清除找回邮箱/手机都需要当前密码，空值即清除；手机号按服务端规则去掉
+  空白/`-`/`(`/`)`/`.` 与开头 `+` 后校验 6–15 位数字。原密码错误提示 403、
+  被其他账号占用提示 409、非法值提示 400；保存后概要立即刷新。
+- “我的账号”里的安全密钥一栏调用 `/v1/account/webauthn/*`：`GET
+  /v1/account/webauthn/credentials` 列出已登记密钥（名称、算法、登记/最近
+  使用时间）；登记时先 `POST /v1/account/webauthn/register/begin`（需当前
+  密码）取挑战与 `exclude_credentials`，再由 `navigator.credentials.create`
+  生成凭据并把 `client_data_json`/`attestation_object` 以 base64url 提交到
+  `register/finish`；删除调用 `credentials/remove`（同样需当前密码）。服务器
+  未配置 `--webauthn-rp-id`/`--webauthn-origin` 时该栏显示“服务器未配置”并
+  隐藏表单，不阻塞其他自助功能。
 - 集中策略 API（admin `devices` 资源，写操作记审计）：
   `GET/POST /v1/policies`、`GET/PUT/DELETE /v1/policies/{id}` 管理命名策略
   对象（名称唯一、模式、权限上限、允许用户/组、对象版本）；
   `GET/POST /v1/policy-assignments`、`DELETE /v1/policy-assignments/{id}`
-  把对象分配到 `all`/`group`/`device`（同一范围唯一，优先级 -10000..10000）。
+  把对象分配到 `all`/`group`/`device`（同一范围唯一，优先级 -10000..10000）；
+  `POST /v1/policy-assignments/bulk` 在单个事务里为 1..200 台设备建 `device`
+  分配，重复或已有分配的设备回列在 `skipped` 而不是让整批失败，配额超限整批
+  回滚，一批只写一条审计并只 reconcile 一次。管理台“新建分配”在 `device`
+  范围接受多台设备 ID（逗号、空格或换行分隔，去重后一次最多 200 台），一次
+  调用该批量接口并提示创建/跳过数量。
   服务端按优先级降序、同优先级 `device > group > all` 解析并物化到
   `device_policies`，手动 `PUT /v1/device-policies/{peer}` 覆盖分配，删除手动
   策略后回退；生效版本由 `device_policy_versions` 按设备单调分配，回退不会
   降低版本。变更经 `GET /v1/hosts/{id}/events` 推送 `policy` 或
-  `managed=false`，账号库 schema 当前为 v14。
+  `managed=false`，账号库 schema 当前为 v16。账号级会话权限
+  （`POST /v1/accounts/{username}/permissions`）在签发接入票据时与设备策略
+  上限取交集，因此只收紧不放宽；未受管设备由主机本机认证，不受服务端票据
+  约束。
 - 总览与设备页每 15 s 自动刷新，页面隐藏时暂停；账号、录制与审计表格不
   自动刷新，避免翻页或输入时被打断。
 - 静态资源在编译时用 `//go:embed` 打入二进制，只放行上述三个文件名；CSP

@@ -383,11 +383,21 @@ func (s *Store) ConnectionsFor(username string, limit int) ([]ConnectionEvent, e
 
 // ConnectionsForBefore pages cross-account reports older than beforeID.
 func (s *Store) ConnectionsForBefore(username string, beforeID int64, limit int) ([]ConnectionEvent, error) {
+	return s.ConnectionsForBeforeRange(username, TimeBounds{}, beforeID, limit)
+}
+
+// ConnectionsForBeforeRange is ConnectionsForBefore narrowed to an inclusive
+// window on started_at.
+func (s *Store) ConnectionsForBeforeRange(username string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	username = strings.TrimSpace(username)
-	if username == "" {
-		return s.connectionEvents("", nil, beforeID, limit)
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if username != "" {
+		clauses = append(clauses, "username = ? COLLATE NOCASE")
+		args = append(args, username)
 	}
-	return s.connectionEvents("username = ? COLLATE NOCASE", []any{username}, beforeID, limit)
+	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
+	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }
 
 // ConnectionsForHost lists sessions that involve one host, including inbound
@@ -398,12 +408,21 @@ func (s *Store) ConnectionsForHost(hostID string, limit int) ([]ConnectionEvent,
 
 // ConnectionsForHostBefore pages host-involved reports older than beforeID.
 func (s *Store) ConnectionsForHostBefore(hostID string, beforeID int64, limit int) ([]ConnectionEvent, error) {
+	return s.ConnectionsForHostBeforeRange(hostID, TimeBounds{}, beforeID, limit)
+}
+
+// ConnectionsForHostBeforeRange is ConnectionsForHostBefore narrowed to an
+// inclusive window on started_at.
+func (s *Store) ConnectionsForHostBeforeRange(hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	hostID = strings.TrimSpace(hostID)
-	if hostID == "" {
-		return s.connectionEvents("", nil, beforeID, limit)
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 3)
+	if hostID != "" {
+		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
+		args = append(args, hostID, hostID)
 	}
-	return s.connectionEvents(
-		"(host_id = ? OR peer_id = ? COLLATE NOCASE)", []any{hostID, hostID}, beforeID, limit)
+	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
+	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }
 
 func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit int) ([]ConnectionEvent, error) {

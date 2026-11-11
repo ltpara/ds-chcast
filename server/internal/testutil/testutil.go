@@ -22,6 +22,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
 	"github.com/ltpara/ds-chcast/server/internal/oidc"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
@@ -51,12 +52,18 @@ type Options struct {
 	RelayOnly           bool
 	WakeRelays          map[string][]string
 	Registration        *abuse.Blocker
-	RelayServers        []string
+	// RegisterThrottle bounds repeated signed registrations of one id. Nil
+	// disables the check.
+	RegisterThrottle *abuse.IDWindow
+	RelayServers     []string
 	// RelayNodes are standalone relay node base URLs. RelayNodeKey is their
 	// shared control key; empty falls back to RelayNodeKey.
 	RelayNodes []string
 	// RelayNodeKey authenticates control requests to RelayNodes.
 	RelayNodeKey string
+	// RelayNodeRegions labels RelayNodes with GeoIP location text so hosts are
+	// leased a node in their own region first.
+	RelayNodeRegions map[string]string
 	// RelayNodeHealth overrides the node health probe interval.
 	RelayNodeHealth time.Duration
 	// SoftwareVersion and SoftwareURL advertise an update like hbbs.
@@ -99,11 +106,16 @@ type Options struct {
 	WebAuthnOrigins []string
 	// OIDC enables viewer single sign-on routes. Nil leaves them at 503.
 	OIDC *oidc.Provider
-	// GeoIP labels login addresses in audit events and session lists.
-	GeoIP *geoip.Locator
+	// GeoIP labels login addresses in audit events and session lists. A
+	// *geoip.Reloader keeps working across runtime reloads.
+	GeoIP geoip.Table
 	// RelayExtra advertises additional relay hosts (for example the IPv6
 	// listener of the same relay) without making them the primary.
 	RelayExtra []string
+	// LANMask enables the hbbs LAN rule; LANLocalIP is the local relay address
+	// handed to peers inside the mask.
+	LANMask    *lanmask.Mask
+	LANLocalIP string
 	// CarrierV6 adds an IPv6 shared-carrier listener on ::1 and advertises it,
 	// so tests can cover dual-stack carrier endpoints.
 	CarrierV6 bool
@@ -231,6 +243,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		rendezvous.WithServerKey(ServerKey),
 		rendezvous.WithLinkKey(opts.LinkKey),
 		rendezvous.WithRelayOnly(relayOnly.Load),
+		rendezvous.WithLAN(opts.LANMask, opts.LANLocalIP),
 		rendezvous.WithHostCarrierLinked(func(id string) bool {
 			host, ok := reg.Lookup(id)
 			if !ok {
@@ -271,6 +284,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		}
 		pool, err = relaypool.New(relaypool.Config{
 			Nodes:    opts.RelayNodes,
+			Regions:  opts.RelayNodeRegions,
 			Key:      key,
 			Interval: opts.RelayNodeHealth,
 			Timeout:  time.Second,
@@ -340,7 +354,10 @@ func StartWith(t testing.TB, opts Options) *Server {
 		TLS:                        opts.TLS,
 		GeoIP:                      opts.GeoIP,
 		RelayOnly:                  relayOnly,
+		LANMask:                    opts.LANMask,
+		LANLocalIP:                 opts.LANLocalIP,
 		Blocker:                    opts.Registration,
+		RegisterThrottle:           opts.RegisterThrottle,
 		PunchLog:                   punchLog,
 		IPChanges:                  ipChanges,
 		RelayAddrs:                 relayAddrs,

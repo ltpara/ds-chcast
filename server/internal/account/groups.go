@@ -322,6 +322,14 @@ func (s *Store) DeleteAccountGroup(groupID string) error {
 	if _, err := tx.Exec(`DELETE FROM account_group_devices WHERE group_id = ?`, groupID); err != nil {
 		return fmt.Errorf("account store %s: delete group devices: %w", s.path, err)
 	}
+	// Address-book shares addressed to the group expire with it; a grant whose
+	// target no longer exists must not linger in the owner's grant list.
+	if _, err := tx.Exec(
+		`DELETE FROM address_book_target_grants WHERE target_kind = 'group' AND target_id = ?`,
+		groupID,
+	); err != nil {
+		return fmt.Errorf("account store %s: delete group address book grants: %w", s.path, err)
+	}
 	// A group-scoped policy assignment dies with its group; devices that were
 	// covered by it are reconciled back to open/manual by the caller.
 	if _, err := tx.Exec(
@@ -777,6 +785,12 @@ const groupEventFilter = `(user_id IN (SELECT user_id FROM account_group_members
 // ConnectionsForGroupBefore pages a group's session history. Optional
 // username and host filters narrow the group window further.
 func (s *Store) ConnectionsForGroupBefore(groupID, username, hostID string, beforeID int64, limit int) ([]ConnectionEvent, error) {
+	return s.ConnectionsForGroupBeforeRange(groupID, username, hostID, TimeBounds{}, beforeID, limit)
+}
+
+// ConnectionsForGroupBeforeRange is ConnectionsForGroupBefore narrowed to an
+// inclusive window on started_at.
+func (s *Store) ConnectionsForGroupBeforeRange(groupID, username, hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	groupID = strings.TrimSpace(groupID)
 	if !registry.ValidID(groupID) {
 		return nil, ErrInvalidAccountGroupID
@@ -791,12 +805,19 @@ func (s *Store) ConnectionsForGroupBefore(groupID, username, hostID string, befo
 		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
 		args = append(args, hostID, hostID)
 	}
+	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
 	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }
 
 // FileTransfersForGroupBefore is the file-transfer counterpart of
 // ConnectionsForGroupBefore.
 func (s *Store) FileTransfersForGroupBefore(groupID, username, hostID string, beforeID int64, limit int) ([]FileEvent, error) {
+	return s.FileTransfersForGroupBeforeRange(groupID, username, hostID, TimeBounds{}, beforeID, limit)
+}
+
+// FileTransfersForGroupBeforeRange is FileTransfersForGroupBefore narrowed to
+// an inclusive window on occurred_at.
+func (s *Store) FileTransfersForGroupBeforeRange(groupID, username, hostID string, bounds TimeBounds, beforeID int64, limit int) ([]FileEvent, error) {
 	groupID = strings.TrimSpace(groupID)
 	if !registry.ValidID(groupID) {
 		return nil, ErrInvalidAccountGroupID
@@ -811,5 +832,6 @@ func (s *Store) FileTransfersForGroupBefore(groupID, username, hostID string, be
 		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
 		args = append(args, hostID, hostID)
 	}
+	clauses, args = addTimeBounds(clauses, args, "occurred_at", bounds)
 	return s.fileEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }

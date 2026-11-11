@@ -51,6 +51,11 @@ func (s *server) wakeHost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if record.Disabled {
+		writeError(w, http.StatusConflict, "device is disabled")
+		s.recordAudit(r, actor, account.AuditDeviceWake, "wake "+id+" refused: device disabled", false)
+		return
+	}
 	if len(record.WakeTargets) == 0 {
 		// Without a link the target never reported, a relay agent would only
 		// guess where to broadcast. Refuse instead of fanning the packet out

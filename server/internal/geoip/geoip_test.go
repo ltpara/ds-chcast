@@ -73,3 +73,49 @@ func TestNilLocator(t *testing.T) {
 		t.Fatalf("nil len = %d", got)
 	}
 }
+
+func TestReloaderSwapsTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "geoip.txt")
+	if err := os.WriteFile(path, []byte("203.0.113.0/24 Osaka\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locator, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewReloader(path, locator)
+	if got := r.Path(); got != path {
+		t.Fatalf("path = %q", got)
+	}
+	if got := r.Lookup("203.0.113.7"); got != "Osaka" {
+		t.Fatalf("initial lookup = %q", got)
+	}
+
+	if err := os.WriteFile(path, []byte("203.0.113.0/24 Tokyo\n198.51.100.0/24 Lab\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prefixes, err := r.Reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if prefixes != 2 || r.Len() != 2 {
+		t.Fatalf("reloaded prefixes = %d/%d", prefixes, r.Len())
+	}
+	if got := r.Lookup("203.0.113.7"); got != "Tokyo" {
+		t.Fatalf("lookup after reload = %q", got)
+	}
+	if got := r.Lookup("198.51.100.4"); got != "Lab" {
+		t.Fatalf("new prefix lookup = %q", got)
+	}
+
+	// A broken file keeps the last good table so logins keep resolving.
+	if err := os.WriteFile(path, []byte("not a prefix\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reload(); err == nil {
+		t.Fatal("reload accepted a malformed table")
+	}
+	if got := r.Lookup("203.0.113.7"); got != "Tokyo" {
+		t.Fatalf("lookup after failed reload = %q", got)
+	}
+}

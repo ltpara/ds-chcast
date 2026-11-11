@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -12,14 +13,28 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
+// errRendezvousDial marks a control link whose transport never opened, as
+// opposed to one that authenticated and later dropped. Only the former falls
+// back to the signalling WebSocket.
+var errRendezvousDial = errors.New("rendezvous control dial failed")
+
 // rendezvousControlLoop carries server-originated instructions independently
 // of the relay data plane, including when UDP registration cannot get through.
 func (h *HostAgent) rendezvousControlLoop() {
 	for h.ctx.Err() == nil {
 		endpoint := h.getTCPPunch()
 		if endpoint != nil {
-			if err := h.runRendezvousControl(endpoint); err != nil && h.ctx.Err() == nil {
+			err := h.runRendezvousControl(endpoint)
+			if err != nil && h.ctx.Err() == nil {
 				h.log.Debug("rendezvous control disconnected", "error", err)
+			}
+			if errors.Is(err, errRendezvousDial) && h.ctx.Err() == nil {
+				// The raw TCP punch port is unreachable; the HTTP(S) listener
+				// may still be open through a proxy.
+				h.log.Debug("rendezvous control falling back to the signalling WebSocket")
+				if wsErr := h.runRendezvousControlWS(); wsErr != nil && h.ctx.Err() == nil {
+					h.log.Debug("signalling WebSocket disconnected", "error", wsErr)
+				}
 			}
 		}
 		if !h.sleep(time.Second) {
@@ -33,8 +48,25 @@ func (h *HostAgent) runRendezvousControl(endpoint *net.TCPAddr) error {
 	conn, err := h.cfg.Proxy.DialContext(dialCtx, "tcp", endpoint.String())
 	cancel()
 	if err != nil {
+		return fmt.Errorf("%w: %v", errRendezvousDial, err)
+	}
+	return h.serveRendezvousControl(conn, endpoint)
+}
+
+func (h *HostAgent) runRendezvousControlWS() error {
+	dialCtx, cancel := context.WithTimeout(h.ctx, tcpPunchDialWait)
+	conn, err := dialSignal(dialCtx, h.cfg.ServerURL, h.cfg.Proxy, h.cfg.TLS)
+	cancel()
+	if err != nil {
 		return err
 	}
+	return h.serveRendezvousControl(conn, nil)
+}
+
+// serveRendezvousControl authenticates one control link and reads triggers
+// until it drops. watch is the raw TCP endpoint whose replacement closes the
+// link; a WebSocket link passes nil because it rides the API address.
+func (h *HostAgent) serveRendezvousControl(conn net.Conn, watch *net.TCPAddr) error {
 	defer conn.Close()
 	stopClose := context.AfterFunc(h.ctx, func() { conn.Close() })
 	defer stopClose()
@@ -102,10 +134,12 @@ func (h *HostAgent) runRendezvousControl(endpoint *net.TCPAddr) error {
 			case <-h.ctx.Done():
 				return
 			case <-ticker.C:
-				current := h.getTCPPunch()
-				if current == nil || current.String() != endpoint.String() {
-					conn.Close()
-					return
+				if watch != nil {
+					current := h.getTCPPunch()
+					if current == nil || current.String() != watch.String() {
+						conn.Close()
+						return
+					}
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if send.WriteFrame(nil) != nil {

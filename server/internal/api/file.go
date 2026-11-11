@@ -245,6 +245,10 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
 	var (
 		events []account.FileEvent
 		err    error
@@ -252,12 +256,12 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	if groupID != "" {
-		events, err = s.cfg.Accounts.FileTransfersForGroupBefore(
-			groupID, username, host, beforeID, limit)
+		events, err = s.cfg.Accounts.FileTransfersForGroupBeforeRange(
+			groupID, username, host, bounds, beforeID, limit)
 	} else if host != "" {
-		events, err = s.cfg.Accounts.FileTransfersForHostBefore(host, beforeID, limit)
+		events, err = s.cfg.Accounts.FileTransfersForHostBeforeRange(host, bounds, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.FileTransfersForBefore(username, beforeID, limit)
+		events, err = s.cfg.Accounts.FileTransfersForBeforeRange(username, bounds, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account file transfer audit query", "error", err)

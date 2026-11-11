@@ -282,11 +282,21 @@ func (s *Store) FileTransfersFor(username string, limit int) ([]FileEvent, error
 
 // FileTransfersForBefore pages cross-account reports older than beforeID.
 func (s *Store) FileTransfersForBefore(username string, beforeID int64, limit int) ([]FileEvent, error) {
+	return s.FileTransfersForBeforeRange(username, TimeBounds{}, beforeID, limit)
+}
+
+// FileTransfersForBeforeRange is FileTransfersForBefore narrowed to an
+// inclusive window on occurred_at.
+func (s *Store) FileTransfersForBeforeRange(username string, bounds TimeBounds, beforeID int64, limit int) ([]FileEvent, error) {
 	username = strings.TrimSpace(username)
-	if username == "" {
-		return s.fileEvents("", nil, beforeID, limit)
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if username != "" {
+		clauses = append(clauses, "username = ? COLLATE NOCASE")
+		args = append(args, username)
 	}
-	return s.fileEvents("username = ? COLLATE NOCASE", []any{username}, beforeID, limit)
+	clauses, args = addTimeBounds(clauses, args, "occurred_at", bounds)
+	return s.fileEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }
 
 // FileTransfersForHost lists transfers involving one host, including inbound
@@ -297,12 +307,21 @@ func (s *Store) FileTransfersForHost(hostID string, limit int) ([]FileEvent, err
 
 // FileTransfersForHostBefore pages host-involved reports older than beforeID.
 func (s *Store) FileTransfersForHostBefore(hostID string, beforeID int64, limit int) ([]FileEvent, error) {
+	return s.FileTransfersForHostBeforeRange(hostID, TimeBounds{}, beforeID, limit)
+}
+
+// FileTransfersForHostBeforeRange is FileTransfersForHostBefore narrowed to an
+// inclusive window on occurred_at.
+func (s *Store) FileTransfersForHostBeforeRange(hostID string, bounds TimeBounds, beforeID int64, limit int) ([]FileEvent, error) {
 	hostID = strings.TrimSpace(hostID)
-	if hostID == "" {
-		return s.fileEvents("", nil, beforeID, limit)
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 3)
+	if hostID != "" {
+		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
+		args = append(args, hostID, hostID)
 	}
-	return s.fileEvents(
-		"(host_id = ? OR peer_id = ? COLLATE NOCASE)", []any{hostID, hostID}, beforeID, limit)
+	clauses, args = addTimeBounds(clauses, args, "occurred_at", bounds)
+	return s.fileEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }
 
 func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) ([]FileEvent, error) {

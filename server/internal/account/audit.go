@@ -30,11 +30,15 @@ const (
 	AuditAccountUnban      = "account_unban"
 	AuditAccountEmail      = "account_email"
 	AuditAccountPhone      = "account_phone"
+	AuditAccountSessionCap = "account_session_cap"
 	AuditAccountRecover    = "account_recover"
 	AuditWebAuthnRegister  = "webauthn_register"
 	AuditWebAuthnRemove    = "webauthn_remove"
 	AuditDeviceLabels      = "device_labels"
 	AuditDeviceReset       = "device_reset"
+	AuditDeviceDisable     = "device_disable"
+	AuditDeviceEnable      = "device_enable"
+	AuditDeviceOwner       = "device_owner"
 	AuditDeviceLeaseRemove = "device_lease_remove"
 	AuditDeviceWake        = "device_wake"
 	AuditRecordingUpload   = "recording_upload"
@@ -67,11 +71,11 @@ const (
 	// AuditPolicyObject* and AuditPolicyAssignment* record the central policy
 	// authoring layer; the materialised per-device rows still report through
 	// the device policy actions above.
-	AuditPolicyObjectCreate       = "policy_object_create"
-	AuditPolicyObjectUpdate       = "policy_object_update"
-	AuditPolicyObjectDelete       = "policy_object_delete"
-	AuditPolicyAssignmentCreate   = "policy_assignment_create"
-	AuditPolicyAssignmentDelete   = "policy_assignment_delete"
+	AuditPolicyObjectCreate     = "policy_object_create"
+	AuditPolicyObjectUpdate     = "policy_object_update"
+	AuditPolicyObjectDelete     = "policy_object_delete"
+	AuditPolicyAssignmentCreate = "policy_assignment_create"
+	AuditPolicyAssignmentDelete = "policy_assignment_delete"
 
 	// AuditAccessKidRevoke records retiring an issuer key. The key id is in the
 	// detail; connected hosts receive the same statement on the event stream.
@@ -164,13 +168,26 @@ func (s *Store) AuditEventsFor(action string, limit int) ([]AuditEvent, error) {
 // newest row. The cursor is an ID rather than an offset so rows appended while
 // an operator pages do not shift the window.
 func (s *Store) AuditEventsForBefore(action string, beforeID int64, limit int) ([]AuditEvent, error) {
+	return s.AuditEventsForBeforeRange(action, "", TimeBounds{}, beforeID, limit)
+}
+
+// AuditEventsForBeforeRange is AuditEventsForBefore narrowed to an inclusive
+// millisecond window and optionally to one username. Usernames are stored as
+// attempted, so filtering finds failed logins of existing accounts too.
+func (s *Store) AuditEventsForBeforeRange(action, user string, bounds TimeBounds, beforeID int64, limit int) ([]AuditEvent, error) {
 	action = strings.TrimSpace(action)
-	clauses := make([]string, 0, 2)
-	args := make([]any, 0, 3)
+	user = strings.TrimSpace(user)
+	clauses := make([]string, 0, 3)
+	args := make([]any, 0, 4)
 	if action != "" {
 		clauses = append(clauses, "action = ?")
 		args = append(args, action)
 	}
+	if user != "" {
+		clauses = append(clauses, "username = ?")
+		args = append(args, user)
+	}
+	clauses, args = addTimeBounds(clauses, args, "created_at", bounds)
 	return s.auditEvents(clauses, args, beforeID, limit)
 }
 
@@ -179,11 +196,18 @@ func (s *Store) AuditEventsForBefore(action string, beforeID int64, limit int) (
 // through the account table; a renamed or deleted user stops matching, which
 // is the same rule the rest of the audit view follows.
 func (s *Store) AuditEventsForGroupBefore(groupID, action string, beforeID int64, limit int) ([]AuditEvent, error) {
+	return s.AuditEventsForGroupBeforeRange(groupID, action, "", TimeBounds{}, beforeID, limit)
+}
+
+// AuditEventsForGroupBeforeRange is AuditEventsForGroupBefore narrowed to an
+// inclusive millisecond window and optionally to one username.
+func (s *Store) AuditEventsForGroupBeforeRange(groupID, action, user string, bounds TimeBounds, beforeID int64, limit int) ([]AuditEvent, error) {
 	groupID = strings.TrimSpace(groupID)
 	if !registry.ValidID(groupID) {
 		return nil, ErrInvalidAccountGroupID
 	}
 	action = strings.TrimSpace(action)
+	user = strings.TrimSpace(user)
 	clauses := []string{`username IN (
 		SELECT u.username FROM account_group_members m
 		JOIN users u ON u.id = m.user_id
@@ -193,6 +217,11 @@ func (s *Store) AuditEventsForGroupBefore(groupID, action string, beforeID int64
 		clauses = append(clauses, "action = ?")
 		args = append(args, action)
 	}
+	if user != "" {
+		clauses = append(clauses, "username = ?")
+		args = append(args, user)
+	}
+	clauses, args = addTimeBounds(clauses, args, "created_at", bounds)
 	return s.auditEvents(clauses, args, beforeID, limit)
 }
 

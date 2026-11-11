@@ -300,6 +300,17 @@ func TCPPunchDeclineMessage(id, nonce, reason string, unix int64) []byte {
 	return fieldsMessage("chast-tcp-decline-v1", id, nonce, reason, strconv.FormatInt(unix, 10))
 }
 
+// LocalAddrMessage binds the LAN candidates a host reports on demand. The
+// nonce echoes the punch that asked, so an old answer cannot refresh a later
+// one, and the count keeps a truncated list from verifying.
+func LocalAddrMessage(id, nonce string, localAddrs []string, unix int64) []byte {
+	fields := make([]string, 0, len(localAddrs)+4)
+	fields = append(fields, id, nonce, strconv.Itoa(len(localAddrs)))
+	fields = append(fields, localAddrs...)
+	fields = append(fields, strconv.FormatInt(unix, 10))
+	return fieldsMessage("chast-local-addr-v1", fields...)
+}
+
 func (s *Server) SignRendezvousChallenge(id, clientNonce, serverNonce string) string {
 	return Sign(s.priv, RendezvousControlMessage("server", id, clientNonce, serverNonce))
 }

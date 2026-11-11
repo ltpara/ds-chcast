@@ -59,16 +59,21 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
 	var (
 		events []account.AuditEvent
 		err    error
 	)
+	user := strings.TrimSpace(r.URL.Query().Get("user"))
 	if groupID != "" {
-		events, err = s.cfg.Accounts.AuditEventsForGroupBefore(
-			groupID, r.URL.Query().Get("action"), beforeID, limit)
+		events, err = s.cfg.Accounts.AuditEventsForGroupBeforeRange(
+			groupID, r.URL.Query().Get("action"), user, bounds, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.AuditEventsForBefore(
-			r.URL.Query().Get("action"), beforeID, limit)
+		events, err = s.cfg.Accounts.AuditEventsForBeforeRange(
+			r.URL.Query().Get("action"), user, bounds, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account audit query", "error", err)

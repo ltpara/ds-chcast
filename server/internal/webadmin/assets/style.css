@@ -306,6 +306,7 @@ th {
 tbody tr:hover { background: rgba(77, 163, 255, 0.05); }
 td.wrap { white-space: normal; min-width: 200px; }
 .actions-col { text-align: right; }
+.check-col { width: 28px; text-align: center; }
 .actions-wrap { display: flex; gap: 6px; justify-content: flex-end; }
 
 .inline-form {

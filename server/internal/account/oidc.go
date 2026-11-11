@@ -44,7 +44,7 @@ func (s *Store) LoginOIDC(
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.issueOIDCSessionLocked(user, deviceID, deviceName)
+		return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
 	}
 	if !autoCreate {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrOIDCAccountNotFound
@@ -52,7 +52,7 @@ func (s *Store) LoginOIDC(
 
 	// Hashing dominates the cost, so it happens outside the store lock. The
 	// link is checked again below in case a concurrent callback won.
-	hash, err := hashPassword(randomOIDCPassword())
+	hash, err := hashPassword(randomManagedPassword())
 	if err != nil {
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("hash OIDC password: %w", err)
 	}
@@ -69,7 +69,7 @@ func (s *Store) LoginOIDC(
 		if user.Banned {
 			return User{}, "", time.Time{}, "", time.Time{}, ErrAccountBanned
 		}
-		return s.issueOIDCSessionLocked(user, deviceID, deviceName)
+		return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
 	}
 	username, err := s.availableOIDCUsernameLocked(base)
 	if err != nil {
@@ -116,7 +116,7 @@ func (s *Store) LoginOIDC(
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: commit OIDC account: %w", s.path, err)
 	}
 	user = User{ID: id, Username: username, Role: role, CreatedAt: now, Email: email}
-	return s.issueOIDCSessionLocked(user, deviceID, deviceName)
+	return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
 }
 
 func (s *Store) oidcUserLocked(issuer, subject string) (User, bool, error) {
@@ -140,9 +140,10 @@ func (s *Store) oidcUserLocked(issuer, subject string) (User, bool, error) {
 	return user, true, nil
 }
 
-// issueOIDCSessionLocked writes one access/refresh pair. It mirrors the token
-// half of LoginWithRefreshFactors without touching two-factor state.
-func (s *Store) issueOIDCSessionLocked(user User, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
+// issueVerifiedSessionLocked writes one access/refresh pair for an account an
+// external provider has already authenticated. It mirrors the token half of
+// LoginWithRefreshFactors without touching local two-factor state.
+func (s *Store) issueVerifiedSessionLocked(user User, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
 	now := s.now().UTC()
 	token, err := newToken()
 	if err != nil {
@@ -266,7 +267,9 @@ func isUsernameStart(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
-func randomOIDCPassword() string {
+// randomManagedPassword seeds an account whose only sign-in path is an
+// external provider, so nobody can guess a local password for it.
+func randomManagedPassword() string {
 	buffer := make([]byte, 32)
 	if _, err := rand.Read(buffer); err != nil {
 		// crypto/rand failing means the process cannot mint tokens either;

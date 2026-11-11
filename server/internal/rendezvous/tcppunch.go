@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/lanmask"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -32,6 +34,10 @@ type tcpWait struct {
 	ch       chan tcpPair
 	observed string
 	local    string
+	// viaWS marks a side that announced over the signalling WebSocket. Its
+	// observed address is the HTTP connection's, so the punch endpoint is
+	// rebuilt from the port the side reported for its own punch socket.
+	viaWS bool
 }
 
 type tcpPair struct {
@@ -104,7 +110,7 @@ func (p *tcpPuncher) serve() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go p.handle(conn)
+		go p.handle(conn, false)
 	}
 }
 
@@ -119,7 +125,7 @@ func (p *tcpPuncher) close() {
 	p.mu.Unlock()
 }
 
-func (p *tcpPuncher) handle(conn net.Conn) {
+func (p *tcpPuncher) handle(conn net.Conn, viaWS bool) {
 	defer conn.Close()
 	remote, ok := conn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
@@ -151,7 +157,7 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 		p.mu.Unlock()
 		return
 	}
-	own, err := p.join(key, msg.Role, remote.String(), msg.Candidate)
+	own, err := p.join(key, msg.Role, remote.String(), msg.Candidate, viaWS)
 	if err != nil {
 		writeAnnounce(conn, wire.Message{Type: wire.TypeTCPPunch, Nonce: msg.Nonce, Error: err.Error()})
 		return
@@ -178,7 +184,7 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 				}
 			}
 		}()
-		go p.triggerHost(msg.HostID, msg.Nonce, remote.String(), msg.NATType)
+		go p.triggerHost(msg.HostID, msg.Nonce, own.punchAddress(), msg.NATType)
 	}
 	timer := time.NewTimer(tcpPunchWait)
 	defer timer.Stop()
@@ -189,15 +195,21 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 				!p.limiter.allow(remote.IP.String()) || p.checkAnnounce(retry, remote.String()) != nil {
 				return
 			}
-			go p.triggerHost(msg.HostID, msg.Nonce, remote.String(), retry.NATType)
+			go p.triggerHost(msg.HostID, msg.Nonce, punchAddress(remote.String(), retry.Candidate, viaWS), retry.NATType)
 		case <-disconnected:
 			return
 		case result := <-own.ch:
 			host, _ := p.srv.reg.Lookup(msg.HostID)
+			nat := host.NATType
+			if p.srv.lanXORAddr(host, remote.String()) {
+				// hbbs reports the peer as symmetric for a LAN/WAN pair, which
+				// makes both agents start on the relay instead of punching.
+				nat = "symmetric"
+			}
 			writeAnnounce(conn, wire.Message{
 				Type: wire.TypeTCPPunch, Nonce: msg.Nonce,
 				OK: result.err == "", Error: result.err,
-				Candidate: result.peer, NATType: host.NATType, IsLocal: result.local,
+				Candidate: result.peer, NATType: nat, IsLocal: result.local,
 			})
 			return
 		case <-timer.C:
@@ -281,7 +293,7 @@ func (p *tcpPuncher) checkAnnounce(msg wire.Message, peer string) error {
 // repeated announce for the same role replaces the older socket: a
 // retransmitted trigger or a retried round leaves the previous wait stale, and
 // letting it block the fresh announce would waste the whole window.
-func (p *tcpPuncher) join(key, role, observed, local string) (*tcpWait, error) {
+func (p *tcpPuncher) join(key, role, observed, local string, viaWS bool) (*tcpWait, error) {
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -294,7 +306,7 @@ func (p *tcpPuncher) join(key, role, observed, local string) (*tcpWait, error) {
 		sess = &tcpSession{created: now}
 		p.sessions[key] = sess
 	}
-	own := &tcpWait{ch: make(chan tcpPair, 1), observed: observed, local: local}
+	own := &tcpWait{ch: make(chan tcpPair, 1), observed: observed, local: local, viaWS: viaWS}
 	var peer *tcpWait
 	if role == wire.RoleViewer {
 		if sess.viewer != nil {
@@ -311,8 +323,8 @@ func (p *tcpPuncher) join(key, role, observed, local string) (*tcpWait, error) {
 	}
 	if peer != nil {
 		delete(p.sessions, key)
-		tryNotify(peer, tcpPeerResult(own, peer))
-		tryNotify(own, tcpPeerResult(peer, own))
+		tryNotify(peer, p.peerResult(own, peer))
+		tryNotify(own, p.peerResult(peer, own))
 	}
 	return own, nil
 }
@@ -378,7 +390,12 @@ func (p *tcpPuncher) triggerHost(hostID, nonce, candidate, nat string) {
 	if link != nil {
 		hostObserved = link.conn.RemoteAddr().String()
 	}
-	msg.IsLocal = sameObservedIP(hostObserved, candidate)
+	msg.IsLocal = p.srv.lanMask.SameIntranet(lanmask.AddrIP(hostObserved), lanmask.AddrIP(candidate))
+	if p.srv.lanXORAddr(host, candidate) {
+		// Matches the UDP path: a LAN/WAN pair is reported as symmetric so the
+		// host decides to relay instead of probing a private address.
+		msg.NATType = "symmetric"
+	}
 	if p.triggerControl(msg) {
 		return
 	}
@@ -421,16 +438,14 @@ func deriveTCPPunchListen(udp *net.UDPAddr) string {
 	return net.JoinHostPort(udp.IP.String(), fmt.Sprint(udp.Port))
 }
 
-func sameObservedIP(a, b string) bool {
-	ah, _, ae := net.SplitHostPort(a)
-	bh, _, be := net.SplitHostPort(b)
-	ai, bi := net.ParseIP(ah), net.ParseIP(bh)
-	return ae == nil && be == nil && ai != nil && bi != nil && ai.Equal(bi)
-}
-
-func tcpPeerResult(peer, own *tcpWait) tcpPair {
-	result := tcpPair{peer: peer.observed}
-	if sameObservedIP(peer.observed, own.observed) && peer.local != "" {
+// peerResult builds the endpoint the other side should punch. A peer that
+// announced over the signalling WebSocket reports only its punch socket's port,
+// so its observed IP is combined with that port, as hbbs does for its WS path.
+// When both sides share a network the peer's private endpoint is substituted
+// instead; a WAN peer is never pointed at a private address.
+func (p *tcpPuncher) peerResult(peer, own *tcpWait) tcpPair {
+	result := tcpPair{peer: peer.punchAddress()}
+	if p.srv.lanMask.SameIntranet(lanmask.AddrIP(peer.observed), lanmask.AddrIP(own.observed)) && peer.local != "" {
 		host, port, err := net.SplitHostPort(peer.local)
 		ip := net.ParseIP(host)
 		if err == nil && port != "0" && ip != nil && !ip.IsUnspecified() && !ip.IsMulticast() {
@@ -438,4 +453,33 @@ func tcpPeerResult(peer, own *tcpWait) tcpPair {
 		}
 	}
 	return result
+}
+
+// punchAddress is the endpoint a peer should be punched at. A raw TCP announce
+// reports the connection's own endpoint; a WebSocket announce only knows the
+// port its punch socket holds, so the observed IP is combined with it.
+func punchAddress(observed, local string, viaWS bool) string {
+	if !viaWS {
+		return observed
+	}
+	_, port, err := net.SplitHostPort(local)
+	if err != nil {
+		return observed
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return observed
+	}
+	host, _, err := net.SplitHostPort(observed)
+	if err != nil || net.ParseIP(host) == nil {
+		return observed
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func (w *tcpWait) punchAddress() string {
+	if w == nil {
+		return ""
+	}
+	return punchAddress(w.observed, w.local, w.viaWS)
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/base64"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -115,7 +116,7 @@ func (s *server) issueEmergencyAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	subject := "emergency:" + actor
 	now := time.Now().UTC()
-	resp, ok := s.hostLookup(peerID, now, s.relayOnly())
+	resp, ok := s.hostLookup(peerID, now, s.relayOnly(), net.ParseIP(s.clientIP(r)))
 	if !ok {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return

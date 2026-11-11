@@ -3,6 +3,7 @@ package api_test
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -28,6 +29,11 @@ type policyAssignmentReply struct {
 	ScopeKind  string `json:"scope_kind"`
 	ScopeValue string `json:"scope_value"`
 	Priority   int    `json:"priority"`
+}
+
+type policyBulkReply struct {
+	Created []policyAssignmentReply `json:"created"`
+	Skipped []string                `json:"skipped"`
 }
 
 type managedPolicyReply struct {
@@ -315,5 +321,150 @@ func TestPolicyObjectRoutes(t *testing.T) {
 	}
 	if err := json.Unmarshal(body, &list); err != nil || len(list.Policies) != 0 {
 		t.Fatalf("policies after delete = %+v (%v)", list.Policies, err)
+	}
+}
+
+// TestBulkPolicyAssignments covers the console's one-shot device list: ids are
+// validated and deduplicated at the edge, a device that already has an
+// assignment is skipped rather than failing the batch, and the created rows
+// materialise and push exactly like a single assignment.
+func TestBulkPolicyAssignments(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if _, err := s.Accounts.SetRole("bob", account.RoleOperator); err != nil {
+		t.Fatalf("promote bob: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse").Token
+	operator := login(t, s.URL, "bob", "battery staple").Token
+
+	now := time.Now().Unix()
+	for _, peer := range []string{"devbox", "laptop"} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+			registerBody(t, peer, peer+" secret", "AB12", now), testutil.ServerKey); status != http.StatusOK {
+			t.Fatalf("register %s: %d %s", peer, status, body)
+		}
+	}
+	status, body := request(t, http.MethodPost, s.URL+"/v1/policies",
+		`{"name":"lab profile","mode":"open","permission_ceiling":4}`, admin)
+	if status != http.StatusCreated {
+		t.Fatalf("create policy: %d %s", status, body)
+	}
+	var profile policyObjectReply
+	if err := json.Unmarshal(body, &profile); err != nil {
+		t.Fatalf("policy reply: %v", err)
+	}
+
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/policy-assignments/bulk",
+		mustJSON(t, map[string]any{"policy_id": profile.ID, "devices": []string{"devbox"}}),
+		operator); status != http.StatusForbidden {
+		t.Fatalf("operator bulk = %d %s", status, body)
+	}
+	many := make([]string, account.MaxPolicyAssignmentBatch+1)
+	for i := range many {
+		many[i] = "device" + strconv.Itoa(i)
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"empty devices", mustJSON(t, map[string]any{"policy_id": profile.ID, "devices": []string{}}), http.StatusBadRequest},
+		{"bad device id", mustJSON(t, map[string]any{"policy_id": profile.ID, "devices": []string{"bad id"}}), http.StatusBadRequest},
+		{"bad priority", mustJSON(t, map[string]any{"policy_id": profile.ID, "devices": []string{"devbox"}, "priority": 10001}), http.StatusBadRequest},
+		{"unknown policy", mustJSON(t, map[string]any{"policy_id": "nope", "devices": []string{"devbox"}}), http.StatusNotFound},
+		{"too many devices", mustJSON(t, map[string]any{"policy_id": profile.ID, "devices": many}), http.StatusBadRequest},
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/policy-assignments/bulk", tc.body, admin); status != tc.want {
+			t.Fatalf("%s = %d %s", tc.name, status, body)
+		}
+	}
+
+	// desk is bound first so the batch has a device to report as skipped.
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/policy-assignments",
+		mustJSON(t, map[string]any{"policy_id": profile.ID, "scope_kind": "device", "scope_value": "desk", "priority": 7}),
+		admin); status != http.StatusCreated {
+		t.Fatalf("single device assignment: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodPost, s.URL+"/v1/policy-assignments/bulk",
+		mustJSON(t, map[string]any{
+			"policy_id": profile.ID,
+			"devices":   []string{"devbox", "desk", "laptop", "devbox"},
+			"priority":  7,
+		}), admin)
+	if status != http.StatusCreated {
+		t.Fatalf("bulk assignment: %d %s", status, body)
+	}
+	var reply policyBulkReply
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatalf("bulk reply: %v (%s)", err, body)
+	}
+	if len(reply.Created) != 2 || len(reply.Skipped) != 1 || reply.Skipped[0] != "desk" {
+		t.Fatalf("bulk reply = %+v", reply)
+	}
+	if reply.Created[0].ScopeValue != "devbox" || reply.Created[1].ScopeValue != "laptop" ||
+		reply.Created[0].PolicyName != "lab profile" || reply.Created[0].ScopeKind != "device" ||
+		reply.Created[0].Priority != 7 || reply.Created[0].ID == "" {
+		t.Fatalf("bulk created = %+v", reply.Created)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/policy-assignments", "", admin)
+	if status != http.StatusOK {
+		t.Fatalf("list assignments: %d %s", status, body)
+	}
+	var assignments struct {
+		Assignments []policyAssignmentReply `json:"assignments"`
+	}
+	if err := json.Unmarshal(body, &assignments); err != nil || len(assignments.Assignments) != 3 {
+		t.Fatalf("assignment list = %+v (%v)", assignments.Assignments, err)
+	}
+
+	// A host that has never carried a policy row learns the batch when it
+	// registers again, exactly like a single assignment.
+	status, body = request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "devbox", "devbox secret", "AB12", time.Now().Unix()), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("re-register devbox: %d %s", status, body)
+	}
+	var registration registrationPolicyReply
+	if err := json.Unmarshal(body, &registration); err != nil {
+		t.Fatalf("register reply: %v", err)
+	}
+	if registration.DevicePolicy == nil || registration.DevicePolicy.PolicyVersion != 1 ||
+		registration.DevicePolicy.PermissionCeiling != 4 || registration.DevicePolicy.Mode != "open" {
+		t.Fatalf("registration policy = %+v", registration.DevicePolicy)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/device-policies/devbox", "", admin)
+	if status != http.StatusOK {
+		t.Fatalf("materialised policy: %d %s", status, body)
+	}
+	managed := decodeManagedPolicy(t, body)
+	if !managed.Managed || managed.Policy.Source == nil ||
+		managed.Policy.Source.ID != profile.ID || managed.Policy.Source.Priority != 7 {
+		t.Fatalf("materialised policy = %+v", managed.Policy)
+	}
+
+	// Repeating the same list is a no-op: everything is reported as skipped and
+	// no duplicate rows appear.
+	status, body = request(t, http.MethodPost, s.URL+"/v1/policy-assignments/bulk",
+		mustJSON(t, map[string]any{
+			"policy_id": profile.ID,
+			"devices":   []string{"devbox", "desk", "laptop"},
+			"priority":  7,
+		}), admin)
+	if status != http.StatusCreated {
+		t.Fatalf("repeat bulk: %d %s", status, body)
+	}
+	if err := json.Unmarshal(body, &reply); err != nil || len(reply.Created) != 0 || len(reply.Skipped) != 3 {
+		t.Fatalf("repeat bulk = %+v (%v)", reply, err)
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/policy-assignments", "", admin); status != http.StatusOK {
+		t.Fatalf("list after repeat: %d %s", status, body)
+	} else if err := json.Unmarshal(body, &assignments); err != nil || len(assignments.Assignments) != 3 {
+		t.Fatalf("assignments after repeat = %+v (%v)", assignments.Assignments, err)
 	}
 }

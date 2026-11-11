@@ -16,7 +16,9 @@ type identityEntry struct {
 	Platform   string   `json:"platform"`
 	Version    string   `json:"version"`
 	Alias      string   `json:"alias"`
+	Owner      string   `json:"owner"`
 	Tags       []string `json:"tags"`
+	Disabled   bool     `json:"disabled"`
 	Online     bool     `json:"online"`
 	Relay      string   `json:"relay"`
 	Candidate  string   `json:"candidate"`

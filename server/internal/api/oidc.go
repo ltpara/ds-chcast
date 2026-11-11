@@ -29,13 +29,16 @@ type oidcLoginState struct {
 	verifier   string
 	deviceID   string
 	deviceName string
-	started    bool
-	done       bool
-	errText    string
-	errCode    string
-	user       account.User
-	token      string
-	refresh    string
+	// client is the optional caller hint ("console") that lets the browser
+	// callback page word its "return to ..." line for the right app.
+	client  string
+	started bool
+	done    bool
+	errText string
+	errCode string
+	user    account.User
+	token   string
+	refresh string
 }
 
 type oidcStatusResponse struct {
@@ -47,6 +50,9 @@ type oidcStatusResponse struct {
 type oidcBeginRequest struct {
 	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
+	// Client is an optional caller hint; only "console" is recognised and
+	// makes the callback page send the user back to the admin console.
+	Client string `json:"client"`
 }
 
 type oidcBeginResponse struct {
@@ -113,6 +119,10 @@ func (s *server) oidcBegin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	client := ""
+	if strings.EqualFold(strings.TrimSpace(req.Client), "console") {
+		client = "console"
+	}
 	s.oidcMu.Lock()
 	s.pruneOIDCPendingLocked(now)
 	s.oidcPending[state] = &oidcLoginState{
@@ -121,6 +131,7 @@ func (s *server) oidcBegin(w http.ResponseWriter, r *http.Request) {
 		verifier:   verifier,
 		deviceID:   strings.TrimSpace(req.DeviceID),
 		deviceName: strings.TrimSpace(req.DeviceName),
+		client:     client,
 	}
 	s.oidcMu.Unlock()
 	writeJSON(w, http.StatusOK, oidcBeginResponse{
@@ -138,12 +149,12 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	if s.cfg.OIDC == nil || s.cfg.Accounts == nil {
 		writeOIDCPage(w, http.StatusServiceUnavailable, "Single sign-on unavailable",
-			"This server has no identity provider configured.")
+			"This server has no identity provider configured.", "")
 		return
 	}
 	stateKey := strings.TrimSpace(r.URL.Query().Get("state"))
 	if stateKey == "" {
-		writeOIDCPage(w, http.StatusBadRequest, "Login failed", "The identity provider returned no state.")
+		writeOIDCPage(w, http.StatusBadRequest, "Login failed", "The identity provider returned no state.", "")
 		return
 	}
 	now := time.Now()
@@ -153,18 +164,22 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	if entry == nil || now.Sub(entry.created) > oidcPendingTTL {
 		delete(s.oidcPending, stateKey)
 		s.oidcMu.Unlock()
-		writeOIDCPage(w, http.StatusBadRequest, "Login expired", "Start the sign-in again from the chast viewer.")
+		writeOIDCPage(w, http.StatusBadRequest, "Login expired",
+			"Start the sign-in again from the chast viewer or admin console.", "")
 		return
 	}
 	if entry.started || entry.done {
 		s.oidcMu.Unlock()
-		writeOIDCPage(w, http.StatusConflict, "Login already used", "This sign-in link has already been processed.")
+		writeOIDCPage(w, http.StatusConflict, "Login already used",
+			"This sign-in link has already been processed.", "")
 		return
 	}
 	entry.started = true
 	nonce, verifier := entry.nonce, entry.verifier
 	deviceID, deviceName := entry.deviceID, entry.deviceName
+	client := entry.client
 	s.oidcMu.Unlock()
+	returnTo := oidcReturnTarget(client)
 
 	if providerError := strings.TrimSpace(r.URL.Query().Get("error")); providerError != "" {
 		if len(providerError) > 64 {
@@ -173,13 +188,14 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.Warn("oidc provider rejected the login", "error", providerError)
 		s.finishOIDC(stateKey, "oidc_failed", "identity provider rejected the login")
 		writeOIDCPage(w, http.StatusUnauthorized, "Login rejected",
-			"The identity provider did not approve this sign-in.")
+			"The identity provider did not approve this sign-in.", returnTo)
 		return
 	}
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
 	if code == "" {
 		s.finishOIDC(stateKey, "oidc_failed", "identity provider returned no code")
-		writeOIDCPage(w, http.StatusBadRequest, "Login failed", "The identity provider returned no authorization code.")
+		writeOIDCPage(w, http.StatusBadRequest, "Login failed",
+			"The identity provider returned no authorization code.", returnTo)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
@@ -189,7 +205,7 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.Warn("oidc token exchange failed", "error", err)
 		s.finishOIDC(stateKey, "oidc_failed", "token exchange failed")
 		writeOIDCPage(w, http.StatusBadGateway, "Login failed",
-			"The identity provider response could not be verified.")
+			"The identity provider response could not be verified.", returnTo)
 		return
 	}
 	user, token, _, refresh, _, err := s.cfg.Accounts.LoginOIDC(
@@ -201,7 +217,7 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		status, code, message := oidcLoginError(err)
 		s.cfg.Logger.Warn("oidc account login failed", "error", err)
 		s.finishOIDC(stateKey, code, message)
-		writeOIDCPage(w, status, "Login failed", message)
+		writeOIDCPage(w, status, "Login failed", message, returnTo)
 		return
 	}
 	ip := s.clientIP(r)
@@ -211,8 +227,12 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	s.auditLogin(r, user.Username, "oidc", true)
 	s.cfg.Logger.Info("account login", "user", user.Username, "method", "oidc")
 	s.completeOIDC(stateKey, user, token, refresh)
-	writeOIDCPage(w, http.StatusOK, "Signed in",
-		fmt.Sprintf("Return to the chast viewer to finish signing in as %s.", user.Username))
+	message := fmt.Sprintf("Return to the chast viewer to finish signing in as %s.", user.Username)
+	if client == "console" {
+		// The console polls in its own tab and closes this one itself.
+		message = fmt.Sprintf("Signed in as %s. Switch back to the chast admin console, which completes the sign-in on its own.", user.Username)
+	}
+	writeOIDCPage(w, http.StatusOK, "Signed in", message, returnTo)
 }
 
 // oidcPoll lets the viewer collect the session the browser callback created.
@@ -322,15 +342,29 @@ func oidcLoginError(err error) (status int, code, message string) {
 	}
 }
 
-func writeOIDCPage(w http.ResponseWriter, status int, title, message string) {
+// oidcReturnTarget names the app whose sign-in started the browser step so the
+// page footer can send the user back there. Unknown or missing hints keep the
+// neutral "close this tab" wording.
+func oidcReturnTarget(client string) string {
+	if client == "console" {
+		return "the chast admin console"
+	}
+	return ""
+}
+
+func writeOIDCPage(w http.ResponseWriter, status int, title, message, returnTo string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
+	footer := "You may close this tab."
+	if returnTo != "" {
+		footer = "You may close this tab and return to " + returnTo + "."
+	}
 	_, _ = fmt.Fprintf(w, `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>%s</title>
 <style>body{font-family:system-ui,sans-serif;max-width:34rem;margin:15vh auto;padding:0 1.5rem;color:#1f2328}
 h1{font-size:1.4rem}p{line-height:1.6}</style></head>
-<body><h1>%s</h1><p>%s</p><p>You may close this tab.</p></body></html>`,
-		html.EscapeString(title), html.EscapeString(title), html.EscapeString(message))
+<body><h1>%s</h1><p>%s</p><p>%s</p></body></html>`,
+		html.EscapeString(title), html.EscapeString(title), html.EscapeString(message), html.EscapeString(footer))
 }

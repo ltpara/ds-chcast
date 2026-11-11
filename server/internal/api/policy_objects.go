@@ -4,8 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/registry"
 )
 
 type policyObjectView struct {
@@ -44,6 +46,17 @@ type policyAssignmentRequest struct {
 	ScopeKind  string `json:"scope_kind"`
 	ScopeValue string `json:"scope_value"`
 	Priority   int    `json:"priority"`
+}
+
+type policyAssignmentBulkRequest struct {
+	PolicyID string   `json:"policy_id"`
+	Devices  []string `json:"devices"`
+	Priority int      `json:"priority"`
+}
+
+type policyAssignmentBulkView struct {
+	Created []policyAssignmentView `json:"created"`
+	Skipped []string               `json:"skipped"`
 }
 
 func viewPolicyObject(policy account.PolicyObject) policyObjectView {
@@ -214,6 +227,61 @@ func (s *server) createPolicyAssignment(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, viewPolicyAssignment(assignment))
 }
 
+// bulkPolicyAssignments binds one policy to many devices in one transaction.
+// Devices that already hold an assignment come back in skipped instead of
+// failing the call, so one stale id cannot discard the rest of the batch.
+func (s *server) bulkPolicyAssignments(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
+		return
+	}
+	actor := principal.Actor
+	var req policyAssignmentBulkRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	devices := make([]string, 0, len(req.Devices))
+	seen := make(map[string]bool, len(req.Devices))
+	for _, id := range req.Devices {
+		id = strings.TrimSpace(id)
+		if !registry.ValidID(id) {
+			writeError(w, http.StatusBadRequest, "devices must be host ids")
+			return
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		devices = append(devices, id)
+	}
+	if len(devices) == 0 || len(devices) > account.MaxPolicyAssignmentBatch {
+		writeError(w, http.StatusBadRequest,
+			"devices must list 1 to "+strconv.Itoa(account.MaxPolicyAssignmentBatch)+" host ids")
+		return
+	}
+	batch, err := s.cfg.Accounts.CreateDevicePolicyAssignments(req.PolicyID, devices, req.Priority, actor)
+	if err != nil {
+		writePolicyObjectError(w, err)
+		return
+	}
+	if len(batch.Created) > 0 {
+		s.recordAudit(r, actor, account.AuditPolicyAssignmentCreate,
+			"assigned policy "+batch.PolicyName+" to "+
+				strconv.Itoa(len(batch.Created))+" devices ("+
+				strconv.Itoa(len(batch.Skipped))+" skipped)", true)
+		s.reconcileAllPolicies()
+	}
+	out := policyAssignmentBulkView{
+		Created: make([]policyAssignmentView, 0, len(batch.Created)),
+		Skipped: batch.Skipped,
+	}
+	for _, assignment := range batch.Created {
+		out.Created = append(out.Created, viewPolicyAssignment(assignment))
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
 func (s *server) deletePolicyAssignment(w http.ResponseWriter, r *http.Request) {
 	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
@@ -296,6 +364,7 @@ func writePolicyObjectError(w http.ResponseWriter, err error) {
 	case errors.Is(err, account.ErrInvalidPolicyObjectName),
 		errors.Is(err, account.ErrInvalidPolicyScope),
 		errors.Is(err, account.ErrInvalidPolicyPriority),
+		errors.Is(err, account.ErrInvalidPolicyAssignmentBatch),
 		errors.Is(err, account.ErrInvalidDevicePolicyMode),
 		errors.Is(err, account.ErrDevicePolicyUser),
 		errors.Is(err, account.ErrDevicePolicyGroup),

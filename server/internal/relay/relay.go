@@ -85,6 +85,12 @@ type Manager struct {
 	// relay never forwards a stranger's datagrams to a host.
 	requireViewerToken bool
 
+	// proxyHeader names a WebSocket handshake header trusted as the viewer's
+	// source IP when the relay or shared carrier sits behind a reverse proxy.
+	// Empty keeps the socket address, which is the only safe choice for a
+	// directly exposed listener.
+	proxyHeader string
+
 	// transport verifies short-lived transport credentials when a viewer
 	// presents one. A credential, when presented, is authoritative: an invalid
 	// one never falls back to the carrier token. Managed hosts refuse the token
@@ -122,6 +128,15 @@ func WithReadBuffer(size int) Option {
 // default; only tests and embedded single-user relays turn it off.
 func WithViewerTokenRequired(required bool) Option {
 	return func(m *Manager) { m.requireViewerToken = required }
+}
+
+// WithProxyHeader trusts a WebSocket handshake header (for example X-Real-IP
+// or X-Forwarded-For) as the viewer IP for relay policy when the relay and
+// shared carrier are reachable only through a reverse proxy that overwrites
+// the header. Empty keeps the socket address. A direct listener must leave
+// this off, otherwise any client can spoof its address.
+func WithProxyHeader(name string) Option {
+	return func(m *Manager) { m.proxyHeader = strings.ToLower(strings.TrimSpace(name)) }
 }
 
 // WithTransportVerifier makes the relay accept short-lived transport
@@ -317,6 +332,45 @@ func peerIP(peer string) string {
 		return peer
 	}
 	return host
+}
+
+// wsPeer is the policy-visible peer of a WebSocket viewer. With a trusted
+// proxy header configured, only the IP is replaced; the proxied connection's
+// port is kept so transport-credential replay binding stays per connection.
+func wsPeer(conn net.Conn, ws *carrier.WSConn, proxyHeader string) string {
+	remote := conn.RemoteAddr().String()
+	if proxyHeader == "" {
+		return remote
+	}
+	_, port, err := net.SplitHostPort(remote)
+	if err != nil {
+		return remote
+	}
+	ip := firstForwardedIP(ws.Header(proxyHeader))
+	if ip == nil {
+		return remote
+	}
+	return net.JoinHostPort(ip.String(), port)
+}
+
+// firstForwardedIP accepts one address or a comma-separated list, as used by
+// X-Forwarded-For, and ignores entries that are not IP literals or carry a
+// port. Bracketed and bare IPv6 addresses are both accepted.
+func firstForwardedIP(value string) net.IP {
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(part); err == nil {
+			part = host
+		}
+		part = strings.Trim(part, "[]")
+		if ip := net.ParseIP(part); ip != nil {
+			return ip
+		}
+	}
+	return nil
 }
 
 // sessionTraceID anchors relay spans on the host ID so they join the punch
@@ -840,7 +894,7 @@ func (m *Manager) Close() {
 // EnableSharedCarrier starts the single-port carrier used by hosts whose
 // registration names it. It is optional: per-port TCP carriers stay available.
 func (m *Manager) EnableSharedCarrier(bind string) error {
-	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.transport, m.policy, m.log)
+	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.transport, m.policy, m.log, m.proxyHeader)
 	if err != nil {
 		return err
 	}
@@ -1379,9 +1433,10 @@ func (p *port) handleTCP(conn net.Conn) {
 			conn.Close()
 			return
 		}
+		peer := wsPeer(conn, ws, p.set.manager.proxyHeader)
 		if p.set.manager.requireViewerToken {
 			body, err := ws.ReadMessage()
-			if err != nil || !p.viewerHelloOK(body, conn.RemoteAddr().String()) {
+			if err != nil || !p.viewerHelloOK(body, peer) {
 				conn.Close()
 				return
 			}
@@ -1390,7 +1445,7 @@ func (p *port) handleTCP(conn net.Conn) {
 		p.serveViewer(&carrierViewer{
 			conn: conn,
 			ws:   ws,
-			peer: conn.RemoteAddr().String(),
+			peer: peer,
 		})
 	case strings.HasPrefix(string(prefix), "CHAS"):
 		line, err := carrier.ReadLine(br, 64)

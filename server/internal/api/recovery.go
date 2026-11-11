@@ -364,6 +364,49 @@ func (s *server) adminSetAccountPhone(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, viewAdminAccount(user))
 }
 
+// adminSendAccountResetEmail mails a password-reset link without the user's
+// password so an operator can help someone locked out. The token only exists
+// in the mail and the reset link; the reply and audit never carry it.
+func (s *server) adminSendAccountResetEmail(w http.ResponseWriter, r *http.Request) {
+	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	if !ok {
+		return
+	}
+	if s.cfg.Mailer == nil {
+		writeError(w, http.StatusServiceUnavailable, "email recovery is not configured")
+		return
+	}
+	username := r.PathValue("username")
+	throttleKey := "admin-recover|" + strings.ToLower(username)
+	if !s.allowRecovery(throttleKey) {
+		writeError(w, http.StatusTooManyRequests, "a reset email was requested too recently")
+		return
+	}
+	token, user, _, err := s.cfg.Accounts.CreatePasswordReset(username, s.cfg.RecoveryTTL)
+	if err != nil {
+		if !errors.Is(err, account.ErrUnknownUser) && !errors.Is(err, account.ErrNoRecoveryEmail) {
+			s.cfg.Logger.Error("admin create password reset", "user", username, "error", err)
+		}
+		writeAccountError(w, err)
+		return
+	}
+	link := s.recoveryLink(token)
+	if err := s.cfg.Mailer.SendPasswordReset(
+		user.Email, user.Username, token, link, s.cfg.RecoveryTTL,
+	); err != nil {
+		s.cfg.Logger.Warn("admin password reset email failed",
+			"user", user.Username, "error", err)
+		s.recordAudit(r, actor, account.AuditAccountRecover,
+			"reset email failed for "+user.Username, false)
+		writeError(w, http.StatusBadGateway, "could not send the reset email")
+		return
+	}
+	s.recordAudit(r, actor, account.AuditAccountRecover,
+		"reset email sent for "+user.Username, true)
+	s.cfg.Logger.Info("admin password reset email sent", "user", user.Username)
+	writeJSON(w, http.StatusAccepted, recoverResponse{Status: "sent"})
+}
+
 // adminSendAccountSMSCode mints a reset code and hands it to the gateway. The
 // code itself never appears in the response or the audit log.
 func (s *server) adminSendAccountSMSCode(w http.ResponseWriter, r *http.Request) {

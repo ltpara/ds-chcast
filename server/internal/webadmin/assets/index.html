@@ -22,9 +22,19 @@
         <input id="server-key" type="password" placeholder="服务器密钥（未设置可留空）" spellcheck="false" autocomplete="off">
         <span id="login-account" class="login-fields hidden">
           <input id="login-username" placeholder="用户名" spellcheck="false" autocomplete="username">
-          <input id="login-password" type="password" placeholder="密码" autocomplete="current-password">
+          <input id="login-password" type="password" placeholder="密码" autocomplete="current-password" title="本地账号密码，或 LDAP/AD 目录密码；由目录接管的账号只接受目录密码">
           <input id="login-totp" placeholder="2FA / 恢复码（可选）" maxlength="24" autocomplete="one-time-code">
+          <select id="login-code-kind" aria-label="验证码类型">
+            <option value="auto">自动识别</option>
+            <option value="totp">验证器</option>
+            <option value="email">邮箱验证码</option>
+            <option value="sms">短信验证码</option>
+            <option value="recovery">恢复码</option>
+          </select>
+          <button id="login-send-code" type="button" title="选择邮箱或短信验证码后，用用户名和密码请求发送一次性验证码">发送验证码</button>
+          <button id="login-webauthn" type="button" title="填写密码时为密码+安全密钥；密码留空则用免密码通行密钥（需要 HTTPS 或 localhost）">使用安全密钥登录</button>
         </span>
+        <button id="login-oidc" type="button" class="hidden" title="在浏览器中通过服务器配置的身份提供方登录，完成后自动返回管理台">使用单点登录</button>
         <button type="submit" class="primary">连接</button>
       </form>
       <div id="session-bar" class="session hidden">
@@ -43,6 +53,7 @@
       <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
       <button type="button" class="tab" data-tab="policies" role="tab">设备策略</button>
       <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
+      <button type="button" class="tab" data-tab="mine" role="tab">我的账号</button>
       <button type="button" class="tab" data-tab="tokens" role="tab">API 令牌</button>
       <button type="button" class="tab" data-tab="groups" role="tab">分组</button>
       <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
@@ -84,13 +95,23 @@
             <input id="device-query" type="search" placeholder="搜索 ID / 别名 / 主机名 / 标签" spellcheck="false">
             <label class="check"><input id="device-online" type="checkbox"> 仅在线</label>
             <button type="button" id="device-refresh">刷新</button>
+            <button type="button" id="device-export">导出 CSV</button>
+            <span id="device-selection" class="muted">未选择设备</span>
+            <button type="button" id="device-bulk-disable" class="danger" disabled>批量禁用</button>
+            <button type="button" id="device-bulk-enable" disabled>批量启用</button>
+            <button type="button" id="device-bulk-clear" disabled>清除选择</button>
           </div>
         </div>
         <p id="device-summary" class="muted"></p>
+        <div class="toolbar">
+          <button type="button" id="device-prev" disabled>上一页</button>
+          <span id="device-page" class="muted"></span>
+          <button type="button" id="device-next" disabled>下一页</button>
+        </div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>ID</th><th>别名</th><th>标签</th><th>主机名</th><th>平台</th><th>版本</th><th>元数据签名</th><th>状态</th><th>中继 / 地址</th><th>最近在线</th><th class="actions-col">操作</th></tr>
+              <tr><th class="check-col"><input id="device-select-all" type="checkbox" title="选择当前列表的全部设备"></th><th>ID</th><th>别名</th><th>所有者</th><th>标签</th><th>主机名</th><th>平台</th><th>版本</th><th>元数据签名</th><th>状态</th><th>中继 / 地址</th><th>最近在线</th><th class="actions-col">操作</th></tr>
             </thead>
             <tbody id="device-rows"></tbody>
           </table>
@@ -126,7 +147,7 @@
           <h2>策略分配</h2>
           <button type="button" id="policy-assignment-create" class="primary">新建分配</button>
         </div>
-        <p class="muted">分配把策略对象绑定到全部设备、设备分组或单台设备。同一范围只能有一个分配；多个范围同时命中时优先级高者生效，优先级相同则设备 &gt; 分组 &gt; 全部。设备分组沿用“分组”页签中的设备成员关系。</p>
+        <p class="muted">分配把策略对象绑定到全部设备、设备分组或一台/多台设备。同一范围只能有一个分配；多个范围同时命中时优先级高者生效，优先级相同则设备 &gt; 分组 &gt; 全部。设备分组沿用“分组”页签中的设备成员关系。</p>
         <div class="table-wrap">
           <table>
             <thead>
@@ -173,17 +194,161 @@
           </label>
           <button type="submit" class="primary">创建</button>
         </form>
-        <p class="muted">管理台可用服务器密钥或账号登录：admin 可管理账号，operator 可改设备标签与重置身份，readonly 只读；user 无管理台权限。封禁、重置密码与重置 2FA 立即生效并写入审计。</p>
+        <p class="muted">管理台可用服务器密钥或账号登录：admin 可管理账号，operator 可改设备标签与重置身份，readonly 只读；user 无管理台权限。封禁、重置密码与重置 2FA 立即生效并写入审计。会话权限限制该账号在所有受管设备上的新会话，与设备策略取交集；未受管设备仍由主机本机认证决定。</p>
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>账号列表</h2><button type="button" id="account-refresh">刷新</button></div>
+        <div class="panel-head">
+          <h2>账号列表</h2>
+          <div class="toolbar">
+            <input id="account-query" type="search" placeholder="搜索用户名" spellcheck="false">
+            <select id="account-role-filter" title="按角色筛选">
+              <option value="">全部角色</option>
+              <option value="admin">admin</option>
+              <option value="operator">operator</option>
+              <option value="readonly">readonly</option>
+              <option value="user">user</option>
+            </select>
+            <button type="button" id="account-refresh">刷新</button>
+            <button type="button" id="account-export">导出 CSV</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="account-prev" disabled>上一页</button>
+          <span id="account-page" class="muted"></span>
+          <button type="button" id="account-next" disabled>下一页</button>
+        </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>用户名</th><th>角色</th><th>创建时间</th><th>状态</th><th class="actions-col">操作</th></tr></thead>
+            <thead><tr><th>用户名</th><th>角色</th><th>创建时间</th><th>状态</th><th>会话权限</th><th>找回方式</th><th class="actions-col">操作</th></tr></thead>
             <tbody id="account-rows"></tbody>
           </table>
         </div>
         <p id="account-empty" class="muted hidden">还没有账号</p>
+      </div>
+    </section>
+
+    <section id="panel-mine" class="panel-page">
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>我的账号</h2><button type="button" id="mine-refresh">刷新</button></div>
+          <dl id="mine-summary" class="kv"></dl>
+          <p class="muted">这里只影响当前登录账号；角色与封禁由管理员在“账号”页处理，服务器密钥登录不能使用本页。</p>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>修改密码</h2></div>
+          <form id="mine-password-form" class="inline-form" autocomplete="off">
+            <label>当前密码<input id="mine-password-current" type="password" autocomplete="current-password"></label>
+            <label>新密码<input id="mine-password-new" type="password" autocomplete="new-password"></label>
+            <label>确认新密码<input id="mine-password-confirm" type="password" autocomplete="new-password"></label>
+            <button type="submit" class="primary">修改</button>
+          </form>
+          <p class="muted">修改成功后当前会话保留，其他设备上的会话会被撤销。</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>账号找回</h2></div>
+        <div class="grid-2">
+          <form id="mine-email-form" class="inline-form" autocomplete="off">
+            <label>找回邮箱<input id="mine-email" type="email" placeholder="用于密码重置链接与备用登录码"></label>
+            <label>当前密码<input id="mine-email-password" type="password" autocomplete="current-password"></label>
+            <button type="submit" class="primary">保存邮箱</button>
+            <button type="button" id="mine-email-clear" class="ghost">清除</button>
+          </form>
+          <form id="mine-phone-form" class="inline-form" autocomplete="off">
+            <label>找回手机<input id="mine-phone" type="tel" placeholder="6–15 位数字"></label>
+            <label>当前密码<input id="mine-phone-password" type="password" autocomplete="current-password"></label>
+            <button type="submit" class="primary">保存手机</button>
+            <button type="button" id="mine-phone-clear" class="ghost">清除</button>
+          </form>
+        </div>
+        <p class="muted">找回邮箱/手机用于密码重置和两步验证的备用登录码；服务器未配置 SMTP 或短信网关时仍可保存，但不能发信。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>两步验证</h2><span id="mine-2fa-state" class="muted"></span></div>
+        <div id="mine-2fa-off">
+          <form id="mine-2fa-start" class="inline-form" autocomplete="off">
+            <label>当前密码<input id="mine-2fa-password" type="password" autocomplete="current-password"></label>
+            <button type="submit">开始绑定</button>
+          </form>
+          <p class="muted">绑定后登录需要再输入验证器生成的 6 位验证码或一枚恢复码。</p>
+        </div>
+        <div id="mine-2fa-pending" class="stack hidden">
+          <p class="muted">在身份验证器中添加以下密钥，然后填入验证器当前的 6 位验证码完成绑定。</p>
+          <p>密钥：<code id="mine-2fa-secret" class="mono"></code></p>
+          <p class="muted mono" id="mine-2fa-uri"></p>
+          <form id="mine-2fa-enable" class="inline-form" autocomplete="off">
+            <label>当前密码<input id="mine-2fa-enable-password" type="password" autocomplete="current-password"></label>
+            <label>验证码<input id="mine-2fa-enable-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code"></label>
+            <button type="submit" class="primary">启用</button>
+            <button type="button" id="mine-2fa-cancel" class="ghost">取消</button>
+          </form>
+        </div>
+        <div id="mine-2fa-on" class="stack hidden">
+          <p id="mine-2fa-recovery-note" class="muted"></p>
+          <div class="grid-2">
+            <form id="mine-2fa-disable" class="inline-form" autocomplete="off">
+              <label>当前密码<input id="mine-2fa-disable-password" type="password" autocomplete="current-password"></label>
+              <label>验证码<input id="mine-2fa-disable-code" inputmode="numeric" maxlength="24" autocomplete="one-time-code"></label>
+              <button type="submit" class="danger">停用</button>
+            </form>
+            <form id="mine-recovery" class="inline-form" autocomplete="off">
+              <label>当前密码<input id="mine-recovery-password" type="password" autocomplete="current-password"></label>
+              <label>验证码<input id="mine-recovery-code" inputmode="numeric" maxlength="24" autocomplete="one-time-code"></label>
+              <button type="submit">生成恢复码</button>
+            </form>
+          </div>
+          <div id="mine-recovery-codes" class="stack hidden">
+            <p class="muted">恢复码只显示这一次，请离线保存；每枚只能使用一次。</p>
+            <p id="mine-recovery-list" class="mono"></p>
+            <button type="button" id="mine-recovery-copy">复制全部</button>
+            <button type="button" id="mine-recovery-download">下载文件</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>安全密钥</h2><span id="mine-keys-state" class="muted"></span></div>
+        <div id="mine-keys-off" class="hidden">
+          <p class="muted">服务器未配置 WebAuthn（--webauthn-rp-id / --webauthn-origin），当前不能登记安全密钥。</p>
+        </div>
+        <div id="mine-keys-on" class="stack hidden">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>名称</th><th>算法</th><th>登记时间</th><th>最近使用</th><th class="actions-col">操作</th></tr>
+              </thead>
+              <tbody id="mine-key-rows"></tbody>
+            </table>
+          </div>
+          <p id="mine-key-empty" class="muted">尚未登记安全密钥，可以用密码登录或在本页登记一枚。</p>
+          <form id="mine-key-form" class="inline-form" autocomplete="off">
+            <label>名称<input id="mine-key-name" maxlength="64" spellcheck="false" placeholder="例如：YubiKey 5C"></label>
+            <label>当前密码<input id="mine-key-password" type="password" autocomplete="current-password"></label>
+            <button type="submit" class="primary">登记安全密钥</button>
+          </form>
+          <p class="muted">登记和删除都需要当前密码；浏览器会弹出系统安全密钥或 Windows Hello 提示。WebAuthn 只在 HTTPS 或 localhost 下可用。</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>登录会话</h2>
+          <div class="toolbar">
+            <button type="button" id="mine-sessions-refresh">刷新</button>
+            <button type="button" id="mine-sessions-revoke-others" class="danger">撤销其他会话</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>设备</th><th>登录 IP</th><th>位置</th><th>创建时间</th><th>到期时间</th><th>状态</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="mine-session-rows"></tbody>
+          </table>
+        </div>
+        <p id="mine-session-empty" class="muted hidden">没有其他登录会话</p>
       </div>
     </section>
 
@@ -301,7 +466,10 @@
           <span class="spacer"></span>
           <select id="audit-group" aria-label="按分组过滤"></select>
           <input id="audit-filter" type="search" placeholder="动作" spellcheck="false">
+          <input id="audit-user" class="hidden" type="search" placeholder="账号（可选，精确匹配）" spellcheck="false">
           <input id="audit-host" class="hidden" type="search" placeholder="主机 ID（可选）" spellcheck="false">
+          <input id="audit-since" type="datetime-local" aria-label="起始时间">
+          <input id="audit-until" type="datetime-local" aria-label="结束时间">
           <button type="button" id="audit-reload">查询</button>
           <button type="button" id="audit-emergency" class="ghost" title="列出管理员应急授权记录">应急授权</button>
           <button type="button" id="audit-csv" class="ghost">导出 CSV</button>
@@ -342,9 +510,10 @@
 
   <dialog id="device-dialog">
     <form id="device-form" method="dialog">
-      <h2>编辑设备标签</h2>
+      <h2>编辑设备</h2>
       <p id="device-dialog-id" class="mono muted"></p>
       <label>别名<input id="device-alias" maxlength="128" spellcheck="false"></label>
+      <label>所有者（账号用户名，留空表示不指定）<input id="device-owner" maxlength="64" spellcheck="false" placeholder="alice"></label>
       <label>标签（逗号分隔，最多 16 个）<input id="device-tags" placeholder="lab, vip" spellcheck="false"></label>
       <div class="dialog-actions">
         <button type="button" id="device-cancel">取消</button>
@@ -412,10 +581,10 @@
         <select id="policy-assignment-scope">
           <option value="all">all（全部设备）</option>
           <option value="group">group（设备分组）</option>
-          <option value="device">device（单台设备）</option>
+          <option value="device">device（一台或多台设备）</option>
         </select>
       </label>
-      <label id="policy-assignment-value-label"><span id="policy-assignment-value-text">范围值</span><input id="policy-assignment-value" maxlength="64" spellcheck="false" placeholder="lab-a" list="policy-assignment-groups"></label>
+      <label id="policy-assignment-value-label"><span id="policy-assignment-value-text">范围值</span><input id="policy-assignment-value" maxlength="4096" spellcheck="false" placeholder="lab-a" list="policy-assignment-groups"></label>
       <datalist id="policy-assignment-groups"></datalist>
       <label>优先级（-10000..10000，数值越大越优先）<input id="policy-assignment-priority" type="number" min="-10000" max="10000" step="1" value="0"></label>
       <p id="policy-assignment-hint" class="muted"></p>
@@ -425,6 +594,57 @@
         <button type="submit" class="primary">创建</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="account-cap-dialog">
+    <form id="account-cap-form" method="dialog" class="dialog-stack" autocomplete="off">
+      <h2 id="account-cap-title">会话权限</h2>
+      <p id="account-cap-note" class="muted"></p>
+      <label>权限上限（32 位掩码，0 表示不限制）<input id="account-cap-ceiling" type="number" min="0" max="4294967295" step="1" value="0"></label>
+      <p id="account-cap-hint" class="muted"></p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="account-cap-cancel">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="account-recovery-dialog">
+    <form id="account-recovery-form" method="dialog" class="dialog-stack" autocomplete="off">
+      <h2 id="account-recovery-title">找回方式</h2>
+      <p id="account-recovery-note" class="muted"></p>
+      <label>找回邮箱<input id="account-recovery-email" type="email" placeholder="留空清除"></label>
+      <label>找回手机<input id="account-recovery-phone" type="tel" placeholder="6–15 位数字，留空清除"></label>
+      <div class="dialog-actions">
+        <button type="button" id="account-recovery-email-send">发送重置邮件</button>
+        <button type="button" id="account-recovery-sms">发送重置短信</button>
+        <span class="spacer"></span>
+        <button type="button" id="account-recovery-cancel">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="account-sessions-dialog">
+    <div class="dialog-stack">
+      <h2 id="account-sessions-title">登录会话</h2>
+      <p id="account-sessions-note" class="muted"></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>设备</th><th>登录 IP</th><th>位置</th><th>登录时间</th><th>到期</th><th>状态</th><th></th></tr>
+          </thead>
+          <tbody id="account-session-rows"></tbody>
+        </table>
+      </div>
+      <p id="account-session-empty" class="muted hidden">该账号当前没有登录会话</p>
+      <div class="dialog-actions">
+        <button type="button" id="account-sessions-revoke-all" class="danger">全部退出</button>
+        <span class="spacer"></span>
+        <button type="button" id="account-sessions-close">关闭</button>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="token-secret-dialog">

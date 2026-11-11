@@ -53,15 +53,38 @@ func (s *server) resolveLookupSubject(r *http.Request) (lookupSubject, bool) {
 	return lookupSubject{}, false
 }
 
+// deviceAdmission applies the policy and then the owner assignment. The owner
+// is an authenticated account, so a banned owner never reaches this call: the
+// session would already be refused.
+func (s *server) deviceAdmission(peerID, userID, username string) (account.DeviceAdmission, error) {
+	admission, err := s.cfg.Accounts.CheckDeviceAdmission(peerID, userID)
+	if err != nil {
+		return admission, err
+	}
+	if !admission.Allowed && username != "" {
+		if record, ok := s.cfg.Registry.Identity(peerID); ok &&
+			record.Owner != "" && record.Owner == username {
+			admission.Allowed = true
+			admission.Reason = "device owner"
+		}
+	}
+	return admission, nil
+}
+
 // lookupAdmission answers whether the subject may learn this device's
 // addresses. Managed open devices keep admitting any caller; restricted
 // devices need an allowed account. The host still performs local
 // authentication; this is server-side admission, not the final access ticket.
 func (s *server) lookupAdmission(hostID string, subject lookupSubject) (bool, string, error) {
+	// A disabled device is not merely offline: even its durable record (name,
+	// fingerprint, binding) must not be handed to a viewer.
+	if record, ok := s.cfg.Registry.Identity(hostID); ok && record.Disabled {
+		return false, "device is disabled", nil
+	}
 	if s.cfg.Accounts == nil {
 		return true, "", nil
 	}
-	admission, err := s.cfg.Accounts.CheckDeviceAdmission(hostID, subject.UserID)
+	admission, err := s.deviceAdmission(hostID, subject.UserID, subject.Username)
 	if err != nil {
 		return false, "", err
 	}
