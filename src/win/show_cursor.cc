@@ -7,8 +7,8 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cmath>
 #include <exception>
-#include <mutex>
 #include <thread>
 
 namespace chast {
@@ -31,6 +31,93 @@ struct MoveRequest {
     int32_t y;
     std::string* error;
 };
+
+// The arrow is painted into a 32bpp DIB and handed to the window with
+// UpdateLayeredWindow, so every pixel outside the shape is fully transparent.
+// SetLayeredWindowAttributes with LWA_ALPHA cannot do that: it tints the whole
+// window rectangle and leaves a black square behind the icon.
+constexpr int kDesignSize = 32;
+constexpr int kSamplesPerAxis = 4;
+constexpr double kOutlineWidth = 1.4;
+
+// Design-space arrow polygon, tip first, in the 32x32 cursor grid Windows
+// uses at 100% scaling.
+constexpr double kArrow[7][2] = {
+    {1.5, 1.0},  {1.5, 23.0}, {7.0, 17.5}, {11.0, 27.5},
+    {15.5, 25.5}, {11.5, 16.0}, {19.0, 16.0},
+};
+
+bool point_in_polygon(double x, double y) {
+    constexpr int kVertices = 7;
+    bool inside = false;
+    for (int i = 0, j = kVertices - 1; i < kVertices; j = i++) {
+        const double xi = kArrow[i][0];
+        const double yi = kArrow[i][1];
+        const double xj = kArrow[j][0];
+        const double yj = kArrow[j][1];
+        if (((yi > y) != (yj > y)) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+double segment_distance(double x, double y, double x1, double y1, double x2, double y2) {
+    const double dx = x2 - x1;
+    const double dy = y2 - y1;
+    const double length_sq = dx * dx + dy * dy;
+    double t = length_sq > 0.0 ? ((x - x1) * dx + (y - y1) * dy) / length_sq : 0.0;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    const double offset_x = x1 + t * dx - x;
+    const double offset_y = y1 + t * dy - y;
+    return std::sqrt(offset_x * offset_x + offset_y * offset_y);
+}
+
+double outline_distance(double x, double y) {
+    constexpr int kVertices = 7;
+    double nearest = segment_distance(x, y, kArrow[0][0], kArrow[0][1], kArrow[1][0],
+                                      kArrow[1][1]);
+    for (int i = 1; i < kVertices; ++i) {
+        const int j = (i + 1) % kVertices;
+        const double distance =
+            segment_distance(x, y, kArrow[i][0], kArrow[i][1], kArrow[j][0], kArrow[j][1]);
+        if (distance < nearest) {
+            nearest = distance;
+        }
+    }
+    return nearest;
+}
+
+void paint_arrow(void* raw_bits, int width, int height) {
+    auto* bits = static_cast<uint32_t*>(raw_bits);
+    constexpr int kSamples = kSamplesPerAxis * kSamplesPerAxis;
+    const double scale_x = static_cast<double>(kDesignSize) / width;
+    const double scale_y = static_cast<double>(kDesignSize) / height;
+    for (int py = 0; py < height; ++py) {
+        for (int px = 0; px < width; ++px) {
+            int covered = 0;
+            int white = 0;
+            for (int sy = 0; sy < kSamplesPerAxis; ++sy) {
+                for (int sx = 0; sx < kSamplesPerAxis; ++sx) {
+                    const double x = (px + (sx + 0.5) / kSamplesPerAxis) * scale_x;
+                    const double y = (py + (sy + 0.5) / kSamplesPerAxis) * scale_y;
+                    if (!point_in_polygon(x, y)) {
+                        continue;
+                    }
+                    ++covered;
+                    if (outline_distance(x, y) >= kOutlineWidth) {
+                        ++white;
+                    }
+                }
+            }
+            // Premultiplied BGRA: white fill, black stroke, nothing outside.
+            const uint32_t alpha = static_cast<uint32_t>(kHintAlpha) * covered / kSamples;
+            const uint32_t color = static_cast<uint32_t>(kHintAlpha) * white / kSamples;
+            bits[py * width + px] = (alpha << 24) | (color << 16) | (color << 8) | color;
+        }
+    }
+}
 
 std::string win32_error(DWORD code) {
     wchar_t* buffer = nullptr;
@@ -68,30 +155,34 @@ struct CursorHintOverlay::Impl {
     std::string create_error;
     std::atomic<bool> visible{false};
 
-    HCURSOR cursor = nullptr;
+    HDC surface_dc = nullptr;
+    HBITMAP surface_bitmap = nullptr;
+    HGDIOBJ previous_bitmap = nullptr;
     int cursor_width = 0;
     int cursor_height = 0;
     POINT hotspot{};
-    std::mutex state_mutex;
 
     void run();
     bool move(HWND hwnd, int32_t x, int32_t y, std::string* error);
     void hide(HWND hwnd);
-    void paint(HWND hwnd) const;
+    void release_surface();
 
     static LRESULT window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 };
 
-void CursorHintOverlay::Impl::paint(HWND hwnd) const {
-    PAINTSTRUCT paint{};
-    const HDC dc = BeginPaint(hwnd, &paint);
-    if (dc == nullptr) {
-        return;
+void CursorHintOverlay::Impl::release_surface() {
+    if (surface_dc != nullptr && previous_bitmap != nullptr) {
+        SelectObject(surface_dc, previous_bitmap);
     }
-    if (cursor != nullptr) {
-        DrawIconEx(dc, 0, 0, cursor, cursor_width, cursor_height, 0, nullptr, DI_NORMAL);
+    if (surface_bitmap != nullptr) {
+        DeleteObject(surface_bitmap);
     }
-    EndPaint(hwnd, &paint);
+    if (surface_dc != nullptr) {
+        DeleteDC(surface_dc);
+    }
+    surface_dc = nullptr;
+    surface_bitmap = nullptr;
+    previous_bitmap = nullptr;
 }
 
 bool CursorHintOverlay::Impl::move(HWND hwnd, int32_t x, int32_t y, std::string* error) {
@@ -112,22 +203,34 @@ bool CursorHintOverlay::Impl::move(HWND hwnd, int32_t x, int32_t y, std::string*
     if (x > left + width - 1) x = left + width - 1;
     if (y > top + height - 1) y = top + height - 1;
 
-    POINT hotspot{};
-    int cursor_width = 0;
-    int cursor_height = 0;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        hotspot = this->hotspot;
-        cursor_width = this->cursor_width;
-        cursor_height = this->cursor_height;
+    POINT destination{x - hotspot.x, y - hotspot.y};
+    SIZE size{cursor_width, cursor_height};
+    POINT source{0, 0};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
+    const HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        *error = "GetDC: " + win32_error(GetLastError());
+        return false;
     }
-    if (!SetWindowPos(hwnd, HWND_TOPMOST, x - hotspot.x, y - hotspot.y, cursor_width,
-                      cursor_height, SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+    const BOOL updated = UpdateLayeredWindow(hwnd, screen, &destination, &size, surface_dc,
+                                             &source, 0, &blend, ULW_ALPHA);
+    const DWORD update_error = GetLastError();
+    ReleaseDC(nullptr, screen);
+    if (updated == FALSE) {
+        *error = "UpdateLayeredWindow: " + win32_error(update_error);
+        return false;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    if (!SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
         *error = "SetWindowPos: " + win32_error(GetLastError());
         return false;
     }
     visible = true;
-    InvalidateRect(hwnd, nullptr, FALSE);
     return true;
 }
 
@@ -152,37 +255,45 @@ void CursorHintOverlay::Impl::run() {
         return;
     }
 
-    // LoadCursorW returns a shared system cursor, so no DestroyCursor is
-    // needed. GetIconInfo on a cursor needs no copy and yields the hotspot the
-    // drawn arrow must be offset by.
-    HCURSOR shared_cursor = LoadCursorW(nullptr, IDC_ARROW);
-    ICONINFO icon_info{};
-    if (shared_cursor == nullptr || !GetIconInfo(shared_cursor, &icon_info)) {
-        create_error = "LoadCursorW(IDC_ARROW): " + win32_error(GetLastError());
+    cursor_width = GetSystemMetrics(SM_CXCURSOR);
+    cursor_height = GetSystemMetrics(SM_CYCURSOR);
+    if (cursor_width <= 0) cursor_width = kDesignSize;
+    if (cursor_height <= 0) cursor_height = kDesignSize;
+    hotspot = POINT{static_cast<LONG>(std::lround(1.5 * cursor_width / kDesignSize)),
+                    static_cast<LONG>(std::lround(1.0 * cursor_height / kDesignSize))};
+
+    surface_dc = CreateCompatibleDC(nullptr);
+    if (surface_dc == nullptr) {
+        create_error = "CreateCompatibleDC: " + win32_error(GetLastError());
         SetEvent(ready);
         return;
     }
-    if (icon_info.hbmMask != nullptr) DeleteObject(icon_info.hbmMask);
-    if (icon_info.hbmColor != nullptr) DeleteObject(icon_info.hbmColor);
-    {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        cursor = shared_cursor;
-        cursor_width = GetSystemMetrics(SM_CXCURSOR);
-        cursor_height = GetSystemMetrics(SM_CYCURSOR);
-        if (cursor_width <= 0) cursor_width = 32;
-        if (cursor_height <= 0) cursor_height = 32;
-        hotspot = POINT{static_cast<LONG>(icon_info.xHotspot),
-                        static_cast<LONG>(icon_info.yHotspot)};
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = cursor_width;
+    info.bmiHeader.biHeight = -cursor_height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    surface_bitmap = CreateDIBSection(surface_dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (surface_bitmap == nullptr || bits == nullptr) {
+        create_error = "CreateDIBSection: " + win32_error(GetLastError());
+        release_surface();
+        SetEvent(ready);
+        return;
     }
+    previous_bitmap = SelectObject(surface_dc, surface_bitmap);
+    paint_arrow(bits, cursor_width, cursor_height);
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = &Impl::window_proc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = shared_cursor;
     wc.lpszClassName = L"chast_cursor_hint";
     if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         create_error = "RegisterClassExW: " + win32_error(GetLastError());
+        release_surface();
         SetEvent(ready);
         return;
     }
@@ -193,13 +304,7 @@ void CursorHintOverlay::Impl::run() {
         wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, this);
     if (window == nullptr) {
         create_error = "CreateWindowExW: " + win32_error(GetLastError());
-        SetEvent(ready);
-        return;
-    }
-    if (!SetLayeredWindowAttributes(window, 0, kHintAlpha, LWA_ALPHA)) {
-        create_error = "SetLayeredWindowAttributes: " + win32_error(GetLastError());
-        DestroyWindow(window);
-        window = nullptr;
+        release_surface();
         SetEvent(ready);
         return;
     }
@@ -211,6 +316,7 @@ void CursorHintOverlay::Impl::run() {
         DispatchMessageW(&message);
     }
     window = nullptr;
+    release_surface();
 }
 
 LRESULT CALLBACK CursorHintOverlay::Impl::window_proc(HWND hwnd, UINT message, WPARAM wparam,
@@ -234,14 +340,6 @@ LRESULT CALLBACK CursorHintOverlay::Impl::window_proc(HWND hwnd, UINT message, W
                 impl->hide(hwnd);
             }
             return 0;
-        case WM_PAINT:
-            if (impl != nullptr) {
-                impl->paint(hwnd);
-                return 0;
-            }
-            break;
-        case WM_ERASEBKGND:
-            return 1;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
