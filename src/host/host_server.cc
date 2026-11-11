@@ -5099,6 +5099,13 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     uint64_t last_sample_bytes = stats.bytes;
     uint64_t qos_replies = 0;
     uint64_t video_replies = 0;
+    // RustDesk's TestDelay timer sends one probe per second and feeds the
+    // policy when the reply arrives. The link loop runs at 500 ms for
+    // statistics, but the quality controller's two-sample delay history and
+    // 20-sample baseline only keep their real-time meaning at the reference
+    // cadence.
+    auto next_qos_sample = Clock::now() + std::chrono::seconds(1);
+    auto next_qos_probe = next_qos_sample;
     auto sample_link = [&](Clock::time_point now) -> bool {
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_link_sample).count();
         if (elapsed <= 0) return true;
@@ -5121,15 +5128,23 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // receipt or outstanding frame participates alongside the probe.
         const auto video_delay = latency.video_replies != video_replies ? latency.video_delay_us : 0;
         const auto delay = std::max({latency.rtt_us, video_delay, latency.video_pending_us});
+        const bool fresh = latency.replies != qos_replies || latency.video_replies != video_replies;
+        const bool sample_due = now >= next_qos_sample;
         quality_peer->feedback(static_cast<uint32_t>(std::min<uint64_t>(delay / 1000, UINT32_MAX)),
                                std::max(latency.pending_us, latency.video_pending_us) / 1000,
-                               latency.replies != qos_replies || latency.video_replies != video_replies);
-        qos_replies = latency.replies;
-        video_replies = latency.video_replies;
-        auto probed = session_->send_latency_probe();
-        if (!probed.ok() && !session_->peer_alive()) {
-            *peer_left = true;
-            return false;
+                               fresh && sample_due);
+        if (fresh && sample_due) {
+            qos_replies = latency.replies;
+            video_replies = latency.video_replies;
+            next_qos_sample = now + std::chrono::seconds(1);
+        }
+        if (now >= next_qos_probe) {
+            next_qos_probe = now + std::chrono::seconds(1);
+            auto probed = session_->send_latency_probe();
+            if (!probed.ok() && !session_->peer_alive()) {
+                *peer_left = true;
+                return false;
+            }
         }
         if (!encoder) return true;
         auto rated = encoder->set_rate(0, 0); // synchronizes the shared decision
@@ -6084,6 +6099,7 @@ void HostServer::begin_file_session() {
     file_audit_ref_ = session_audit_ref_;
     file_audit_ref_absent_ = session_audit_ref_absent_;
     upload_.reset();
+    held_upload_.reset();
     clipboard_incoming_ = ClipboardIncoming{};
     last_file_identity_ = 0;
     last_file_entries_.clear();
@@ -6091,9 +6107,7 @@ void HostServer::begin_file_session() {
     {
         // A clipboard download path belongs to the session that announced
         // it; a fresh viewer must not reach files an earlier one copied.
-        std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
-        clipboard_file_entries_.clear();
-        clipboard_file_paths_.clear();
+        clear_clipboard_file_share();
     }
     download_stream_.close();
     download_tokens_ = kDownloadBurst;
@@ -6117,6 +6131,8 @@ void HostServer::end_file_session() {
         upload_->receiver->abort(true);
         upload_.reset();
     }
+    // The held offer belonged to this viewer; its decision can no longer come.
+    held_upload_.reset();
     if (send_hasher_.joinable()) {
         send_hasher_.join();
     }
@@ -6153,11 +6169,7 @@ void HostServer::end_file_session() {
     file_shares_.clear();
     file_audit_ref_.clear();
     file_audit_ref_absent_ = false;
-    {
-        std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
-        clipboard_file_entries_.clear();
-        clipboard_file_paths_.clear();
-    }
+    clear_clipboard_file_share();
 }
 
 bool HostServer::file_transfer_allowed() const {
@@ -6422,7 +6434,7 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
                                                  "no clipboard list is waiting");
                 continue;
             }
-            if (upload_) {
+            if (upload_ || held_upload_) {
                 ++stats.file_failures;
                 (void)session_->send_file_answer(offer.transfer_id, FileCode::Busy, 0,
                                                  "another transfer is running");
@@ -6448,6 +6460,9 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
             options.size = offer.size;
             options.sha256 = offer.sha256;
             options.allow_resume = offer.resume;
+            // A staging tree belongs to this list alone, so a leftover name is
+            // ours to replace rather than something the viewer must decide.
+            options.overwrite = true;
             uint64_t resume_offset = 0;
             std::string receive_error;
             std::unique_ptr<FileReceiver> receiver =
@@ -6486,7 +6501,7 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
         if (!file_transfer_allowed()) {
             continue;
         }
-        if (upload_) {
+        if (upload_ || held_upload_) {
             ++stats.file_failures;
             (void)session_->send_file_answer(offer.transfer_id, FileCode::Busy, 0,
                                              "another transfer is running");
@@ -6524,6 +6539,51 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
         options.size = offer.size;
         options.sha256 = offer.sha256;
         options.allow_resume = offer.resume;
+        FileReceiveTarget target;
+        std::string target_error;
+        if (!inspect_receive_target(options, target, &target_error)) {
+            ++stats.file_failures;
+            (void)session_->send_file_answer(offer.transfer_id, FileCode::Refused, 0,
+                                             target_error);
+            log("file: refused " + offer.name + ": " + target_error);
+            continue;
+        }
+        if (target.exists) {
+            if (target.directory) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(
+                    offer.transfer_id, FileCode::Refused, 0,
+                    "the destination is an existing directory");
+                log("file: refused " + offer.name +
+                    ": the destination is an existing directory");
+                continue;
+            }
+            auto held = std::make_unique<HeldUpload>();
+            held->root = upload_root;
+            held->relative = upload_relative;
+            FileConflict conflict;
+            conflict.transfer_id = offer.transfer_id;
+            conflict.identical = offer.modified_time != 0 &&
+                                 target.modified_time == offer.modified_time &&
+                                 target.size == offer.size;
+            conflict.existing_size = target.size;
+            conflict.existing_modified_time = target.modified_time;
+            held->offer = std::move(offer);
+            held_upload_ = std::move(held);
+            const Error asked = session_->send_file_conflict(conflict);
+            if (!asked.ok()) {
+                held_upload_.reset();
+                ++stats.file_failures;
+                log("file: cannot ask about " +
+                    (upload_relative.empty() ? std::string("the file") : upload_relative) +
+                    ": " + asked.to_string());
+                continue;
+            }
+            log("file: " + (upload_relative.empty() ? std::string() : upload_relative + "/") +
+                held_upload_->offer.name + " already exists; waiting for the viewer" +
+                (conflict.identical ? " (identical)" : ""));
+            continue;
+        }
         uint64_t resume_offset = 0;
         std::string receive_error;
         std::unique_ptr<FileReceiver> receiver =
@@ -6769,20 +6829,28 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
             // gated by the clipboard permission rather than file transfer.
             const bool clipboard_ok = clipboard_allowed() &&
                 clipboard_from_host(settings_.clipboard_direction);
+            std::shared_ptr<ClipboardVirtualFiles> source;
             {
                 std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
                 if (clipboard_index < clipboard_file_paths_.size() &&
                     clipboard_index < clipboard_file_entries_.size() &&
                     !clipboard_file_entries_[clipboard_index].directory) {
                     full_path = clipboard_file_paths_[clipboard_index];
+                    source = clipboard_file_source_;
                 }
             }
+            // The owner marker: only the capture that produced the announced
+            // list may serve its index, and the file must still hold the same
+            // bytes (a re-copy or an in-place rewrite invalidates it).
             if (!clipboard_ok) {
                 answer.code = FileCode::Refused;
                 answer.reason = "clipboard is disabled";
-            } else if (full_path.empty()) {
+            } else if (full_path.empty() || !source) {
                 answer.code = FileCode::Refused;
                 answer.reason = "the clipboard does not hold that file";
+            } else if (!source->Active() || !source->Unchanged(clipboard_index)) {
+                answer.code = FileCode::Refused;
+                answer.reason = "the clipboard changed since these files were announced";
             }
         } else if (!file_transfer_allowed()) {
             answer.code = FileCode::Refused;
@@ -7025,12 +7093,26 @@ void HostServer::drive_file_download(HostServerStats& stats) {
                 file_access_token = send_.file_access_token;
             }
             uint64_t size = 0;
+            uint64_t modified_time = 0;
             std::array<uint8_t, 32> digest{};
             std::string error;
             bool ok = false;
             {
                 ScopedFileAccess access(file_access_token);
                 ok = access.ok() && sha256_file(path, size, digest, &error);
+            }
+            if (ok) {
+                std::error_code stamp_error;
+                const auto stamp = std::filesystem::last_write_time(
+                    path_from_utf8(path), stamp_error);
+                if (!stamp_error) {
+                    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::clock_cast<std::chrono::system_clock>(stamp)
+                            .time_since_epoch());
+                    if (seconds.count() > 0) {
+                        modified_time = static_cast<uint64_t>(seconds.count());
+                    }
+                }
             }
             if (ok && size > kMaxFileTransferBytes) {
                 ok = false;
@@ -7043,6 +7125,7 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             }
             if (ok) {
                 send_.size = size;
+                send_.modified_time = modified_time;
                 send_.digest = digest;
                 send_.stage = FileSend::Stage::kReady;
             } else {
@@ -7197,6 +7280,7 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             offer.sha256 = snapshot.digest;
             offer.name = snapshot.name;
             offer.clipboard = snapshot.clipboard;
+            offer.modified_time = snapshot.modified_time;
             Error sent = session_->offer_file(offer);
             if (!sent.ok()) {
                 send_file_failure("offer: " + sent.to_string(), false, stats);
@@ -7221,6 +7305,22 @@ void HostServer::drive_file_download(HostServerStats& stats) {
                 if (answer.transfer_id != snapshot.transfer_id) {
                     continue;
                 }
+                if (answer.code == FileCode::Conflict) {
+                    // The viewer is asking its user; the decision arrives as
+                    // FileConflictAnswer and the offer timeout pauses.
+                    {
+                        std::lock_guard<std::mutex> lock(download_mutex_);
+                        if (send_.transfer_id != snapshot.transfer_id ||
+                            send_.stage != FileSend::Stage::kOffered) {
+                            continue;
+                        }
+                        send_.conflict_pending = true;
+                    }
+                    log("file: " + snapshot.name +
+                        " already exists on the viewer; waiting for its decision");
+                    publish_download();
+                    return;
+                }
                 if (answer.code != FileCode::Ok) {
                     send_file_failure(
                         answer.reason.empty() ? "the viewer refused the file"
@@ -7233,39 +7333,11 @@ void HostServer::drive_file_download(HostServerStats& stats) {
                                       true, stats);
                     return;
                 }
-                {
-                    ScopedFileAccess access(snapshot.file_access_token);
-                    if (access.ok()) download_stream_.open(path_from_utf8(snapshot.path), std::ios::binary);
-                    else download_stream_.setstate(std::ios::failbit);
-                }
-                if (!download_stream_) {
-                    send_file_failure("the local file cannot be opened", false, stats);
-                    return;
-                }
-                download_stream_.seekg(static_cast<std::streamoff>(answer.resume_offset),
-                                       std::ios::beg);
-                if (!download_stream_) {
-                    send_file_failure("the local file cannot seek to the resume offset",
-                                      false, stats);
-                    return;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(download_mutex_);
-                    if (send_.transfer_id == snapshot.transfer_id &&
-                        send_.stage == FileSend::Stage::kOffered) {
-                        send_.stage = FileSend::Stage::kSending;
-                        send_.resume_offset = answer.resume_offset;
-                        send_.sent = answer.resume_offset;
-                    }
-                }
-                download_tokens_ = kDownloadBurst;
-                download_token_time_ = Clock::now();
-                log("file: sending " + snapshot.name + " from " +
-                    std::to_string(answer.resume_offset));
-                publish_download();
+                start_file_send(snapshot.transfer_id, answer.resume_offset, stats);
                 return;
             }
-            if (Clock::now() - snapshot.answer_time > std::chrono::seconds(30)) {
+            if (!snapshot.conflict_pending &&
+                Clock::now() - snapshot.answer_time > std::chrono::seconds(30)) {
                 send_file_failure("the viewer did not answer the offer", false, stats);
             }
             return;
@@ -7340,6 +7412,174 @@ void HostServer::drive_file_download(HostServerStats& stats) {
     }
 }
 
+void HostServer::start_file_send(uint32_t transfer_id, uint64_t resume_offset,
+                                 HostServerStats& stats) {
+    FileSend snapshot;
+    {
+        std::lock_guard<std::mutex> lock(download_mutex_);
+        if (send_.transfer_id != transfer_id ||
+            send_.stage != FileSend::Stage::kOffered) {
+            return;
+        }
+        snapshot = send_;
+    }
+    if (resume_offset > snapshot.size) {
+        send_file_failure("the viewer asked to resume past the end of the file", true,
+                          stats);
+        return;
+    }
+    {
+        ScopedFileAccess access(snapshot.file_access_token);
+        if (access.ok()) {
+            download_stream_.open(path_from_utf8(snapshot.path), std::ios::binary);
+        } else {
+            download_stream_.setstate(std::ios::failbit);
+        }
+    }
+    if (!download_stream_) {
+        send_file_failure("the local file cannot be opened", false, stats);
+        return;
+    }
+    download_stream_.seekg(static_cast<std::streamoff>(resume_offset), std::ios::beg);
+    if (!download_stream_) {
+        send_file_failure("the local file cannot seek to the resume offset", false, stats);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(download_mutex_);
+        if (send_.transfer_id == transfer_id &&
+            send_.stage == FileSend::Stage::kOffered) {
+            send_.stage = FileSend::Stage::kSending;
+            send_.resume_offset = resume_offset;
+            send_.sent = resume_offset;
+            send_.conflict_pending = false;
+        }
+    }
+    download_tokens_ = kDownloadBurst;
+    download_token_time_ = Clock::now();
+    log("file: sending " + snapshot.name + " from " + std::to_string(resume_offset));
+    publish_download();
+}
+
+void HostServer::answer_held_upload(const FileConflictAnswer& answer,
+                                    HostServerStats& stats) {
+    std::unique_ptr<HeldUpload> held = std::move(held_upload_);
+    const uint32_t transfer_id = held->offer.transfer_id;
+    const std::string offered_path = held->relative.empty()
+                                         ? held->offer.name
+                                         : held->relative + "/" + held->offer.name;
+    if (answer.decision == FileConflictDecision::Skip) {
+        (void)session_->send_file_answer(transfer_id, FileCode::Skipped, 0,
+                                         "the existing file is kept");
+        log("file: skipped " + offered_path + " (the existing file is kept)");
+        return;
+    }
+    if (answer.decision == FileConflictDecision::Cancel) {
+        (void)session_->send_file_answer(transfer_id, FileCode::Cancelled, 0,
+                                         "the viewer cancelled the transfer");
+        log("file: " + offered_path + " cancelled at the overwrite prompt");
+        return;
+    }
+    FileReceiveOptions options;
+    options.directory = held->root;
+    options.name = held->offer.name;
+    options.relative_path = held->relative;
+    options.size = held->offer.size;
+    options.sha256 = held->offer.sha256;
+    options.allow_resume = held->offer.resume;
+    options.overwrite = true;
+    uint64_t resume_offset = 0;
+    std::string receive_error;
+    std::unique_ptr<FileReceiver> receiver =
+        FileReceiver::create(options, &resume_offset, &receive_error);
+    if (!receiver) {
+        ++stats.file_failures;
+        (void)session_->send_file_answer(transfer_id, FileCode::Refused, 0,
+                                         receive_error);
+        log("file: refused " + offered_path + ": " + receive_error);
+        return;
+    }
+    auto active = std::make_unique<ActiveUpload>();
+    active->offer = std::move(held->offer);
+    active->receiver = std::move(receiver);
+    active->answer_time = Clock::now();
+    active->written = resume_offset;
+    const std::string name = active->receiver->name();
+    upload_ = std::move(active);
+    Error answered = session_->send_file_answer(transfer_id, FileCode::Ok, resume_offset);
+    if (!answered.ok()) {
+        upload_.reset();
+        ++stats.file_failures;
+        log("file: cannot accept " + offered_path + ": " + answered.to_string());
+        return;
+    }
+    log("file: receiving " + offered_path + " (" +
+        std::to_string(upload_->offer.size) + " bytes, replacing the existing file" +
+        (resume_offset > 0 ? ", resuming at " + std::to_string(resume_offset) : "") + ")");
+}
+
+void HostServer::answer_held_download(const FileConflictAnswer& answer,
+                                      HostServerStats& stats) {
+    FileSend snapshot;
+    bool current = false;
+    {
+        std::lock_guard<std::mutex> lock(download_mutex_);
+        // The decision can overtake the FileAnswer{Conflict} that pauses the
+        // offer timeout, so conflict_pending is not required here.
+        current = send_.transfer_id == answer.transfer_id &&
+                  send_.stage == FileSend::Stage::kOffered;
+        if (current) {
+            snapshot = send_;
+        }
+    }
+    if (!current) {
+        return;
+    }
+    switch (answer.decision) {
+        case FileConflictDecision::Overwrite: {
+            const Error accepted = session_->accept_held_download(answer.transfer_id);
+            if (!accepted.ok()) {
+                send_file_failure("cannot restart the overwritten download: " +
+                                      accepted.to_string(),
+                                  true, stats);
+                return;
+            }
+            start_file_send(answer.transfer_id, 0, stats);
+            return;
+        }
+        case FileConflictDecision::Skip:
+            {
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                if (send_.transfer_id == answer.transfer_id &&
+                    send_.stage == FileSend::Stage::kOffered) {
+                    send_.stage = FileSend::Stage::kDone;
+                    send_.error = "the viewer kept its existing file";
+                    send_.conflict_pending = false;
+                    send_.counted = true;
+                }
+            }
+            session_->cancel_file_upload(answer.transfer_id);
+            log("file: " + snapshot.name + " skipped (the viewer kept its existing file)");
+            publish_download();
+            return;
+        case FileConflictDecision::Cancel:
+            send_file_failure("the viewer cancelled the transfer", false, stats, true);
+            session_->cancel_file_upload(answer.transfer_id);
+            return;
+    }
+}
+
+void HostServer::drain_file_conflicts(HostServerStats& stats) {
+    FileConflictAnswer answer;
+    while (session_->take_file_conflict_answer(answer)) {
+        if (held_upload_ && answer.transfer_id == held_upload_->offer.transfer_id) {
+            answer_held_upload(answer, stats);
+        } else {
+            answer_held_download(answer, stats);
+        }
+    }
+}
+
 void HostServer::poll_files(HostServerStats& stats) {
     if (upload_ && !file_transfer_allowed() && !upload_->offer.clipboard) {
         // The transport already told the viewer and dropped the stream;
@@ -7353,10 +7593,19 @@ void HostServer::poll_files(HostServerStats& stats) {
             " because the clipboard was revoked");
         end_upload(FileCode::Cancelled, "the clipboard was disabled", true, false, stats);
     }
+    if (held_upload_ && !file_transfer_allowed()) {
+        log("file: dropping the held offer for " + held_upload_->offer.name +
+            " because file transfer was revoked");
+        (void)session_->send_file_answer(held_upload_->offer.transfer_id,
+                                         FileCode::Cancelled, 0,
+                                         "file transfer was disabled");
+        held_upload_.reset();
+    }
     if (clipboard_incoming_.active && !clipboard_transfer_allowed()) {
         reset_clipboard_incoming(true);
     }
     drain_file_offers(stats);
+    drain_file_conflicts(stats);
     drain_file_data(stats);
     drain_file_cancel(stats);
     drain_file_browse(stats);
@@ -7988,9 +8237,18 @@ void HostServer::cancel_clipboard_work() {
     pending_clipboard_paths_.clear();
 }
 
+void HostServer::clear_clipboard_file_share() {
+    std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
+    clipboard_file_entries_.clear();
+    clipboard_file_paths_.clear();
+    clipboard_file_source_.reset();
+}
+
 void HostServer::remember_local_clipboard() {
     cancel_clipboard_work();
+    clear_clipboard_file_share();
     clipboard_baseline_pending_ = true;
+    clipboard_initial_send_ = true;
     last_clipboard_hash_ = 0;
     last_clipboard_ = {};
     last_file_entries_.clear();
@@ -8014,6 +8272,7 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
             return;
         }
         cancel_clipboard_work();
+        clear_clipboard_file_share();
         last_clipboard_hash_ = clipboard_content_hash(content);
         last_clipboard_ = ClipboardContent{};
         if (!config_.clipboard_write_files || config_.clipboard_write_virtual_files) {
@@ -8044,6 +8303,7 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
     }
     // New peer content supersedes a queued retry and invalidates older reads.
     cancel_clipboard_work();
+    clear_clipboard_file_share();
     if (clipboard_channel_) clipboard_channel_->ClearLocal();
     if (upload_ && upload_->offer.clipboard) {
         end_upload(FileCode::Cancelled, "the viewer replaced its clipboard list", true, true, stats);
@@ -8098,11 +8358,16 @@ void HostServer::drain_peer(HostServerStats& stats) {
 
 void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
                                 HostServerStats& stats) {
+    const bool clipboard_send = clipboard_allowed() && clipboard_from_host(settings_.clipboard_direction);
     if (clipboard_channel_) clipboard_channel_->Poll(*session_,
-        clipboard_allowed() && clipboard_from_host(settings_.clipboard_direction), clipboard_transfer_allowed());
+        clipboard_send, clipboard_transfer_allowed());
+    // Poll cancels the announced capture once sending stops; drop the
+    // whitelist with it so a later request cannot name a dead index.
+    if (!clipboard_send) clear_clipboard_file_share();
     if (!clipboard_allowed()) {
         if (clipboard_was_allowed_) cancel_clipboard_work();
         clipboard_was_allowed_ = false;
+        clipboard_initial_send_ = false;
         return;
     }
     if (!clipboard_was_allowed_) {
@@ -8113,38 +8378,43 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     ClipboardWorker::Result result;
     bool have_read = false;
-    if (clipboard_worker_ && clipboard_worker_->Take(result) && result.epoch == clipboard_epoch_) {
-        if (result.operation == ClipboardWorker::Operation::Read) {
-            have_read = !clipboard_write_pending_;
-        } else {
-            clipboard_write_inflight_ = false;
-            if (result.written) {
-                clipboard_write_pending_ = false;
-                clipboard_baseline_pending_ = false;
-                if (clipboard_write_is_files_) {
-                    last_file_entries_ = pending_virtual_files_ ? pending_virtual_files_->entries() : clipboard_incoming_.entries;
-                    last_file_identity_ = clipboard_file_identity_hash(last_file_entries_);
-                    last_file_source_version_ = 0;
-                    last_file_paths_ = pending_clipboard_paths_;
-                    clipboard_incoming_.active = false;
-                    pending_virtual_files_.reset();
-                } else {
-                    last_clipboard_hash_ = clipboard_content_hash(pending_clipboard_content_);
-                    last_clipboard_ = std::move(pending_clipboard_content_);
-                    last_file_identity_ = 0;
-                    last_file_entries_.clear();
-                    last_file_paths_.clear();
-                }
-                ++stats.clipboard_received;
+    if (clipboard_worker_ && clipboard_worker_->Take(result)) {
+        if (result.epoch == clipboard_epoch_) {
+            if (result.operation == ClipboardWorker::Operation::Read) {
+                have_read = !clipboard_write_pending_;
             } else {
-                ++stats.clipboard_write_failures;
-                if (++clipboard_write_attempts_ >= 10) {
+                clipboard_write_inflight_ = false;
+                if (result.written) {
                     clipboard_write_pending_ = false;
-                    log("clipboard: write failed after 10 attempts");
-                    if (pending_virtual_files_ && clipboard_channel_) { clipboard_channel_->CancelRemote(); pending_virtual_files_.reset(); }
-                    if (clipboard_write_is_files_) reset_clipboard_incoming(true);
+                    clipboard_baseline_pending_ = false;
+                    // The peer's item is on the local clipboard now; never send
+                    // it back, even if the opening baseline had not gone out yet.
+                    clipboard_initial_send_ = false;
+                    if (clipboard_write_is_files_) {
+                        last_file_entries_ = pending_virtual_files_ ? pending_virtual_files_->entries() : clipboard_incoming_.entries;
+                        last_file_identity_ = clipboard_file_identity_hash(last_file_entries_);
+                        last_file_source_version_ = 0;
+                        last_file_paths_ = pending_clipboard_paths_;
+                        clipboard_incoming_.active = false;
+                        pending_virtual_files_.reset();
+                    } else {
+                        last_clipboard_hash_ = clipboard_content_hash(pending_clipboard_content_);
+                        last_clipboard_ = std::move(pending_clipboard_content_);
+                        last_file_identity_ = 0;
+                        last_file_entries_.clear();
+                        last_file_paths_.clear();
+                    }
+                    ++stats.clipboard_received;
+                } else {
+                    ++stats.clipboard_write_failures;
+                    if (++clipboard_write_attempts_ >= 10) {
+                        clipboard_write_pending_ = false;
+                        log("clipboard: write failed after 10 attempts");
+                        if (pending_virtual_files_ && clipboard_channel_) { clipboard_channel_->CancelRemote(); pending_virtual_files_.reset(); }
+                        if (clipboard_write_is_files_) reset_clipboard_incoming(true);
+                    }
+                    clipboard_write_retry_ = now + std::chrono::milliseconds(250);
                 }
-                clipboard_write_retry_ = now + std::chrono::milliseconds(250);
             }
         }
     }
@@ -8169,19 +8439,29 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     ClipboardSnapshot snapshot = std::move(result.snapshot);
     next_clipboard_poll_ = now + clipboard_poll_interval();
-    if (snapshot.state == ClipboardReadState::Failed) return;
+    if (snapshot.state == ClipboardReadState::Failed) {
+        // The opening observation failed, so whatever a later read finds is
+        // history that predates the session. It may seed the baseline, but it
+        // must not feed the one-shot opening send.
+        if (clipboard_baseline_pending_) clipboard_initial_send_ = false;
+        return;
+    }
     const bool has_content = snapshot.state == ClipboardReadState::Content && !snapshot.has_files;
+    bool initial_send = false;
     if (clipboard_baseline_pending_) {
         clipboard_baseline_pending_ = false;
+        initial_send = clipboard_initial_send_;
+        clipboard_initial_send_ = false;
         last_clipboard_hash_ = has_content
                                    ? clipboard_content_hash(snapshot.content) : 0;
-        last_clipboard_ = std::move(snapshot.content);
+        // Copied, not moved: an initial send still needs this snapshot.
+        last_clipboard_ = snapshot.content;
         last_file_identity_ = snapshot.has_files
                                   ? clipboard_file_identity_hash(snapshot.entries) : 0;
         last_file_source_version_ = snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
-        last_file_entries_ = std::move(snapshot.entries);
-        last_file_paths_ = std::move(snapshot.paths);
-        return;
+        last_file_entries_ = snapshot.entries;
+        last_file_paths_ = snapshot.paths;
+        if (!initial_send || (!has_content && !snapshot.has_files)) return;
     }
     auto& current_files = snapshot.entries;
     auto& current_paths = snapshot.paths;
@@ -8190,7 +8470,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         last_clipboard_ = ClipboardContent{};
         last_clipboard_hash_ = 0;
         const auto source_version = snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
-        if (identity == 0 || (identity == last_file_identity_ &&
+        if (identity == 0 || (!initial_send && identity == last_file_identity_ &&
             (!last_file_source_version_ || last_file_source_version_ == source_version))) {
             return;
         }
@@ -8215,11 +8495,14 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         }
         // Only a list this viewer actually received may be downloaded by
         // index; publishing after the send keeps a failed announce from
-        // leaving paths the viewer never saw.
+        // leaving paths the viewer never saw. The source travels with the
+        // whitelist so an index is only served by the capture that announced
+        // it.
         {
             std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
             clipboard_file_entries_ = last_file_entries_;
             clipboard_file_paths_ = last_file_paths_;
+            clipboard_file_source_ = snapshot.local_files;
         }
         clipboard_channel_->CancelRemote();
         clipboard_channel_->SetLocal(clipboard_seq_, std::move(snapshot.local_files));
@@ -8230,6 +8513,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     // No files now, so a later text item is a fresh change again.
     if (clipboard_channel_) clipboard_channel_->ClearLocal();
+    clear_clipboard_file_share();
     last_file_identity_ = 0;
     last_file_entries_.clear();
     last_file_paths_.clear();
@@ -8238,7 +8522,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     ClipboardContent current = std::move(snapshot.content);
     const uint64_t hash = clipboard_content_hash(current);
-    if (hash == last_clipboard_hash_) {
+    if (hash == last_clipboard_hash_ && !initial_send) {
         return;
     }
     // Remember content we cannot put on the wire (oversized or malformed) so

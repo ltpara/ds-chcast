@@ -15,10 +15,16 @@ void main() {
     final dir = Directory.systemTemp.createTempSync('chast-review-prefs-');
     ViewPreferences.configPathOverride = '${dir.path}/ui.json';
     ViewPreferences.save(
-      const ViewPreferences(fit: 1, reverseWheel: true, swapButtons: true),
+      const ViewPreferences(
+        fit: 1,
+        reverseWheel: true,
+        swapButtons: true,
+        showMyCursor: true,
+      ),
       peerId: 'review-peer',
     );
     final inputs = <Map<Object?, Object?>>[];
+    final cursors = <Map<Object?, Object?>>[];
     final messenger = tester.binding.defaultBinaryMessenger;
     const native = MethodChannel('chast/viewer');
     const gpu = MethodChannel('flutter_gpu_texture_renderer');
@@ -59,6 +65,9 @@ void main() {
           return false;
         case 'sendInput':
           inputs.add(call.arguments as Map<Object?, Object?>);
+          return true;
+        case 'showCursor':
+          cursors.add(call.arguments as Map<Object?, Object?>);
           return true;
         case 'start':
         case 'stop':
@@ -103,6 +112,16 @@ void main() {
       ViewerMouse.right,
     );
 
+    // The child window forwards the draw-only cursor hint with the same
+    // desktop mapping as its mouse input and clears it on exit.
+    view.onCursorHint!(const Offset(100, 50));
+    await tester.pump();
+    expect(cursors, hasLength(1));
+    expect(cursors.single, {'x': -1180, 'y': -50, 'visible': true});
+    view.onCursorHintExit!();
+    await tester.pump();
+    expect(cursors.last, {'x': 0, 'y': 0, 'visible': false});
+
     // Another window changes unrelated settings after this one loaded them.
     ViewPreferences.update(
       peerId: 'review-peer',
@@ -132,6 +151,7 @@ void main() {
       reverseWheel: false,
       swapButtons: false,
       keyboardMode: 'physical',
+      showMyCursor: false,
     );
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pump();
@@ -142,6 +162,11 @@ void main() {
       tester.widget<KeyboardModeButton>(find.byType(KeyboardModeButton)).mode,
       ViewerKeyboardMode.physical,
     );
+    // A reload that turns the preference off must stop new hints.
+    final hints = cursors.length;
+    refreshed.onCursorHint!(const Offset(10, 10));
+    await tester.pump();
+    expect(cursors, hasLength(hints));
     inputs.clear();
     refreshed.onButton!(const Offset(100, 50), ViewerMouse.left, true);
     refreshed.onButton!(const Offset(100, 50), ViewerMouse.left, false);

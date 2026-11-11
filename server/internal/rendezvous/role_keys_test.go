@@ -113,7 +113,7 @@ func TestTCPPunchAcceptsLinkKey(t *testing.T) {
 		Nonce:     nonce,
 		Timestamp: stamp,
 		Auth:      identity.PunchAuth("not-the-link-key", "devbox", nonce, stamp),
-	}); err == nil || err.Error() != "punch authentication failed" {
+	}, "127.0.0.1:40000"); err == nil || err.Error() != "punch authentication failed" {
 		t.Fatalf("wrong viewer key accepted: %v", err)
 	}
 }

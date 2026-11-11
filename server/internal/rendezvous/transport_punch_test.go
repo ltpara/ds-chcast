@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -231,7 +232,103 @@ func TestTCPPunchManagedViewerNeedsTransportCredential(t *testing.T) {
 		Nonce:     "tcp-managed-linkkey",
 		Timestamp: stamp,
 		Auth:      identity.PunchAuth(linkKey, "devbox", "tcp-managed-linkkey", stamp),
-	}); err == nil || err.Error() != "punch authentication failed" {
+	}, "127.0.0.1:1"); err == nil || err.Error() != "punch authentication failed" {
 		t.Fatalf("managed host accepted the link key over TCP punch: %v", err)
+	}
+}
+
+// TestTransportPunchReplayRejected pins the punch replay guard. A retransmit
+// from the socket that first sent the proof is allowed, but replaying the same
+// datagram from another source is refused, matching the relay guard.
+func TestTransportPunchReplayRejected(t *testing.T) {
+	const linkKey = "viewer-link-secret"
+	issuer := transportIssuer(t)
+	_, reg, meetAddr, priv := startMeet(t,
+		WithServerKey("management-secret"),
+		WithLinkKey(linkKey),
+		WithTransportVerifier(punchTransportVerifier(t, issuer)),
+	)
+	reg.SetPolicy("devbox", true, 7)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	if ack := keepalive(t, host, meetAddr, priv); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+
+	now := time.Now()
+	client := newTransportViewer(t)
+	ticket := mintPunchTicket(t, issuer, "devbox", acl.TransportAudiencePunch, client, 7, now)
+	nonce := "managed-replay-punch1"
+	if reply := transportPunch(t, viewer, meetAddr, client, ticket, nonce, now.Unix()); !reply.OK {
+		t.Fatalf("first transport punch: %+v", reply)
+	}
+	recv(t, host)
+	if reply := transportPunch(t, viewer, meetAddr, client, ticket, nonce, now.Unix()); !reply.OK {
+		t.Fatalf("retransmit from the same source was refused: %+v", reply)
+	}
+	recv(t, host)
+
+	attacker := listenUDP(t)
+	if reply := transportPunch(t, attacker, meetAddr, client, ticket, nonce, now.Unix()); reply.OK {
+		t.Fatalf("replayed punch from another source was accepted: %+v", reply)
+	}
+}
+
+// TestTCPPunchReplayRejected covers the same guard on the TCP coordination
+// path, where the peer is the accepted connection's remote address.
+func TestTCPPunchReplayRejected(t *testing.T) {
+	issuer := transportIssuer(t)
+	meet, reg, meetAddr, priv := startMeet(t,
+		WithServerKey("management-secret"),
+		WithTransportVerifier(punchTransportVerifier(t, issuer)),
+	)
+	reg.SetPolicy("devbox", true, 7)
+	keepalive(t, listenUDP(t), meetAddr, priv)
+
+	now := time.Now()
+	client := newTransportViewer(t)
+	ticket := mintPunchTicket(t, issuer, "devbox", acl.TransportAudiencePunch, client, 7, now)
+	nonce := "tcp-managed-replay1"
+	msg := wire.Message{
+		Type:           wire.TypeTCPPunch,
+		Role:           wire.RoleViewer,
+		HostID:         "devbox",
+		Nonce:          nonce,
+		Timestamp:      now.Unix(),
+		Transport:      ticket,
+		TransportProof: identity.Sign(client.priv, identity.TransportProofMessage(acl.TransportAudiencePunch, "devbox", nonce, now.Unix())),
+	}
+	p := &tcpPuncher{srv: meet}
+	if err := p.checkAnnounce(msg, "10.0.0.1:1000"); err != nil {
+		t.Fatalf("first TCP announce: %v", err)
+	}
+	if err := p.checkAnnounce(msg, "10.0.0.2:2000"); err == nil {
+		t.Fatal("TCP announce replayed from another peer was accepted")
+	}
+	if err := p.checkAnnounce(msg, "10.0.0.1:1000"); err != nil {
+		t.Fatalf("same-peer TCP retry was refused: %v", err)
+	}
+}
+
+// TestTransportPunchReplayCacheCapacity pins the fail-closed boundary: a full
+// cache refuses new proofs instead of evicting a live entry, and entries whose
+// ticket has expired are reclaimed on the next admission.
+func TestTransportPunchReplayCacheCapacity(t *testing.T) {
+	s := &Server{transportReplay: make(map[string]punchReplay)}
+	now := time.Now()
+	expiresAt := now.Add(time.Minute).Unix()
+	for i := 0; i < punchReplayCapacity; i++ {
+		id := strconv.Itoa(i)
+		if !s.admitTransportPunch(id, "nonce-"+id, now.Unix(), expiresAt, "10.0.0.1:1000", now) {
+			t.Fatalf("admission %d refused before the cache filled", i)
+		}
+	}
+	if s.admitTransportPunch("overflow", "nonce-overflow", now.Unix(), expiresAt, "10.0.0.1:1000", now) {
+		t.Fatal("a full replay cache admitted a new proof")
+	}
+	later := now.Add(2 * time.Minute)
+	if !s.admitTransportPunch("after-expiry", "nonce-after-expiry", later.Unix(),
+		later.Add(time.Minute).Unix(), "10.0.0.1:1000", later) {
+		t.Fatal("expired replay entries were not reclaimed")
 	}
 }

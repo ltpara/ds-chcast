@@ -221,11 +221,28 @@ func (s *server) syncRegistryPolicy(peerID string) {
 		s.cfg.Logger.Error("sync registry device policy", "id", peerID, "error", err)
 		return
 	}
+	// Read the previous admission mode before overwriting it, so a no-op
+	// policy edit does not contact the relay node.
+	host, live := s.cfg.Registry.Lookup(peerID)
+	wasManaged := live && host.Managed
 	if !managed {
 		s.cfg.Registry.SetPolicy(peerID, false, 0)
+	} else {
+		s.cfg.Registry.SetPolicy(peerID, true, policy.PolicyVersion)
+	}
+	// A standalone relay node enforces the flag on its own and only learns it
+	// from hbbs, so push the change to the live lease. The in-process relay
+	// reads the registry and needs no push.
+	if !live || host.RelayNode == "" || s.cfg.RelayPool == nil || wasManaged == managed {
 		return
 	}
-	s.cfg.Registry.SetPolicy(peerID, true, policy.PolicyVersion)
+	pool, node := s.cfg.RelayPool, host.RelayNode
+	go func() {
+		if err := pool.SetManaged(node, peerID, managed); err != nil {
+			s.cfg.Logger.Warn("relay node managed update failed; the next host registration retries",
+				"id", peerID, "node", node, "managed", managed, "error", err)
+		}
+	}()
 }
 
 // hostDevicePolicy is the policy statement a host receives on registration.

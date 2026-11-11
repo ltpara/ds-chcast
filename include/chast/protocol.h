@@ -54,7 +54,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 68;
+inline constexpr uint16_t kProtocolVersion = 69;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -471,6 +471,18 @@ enum class ControlType : uint16_t {
     // needed; admission already authorized the session. Sent at a throttled
     // rate while the viewer pointer moves.
     ShowCursor = 83,
+    // Host -> viewer (v69): the destination already holds an entry with the
+    // offer's name, so the offer is held until the viewer decides. Payload:
+    // transfer id (u32), flags (u8, bit0 = the existing file is identical in
+    // size and modification time), three reserved zero bytes, existing size
+    // (u64), existing modification time (u64, Unix seconds). Sent instead of
+    // FileAnswer; the host waits for FileConflictAnswer.
+    FileConflict = 84,
+    // Viewer -> host (v69): the decision for a held offer. Also answers the
+    // download direction after the viewer replied FileAnswer with
+    // FileCode::Conflict. Payload: transfer id (u32), decision (u8: 0 skip,
+    // 1 overwrite, 2 cancel), three reserved zero bytes.
+    FileConflictAnswer = 85,
 };
 
 // ----- input -----
@@ -768,6 +780,8 @@ inline constexpr uint8_t kFileOfferFlagResume = 0x01;
 inline constexpr uint8_t kFileOfferFlagClipboard = 0x02;
 inline constexpr uint8_t kFileOfferFlagsKnown =
     kFileOfferFlagResume | kFileOfferFlagClipboard;
+inline constexpr uint8_t kFileConflictFlagIdentical = 0x01;
+inline constexpr uint8_t kFileConflictFlagsKnown = kFileConflictFlagIdentical;
 
 enum class FileCode : uint8_t {
     Ok = 0,
@@ -777,6 +791,14 @@ enum class FileCode : uint8_t {
     DigestMismatch = 4,  // the received bytes do not hash to the offer
     IoError = 5,         // the host could not write or finalize the file
     Cancelled = 6,       // the viewer (or a permission change) cancelled
+    // The receiver deliberately skipped the file: a same-name target exists
+    // and the user (or a remembered choice) chose not to replace it. Not a
+    // failure, and no stream follows.
+    Skipped = 7,
+    // The receiver holds the offer pending a local overwrite decision. The
+    // sender must wait for FileConflictAnswer instead of treating it as a
+    // refusal. Only the viewer sends this, in the download direction.
+    Conflict = 8,
 };
 
 struct FileOffer {
@@ -790,6 +812,10 @@ struct FileOffer {
     // file name. Empty keeps the file at the root. The receiver sanitizes
     // each component before it creates anything.
     std::string relative_path;
+    // The sender's last-write time in Unix seconds, 0 when unknown (v69).
+    // The receiver compares it with the size to tell an identical file from
+    // a changed one and shows the hint in its overwrite prompt.
+    uint64_t modified_time = 0;
 };
 
 struct FileAnswer {
@@ -810,6 +836,28 @@ struct FileCancel {
     uint32_t transfer_id = 0;
     FileCode code = FileCode::Cancelled;
     std::string reason;
+};
+
+// A held offer whose destination already holds this name (v69). The receiver
+// states what it found so the sender's prompt can show it and hint when the
+// file is identical; it never decides by itself (RustDesk leaves the choice to
+// the user, with an optional remembered answer for the rest of the batch).
+struct FileConflict {
+    uint32_t transfer_id = 0;
+    bool identical = false;
+    uint64_t existing_size = 0;
+    uint64_t existing_modified_time = 0;  // Unix seconds, 0 when unknown
+};
+
+enum class FileConflictDecision : uint8_t {
+    Skip = 0,       // leave the existing file, drop this transfer
+    Overwrite = 1,  // replace the existing file
+    Cancel = 2,     // abort the prompt (the sender cancels the batch)
+};
+
+struct FileConflictAnswer {
+    uint32_t transfer_id = 0;
+    FileConflictDecision decision = FileConflictDecision::Skip;
 };
 
 // CFIL stream prefix. The bytes after it are raw file content starting at
@@ -965,7 +1013,9 @@ bool parse_file_op_result(const std::vector<uint8_t>& payload, FileOpResult& res
 // is. The sprite only rides along when its id changes; a position-only update
 // is 26 bytes.
 
-inline constexpr uint16_t kMaxCursorSize = 256;
+// The same 512 px bound RustDesk applies to decoded cursors: past it the
+// viewer's sprite handling costs more than any real pointer needs.
+inline constexpr uint16_t kMaxCursorSize = 512;
 
 struct CursorUpdate {
     // The host's pointer is on the captured output and should be drawn. False
@@ -2542,6 +2592,16 @@ bool parse_file_result(const std::vector<uint8_t>& payload, FileResult& result,
 std::vector<uint8_t> make_file_cancel(const FileCancel& cancel);
 bool parse_file_cancel(const std::vector<uint8_t>& payload, FileCancel& cancel,
                        std::string* error);
+// Same-name conflicts (v69). The host announces a held upload offer with
+// FileConflict; the download direction announces a held offer with
+// FileAnswer{FileCode::Conflict}. Either direction then sends
+// FileConflictAnswer with the viewer's decision.
+std::vector<uint8_t> make_file_conflict(const FileConflict& conflict);
+bool parse_file_conflict(const std::vector<uint8_t>& payload, FileConflict& conflict,
+                         std::string* error);
+std::vector<uint8_t> make_file_conflict_answer(const FileConflictAnswer& answer);
+bool parse_file_conflict_answer(const std::vector<uint8_t>& payload,
+                                FileConflictAnswer& answer, std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.

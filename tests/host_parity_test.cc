@@ -337,9 +337,12 @@ void clipboard_directions() {
         require(until([&] { return !(viewer->permissions() & kPermissionFileTransfer); }), "ordinary files revoked");
         require(!viewer->request_file_list(42, "").ok(), "browser stays disabled during clipboard transfer");
         if (clipboard_from_host(direction)) {
+            ClipboardContent content;
+            // The session opens with one sync of the host's current clipboard.
+            require(until([&] { return viewer->take_clipboard_content(content); }) && content.text() == "local-0",
+                    "opening clipboard sync carries the current host text");
             require(until([&] { return *reads >= 2; }), "outbound clipboard establishes a baseline");
             *revision = 1;
-            ClipboardContent content;
             require(until([&] { return viewer->take_clipboard_content(content); }) && content.text() == "local-1",
                     "permitted host text arrives after baseline");
             *revision = 2;

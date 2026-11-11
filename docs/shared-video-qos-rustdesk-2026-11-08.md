@@ -21,7 +21,7 @@
 | 生命周期 | 切屏保留连接的策略参与者，离开删除；最后连接离开重置策略。显示源销毁时清理对应计数 |
 | 编码器调用 | 只有显示服务线程应用聚合结果；连接自己的 `set_rate` 适配器只同步共享结果，不再覆盖其他用户的限制 |
 
-移除了桌面会话中独立的 `BitrateController` 调节路径，保留该类和原测试作为其他用途的纯逻辑工具。服务缓存已成功提交的目标，防止硬件码率取整后每个采集周期重复调用 `set_rate`。码率或 FPS 的实际变化通过 StreamInfo 通知所有观看者。回归过程中还修复了关键帧请求的异步重复：已有当前代次 IDR 等待该订阅消费时，不再重复安排编码，保持静止桌面不自行产生画面。
+移除了桌面会话中独立的 `BitrateController` 调节路径；该类、`tests/bitrate_test.cc` 与旧分辨率阶梯在 2026-11-11 一并删除，避免再被误认为现行行为。服务缓存已成功提交的目标，防止硬件码率取整后每个采集周期重复调用 `set_rate`。码率或 FPS 的实际变化通过 StreamInfo 通知所有观看者。回归过程中还修复了关键帧请求的异步重复：已有当前代次 IDR 等待该订阅消费时，不再重复安排编码，保持静止桌面不自行产生画面。
 
 v51 引入双向 LatencyProbe/Reply；客户端的时钟同步保留，主机测量不依赖客户端墙钟。当前协议进一步升为 **v52**，加入下面的视频取帧确认；主机与查看器须同步更新。因为 QUIC 回调不能阻塞，回复发送队列满时可丢弃；主机重发同一时间戳，保留首次探测的等待时间。发起探测也改成不等待发送容量；队列满时保留最初时间戳，不能把拥塞等待清零。
 
@@ -80,6 +80,17 @@ v51 引入双向 LatencyProbe/Reply；客户端的时钟同步保留，主机测
 - 2026-11-11 撤销刷新计入后的复测：`video_qos`、`desktop_stream`、`quic_weak_network` 定向 3/3 通过（`build/ctest-v67-repeat-revert-1.log`）；`chast-quic verify --netem` 直跑 2 次，496/492 个访问单元全部送达并解码，最低目标 1000 kbps、回升 1749 kbps、30 fps（`build/weak-abr-v67-revert-run1..2.log`）。本轮回升由持续的真实画面帧提供 `dynamic` 证据，刷新帧仍不计入；完全静止桌面不会仅凭刷新帧回升码率，与参考一致。撤销后全量 Release ctest 70/70 通过（917.55 秒，`build/ctest-v67-full-4.log`）。全队列饱和的桌面流基线仍等待队列高水位稳定后取样。
 - 2026-11-11 调价入口节奏对齐：`VideoQos::tick` 之前在每个服务 tick 都会进入 `adjust_ratio`；高延迟未确认的早退不更新 `last_ratio_`，动态计数因此约每 33 ms 被清零。现在周期入口增加 1 s 节流（完整调价仍保持 3 s 冷却），与 RustDesk 每秒一次的 `update_display_data` 一致。`video_qos` 新增确定性断言：先降比例制造余量，在 160 ms 超额延迟下逐 tick 送帧，1 s 后延迟恢复时必须带着累积的 `dynamic` 证据回升；去掉节流该断言即失败。`video_qos` 110 项通过（`build/video-qos-cadence.log`），`desktop_stream`/`quic_weak_network` 同轮定向 3/3 通过（`build/ctest-v67-cadence-1.log`）。全量构建还发现并修复 `tests/protocol_test.cc` 中 `preset_percent` 的重复定义（既有工作区编译错误），`protocol` 测试通过。节奏修复后的全量 Release ctest **70/70** 通过（946.63 秒，`build/ctest-v67-full-5.log`；2 项剪贴板监听测试按既有条件跳过），完整 `go test ./...` 同轮通过。
 - 边界：刷新画质/功耗收益只在真实 GPU 回环上验证了“可解码、继续取帧”，未做跨机画质对比；预算表来自 RustDesk 实测值，本机显卡不保证同样适用。
+
+## 2026-11-11：延迟样本与探测节奏对齐 TestDelay
+
+RustDesk 的 TestDelay 定时器每秒最多发一项探测（已有未完成探测时跳过），回复到达时调用 `user_network_delay`。策略的 2 样本延迟历史、20 样本 RTT 基线和 3 个坏回复的拥塞确认都以约 1 Hz 的样本为前提。本项目 `sample_link` 每 500 ms 运行一次，此前只要出现新的探测回复或视频确认就向 `QualityPeer::feedback` 送样本，最密可达 2 Hz；真实时间窗口因此缩短一半（降帧确认约 1.5 s 而非约 3 s，RTT 基线约 10 s 而非约 20 s）。
+
+现拆开统计与策略节奏：`sample_link` 仍每 500 ms 更新链路统计、发送队列满时的探测重试，并由 `VideoQos::pending` 按整秒桶处理未取帧超时；`next_qos_sample` 与 `next_qos_probe` 各自按 1 s 门控。只有采样到期且确有新回复时才消费 `qos_replies`/`video_replies` 并调用 `feedback`，待收帧年龄仍每 tick 送入（它不是回复样本）。静态桌面上旧的视频延迟依旧不会反复参与；没有新回复时也不会重复计入 RTT 样本。客户端每秒一次的主动探测与主机探测共享同一条控制流，`send_latency_probe` 对同一未完成时间戳仍保留 1 s 重试节流。
+
+验证（本机 Release）：
+- `chast-video-qos-test` 110 项通过；`chast-host-parity-test` 全量 0 失败，其中 `application_latency` 在 6 s 内取得至少 4 个探测回复并升帧，`video_backpressure` 在 7 s 内把待收年龄推过 2000 ms、降到 5 FPS，并在恢复消费后回到新 IDR 和更高 FPS。
+- `ctest -C Release -R "^(desktop_stream|video_qos|quic_weak_network)$"` 中 `video_qos` 与 `quic_weak_network` 通过；`desktop_stream` 在组合跑中一次指针/满队列断言失败，单独连续 3 次通过，属于该断言既有的在途编码时序竞态，与本次改动无关。
+- `chast-quic verify --netem` 三次通过：最低目标 1000 kbps、12 次码率变更、末尾恢复 30 fps，453/495/494 个访问单元全部送达并解码；峰值帧龄分别为 4733/1415/1708 ms（前两次留存日志 `build/weak-align-cadence-run1..2.log`），短时进程内中继场景的帧龄波动主要来自降码率确认期间的在途数据与关键帧突发。1 Hz 采样让 2 个坏回复的码率确认和 3 个坏回复的 FPS 确认回到参考的约 2 s/3 s，确认变慢是严格对齐参考时间常数的预期代价。
 
 ## 验证入口
 

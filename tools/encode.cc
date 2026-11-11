@@ -14,7 +14,7 @@
 //
 //   chast-encode [--display N] [--seconds S] [--codec h264|hevc] [--out file]
 //                [--encoder auto|vpl|ffmpeg|software] [--bitrate kbps]
-//                [--capture auto|dxgi|gdi]
+//                [--capture auto|dxgi|gdi] [--dump-input DIR]
 //                [--keyframe-interval MS] [--bitrate-switch MS:KBPS[:FPS]]
 //                [--quality RATIO] [--framerate F] [--no-hdr] [--no-cursor] [--quiet]
 //
@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,7 @@ struct Options {
     UINT change_framerate = 0;
     float quality = 0.67f;      // RustDesk Quality::Balanced
     UINT framerate = 30;
+    std::string dump_input_dir;  // one NV12 file per encoded picture, for quality metrics
     chast::CaptureConfig config;
     bool quiet = false;
 };
@@ -88,6 +90,8 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--out" && i + 1 < argc) {
                 options.out_path = argv[++i];
                 options.out_path_set = true;
+            } else if (arg == "--dump-input" && i + 1 < argc) {
+                options.dump_input_dir = argv[++i];
             } else if (arg == "--bitrate" && i + 1 < argc) {
                 options.bitrate_kbps = static_cast<UINT>(std::stoul(argv[++i]));
             } else if (arg == "--keyframe-interval" && i + 1 < argc) {
@@ -149,6 +153,74 @@ const char* codec_name(chast::VideoCodec codec) {
     return "unknown";
 }
 
+// Copies `texture` into a CPU-readable staging texture and leaves it mapped;
+// verification-only, the encode path itself never reads back pixels.
+bool stage_readback(ID3D11Device* device, ID3D11DeviceContext* context,
+                    ID3D11Texture2D* texture, chast::ComPtr<ID3D11Texture2D>& staging,
+                    D3D11_MAPPED_SUBRESOURCE& mapped, D3D11_TEXTURE2D_DESC& desc,
+                    std::string& error) {
+    texture->GetDesc(&desc);
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+    if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, staging.put()))) {
+        error = "staging texture creation failed";
+        return false;
+    }
+    context->CopyResource(staging.get(), texture);
+    if (FAILED(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "staging map failed";
+        return false;
+    }
+    return true;
+}
+
+// Writes one NV12 frame with the surface padding dropped, so the file is the
+// same planar NV12 layout chast-decode produces for comparison.
+bool save_nv12(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+               UINT width, UINT height, UINT surface_height, const std::string& path,
+               std::string& error) {
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_NV12) {
+        error = "only NV12 textures can be dumped as NV12";
+        return false;
+    }
+
+    chast::ComPtr<ID3D11Texture2D> staging;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (!stage_readback(device, context, texture, staging, mapped, desc, error)) {
+        return false;
+    }
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "wb") != 0 || !file) {
+        context->Unmap(staging.get(), 0);
+        error = "could not open " + path;
+        return false;
+    }
+    const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
+    for (UINT y = 0; y < height; ++y) {
+        fwrite(base + static_cast<size_t>(y) * mapped.RowPitch, 1, width, file);
+    }
+    const uint8_t* uv = base + static_cast<size_t>(surface_height) * mapped.RowPitch;
+    for (UINT y = 0; y < height / 2; ++y) {
+        fwrite(uv + static_cast<size_t>(y) * mapped.RowPitch, 1, width, file);
+    }
+    fclose(file);
+    context->Unmap(staging.get(), 0);
+    return true;
+}
+
+std::string input_dump_path(const std::string& dir, uint64_t index) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "input-%05llu.yuv",
+                  static_cast<unsigned long long>(index));
+    return (std::filesystem::path(dir) / name).string();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -159,6 +231,15 @@ int main(int argc, char** argv) {
     }
 
     std::string error;
+    if (!options.dump_input_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(options.dump_input_dir, ec);
+        if (ec) {
+            std::fprintf(stderr, "could not create %s: %s\n", options.dump_input_dir.c_str(),
+                         ec.message().c_str());
+            return 1;
+        }
+    }
     std::unique_ptr<chast::IDxgiCapturer> capturer =
         chast::create_capturer(options.display, options.config, &error);
     if (!capturer) {
@@ -214,6 +295,8 @@ int main(int argc, char** argv) {
     uint64_t repeats = 0;
     uint64_t timeouts = 0;
     uint64_t errors = 0;
+    uint64_t input_dumps = 0;
+    std::string dump_error;
     bool force_keyframe = true;  // the first frame is always an IDR
     bool bitrate_changed = false;
     bool have_input = false;
@@ -372,10 +455,12 @@ int main(int argc, char** argv) {
             std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
         packets.clear();
         chast::Error err = chast::Error::success();
+        bool used_repeat = false;
         if (!frame.nv12_updated && have_input) {
             err = encoder->encode_repeat(pts_ms, force_keyframe, packets);
             if (err.ok()) {
                 ++repeats;
+                used_repeat = true;
             } else if (err.status() == chast::Status::DeviceRemoved ||
                        err.status() == chast::Status::DeviceReset) {
                 // The device is gone; encode() would only hit it again.
@@ -408,6 +493,29 @@ int main(int argc, char** argv) {
                 force_keyframe = false;
             }
         }
+        if (!options.dump_input_dir.empty() && !packets.empty()) {
+            const std::string path = input_dump_path(options.dump_input_dir, input_dumps);
+            bool dumped = false;
+            if (used_repeat && input_dumps > 0) {
+                std::error_code ec;
+                std::filesystem::copy_file(
+                    input_dump_path(options.dump_input_dir, input_dumps - 1), path,
+                    std::filesystem::copy_options::overwrite_existing, ec);
+                dumped = !ec;
+                if (ec) {
+                    dump_error = ec.message();
+                }
+            } else {
+                dumped = save_nv12(frame.device, frame.context, frame.nv12_texture,
+                                   frame.nv12_width, frame.nv12_height,
+                                   frame.nv12_surface_height, path, dump_error);
+            }
+            if (dumped) {
+                ++input_dumps;
+            } else if (input_dumps == 0 && !options.quiet) {
+                std::fprintf(stderr, "input dump failed: %s\n", dump_error.c_str());
+            }
+        }
     }
 
     if (sink) {
@@ -417,7 +525,7 @@ int main(int argc, char** argv) {
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::printf("frames=%llu encoded=%llu keyframes=%llu errors=%llu pointer-only=%llu "
-                "repeats=%llu timeouts=%llu bytes=%llu kbps=%.0f fps=%.1f\n",
+                "repeats=%llu timeouts=%llu input-dump=%llu bytes=%llu kbps=%.0f fps=%.1f\n",
                 static_cast<unsigned long long>(frames),
                 static_cast<unsigned long long>(encoded),
                 static_cast<unsigned long long>(keyframes),
@@ -425,6 +533,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(pointer_only),
                 static_cast<unsigned long long>(repeats),
                 static_cast<unsigned long long>(timeouts),
+                static_cast<unsigned long long>(input_dumps),
                 static_cast<unsigned long long>(bytes),
                 elapsed > 0.0 ? static_cast<double>(bytes) * 8.0 / elapsed / 1000.0 : 0.0,
                 elapsed > 0.0 ? static_cast<double>(encoded) / elapsed : 0.0);

@@ -889,6 +889,11 @@ Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
 }
 
 void DxgiCapturer::pump_cursor(const DXGI_OUTDUPL_FRAME_INFO& info) {
+    // PointerPosition is only filled in on frames that carry a mouse update;
+    // on other frames it reads as zero and would mark a visible pointer hidden.
+    if (info.LastMouseUpdateTime.QuadPart == 0) {
+        return;
+    }
     if (info.PointerPosition.Visible) {
         cursor_decoder_.update_position(info.PointerPosition.Position, true);
     } else if (cursor_decoder_.has_position()) {
@@ -896,12 +901,7 @@ void DxgiCapturer::pump_cursor(const DXGI_OUTDUPL_FRAME_INFO& info) {
         // the pointer invisible.
         cursor_decoder_.update_position(cursor_decoder_.position(), false);
     }
-    // The shape arrives on the frame that reports a mouse update. Calling
-    // this unconditionally is also correct (DXGI answers "unchanged" with
-    // zero bytes) but costs a round trip per frame.
-    if (info.LastMouseUpdateTime.QuadPart != 0 || info.PointerPosition.Visible) {
-        cursor_decoder_.update_shape(duplication_.get());
-    }
+    cursor_decoder_.update_shape(duplication_.get());
 }
 
 void DxgiCapturer::publish_common(ID3D11Texture2D* texture, bool desktop_updated,

@@ -225,15 +225,24 @@ void test_nested_receiver(const std::filesystem::path& directory) {
 
     offset = 0;
     receiver = chast::FileReceiver::create(options, &offset, &error);
-    check(receiver != nullptr, "a second receiver accepts the same nested offer");
+    check(receiver == nullptr && error == "the destination already exists",
+          "a duplicate name is refused instead of being renamed silently");
+
+    chast::FileReceiveOptions replace = options;
+    replace.overwrite = true;
+    offset = 0;
+    receiver = chast::FileReceiver::create(replace, &offset, &error);
+    check(receiver != nullptr, "an overwrite receiver accepts the same nested offer");
     if (receiver) {
         check(receiver->write(reinterpret_cast<const uint8_t*>(content.data()),
                               content.size(), &error),
-              "the duplicate is written");
+              "the replacement is written");
         std::string final_path;
         check(receiver->finish(final_path, &error) &&
-                  std::filesystem::path(final_path).filename() == L"report (1).txt",
-              "a duplicate leaf inside the nested directory gets a unique name");
+                  std::filesystem::path(final_path) ==
+                      directory / "Trip" / "2024" / "report.txt" &&
+                  read_file(final_path) == content,
+              "the overwrite replaces the existing file in place");
     }
 
     options.name = "resume.txt";
@@ -281,6 +290,37 @@ void test_nested_receiver(const std::filesystem::path& directory) {
     offset = 0;
     receiver = chast::FileReceiver::create(crossing, &offset, &error);
     check(receiver == nullptr, "a directory component that is a file is refused");
+}
+
+void test_receive_target(const std::filesystem::path& directory) {
+    chast::FileReceiveOptions options;
+    options.directory = directory.string();
+    options.name = "probe.txt";
+    options.relative_path = "target-check";
+    options.size = 3;
+    chast::FileReceiveTarget target;
+    std::string error;
+    check(chast::inspect_receive_target(options, target, &error) && !target.exists,
+          "a missing destination is reported as free without creating anything");
+    check(!std::filesystem::exists(directory / "target-check"),
+          "inspecting a missing destination leaves the tree untouched");
+
+    std::error_code ignored;
+    std::filesystem::create_directories(directory / "target-check", ignored);
+    {
+        std::ofstream output(directory / "target-check" / "probe.txt", std::ios::binary);
+        output << "old";
+    }
+    check(chast::inspect_receive_target(options, target, &error) && target.exists &&
+              !target.directory && target.size == 3 && target.modified_time > 0,
+          "an existing destination reports its size and modification time for the prompt");
+    chast::FileReceiveOptions directory_options = options;
+    directory_options.relative_path.clear();
+    directory_options.name = "target-check";
+    target = chast::FileReceiveTarget{};
+    check(chast::inspect_receive_target(directory_options, target, &error) &&
+              target.exists && target.directory,
+          "an existing directory destination is reported as a directory");
 }
 
 void test_part_isolation(const std::filesystem::path& directory) {
@@ -702,6 +742,7 @@ int main() {
         test_sha256_file(directory);
         test_receiver(directory);
         test_nested_receiver(directory);
+        test_receive_target(directory);
         std::string directory_error;
         check(chast::create_receive_directory(directory.string(), "empty-tree/leaf", &directory_error) &&
                   std::filesystem::is_empty(directory / "empty-tree" / "leaf"),

@@ -151,14 +151,17 @@ void local_file_lifetime() {
     auto source = collected ? chast::make_local_clipboard_files(entries, paths, &error) : nullptr;
     check(source != nullptr, "copied file identities captured without reading bytes");
     if (source) {
+        check(source->Unchanged(0), "a freshly captured file still matches its announced identity");
         std::filesystem::rename(path, saved);
         { std::ofstream output(path, std::ios::binary); output << "new"; }
         std::vector<uint8_t> bytes;
         check(source->Read(0, 0, 3, bytes, &error) && std::string(bytes.begin(), bytes.end()) == "old",
               "replacing the path cannot make an old offer read the new file");
         { std::ofstream output(saved, std::ios::binary); output << "changed"; }
+        check(!source->Unchanged(0), "an in-place rewrite invalidates the announced index");
         check(!source->Read(0, 0, 3, bytes, &error) && bytes.empty(), "mutated copied file fails instead of returning mixed content");
         source->Cancel();
+        check(!source->Unchanged(0), "a cancelled source never serves a stale index");
         check(!source->Read(0, 0, 1, bytes, &error) && bytes.empty(), "cancelled source returns no bytes");
     }
     source.reset();

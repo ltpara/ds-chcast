@@ -58,8 +58,11 @@ void test_register_validation() {
     // A sprite that does not match its declared size is refused.
     EXPECT(!cursor.Register(2, 9, 8, 0, 0, pixels, &error));
     EXPECT(error.find("does not match") != std::string::npos);
-    // Bigger than the OS cursor cap is refused up front.
-    EXPECT(!cursor.Register(3, 300, 4, 0, 0, sprite(300, 4), &error));
+    // The cap is 512 px, matching the host's sprite limit; anything past it
+    // is refused up front.
+    EXPECT(cursor.Register(3, 300, 4, 0, 0, sprite(300, 4), &error));
+    EXPECT(cursor.Register(4, 512, 4, 0, 0, sprite(512, 4), &error));
+    EXPECT(!cursor.Register(5, 513, 4, 0, 0, sprite(513, 4), &error));
     // A repeated id is a no-op, not an error.
     EXPECT(cursor.Register(1, 8, 8, 0, 0, pixels, &error));
     EXPECT(!cursor.active());
@@ -105,11 +108,56 @@ void test_activate_and_cache() {
 void test_oversized_scale_shrinks() {
     chast_viewer::RemoteCursor cursor;
     std::string error;
-    EXPECT(cursor.Register(11, 200, 100, 0, 0, sprite(200, 100), &error));
-    // 4x would be 800 px wide, far past the icon cap; it shrinks instead of
-    // failing, so the pointer stays visible.
-    EXPECT(cursor.Activate(11, 4.0, &error));
+    EXPECT(cursor.Register(11, 300, 300, 0, 0, sprite(300, 300), &error));
+    // 2x would be 600 px wide. The quantiser would round a 1.70 fit up to
+    // 1.75 and still overflow, so the clamp works in whole percents: 170
+    // gives 510, which is the largest fit under the 512 px cap.
+    EXPECT(cursor.Activate(11, 2.0, &error));
     EXPECT(cursor.active());
+    HCURSOR handle = cursor.cursor();
+    EXPECT(handle != nullptr);
+    if (handle == nullptr) {
+        return;
+    }
+    ICONINFO info{};
+    EXPECT(GetIconInfo(handle, &info) != FALSE);
+    BITMAP color{};
+    EXPECT(info.hbmColor != nullptr && GetObject(info.hbmColor, sizeof(color), &color) > 0);
+    EXPECT(color.bmWidth == 510);
+    EXPECT(color.bmHeight == 510);
+    if (info.hbmColor) {
+        DeleteObject(info.hbmColor);
+    }
+    if (info.hbmMask) {
+        DeleteObject(info.hbmMask);
+    }
+}
+
+void test_largest_sprite_installs() {
+    chast_viewer::RemoteCursor cursor;
+    std::string error;
+    // The host's protocol cap is 512 px; a system cursor of that size must
+    // actually be buildable, or the extra range would be dead.
+    EXPECT(cursor.Register(31, 512, 512, 3, 5, sprite(512, 512), &error));
+    EXPECT(cursor.Activate(31, 1.0, &error));
+    HCURSOR handle = cursor.cursor();
+    EXPECT(handle != nullptr);
+    if (handle == nullptr) {
+        return;
+    }
+    ICONINFO info{};
+    EXPECT(GetIconInfo(handle, &info) != FALSE);
+    BITMAP color{};
+    EXPECT(info.hbmColor != nullptr && GetObject(info.hbmColor, sizeof(color), &color) > 0);
+    EXPECT(color.bmWidth == 512);
+    EXPECT(color.bmHeight == 512);
+    EXPECT(info.xHotspot == 3 && info.yHotspot == 5);
+    if (info.hbmColor) {
+        DeleteObject(info.hbmColor);
+    }
+    if (info.hbmMask) {
+        DeleteObject(info.hbmMask);
+    }
 }
 
 void test_clear_releases_and_resets() {
@@ -171,6 +219,7 @@ int main() {
     test_register_validation();
     test_activate_and_cache();
     test_oversized_scale_shrinks();
+    test_largest_sprite_installs();
     test_clear_releases_and_resets();
     test_shape_table_is_bounded();
     test_handle_matches_shape();

@@ -1984,6 +1984,15 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
             )
           : label;
     } else if (status.downloadPhase == ViewerFilePhase.done &&
+        status.downloadPath.isEmpty &&
+        status.downloadError.isNotEmpty) {
+      // A skipped download finishes without a file: the operator kept the
+      // existing one.
+      child = Text(
+        tr('已跳过，保留现有文件'),
+        style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+      );
+    } else if (status.downloadPhase == ViewerFilePhase.done &&
         status.downloadPath.isNotEmpty) {
       child = Row(
         children: <Widget>[

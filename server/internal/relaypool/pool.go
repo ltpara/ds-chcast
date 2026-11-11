@@ -378,6 +378,49 @@ func (p *Pool) requestLease(base string, body leaseRequest) (Lease, error) {
 	return lease, nil
 }
 
+// SetManaged updates the admission mode of a live lease on the node that holds
+// it, without renewing, moving or re-keying the lease. A policy assignment is
+// rare and must not wait for the host's next registration; only the managed
+// flag changes, so a concurrent re-registration's carrier token is never
+// overwritten by a stale copy. An unknown node or an expired lease is reported
+// and left to the next registration.
+func (p *Pool) SetManaged(nodeURL, id string, managed bool) error {
+	p.mu.Lock()
+	node := p.findLocked(nodeURL)
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return errors.New("relay pool is closed")
+	}
+	if node == nil {
+		return fmt.Errorf("relay node %q is not in the pool", nodeURL)
+	}
+	payload, err := json.Marshal(map[string]bool{"managed": managed})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		node.url+"/v1/leases/"+url.PathEscape(id)+"/managed", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.cfg.Key)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", node.url, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	default:
+		return fmt.Errorf("%s: %s", node.url, responseError(resp))
+	}
+}
+
 // Release drops a lease on the node it was provisioned from. It is best
 // effort: an unreachable node expires the lease on its own.
 func (p *Pool) Release(nodeURL, id string) {

@@ -13,6 +13,7 @@
 
 #include <d3d11.h>
 #include <windows.h>
+#include <imm.h>
 #include <wrl/client.h>
 #include <shlobj.h>
 
@@ -2349,11 +2350,754 @@ int multi_share_probe() {
     return success ? 0 : 1;
 }
 
+// Protocol v69: a destination that already holds the offered name is never
+// renamed silently. The viewer prompts, Skip keeps the existing file without
+// counting a failure, Overwrite replaces it, and Cancel drops the queue; a
+// remembered answer then covers both directions for the rest of the session.
+int file_conflict_probe() {
+    const uint64_t suffix =
+        (static_cast<uint64_t>(GetCurrentProcessId()) << 20) ^ GetTickCount64();
+    const fs::path work = fs::temp_directory_path() /
+                          ("chast-file-conflict-probe-" + std::to_string(suffix));
+    const fs::path receive = work / "receive";
+    const fs::path share = work / "share";
+    const fs::path staging = work / "staging";
+    const std::string upload_name = "clash-" + std::to_string(suffix) + ".txt";
+    const std::string download_name = "remote-" + std::to_string(suffix) + ".txt";
+    const std::string downloads_text = chast::default_receive_directory();
+    if (downloads_text.empty()) {
+        std::fprintf(stderr, "viewer-probe: the viewer has no download directory\n");
+        return 1;
+    }
+    const fs::path downloads = from_utf8(downloads_text);
+    ReceiveDirectoryGuard receive_guard(downloads);
+
+    std::string error;
+    if (!write_file(receive / "incoming" / upload_name, "host-old", &error) ||
+        !write_file(share / download_name, "host-remote", &error) ||
+        !write_file(downloads / download_name, "local-old", &error) ||
+        !write_file(staging / upload_name, "viewer-new", &error)) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        std::error_code ignored;
+        fs::remove_all(work, ignored);
+        return 1;
+    }
+
+    const uint16_t port = pick_free_port();
+    ProbeSink sink;
+    std::unique_ptr<chast::HostServer> host;
+    if (port == 0) {
+        error = "no free loopback port";
+    } else if (!sink.create(&error)) {
+        // keep the error
+    } else {
+        host = start_host(utf8(receive), port, &error, true, {}, {}, {},
+                          chast::ClipboardDirection::Both, {}, {},
+                          [&](chast::HostServerConfig& config) {
+                              config.settings.file_share_roots = {utf8(share)};
+                          });
+    }
+    std::unique_ptr<chast_viewer::ViewerEngine> engine;
+    if (host) {
+        engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+        engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
+        if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
+                           kPassword, {}, {}, false,
+                           chast_viewer::ViewerTransport::kAuto, {}, 0, {}, {},
+                           true)) {
+            error = "ViewerEngine::Start was refused";
+            engine.reset();
+        }
+    }
+
+    bool success = false;
+    if (engine && wait_streaming(*engine, 20s, &error) &&
+        wait_file_permission(*engine, 10s)) {
+        chast_viewer::ViewerEngine& viewer = *engine;
+        auto fail = [&](std::string message) {
+            error = std::move(message);
+            return false;
+        };
+        auto wait_conflict = [&](bool download, const std::string& name,
+                                 uint64_t existing_size, bool identical,
+                                 uint32_t* transfer_id) {
+            const auto deadline = std::chrono::steady_clock::now() + 20s;
+            for (;;) {
+                const chast_viewer::ViewerStatus status = viewer.Snapshot();
+                if (status.file_conflict_pending) {
+                    if (status.file_conflict_download != download ||
+                        status.file_conflict_name != name) {
+                        return fail("the prompt named '" + status.file_conflict_name +
+                                    "' (download " +
+                                    std::to_string(status.file_conflict_download) +
+                                    "), expected the " +
+                                    (download ? "download" : "upload") + " of " + name);
+                    }
+                    if (status.file_conflict_existing_size != existing_size) {
+                        return fail("the prompt reported an existing size of " +
+                                    std::to_string(status.file_conflict_existing_size) +
+                                    ", expected " + std::to_string(existing_size));
+                    }
+                    if (status.file_conflict_identical != identical) {
+                        return fail("the prompt reported identical=" +
+                                    std::to_string(status.file_conflict_identical));
+                    }
+                    if (status.file_conflict_transfer_id == 0) {
+                        return fail("the prompt carried no transfer id");
+                    }
+                    *transfer_id = status.file_conflict_transfer_id;
+                    return true;
+                }
+                if (status.state != chast_viewer::ViewerState::kStreaming) {
+                    return fail("the session ended while a conflict was expected");
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return fail("the conflict prompt for " + name + " did not appear");
+                }
+                std::this_thread::sleep_for(5ms);
+            }
+        };
+        // Waits for a success counter to advance; a failure counter moving
+        // instead is an error, and `prompted` records a prompt that should not
+        // have appeared under a remembered answer.
+        auto wait_progress = [&](uint64_t chast_viewer::ViewerStatus::*counter,
+                                 uint64_t before,
+                                 uint64_t chast_viewer::ViewerStatus::*failures,
+                                 const char* what, bool* prompted) {
+            const uint64_t failures_before = viewer.Snapshot().*failures;
+            const auto deadline = std::chrono::steady_clock::now() + 30s;
+            for (;;) {
+                const chast_viewer::ViewerStatus status = viewer.Snapshot();
+                if (status.*counter > before) {
+                    return true;
+                }
+                if (prompted && status.file_conflict_pending) {
+                    *prompted = true;
+                }
+                if (status.*failures != failures_before) {
+                    return fail(std::string(what) + " was counted as a failure");
+                }
+                if (status.state != chast_viewer::ViewerState::kStreaming) {
+                    return fail(std::string(what) + ": the session ended");
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return fail(std::string(what) + " did not finish");
+                }
+                std::this_thread::sleep_for(5ms);
+            }
+        };
+
+        bool ok = true;
+        std::string bytes;
+        uint32_t transfer_id = 0;
+        chast_viewer::ViewerStatus before = viewer.Snapshot();
+        do {
+            // 1. A host download whose name already exists locally prompts;
+            // Overwrite replaces the local file in place.
+            if (!viewer.RequestFileDownload("share/" + download_name)) {
+                ok = fail("RequestFileDownload(" + download_name + ") was refused");
+                break;
+            }
+            if (!wait_conflict(true, download_name, 9, false, &transfer_id)) {
+                ok = false;
+                break;
+            }
+            if (!viewer.AnswerFileConflict(chast::FileConflictDecision::Overwrite)) {
+                ok = fail("AnswerFileConflict(Overwrite) was refused");
+                break;
+            }
+            if (!wait_progress(&chast_viewer::ViewerStatus::files_received,
+                               before.files_received,
+                               &chast_viewer::ViewerStatus::file_receive_failures,
+                               "the overwritten download", nullptr)) {
+                ok = false;
+                break;
+            }
+            if (!read_file(downloads / download_name, &bytes, &error)) {
+                ok = false;
+                break;
+            }
+            if (bytes != "host-remote") {
+                ok = fail("the overwritten download did not replace the local file");
+                break;
+            }
+
+            // 2. Cancel releases the held offer and keeps the host's file.
+            before = viewer.Snapshot();
+            if (!viewer.SendFiles({utf8(staging / upload_name)}, "receive/incoming")) {
+                ok = fail("SendFiles(" + upload_name + ") was refused");
+                break;
+            }
+            if (!wait_conflict(false, upload_name, 8, false, &transfer_id)) {
+                ok = false;
+                break;
+            }
+            if (!viewer.AnswerFileConflict(chast::FileConflictDecision::Cancel)) {
+                ok = fail("AnswerFileConflict(Cancel) was refused");
+                break;
+            }
+            if (!wait_progress(&chast_viewer::ViewerStatus::file_cancels,
+                               before.file_cancels,
+                               &chast_viewer::ViewerStatus::file_failures,
+                               "the cancelled upload", nullptr)) {
+                ok = false;
+                break;
+            }
+            if (!read_file(receive / "incoming" / upload_name, &bytes, &error)) {
+                ok = false;
+                break;
+            }
+            if (bytes != "host-old") {
+                ok = fail("a cancelled upload changed the host's file");
+                break;
+            }
+
+            // 3. Skip keeps the host's file and is counted apart from failures.
+            before = viewer.Snapshot();
+            if (!viewer.SendFiles({utf8(staging / upload_name)}, "receive/incoming")) {
+                ok = fail("SendFiles(" + upload_name + ") was refused");
+                break;
+            }
+            if (!wait_conflict(false, upload_name, 8, false, &transfer_id)) {
+                ok = false;
+                break;
+            }
+            if (!viewer.AnswerFileConflict(chast::FileConflictDecision::Skip)) {
+                ok = fail("AnswerFileConflict(Skip) was refused");
+                break;
+            }
+            if (!wait_progress(&chast_viewer::ViewerStatus::files_skipped,
+                               before.files_skipped,
+                               &chast_viewer::ViewerStatus::file_failures,
+                               "the skipped upload", nullptr)) {
+                ok = false;
+                break;
+            }
+            if (!read_file(receive / "incoming" / upload_name, &bytes, &error)) {
+                ok = false;
+                break;
+            }
+            if (bytes != "host-old") {
+                ok = fail("a skipped upload changed the host's file");
+                break;
+            }
+            if (viewer.Snapshot().files_sent != before.files_sent) {
+                ok = fail("a skipped upload was counted as sent");
+                break;
+            }
+
+            // 4. Overwrite together with "remember" replaces the host's file
+            // and stores the policy on the viewer.
+            before = viewer.Snapshot();
+            if (!viewer.SendFiles({utf8(staging / upload_name)}, "receive/incoming")) {
+                ok = fail("SendFiles(" + upload_name + ") was refused");
+                break;
+            }
+            if (!wait_conflict(false, upload_name, 8, false, &transfer_id)) {
+                ok = false;
+                break;
+            }
+            if (!viewer.AnswerFileConflict(chast::FileConflictDecision::Overwrite, true)) {
+                ok = fail("AnswerFileConflict(Overwrite, remember) was refused");
+                break;
+            }
+            if (!wait_progress(&chast_viewer::ViewerStatus::files_sent, before.files_sent,
+                               &chast_viewer::ViewerStatus::file_failures,
+                               "the overwriting upload", nullptr)) {
+                ok = false;
+                break;
+            }
+            if (!read_file(receive / "incoming" / upload_name, &bytes, &error)) {
+                ok = false;
+                break;
+            }
+            if (bytes != "viewer-new") {
+                ok = fail("the overwriting upload did not replace the host's file");
+                break;
+            }
+            if (viewer.Snapshot().file_conflict_policy != 1) {
+                ok = fail("the remembered overwrite was not stored");
+                break;
+            }
+
+            // 5. The remembered answer covers the rest of the queue: the same
+            // name again finishes without a prompt.
+            before = viewer.Snapshot();
+            bool prompted = false;
+            if (!viewer.SendFiles({utf8(staging / upload_name)}, "receive/incoming")) {
+                ok = fail("SendFiles(" + upload_name + ") was refused");
+                break;
+            }
+            if (!wait_progress(&chast_viewer::ViewerStatus::files_sent, before.files_sent,
+                               &chast_viewer::ViewerStatus::file_failures,
+                               "the remembered overwrite upload", &prompted)) {
+                ok = false;
+                break;
+            }
+            if (prompted) {
+                ok = fail("a remembered answer still prompted for the next upload");
+                break;
+            }
+            if (!read_file(receive / "incoming" / upload_name, &bytes, &error)) {
+                ok = false;
+                break;
+            }
+            if (bytes != "viewer-new") {
+                ok = fail("the remembered upload changed the host's file");
+                break;
+            }
+
+            // 6. The same remembered answer applies to a download.
+            before = viewer.Snapshot();
+            prompted = false;
+            if (!viewer.RequestFileDownload("share/" + download_name)) {
+                ok = fail("the remembered RequestFileDownload was refused");
+                break;
+            }
+            if (!wait_progress(&chast_viewer::ViewerStatus::files_received,
+                               before.files_received,
+                               &chast_viewer::ViewerStatus::file_receive_failures,
+                               "the remembered overwrite download", &prompted)) {
+                ok = false;
+                break;
+            }
+            if (prompted) {
+                ok = fail("a remembered answer still prompted for a download");
+                break;
+            }
+            if (!read_file(downloads / download_name, &bytes, &error)) {
+                ok = false;
+                break;
+            }
+            if (bytes != "host-remote") {
+                ok = fail("the remembered download changed the local file");
+                break;
+            }
+        } while (false);
+
+        if (ok && error.empty()) {
+            std::printf(
+                "viewer-probe: file conflicts -> download prompt/overwrite, upload "
+                "cancel/skip/overwrite, remembered answer covers uploads and downloads\n");
+            success = true;
+        } else if (!error.empty()) {
+            std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        }
+    } else if (!error.empty()) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+    }
+    if (engine) {
+        engine->Stop();
+    }
+    if (host) {
+        host->stop();
+    }
+    std::error_code ignored;
+    fs::remove_all(work, ignored);
+    fs::remove(downloads / download_name, ignored);
+    return success ? 0 : 1;
+}
+
+// Keyboard acceptance against the real Windows input stack. The viewer-side
+// hook mapping is covered by keyboard_test; this probe covers the half that
+// needs a desktop: keys injected by the host session land in a real edit
+// control, and the host layout, the host IME or a Unicode commit decides the
+// text. The window belongs to this process and stays foreground for the run,
+// so no other application receives the injected keys.
+constexpr wchar_t kKeyboardClass[] = L"chast-keyboard-acceptance";
+
+struct KeyboardWindow {
+    HWND window = nullptr;
+    HWND edit = nullptr;
+};
+
+LRESULT CALLBACK keyboard_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_CLOSE) {
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+void pump_messages(std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    for (;;) {
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(2ms);
+    }
+}
+
+std::string to_utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    const int length = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                                           static_cast<int>(text.size()), nullptr, 0,
+                                           nullptr, nullptr);
+    std::string out(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        out.data(), length, nullptr, nullptr);
+    return out;
+}
+
+std::wstring edit_text(HWND edit) {
+    const int length = GetWindowTextLengthW(edit);
+    if (length <= 0) return {};
+    std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(edit, buffer.data(), length + 1);
+    return std::wstring(buffer.data(), static_cast<size_t>(length));
+}
+
+bool create_keyboard_window(KeyboardWindow& target, std::string* error) {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSEXW cls{};
+    cls.cbSize = sizeof(cls);
+    cls.lpfnWndProc = keyboard_window_proc;
+    cls.hInstance = instance;
+    cls.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
+    cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    cls.lpszClassName = kKeyboardClass;
+    if (!RegisterClassExW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        *error = "RegisterClassEx failed with " + std::to_string(GetLastError());
+        return false;
+    }
+    target.window = CreateWindowExW(
+        WS_EX_TOPMOST, kKeyboardClass, L"chast keyboard acceptance", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 720, 260, nullptr, nullptr, instance, nullptr);
+    if (!target.window) {
+        *error = "CreateWindowEx failed with " + std::to_string(GetLastError());
+        return false;
+    }
+    target.edit = CreateWindowExW(
+        0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
+                               WS_VSCROLL | ES_LEFT | WS_TABSTOP,
+        0, 0, 0, 0, target.window, nullptr, instance, nullptr);
+    if (!target.edit) {
+        *error = "creating the edit control failed with " +
+                 std::to_string(GetLastError());
+        return false;
+    }
+    RECT client{};
+    GetClientRect(target.window, &client);
+    MoveWindow(target.edit, 0, 0, client.right, client.bottom, TRUE);
+    ShowWindow(target.window, SW_SHOW);
+    UpdateWindow(target.window);
+    SetFocus(target.edit);
+    pump_messages(120ms);
+    return true;
+}
+
+void destroy_keyboard_window(KeyboardWindow& target) {
+    if (target.window) DestroyWindow(target.window);
+    target = KeyboardWindow{};
+    pump_messages(50ms);
+}
+
+// SetForegroundWindow is refused when the caller is not the foreground
+// process; attaching to the current foreground thread is the standard escape.
+// The window stays topmost for the run so nothing can cover it, and every key
+// is sent only after this check passes.
+bool ensure_keyboard_foreground(const KeyboardWindow& target) {
+    if (GetForegroundWindow() != target.window) {
+        const HWND foreground = GetForegroundWindow();
+        const DWORD foreground_thread =
+            foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+        const DWORD own_thread = GetCurrentThreadId();
+        const bool attached =
+            foreground_thread != 0 && foreground_thread != own_thread;
+        if (attached) AttachThreadInput(own_thread, foreground_thread, TRUE);
+        BringWindowToTop(target.window);
+        SetForegroundWindow(target.window);
+        SetFocus(target.edit);
+        if (attached) AttachThreadInput(own_thread, foreground_thread, FALSE);
+        pump_messages(40ms);
+    }
+    return GetForegroundWindow() == target.window && GetFocus() == target.edit;
+}
+
+// The injector compares this bitmap with the host's own lock state and taps a
+// lock key when they disagree, so reporting the real state keeps the operator's
+// Caps/Num/Scroll untouched during the run.
+uint16_t current_locks() {
+    uint16_t bits = 0;
+    if ((GetKeyState(VK_CAPITAL) & 1) != 0) bits |= chast::kLockCaps;
+    if ((GetKeyState(VK_NUMLOCK) & 1) != 0) bits |= chast::kLockNum;
+    if ((GetKeyState(VK_SCROLL) & 1) != 0) bits |= chast::kLockScroll;
+    return bits;
+}
+
+bool send_probe_key(chast_viewer::ViewerEngine& viewer, uint16_t usage, bool down,
+                    uint16_t modifiers) {
+    chast::InputEvent event;
+    event.kind = chast::InputKind::Key;
+    event.key.action = down ? chast::KeyAction::Down : chast::KeyAction::Up;
+    event.key.hid_usage = usage;
+    event.modifiers = modifiers;
+    return viewer.SendInput(event);
+}
+
+bool send_legacy_key(chast_viewer::ViewerEngine& viewer, uint16_t virtual_key,
+                     bool down, uint16_t modifiers) {
+    chast::InputEvent event;
+    event.kind = chast::InputKind::LegacyKey;
+    event.legacy_key.action = down ? chast::KeyAction::Down : chast::KeyAction::Up;
+    event.legacy_key.virtual_key = virtual_key;
+    event.modifiers = modifiers;
+    return viewer.SendInput(event);
+}
+
+bool pump_until_text(HWND edit, const std::wstring& expected,
+                     std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        pump_messages(10ms);
+        if (edit_text(edit) == expected) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+    }
+}
+
+bool type_usage(chast_viewer::ViewerEngine& viewer, uint16_t usage,
+                uint16_t held, uint16_t locks) {
+    if (!send_probe_key(viewer, usage, true, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, usage, false, held | locks)) return false;
+    pump_messages(25ms);
+    return true;
+}
+
+bool type_shifted(chast_viewer::ViewerEngine& viewer, uint16_t usage,
+                  uint16_t locks) {
+    const uint16_t held = chast::kModifierLeftShift;
+    if (!send_probe_key(viewer, 0xE1, true, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, usage, true, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, usage, false, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, 0xE1, false, locks)) return false;
+    pump_messages(25ms);
+    return true;
+}
+
+bool type_altgr(chast_viewer::ViewerEngine& viewer, uint16_t usage,
+                uint16_t locks) {
+    const uint16_t held = chast::kModifierRightAlt;
+    if (!send_probe_key(viewer, 0xE6, true, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, usage, true, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, usage, false, held | locks)) return false;
+    pump_messages(25ms);
+    if (!send_probe_key(viewer, 0xE6, false, locks)) return false;
+    pump_messages(25ms);
+    return true;
+}
+
+bool activate_keyboard_layout(HKL layout, std::string* error) {
+    if (layout == nullptr || ActivateKeyboardLayout(layout, 0) == nullptr) {
+        *error = "ActivateKeyboardLayout failed with " +
+                 std::to_string(GetLastError());
+        return false;
+    }
+    pump_messages(120ms);
+    return true;
+}
+
+// Chooses an installed Chinese IME layout and opens it in native (Chinese)
+// mode. Returns the layout, or null with `error` set when none is installed.
+HKL prepare_host_ime(KeyboardWindow& target, std::string* error) {
+    HKL ime = nullptr;
+    for (const wchar_t* id : {L"00000804", L"E0080804", L"E0200804"}) {
+        const HKL candidate = LoadKeyboardLayoutW(id, 0);
+        if (candidate != nullptr && ImmIsIME(candidate)) {
+            ime = candidate;
+            break;
+        }
+    }
+    if (ime == nullptr) {
+        *error = "no Chinese IME layout is installed";
+        return nullptr;
+    }
+    if (!activate_keyboard_layout(ime, error)) return nullptr;
+    ImmAssociateContextEx(target.edit, nullptr, IACE_DEFAULT);
+    const HIMC context = ImmGetContext(target.edit);
+    if (context == nullptr) {
+        *error = "the edit control has no IME context";
+        return nullptr;
+    }
+    ImmSetOpenStatus(context, TRUE);
+    ImmSetConversionStatus(context, IME_CMODE_NATIVE, IME_SMODE_NONE);
+    ImmReleaseContext(target.edit, context);
+    pump_messages(120ms);
+    return ime;
+}
+
+int keyboard_probe() {
+    // main() returns before its own CoInitializeEx for the single-purpose
+    // probes; the host and the IME can touch COM, so initialize here too.
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    KeyboardWindow window;
+    std::string error;
+    if (!create_keyboard_window(window, &error)) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        return 1;
+    }
+    const uint16_t port = pick_free_port();
+    ProbeSink sink;
+    std::unique_ptr<chast::HostServer> host;
+    if (port == 0) {
+        error = "no free loopback port";
+    } else if (!sink.create(&error)) {
+        // keep the error
+    } else {
+        // A real desktop session with input: the host injects into the
+        // foreground edit control below. No shared folder is involved.
+        host = start_host({}, port, &error);
+    }
+    std::unique_ptr<chast_viewer::ViewerEngine> engine;
+    if (host) {
+        engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+        engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
+        if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
+                           kPassword, {}, {}, false,
+                           chast_viewer::ViewerTransport::kAuto, {}, 0, {}, {},
+                           false)) {
+            error = "ViewerEngine::Start was refused";
+            engine.reset();
+        }
+    }
+
+    bool success = false;
+    bool ime_tested = false;
+    if (engine && wait_streaming(*engine, 20s, &error) &&
+        wait_permission(*engine, chast::kPermissionInput, 10s)) {
+        chast_viewer::ViewerEngine& viewer = *engine;
+        auto fail = [&](std::string message) {
+            error = std::move(message);
+            return false;
+        };
+        auto type_text = [&](const std::wstring& expected, const char* what,
+                             const std::function<bool()>& type) {
+            SetWindowTextW(window.edit, L"");
+            pump_messages(30ms);
+            if (!ensure_keyboard_foreground(window)) {
+                return fail(std::string("the acceptance window could not take the foreground for ") +
+                            what);
+            }
+            if (!type()) return fail(std::string("an input event was refused for ") + what);
+            if (!pump_until_text(window.edit, expected, 3s)) {
+                return fail(std::string(what) + " produced '" +
+                            to_utf8(edit_text(window.edit)) + "', expected '" +
+                            to_utf8(expected) + "'");
+            }
+            return true;
+        };
+
+        do {
+            // 1. US layout: physical positions produce the US text.
+            HKL us = LoadKeyboardLayoutW(L"00000409", 0);
+            if (us == nullptr || !activate_keyboard_layout(us, &error)) {
+                fail("the US layout could not be activated");
+                break;
+            }
+            if (!type_text(L"Chast1", "US layout text", [&] {
+                    return type_shifted(viewer, 0x06, current_locks()) &&  // C
+                           type_usage(viewer, 0x0B, 0, current_locks()) &&  // H
+                           type_usage(viewer, 0x04, 0, current_locks()) &&  // A
+                           type_usage(viewer, 0x16, 0, current_locks()) &&  // S
+                           type_usage(viewer, 0x17, 0, current_locks()) &&  // T
+                           type_usage(viewer, 0x1E, 0, current_locks());    // 1
+                })) {
+                break;
+            }
+
+            // 2. German layout: the same physical positions now follow the
+            // host layout (QWERTZ), Shift+7 becomes '/', AltGr+Q becomes '@'.
+            HKL german = LoadKeyboardLayoutW(L"00000407", 0);
+            if (german == nullptr || !activate_keyboard_layout(german, &error)) {
+                fail("the German layout could not be activated");
+                break;
+            }
+            if (!type_text(L"zy/@", "German layout text", [&] {
+                    return type_usage(viewer, 0x1C, 0, current_locks()) &&  // Y position -> z
+                           type_usage(viewer, 0x1D, 0, current_locks()) &&  // Z position -> y
+                           type_shifted(viewer, 0x24, current_locks()) &&   // Shift+7 -> /
+                           type_altgr(viewer, 0x14, current_locks());       // AltGr+Q -> @
+                })) {
+                break;
+            }
+
+            // 3. Legacy mode sends the named key: VK_Y is the letter Y even
+            // though the physical US-Y position is Z on this layout.
+            if (!type_text(L"y", "legacy virtual-key text", [&] {
+                    return send_legacy_key(viewer, 'Y', true, current_locks()) &&
+                           (pump_messages(25ms), true) &&
+                           send_legacy_key(viewer, 'Y', false, current_locks()) &&
+                           (pump_messages(25ms), true);
+                })) {
+                break;
+            }
+
+            // 4. Unicode commit (the local-IME mode's wire message) does not
+            // depend on the host layout at all.
+            if (!type_text(L"直接提交文字", "Unicode text commit", [&] {
+                    return viewer.SendText("直接提交文字");
+                })) {
+                break;
+            }
+
+            // 5. Host IME: physical keys feed Microsoft Pinyin and space
+            // commits the first candidate.
+            HKL ime = prepare_host_ime(window, &error);
+            if (ime != nullptr) {
+                ime_tested = true;
+                if (!type_text(L"你好", "host IME composition", [&] {
+                        return type_usage(viewer, 0x11, 0, current_locks()) &&  // N
+                               type_usage(viewer, 0x0C, 0, current_locks()) &&  // I
+                               type_usage(viewer, 0x0B, 0, current_locks()) &&  // H
+                               type_usage(viewer, 0x04, 0, current_locks()) &&  // A
+                               type_usage(viewer, 0x12, 0, current_locks()) &&  // O
+                               type_usage(viewer, 0x2C, 0, current_locks());    // Space
+                    })) {
+                    break;
+                }
+            } else {
+                std::fprintf(stderr, "viewer-probe: IME check skipped: %s\n",
+                             error.c_str());
+                error.clear();
+            }
+
+            std::printf(
+                "viewer-probe: keyboard -> US layout text, German layout text "
+                "(physical positions, Shift and AltGr), legacy VK_Y, Unicode "
+                "commit%s\n",
+                ime_tested ? ", host Pinyin composition" : " (IME unavailable)");
+            success = true;
+        } while (false);
+        if (!success && !error.empty()) {
+            std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        }
+    } else if (!error.empty()) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+    }
+    if (engine) engine->Stop();
+    if (host) host->stop();
+    destroy_keyboard_window(window);
+    return success ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--elevation") return elevation_probe();
     if (argc == 2 && std::string(argv[1]) == "--clipboard-native") return native_clipboard_probe();
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
     if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();
+    if (argc == 2 && std::string(argv[1]) == "--file-conflict") return file_conflict_probe();
+    if (argc == 2 && std::string(argv[1]) == "--keyboard") return keyboard_probe();
     bool files_only = false;
     bool file_pages = false;
     bool file_transfer_denied = false;
@@ -2378,7 +3122,8 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: chast-viewer-probe [--files-only | --file-pages | --files-only-denied | "
-                         "--clipboard-files | --clipboard-files-up] [--clipboard-empty]\n");
+                         "--clipboard-files | --clipboard-files-up | --file-conflict | --keyboard] "
+                         "[--clipboard-empty]\n");
             return 2;
         }
     }

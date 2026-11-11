@@ -274,7 +274,7 @@ add_library(chast.clipboard STATIC
     src/clipboard/clipboard_listener.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32 ole32 uuid shlwapi)
+target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32 ole32 uuid shlwapi zstd::libzstd)
 
 # Receive-side file handling: name sanitizing, resumable .part files, digest
 # verification. The receiver side only; the viewer hashes what it sends through
@@ -313,7 +313,6 @@ add_library(chast.host STATIC
     src/capture/camera.cc
     src/capture/camera_capturer.cc
     src/host/audit_spool.cc
-    src/host/bitrate_controller.cc
     src/host/camera_relay.cc
     src/host/display_privacy.cc
     src/host/desktop_stream.cc
@@ -464,7 +463,7 @@ if(CHAST_BUILD_TESTS)
     target_compile_definitions(chast-viewer-probe PRIVATE NOMINMAX)
     # avformat only backs the engine's local recording, as in the runner.
     target_link_libraries(chast-viewer-probe PRIVATE chast.host d3d11 dxgi
-        "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
+        "${FFMPEG_ROOT}/lib/avformat.lib" secur32 imm32)
     add_custom_command(TARGET chast-viewer-probe POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-viewer-probe>
@@ -667,11 +666,6 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-ticket-lease-test tests/host_ticket_lease_test.cc)
     target_link_libraries(chast-host-ticket-lease-test PRIVATE chast.host)
 
-    # Adaptive bitrate policy: pure logic, driven by synthetic transport
-    # samples.
-    add_executable(chast-bitrate-test tests/bitrate_test.cc)
-    target_link_libraries(chast-bitrate-test PRIVATE chast.host)
-
     # AAC encode/decode round trip: no device, no network.
     add_executable(chast-audio-codec-test tests/audio_codec_test.cc)
     target_link_libraries(chast-audio-codec-test PRIVATE chast.audio)
@@ -781,7 +775,6 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_ticket_lease PROPERTIES TIMEOUT 120)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)
-    add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
     add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
     add_test(NAME audio_playout COMMAND chast-audio-playout-test)
@@ -893,6 +886,12 @@ if(CHAST_BUILD_TESTS)
     # must be gone once the session ends.
     add_test(NAME viewer_clipboard_files_up COMMAND chast-viewer-probe --clipboard-files-up)
     set_tests_properties(viewer_clipboard_files_up PROPERTIES TIMEOUT 120)
+    # Protocol v69 file conflicts: an existing destination is never renamed
+    # silently. The viewer prompts for both directions, Skip keeps the
+    # existing file apart from failures, Overwrite replaces it, Cancel drops
+    # the queue, and one remembered answer covers uploads and downloads.
+    add_test(NAME viewer_file_conflict COMMAND chast-viewer-probe --file-conflict)
+    set_tests_properties(viewer_file_conflict PROPERTIES TIMEOUT 180)
     # The FFmpeg backend serves the adapters oneVPL does not cover and is the
     # second attempt on Intel. Pin it to exercise its D3D11VA frame pool, rate
     # programming and replay path instead of Auto's oneVPL choice.

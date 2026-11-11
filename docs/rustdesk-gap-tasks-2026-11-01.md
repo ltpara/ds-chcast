@@ -1495,9 +1495,11 @@ u16 权限掩码在 `kPermissionRemoteConfig = 0x8000` 之后已经没有空闲�
   分层、点击穿透、不激活、不进 Alt+Tab 的覆盖层，按虚拟桌面边界夹取坐标
   后绘制本地指针；断线、会话结束和覆盖层销毁都会隐藏，坐标永不进入注入器。
   查看端工具栏新增按设备保存的开关，指针移动按 33 ms 节流发送，关闭或离开
-  会话发送隐藏提示。自动化：`chast-protocol-test` 的往返/负坐标/隐藏/截断/
-  尾随/未知标志/保留位用例；`flutter analyze` 无问题；`display_menu` 与
-  `view_prefs` 定向 57/57。边界：RustDesk 式白板绘制未实现；覆盖层在真实
+  会话发送隐藏提示；独立显示器窗口复用同一偏好、节流和帧→桌面坐标映射，
+  关闭或偏好切到关闭时发送隐藏。自动化：`chast-protocol-test` 的往返/负坐标/
+  隐藏/截断/尾随/未知标志/保留位用例；`display_window_preferences_test` 断言
+  独立显示器窗口的精确桌面坐标、离开隐藏和偏好关闭后停发；`flutter analyze`
+  无问题；`display_menu` 与 `view_prefs` 定向 57/57。边界：RustDesk 式白板绘制未实现；覆盖层在真实
   多屏、混合 DPI 和负坐标下的目视位置，以及 Windows 10 实机，待人工验证。
 - **G22 主机语音麦克风选择**：`host.ini` 新增 `voice_microphone=`（空表示
   跟随系统默认通信麦克风）。安全设置“高级”页新增下拉与刷新，托盘新增

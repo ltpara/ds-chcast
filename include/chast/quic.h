@@ -1324,6 +1324,26 @@ public:
     // Sender: tells the receiver to drop the transfer and its partial file.
     // The local stream is aborted through cancel_file_upload().
     Error send_file_cancel(uint32_t transfer_id, FileCode code, const std::string& reason);
+    // Host only: the held offer's name already exists, so the offer waits for
+    // the viewer to decide. Sent instead of send_file_answer(); the answer
+    // arrives through take_file_conflict_answer(). The offer stays in
+    // incoming_file_offers, unreserved by timeouts, until the caller answers
+    // it through send_file_answer().
+    Error send_file_conflict(const FileConflict& conflict);
+    // Viewer only: pops the oldest held-offer announcement.
+    bool take_file_conflict(FileConflict& conflict);
+    // Viewer only: sends the decision for a held offer, in both directions.
+    // In the upload direction this answers the host's announcement; in the
+    // download direction it follows the FileAnswer with FileCode::Conflict.
+    Error send_file_conflict_answer(const FileConflictAnswer& answer);
+    // Host only: pops the oldest decision. The caller then either starts the
+    // transfer (send_file_answer Ok in the upload direction, stream start in
+    // the download direction), sends FileAnswer{Skipped}, or cancels.
+    bool take_file_conflict_answer(FileConflictAnswer& answer);
+    // Host only: accepts a held download after the viewer's overwrite
+    // decision. No FileAnswer{Ok} follows in that direction, so the offer
+    // must be marked accepted here before its stream can start.
+    Error accept_held_download(uint32_t transfer_id);
 
     // ----- shared-folder browsing -----
     //

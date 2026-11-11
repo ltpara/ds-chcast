@@ -653,6 +653,11 @@ private:
     }
     std::chrono::milliseconds clipboard_poll_interval() const;
     void cancel_clipboard_work();
+    // Drops the announced ".chast-clipboard/<index>" whitelist together with
+    // the capture that backs it, so a later request cannot resolve an old
+    // index against another copy. Callers clear the channel first when the
+    // local clipboard itself changed.
+    void clear_clipboard_file_share();
     void remember_local_clipboard();
     void apply_peer_clipboard(ClipboardContent content, HostServerStats& stats);
     void drain_peer(HostServerStats& stats);
@@ -846,6 +851,12 @@ private:
         uint64_t size = 0;
         uint64_t sent = 0;
         uint64_t resume_offset = 0;
+        // The file's last-write time in Unix seconds, read while hashing. The
+        // viewer's conflict prompt uses it for its identical-file hint.
+        uint64_t modified_time = 0;
+        // The viewer answered FileAnswer{Conflict}: the offer waits for a
+        // FileConflictAnswer and the ordinary offer timeout does not apply.
+        bool conflict_pending = false;
         std::array<uint8_t, 32> digest{};
         std::chrono::steady_clock::time_point answer_time;
         // A stream write can fail because the viewer cancelled: its reset
@@ -880,6 +891,10 @@ private:
     mutable std::mutex clipboard_files_mutex_;
     std::vector<std::string> clipboard_file_paths_;
     std::vector<ClipboardFileEntry> clipboard_file_entries_;
+    // The capture that produced the announced list. Cancelled when the
+    // clipboard is cleared or replaced, so a delayed download request cannot
+    // serve another copy's file under an old index.
+    std::shared_ptr<ClipboardVirtualFiles> clipboard_file_source_;
     uint64_t last_file_identity_ = 0;
     uint64_t last_file_source_version_ = 0;
     uint64_t last_peer_clipboard_seq_ = 0;
@@ -928,6 +943,15 @@ private:
     // clipboard and suppresses the echo the next local poll would see.
     void finish_clipboard_incoming(HostServerStats& stats);
     void drain_file_offers(HostServerStats& stats);
+    // Applies every viewer decision that arrived for a held offer, in either
+    // direction, and starts or ends the transfer it belongs to.
+    void drain_file_conflicts(HostServerStats& stats);
+    void answer_held_upload(const FileConflictAnswer& answer, HostServerStats& stats);
+    void answer_held_download(const FileConflictAnswer& answer, HostServerStats& stats);
+    // Opens the local file and moves the offer into the streaming stage. Used
+    // by an Ok FileAnswer and by an Overwrite decision.
+    void start_file_send(uint32_t transfer_id, uint64_t resume_offset,
+                         HostServerStats& stats);
     void drain_file_data(HostServerStats& stats);
     void drain_file_cancel(HostServerStats& stats);
     void drain_file_browse(HostServerStats& stats);
@@ -964,6 +988,15 @@ private:
     };
 
     std::unique_ptr<ActiveUpload> upload_;
+    // A viewer upload whose destination already holds the name (v69). The
+    // host creates nothing and answers nothing until the viewer decides; so
+    // no timeout runs while a person is looking at the prompt.
+    struct HeldUpload {
+        FileOffer offer;
+        std::string root;
+        std::string relative;
+    };
+    std::unique_ptr<HeldUpload> held_upload_;
     std::string file_receive_directory_;
     // Browse roots for this session. Empty keeps the receive directory as the
     // only root; otherwise the top level lists the receive directory (when it
@@ -1004,6 +1037,11 @@ private:
     std::shared_ptr<ClipboardVirtualFiles> pending_virtual_files_;
     uint64_t clipboard_epoch_ = 0;
     bool clipboard_baseline_pending_ = true;
+    // One-shot: after the opening baseline is recorded, send it once so the
+    // viewer starts with the host's current item instead of waiting for its
+    // first change (the baseline exists only to suppress stale history on
+    // later reads).
+    bool clipboard_initial_send_ = false;
     bool clipboard_write_pending_ = false;
     bool clipboard_write_inflight_ = false;
     bool clipboard_write_is_files_ = false;

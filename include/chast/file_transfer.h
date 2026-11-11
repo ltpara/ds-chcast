@@ -59,14 +59,35 @@ struct FileReceiveOptions {
     std::array<uint8_t, 32> sha256{};
     // Honour an existing .part + sidecar for the same offer.
     bool allow_resume = false;
+    // Replace an existing file at the destination. The receiver never renames
+    // around a conflict on its own; the caller resolves it first.
+    bool overwrite = false;
 };
+
+// What already holds an offer's destination name. The receiver inspects the
+// target before answering so it can ask its user instead of renaming silently.
+struct FileReceiveTarget {
+    bool exists = false;
+    bool directory = false;
+    uint64_t size = 0;
+    uint64_t modified_time = 0;  // Unix seconds, 0 when unknown
+};
+
+// Reports whether the offer's sanitized destination already exists below its
+// receive directory. Nothing is created and no reparse point is followed; a
+// missing directory chain means the destination does not exist yet. Returns
+// false with `error` only when the name, path or directory is unusable.
+bool inspect_receive_target(const FileReceiveOptions& options, FileReceiveTarget& target,
+                            std::string* error);
 
 class FileReceiver {
 public:
     // Opens the receive directory and prepares the .part file. On success
     // `resume_offset` is the byte the sender should start at. Returns nullptr
-    // with `error` for an unusable name, insufficient disk space, a reparse
-    // point or a file-system failure.
+    // with `error` when the destination already exists and
+    // `options.overwrite` is false, when it is a directory, or for an
+    // unusable name, insufficient disk space, a reparse point or a
+    // file-system failure.
     static std::unique_ptr<FileReceiver> create(const FileReceiveOptions& options,
                                                 uint64_t* resume_offset, std::string* error);
     ~FileReceiver();
@@ -89,7 +110,7 @@ public:
 
     uint64_t received() const;
     uint64_t size() const;
-    // Sanitized name without the uniqueness suffix.
+    // Sanitized name the file is written as.
     const std::string& name() const;
 
 private:

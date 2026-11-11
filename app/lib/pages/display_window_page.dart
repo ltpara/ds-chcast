@@ -48,6 +48,12 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   bool _keyboardChanging = false;
   ViewFit _fit = ViewFit.adaptive;
   MouseMapping _mouseMapping = const MouseMapping();
+  // Same per-device preference as the session window: the hint is draw-only,
+  // so it keeps working while remote control is off.
+  bool _showMyCursor = false;
+  bool _cursorHintOnHost = false;
+  int _cursorHintSentMs = 0;
+  static const int _cursorHintIntervalMs = 33;
   final Map<int, int> _remoteButtons = <int, int>{};
   String _error = '';
   double _wheelX = 0, _wheelY = 0;
@@ -73,6 +79,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
       swapButtons: prefs.swapButtons,
     );
     _keyboardMode = viewerKeyboardModeFromName(prefs.keyboardMode);
+    _showMyCursor = prefs.showMyCursor;
     ViewerBridge.setKeyboardTextRejectedHandler(() {
       if (mounted && !_closing) {
         setState(() => _error = tr('文字未发送，请检查控制权限或连接状态'));
@@ -159,12 +166,14 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   void _reloadPreferences() {
     if (!mounted || _closing) return;
     final prefs = ViewPreferences.load(peerId: widget.peerId);
+    if (_showMyCursor && !prefs.showMyCursor) _hideCursorHint();
     setState(() {
       _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
       _mouseMapping = MouseMapping(
         reverseWheel: prefs.reverseWheel,
         swapButtons: prefs.swapButtons,
       );
+      _showMyCursor = prefs.showMyCursor;
     });
     final mode = viewerKeyboardModeFromName(prefs.keyboardMode);
     if (mode != _keyboardMode) {
@@ -242,6 +251,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     _timer?.cancel();
     _syncCapture();
     _release();
+    // The main session keeps running after this window closes, so clear the
+    // host-side viewer pointer instead of leaving a stale hint behind.
+    _hideCursorHint();
     // Native Shutdown also detaches synchronously if the window X destroys
     // this engine before Dart cleanup can finish.
     try {
@@ -262,6 +274,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     _focus.dispose();
     unawaited(_quiet(ViewerBridge.setKeyCapture(false)));
     _release();
+    _hideCursorHint();
     unawaited(_quiet(_displays.close().whenComplete(_displays.dispose)));
     super.dispose();
   }
@@ -314,6 +327,24 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
       width: s.sourceWidth > 0 ? s.sourceWidth : s.width,
       height: s.sourceHeight > 0 ? s.sourceHeight : s.height,
     );
+  }
+
+  void _onCursorHint(Offset frame) {
+    if (!_showMyCursor || _texture == null) return;
+    final (int x, int y) = _point(frame);
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (_cursorHintOnHost && now - _cursorHintSentMs < _cursorHintIntervalMs) {
+      return;
+    }
+    _cursorHintSentMs = now;
+    _cursorHintOnHost = true;
+    unawaited(ViewerBridge.showCursor(x: x, y: y, visible: true));
+  }
+
+  void _hideCursorHint() {
+    if (!_cursorHintOnHost) return;
+    _cursorHintOnHost = false;
+    unawaited(ViewerBridge.showCursor(x: 0, y: 0, visible: false));
   }
 
   void _move(Offset p, int buttons) {
@@ -541,6 +572,8 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           onGesture: _gesture,
                           onDevicePointer: _device,
                           onDeviceCancel: _device,
+                          onCursorHint: _onCursorHint,
+                          onCursorHintExit: _hideCursorHint,
                         );
                       },
                     ),

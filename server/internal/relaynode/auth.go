@@ -86,8 +86,9 @@ func (a *Authenticator) Lookup(id string) (LeaseInfo, bool) {
 
 // Put creates or renews a lease for an already allocated port. Reusing a live
 // id with a different key is refused; an expired id may be bound to a new key.
-// The managed flag is recomputed by hbbs on every renewal, so a device policy
-// assignment reaches the node within one host registration TTL.
+// The managed flag is recomputed by hbbs on every renewal, and a policy change
+// between renewals arrives through SetManaged instead of waiting for the host's
+// next registration.
 func (a *Authenticator) Put(id, pubText, token string, managed bool, port int, ttl time.Duration) (LeaseInfo, error) {
 	pub, err := identity.ParsePublicKey(pubText)
 	if err != nil {
@@ -119,6 +120,22 @@ func (a *Authenticator) Remove(id string) bool {
 	_, ok := a.leases[id]
 	delete(a.leases, id)
 	return ok
+}
+
+// SetManaged flips the admission mode of a live lease without touching its
+// key, token or expiry. hbbs calls it when a device policy assignment changes
+// so the node stops trusting the legacy carrier token before the host's next
+// registration. It reports false when no live lease exists: the next
+// registration provisions one with the current policy.
+func (a *Authenticator) SetManaged(id string, managed bool) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	entry := a.liveLocked(id, a.now())
+	if entry == nil {
+		return false
+	}
+	entry.managed = managed
+	return true
 }
 
 // Prune forgets expired leases and returns their ids so the caller can release

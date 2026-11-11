@@ -121,6 +121,106 @@ func TestEmergencyAccessViewerReachesRestrictedDevice(t *testing.T) {
 	assertRoundTrip(t, viewer, ModeDirect)
 }
 
+// TestEmergencyAccessRenewsTicketWithoutRelay proves the agent renews an
+// override on a direct session, where neither relay auth nor the viewer
+// account keeps the lease alive. The credential is forced into the refresh
+// window and the loop runs with a short interval so the test does not sleep
+// for the production 30 seconds.
+func TestEmergencyAccessRenewsTicketWithoutRelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issuer := transportTestIssuer(t)
+	s := testutil.StartWith(t, testutil.Options{AccessIssuer: issuer})
+	if _, err := s.Accounts.CreateUser("rootadmin", "correct horse"); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	_, adminToken, _, err := s.Accounts.Login("rootadmin", "correct horse")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if _, err := s.Accounts.SetDevicePolicy("devbox", account.DevicePolicyRestricted, 6,
+		[]string{"alice"}, nil, "root"); err != nil {
+		t.Fatalf("device policy: %v", err)
+	}
+	echo := startEcho(t)
+	host, err := StartHost(ctx, HostConfig{
+		ServerURL:   s.URL,
+		ServerKey:   testutil.ServerKey,
+		ID:          "devbox",
+		Key:         "host-secret",
+		Fingerprint: "AB12",
+		LocalAddr:   echo.LocalAddr().String(),
+		ListenAddr:  "127.0.0.1:0",
+		Keepalive:   300 * time.Millisecond,
+		Logger:      quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start host agent: %v", err)
+	}
+	t.Cleanup(host.Close)
+	readyCtx, readyCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := host.WaitReady(readyCtx); err != nil {
+		readyCancel()
+		t.Fatalf("host agent readiness: %v", err)
+	}
+	readyCancel()
+
+	clientPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	renewed := make(chan AccessTicket, 2)
+	viewer, err := StartViewer(ctx, ViewerConfig{
+		ServerURL:     s.URL,
+		ServerKey:     testutil.ServerKey,
+		HostID:        "devbox",
+		ListenAddr:    "127.0.0.1:0",
+		Mode:          ModeDirect,
+		DirectTimeout: 2 * time.Second,
+		Logger:        quietLogger(),
+		Emergency: &EmergencyAccess{
+			AdminToken:      adminToken,
+			ClientPublicKey: base64.RawURLEncoding.EncodeToString(clientPub),
+			Reason:          "incident 4711: console unreachable",
+		},
+		OnAccessTicket: func(ticket AccessTicket) { renewed <- ticket },
+	})
+	if err != nil {
+		t.Fatalf("start emergency viewer: %v", err)
+	}
+	t.Cleanup(viewer.Close)
+	first := viewer.AccessTicket()
+	if first == nil || first.Ticket == "" {
+		t.Fatal("emergency viewer received no initial access ticket")
+	}
+	if viewer.transportPunch == nil {
+		t.Fatal("emergency viewer received no punch credential")
+	}
+
+	viewer.transportMu.Lock()
+	viewer.transportPunch.ExpiresAtMS = time.Now().Add(-time.Second).UnixMilli()
+	viewer.transportMu.Unlock()
+	go viewer.credentialRefreshLoop(20 * time.Millisecond)
+
+	select {
+	case ticket := <-renewed:
+		if ticket.Ticket == first.Ticket {
+			t.Fatal("refresh reused the initial ticket instead of signing a new one")
+		}
+		if ticket.ExpiresAtMS <= first.ExpiresAtMS {
+			t.Fatalf("renewed expiry %d does not extend %d", ticket.ExpiresAtMS, first.ExpiresAtMS)
+		}
+		if ticket.Subject != first.Subject {
+			t.Fatalf("renewed subject %q differs from %q", ticket.Subject, first.Subject)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct emergency session did not renew its ticket")
+	}
+}
+
 // TestEmergencyAccessNeedsAdminCredentialAndReason pins the client-side
 // validation: the tunnel refuses a partial override instead of silently
 // falling back to an ordinary lookup the device will reject.

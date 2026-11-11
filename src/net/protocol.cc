@@ -4478,7 +4478,7 @@ bool parse_stream_options_result(const std::vector<uint8_t>& payload,
 namespace {
 
 bool parse_file_code(uint8_t raw, FileCode& code, std::string* error) {
-    if (raw > static_cast<uint8_t>(FileCode::Cancelled)) {
+    if (raw > static_cast<uint8_t>(FileCode::Conflict)) {
         set_error(error, "unknown file result code " + std::to_string(raw));
         return false;
     }
@@ -4576,7 +4576,7 @@ std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
         // honest instead of truncating a UTF-8 byte sequence in half.
         relative.clear();
     }
-    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size() + 2 + relative.size());
+    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size() + 2 + relative.size() + 8);
     uint8_t* cursor = payload.data();
     put_u32(cursor, offer.transfer_id);
     put_u64(cursor, offer.size);
@@ -4592,7 +4592,9 @@ std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
     put_u16(cursor, static_cast<uint16_t>(relative.size()));
     if (!relative.empty()) {
         std::memcpy(cursor, relative.data(), relative.size());
+        cursor += relative.size();
     }
+    put_u64(cursor, offer.modified_time);
     return make_control(ControlType::FileOffer, payload);
 }
 
@@ -4628,16 +4630,24 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
         return false;
     }
     offer.relative_path.clear();
+    offer.modified_time = 0;
     if (!reader.at_end()) {
         // v22 appends the directory. A missing tail is a v21-style root
         // offer; peers still have to agree on the version in the handshake.
         uint16_t relative_size = 0;
         if (!reader.u16(relative_size) ||
-            !reader.string(offer.relative_path, relative_size) || !reader.at_end()) {
+            !reader.string(offer.relative_path, relative_size)) {
             set_error(error, "FileOffer relative path overruns the message");
             return false;
         }
         if (!parse_file_relative_path(offer.relative_path, error)) {
+            return false;
+        }
+    }
+    if (!reader.at_end()) {
+        // v69 appends the sender's last-write time.
+        if (!reader.u64(offer.modified_time) || !reader.at_end()) {
+            set_error(error, "FileOffer modification time overruns the message");
             return false;
         }
     }
@@ -4781,6 +4791,93 @@ bool parse_file_cancel(const std::vector<uint8_t>& payload, FileCancel& cancel,
         return false;
     }
     return parse_file_reason(cancel.reason, kMaxFileReasonBytes, "FileCancel", error);
+}
+
+std::vector<uint8_t> make_file_conflict(const FileConflict& conflict) {
+    if (conflict.transfer_id == 0 || conflict.existing_size > kMaxFileTransferBytes) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 1 + 3 + 8 + 8);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, conflict.transfer_id);
+    put_u8(cursor, conflict.identical ? kFileConflictFlagIdentical : 0);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u64(cursor, conflict.existing_size);
+    put_u64(cursor, conflict.existing_modified_time);
+    return make_control(ControlType::FileConflict, payload);
+}
+
+bool parse_file_conflict(const std::vector<uint8_t>& payload, FileConflict& conflict,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t flags = 0;
+    uint8_t reserved[3] = {0, 0, 0};
+    if (!reader.u32(conflict.transfer_id) || !reader.u8(flags) ||
+        !reader.raw(reserved, sizeof(reserved)) || !reader.u64(conflict.existing_size) ||
+        !reader.u64(conflict.existing_modified_time) || !reader.at_end()) {
+        set_error(error, "malformed FileConflict");
+        return false;
+    }
+    if (conflict.transfer_id == 0) {
+        set_error(error, "FileConflict carries no transfer id");
+        return false;
+    }
+    if ((flags & ~kFileConflictFlagsKnown) != 0) {
+        set_error(error, "FileConflict carries unknown flags");
+        return false;
+    }
+    if (reserved[0] != 0 || reserved[1] != 0 || reserved[2] != 0) {
+        set_error(error, "FileConflict reserved bytes are not zero");
+        return false;
+    }
+    conflict.identical = (flags & kFileConflictFlagIdentical) != 0;
+    if (conflict.existing_size > kMaxFileTransferBytes) {
+        set_error(error, "FileConflict size is past the protocol limit");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_conflict_answer(const FileConflictAnswer& answer) {
+    if (answer.transfer_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 1 + 3);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, answer.transfer_id);
+    put_u8(cursor, static_cast<uint8_t>(answer.decision));
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    return make_control(ControlType::FileConflictAnswer, payload);
+}
+
+bool parse_file_conflict_answer(const std::vector<uint8_t>& payload,
+                                FileConflictAnswer& answer, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_decision = 0;
+    uint8_t reserved[3] = {0, 0, 0};
+    if (!reader.u32(answer.transfer_id) || !reader.u8(raw_decision) ||
+        !reader.raw(reserved, sizeof(reserved)) || !reader.at_end()) {
+        set_error(error, "malformed FileConflictAnswer");
+        return false;
+    }
+    if (answer.transfer_id == 0) {
+        set_error(error, "FileConflictAnswer carries no transfer id");
+        return false;
+    }
+    if (raw_decision > static_cast<uint8_t>(FileConflictDecision::Cancel)) {
+        set_error(error, "FileConflictAnswer carries an unknown decision");
+        return false;
+    }
+    if (reserved[0] != 0 || reserved[1] != 0 || reserved[2] != 0) {
+        set_error(error, "FileConflictAnswer reserved bytes are not zero");
+        return false;
+    }
+    answer.decision = static_cast<FileConflictDecision>(raw_decision);
+    return true;
 }
 
 void encode_file_stream_header(const FileStreamHeader& header,

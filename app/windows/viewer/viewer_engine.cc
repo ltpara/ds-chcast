@@ -1137,6 +1137,26 @@ void ViewerEngine::CancelDownload() {
     download_cancel_.store(true);
 }
 
+bool ViewerEngine::AnswerFileConflict(chast::FileConflictDecision decision,
+                                      bool remember) {
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        if (conflicts_.empty()) {
+            return false;
+        }
+        ConflictAnswer answer;
+        answer.transfer_id = conflicts_.front().transfer_id;
+        answer.decision = decision;
+        // Cancel ends the queue, so there is nothing left to remember.
+        answer.remember = remember && decision != chast::FileConflictDecision::Cancel;
+        conflict_answers_.push_back(answer);
+    }
+    // The file worker wakes for the same condition; the session loop polls the
+    // answer queue on its next pass.
+    file_work_cv_.notify_all();
+    return true;
+}
+
 bool ViewerEngine::TakeFileList(FileListAnswer& answer) {
     std::lock_guard<std::mutex> lock(browse_mutex_);
     if (!newest_file_list_) {
@@ -1212,6 +1232,24 @@ void ViewerEngine::FileWorker() {
                 ok = false;
                 error = "the file exceeds the protocol's 16 GiB limit";
             }
+            // The host compares this with the destination's stamp to tell an
+            // identical file from a stale one, so it must be read after the
+            // hash proves the bytes.
+            uint64_t modified_time = 0;
+            if (ok) {
+                std::error_code stamp_error;
+                const auto stamp =
+                    std::filesystem::last_write_time(path_from_utf8(job.path), stamp_error);
+                if (!stamp_error) {
+                    const auto seconds =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::clock_cast<std::chrono::system_clock>(stamp)
+                                .time_since_epoch());
+                    if (seconds.count() > 0) {
+                        modified_time = static_cast<uint64_t>(seconds.count());
+                    }
+                }
+            }
             lock.lock();
             if (upload_epoch_ != epoch) {
                 // A purge cleared the ordinary entries this result belonged to,
@@ -1237,6 +1275,7 @@ void ViewerEngine::FileWorker() {
                 }
                 if (ok) {
                     upload.size = size;
+                    upload.modified_time = modified_time;
                     upload.digest = digest;
                     upload.stage = FileUpload::Stage::kReady;
                     std::fprintf(stderr, "viewer: %s is %llu bytes\n",
@@ -2177,9 +2216,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
     uint64_t file_cancels = 0;
+    uint64_t files_skipped = 0;
     uint64_t files_received = 0;
     uint64_t file_receive_failures = 0;
     uint64_t download_cancels = 0;
+    uint64_t downloads_skipped = 0;
+    uint64_t file_conflicts = 0;
     // A finished transfer is queued here so the page reports it even if its
     // poll missed the moment. Clipboard staging is excluded: the host does not
     // audit it either, and the two sides must agree on the same file set.
@@ -2534,9 +2576,27 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.files_sent = files_sent;
             status_.file_failures = file_failures;
             status_.file_cancels = file_cancels;
+            status_.files_skipped = files_skipped;
             status_.files_received = files_received;
             status_.file_receive_failures = file_receive_failures;
             status_.download_cancels = download_cancels;
+            status_.downloads_skipped = downloads_skipped;
+            status_.file_conflicts = file_conflicts;
+            {
+                std::lock_guard<std::mutex> file_lock(file_mutex_);
+                status_.file_conflict_pending = !conflicts_.empty();
+                status_.file_conflict_policy = conflict_policy_;
+                if (!conflicts_.empty()) {
+                    const PendingFileConflict& conflict = conflicts_.front();
+                    status_.file_conflict_download = conflict.download;
+                    status_.file_conflict_transfer_id = conflict.transfer_id;
+                    status_.file_conflict_name = conflict.name;
+                    status_.file_conflict_size = conflict.size;
+                    status_.file_conflict_identical = conflict.identical;
+                    status_.file_conflict_existing_size = conflict.existing_size;
+                    status_.file_conflict_existing_time = conflict.existing_modified_time;
+                }
+            }
             {
                 std::lock_guard<std::mutex> file_lock(file_mutex_);
                 status_.download_cancellable = download_.cancellable;
@@ -2551,6 +2611,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         break;
                     case FileDownload::Stage::kReceiving:
                         status_.download_phase = FilePhase::kSending;
+                        break;
+                    case FileDownload::Stage::kConflict:
+                        status_.download_phase = FilePhase::kConflict;
                         break;
                     case FileDownload::Stage::kDone:
                         status_.download_phase = FilePhase::kDone;
@@ -2584,6 +2647,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         case FileUpload::Stage::kReady:
                         case FileUpload::Stage::kOffered:
                             status_.file_phase = FilePhase::kOffered;
+                            for (const PendingFileConflict& conflict : conflicts_) {
+                                if (!conflict.download &&
+                                    conflict.transfer_id == current.transfer_id) {
+                                    status_.file_phase = FilePhase::kConflict;
+                                    break;
+                                }
+                            }
                             break;
                         case FileUpload::Stage::kSending:
                         case FileUpload::Stage::kFinishing:
@@ -3447,6 +3517,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // and remembered so the next poll cannot echo it back.
                 bool clipboard_was_allowed = false;
                 bool clipboard_baseline_pending = true;
+                // A failed first observation still records a later baseline,
+                // but that baseline is pre-session history and must not feed
+                // the one-shot opening send below.
+                bool clipboard_baseline_failed = false;
+                // One-shot opening sync: the baseline read is sent once so the
+                // host starts with the viewer's current item, then later polls
+                // keep the change-only semantics.
+                bool clipboard_initial_send = false;
+                bool clipboard_initial_files = false;
                 uint64_t clipboard_sync_version = clipboard_sync_version_.load();
                 uint64_t clipboard_epoch = 0;
                 uint64_t clipboard_hash = 0;
@@ -3713,9 +3792,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     chast::ClipboardContent current = std::move(clipboard_snapshot->content);
                     clipboard_snapshot.reset();
                     const uint64_t hash = chast::clipboard_content_hash(current);
-                    if (hash == clipboard_hash) {
+                    if (hash == clipboard_hash && !clipboard_initial_send) {
                         return;
                     }
+                    clipboard_initial_send = false;
                     // Remember content that cannot go on the wire too, so the
                     // same oversized item is not retried every 500 ms.
                     clipboard_hash = hash;
@@ -3914,6 +3994,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto purge_uploads = [&](const std::string& message,
                                          bool cancelled = false) {
                     uint32_t active_id = 0;
+                    uint32_t held_offer = 0;
                     std::string name;
                     size_t dropped = 0;
                     {
@@ -3921,6 +4002,18 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         // A folder walk or hash still in flight must not
                         // repopulate the queue after the purge.
                         ++upload_epoch_;
+                        // A held upload prompt leaves with the queue it
+                        // belongs to; the host has to learn the offer ended.
+                        for (auto it = conflicts_.begin(); it != conflicts_.end();) {
+                            if (it->download) {
+                                ++it;
+                                continue;
+                            }
+                            if (held_offer == 0) {
+                                held_offer = it->transfer_id;
+                            }
+                            it = conflicts_.erase(it);
+                        }
                         bool reported = false;
                         for (auto it = uploads_.begin(); it != uploads_.end();) {
                             if (it->clipboard) {
@@ -3967,6 +4060,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         file_stream.close();
                         session->cancel_file_upload(active_id);
                     }
+                    if (held_offer != 0) {
+                        chast::FileConflictAnswer release;
+                        release.transfer_id = held_offer;
+                        release.decision = chast::FileConflictDecision::Cancel;
+                        (void)session->send_file_conflict_answer(release);
+                    }
                     if (!name.empty()) {
                         std::fprintf(stderr,
                                      "viewer: file %s failed: %s (%zu queued entries "
@@ -4001,6 +4100,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         cancel_clipboard_work();
                         clipboard_was_allowed = true;
                         clipboard_baseline_pending = true;
+                        clipboard_baseline_failed = false;
+                        clipboard_initial_send = false;
+                        clipboard_initial_files = false;
                         clipboard_hash = 0;
                         clipboard_out_identity = 0;
                         next_clipboard_poll = now;
@@ -4008,6 +4110,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     chast::ClipboardWorker::Result result;
                     if (clipboard_worker_->Take(result) && result.epoch == clipboard_epoch) {
                         if (result.operation == chast::ClipboardWorker::Operation::Read) {
+                            if (!pending_clipboard.active &&
+                                result.snapshot.state == chast::ClipboardReadState::Failed &&
+                                clipboard_baseline_pending) {
+                                clipboard_baseline_failed = true;
+                            }
                             if (!pending_clipboard.active && result.snapshot.state != chast::ClipboardReadState::Failed) {
                                 clipboard_has_files = result.snapshot.has_files;
                                 if (clipboard_baseline_pending) {
@@ -4017,15 +4124,22 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     clipboard_out_identity = clipboard_has_files
                                         ? chast::clipboard_file_identity_hash(result.snapshot.entries) : 0;
                                     clipboard_source_version = result.snapshot.local_files ? result.snapshot.local_files->SourceVersion() : 0;
-                                } else {
-                                    clipboard_snapshot = std::move(result.snapshot);
+                                    clipboard_initial_files = !clipboard_baseline_failed &&
+                                        clipboard_has_files && !result.snapshot.entries.empty();
+                                    clipboard_initial_send = !clipboard_baseline_failed &&
+                                        !clipboard_has_files && !result.snapshot.content.empty();
+                                    clipboard_baseline_failed = false;
                                 }
+                                clipboard_snapshot = std::move(result.snapshot);
                             }
                             next_clipboard_poll = now + clipboard_poll_interval;
                         } else if (pending_clipboard.active) {
                             pending_clipboard.inflight = false;
                             if (result.written) {
                                 clipboard_baseline_pending = false;
+                                clipboard_baseline_failed = false;
+                                clipboard_initial_send = false;
+                                clipboard_initial_files = false;
                                 ++clipboard_received;
                                 if (pending_clipboard.files) {
                                     clipboard_received_formats = 1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
@@ -4082,7 +4196,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     clipboard_snapshot.reset();
                     const uint64_t identity = chast::clipboard_file_identity_hash(entries);
                     const auto source_version = local_files ? local_files->SourceVersion() : 0;
-                    if (identity == 0 || (identity == clipboard_out_identity &&
+                    const bool initial_files = clipboard_initial_files;
+                    clipboard_initial_files = false;
+                    if (identity == 0 || (!initial_files && identity == clipboard_out_identity &&
                         (!clipboard_source_version || source_version == clipboard_source_version))) {
                         return;
                     }
@@ -4158,6 +4274,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // the last outcome visible after the queue drains.
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
+                        // A prompt whose offer was purged (cancel, revocation)
+                        // has nobody left to answer it.
+                        std::erase_if(conflicts_, [&](const PendingFileConflict& conflict) {
+                            return !conflict.download &&
+                                   (uploads_.empty() ||
+                                    uploads_.front().transfer_id != conflict.transfer_id);
+                        });
                         while (!uploads_.empty()) {
                             const FileUpload::Stage stage = uploads_.front().stage;
                             if (stage != FileUpload::Stage::kDone &&
@@ -4165,12 +4288,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 break;
                             }
                             const bool success = stage == FileUpload::Stage::kDone;
-                            if (!success) {
+                            const bool skipped = success && uploads_.front().skipped;
+                            if (skipped) {
+                                ++files_skipped;
+                            } else if (!success) {
                                 ++file_failures;
                             } else {
                                 ++files_sent;
                             }
-                            if (!uploads_.front().clipboard) {
+                            if (!uploads_.front().clipboard && !skipped) {
+                                // The host writes no audit record for a kept
+                                // file either, so the two sets stay aligned.
                                 record_completed_file(true, uploads_.front().name,
                                                       uploads_.front().size, success,
                                                       uploads_.front().error);
@@ -4262,6 +4390,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         chast::FileOffer offer;
                         offer.transfer_id = snapshot.transfer_id;
                         offer.size = snapshot.size;
+                        offer.modified_time = snapshot.modified_time;
                         offer.resume = true;
                         offer.sha256 = snapshot.digest;
                         offer.name = snapshot.name;
@@ -4286,10 +4415,91 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         return;
                     }
                     if (snapshot.stage == FileUpload::Stage::kOffered) {
+                        chast::FileConflict conflict;
+                        while (session->take_file_conflict(conflict)) {
+                            if (conflict.transfer_id != snapshot.transfer_id) {
+                                continue;
+                            }
+                            // The host found the destination name already in
+                            // use and holds the offer for a decision. A
+                            // remembered choice answers at once; otherwise the
+                            // prompt waits for AnswerFileConflict().
+                            int policy = 0;
+                            bool already_asked = false;
+                            {
+                                std::lock_guard<std::mutex> lock(file_mutex_);
+                                policy = conflict_policy_;
+                                for (const PendingFileConflict& pending : conflicts_) {
+                                    if (!pending.download &&
+                                        pending.transfer_id == conflict.transfer_id) {
+                                        already_asked = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (policy == 0 && !already_asked) {
+                                PendingFileConflict pending;
+                                pending.download = false;
+                                pending.transfer_id = conflict.transfer_id;
+                                pending.name = snapshot.name;
+                                pending.size = snapshot.size;
+                                pending.identical = conflict.identical;
+                                pending.existing_size = conflict.existing_size;
+                                pending.existing_modified_time =
+                                    conflict.existing_modified_time;
+                                {
+                                    std::lock_guard<std::mutex> lock(file_mutex_);
+                                    conflicts_.push_back(std::move(pending));
+                                }
+                                ++file_conflicts;
+                                std::fprintf(stderr,
+                                             "viewer: file %s already exists on the host%s; "
+                                             "waiting for the operator\n",
+                                             snapshot.name.c_str(),
+                                             conflict.identical ? " (identical)" : "");
+                                return;
+                            }
+                            chast::FileConflictAnswer reply;
+                            reply.transfer_id = conflict.transfer_id;
+                            reply.decision = policy == 1
+                                                 ? chast::FileConflictDecision::Overwrite
+                                                 : chast::FileConflictDecision::Skip;
+                            (void)session->send_file_conflict_answer(reply);
+                            std::fprintf(stderr,
+                                         "viewer: file %s already exists; %s (remembered)\n",
+                                         snapshot.name.c_str(),
+                                         policy == 1 ? "overwriting"
+                                                     : "keeping the existing file");
+                            return;
+                        }
                         chast::FileAnswer answer;
                         while (session->take_file_answer(answer)) {
                             if (answer.transfer_id != snapshot.transfer_id) {
                                 continue;
+                            }
+                            if (answer.code == chast::FileCode::Skipped) {
+                                {
+                                    std::lock_guard<std::mutex> lock(file_mutex_);
+                                    if (!uploads_.empty() &&
+                                        uploads_.front().transfer_id ==
+                                            snapshot.transfer_id) {
+                                        uploads_.front().stage = FileUpload::Stage::kDone;
+                                        uploads_.front().skipped = true;
+                                        uploads_.front().error =
+                                            "the existing file was kept";
+                                    }
+                                }
+                                std::fprintf(stderr,
+                                             "viewer: file %s skipped; the host kept its file\n",
+                                             snapshot.name.c_str());
+                                return;
+                            }
+                            if (answer.code == chast::FileCode::Cancelled) {
+                                purge_uploads(answer.reason.empty()
+                                                  ? "the transfer was cancelled"
+                                                  : answer.reason,
+                                              true);
+                                return;
                             }
                             if (answer.code != chast::FileCode::Ok) {
                                 file_fail(answer.reason.empty() ? file_code_name(answer.code)
@@ -4453,9 +4663,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     uint64_t received = 0;
                     std::string name;
                     uint64_t size = 0;
+                    bool held = false;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
-                        if (download_.stage != FileDownload::Stage::kReceiving) {
+                        held = download_.stage == FileDownload::Stage::kConflict;
+                        if (download_.stage != FileDownload::Stage::kReceiving && !held) {
                             return;
                         }
                         transfer_id = download_.transfer_id;
@@ -4471,6 +4683,34 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         if (folder_transfers_.find(transfer_id) != folder_transfers_.end()) {
                             return;
                         }
+                    }
+                    if (held) {
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (download_.stage != FileDownload::Stage::kConflict ||
+                                download_.transfer_id != transfer_id) {
+                                return;
+                            }
+                            size = download_.size;
+                            download_.stage = FileDownload::Stage::kFailed;
+                            download_.error = "the viewer cancelled the download";
+                            // The prompt leaves with the transfer it names.
+                            std::erase_if(conflicts_,
+                                          [&](const PendingFileConflict& conflict) {
+                                              return conflict.download &&
+                                                     conflict.transfer_id == transfer_id;
+                                          });
+                        }
+                        chast::FileConflictAnswer answer;
+                        answer.transfer_id = transfer_id;
+                        answer.decision = chast::FileConflictDecision::Cancel;
+                        (void)session->send_file_conflict_answer(answer);
+                        record_completed_file(false, name, size, false,
+                                              "the viewer cancelled the download");
+                        ++download_cancels;
+                        std::fprintf(stderr, "viewer: download %s cancelled by the viewer\n",
+                                     name.c_str());
+                        return;
                     }
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
@@ -4593,21 +4833,186 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                  code == 1 ? error.c_str() : "");
                 };
 
+                // Ends a download the host is holding at the same-name prompt.
+                // `report` answers the host with Cancel so it stops holding the
+                // offer; the walk that owns the transfer ends with it.
+                auto fail_conflict_download = [&](const std::string& message, bool report,
+                                                  bool cancelled = false) {
+                    uint32_t transfer_id = 0;
+                    std::string name;
+                    uint64_t size = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (download_.stage != FileDownload::Stage::kConflict) {
+                            return;
+                        }
+                        transfer_id = download_.transfer_id;
+                        name = download_.name;
+                        size = download_.size;
+                        download_.stage = FileDownload::Stage::kFailed;
+                        download_.error = message;
+                    }
+                    if (report) {
+                        chast::FileConflictAnswer answer;
+                        answer.transfer_id = transfer_id;
+                        answer.decision = chast::FileConflictDecision::Cancel;
+                        (void)session->send_file_conflict_answer(answer);
+                    }
+                    record_completed_file(false, name, size, false, message);
+                    if (cancelled) {
+                        ++download_cancels;
+                    } else {
+                        ++file_receive_failures;
+                    }
+                    std::fprintf(stderr, "viewer: download %s failed: %s\n", name.c_str(),
+                                 message.c_str());
+                    bool walk = false;
+                    {
+                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                        walk = folder_transfers_.erase(transfer_id) > 0;
+                        if (walk && folder_.transfer_id == transfer_id) {
+                            folder_.transfer_id = 0;
+                            folder_.current.clear();
+                        }
+                    }
+                    if (walk) {
+                        finish_folder_download(cancelled ? 2 : 1, message);
+                    }
+                };
+
+                // Applies the answers AnswerFileConflict() queued. A remembered
+                // choice covers the rest of the queue; Cancel drops the upload
+                // queue or ends the download it belongs to.
+                auto drain_file_conflicts = [&] {
+                    for (;;) {
+                        ConflictAnswer answer;
+                        PendingFileConflict pending;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (conflict_answers_.empty()) {
+                                return;
+                            }
+                            answer = conflict_answers_.front();
+                            conflict_answers_.pop_front();
+                            auto it = std::find_if(conflicts_.begin(), conflicts_.end(),
+                                                   [&](const PendingFileConflict& entry) {
+                                                       return entry.transfer_id ==
+                                                              answer.transfer_id;
+                                                   });
+                            if (it == conflicts_.end()) {
+                                // The prompt left with its transfer.
+                                continue;
+                            }
+                            pending = *it;
+                            conflicts_.erase(it);
+                            if (answer.remember &&
+                                answer.decision != chast::FileConflictDecision::Cancel) {
+                                conflict_policy_ =
+                                    answer.decision == chast::FileConflictDecision::Overwrite
+                                        ? 1
+                                        : 2;
+                            }
+                        }
+                        chast::FileConflictAnswer reply;
+                        reply.transfer_id = pending.transfer_id;
+                        reply.decision = answer.decision;
+                        if (!pending.download) {
+                            (void)session->send_file_conflict_answer(reply);
+                            if (answer.decision == chast::FileConflictDecision::Cancel) {
+                                // The head still waits in kOffered; dropping it
+                                // also ends the rest of the queue.
+                                purge_uploads("the operator cancelled the upload", true);
+                            }
+                            // Skip and Overwrite finish through the host's
+                            // FileAnswer: Skipped ends the entry, Ok starts it.
+                            continue;
+                        }
+                        if (answer.decision == chast::FileConflictDecision::Cancel) {
+                            (void)session->send_file_conflict_answer(reply);
+                            fail_conflict_download("the viewer cancelled the download", false,
+                                                   true);
+                            continue;
+                        }
+                        if (answer.decision == chast::FileConflictDecision::Skip) {
+                            (void)session->send_file_conflict_answer(reply);
+                            bool current = false;
+                            {
+                                std::lock_guard<std::mutex> lock(file_mutex_);
+                                if (download_.stage == FileDownload::Stage::kConflict &&
+                                    download_.transfer_id == pending.transfer_id) {
+                                    download_.stage = FileDownload::Stage::kDone;
+                                    download_.error = "the existing file was kept";
+                                    current = true;
+                                }
+                            }
+                            if (current) {
+                                // No audit record: the host writes none for a
+                                // kept file either.
+                                ++downloads_skipped;
+                                std::fprintf(stderr,
+                                             "viewer: download %s skipped; the existing "
+                                             "file is kept\n",
+                                             pending.name.c_str());
+                            }
+                            continue;
+                        }
+                        // Overwrite: reopen the destination over the existing
+                        // file; the host restarts the stream from zero.
+                        chast::FileReceiveOptions options = pending.options;
+                        options.overwrite = true;
+                        uint64_t resume_offset = 0;
+                        std::string receive_error;
+                        std::unique_ptr<chast::FileReceiver> receiver =
+                            chast::FileReceiver::create(options, &resume_offset, &receive_error);
+                        if (!receiver) {
+                            reply.decision = chast::FileConflictDecision::Cancel;
+                            (void)session->send_file_conflict_answer(reply);
+                            fail_conflict_download(
+                                "cannot replace '" + pending.name + "': " + receive_error,
+                                false);
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (download_.stage != FileDownload::Stage::kConflict ||
+                                download_.transfer_id != pending.transfer_id) {
+                                receiver->abort(false);
+                                continue;
+                            }
+                            download_.stage = FileDownload::Stage::kReceiving;
+                            download_.receiver = std::move(receiver);
+                            download_.received = resume_offset;
+                            download_.answer_time = Clock::now();
+                        }
+                        (void)session->send_file_conflict_answer(reply);
+                        std::fprintf(stderr,
+                                     "viewer: download %s accepted over the existing file\n",
+                                     pending.name.c_str());
+                    }
+                };
+
                 auto drain_downloads = [&] {
                     bool transfer_receiving = false;
+                    bool transfer_held = false;
                     bool clipboard_receiving = false;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
                         transfer_receiving =
                             download_.stage == FileDownload::Stage::kReceiving;
+                        transfer_held = download_.stage == FileDownload::Stage::kConflict;
                         clipboard_receiving =
                             transfer_receiving &&
                             clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
                             clipboard_files.transfer_id == download_.transfer_id;
                     }
-                    if (transfer_receiving && !clipboard_receiving &&
+                    if ((transfer_receiving || transfer_held) && !clipboard_receiving &&
                         (permissions & chast::kPermissionFileTransfer) == 0) {
-                        download_fail("the host revoked file transfer", false);
+                        if (transfer_held) {
+                            // The host dropped the held offer with the grant.
+                            fail_conflict_download("the host revoked file transfer", false);
+                        } else {
+                            download_fail("the host revoked file transfer", false);
+                        }
                     }
                     if (transfer_receiving && clipboard_receiving && !clipboard_receive_allowed()) {
                         download_fail("clipboard sync is disabled", false);
@@ -4650,7 +5055,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         bool busy = false;
                         {
                             std::lock_guard<std::mutex> lock(file_mutex_);
-                            busy = download_.stage == FileDownload::Stage::kReceiving;
+                            busy = download_.stage == FileDownload::Stage::kReceiving ||
+                                   download_.stage == FileDownload::Stage::kConflict;
                         }
                         const bool no_directory = clipboard_transfer
                                                       ? clipboard_files.directory.empty()
@@ -4742,31 +5148,174 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         options.size = offer.size;
                         options.sha256 = offer.sha256;
                         options.allow_resume = offer.resume;
-                        uint64_t resume_offset = 0;
-                        std::string receive_error;
-                        std::unique_ptr<chast::FileReceiver> receiver = chast::FileReceiver::create(
-                            options, &resume_offset, &receive_error);
-                        if (!receiver) {
+                        // Clipboard staging is a fresh directory per list, so
+                        // a name there is never the operator's own file.
+                        options.overwrite = clipboard_transfer;
+                        auto refuse_offer = [&](const std::string& reason) {
                             ++file_receive_failures;
-                            (void)session->send_file_answer(offer.transfer_id, chast::FileCode::Refused,
-                                                            0, receive_error);
+                            (void)session->send_file_answer(offer.transfer_id,
+                                                            chast::FileCode::Refused, 0,
+                                                            reason);
                             std::fprintf(stderr, "viewer: download %s refused: %s\n",
-                                         offer.name.c_str(), receive_error.c_str());
+                                         offer.name.c_str(), reason.c_str());
                             if (clipboard_transfer) {
                                 clip_files_fail("cannot receive '" + offer.name +
-                                                "': " + receive_error);
-                                continue;
+                                                "': " + reason);
+                                return;
                             }
-                            record_completed_file(false, offer.name, offer.size, false,
-                                                  receive_error);
+                            record_completed_file(false, offer.name, offer.size, false, reason);
                             bool walk_transfer = false;
                             {
                                 std::lock_guard<std::mutex> lock(browse_mutex_);
                                 walk_transfer = folder_transfers_.erase(offer.transfer_id) > 0;
                             }
                             if (walk_transfer) {
-                                finish_folder_download(1, receive_error);
+                                finish_folder_download(1, reason);
                             }
+                        };
+                        if (!clipboard_transfer) {
+                            chast::FileReceiveTarget target;
+                            std::string target_error;
+                            if (!chast::inspect_receive_target(options, target, &target_error)) {
+                                refuse_offer(target_error);
+                                continue;
+                            }
+                            if (target.exists) {
+                                if (target.directory) {
+                                    refuse_offer("the destination is an existing directory");
+                                    continue;
+                                }
+                                // A remembered choice answers without a
+                                // prompt, the same way the upload direction
+                                // does.
+                                int policy = 0;
+                                {
+                                    std::lock_guard<std::mutex> lock(file_mutex_);
+                                    policy = conflict_policy_;
+                                }
+                                if (policy != 0) {
+                                    const chast::Error held = session->send_file_answer(
+                                        offer.transfer_id, chast::FileCode::Conflict, 0);
+                                    if (!held.ok()) {
+                                        refuse_offer("cannot hold the offer: " +
+                                                     held.to_string());
+                                        continue;
+                                    }
+                                    chast::FileConflictAnswer answer;
+                                    answer.transfer_id = offer.transfer_id;
+                                    if (policy == 2) {
+                                        answer.decision = chast::FileConflictDecision::Skip;
+                                        (void)session->send_file_conflict_answer(answer);
+                                        {
+                                            std::lock_guard<std::mutex> lock(file_mutex_);
+                                            download_ = FileDownload{};
+                                            download_.stage = FileDownload::Stage::kDone;
+                                            download_.transfer_id = offer.transfer_id;
+                                            download_.name = offer.name;
+                                            download_.size = offer.size;
+                                            download_.error = "the existing file was kept";
+                                            download_.answer_time = Clock::now();
+                                        }
+                                        ++downloads_skipped;
+                                        std::fprintf(stderr,
+                                                     "viewer: download %s skipped "
+                                                     "(remembered)\n",
+                                                     offer.name.c_str());
+                                        continue;
+                                    }
+                                    // Overwrite: reopen the destination over
+                                    // the existing file; the host restarts the
+                                    // stream from zero.
+                                    chast::FileReceiveOptions overwrite_options = options;
+                                    overwrite_options.overwrite = true;
+                                    uint64_t resume_offset = 0;
+                                    std::string overwrite_error;
+                                    std::unique_ptr<chast::FileReceiver> overwrite_receiver =
+                                        chast::FileReceiver::create(overwrite_options,
+                                                                    &resume_offset,
+                                                                    &overwrite_error);
+                                    if (!overwrite_receiver) {
+                                        answer.decision = chast::FileConflictDecision::Cancel;
+                                        (void)session->send_file_conflict_answer(answer);
+                                        refuse_offer("cannot replace '" + offer.name +
+                                                     "': " + overwrite_error);
+                                        continue;
+                                    }
+                                    {
+                                        std::lock_guard<std::mutex> lock(file_mutex_);
+                                        download_ = FileDownload{};
+                                        download_.stage = FileDownload::Stage::kReceiving;
+                                        download_.transfer_id = offer.transfer_id;
+                                        download_.name = overwrite_receiver->name();
+                                        download_.size = offer.size;
+                                        download_.received = resume_offset;
+                                        download_.answer_time = Clock::now();
+                                        download_.receiver = std::move(overwrite_receiver);
+                                        download_.cancellable = !walk_offer;
+                                    }
+                                    answer.decision = chast::FileConflictDecision::Overwrite;
+                                    (void)session->send_file_conflict_answer(answer);
+                                    std::fprintf(stderr,
+                                                 "viewer: download %s accepted over the "
+                                                 "existing file (remembered)\n",
+                                                 offer.name.c_str());
+                                    continue;
+                                }
+                                // Hold the offer at the host and let the
+                                // operator decide; the receiver is created
+                                // only once an overwrite is chosen.
+                                PendingFileConflict pending;
+                                pending.download = true;
+                                pending.transfer_id = offer.transfer_id;
+                                pending.name = offer.name;
+                                pending.size = offer.size;
+                                // RustDesk calls a same-size, same-second file
+                                // identical and still asks, with a hint.
+                                const bool identical =
+                                    offer.modified_time != 0 &&
+                                    target.modified_time == offer.modified_time &&
+                                    target.size == offer.size;
+                                pending.identical = identical;
+                                pending.existing_size = target.size;
+                                pending.existing_modified_time = target.modified_time;
+                                pending.options = options;
+                                // An overwrite restarts at zero, so a stale
+                                // .part must not be resumed into it.
+                                pending.options.allow_resume = false;
+                                pending.walk = walk_offer;
+                                {
+                                    std::lock_guard<std::mutex> lock(file_mutex_);
+                                    download_ = FileDownload{};
+                                    download_.stage = FileDownload::Stage::kConflict;
+                                    download_.transfer_id = offer.transfer_id;
+                                    download_.name = offer.name;
+                                    download_.size = offer.size;
+                                    download_.answer_time = Clock::now();
+                                    download_.cancellable = !walk_offer;
+                                    conflicts_.push_back(std::move(pending));
+                                }
+                                ++file_conflicts;
+                                const chast::Error held = session->send_file_answer(
+                                    offer.transfer_id, chast::FileCode::Conflict, 0);
+                                if (!held.ok()) {
+                                    fail_conflict_download(
+                                        "cannot hold the offer: " + held.to_string(), false);
+                                    continue;
+                                }
+                                std::fprintf(stderr,
+                                             "viewer: download %s already exists locally%s; "
+                                             "waiting for the operator\n",
+                                             offer.name.c_str(),
+                                             identical ? " (identical)" : "");
+                                continue;
+                            }
+                        }
+                        uint64_t resume_offset = 0;
+                        std::string receive_error;
+                        std::unique_ptr<chast::FileReceiver> receiver = chast::FileReceiver::create(
+                            options, &resume_offset, &receive_error);
+                        if (!receiver) {
+                            refuse_offer(receive_error);
                             continue;
                         }
                         const std::string name = receiver->name();
@@ -4989,15 +5538,24 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     chast::FileCancel cancel;
                     while (session->take_file_cancel(cancel)) {
                         bool matches = false;
+                        bool held = false;
                         {
                             std::lock_guard<std::mutex> lock(file_mutex_);
-                            matches = download_.stage == FileDownload::Stage::kReceiving &&
+                            held = download_.stage == FileDownload::Stage::kConflict;
+                            matches = (download_.stage == FileDownload::Stage::kReceiving ||
+                                       held) &&
                                       download_.transfer_id == cancel.transfer_id;
                         }
-                        if (matches) {
-                            download_fail(cancel.reason.empty() ? "the host cancelled the download"
-                                                               : cancel.reason,
-                                          false);
+                        if (!matches) {
+                            continue;
+                        }
+                        const std::string reason = cancel.reason.empty()
+                                                       ? "the host cancelled the download"
+                                                       : cancel.reason;
+                        if (held) {
+                            fail_conflict_download(reason, false);
+                        } else {
+                            download_fail(reason, false);
                         }
                     }
                 };
@@ -5501,7 +6059,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     std::lock_guard<std::mutex> lock(browse_mutex_);
                                     if (folder_.transfer_id == transfer) {
                                         if (active == transfer &&
-                                            stage == FileDownload::Stage::kReceiving) {
+                                            (stage == FileDownload::Stage::kReceiving ||
+                                             stage == FileDownload::Stage::kConflict)) {
+                                            // The prompt may stay open as long
+                                            // as the operator takes.
                                             folder_.transfer_deadline =
                                                 now + std::chrono::seconds(60);
                                         } else if (now > folder_.transfer_deadline) {
@@ -5542,12 +6103,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         if (cancel) {
                             if (transfer != 0) {
                                 bool active = false;
+                                bool held = false;
                                 std::string cancelled_name;
                                 uint64_t cancelled_size = 0;
                                 {
                                     std::lock_guard<std::mutex> lock(file_mutex_);
+                                    held = download_.stage == FileDownload::Stage::kConflict &&
+                                           download_.transfer_id == transfer;
                                     active = download_.stage == FileDownload::Stage::kReceiving &&
                                              download_.transfer_id == transfer;
+                                    if (held) {
+                                        cancelled_name = download_.name;
+                                        cancelled_size = download_.size;
+                                    }
                                     if (active) {
                                         cancelled_name = download_.name;
                                         cancelled_size = download_.size;
@@ -5558,6 +6126,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         download_.stage = FileDownload::Stage::kFailed;
                                         download_.error = "cancelled by the operator";
                                     }
+                                }
+                                if (held) {
+                                    // The host holds this offer; only the
+                                    // conflict answer releases it.
+                                    fail_conflict_download("cancelled by the operator", true,
+                                                           true);
+                                    return;
                                 }
                                 if (active) {
                                     record_completed_file(false, cancelled_name, cancelled_size,
@@ -5677,7 +6252,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             bool busy = false;
                             {
                                 std::lock_guard<std::mutex> file_lock(file_mutex_);
-                                busy = download_.stage == FileDownload::Stage::kReceiving;
+                                busy = download_.stage == FileDownload::Stage::kReceiving ||
+                                       download_.stage == FileDownload::Stage::kConflict;
                             }
                             if (!busy) {
                                 path = folder_.files.front().first;
@@ -8099,6 +8675,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         purge_uploads("the viewer cancelled the upload", true);
                     }
                     drive_file_upload();
+                    drain_file_conflicts();
                     // Browse answers are adopted before file offers: a walk's
                     // download answer names the transfer whose offer follows,
                     // and the offer must already know its mirrored directory.
@@ -8457,6 +9034,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             uploads_.clear();
         }
         pending_upload_roots_.clear();
+        // A prompt cannot outlive the connection that carries its offer.
+        conflicts_.clear();
+        conflict_answers_.clear();
+        conflict_policy_ = 0;
     }
     if (cancelled_upload != 0) {
         session->cancel_file_upload(cancelled_upload);
@@ -8469,7 +9050,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         uint64_t download_size = 0;
         {
             std::lock_guard<std::mutex> lock(file_mutex_);
-            if (download_.stage == FileDownload::Stage::kReceiving) {
+            if (download_.stage == FileDownload::Stage::kReceiving ||
+                download_.stage == FileDownload::Stage::kConflict) {
                 if (!download_.clipboard) {
                     failed_download = true;
                     download_name = download_.name;

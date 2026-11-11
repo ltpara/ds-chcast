@@ -600,6 +600,18 @@ class ViewerStatus {
     this.fileReceiveFailures = 0,
     this.downloadCancels = 0,
     this.downloadCancellable = false,
+    this.fileConflictPending = false,
+    this.fileConflictDownload = false,
+    this.fileConflictTransferId = 0,
+    this.fileConflictName = '',
+    this.fileConflictSize = 0,
+    this.fileConflictIdentical = false,
+    this.fileConflictExistingSize = 0,
+    this.fileConflictExistingTime = 0,
+    this.fileConflictPolicy = 0,
+    this.fileConflicts = 0,
+    this.filesSkipped = 0,
+    this.downloadsSkipped = 0,
     this.fileListAnswers = 0,
     this.fileListDirectory = '',
     this.fileListEntries = 0,
@@ -948,6 +960,28 @@ class ViewerStatus {
   /// walks have their own cancel and clipboard transfers follow the clipboard
   /// permission, so the page offers no cancel action for those.
   final bool downloadCancellable;
+
+  /// A same-name conflict waiting for the operator. [fileConflictDownload] is
+  /// true for a host download this viewer would receive, false for an upload
+  /// the host is holding; [fileConflictName], [fileConflictSize] and
+  /// [fileConflictIdentical] describe the incoming entry, and
+  /// [fileConflictExistingSize] / [fileConflictExistingTime] (Unix seconds)
+  /// the local copy. [fileConflictPolicy] is the remembered choice for the
+  /// rest of the queue (0 ask, 1 overwrite, 2 skip); [fileConflicts] counts
+  /// the prompts shown, and [filesSkipped] / [downloadsSkipped] the entries
+  /// the operator kept, counted apart from failures.
+  final bool fileConflictPending;
+  final bool fileConflictDownload;
+  final int fileConflictTransferId;
+  final String fileConflictName;
+  final int fileConflictSize;
+  final bool fileConflictIdentical;
+  final int fileConflictExistingSize;
+  final int fileConflictExistingTime;
+  final int fileConflictPolicy;
+  final int fileConflicts;
+  final int filesSkipped;
+  final int downloadsSkipped;
 
   /// Shared-folder browsing. [fileListAnswers] changes with every listing the
   /// host sent (the entries themselves come from [ViewerBridge.takeFileList]);
@@ -1663,6 +1697,18 @@ class ViewerStatus {
       fileReceiveFailures: asInt(map['fileReceiveFailures']),
       downloadCancels: asInt(map['downloadCancels']),
       downloadCancellable: map['downloadCancellable'] == true,
+      fileConflictPending: map['fileConflictPending'] == true,
+      fileConflictDownload: map['fileConflictDownload'] == true,
+      fileConflictTransferId: asInt(map['fileConflictTransferId']),
+      fileConflictName: asString(map['fileConflictName']),
+      fileConflictSize: asInt(map['fileConflictSize']),
+      fileConflictIdentical: map['fileConflictIdentical'] == true,
+      fileConflictExistingSize: asInt(map['fileConflictExistingSize']),
+      fileConflictExistingTime: asInt(map['fileConflictExistingTime']),
+      fileConflictPolicy: asInt(map['fileConflictPolicy']),
+      fileConflicts: asInt(map['fileConflicts']),
+      filesSkipped: asInt(map['filesSkipped']),
+      downloadsSkipped: asInt(map['downloadsSkipped']),
       fileListAnswers: asInt(map['fileListAnswers']),
       fileListDirectory: asString(map['fileListDirectory']),
       fileListEntries: asInt(map['fileListEntries']),
@@ -1868,6 +1914,57 @@ class ViewerStatus {
         return ViewerState.idle;
     }
   }
+}
+
+/// The host pointer as the view-only page draws it. Positions are captured
+/// desktop (source) pixels, and [x]/[y] is the hotspot, so the sprite is
+/// painted at (x - hotspotX, y - hotspotY). [bgra] is present only on the poll
+/// that follows a shape change; the page keeps the image it decoded after that.
+class RemoteCursorView {
+  const RemoteCursorView({
+    required this.visible,
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+    required this.hotspotX,
+    required this.hotspotY,
+    required this.shapeId,
+    this.bgra,
+  });
+
+  factory RemoteCursorView.fromMap(Map<Object?, Object?> value) =>
+      RemoteCursorView(
+        visible: value['visible'] == true,
+        x: (value['x'] as num).toInt(),
+        y: (value['y'] as num).toInt(),
+        width: (value['width'] as num).toInt(),
+        height: (value['height'] as num).toInt(),
+        hotspotX: (value['hotspotX'] as num).toInt(),
+        hotspotY: (value['hotspotY'] as num).toInt(),
+        shapeId: (value['shapeId'] as num).toInt(),
+        bgra: value['bgra'] is Uint8List ? value['bgra'] as Uint8List : null,
+      );
+
+  final bool visible;
+  final int x, y, width, height, hotspotX, hotspotY, shapeId;
+  final Uint8List? bgra;
+
+  @override
+  bool operator ==(Object other) =>
+      other is RemoteCursorView &&
+      other.visible == visible &&
+      other.x == x &&
+      other.y == y &&
+      other.width == width &&
+      other.height == height &&
+      other.hotspotX == hotspotX &&
+      other.hotspotY == hotspotY &&
+      other.shapeId == shapeId;
+
+  @override
+  int get hashCode =>
+      Object.hash(visible, x, y, width, height, hotspotX, hotspotY, shapeId);
 }
 
 class ViewerBridge {
@@ -2779,6 +2876,19 @@ class ViewerBridge {
     await _channel.invokeMethod<void>('cancelDownload');
   }
 
+  /// Answers the same-name conflict [ViewerStatus.fileConflictPending] shows.
+  /// [decision] is 0 skip, 1 overwrite, 2 cancel; [remember] keeps skip or
+  /// overwrite for the rest of the queue. Returns false when there is no
+  /// conflict to answer.
+  static Future<bool> answerFileConflict(int decision,
+      {bool remember = false}) async {
+    final answered = await _channel.invokeMethod<bool>('answerFileConflict', {
+      'decision': decision,
+      'remember': remember,
+    });
+    return answered ?? false;
+  }
+
   /// Drops every ordinary upload still queued or in flight and asks the host
   /// to abort the active transfer. Clipboard uploads keep running; a cancel
   /// while nothing is uploading is a no-op.
@@ -2945,6 +3055,15 @@ class ViewerBridge {
   /// arrow. Called when control ends, so the page's own cursor returns.
   static Future<void> clearRemoteCursor() async {
     await _channel.invokeMethod<void>('clearRemoteCursor');
+  }
+
+  /// Picks up the host pointer for the view-only overlay. Position and
+  /// visibility come back on every call; the sprite bytes only when the shape
+  /// changed. Returns null before the host has sent a pointer.
+  static Future<RemoteCursorView?> takeRemoteCursor() async {
+    final Map<Object?, Object?>? value = await _channel
+        .invokeMapMethod<Object?, Object?>('takeRemoteCursor');
+    return value == null ? null : RemoteCursorView.fromMap(value);
   }
 
   /// Mutes or unmutes system sound on this viewer. Decoding and buffering keep

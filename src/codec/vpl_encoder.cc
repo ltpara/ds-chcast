@@ -78,6 +78,16 @@ constexpr int kMaxSyncPolls = 100;  // 10 s before giving up on a frame
 // ladder a second, not the full stream timeout.
 constexpr int kProbeSyncPolls = 10;  // 1 s
 
+// CBR fields derived from the target rate. mfxhw64 leaves BufferSizeInKB and
+// InitialDelayInKB zero at Query time, which unbounds the rate control, so
+// every place that writes a new TargetKbps also rewrites the leaky bucket.
+void set_cbr_rate(mfxInfoMFX& mfx, UINT kbps) {
+    mfx.TargetKbps = static_cast<mfxU16>((std::clamp)(kbps, 1u, 0xFFFFu));
+    mfx.BufferSizeInKB = static_cast<mfxU16>((std::clamp)(mfx.TargetKbps / 8u, 1u, 0xFFFFu));
+    mfx.InitialDelayInKB = static_cast<mfxU16>(mfx.BufferSizeInKB / 2u);
+    mfx.MaxKbps = mfx.TargetKbps;
+}
+
 const char* mfx_status_name(mfxStatus sts) {
     switch (sts) {
         case MFX_ERR_NONE: return "MFX_ERR_NONE";
@@ -627,8 +637,7 @@ Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& t
         static_cast<mfxU16>(tier.low_power ? MFX_CODINGOPTION_ON : MFX_CODINGOPTION_OFF);
     mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
     mfx.RateControlMethod = MFX_RATECONTROL_CBR;
-    mfx.TargetKbps =
-        static_cast<mfxU16>((std::clamp)(bitrate_ / 1000u, 1u, 0xFFFFu));
+    set_cbr_rate(mfx, bitrate_ / 1000u);
     // A stream with no periodic key frames; RustDesk's gop is MAX_GOP unless
     // the caller configured an interval, and this encoder asks per frame.
     mfx.GopPicSize =
@@ -1094,7 +1103,7 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
         mfxExtBuffer* buffers[3] = {&signal.Header, &sequence.Header, &option.Header};
         candidate.ExtParam = buffers;
         candidate.NumExtParam = 3;
-        candidate.mfx.TargetKbps = static_cast<mfxU16>(kbps);
+        set_cbr_rate(candidate.mfx, kbps);
         mfxStatus sts = MFXVideoENCODE_Query(session_, &candidate, &candidate);
         if (sts >= MFX_ERR_NONE && option.StartNewSequence == MFX_CODINGOPTION_OFF) {
             sts = MFXVideoENCODE_Reset(session_, &candidate);
@@ -1125,7 +1134,7 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
     // over from initialisation.
     mfxVideoParam reset = params_;
     reset.mfx.RateControlMethod = MFX_RATECONTROL_CBR;
-    reset.mfx.TargetKbps = static_cast<mfxU16>(kbps);
+    set_cbr_rate(reset.mfx, kbps);
     reset.mfx.FrameInfo.FrameRateExtN = static_cast<mfxU16>(fps);
     reset.mfx.FrameInfo.FrameRateExtD = 1;
     reset.ExtParam = extensions_;
@@ -1144,6 +1153,9 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
         return mfx_error(sts, "MFXVideoENCODE_Reset(rate)");
     }
     params_.mfx.TargetKbps = reset.mfx.TargetKbps;
+    params_.mfx.BufferSizeInKB = reset.mfx.BufferSizeInKB;
+    params_.mfx.InitialDelayInKB = reset.mfx.InitialDelayInKB;
+    params_.mfx.MaxKbps = reset.mfx.MaxKbps;
     params_.mfx.FrameInfo.FrameRateExtN = reset.mfx.FrameInfo.FrameRateExtN;
     bitrate_ = static_cast<UINT>(reset.mfx.TargetKbps) * 1000u;
     framerate_ = static_cast<UINT>(reset.mfx.FrameInfo.FrameRateExtN);
@@ -1180,8 +1192,7 @@ Error MfxEncoder::reopen(UINT bits_per_second, UINT framerate) {
 
     const mfxVideoParam previous = params_;
     mfxVideoParam next = params_;
-    next.mfx.TargetKbps =
-        static_cast<mfxU16>((std::clamp)(bits_per_second / 1000u, 1u, 0xFFFFu));
+    set_cbr_rate(next.mfx, bits_per_second / 1000u);
     next.mfx.FrameInfo.FrameRateExtN = static_cast<mfxU16>(framerate);
     next.mfx.FrameInfo.FrameRateExtD = 1;
     next.ExtParam = extensions_;

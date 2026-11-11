@@ -63,15 +63,7 @@ public:
                                   FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT);
         if (input == INVALID_HANDLE_VALUE) return fail();
         struct Closer { HANDLE handle; ~Closer() { CloseHandle(handle); } } close{input};
-        auto unchanged = [&] {
-            BY_HANDLE_FILE_INFORMATION info{};
-            return GetFileInformationByHandle(input, &info) &&
-                info.nFileSizeHigh == file.info.nFileSizeHigh && info.nFileSizeLow == file.info.nFileSizeLow &&
-                CompareFileTime(&info.ftLastWriteTime, &file.info.ftLastWriteTime) == 0 &&
-                info.dwVolumeSerialNumber == file.info.dwVolumeSerialNumber &&
-                info.nFileIndexHigh == file.info.nFileIndexHigh && info.nFileIndexLow == file.info.nFileIndexLow;
-        };
-        if (!unchanged()) return fail();
+        if (!SameFile(input, file.info)) return fail();
         OVERLAPPED operation{};
         operation.Offset = static_cast<DWORD>(offset); operation.OffsetHigh = static_cast<DWORD>(offset >> 32);
         operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -94,10 +86,28 @@ public:
             ok = GetOverlappedResult(input, &operation, &got, TRUE) && wait == WAIT_OBJECT_0 && got == length;
         }
         { std::lock_guard lock(io_mutex_); reading_ = INVALID_HANDLE_VALUE; }
-        if (!ok || !Active() || !unchanged()) return fail();
+        if (!ok || !Active() || !SameFile(input, file.info)) return fail();
         return true;
     }
+    bool Unchanged(size_t index) const override {
+        if (!Active() || index >= entries_.size() || entries_[index].directory) return false;
+        const auto& file = files_[index];
+        HANDLE input = ReOpenFile(file.handle, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OPEN_REPARSE_POINT);
+        if (input == INVALID_HANDLE_VALUE) return false;
+        const bool same = SameFile(input, file.info);
+        CloseHandle(input);
+        return same;
+    }
 private:
+    static bool SameFile(HANDLE handle, const BY_HANDLE_FILE_INFORMATION& expected) {
+        BY_HANDLE_FILE_INFORMATION info{};
+        return GetFileInformationByHandle(handle, &info) &&
+            info.nFileSizeHigh == expected.nFileSizeHigh && info.nFileSizeLow == expected.nFileSizeLow &&
+            CompareFileTime(&info.ftLastWriteTime, &expected.ftLastWriteTime) == 0 &&
+            info.dwVolumeSerialNumber == expected.dwVolumeSerialNumber &&
+            info.nFileIndexHigh == expected.nFileIndexHigh && info.nFileIndexLow == expected.nFileIndexLow;
+    }
     struct File { HANDLE handle = INVALID_HANDLE_VALUE; BY_HANDLE_FILE_INFORMATION info{}; };
     std::vector<ClipboardFileEntry> entries_;
     std::vector<File> files_;

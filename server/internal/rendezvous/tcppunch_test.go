@@ -151,10 +151,10 @@ func TestTCPPunchAcceptsHostOnlineThroughCarrier(t *testing.T) {
 	)
 	p := &tcpPuncher{srv: meet}
 	nonce := "tcp-punch-carrier-only"
-	if err := p.checkAnnounce(viewerAnnounce(nonce, time.Now().Unix())); err != nil {
+	if err := p.checkAnnounce(viewerAnnounce(nonce, time.Now().Unix()), "127.0.0.1:40000"); err != nil {
 		t.Fatalf("carrier-backed host was rejected: %v", err)
 	}
-	if err := p.checkAnnounce(hostAnnounce(priv, nonce, time.Now().Unix())); err != nil {
+	if err := p.checkAnnounce(hostAnnounce(priv, nonce, time.Now().Unix()), "127.0.0.1:40001"); err != nil {
 		t.Fatalf("authenticated carrier-backed host was rejected: %v", err)
 	}
 }
@@ -196,7 +196,7 @@ func TestTCPPunchAuthenticatesViewerBeforeRevealingHostState(t *testing.T) {
 	p := &tcpPuncher{srv: meet}
 	msg := viewerAnnounce("tcp-punch-auth-order", time.Now().Unix())
 	msg.Auth = ""
-	err := p.checkAnnounce(msg)
+	err := p.checkAnnounce(msg, "127.0.0.1:40000")
 	if err == nil || err.Error() != "punch authentication failed" {
 		t.Fatalf("unauthenticated announce error = %v, want authentication failure", err)
 	}

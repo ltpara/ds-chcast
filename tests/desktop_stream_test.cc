@@ -559,16 +559,21 @@ void slow_viewer_backpressure() {
     while (state->encodes < 55 && std::chrono::steady_clock::now() < fill)
         std::this_thread::sleep_for(5ms);
     check(state->encodes >= 55, "service publishes into the bounded window");
-    // Production must stop once every queue is at the high-water mark.
-    auto last_change = std::chrono::steady_clock::now();
+    // Production must stop once every queue is at the high-water mark. While
+    // full, the service still samples capture every tick, so require real
+    // ticks with no encode instead of a wall-clock quiet window: a
+    // descheduled service thread can outlast any fixed window while the last
+    // picture is still in flight.
     unsigned observed = state->encodes;
-    const auto settle = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() - last_change < 400ms &&
-           std::chrono::steady_clock::now() < settle) {
-        std::this_thread::sleep_for(10ms);
+    unsigned observed_captures = state->captures;
+    const auto settle = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < settle) {
+        std::this_thread::sleep_for(5ms);
         if (state->encodes != observed) {
             observed = state->encodes;
-            last_change = std::chrono::steady_clock::now();
+            observed_captures = state->captures;
+        } else if (state->captures - observed_captures >= 10) {
+            break;
         }
     }
     const unsigned paused_encodes = state->encodes, paused_captures = state->captures,
@@ -666,18 +671,19 @@ void cursor_sink_while_full() {
         std::this_thread::sleep_for(5ms);
     check(state->encodes >= 60, "fill the stalled viewer's video window");
     // The encoder counter advances before the picture reaches the subscriber
-    // queue, so the 60th encode can be in flight when the counter is first
-    // read. Wait for the window to reach its high-water mark before taking
-    // the baseline; encoding stops while every queue is full.
-    auto last_change = std::chrono::steady_clock::now();
+    // queue, so the last encode can be in flight when the counter is first
+    // read. Wait for real service ticks with no encode, not a wall-clock
+    // quiet window: the capture tick keeps running while every queue is full.
     unsigned observed = state->encodes;
-    const auto settle = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() - last_change < 400ms &&
-           std::chrono::steady_clock::now() < settle) {
-        std::this_thread::sleep_for(10ms);
+    unsigned observed_captures = state->captures;
+    const auto settle = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < settle) {
+        std::this_thread::sleep_for(5ms);
         if (state->encodes != observed) {
             observed = state->encodes;
-            last_change = std::chrono::steady_clock::now();
+            observed_captures = state->captures;
+        } else if (state->captures - observed_captures >= 10) {
+            break;
         }
     }
 
@@ -719,7 +725,12 @@ void cursor_sink_while_full() {
     // no new frame, the change must stay pending rather than be encoded into
     // a window that would drop it.
     state->moving = true;
-    std::this_thread::sleep_for(100ms);
+    // A desktop change must be sampled by the service thread while the
+    // window is still full; a wall-clock window can pass without a tick.
+    const unsigned caught = state->captures;
+    const auto caught_deadline = std::chrono::steady_clock::now() + 2s;
+    while (state->captures - caught < 3 && std::chrono::steady_clock::now() < caught_deadline)
+        std::this_thread::sleep_for(5ms);
     state->moving = false;
     const unsigned before_resume = state->encodes;
     std::this_thread::sleep_for(300ms);

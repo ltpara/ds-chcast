@@ -844,6 +844,32 @@ void ViewerBridge::HandleMethodCall(
         }
         result->Success(flutter::EncodableValue(std::move(updates))); return;
     }
+    if (method == "takeRemoteCursor") {
+        // The view-only page polls this at pointer cadence: the newest
+        // position every time, the sprite only when a shape arrives.
+        DrainCursorUpdates();
+        if (!have_cursor_) {
+            result->Success(); return;
+        }
+        flutter::EncodableMap item;
+        item[key("visible")] = flutter::EncodableValue(last_cursor_.visible);
+        item[key("x")] = flutter::EncodableValue(last_cursor_.x);
+        item[key("y")] = flutter::EncodableValue(last_cursor_.y);
+        item[key("width")] = flutter::EncodableValue(static_cast<int32_t>(last_cursor_.width));
+        item[key("height")] = flutter::EncodableValue(static_cast<int32_t>(last_cursor_.height));
+        item[key("hotspotX")] =
+            flutter::EncodableValue(static_cast<int32_t>(last_cursor_.hotspot_x));
+        item[key("hotspotY")] =
+            flutter::EncodableValue(static_cast<int32_t>(last_cursor_.hotspot_y));
+        item[key("shapeId")] =
+            flutter::EncodableValue(static_cast<int64_t>(last_cursor_.shape_id));
+        if (cursor_sprite_sent_ != cursor_sprite_version_ &&
+            cursor_sprite_shape_ == last_cursor_.shape_id) {
+            item[key("bgra")] = flutter::EncodableValue(cursor_sprite_);
+            cursor_sprite_sent_ = cursor_sprite_version_;
+        }
+        result->Success(flutter::EncodableValue(std::move(item))); return;
+    }
 
     if (method == "status") {
         const ViewerStatus status = viewer_->Snapshot();
@@ -961,6 +987,30 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.download_cancels));
         map[key("downloadCancellable")] =
             flutter::EncodableValue(status.download_cancellable);
+        map[key("fileConflictPending")] =
+            flutter::EncodableValue(status.file_conflict_pending);
+        map[key("fileConflictDownload")] =
+            flutter::EncodableValue(status.file_conflict_download);
+        map[key("fileConflictTransferId")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_conflict_transfer_id));
+        map[key("fileConflictName")] =
+            flutter::EncodableValue(status.file_conflict_name);
+        map[key("fileConflictSize")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_conflict_size));
+        map[key("fileConflictIdentical")] =
+            flutter::EncodableValue(status.file_conflict_identical);
+        map[key("fileConflictExistingSize")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_conflict_existing_size));
+        map[key("fileConflictExistingTime")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_conflict_existing_time));
+        map[key("fileConflictPolicy")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_conflict_policy));
+        map[key("fileConflicts")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_conflicts));
+        map[key("filesSkipped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.files_skipped));
+        map[key("downloadsSkipped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.downloads_skipped));
         map[key("fileListAnswers")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_list_answers));
         map[key("fileListDirectory")] =
@@ -1869,6 +1919,38 @@ void ViewerBridge::HandleMethodCall(
             viewer_->CancelDownload();
         }
         result->Success();
+        return;
+    }
+
+    if (method == "answerFileConflict") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "answerFileConflict wants a decision");
+            return;
+        }
+        const auto decision = args->find(flutter::EncodableValue("decision"));
+        const auto* decision_value =
+            decision == args->end() ? nullptr : std::get_if<int32_t>(&decision->second);
+        if (decision_value == nullptr || *decision_value < 0 ||
+            *decision_value > static_cast<int32_t>(chast::FileConflictDecision::Cancel)) {
+            result->Error("bad_args", "answerFileConflict wants a decision");
+            return;
+        }
+        bool remember = false;
+        const auto remember_value = args->find(flutter::EncodableValue("remember"));
+        if (remember_value != args->end()) {
+            const auto* flag = std::get_if<bool>(&remember_value->second);
+            if (flag == nullptr) {
+                result->Error("bad_args", "remember must be a bool");
+                return;
+            }
+            remember = *flag;
+        }
+        const bool accepted =
+            viewer_ != nullptr &&
+            viewer_->AnswerFileConflict(
+                static_cast<chast::FileConflictDecision>(*decision_value), remember);
+        result->Success(flutter::EncodableValue(accepted));
         return;
     }
 
@@ -3310,19 +3392,22 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
     return DefSubclassProc(window, message, wparam, lparam);
 }
 
-void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
+void ViewerBridge::DrainCursorUpdates() {
     if (viewer_ == nullptr) {
         return;
     }
     // Every update the session received since the last poll: register the
-    // sprite of each new shape, then remember only the newest state. The
-    // sprite crosses no boundary here, which is why this stays in native code.
+    // sprite of each new shape, keep the newest sprite for the view-only
+    // overlay, then remember only the newest state.
     chast::CursorUpdate update;
     while (viewer_->TakeCursor(update)) {
         if (!update.sprite.empty() && update.shape_id != 0) {
+            cursor_sprite_ = std::move(update.sprite);
+            cursor_sprite_shape_ = update.shape_id;
+            ++cursor_sprite_version_;
             std::string error;
             if (!remote_cursor_.Register(update.shape_id, update.width, update.height,
-                                         update.hotspot_x, update.hotspot_y, update.sprite,
+                                         update.hotspot_x, update.hotspot_y, cursor_sprite_,
                                          &error)) {
                 std::fprintf(stderr, "chast_viewer: remote cursor: %s\n", error.c_str());
             }
@@ -3330,14 +3415,23 @@ void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
         last_cursor_ = std::move(update);
         have_cursor_ = true;
     }
+}
+
+void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
+    if (viewer_ == nullptr) {
+        return;
+    }
+    DrainCursorUpdates();
 
     bool enabled = false;
     int64_t scale_milli = 1000;
     map_bool(args, "enabled", &enabled);
     map_int(args, "scaleMilli", &scale_milli);
-    if (!enabled || !have_cursor_ || !last_cursor_.visible || last_cursor_.shape_id == 0) {
-        // View-only, or the host says its pointer is hidden: Flutter's own
-        // cursor is the right one again.
+    if (!enabled || !have_cursor_ || last_cursor_.shape_id == 0) {
+        // View-only, or the host has not named a shape yet: Flutter's own
+        // cursor is the right one again. A hidden host pointer keeps the last
+        // shape, as RustDesk's client does: the local pointer is what the user
+        // moves, so hiding the host's must not take it away.
         if (cursor_override_) {
             cursor_override_ = false;
             remote_cursor_.Deactivate();
@@ -3376,6 +3470,11 @@ void ViewerBridge::ClearCursor() {
     cursor_override_ = false;
     have_cursor_ = false;
     cursor_shape_ = 0;
+    last_cursor_ = {};
+    cursor_sprite_.clear();
+    cursor_sprite_shape_ = 0;
+    cursor_sprite_version_ = 0;
+    cursor_sprite_sent_ = 0;
     remote_cursor_.Clear();
     if (view_ != nullptr && IsWindow(view_)) {
         ::SetCursor(::LoadCursor(nullptr, IDC_ARROW));

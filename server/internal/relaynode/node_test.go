@@ -346,6 +346,49 @@ func TestProvisionRenewsAndReleases(t *testing.T) {
 	}
 }
 
+func TestManagedUpdateAppliesToLiveLease(t *testing.T) {
+	n := startTestNode(t, []int{0})
+	_, pub := testKey("host-a")
+	lease := provisionLease(t, n.http, "devbox", pub, "carrier-a", 60)
+	if !n.auth.VerifyCarrier("devbox", "carrier-a") {
+		t.Fatal("an unmanaged lease must accept the carrier token")
+	}
+
+	status, body := call(t, n.http, http.MethodPost, "/v1/leases/devbox/managed", testNodeKey,
+		map[string]bool{"managed": true})
+	if status != http.StatusNoContent {
+		t.Fatalf("managed update = %d: %s", status, body)
+	}
+	if n.auth.VerifyCarrier("devbox", "carrier-a") {
+		t.Fatal("a managed lease still accepts the legacy carrier token")
+	}
+	if info, ok := n.auth.Lookup("devbox"); !ok || info.Port != lease.Port || info.PublicKey != pub {
+		t.Fatalf("managed update changed the lease: %+v, %v", info, ok)
+	}
+
+	status, body = call(t, n.http, http.MethodPost, "/v1/leases/devbox/managed", testNodeKey,
+		map[string]bool{"managed": false})
+	if status != http.StatusNoContent {
+		t.Fatalf("managed clear = %d: %s", status, body)
+	}
+	if !n.auth.VerifyCarrier("devbox", "carrier-a") {
+		t.Fatal("clearing managed did not restore carrier-token admission")
+	}
+
+	if status, _ := call(t, n.http, http.MethodPost, "/v1/leases/missing/managed", testNodeKey,
+		map[string]bool{"managed": true}); status != http.StatusNotFound {
+		t.Fatalf("unknown lease update = %d", status)
+	}
+	if status, _ := call(t, n.http, http.MethodPost, "/v1/leases/devbox/managed", testNodeKey,
+		map[string]string{}); status != http.StatusBadRequest {
+		t.Fatalf("missing managed field = %d", status)
+	}
+	if status, _ := call(t, n.http, http.MethodPost, "/v1/leases/devbox/managed", "wrong-key",
+		map[string]bool{"managed": true}); status != http.StatusUnauthorized {
+		t.Fatalf("managed update without the key = %d", status)
+	}
+}
+
 func TestProvisionValidation(t *testing.T) {
 	n := startTestNode(t, []int{0, 0})
 	_, pub := testKey("host-a")

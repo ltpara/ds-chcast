@@ -40,6 +40,10 @@ const (
 	// ten seconds. Two endpoints are probed per measurement, retried on failure.
 	DefaultNatProbeRateMax = 60
 	defaultRateSpan        = 10 * time.Second
+	// punchReplayCapacity bounds the seen transport proofs. Like the relay
+	// guard, the cache refuses new admissions when full instead of evicting a
+	// live entry, which would forget a replay.
+	punchReplayCapacity = 8192
 )
 
 type options struct {
@@ -156,6 +160,8 @@ type Server struct {
 	relayOnly         func() bool
 	hostCarrierLinked func(string) bool
 	transport         *acl.TransportVerifier
+	transportReplayMu sync.Mutex
+	transportReplay   map[string]punchReplay
 	// tcpPunch is nil when the coordination listener is disabled or could not
 	// bind; punching then stays on UDP.
 	tcpPunch  *tcpPuncher
@@ -200,6 +206,7 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		relayOnly:         cfg.relayOnly,
 		hostCarrierLinked: cfg.hostCarrierLinked,
 		transport:         cfg.transport,
+		transportReplay:   make(map[string]punchReplay),
 		done:              make(chan struct{}),
 	}
 	server.startTCPPunch(cfg)
@@ -413,8 +420,8 @@ func (s *Server) relayFor(host registry.Host) string {
 // back to the legacy keys. A managed host always requires a credential, so
 // device policy can never be bypassed with the deployment-wide punch secret;
 // unmanaged devices keep the historical shared-key behavior.
-func (s *Server) checkViewerPunch(msg wire.Message, now time.Time) bool {
-	if s.verifyTransportPunch(msg, now) {
+func (s *Server) checkViewerPunch(msg wire.Message, now time.Time, peer string) bool {
+	if s.verifyTransportPunch(msg, now, peer) {
 		return true
 	}
 	if msg.Transport != "" {
@@ -437,7 +444,7 @@ func (s *Server) checkViewerPunch(msg wire.Message, now time.Time) bool {
 // verifyTransportPunch validates the signed credential and the viewer's proof
 // of possession. The proof covers the fresh nonce and timestamp, so a captured
 // credential cannot be presented by another party.
-func (s *Server) verifyTransportPunch(msg wire.Message, now time.Time) bool {
+func (s *Server) verifyTransportPunch(msg wire.Message, now time.Time, peer string) bool {
 	if s.transport == nil || msg.Transport == "" || msg.TransportProof == "" || msg.Timestamp <= 0 {
 		return false
 	}
@@ -458,7 +465,43 @@ func (s *Server) verifyTransportPunch(msg wire.Message, now time.Time) bool {
 		return false
 	}
 	message := identity.TransportProofMessage(ticket.Audience, ticket.HostID, msg.Nonce, msg.Timestamp)
-	return identity.Verify(ed25519.PublicKey(ticket.ClientPublicKey[:]), message, msg.TransportProof)
+	if !identity.Verify(ed25519.PublicKey(ticket.ClientPublicKey[:]), message, msg.TransportProof) {
+		return false
+	}
+	return s.admitTransportPunch(ticket.ID, msg.Nonce, msg.Timestamp, ticket.ExpiresAt, peer, now)
+}
+
+type punchReplay struct {
+	peer    string
+	expires time.Time
+}
+
+// admitTransportPunch records one verified proof. An identical proof may repeat
+// from the same peer, which keeps UDP retransmits and TCP punch retries working,
+// but the same datagram replayed from another source is refused. The cache never
+// evicts a live entry to make room: when full, new proofs fail closed.
+func (s *Server) admitTransportPunch(ticketID, nonce string, timestamp, expiresAt int64,
+	peer string, now time.Time) bool {
+	key := ticketID + "\x00" + nonce + "\x00" + strconv.FormatInt(timestamp, 10)
+	s.transportReplayMu.Lock()
+	defer s.transportReplayMu.Unlock()
+	for seenKey, entry := range s.transportReplay {
+		if !now.Before(entry.expires) {
+			delete(s.transportReplay, seenKey)
+		}
+	}
+	if entry, ok := s.transportReplay[key]; ok {
+		return entry.peer == peer
+	}
+	if len(s.transportReplay) >= punchReplayCapacity {
+		return false
+	}
+	expiry := time.Unix(expiresAt, 0).Add(punchAuthWindow)
+	if !expiry.After(now) {
+		expiry = now.Add(punchAuthWindow)
+	}
+	s.transportReplay[key] = punchReplay{peer: peer, expires: expiry}
+	return true
 }
 
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
@@ -498,7 +541,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
-	if !s.checkViewerPunch(msg, time.Now()) {
+	if !s.checkViewerPunch(msg, time.Now(), src.String()) {
 		result = "auth_failed"
 		reply.Error = "punch authentication failed"
 		s.reply(src, reply)

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -206,6 +207,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // Host shared-folder browser. Modeless like chat; it never takes the
   // keyboard, so remote input keeps flowing while it is open.
   bool _fileBrowserOpen = false;
+  // Same-name prompt. The native side holds the offer until the dialog
+  // answers; the answered key (direction and transfer id) is kept briefly so
+  // a poll still carrying the old prompt cannot reopen it.
+  bool _conflictDialogOpen = false;
+  String _answeredConflictKey = '';
+  DateTime? _answeredConflictAt;
   // The directory the open browser last listed; dropped files follow it so
   // they land where the user is looking instead of the receive root.
   String _fileBrowserDirectory = '';
@@ -321,6 +328,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   double _cursorScale = 0;
   bool _cursorBusy = false;
   bool _cursorDirty = false;
+  // View-only pointer: the host's sprite drawn over the picture because no
+  // local cursor is installed to stand in for it. The image is decoded once
+  // per shape; positions arrive at RustDesk's 33 ms pointer cadence.
+  Timer? _remoteCursorTimer;
+  bool _remoteCursorBusy = false;
+  final ValueNotifier<RemoteCursorView?> _remoteCursor =
+      ValueNotifier<RemoteCursorView?>(null);
+  ui.Image? _remoteCursorImage;
+  int? _remoteCursorImageShape;
   // The identity this page pins for the current connection. Empty only until
   // the first contact, whose certificate is then confirmed and remembered.
   String _pinnedFingerprint = '';
@@ -464,6 +480,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _focus.dispose();
     _portForwardRules.dispose();
     _clearCursor();
+    _remoteCursorTimer?.cancel();
+    _remoteCursorTimer = null;
+    _remoteCursorImage?.dispose();
+    _remoteCursorImage = null;
+    _remoteCursor.dispose();
     final DateTime? auditStartedAt = _auditStartedAt;
     _auditStartedAt = null;
     if (auditStartedAt != null) {
@@ -667,6 +688,51 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         status.acceptsRecording) {
       _autoRecordAttempted = true;
       unawaited(_applyRecording(true));
+    }
+  }
+
+  /// Same-name prompts for file transfers (protocol v69). The engine holds
+  /// the offer until an answer; a remembered policy answers later conflicts
+  /// itself, so only ask while none is set. Responses are remembered briefly
+  /// by direction and transfer id because a poll can still carry the prompt
+  /// that was just answered.
+  void _watchFileConflict(ViewerStatus status) {
+    if (!status.fileConflictPending || _conflictDialogOpen) {
+      return;
+    }
+    final String key =
+        '${status.fileConflictDownload ? 1 : 0}:${status.fileConflictTransferId}';
+    final DateTime? answeredAt = _answeredConflictAt;
+    if (key == _answeredConflictKey &&
+        answeredAt != null &&
+        DateTime.now().difference(answeredAt) < const Duration(seconds: 2)) {
+      return;
+    }
+    _conflictDialogOpen = true;
+    unawaited(_showFileConflictDialog(status, key));
+  }
+
+  Future<void> _showFileConflictDialog(ViewerStatus status, String key) async {
+    final _FileConflictAnswer? answer = await showDialog<_FileConflictAnswer>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) => _FileConflictDialog(status: status),
+    );
+    _conflictDialogOpen = false;
+    if (answer == null) {
+      return;
+    }
+    _answeredConflictKey = key;
+    _answeredConflictAt = DateTime.now();
+    try {
+      await ViewerBridge.answerFileConflict(
+        answer.decision,
+        remember: answer.remember,
+      );
+    } on MissingPluginException {
+      // The engine went away with the session; nothing is left to answer.
+    } on PlatformException {
+      // Treated as stale; the next poll asks again if the prompt remains.
     }
   }
 
@@ -1477,6 +1543,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     _trackRecording(status);
     _watchRecording(status);
+    _watchFileConflict(status);
     _syncPortForwardRules(status.portForwardRules);
     // Track each persistent console's service id while it is alive. An ending
     // or refusal leaves nothing to attach to, and a poll from a fresh engine
@@ -2017,6 +2084,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// the control gate or the drawn scale changed since the last call.
   void _syncCursor() {
     final bool enabled = _inputActive && !_independentDisplays;
+    // While the page cannot replace the local cursor, the host's pointer is
+    // drawn over the picture instead, so a view-only session still shows it.
+    _setRemoteCursorPolling(
+      !enabled &&
+          !_independentDisplays &&
+          _status.state == ViewerState.streaming &&
+          _status.hasFrame,
+    );
     final double scale = _cursorTargetScale;
     if (_cursorSynced &&
         enabled == _cursorWanted &&
@@ -2065,6 +2140,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _clearCursor() {
+    _setRemoteCursorPolling(false);
     final bool touched = _cursorSynced || _cursorInstalled;
     _cursorSynced = false;
     _cursorWanted = false;
@@ -2091,6 +2167,123 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     } on MissingPluginException {
       // The native viewer is going away.
     }
+  }
+
+  /// Starts or stops the view-only pointer poll. RustDesk sends pointer state
+  /// on a 33 ms service, so this asks at the same cadence.
+  void _setRemoteCursorPolling(bool on) {
+    if (on) {
+      _remoteCursorTimer ??= Timer.periodic(
+        const Duration(milliseconds: 33),
+        (_) => unawaited(_pollRemoteCursor()),
+      );
+      return;
+    }
+    _remoteCursorTimer?.cancel();
+    _remoteCursorTimer = null;
+    _remoteCursorBusy = false;
+    _remoteCursor.value = null;
+    _dropRemoteCursorImage();
+  }
+
+  void _dropRemoteCursorImage() {
+    final ui.Image? old = _remoteCursorImage;
+    _remoteCursorImage = null;
+    _remoteCursorImageShape = null;
+    if (old != null) {
+      // The overlay built this frame may still paint the image.
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
+  }
+
+  Future<void> _pollRemoteCursor() async {
+    if (_remoteCursorBusy || !mounted) {
+      return;
+    }
+    _remoteCursorBusy = true;
+    try {
+      final RemoteCursorView? cursor = await ViewerBridge.takeRemoteCursor();
+      if (!mounted) {
+        return;
+      }
+      if (cursor == null) {
+        _remoteCursor.value = null;
+        return;
+      }
+      final Uint8List? bgra = cursor.bgra;
+      if (bgra != null &&
+          bgra.length == cursor.width * cursor.height * 4 &&
+          cursor.width > 0 &&
+          cursor.height > 0 &&
+          _remoteCursorImageShape != cursor.shapeId) {
+        final Completer<ui.Image> decoded = Completer<ui.Image>();
+        ui.decodeImageFromPixels(
+          bgra,
+          cursor.width,
+          cursor.height,
+          ui.PixelFormat.bgra8888,
+          decoded.complete,
+        );
+        final ui.Image image = await decoded.future;
+        if (!mounted) {
+          image.dispose();
+          return;
+        }
+        _dropRemoteCursorImage();
+        _remoteCursorImage = image;
+        _remoteCursorImageShape = cursor.shapeId;
+      }
+      if (!cursor.visible ||
+          cursor.shapeId == 0 ||
+          _remoteCursorImageShape != cursor.shapeId) {
+        _remoteCursor.value = null;
+        return;
+      }
+      _remoteCursor.value = cursor;
+    } on PlatformException {
+      // The session is already going away.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      _remoteCursorBusy = false;
+    }
+  }
+
+  Widget _buildRemoteCursorOverlay(Size drawn) {
+    return ValueListenableBuilder<RemoteCursorView?>(
+      valueListenable: _remoteCursor,
+      builder: (BuildContext context, RemoteCursorView? cursor, Widget? child) {
+        final ui.Image? image = _remoteCursorImage;
+        if (cursor == null || !cursor.visible || image == null) {
+          return const SizedBox.shrink();
+        }
+        final int width =
+            _status.sourceWidth > 0 ? _status.sourceWidth : _status.width;
+        final int height =
+            _status.sourceHeight > 0 ? _status.sourceHeight : _status.height;
+        if (width <= 0 || height <= 0 || drawn.width <= 0 || drawn.height <= 0) {
+          return const SizedBox.shrink();
+        }
+        final double sx = drawn.width / width;
+        final double sy = drawn.height / height;
+        // x/y is the hotspot, so the sprite's top-left sits before it.
+        return Stack(
+          children: <Widget>[
+            Positioned(
+              left: (cursor.x - cursor.hotspotX) * sx,
+              top: (cursor.y - cursor.hotspotY) * sy,
+              width: cursor.width * sx,
+              height: cursor.height * sy,
+              child: RawImage(
+                image: image,
+                fit: BoxFit.fill,
+                filterQuality: FilterQuality.low,
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   void _onViewScale(double scale) {
@@ -5781,6 +5974,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onCursorHint: _onCursorHint,
                       onCursorHintExit: _hideCursorHint,
                       onFocusRequested: _focus.requestFocus,
+                      overlayBuilder:
+                          _inputActive ? null : _buildRemoteCursorOverlay,
                     ),
                   )
                 else
@@ -7623,6 +7818,123 @@ class _CredentialDialogState extends State<_CredentialDialog> {
       ],
     );
   }
+}
+
+/// What the operator chose for a same-name conflict. The decision numbers
+/// match the protocol: 0 skip, 1 overwrite, 2 cancel.
+class _FileConflictAnswer {
+  const _FileConflictAnswer(this.decision, this.remember);
+
+  final int decision;
+  final bool remember;
+}
+
+/// RustDesk-style prompt for a file that already exists on the other side.
+/// Skip keeps the existing file, Overwrite replaces it and Cancel ends the
+/// transfer (for an upload queue or folder download, the rest of it too).
+class _FileConflictDialog extends StatefulWidget {
+  const _FileConflictDialog({required this.status});
+
+  final ViewerStatus status;
+
+  @override
+  State<_FileConflictDialog> createState() => _FileConflictDialogState();
+}
+
+class _FileConflictDialogState extends State<_FileConflictDialog> {
+  bool _remember = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final ViewerStatus status = widget.status;
+    final String existing = <String>[
+      _formatBytes(status.fileConflictExistingSize),
+      _formatConflictTime(status.fileConflictExistingTime),
+    ].where((String part) => part.isNotEmpty).join(' · ');
+    return AlertDialog(
+      title: Text(tr('文件已存在')),
+      content: SizedBox(
+        width: 400,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              status.fileConflictDownload
+                  ? tr('主机发送的文件与本地已有文件同名：')
+                  : tr('要上传的文件与主机上的文件同名：'),
+              style: const TextStyle(fontSize: 12.5),
+            ),
+            const SizedBox(height: 8),
+            SelectableText(
+              status.fileConflictName,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              tr('已有文件：{detail}', <String, Object?>{'detail': existing}),
+              style: const TextStyle(fontSize: 12.5),
+            ),
+            Text(
+              tr('新文件：{size}', <String, Object?>{
+                'size': _formatBytes(status.fileConflictSize),
+              }),
+              style: const TextStyle(fontSize: 12.5),
+            ),
+            if (status.fileConflictIdentical) ...<Widget>[
+              const SizedBox(height: 8),
+              Text(
+                tr('两个文件的大小和修改时间相同，内容可能一致。'),
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: Colors.orangeAccent,
+                ),
+              ),
+            ],
+            CheckboxListTile(
+              value: _remember,
+              onChanged: (bool? value) =>
+                  setState(() => _remember = value ?? false),
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              dense: true,
+              title: Text(
+                tr('对队列中的其余文件使用相同操作'),
+                style: const TextStyle(fontSize: 12.5),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () =>
+              Navigator.of(context).pop(const _FileConflictAnswer(2, false)),
+          child: Text(tr('取消传输')),
+        ),
+        TextButton(
+          onPressed: () =>
+              Navigator.of(context).pop(_FileConflictAnswer(0, _remember)),
+          child: Text(tr('跳过')),
+        ),
+        FilledButton(
+          onPressed: () =>
+              Navigator.of(context).pop(_FileConflictAnswer(1, _remember)),
+          child: Text(tr('覆盖')),
+        ),
+      ],
+    );
+  }
+}
+
+String _formatConflictTime(int seconds) {
+  if (seconds <= 0) {
+    return '';
+  }
+  final DateTime at = DateTime.fromMillisecondsSinceEpoch(seconds * 1000);
+  String two(int value) => value.toString().padLeft(2, '0');
+  return '${at.year}-${two(at.month)}-${two(at.day)} '
+      '${two(at.hour)}:${two(at.minute)}';
 }
 
 String _formatBytes(int bytes) {

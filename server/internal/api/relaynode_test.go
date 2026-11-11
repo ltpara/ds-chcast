@@ -56,6 +56,7 @@ func newStubNode(t *testing.T, relayHost, carrier string) *stubNode {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", n.handleHealth)
 	mux.HandleFunc("POST /v1/leases", n.handleLease)
+	mux.HandleFunc("POST /v1/leases/{id}/managed", n.handleManaged)
 	mux.HandleFunc("DELETE /v1/leases/{id}", n.handleRelease)
 	n.server = httptest.NewServer(mux)
 	n.url = n.server.URL
@@ -173,6 +174,31 @@ func (n *stubNode) handleLease(w http.ResponseWriter, r *http.Request) {
 		reply["carrier_v6"] = carrierV6
 	}
 	writeStubJSON(w, http.StatusOK, reply)
+}
+
+func (n *stubNode) handleManaged(w http.ResponseWriter, r *http.Request) {
+	if !n.checkKey(w, r) {
+		return
+	}
+	var req struct {
+		Managed *bool `json:"managed"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil || req.Managed == nil {
+		writeStubJSON(w, http.StatusBadRequest, map[string]string{"error": "managed is required"})
+		return
+	}
+	id := r.PathValue("id")
+	n.mu.Lock()
+	_, live := n.ports[id]
+	if live {
+		n.managed[id] = *req.Managed
+	}
+	n.mu.Unlock()
+	if !live {
+		writeStubJSON(w, http.StatusNotFound, map[string]string{"error": "no live lease for " + id})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (n *stubNode) handleRelease(w http.ResponseWriter, r *http.Request) {
@@ -393,6 +419,42 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 	}
 	waitUntil(t, 2*time.Second, "remote lease release", func() bool {
 		return node.releaseCount("devbox") == 1
+	})
+}
+
+func TestPolicyChangePushesManagedToHoldingNode(t *testing.T) {
+	node := newStubNode(t, "relay-a.example", "relay-a.example:8448")
+	s := testutil.StartWith(t, testutil.Options{
+		RelayNodes:      []string{node.url},
+		RelayNodeHealth: 20 * time.Millisecond,
+	})
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse").Token
+	now := time.Now().Unix()
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "devbox", "devbox secret", "AB12", now), testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register devbox: %d %s", status, body)
+	}
+	if node.managedFor("devbox") {
+		t.Fatal("an unmanaged registration marked the relay lease managed")
+	}
+
+	if status, body := request(t, http.MethodPut, s.URL+"/v1/device-policies/devbox",
+		`{"mode":"open"}`, admin); status != http.StatusOK {
+		t.Fatalf("set policy: %d %s", status, body)
+	}
+	waitUntil(t, time.Second, "managed push to the holding node", func() bool {
+		return node.managedFor("devbox")
+	})
+
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/device-policies/devbox",
+		"", admin); status != http.StatusNoContent {
+		t.Fatalf("delete policy: %d %s", status, body)
+	}
+	waitUntil(t, time.Second, "unmanaged push to the holding node", func() bool {
+		return !node.managedFor("devbox")
 	})
 }
 

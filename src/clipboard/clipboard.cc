@@ -7,6 +7,8 @@
 #include <functional>
 #include <numeric>
 
+#include <zstd.h>
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -754,15 +756,31 @@ std::vector<uint8_t> encode_clipboard_stream(const ClipboardContent& content) {
         stream[cursor++] = static_cast<uint8_t>(content.seq >> (8 * i));
     }
     for (const ClipboardFormatData& entry : content.formats) {
-        const uint32_t length = static_cast<uint32_t>(entry.data.size());
+        std::vector<uint8_t> compressed;
+        if (entry.data.size() >= kClipboardCompressionMinBytes) {
+            std::vector<uint8_t> candidate(ZSTD_compressBound(entry.data.size()));
+            const size_t produced = ZSTD_compress(candidate.data(), candidate.size(),
+                                                  entry.data.data(), entry.data.size(), 1);
+            if (!ZSTD_isError(produced) && produced < entry.data.size()) {
+                candidate.resize(produced);
+                compressed = std::move(candidate);
+            }
+        }
+        const bool is_compressed = !compressed.empty();
+        const std::vector<uint8_t>& stored = is_compressed ? compressed : entry.data;
+        const uint32_t stored_length = static_cast<uint32_t>(stored.size());
+        const uint32_t raw_length = static_cast<uint32_t>(entry.data.size());
         stream.push_back(static_cast<uint8_t>(entry.format));
-        stream.push_back(0);
+        stream.push_back(is_compressed ? kClipboardEntryFlagCompressed : 0);
         stream.push_back(0);
         stream.push_back(0);
         for (int i = 0; i < 4; ++i) {
-            stream.push_back(static_cast<uint8_t>(length >> (8 * i)));
+            stream.push_back(static_cast<uint8_t>(stored_length >> (8 * i)));
         }
-        stream.insert(stream.end(), entry.data.begin(), entry.data.end());
+        for (int i = 0; i < 4; ++i) {
+            stream.push_back(static_cast<uint8_t>(raw_length >> (8 * i)));
+        }
+        stream.insert(stream.end(), stored.begin(), stored.end());
     }
     return stream;
 }
@@ -830,9 +848,16 @@ bool decode_clipboard_stream(const uint8_t* data, size_t size, ClipboardContent&
             }
             return false;
         }
-        if (data[cursor + 1] != 0 || data[cursor + 2] != 0 || data[cursor + 3] != 0) {
+        const uint8_t flags = data[cursor + 1];
+        if (data[cursor + 2] != 0 || data[cursor + 3] != 0) {
             if (error) {
                 *error = "clipboard stream entry reserved bytes are not zero";
+            }
+            return false;
+        }
+        if ((flags & ~kClipboardEntryFlagCompressed) != 0) {
+            if (error) {
+                *error = "clipboard stream entry has unknown flags";
             }
             return false;
         }
@@ -843,15 +868,35 @@ bool decode_clipboard_stream(const uint8_t* data, size_t size, ClipboardContent&
             return false;
         }
         previous = static_cast<int>(format);
-        const uint32_t length = read_u32(data + cursor + 4);
+        const uint32_t stored_length = read_u32(data + cursor + 4);
+        const uint32_t raw_length = read_u32(data + cursor + 8);
         cursor += kClipboardEntryHeaderSize;
-        if (length > format_limit(format)) {
+        if (raw_length > format_limit(format)) {
             if (error) {
                 *error = "clipboard stream entry " + std::to_string(i) + " is past its limit";
             }
             return false;
         }
-        if (length > size - cursor) {
+        const bool compressed = (flags & kClipboardEntryFlagCompressed) != 0;
+        if (compressed) {
+            // The sender only compresses when the payload shrinks; accepting a
+            // larger "compressed" block would let a peer expand a small stream
+            // into the per-format cap for no reason.
+            if (raw_length == 0 || stored_length >= raw_length) {
+                if (error) {
+                    *error = "clipboard stream entry " + std::to_string(i) +
+                             " is not actually compressed";
+                }
+                return false;
+            }
+        } else if (stored_length != raw_length) {
+            if (error) {
+                *error = "clipboard stream entry " + std::to_string(i) +
+                         " stores a different length than it declares";
+            }
+            return false;
+        }
+        if (stored_length > size - cursor) {
             if (error) {
                 *error = "clipboard stream entry " + std::to_string(i) + " overruns";
             }
@@ -859,9 +904,22 @@ bool decode_clipboard_stream(const uint8_t* data, size_t size, ClipboardContent&
         }
         ClipboardFormatData entry;
         entry.format = format;
-        entry.data.assign(data + cursor, data + cursor + length);
-        cursor += length;
-        seen += length;
+        if (compressed) {
+            entry.data.resize(raw_length);
+            const size_t produced = ZSTD_decompress(entry.data.data(), entry.data.size(),
+                                                    data + cursor, stored_length);
+            if (ZSTD_isError(produced) || produced != raw_length) {
+                if (error) {
+                    *error = "clipboard stream entry " + std::to_string(i) +
+                             " does not decompress to its declared length";
+                }
+                return false;
+            }
+        } else {
+            entry.data.assign(data + cursor, data + cursor + stored_length);
+        }
+        cursor += stored_length;
+        seen += raw_length;
         content.formats.push_back(std::move(entry));
     }
     if (cursor != size) {

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "chast/encoder.h"
+#include "chast/file_transfer.h"
 #include "chast/protocol.h"
 #include "display_video_receiver.h"
 
@@ -103,8 +104,9 @@ enum class ViewerTransport {
 
 // The viewer's upload queue, as the UI shows it. kHashing covers both waiting
 // for a folder to expand and the local SHA-256 pass that precedes the offer;
-// the last two are terminal states of the most recent attempt (the local file
-// is never modified).
+// kConflict means the host holds the offer until the operator answers the
+// same-name prompt; the last two are terminal states of the most recent
+// attempt (the local file is never modified).
 enum class FilePhase {
     kIdle = 0,
     kHashing = 1,
@@ -112,6 +114,7 @@ enum class FilePhase {
     kSending = 3,
     kDone = 4,
     kFailed = 5,
+    kConflict = 6,
 };
 
 // One remote console's life on the viewer. Requesting covers the round trip
@@ -310,6 +313,26 @@ struct ViewerStatus {
     // folder walk has CancelDirectoryDownload() and clipboard transfers follow
     // the clipboard permission, so CancelDownload() only acts when this is set.
     bool download_cancellable = false;
+    // Same-name handling (protocol v69). A held offer waits for the operator:
+    // `file_conflict_download` says whether it is a host download this viewer
+    // would receive or a viewer upload the host is holding. The identical flag
+    // and the existing file's size and modification time (Unix seconds) come
+    // from the side that found the clash. `file_conflict_policy` is the
+    // remembered choice for the rest of the queue (0 ask, 1 overwrite,
+    // 2 skip). `file_conflicts` counts the prompts shown; entries the operator
+    // kept are counted apart from failures in files_skipped/downloads_skipped.
+    bool file_conflict_pending = false;
+    bool file_conflict_download = false;
+    uint32_t file_conflict_transfer_id = 0;
+    std::string file_conflict_name;
+    uint64_t file_conflict_size = 0;
+    bool file_conflict_identical = false;
+    uint64_t file_conflict_existing_size = 0;
+    uint64_t file_conflict_existing_time = 0;
+    int file_conflict_policy = 0;
+    uint64_t file_conflicts = 0;
+    uint64_t files_skipped = 0;
+    uint64_t downloads_skipped = 0;
     // Shared-folder browsing. The entries themselves are taken through
     // TakeFileList(); these fields describe the newest answer so a page can
     // update without copying the list. `file_list_directory` echoes the
@@ -857,6 +880,13 @@ public:
     // clipboard transfers keep running because they have their own cancel
     // paths. Safe to call when nothing is downloading.
     void CancelDownload();
+    // The operator's answer to a same-name conflict (ViewerStatus::
+    // file_conflict_pending). Matches RustDesk's prompt: Skip keeps the
+    // existing entry, Overwrite replaces it, Cancel ends the queue (and a
+    // running folder walk). `remember` keeps Skip or Overwrite for the rest of
+    // the queue and has no effect on Cancel. Returns false when no conflict is
+    // waiting for an answer.
+    bool AnswerFileConflict(chast::FileConflictDecision decision, bool remember = false);
     // One listing the host sent, tagged with the directory it was requested
     // for (the host echoes no path, so the engine remembers the request).
     struct FileListAnswer {
@@ -1356,11 +1386,17 @@ private:
         uint64_t size = 0;
         uint64_t sent = 0;
         uint64_t resume_offset = 0;
+        // The local file's last-write time in Unix seconds, so the host can
+        // tell an identical file from a stale one. Zero when unknown.
+        uint64_t modified_time = 0;
         std::array<uint8_t, 32> digest{};
         uint32_t transfer_id = 0;
         // The upload belongs to the local clipboard (protocol v34): the host
         // stages it for CF_HDROP and the clipboard permission gates it.
         bool clipboard = false;
+        // The operator kept the destination's existing file; a completed
+        // entry with this flag counts as skipped, not as sent or failed.
+        bool skipped = false;
         std::string error;
     };
     // The single incoming download. The session thread owns the receiver;
@@ -1369,6 +1405,9 @@ private:
         enum class Stage {
             kNone,
             kReceiving,
+            // The destination already holds the offered name; the host is
+            // holding the offer until the operator answers.
+            kConflict,
             kDone,
             kFailed,
         };
@@ -1385,6 +1424,28 @@ private:
         // Clipboard staging reuses this download slot but is not audited.
         bool clipboard = false;
         std::string error;
+    };
+    // A name conflict waits here for AnswerFileConflict(). `download` picks
+    // the direction: an upload leaves its head in kOffered, a download keeps
+    // the FileDownload slot in kConflict. Everything needed to finish the
+    // accept or the skip is captured when the clash is found.
+    struct PendingFileConflict {
+        bool download = false;
+        uint32_t transfer_id = 0;
+        std::string name;
+        uint64_t size = 0;
+        bool identical = false;
+        uint64_t existing_size = 0;
+        uint64_t existing_modified_time = 0;
+        // Download direction only: the receive options prepared by the offer.
+        chast::FileReceiveOptions options;
+        bool clipboard = false;
+        bool walk = false;
+    };
+    struct ConflictAnswer {
+        uint32_t transfer_id = 0;
+        chast::FileConflictDecision decision = chast::FileConflictDecision::Skip;
+        bool remember = false;
     };
     // Shared-folder browse requests cross in order: a listing, a download or
     // an operation the operator clicked after it must reach the host in that
@@ -1481,6 +1542,17 @@ private:
     std::deque<PendingUploadRoot> pending_upload_roots_;
     FileUpload last_upload_;
     FileDownload download_;
+    // Same-name handling (protocol v69): the prompts waiting for the operator
+    // and the answers already given, both owned by the session thread. An
+    // upload and a download can be held at the same time, so the prompts form
+    // a queue; ViewerStatus shows the front and AnswerFileConflict() answers
+    // it.
+    std::deque<PendingFileConflict> conflicts_;
+    std::deque<ConflictAnswer> conflict_answers_;
+    // Remembered choice for the rest of the queue: 0 ask, 1 overwrite,
+    // 2 skip. Set by an answer with `remember` and cleared when the
+    // queue empties.
+    int conflict_policy_ = 0;
     std::thread file_worker_;
     bool file_worker_stop_ = false;
     // Bumped whenever the queue is purged; a worker that was walking a folder

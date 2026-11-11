@@ -4090,6 +4090,7 @@ void test_file_transfer() {
     offer.name = "report-\xE6\x8A\xA5\xE5\x91\x8A.pdf";
     offer.relative_path = "reports/2026";
     offer.sha256.fill(0xAB);
+    offer.modified_time = 1762999999;
 
     chast::FileOffer got_offer;
     check(chast::parse_file_offer(payload_of(chast::make_file_offer(offer)), got_offer,
@@ -4097,8 +4098,9 @@ void test_file_transfer() {
               got_offer.transfer_id == 7 && got_offer.size == 12 && got_offer.resume &&
               !got_offer.clipboard && got_offer.name == offer.name &&
               got_offer.sha256 == offer.sha256 &&
-              got_offer.relative_path == offer.relative_path,
-          "FileOffer round-trips id, size, resume flag, digest, UTF-8 name and directory");
+              got_offer.relative_path == offer.relative_path &&
+              got_offer.modified_time == 1762999999,
+          "FileOffer round-trips id, size, resume flag, digest, UTF-8 name, directory and time");
 
     chast::FileOffer clipboard_offer = offer;
     clipboard_offer.clipboard = true;
@@ -4113,11 +4115,16 @@ void test_file_transfer() {
     chast::FileOffer legacy_offer = offer;
     legacy_offer.relative_path.clear();
     std::vector<uint8_t> legacy = payload_of(chast::make_file_offer(legacy_offer));
-    legacy.resize(legacy.size() - 2);  // drop the empty v22 directory field
+    legacy.resize(legacy.size() - 8);  // drop the v69 modification time
     chast::FileOffer got_legacy;
     check(chast::parse_file_offer(legacy, got_legacy, &error) &&
+              got_legacy.name == offer.name && got_legacy.relative_path.empty() &&
+              got_legacy.modified_time == 0,
+          "a v22 FileOffer without the modification time still parses at the root");
+    legacy.resize(legacy.size() - 2);  // also drop the empty v22 directory field
+    check(chast::parse_file_offer(legacy, got_legacy, &error) &&
               got_legacy.name == offer.name && got_legacy.relative_path.empty(),
-          "a FileOffer without the directory field still parses at the receive root");
+          "a v21 FileOffer without the directory field parses at the receive root");
 
     check(chast::make_offer_relative_path("Trip", "2024\\07") == "Trip/2024/07" &&
               chast::make_offer_relative_path("Trip", "2024/07") == "Trip/2024/07" &&
@@ -4146,6 +4153,7 @@ void test_file_transfer() {
     chast::FileOffer rooted = offer;
     rooted.relative_path.clear();
     std::vector<uint8_t> overlong = payload_of(chast::make_file_offer(rooted));
+    overlong.resize(overlong.size() - 8);  // the appended directory replaces the v69 time
     const size_t overlong_length = chast::kMaxFileRelativePathBytes + 1;
     overlong.push_back(static_cast<uint8_t>(overlong_length & 0xFF));
     overlong.push_back(static_cast<uint8_t>((overlong_length >> 8) & 0xFF));
@@ -4298,6 +4306,75 @@ void test_file_transfer() {
     std::fill(zero_cancel_wire.begin(), zero_cancel_wire.begin() + 4, 0);
     check(!chast::parse_file_cancel(zero_cancel_wire, got_cancel, &error),
           "FileCancel with a zero transfer id is rejected");
+
+    chast::FileConflict conflict;
+    conflict.transfer_id = 7;
+    conflict.identical = true;
+    conflict.existing_size = 12;
+    conflict.existing_modified_time = 1762999999;
+    chast::FileConflict got_conflict;
+    check(chast::parse_file_conflict(payload_of(chast::make_file_conflict(conflict)),
+                                     got_conflict, &error) &&
+              got_conflict.transfer_id == 7 && got_conflict.identical &&
+              got_conflict.existing_size == 12 &&
+              got_conflict.existing_modified_time == 1762999999,
+          "FileConflict round-trips the identical flag and the existing file");
+    std::vector<uint8_t> conflict_flags = payload_of(chast::make_file_conflict(conflict));
+    conflict_flags[4] = 0x02;  // id(4), then the flags byte
+    check(!chast::parse_file_conflict(conflict_flags, got_conflict, &error),
+          "FileConflict with unknown flags is rejected");
+    std::vector<uint8_t> conflict_reserved = payload_of(chast::make_file_conflict(conflict));
+    conflict_reserved[5] = 1;  // first reserved byte
+    check(!chast::parse_file_conflict(conflict_reserved, got_conflict, &error),
+          "FileConflict with a nonzero reserved byte is rejected");
+    std::vector<uint8_t> conflict_trailing = payload_of(chast::make_file_conflict(conflict));
+    conflict_trailing.push_back(0x55);
+    check(!chast::parse_file_conflict(conflict_trailing, got_conflict, &error),
+          "FileConflict with trailing bytes is rejected");
+    chast::FileConflict zero_conflict;
+    check(chast::make_file_conflict(zero_conflict).empty(),
+          "the FileConflict maker refuses a zero transfer id");
+    std::vector<uint8_t> zero_conflict_wire = payload_of(chast::make_file_conflict(conflict));
+    std::fill(zero_conflict_wire.begin(), zero_conflict_wire.begin() + 4, 0);
+    check(!chast::parse_file_conflict(zero_conflict_wire, got_conflict, &error),
+          "FileConflict with a zero transfer id is rejected");
+
+    chast::FileConflictAnswer conflict_answer;
+    conflict_answer.transfer_id = 7;
+    conflict_answer.decision = chast::FileConflictDecision::Overwrite;
+    chast::FileConflictAnswer got_conflict_answer;
+    check(chast::parse_file_conflict_answer(
+              payload_of(chast::make_file_conflict_answer(conflict_answer)),
+              got_conflict_answer, &error) &&
+              got_conflict_answer.transfer_id == 7 &&
+              got_conflict_answer.decision == chast::FileConflictDecision::Overwrite,
+          "FileConflictAnswer round-trips the overwrite decision");
+    std::vector<uint8_t> bad_decision =
+        payload_of(chast::make_file_conflict_answer(conflict_answer));
+    bad_decision[4] = 3;  // id(4), then the decision byte
+    check(!chast::parse_file_conflict_answer(bad_decision, got_conflict_answer, &error),
+          "FileConflictAnswer with an unknown decision is rejected");
+    std::vector<uint8_t> conflict_answer_reserved =
+        payload_of(chast::make_file_conflict_answer(conflict_answer));
+    conflict_answer_reserved[5] = 1;
+    check(!chast::parse_file_conflict_answer(conflict_answer_reserved, got_conflict_answer,
+                                             &error),
+          "FileConflictAnswer with a nonzero reserved byte is rejected");
+    std::vector<uint8_t> conflict_answer_trailing =
+        payload_of(chast::make_file_conflict_answer(conflict_answer));
+    conflict_answer_trailing.push_back(0x55);
+    check(!chast::parse_file_conflict_answer(conflict_answer_trailing, got_conflict_answer,
+                                             &error),
+          "FileConflictAnswer with trailing bytes is rejected");
+    chast::FileConflictAnswer zero_conflict_answer;
+    check(chast::make_file_conflict_answer(zero_conflict_answer).empty(),
+          "the FileConflictAnswer maker refuses a zero transfer id");
+    std::vector<uint8_t> zero_conflict_answer_wire =
+        payload_of(chast::make_file_conflict_answer(conflict_answer));
+    std::fill(zero_conflict_answer_wire.begin(), zero_conflict_answer_wire.begin() + 4, 0);
+    check(!chast::parse_file_conflict_answer(zero_conflict_answer_wire, got_conflict_answer,
+                                             &error),
+          "FileConflictAnswer with a zero transfer id is rejected");
 
     chast::FileStreamHeader header;
     header.transfer_id = 7;
@@ -4810,7 +4887,7 @@ void test_clipboard_container() {
               what);
     };
     alters(8, static_cast<uint8_t>(stream[8] ^ 0xFF), "a CCLB with a wrong hash is rejected");
-    alters(4, 3, "a CCLB with an unknown version is rejected");
+    alters(4, 2, "a v2 CCLB is rejected by the v3 decoder");
     alters(5, 9, "a CCLB with too many formats is rejected");
     chast::ClipboardContent dropped;
     check(!chast::decode_clipboard_stream(stream.data(), stream.size() - 1, dropped, &error),
@@ -4891,6 +4968,29 @@ void test_clipboard_container() {
                                              large_decoded, &error) &&
               large_decoded.formats.size() == 1 && large_decoded.text() == large_text,
           "clipboard text at the stream limit round-trips");
+    check(large_stream.size() < large_text.size() / 2 &&
+              large_stream[chast::kClipboardStreamHeaderSize + 1] ==
+                  chast::kClipboardEntryFlagCompressed,
+          "a repetitive clipboard item travels compressed");
+    {
+        std::vector<uint8_t> broken = large_stream;
+        broken[chast::kClipboardStreamHeaderSize + chast::kClipboardEntryHeaderSize] ^= 0xFF;
+        chast::ClipboardContent dropped;
+        check(!chast::decode_clipboard_stream(broken.data(), broken.size(), dropped, &error),
+              "a CCLB with a corrupt compressed payload is rejected");
+    }
+    {
+        chast::ClipboardContent tiny;
+        chast::ClipboardFormatData entry;
+        entry.format = chast::ClipboardFormat::Text;
+        entry.data.assign({'o', 'k'});
+        tiny.formats.push_back(std::move(entry));
+        const std::vector<uint8_t> raw_stream = chast::encode_clipboard_stream(tiny);
+        check(raw_stream.size() ==
+                  chast::kClipboardStreamHeaderSize + chast::kClipboardEntryHeaderSize + 2 &&
+                  raw_stream[chast::kClipboardStreamHeaderSize + 1] == 0,
+              "a small clipboard item stays uncompressed");
+    }
     large.formats.front().data.push_back('L');
     check(!chast::valid_clipboard_content(large, &error),
           "clipboard text past the stream limit is rejected");

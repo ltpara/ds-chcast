@@ -599,6 +599,14 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 			go v.tcpPunchLoop()
 		}
 	}
+	// An override ticket has no external renewer: the embedding viewer follows
+	// the access_ticket events this refresh emits. Relay sessions also renew
+	// through relay auth, but direct and carrier sessions have no periodic
+	// credential consumer, so without this loop their lease would expire while
+	// the media path is still healthy.
+	if v.cfg.Emergency != nil {
+		go v.credentialRefreshLoop(20 * time.Second)
+	}
 	v.reportPath()
 	return v, nil
 }
@@ -683,10 +691,11 @@ func (v *ViewerAgent) lookupWithFailover(ctx context.Context, transportKey strin
 	return lookupResult{}, lastErr
 }
 
-// transportRefreshMargin renews a credential well before the relay or carrier
-// would refuse it. Tickets live for 60s and the relay re-authenticates every
-// 20s, so 15s leaves room for a lost renewal.
-const transportRefreshMargin = 15 * time.Second
+// transportRefreshMargin renews a credential well before the relay, carrier or
+// host lease would refuse it. Tickets live for 60s and periodic refreshes run
+// every 20s, so the 30s window leaves one tick plus the lookup timeout for a
+// lost renewal instead of racing the deadline.
+const transportRefreshMargin = 30 * time.Second
 
 func (v *ViewerAgent) applyTransportCredentials(host lookupResult) {
 	v.transportMu.Lock()
@@ -727,21 +736,65 @@ func (v *ViewerAgent) transportCredentialFor(audience string) *transportCredenti
 	if current != nil && time.Until(time.UnixMilli(current.ExpiresAtMS)) > transportRefreshMargin {
 		return current
 	}
+	v.refreshTransportCredentialsLocked()
+	return v.transportCredentialLocked(audience)
+}
+
+// credentialRefreshLoop refreshes the access ticket and transport credentials
+// while an override is active. It runs independently of the relay auth loop so
+// a direct or carrier session follows the renewed ticket as well.
+func (v *ViewerAgent) credentialRefreshLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-v.ctx.Done():
+			return
+		case <-ticker.C:
+			v.refreshExpiringTransportCredentials()
+		}
+	}
+}
+
+func (v *ViewerAgent) refreshExpiringTransportCredentials() {
+	if v.transportKey == nil {
+		return
+	}
+	v.transportMu.Lock()
+	defer v.transportMu.Unlock()
+	if !v.transportIssued {
+		return
+	}
+	refresh := false
+	for _, credential := range []*transportCredential{
+		v.transportPunch, v.transportRelay, v.transportCarrier,
+	} {
+		if credential != nil &&
+			time.Until(time.UnixMilli(credential.ExpiresAtMS)) <= transportRefreshMargin {
+			refresh = true
+			break
+		}
+	}
+	if refresh {
+		v.refreshTransportCredentialsLocked()
+	}
+}
+
+func (v *ViewerAgent) refreshTransportCredentialsLocked() {
 	key := base64.RawURLEncoding.EncodeToString(v.transportKey.Public().(ed25519.PublicKey))
 	ctx, cancel := context.WithTimeout(v.ctx, 10*time.Second)
 	host, err := v.lookupHost(ctx, key)
 	cancel()
 	if err != nil {
-		v.log.Warn("transport credential refresh failed", "audience", audience, "error", err)
-		return current
+		v.log.Warn("transport credential refresh failed", "error", err)
+		return
 	}
 	if err := checkHostBinding(v.cfg.ServerPublicKey, v.cfg.HostID, host); err != nil {
-		v.log.Warn("transport credential refresh binding", "audience", audience, "error", err)
-		return current
+		v.log.Warn("transport credential refresh binding", "error", err)
+		return
 	}
 	v.applyAccessTicket(host.AccessTicket, true)
 	v.applyTransportCredentialsLocked(host)
-	return v.transportCredentialLocked(audience)
 }
 
 func (v *ViewerAgent) transportCredentialLocked(audience string) *transportCredential {

@@ -312,43 +312,6 @@ bool ensure_subdirectory_chain(const std::wstring& root, const std::wstring& rel
     return true;
 }
 
-std::wstring unique_name(const std::wstring& directory, const std::wstring& name,
-                         std::string* error) {
-    if (!path_exists(join(directory, name))) {
-        return name;
-    }
-    std::wstring stem = name;
-    std::wstring extension;
-    const size_t dot = name.find_last_of(L'.');
-    if (dot != std::wstring::npos && dot != 0) {
-        stem = name.substr(0, dot);
-        extension = name.substr(dot);
-    }
-    for (int index = 1; index < 10000; ++index) {
-        const std::wstring suffix = L" (" + std::to_wstring(index) + L")";
-        std::wstring candidate = stem;
-        if (candidate.size() + suffix.size() + extension.size() > kMaxReceiveNameChars) {
-            const size_t keep = kMaxReceiveNameChars > suffix.size() + extension.size()
-                                    ? kMaxReceiveNameChars - suffix.size() - extension.size()
-                                    : 0;
-            candidate.resize(keep);
-            while (!candidate.empty() &&
-                   (candidate.back() == L' ' || candidate.back() == L'.')) {
-                candidate.pop_back();
-            }
-        }
-        candidate += suffix;
-        candidate += extension;
-        if (!path_exists(join(directory, candidate))) {
-            return candidate;
-        }
-    }
-    if (error) {
-        *error = "no free name is left in the receive directory";
-    }
-    return {};
-}
-
 struct Sidecar {
     uint64_t size = 0;
     std::array<uint8_t, 32> digest{};
@@ -604,6 +567,7 @@ struct FileReceiver::Impl {
     std::string name;
     uint64_t size = 0;
     uint64_t received = 0;
+    bool overwrite = false;
     std::array<uint8_t, 32> digest{};
     HANDLE file = INVALID_HANDLE_VALUE;
     Sha256 hash;
@@ -614,7 +578,97 @@ namespace {
 // 100 ns ticks between the FILETIME epoch (1601-01-01) and Unix time.
 constexpr uint64_t kFileTimeUnixEpoch = 116444736000000000ull;
 
+bool stat_file(const std::wstring& path, uint64_t& size, uint64_t& modified_time) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(long_path(path).c_str(), GetFileExInfoStandard, &data)) {
+        return false;
+    }
+    ULARGE_INTEGER file_size{};
+    file_size.LowPart = data.nFileSizeLow;
+    file_size.HighPart = data.nFileSizeHigh;
+    size = file_size.QuadPart;
+    ULARGE_INTEGER stamp{};
+    stamp.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    stamp.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    modified_time = stamp.QuadPart >= kFileTimeUnixEpoch
+                        ? (stamp.QuadPart - kFileTimeUnixEpoch) / 10000000ull
+                        : 0;
+    return true;
+}
+
+// Walks the existing part of the relative directory without creating
+// anything. A missing component or a component that is a file stops the walk:
+// either way the destination cannot exist yet, and create() reports the
+// details when the offer is accepted.
+bool locate_existing_directory(const std::wstring& root, const std::string& relative,
+                               std::wstring& directory) {
+    directory = root;
+    size_t start = 0;
+    while (start < relative.size()) {
+        const size_t slash = relative.find('/', start);
+        const std::string part = relative.substr(
+            start, slash == std::string::npos ? std::string::npos : slash - start);
+        const std::wstring next = join(directory, utf8_to_wide(part));
+        const DWORD attributes = GetFileAttributesW(long_path(next).c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return false;
+        }
+        directory = next;
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
+
 }  // namespace
+
+bool inspect_receive_target(const FileReceiveOptions& options, FileReceiveTarget& target,
+                            std::string* error) {
+    target = FileReceiveTarget{};
+    const std::wstring directory = absolute_path(utf8_to_wide(options.directory));
+    if (directory.empty()) {
+        if (error) {
+            *error = "the receive directory is not usable";
+        }
+        return false;
+    }
+    std::string relative;
+    if (!sanitize_received_directory(options.relative_path, relative)) {
+        if (error) {
+            *error = "the offered folder path is not usable";
+        }
+        return false;
+    }
+    std::wstring final_directory;
+    if (!locate_existing_directory(directory, relative, final_directory)) {
+        return true;
+    }
+    const std::wstring name = sanitize_wide(utf8_to_wide(options.name));
+    const std::wstring full = join(final_directory, name);
+    const DWORD attributes = GetFileAttributesW(long_path(full).c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+            return true;
+        }
+        if (error) {
+            *error = "cannot read the destination (error " + std::to_string(code) + ")";
+        }
+        return false;
+    }
+    target.exists = true;
+    target.directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (!target.directory && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+        // A stat failure only costs the prompt its hint; the overwrite itself
+        // still has to work, so this is not an error.
+        stat_file(full, target.size, target.modified_time);
+    }
+    return true;
+}
 
 FileCode resolve_receive_path(const std::string& root, const std::string& relative,
                               std::string& full_path, bool& is_directory,
@@ -1293,11 +1347,33 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
 
     const std::wstring sanitized = sanitize_wide(utf8_to_wide(options.name));
     impl.name = wide_to_utf8(sanitized);
-    impl.final_name = unique_name(final_directory, sanitized, error);
-    if (impl.final_name.empty()) {
+    impl.final_name = sanitized;
+    impl.overwrite = options.overwrite;
+    impl.final_path = join(final_directory, impl.final_name);
+    // A conflict is resolved by the caller before create(); by now the path
+    // either does not exist or the caller asked to replace it.
+    const DWORD target_attributes = GetFileAttributesW(long_path(impl.final_path).c_str());
+    if (target_attributes != INVALID_FILE_ATTRIBUTES) {
+        if ((target_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            if (error) {
+                *error = "the destination is an existing directory";
+            }
+            return nullptr;
+        }
+        if (!options.overwrite) {
+            if (error) {
+                *error = "the destination already exists";
+            }
+            return nullptr;
+        }
+    } else if (GetLastError() != ERROR_FILE_NOT_FOUND &&
+               GetLastError() != ERROR_PATH_NOT_FOUND) {
+        if (error) {
+            *error = "cannot read the destination (error " +
+                     std::to_string(GetLastError()) + ")";
+        }
         return nullptr;
     }
-    impl.final_path = join(final_directory, impl.final_name);
     const std::wstring part_name = partial_file_name(impl.final_name);
     if (part_name.empty()) {
         if (error) {
@@ -1509,8 +1585,12 @@ bool FileReceiver::finish(std::string& final_path, std::string* error) {
     }
     CloseHandle(impl.file);
     impl.file = INVALID_HANDLE_VALUE;
+    DWORD move_flags = MOVEFILE_WRITE_THROUGH;
+    if (impl.overwrite) {
+        move_flags |= MOVEFILE_REPLACE_EXISTING;
+    }
     if (!MoveFileExW(long_path(impl.part_path).c_str(), long_path(impl.final_path).c_str(),
-                     MOVEFILE_WRITE_THROUGH)) {
+                     move_flags)) {
         if (error) {
             *error = "cannot move the received file into place (error " +
                      std::to_string(GetLastError()) + ")";

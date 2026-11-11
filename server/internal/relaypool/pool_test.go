@@ -33,7 +33,14 @@ type fakeNode struct {
 	carrier     string
 	requests    []leaseRequest
 	released    []string
+	managed     []managedCall
+	managedCode int
 	badAuth     int
+}
+
+type managedCall struct {
+	id      string
+	managed bool
 }
 
 func newFakeNode(t *testing.T, relayHost string) *fakeNode {
@@ -92,6 +99,31 @@ func newNode(t *testing.T, relayHost string, useTLS bool) *fakeNode {
 			Carrier:      carrier,
 			ExpiresInSec: 120,
 		})
+	})
+	mux.HandleFunc("POST /v1/leases/{id}/managed", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testKey {
+			node.mu.Lock()
+			node.badAuth++
+			node.mu.Unlock()
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			Managed *bool `json:"managed"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Managed == nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		node.mu.Lock()
+		status := node.managedCode
+		node.managed = append(node.managed, managedCall{id: r.PathValue("id"), managed: *req.Managed})
+		node.mu.Unlock()
+		if status != 0 {
+			http.Error(w, "lease refused", status)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("DELETE /v1/leases/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+testKey {
@@ -381,6 +413,38 @@ func TestProvisionWithoutHealthyNode(t *testing.T) {
 	if _, err := pool.Provision("devbox", "pk", "token", false, time.Minute, ""); err == nil ||
 		!strings.Contains(err.Error(), "no healthy relay node") {
 		t.Fatalf("empty-candidate provision = %v", err)
+	}
+}
+
+func TestSetManagedTargetsTheHoldingNode(t *testing.T) {
+	node := newFakeNode(t, "node1.example")
+	other := newFakeNode(t, "node2.example")
+	pool := newPool(t, node, other)
+
+	if err := pool.SetManaged(node.server.URL, "devbox", true); err != nil {
+		t.Fatalf("set managed: %v", err)
+	}
+	node.mu.Lock()
+	calls := append([]managedCall(nil), node.managed...)
+	node.mu.Unlock()
+	if len(calls) != 1 || calls[0].id != "devbox" || !calls[0].managed {
+		t.Fatalf("managed calls = %+v", calls)
+	}
+	other.mu.Lock()
+	untouched := len(other.managed)
+	other.mu.Unlock()
+	if untouched != 0 {
+		t.Fatalf("an unrelated node received %d managed updates", untouched)
+	}
+
+	if err := pool.SetManaged("http://unknown.example", "devbox", true); err == nil {
+		t.Fatal("an unknown node was accepted")
+	}
+	node.mu.Lock()
+	node.managedCode = http.StatusNotFound
+	node.mu.Unlock()
+	if err := pool.SetManaged(node.server.URL, "devbox", false); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expired lease error = %v", err)
 	}
 }
 

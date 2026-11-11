@@ -1,5 +1,21 @@
 /// English for the session page, toolbar, camera, chat, stats and terminal.
 const Map<String, String> kEnglishSession = <String, String>{
+  '管理员应急访问': 'Administrator emergency access',
+  '登录并连接': 'Sign in and connect',
+  '管理员用户名': 'Administrator username',
+  '管理员密码': 'Administrator password',
+  '两步验证码（可选）': 'Two-factor code (optional)',
+  '应急原因': 'Emergency reason',
+  '例如：工单 4711，远程桌面无法登录':
+      'For example: ticket 4711, remote desktop cannot sign in',
+  '请填写应急访问原因': 'Enter a reason for the emergency access',
+  '受限设备拒绝普通账号时，管理员可为本次连接签发 60 秒应急票据。操作会记录管理员身份和填写的原因，且仍受设备权限上限与主机本地认证约束。':
+      'When a restricted device rejects an ordinary account, an administrator can issue a 60-second emergency ticket for this connection. The administrator identity and the reason are recorded, and the device permission ceiling and host-local authentication still apply.',
+  '本次会话由管理员应急授权，操作已记录审计':
+      'This session was authorized by an administrator as an emergency override; the action has been audited',
+  '无法读取查看器票据身份': 'Could not read the viewer ticket identity',
+  '隧道代理没有返回应急访问票据':
+      'The tunnel agent did not return an emergency access ticket',
   '请求管理员权限': 'Request administrator access',
   '主机已取得管理员权限': 'The host has administrator access',
   '等待主机本地确认 UAC…': 'Waiting for local UAC approval on the host…',
@@ -515,6 +531,20 @@ const Map<String, String> kEnglishSession = <String, String>{
   '名称不能为空': 'The name cannot be empty',
   '名称不能包含 / \\ : 或使用 . 与 ..': 'The name cannot contain / \\ : or be . or ..',
   '同名文件已存在': 'An entry with that name already exists',
+  '文件已存在': 'The file already exists',
+  '主机发送的文件与本地已有文件同名：':
+      'The file from the host has the same name as a local file:',
+  '要上传的文件与主机上的文件同名：':
+      'The file to upload has the same name as a file on the host:',
+  '已有文件：{detail}': 'Existing file: {detail}',
+  '新文件：{size}': 'New file: {size}',
+  '两个文件的大小和修改时间相同，内容可能一致。':
+      'Both files have the same size and modified time; they may be identical.',
+  '对队列中的其余文件使用相同操作': 'Do the same for the rest of the queue',
+  '取消传输': 'Cancel the transfer',
+  '已跳过，保留现有文件': 'Skipped; the existing file was kept',
+  '跳过': 'Skip',
+  '覆盖': 'Replace',
   '删除“{name}”？': 'Delete "{name}"?',
   '文件夹及其内容将被删除，此操作不可撤销。':
       'The folder and its contents will be deleted; this cannot be undone.',

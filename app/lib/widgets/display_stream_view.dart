@@ -88,11 +88,12 @@ Widget displayCursorOverlay(DisplayTexture texture, Size drawn) {
   final height = stream.sourceHeight > 0 ? stream.sourceHeight : stream.height;
   if (width <= 0 || height <= 0) return const SizedBox.shrink();
   final x = drawn.width / width, y = drawn.height / height;
+  // The protocol reports the hotspot, so the sprite's top-left sits before it.
   return Stack(
     children: [
       Positioned(
-        left: cursor.x * x,
-        top: cursor.y * y,
+        left: (cursor.x - cursor.hotspotX) * x,
+        top: (cursor.y - cursor.hotspotY) * y,
         width: cursor.width * x,
         height: cursor.height * y,
         child: RawImage(

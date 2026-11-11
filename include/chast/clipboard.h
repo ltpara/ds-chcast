@@ -45,12 +45,20 @@ inline constexpr uint32_t kMaxClipboardFileListBytes = 64u * 1024u;
 inline constexpr uint16_t kMaxClipboardFileEntries = 256;
 
 inline constexpr char kClipboardStreamMagic[4] = {'C', 'C', 'L', 'B'};
-inline constexpr uint8_t kClipboardStreamVersion = 2;
+// v3 (protocol v69): per-entry zstd compression. Older peers are refused by
+// the Hello version check, so no v2 fallback is needed on the stream.
+inline constexpr uint8_t kClipboardStreamVersion = 3;
 // magic (4) + version (1) + format count (1) + reserved (2) + hash (8) +
-// total payload length (8) + sender generation (8, v59).
+// total raw payload length (8) + sender generation (8, v59).
 inline constexpr size_t kClipboardStreamHeaderSize = 32;
-// Per entry: format (1) + reserved (1) + reserved (2) + length (4).
-inline constexpr size_t kClipboardEntryHeaderSize = 8;
+// Per entry: format (1) + flags (1) + reserved (2) + stored length (4) +
+// raw length (4). Bit0 of flags marks a zstd payload; stored is then smaller
+// than raw and the header total counts only raw bytes.
+inline constexpr size_t kClipboardEntryHeaderSize = 12;
+inline constexpr uint8_t kClipboardEntryFlagCompressed = 0x01;
+// Compressing a handful of bytes grows them and costs more CPU than it saves,
+// so entries below this size always travel raw.
+inline constexpr uint32_t kClipboardCompressionMinBytes = 256;
 
 struct ClipboardFormatData {
     ClipboardFormat format = ClipboardFormat::Text;

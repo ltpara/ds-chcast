@@ -1030,6 +1030,8 @@ struct QuicSession::Impl {
     struct IncomingFileOffer { bool clipboard = false; bool accepted = false; };
     std::map<uint32_t, IncomingFileOffer> incoming_file_offers;
     std::deque<FileCancel> file_cancels;
+    std::deque<FileConflict> file_conflicts;
+    std::deque<FileConflictAnswer> file_conflict_answers;
     std::map<uint32_t, OutgoingUpload> outgoing_uploads;
     std::deque<FileAnswer> file_answers;
     std::deque<FileResult> file_results;
@@ -4425,6 +4427,48 @@ struct QuicSession::Impl {
                 }
                 if (bad_offset) {
                     control_protocol_failure("FileAnswer: resume offset past the file size");
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileConflict: {
+                if (role != Role::Client) {
+                    break;
+                }
+                FileConflict conflict;
+                if (!parse_file_conflict(payload, conflict, &error)) {
+                    control_protocol_failure("FileConflict: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto it = outgoing_uploads.find(conflict.transfer_id);
+                    if (it == outgoing_uploads.end() || it->second.finished) {
+                        break;
+                    }
+                    while (file_conflicts.size() >= 8) {
+                        file_conflicts.pop_front();
+                    }
+                    file_conflicts.push_back(std::move(conflict));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileConflictAnswer: {
+                if (role != Role::Server) {
+                    break;
+                }
+                FileConflictAnswer answer;
+                if (!parse_file_conflict_answer(payload, answer, &error)) {
+                    control_protocol_failure("FileConflictAnswer: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_conflict_answers.size() >= 8) {
+                        file_conflict_answers.pop_front();
+                    }
+                    file_conflict_answers.push_back(answer);
                 }
                 cv.notify_all();
                 break;
@@ -9052,11 +9096,12 @@ Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_
                 return Error(Status::PermissionDenied, "file offer is missing or permission was revoked");
             }
             it->second.accepted = true;
-        } else {
+        } else if (code != FileCode::Conflict) {
+            // Conflict keeps the offer held until the decision arrives.
             impl.incoming_file_offers.erase(transfer_id);
         }
     }
-    if (code != FileCode::Ok) {
+    if (code != FileCode::Ok && code != FileCode::Conflict) {
         HQUIC stream = nullptr;
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
@@ -9184,6 +9229,11 @@ Error QuicSession::offer_file(const FileOffer& offer) {
         if (impl.outgoing_uploads.count(offer.transfer_id) != 0) {
             return Error(Status::InvalidCall, "the transfer id is already in use");
         }
+        // Offers that were refused, skipped or cancelled never produce a
+        // FileResult, so their finished entries must not exhaust the slots.
+        std::erase_if(impl.outgoing_uploads, [](const auto& item) {
+            return item.second.finished && item.second.stream == nullptr;
+        });
         if (impl.outgoing_uploads.size() >= 8) {
             return Error(Status::WaitTimeout, "too many uploads are already open");
         }
@@ -9213,7 +9263,8 @@ bool QuicSession::take_file_answer(FileAnswer& answer) {
     }
     answer = std::move(impl_->file_answers.front());
     impl_->file_answers.pop_front();
-    if (answer.code != FileCode::Ok) {
+    // Conflict holds the transfer open until FileConflictAnswer arrives.
+    if (answer.code != FileCode::Ok && answer.code != FileCode::Conflict) {
         const auto it = impl_->outgoing_uploads.find(answer.transfer_id);
         if (it != impl_->outgoing_uploads.end()) {
             it->second.finished = true;
@@ -9423,6 +9474,105 @@ bool QuicSession::take_file_result(FileResult& result) {
         impl.api->StreamClose(stream);
     }
     return true;
+}
+
+Error QuicSession::send_file_conflict(const FileConflict& conflict) {
+    Impl& impl = *impl_;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.role != Impl::Role::Server) {
+            return Error(Status::InvalidCall, "only the host holds an offer for a decision");
+        }
+        const auto it = impl.incoming_file_offers.find(conflict.transfer_id);
+        if (it == impl.incoming_file_offers.end() || it->second.accepted) {
+            return Error(Status::InvalidCall, "the offer is not being held");
+        }
+        if (!impl.file_allowed(it->second.clipboard, false)) {
+            return Error(Status::PermissionDenied,
+                         "file transfer is disabled by the host");
+        }
+    }
+    std::vector<uint8_t> message = make_file_conflict(conflict);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the conflict is not encodable");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_conflict(FileConflict& conflict) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_conflicts.empty()) {
+        return false;
+    }
+    conflict = impl_->file_conflicts.front();
+    impl_->file_conflicts.pop_front();
+    return true;
+}
+
+Error QuicSession::send_file_conflict_answer(const FileConflictAnswer& answer) {
+    Impl& impl = *impl_;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.role != Impl::Role::Client) {
+            return Error(Status::InvalidCall, "only the viewer answers a held offer");
+        }
+        const auto sent = impl.outgoing_uploads.find(answer.transfer_id);
+        if (sent != impl.outgoing_uploads.end() && !sent->second.finished) {
+            // A viewer upload the host is holding for the decision.
+            if (!impl.file_allowed(sent->second.offer.clipboard, true)) {
+                return Error(Status::PermissionDenied,
+                             "file transfer is disabled by the host");
+            }
+        } else {
+            // A host download we held with FileAnswer{Conflict}. Overwrite
+            // re-arms the offer so the stream that follows is accepted.
+            const auto offered = impl.incoming_file_offers.find(answer.transfer_id);
+            if (offered == impl.incoming_file_offers.end() || offered->second.accepted) {
+                return Error(Status::InvalidCall, "the transfer is not being held");
+            }
+            if (!impl.file_allowed(offered->second.clipboard, false)) {
+                return Error(Status::PermissionDenied,
+                             "file transfer is disabled by the host");
+            }
+            if (answer.decision == FileConflictDecision::Overwrite) {
+                offered->second.accepted = true;
+            } else {
+                impl.incoming_file_offers.erase(offered);
+            }
+        }
+    }
+    std::vector<uint8_t> message = make_file_conflict_answer(answer);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the answer is not encodable");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_conflict_answer(FileConflictAnswer& answer) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_conflict_answers.empty()) {
+        return false;
+    }
+    answer = impl_->file_conflict_answers.front();
+    impl_->file_conflict_answers.pop_front();
+    return true;
+}
+
+Error QuicSession::accept_held_download(uint32_t transfer_id) {
+    Impl& impl = *impl_;
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "only the host sends a download");
+    }
+    const auto it = impl.outgoing_uploads.find(transfer_id);
+    if (it == impl.outgoing_uploads.end() || it->second.finished) {
+        return Error(Status::InvalidCall, "the download is not being held");
+    }
+    if (!impl.file_allowed(it->second.offer.clipboard, true)) {
+        return Error(Status::PermissionDenied, "file transfer is disabled by the host");
+    }
+    it->second.accepted = true;
+    return Error::success();
 }
 
 // ----- shared-folder browsing -----

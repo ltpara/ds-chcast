@@ -19,6 +19,10 @@ public:
                       std::vector<uint8_t>& bytes, std::string* error) = 0;
     virtual bool Active() const = 0;
     virtual uint64_t SourceVersion() const { return 0; }
+    // Answers whether the announced file at index still refers to the same
+    // bytes on disk. Remote offers are immutable snapshots; local captures
+    // compare against the identity recorded when the list was announced.
+    virtual bool Unchanged(size_t index) const { (void)index; return true; }
     virtual void Cancel() = 0;
 };
 

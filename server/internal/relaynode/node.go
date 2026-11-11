@@ -158,6 +158,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.Handle("POST /v1/leases", s.requireKey(http.HandlerFunc(s.handleLease)))
+	mux.Handle("POST /v1/leases/{id}/managed", s.requireKey(http.HandlerFunc(s.handleManaged)))
 	mux.Handle("DELETE /v1/leases/{id}", s.requireKey(http.HandlerFunc(s.handleRelease)))
 	mux.Handle("GET /v1/stats", s.requireKey(http.HandlerFunc(s.handleStats)))
 	mux.Handle("GET /metrics", s.requireKey(http.HandlerFunc(s.handleMetrics)))
@@ -334,6 +335,40 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Release(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type managedRequest struct {
+	Managed *bool `json:"managed"`
+}
+
+// handleManaged applies a policy change to an existing lease. The field must be
+// present so a malformed body can never relax a managed lease by omission.
+func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !registry.ValidID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
+		return
+	}
+	var req managedRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	if dec.More() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: trailing data"})
+		return
+	}
+	if req.Managed == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "managed is required"})
+		return
+	}
+	if !s.auth.SetManaged(id, *req.Managed) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no live lease for " + id})
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

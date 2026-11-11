@@ -137,7 +137,7 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 		p.serveHostControl(conn, msg)
 		return
 	}
-	if err := p.checkAnnounce(msg); err != nil {
+	if err := p.checkAnnounce(msg, remote.String()); err != nil {
 		writeAnnounce(conn, wire.Message{Type: wire.TypeTCPPunch, Nonce: msg.Nonce, Error: err.Error()})
 		return
 	}
@@ -186,7 +186,7 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 		select {
 		case retry := <-requests:
 			if retry.Role != msg.Role || retry.HostID != msg.HostID || retry.Nonce != msg.Nonce ||
-				!p.limiter.allow(remote.IP.String()) || p.checkAnnounce(retry) != nil {
+				!p.limiter.allow(remote.IP.String()) || p.checkAnnounce(retry, remote.String()) != nil {
 				return
 			}
 			go p.triggerHost(msg.HostID, msg.Nonce, remote.String(), retry.NATType)
@@ -213,7 +213,7 @@ func (p *tcpPuncher) handle(conn net.Conn) {
 // checkAnnounce authenticates one half of a punch. Viewers present either a
 // short-lived transport credential or the legacy link/server key HMAC; hosts
 // prove their registered host key, because only that key can speak for an id.
-func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
+func (p *tcpPuncher) checkAnnounce(msg wire.Message, peer string) error {
 	if p.srv.relayOnly != nil && p.srv.relayOnly() {
 		return errors.New("direct connections are disabled")
 	}
@@ -235,7 +235,7 @@ func (p *tcpPuncher) checkAnnounce(msg wire.Message) error {
 	// viewer without a connection credential must not be able to use this port
 	// to probe whether an ID exists or is online.
 	if msg.Role == wire.RoleViewer {
-		if !p.srv.checkViewerPunch(msg, now) {
+		if !p.srv.checkViewerPunch(msg, now, peer) {
 			return errors.New("punch authentication failed")
 		}
 	}

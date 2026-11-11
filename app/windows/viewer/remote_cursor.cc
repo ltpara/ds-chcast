@@ -8,10 +8,11 @@ namespace chast_viewer {
 
 namespace {
 
-// An icon is capped at 256x256 by the OS; asking for more fails and would
-// leave the viewer with no pointer at all.
-constexpr int kMaxCursorSide = 256;
-constexpr size_t kMaxShapeBytes = 4u * 1024u * 1024u;
+// The host caps sprites at 512 px, the same bound RustDesk's engine uses when
+// it installs remote cursors through CreateIconIndirect. The byte bound is
+// exactly one 512x512 BGRA sprite.
+constexpr int kMaxCursorSide = 512;
+constexpr size_t kMaxShapeBytes = 512u * 512u * 4u;
 
 // A real desktop cycles through a few dozen pointers at most (arrow, I-beam,
 // hand, the eight resize arrows, the wait spinner), so this only bounds what a
@@ -170,20 +171,17 @@ bool RemoteCursor::Activate(uint64_t shape_id, double scale, std::string* error)
     }
     const Shape& shape = found->second;
     int percent = scale_percent(scale);
+    // Shrink to fit rather than fail, and in whole percents: the quantiser
+    // rounds up, so 300 px at its 1.75 factor would still land at 525.
+    const int max_percent = (std::min)(kMaxCursorSide * 100 / shape.width,
+                                       kMaxCursorSide * 100 / shape.height);
+    if (percent > max_percent) {
+        percent = max_percent;
+    }
     int width = (std::max)(1, static_cast<int>(
                                    std::lround(shape.width * percent / 100.0)));
     int height = (std::max)(1, static_cast<int>(
                                     std::lround(shape.height * percent / 100.0)));
-    if (width > kMaxCursorSide || height > kMaxCursorSide) {
-        // Shrink to fit rather than fail: a slightly small pointer beats none.
-        const double fit = (std::min)(static_cast<double>(kMaxCursorSide) / shape.width,
-                                      static_cast<double>(kMaxCursorSide) / shape.height);
-        percent = scale_percent(fit);
-        width = (std::max)(1, static_cast<int>(
-                                  std::lround(shape.width * percent / 100.0)));
-        height = (std::max)(1, static_cast<int>(
-                                   std::lround(shape.height * percent / 100.0)));
-    }
     if (!shape.scaled.contains(percent)) {
         if (shape.scaled.size() >= kMaxScalesPerShape) {
             // QuantiseScale only yields a handful of factors; reaching this

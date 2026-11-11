@@ -84,6 +84,10 @@ private:
     // cursor while the page shows remote control on this window. Called from
     // the poll timer, so it runs on the platform thread.
     void ApplyCursor(const flutter::EncodableMap& args);
+    // Empties the session's cursor queue into the bridge's cache: the newest
+    // state for the control path, and the newest sprite for the view-only
+    // overlay. Both callers run on the platform thread.
+    void DrainCursorUpdates();
     void ClearCursor();
     // Loads the device key once from %APPDATA%\chast, so hosts that trust this
     // viewer can skip the interactive challenges on later connections.
@@ -142,6 +146,12 @@ private:
     RemoteCursor remote_cursor_;
     chast::CursorUpdate last_cursor_;
     bool have_cursor_ = false;
+    // The newest sprite, kept whole for the view-only overlay. Its version
+    // rises with each new sprite so the page copies it once per shape.
+    std::vector<uint8_t> cursor_sprite_;
+    uint64_t cursor_sprite_shape_ = 0;
+    uint64_t cursor_sprite_version_ = 0;
+    uint64_t cursor_sprite_sent_ = 0;
     bool cursor_override_ = false;
     uint64_t cursor_shape_ = 0;
     double cursor_scale_ = 1.0;
