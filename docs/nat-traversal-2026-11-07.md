@@ -321,11 +321,11 @@ RustDesk 客户端行为不算本服务已实现。
 | 中继承载 | TCP + WS，WS 端口 = 中继端口 + 2（`relay_server.rs:88`） | UDP 中继端口 + TCP twin + WS（`relay/relay.go:1385`）+ 共享载体 | 等价（+UDP） |
 | WS 反向代理客户端 IP | 信任 `X-Real-IP`/`X-Forwarded-For`（`relay_server.rs:430`） | `--relay-proxy-header`（默认关闭）在配置后取该头（支持逗号列表）作为查看者 IP，中继端口与共享载体 WS 握手一致；只替换 IP，端口与传输凭据重放绑定不变（`relay/relay.go:340`、`:1436`；`relay/shared.go:255`） | 一致（默认更安全） |
 | 空闲回收 | 30 s 无数据关闭（`relay_server.rs:566`） | 主机 90 s、查看者 60 s | 有意差异 |
-| 带宽限制 | single 128 MiB/s、total 1 GiB/s、黑名单 32 MiB/s（`:40-44`） | `policy.go` 同默认值，可按会话/总量/黑名单计费 | 一致 |
+| 带宽限制 | single 128 MiB/s、total 1 GiB/s、黑名单 32 MiB/s（`:42-46`） | `policy.go` 同默认值，可按会话/总量/黑名单计费 | 一致 |
 | 持续会话降级 | 1800 s 后平均速率 > 0.66×single 即降级 | 同阈值与检查窗口 | 一致 |
 | 黑白名单 | `blacklist.txt`/`blocklist.txt`，每秒复查 | 同文件与复查周期，可落盘、可在控制台增删 | 一致 |
 | 用量统计 | 控制台 `u` | 控制台 `u` | 一致 |
-| 无空闲端口 | 不分配中继地址 | 注册返回 503 `no relay port is available` | 等价 |
+| 无空闲端口 | 单监听配对，无此失败模式 | 池耗尽时降级为“仅直连”注册（200，响应不带中继/载体，`chast_relay_lease_missing_total` 计数）；`--relay-only` 无直连兜底，返回 503（2026-11-12） | 等价（不再让主机整体下线） |
 | 中继健康 | `check_relay_servers` 每 3 s 探测并剔除不可达项（`:1316`） | `--relay-nodes` 每 10 s 健康探测，失败切节点或回退本机（`api/api.go:1546`） | 等价/增强 |
 | 中继选择 | `get_relay_server` 按请求轮询（`:959`） | 中继池按区域/健康选节点，主机续租保持粘性；`--relay-servers` 是同一中继的多个入口名 | 有意差异（连接更稳，但负载分摊方式不同） |
 

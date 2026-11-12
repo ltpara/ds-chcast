@@ -245,7 +245,7 @@
 计划与逐项记录见 `docs/m8-plan.md`。
 
 - 已完成：麦克风与双向音频 M8.5（协议 v18）。
-  - 编码统一走 vcpkg 的独立 Opus：系统声音 48 kHz 立体声 128 kbps，麦克风 48 kHz 单声道 32 kbps、20 ms/960 样本；`OpusHead` 携带 pre-skip。AAC 编码器与工厂已删除，`create_audio_encoder()` 只接受 Opus；`AudioCodec::AAC` 仅保留解码兼容，生产不产生 AAC 流。
+  - 编码统一走 vcpkg 的独立 Opus：系统声音 48 kHz 立体声 128 kbps，麦克风 48 kHz 单声道 32 kbps；2026-11-12 起帧长为 10 ms/480 样本、`RESTRICTED_LOWDELAY`（此前 20 ms/960）；`OpusHead` 携带 pre-skip。AAC 编码器与工厂已删除，`create_audio_encoder()` 只接受 Opus；`AudioCodec::AAC` 仅保留解码兼容，生产不产生 AAC 流。
   - 传输：查看器发起 `CMIC` 单向流（20 字节自描述头 + `OpusHead`），`kPermissionMicrophone` 由主机权限掩码控制，默认关闭；流打开/关闭就是麦克风开/关，权限收回会立即 abort。主机按流创建 Opus 解码器与 WASAPI 播放器，采用到达时间锚定 80 ms lead；查看器采集与编码在独立线程，帧循环队满只丢当前包，不阻塞视频。
   - 查看器：`ViewerEngine` 暴露授权/发送状态、设备、包数、丢弃与错误；原生桥提供 `setMicrophone/listMicrophones/selectMicrophone`；Flutter 工具栏麦克风按钮 + 设备菜单，状态浮层显示上行包数与丢弃。
   - 验证（2026-10-24，单机回环）：`chast-quic verify --microphone` 全部断言通过，`CMIC` 上行 90 包、主机解码 86088 帧、注入播放器测得 440 Hz/RMS 6864，关闭闸门的主机拒绝 `CMIC` 且视频继续；179 个访问单元、摘要 `CB960C0EAC53FDE2`。`ctest -C Release` 11/11；`flutter analyze`、68 项 `flutter test`、Windows Release 构建通过。

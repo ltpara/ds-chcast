@@ -2,11 +2,13 @@
 
 审核日期：2026-11-11。本轮只审核发射端，即被控 Windows 主机；服务器和接收端另行审核。为确定协议是否闭环，必要时追踪接收端调用，但不据此声称已审核整个接收端。
 
+> 2026-11-12 更新：本文参照基线 `c7f212d` 已不在本机 RustDesk 仓库中；当前可用基线是 `D:/rustdesk` 的 `55786aa`（2026-11-03）。该版本已有 Windows HDR 归一化（`libs/scrap/src/dxgi/hdr.rs`）和 `video_service/static_refresh.rs`，因此文中“RustDesk 没有 HDR/静止刷新”的隐含判断只适用于旧基线。另：G04 的“查看端每 8 秒请求 IDR”已在 2026-11-12 复核中撤销，当前实现只在录像器打开时请求一次起始 IDR，其余请求由流重建、序号缺口和解码错误触发，没有周期请求。最新对照见 [发射端审计](sender-audit-2026-11-12.md)。
+
 ## 结论与边界
 
 当前发射端已有较完整的远程控制主干：服务运行、多用户会话、多屏共享采集编码、权限控制、硬件及软件编码、音视频、文件与剪贴板、终端、端口转发、隐私模式和录制均有具体实现。不能仅凭 RustDesk 的功能名称把这些列成缺失，也不能因存在同名处理函数便认定体验完全一致。
 
-独立光标采样、发射端原始截图（G02）、协作光标的颜色/姓名/点击波纹（G21，v71）、查看端录制的周期关键帧（G04，查看端 8 s 自请求）以及第三方 OLE 虚拟文件源读取（G03）已于 2026-11-11 补齐。优先值得继续处理的是未认证连接与正式会话名额隔离和便携提权连续性；OLE 读路径的真实 Office/资源管理器附件与旧版下载替代仍需实测。AV1 软件 4:4:4、更多虚拟显示驱动、远程打印及控制方向切换属于后续选项。
+独立光标采样、发射端原始截图（G02）、协作光标的颜色/姓名/点击波纹（G21，v71）以及第三方 OLE 虚拟文件源读取（G03）已于 2026-11-11 补齐；G04 的“查看端录制周期关键帧”已于 2026-11-12 撤销，见下文 G04 状态。优先值得继续处理的是未认证连接与正式会话名额隔离和便携提权连续性；OLE 读路径的真实 Office/资源管理器附件与旧版下载替代仍需实测。AV1 软件 4:4:4、更多虚拟显示驱动、远程打印及控制方向切换属于后续选项。
 
 这是“主要功能面的源码对照 + 有限构建/测试”，不是逐行证明，也不是全功能实机验收。尤其没有完成双机弱网、多品牌 GPU、真实 UAC/锁屏切换、虚拟显示驱动部署、Office 附件和长时间录制测试。下文“已有”只表示追踪到了实现路径，不代表全部边界场景已通过。
 
@@ -33,7 +35,7 @@
 | Windows 服务、工作进程、登录会话切换 | [service.cc](D:/ds-chcast/host/service.cc)、[worker.cc](D:/ds-chcast/host/worker.cc)、[windows_sessions.cc](D:/ds-chcast/host/windows_sessions.cc) | [windows.rs](D:/rustdesk/src/platform/windows.rs)、[portable_service.rs](D:/rustdesk/src/server/portable_service.rs) | 已有服务模式；便携提权机制部分覆盖，见 G06 |
 | DXGI/GDI 采集及恢复 | [dxgi_capturer.cc](D:/ds-chcast/src/capture/dxgi_capturer.cc)、[gdi_capturer.cc](D:/ds-chcast/src/capture/gdi_capturer.cc) | [dxgi/mod.rs](D:/rustdesk/libs/scrap/src/dxgi/mod.rs)、[gdi.rs](D:/rustdesk/libs/scrap/src/dxgi/gdi.rs) | 已有；设备丢失、锁屏及混合 GPU 仍需实机验收 |
 | 多屏、显示变化与多订阅者 | [desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc)、[display.cc](D:/ds-chcast/src/capture/display.cc)、[display_subscription_test.cc](D:/ds-chcast/tests/display_subscription_test.cc) | [display_service.rs](D:/rustdesk/src/server/display_service.rs)、[video_service.rs](D:/rustdesk/src/server/video_service.rs) | 已有共享流及显示订阅；不能把多显示器支持列为缺口 |
-| GPU 编码、CPU 回退、编解码能力协商 | [encoder_factory.cc](D:/ds-chcast/src/codec/encoder_factory.cc)、[encoder.h](D:/ds-chcast/include/chast/encoder.h) | [codec.rs](D:/rustdesk/libs/scrap/src/common/codec.rs)、[aom.rs](D:/rustdesk/libs/scrap/src/common/aom.rs) | 已有 VPL/FFmpeg 厂商硬编和 OpenH264/VP9 软件路径；软件 AV1/AV1 4:4:4 有差异，见 G08 |
+| GPU 编码、CPU 回退、编解码能力协商 | [encoder_factory.cc](D:/ds-chcast/src/codec/encoder_factory.cc)、[encoder.h](D:/ds-chcast/include/chast/encoder.h) | [codec.rs](D:/rustdesk/libs/scrap/src/common/codec.rs)、[aom.rs](D:/rustdesk/libs/scrap/src/common/aom.rs) | 已有 VPL/FFmpeg 厂商硬编；软件路径为 VP9，OpenH264 已于 2026-11-12 移除；软件 AV1/AV1 4:4:4 仍有差异，见 G08 |
 | 带宽自适应、静态刷新、慢订阅者处理 | [video_qos.cc](D:/ds-chcast/src/host/video_qos.cc)、[desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc) | [video_qos.rs](D:/rustdesk/src/server/video_qos.rs)、[static_refresh.rs](D:/rustdesk/src/server/video_service/static_refresh.rs) | 已有；本轮 video_qos 测试通过，不等于双机弱网体验已验证 |
 | HDR 桌面显示 | [hdr_pass.cc](D:/ds-chcast/src/capture/hdr_pass.cc) | [hdr.rs](D:/rustdesk/libs/scrap/src/dxgi/hdr.rs:1) | 都存在 HDR 桌面到 SDR 的处理；不能据此宣称任一方支持端到端 HDR |
 | 光标形状和位置 | [desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc)、[cursor.cc](D:/ds-chcast/src/capture/cursor.cc) | [input_service.rs](D:/rustdesk/src/server/input_service.rs:330) | 已有独立采样线程（约 33 ms）与独立发送通道，见 G01 补记 |
@@ -46,7 +48,7 @@
 | 文件剪贴板、延迟读取及虚拟发布 | [clipboard_virtual.cc](D:/ds-chcast/src/clipboard/clipboard_virtual.cc)、[clipboard_local.cc](D:/ds-chcast/src/clipboard/clipboard_local.cc)、[clipboard_oledata.cc](D:/ds-chcast/src/clipboard/clipboard_oledata.cc) | [wf_cliprdr.c](D:/rustdesk/libs/clipboard/src/windows/wf_cliprdr.c:3757) | 接收/发布侧与第三方 OLE 虚拟源的延迟读取已有，见 G03；真实 Office 附件与旧版下载路径未实测 |
 | 文件浏览、分享目录、隐藏项、分页、续传 | [file_transfer.cc](D:/ds-chcast/src/clipboard/file_transfer.cc)、[host_server.cc](D:/ds-chcast/src/host/host_server.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs) | 已有；v69 覆盖冲突协商正在修改，暂不判定完成或缺失 |
 | 发射端原始截图 | [desktop_stream.cc](D:/ds-chcast/src/host/desktop_stream.cc)、[host_server.cc](D:/ds-chcast/src/host/host_server.cc)、[viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs:4097)、[video_service.rs](D:/rustdesk/src/server/video_service.rs:1502) | 已有：v70 原始帧请求/响应，查看端失败时回退解码帧，见 G02 |
-| 接收端录制与发射端录制 | [stream_recorder.cc](D:/ds-chcast/src/host/stream_recorder.cc)、[viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [video_service.rs](D:/rustdesk/src/server/video_service.rs:1067)、[connection.rs](D:/rustdesk/src/server/connection.rs:4016) | 两种录制已有；查看端录制已自请求 8 s IDR，主机端录制状态消息仍见 G04 |
+| 接收端录制与发射端录制 | [stream_recorder.cc](D:/ds-chcast/src/host/stream_recorder.cc)、[viewer_engine.cc](D:/ds-chcast/app/windows/viewer/viewer_engine.cc) | [video_service.rs](D:/rustdesk/src/server/video_service.rs:1067)、[connection.rs](D:/rustdesk/src/server/connection.rs:4016) | 两种录制已有；查看端只在录像器打开时请求起始 IDR，没有周期请求（2026-11-12 修正）；主机端录制状态消息仍见 G04 |
 | ConPTY 终端及持久会话 | [terminal_relay.cc](D:/ds-chcast/src/host/terminal_relay.cc) | [terminal_service.rs](D:/rustdesk/src/server/terminal_service.rs) | 已有；没有据此声称所有用户令牌/退出场景都已验证 |
 | TCP 端口转发 | [port_forward_relay.cc](D:/ds-chcast/src/host/port_forward_relay.cc) | [port_forward_mux.rs](D:/rustdesk/src/server/port_forward_mux.rs) | 已有；本轮不展开服务器中继实现 |
 | 虚拟显示、无头及隐私恢复 | [virtual_display.cc](D:/ds-chcast/src/host/virtual_display.cc)、[display_privacy.cc](D:/ds-chcast/src/host/display_privacy.cc) | [virtual_display_manager.rs](D:/rustdesk/src/virtual_display_manager.rs)、[win_virtual_display.rs](D:/rustdesk/src/privacy_mode/win_virtual_display.rs) | 已有；驱动供应与多 GPU 实测尚需补齐，见 G09 |
@@ -102,7 +104,7 @@
 
 **建议。** 增加接收端录制状态，与发射端本地录制共同决定有限 GOP；对每个共享显示源按录制订阅者计数，最后一个录制者退出后再恢复普通会话策略。具体帧数应结合帧率和带宽测量选择，不应直接照搬 240。
 
-**状态（2026-11-11）。** 发射端本地录制已按 8 s 时间预算请求 IDR（`stream_recorder.cc` 的 `kKeyframeMs`，取 240 帧@30 fps）；接收端改为在录像器打开期间按同一 8 s 节拍自行请求目标流 IDR（多显示 `DisplayKeyframeRequest`、单显示 `KeyframeRequest`），无需新协议，见 `display_video_receiver_test` 的周期请求断言。接收端录制状态消息仍未引入，主机端也不会因他方录制调整编码器 GOP。
+**状态（2026-11-11，2026-11-12 修正）。** 发射端本地录制在分段等事件按需请求 IDR（`stream_recorder.cc` 的 `needs_keyframe`）。接收端在录像器打开时请求一次起始关键帧，之后只在流重建、视频序号缺口、解码器重建或初始化失败时按 1 秒节流重试；此前“录像器打开期间每 8 秒请求一次”的实现和相应周期断言已移除，不能按 8 秒节拍描述当前行为。接收端录制状态消息仍未引入，主机端也不会因他方录制调整编码器 GOP。相关审计见 [发射端审计](sender-audit-2026-11-12.md)。
 
 **验收。** 两个接收端分别开始/停止录制，测试共享源、编码器重建和分辨率变化；测量长录像随机 seek 延迟、关键帧间隔、额外码率和分段可播放性。
 
@@ -134,7 +136,9 @@
 
 ### G08 · C：可选软件 AV1 与 AV1 4:4:4
 
-**证据。** [encoder.h:48](D:/ds-chcast/include/chast/encoder.h:48) 明确 AV1 由硬件产生，4:4:4 只允许 VP9；[encoder_factory.cc](D:/ds-chcast/src/codec/encoder_factory.cc) 已有 OpenH264/VP9 软件路径。RustDesk [aom.rs:95](D:/rustdesk/libs/scrap/src/common/aom.rs:95) 有 libaom 编码，I444 使用 profile 1，[codec.rs:403](D:/rustdesk/libs/scrap/src/common/codec.rs:403) 包含 VP9/AV1 的 I444 选择。
+**证据。** [encoder.h:48](D:/ds-chcast/include/chast/encoder.h:48) 明确 AV1 由硬件产生，4:4:4 只允许 VP9；[encoder_factory.cc](D:/ds-chcast/src/codec/encoder_factory.cc) 的软件路径为 VP9（OpenH264 已于 2026-11-12 移除，软件 H.264 不再提供）。RustDesk [aom.rs:95](D:/rustdesk/libs/scrap/src/common/aom.rs:95) 有 libaom 编码，I444 使用 profile 1，[codec.rs:403](D:/rustdesk/libs/scrap/src/common/codec.rs:403) 包含 VP9/AV1 的 I444 选择。
+
+**2026-11-12 晚补充。** 软件回退已与 RustDesk 对齐为 VP9（libvpx）；OpenH264 从编码后端、CMake 和第三方声明中移除。G08 剩余项仅为软件 AV1、VP8 与 AV1 4:4:4。
 
 **建议。** 若低带宽文字清晰度是目标，可试验软件 AV1 4:4:4；先比较相同文字/滚动场景的 CPU、端到端延迟、码率与清晰度，再决定是否默认启用。VP8 属于兼容选项，现阶段优先级较低。不能把这项表述为“我方没有软件回退”或“NVIDIA/AMD 没有硬编”。
 

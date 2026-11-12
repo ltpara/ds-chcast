@@ -1,4 +1,6 @@
-# OpenH264 软件编码兜底
+# OpenH264 软件编码兜底（已废弃）
+
+> **历史文档（2026-11-12 晚起失效）**：产品软件回退已改为 VP9（libvpx），OpenH264 编码器、CMake 依赖与 `OpenH264::openh264` 链接均已从仓库移除。`EncoderBackend::Software` 只接受 VP9，Auto 在硬件全失败后协商软件 VP9。本文保留 2026-11-08 至 2026-11-12 的实现与验证记录，仅作追溯；现行行为见 [sender-effectiveness-rustdesk-2026-11-11.md](sender-effectiveness-rustdesk-2026-11-11.md) 第 16、17 节和 [encoder-quality-comparison-2026-11-11.md](encoder-quality-comparison-2026-11-11.md)。
 
 2026-11-08，在原有 oneVPL、FFmpeg 厂商编码后增加 OpenH264。
 
@@ -69,7 +71,7 @@ cmake --build build --config Release --target chast-host chast-service chast-enc
 | 12.2 | 551.76 |
 | 13.0 | **570.0** |
 
-2026-11-12 在 GTX 960 上实测：驱动 560 系列（NVENC API 12.2）时全部 `*_nvenc` 初始化失败，`EncoderBackend::Auto` 回退 OpenH264，1080p30 合成画面帧年龄约 1.3 秒；升级到 582.78（API 13.0）后走 `h264_nvenc`，帧年龄降到 3–4 毫秒，全部 74 项原生测试通过。AMD AMF 与 Intel QSV 各自有独立的运行时门槛，但失败表现相同：后端存在、驱动拒绝。
+2026-11-12 在 GTX 960 上实测（**早于当晚的 VP9 回退切换**）：驱动 560 系列（NVENC API 12.2）时全部 `*_nvenc` 初始化失败，`EncoderBackend::Auto` 回退 OpenH264，1080p30 合成画面帧年龄约 1.3 秒；升级到 582.78（API 13.0）后走 `h264_nvenc`，帧年龄降到 3–4 毫秒，全部 74 项原生测试通过。当下同样的驱动失败会回退软件 VP9，不再创建 OpenH264。AMD AMF 与 Intel QSV 各自有独立的运行时门槛，但失败表现相同：后端存在、驱动拒绝。
 
 对应改动：
 

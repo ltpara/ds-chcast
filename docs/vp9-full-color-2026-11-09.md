@@ -6,7 +6,7 @@
 
 - `src/codec/vpx_encoder.cc` 使用 libvpx VP9 realtime、CBR、`lag_in_frames=0`、关闭 alt-ref，最多 8 个线程。profile 0 使用 NV12 转 I420；profile 1 读取原始 BGRA，必要时先缩放 BGRA，再转 I444。支持缓存重复帧、强制关键帧及动态码率/FPS。
 - `src/codec/vpx_decoder.cc` 与 `vpx_internal.h` 校验 I420/I444，CPU 解码后转 BGRA 上传 GPU；完整色彩不会先降为 NV12 再恢复 BGRA。VP9 是软件路径，不等于整条链路不再依赖 D3D11。
-- 编码器工厂只在 Auto/Software 下接受 VP9；固定 Vpl/Ffmpeg 不隐式转软件。当前 H.264、HEVC、AV1 只接受 4:2:0；OpenH264 仍是软件 H.264 兜底。
+- 编码器工厂只在 Auto/Software 下接受 VP9；固定 Vpl/Ffmpeg 不隐式转软件。当前 H.264、HEVC、AV1 只接受 4:2:0。2026-11-12 晚起 OpenH264 已移除，`Software` 只接受 VP9，Auto 在硬件失败后回退软件 VP9；不再提供软件 H.264。
 - `DesktopStreamPool` 保留原始 BGRA 与 NV12，按编码器输入要求选用纹理，传播实际 codec/chroma，并按变化重建流和解码器。
 - ViewerEngine、逐屏 DisplayVideoReceiver 和 GpuFrameSink 支持实际色度变更与 BGRA 直接复制；多屏主状态从当前焦点流更新。
 - Flutter 提供 VP9 和标准/完整色彩选项并保存偏好；开启完整色彩时选择 VP9，切换其他 codec 时清除该偏好。偏好与最终实际格式分别处理。
@@ -45,8 +45,7 @@
 
 | 依赖 | 本机安装版本 | 用途 |
 | --- | --- | --- |
-| OpenH264 | 2.6.0#4 | 软件 H.264 兜底 |
-| libvpx | 1.16.0 | VP9 软件编解码 |
+| libvpx | 1.16.0 | VP9 软件编解码（2026-11-12 晚起也是唯一软件回退） |
 | libyuv | 1916；source `d98915a654d3564e4802a0004add46221c4e4348` | BGRA / I444 转换及缩放 |
 | libjpeg-turbo | 3.1.3 | libyuv 构建依赖 |
 

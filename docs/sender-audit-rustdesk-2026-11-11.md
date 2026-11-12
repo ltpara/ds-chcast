@@ -2,6 +2,8 @@
 
 审核日期：2026-11-11。本文审核当前发射端整体实现，不以 Git diff 决定范围。结论来自两侧源码、我方本轮回归和针对调度机制的新增探针；没有运行 RustDesk 二进制，不能据此宣布跨产品画质或延迟胜负。
 
+> 2026-11-12 复核：本机 RustDesk 参照已变为 `D:/rustdesk` 的 `55786aa`（2026-11-03），本文的 `7423dce` 仍可检出但不代表当前参照，旧路径 `D:/rustdesk-ref` 已不存在。`55786aa` 已加入 Windows HDR 归一化和 `static_refresh.rs`，所以本文“参考版本没有 Windows HDR tone-map”和“参考只有 WouldBlock 重复 10 次”的描述只适用于旧基线。另：查看端出站录制已有云端上传，缺的是主机入站录制的集中归档。当前结论见 [发射端审计](sender-audit-2026-11-12.md)。
+
 ## 1. 结论
 
 我方已经具备较完整的 Windows 远控主机能力。本次审核发现的光标采样耦合（A01）、截图控制流阻塞与流 ID 0 歧义（A03）、无设备 CPU 回退缺口（A04）、认证前连接占用正式名额（A05）已进入修复；弱网峰值帧龄门槛已收紧到 3 秒。最终实现和回归结果以 [2026-11-12 修复记录](D:/ds-chcast/docs/sender-fixes-2026-11-12.md) 为准。**A02 撤销缺陷认定：无限 P 帧、按需 IDR 是产品设计约束，录制也不引入周期 IDR。** RustDesk 的录制 GOP 策略属于设计差异，不能作为改变我方约束的理由。
@@ -31,7 +33,7 @@
 | DXGI / GDI 采集及恢复 | 自动采集器可在重建失败时换后端；`gdi-cpu` 在无 D3D 设备时输出系统内存 BGRA 并由软件编码消费；GPU 线程串行持有资源 | `libs/scrap/src/dxgi/mod.rs`、`gdi.rs` | 均有回退；我方 `gdi-cpu` 不再依赖 D3D11/Nv12Pass，见 A04 补记；CPU 路径的实际帧率与画质未与参考产品同条件比较 |
 | HDR、颜色、旋转 | scRGB→SDR、GPU 旋转、GPU BGRA→NV12；默认 BT.601 limited | 参考版本有旋转、GDI 与纹理/像素缓冲路径；本轮未找到 Windows HDR tone-map 实现 | 我方有明确 HDR→SDR 路径；这不等于端到端 HDR，也没有 HDR 显示器的同场景效果比较 |
 | 硬件编码 | oneVPL、FFmpeg NVENC/AMF/QSV；D3D11 纹理输入 | VRAM / HWRAM 编码，具体能力受构建特性和外部 hwcodec 影响 | 都有 GPU 编码路径；不同 GPU、驱动、初始化与重置成本未做同条件比较 |
-| 软件编码与格式 | OpenH264；VP9 4:2:0 / 4:4:4；AV1 只有硬件路径 | VP8、VP9、软件 AV1，VP9/AV1 可 4:4:4 | 我方缺 VP8、软件 AV1、AV1 4:4:4；是否实现取决于目标解码端和机器覆盖，不应把“支持更多格式”直接当成画质更好 |
+| 软件编码与格式 | 软件回退为 VP9（libvpx，4:2:0 / 4:4:4）；AV1 只有硬件路径；OpenH264 已于 2026-11-12 移除 | VP8、VP9、软件 AV1，VP9/AV1 可 4:4:4 | 软件回退格式已与参考一致（VP9）；我方仍缺 VP8、软件 AV1、AV1 4:4:4；不应把“支持更多格式”直接当成画质更好 |
 | 画质与码率 | 质量比例、基础码率表、动态码率；VP9 与硬件使用的预算公式有差别问题 | `common/codec.rs`、`common/vpxcodec.rs`、hwcodec | 硬件公式相近不代表所有编码器等价；VP9 预算、量化和丢帧参数并未对齐，见 B02 |
 | 静止画面刷新 | 按编码器、后端、画质设置有限重复预算；AV1 不刷新 | `video_service.rs` 在 WouldBlock 下仅对非 latency-free 编码器最多重复 10 次 | 我方覆盖更多硬编刷新场景；清晰度增益和额外功耗没有量化，不能仅按次数宣布更好 |
 | 同屏共享、多人接入 | 一个 Source 多个订阅，同格式可复用编码器；格式变化先证明再提交 | 新订阅且已有观看者时触发 `SWITCH` 重建 | 我方避免了部分不必要重建；跨源协商会设置 `negotiating` 并同步等候，不能声称零停顿 |
@@ -110,7 +112,7 @@ RustDesk GDI 返回系统内存像素，`common/convert.rs` 有 libyuv 转换，
 
 **2026-11-11 补记（工作区已修复，来自并发编辑，本轮仅验证）。** `CaptureBackend` 新增 `GdiCpu`：`gdi_capturer.cc` 在该后端下不创建设备、`GdiCapturer` 不建 Nv12Pass，`BitBlt` 后把 DIB 转成 `FrameInfo::cpu_bgra`；`shared_capturer.cc` 的读者在 `cpu_bgra` 时跳过共享纹理，`desktop_stream.cc` 将 CPU 像素直接交给 `OpenH264Encoder::encode_cpu_bgra` / `VpxEncoder::encode_cpu_bgra`。回退入口有三处：`AutoCapturer::initialize` 在 DXGI 失败时建 GDI，`AutoCapturer::capture` 在帧没有视频图像时切 `GdiCpu`，`Reader::fallback_cpu` 在 NV12Pass 初始化/转换失败时切 `GdiCpu`（合并采集的外置设备除外）。截图在 CPU 帧上直接读保留的 BGRA，不必为截图重建编码器。
 
-验证：`chast-desktop-stream-test` 与 `chast-host-parity-test` 重建后通过（17.10 s、154.59 s）；其中 `cpu_encoding_without_device` 覆盖无 D3D 设备的 H.264/VP9 4:2:0/4:4:4 首帧 IDR、增量帧和按需 IDR，`cpu_capture_pipeline` 在本机单屏上真实打开 `GdiCpu` 共享采集，确认帧无 GPU 纹理/设备、`Auto` 选择软件 H.264、编码出关键帧、CPU 截图尺寸正确。本轮另在 `shared_capturer` 测试中补充共享读者用例（`gdi-cpu` 后端、两个读者各自缩放），已注册为 CTest `shared_capturer` 并通过（0.37 s）。边界：未在禁用显卡/驱动的机器上复现视频处理器不可用；CPU 路径的帧率、CPU 占用和多屏开销未与 RustDesk 同条件比较；合并采集（多屏同 GPU 画布）仍要求外置设备，外置设备上的 NV12 失败仍返回 `FatalError`，没有无设备回退。
+验证：`chast-desktop-stream-test` 与 `chast-host-parity-test` 重建后通过（17.10 s、154.59 s）；其中 `cpu_encoding_without_device` 覆盖无 D3D 设备的 H.264/VP9 4:2:0/4:4:4 首帧 IDR、增量帧和按需 IDR，`cpu_capture_pipeline` 在本机单屏上真实打开 `GdiCpu` 共享采集，确认帧无 GPU 纹理/设备、`Auto` 选择软件 H.264、编码出关键帧、CPU 截图尺寸正确（2026-11-12 晚起 Auto 改选软件 VP9，软件 H.264 用例已删除）。本轮另在 `shared_capturer` 测试中补充共享读者用例（`gdi-cpu` 后端、两个读者各自缩放），已注册为 CTest `shared_capturer` 并通过（0.37 s）。边界：未在禁用显卡/驱动的机器上复现视频处理器不可用；CPU 路径的帧率、CPU 占用和多屏开销未与 RustDesk 同条件比较；合并采集（多屏同 GPU 画布）仍要求外置设备，外置设备上的 NV12 失败仍返回 `FatalError`，没有无设备回退。
 
 ### A05：认证前连接占用正式观看者名额（可用性问题）
 
@@ -145,6 +147,8 @@ RustDesk GDI 返回系统内存像素，`common/convert.rs` 有 libyuv 转换，
 ### B03：音频功能更多，不等于更低延迟或更好通话
 
 我方协议 `kOpusFrameSamples=960`，48 kHz 下为 **20 ms**，Opus 使用 AUDIO 或 VOIP application。参考音频服务使用 LowDelay，常规立体声按 **10 ms** 分块。两者集包时间、编码器模式、码率和缓冲不能视为相同。
+
+> **2026-11-12 晚修正**：本节为 2026-11-11 的记录。当前已改为 `kOpusFrameSamples=480`（10 ms）+ `OPUS_APPLICATION_RESTRICTED_LOWDELAY`，帧长与低延迟模式已与 RustDesk 对齐；码率仍显式设置（回环 128 kbps、麦克风 32 kbps），且仍是 DATAGRAM + PLC。系统音频队列深度按 25 包计约 250 ms，不再是 500 ms。
 
 我方系统音频共享队列每订阅 25 包，20 ms 下约 500 ms；最底层采集队列、发送和播放器还会叠加等待。这是上界和结构说明，不是正常负载延迟实测。DATAGRAM 减少可靠重传导致的过期音频等待，同时需要处理丢失；其优势不能用历史整条链路的不同参数结果简单归因。
 
@@ -188,7 +192,7 @@ SpeexDSP 路径确实存在，本轮合成 DSP 测试中噪声地板改善约 14
 | 远程打印 | 参考 printer_service、PrinterData 协议/IPC；我方未找到对应执行链路 | 不能重定向远程打印任务 | 产品扩展 |
 | 协作光标 | 我方 x/y/visible + 按下边沿；覆盖层有颜色、姓名和点击波纹，无自由标注 | 参考 whiteboard 模块 | 缺标注绘制 | 产品扩展 |
 | 切换控制方向 | 参考 SwitchSidesRequest；我方无对应协议 | 不能一键互换主控/被控角色 | 产品扩展 |
-| 录制后上传 | 参考 hbbs_http/record_upload；我方主机录制写本地 | 缺集中归档上传闭环 | 部署需求决定；参考也依赖服务配置 |
+| 录制后上传 | 参考 hbbs_http/record_upload；我方查看端出站录制已有云端上传/配额，主机入站录制只写本地 | 主机侧缺集中归档上传闭环 | 部署需求决定；参考也依赖服务配置 |
 | 更多虚拟显示后端、其他主机平台 | 我方 vdd 明确 Unsupported，主机仅 Windows | 驱动/平台覆盖较窄 | 单独规划，不能混同 Windows 当前体验 |
 
 ## 7. 本轮验证与可复查材料

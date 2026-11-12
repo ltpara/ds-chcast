@@ -1,14 +1,34 @@
 # 发射端功能与实现效果对照（chast vs RustDesk）
 
-状态：代码级对照，2026-11-11。chast 侧基线 `main` `ca51be2` 加本轮未提交
-改动（协议 v70）；RustDesk 侧基线为本机 `D:/rustdesk-ref`，提交 `7423dce`
-（2026-08-22）。
+状态：代码级对照，2026-11-11；2026-11-12 按效果口径复核（第 16 节）。
+chast 侧基线为提交 `deb64b8` 加未提交的协议 v73 改动；RustDesk 侧基线为
+本机 `D:/rustdesk` 的 `55786aa`（2026-11-03）。初版的 `ca51be2`/`7423dce`
+只作为历史记录保留。
 
 
 更新说明（2026-11-12）：本文保留早期静态对照，修复后的实现和验证以
 [发射端修复记录](D:/ds-chcast/docs/sender-fixes-2026-11-12.md) 为准。
 编码策略固定为无限 P 帧、按需 IDR，包括主机和查看端录制；不引入周期 GOP。
 截图现使用 v72 专用 CSHT 流，PNG 异步编码，原文控制流描述只适用于旧实现。
+
+效果复核（2026-11-12）：新增第 16 节，逐项核对码控、帧长、颜色、静止刷新、
+QoS 与软件回退；同时修正第 9 节“两端都是 10 ms Opus”的错误——chast 实际
+是 20 ms 帧，loopback 128 kbps、麦克风 32 kbps。该轮只改文档，没有改代码。
+
+对齐落地（2026-11-12 晚）：按产品决定移除 OpenH264，软件编码只保留
+libvpx VP9；无硬件时 Auto 把共享流协商为 VP9。Opus 改为 10 ms 帧并使用
+`OPUS_APPLICATION_RESTRICTED_LOWDELAY`，算法延迟与 RustDesk 对齐。
+实现、验证与剩余边界见第 17 节；第 16 节中“未改产品默认”的描述
+按该轮历史状态理解。
+
+基线更新（2026-11-12）：`D:/rustdesk-ref` 已不存在，当前本机参照是
+`D:/rustdesk` 的 `55786aa`（2026-11-03）。该版本已加入 Windows HDR 归一化
+（`libs/scrap/src/dxgi/hdr.rs`）和 `video_service/static_refresh.rs`，因此
+本文“RustDesk 无 HDR/仅 WouldBlock 重复 10 次”的判断只适用于旧基线
+`7423dce`；静止刷新预算表与 QoS 阈值在新基线上与我方一致。另：查看端出站
+录制已有云端上传/配额，缺的是主机入站录制的集中归档，本文“无录制上传”
+的表述应按此限定理解。最新结论见
+[发射端审计](sender-audit-2026-11-12.md)。
 
 口径说明：
 
@@ -30,10 +50,10 @@
 | 维度 | chast | RustDesk 7423dce | 判断 |
 | --- | --- | --- | --- |
 | DXGI 采集语义 | 指针帧与桌面帧分开标记；光标独立采样 | `LastPresentTime == 0` 视为 WouldBlock；光标走独立服务 | 持平，chast 更细 |
-| 静态画面的重复编码 | 按编码器/后端的静止刷新预算，刷新帧不算动态画面 | 仅 WouldBlock 时重复最近 YUV，最多 10 次，且仅限非 latency-free 编码器 | chast 更完整（新版本 RustDesk 另有实现） |
-| HDR 桌面 | FP16 scRGB → SDR 像素着色器，失败可回退 | 本基线 Windows 路径无 HDR 处理 | chast 占优（未做目视验收） |
+| 静态画面的重复编码 | 按编码器/后端的静止刷新预算，刷新帧不算动态画面 | 7423dce 仅 WouldBlock 时重复最近 YUV，最多 10 次；55786aa 已有 `static_refresh.rs`，预算表一致 | 旧基线 chast 更完整；新基线双方对齐 |
+| HDR 桌面 | FP16 scRGB → SDR 像素着色器，失败可回退 | 7423dce 无 HDR 处理；55786aa 已加入 `dxgi/hdr.rs` 归一化 | 旧基线 chast 占优；新基线双方都归一化到 SDR，都不是端到端 HDR |
 | 旋转/合并多屏 | 旋转 pass；主机侧合并画布（单 NV12 pass，4096 长边/面积上限） | 旋转有处理；无主机侧合并采集 | chast 多一项能力 |
-| 编码后端 | oneVPL → FFmpeg NVENC/AMF/QSV → OpenH264 | VRAM/HWRAM（外部 hwcodec）→ libvpx VP9，AV1 用 libaom | RustDesk 覆盖面更宽 |
+| 编码后端 | oneVPL → FFmpeg NVENC/AMF/QSV → libvpx VP9（软件；2026-11-12 起，此前为 OpenH264） | VRAM/HWRAM（外部 hwcodec）→ libvpx VP9，AV1 用 libaom | RustDesk 覆盖面更宽 |
 | 硬件编码零拷贝 | VPL/FFmpeg 全程 VRAM，无 CPU 暂存 | VRAM 路径零拷贝；HWRAM 走系统内存 | 持平 |
 | 编码格式 | H.264/HEVC/AV1 硬件 4:2:0；VP9 软件 4:2:0/4:4:4 | H.264/HEVC 硬件；VP8/VP9/AV1 软件；VP9/AV1 4:4:4 | RustDesk 格式更多；chast 为硬件优先策略 |
 | 码率/画质公式 | 对齐 RustDesk：预设表 × 画质比例 × 编码器系数 | 原始实现 | 持平 |
@@ -46,7 +66,7 @@
 | 主机侧截图 | 查看端请求原始帧，主机在显示服务线程旁路拷贝 BGRA、编码 PNG 分片发送；失败/超时回退到解码帧 | 采集循环内取原始帧转 RGBA 发送 | 持平（chast 不打断视频流） |
 | 录制 | 编码包直写 MP4，多源、10 分钟分段、32 MiB 队列 | 编码包写入 Recorder，录制时关键帧间隔 240；可选录制后上传 | chast 分段/多源更明确，RustDesk 多上传 |
 | 多显示器 | 每屏独立 Source，全局编码/QoS，可合并 | 每屏独立 VideoService，全局编码/QoS | 持平 |
-| 主机增值功能 | 有主机侧截图、协作光标颜色/姓名/点击波纹；无自由标注、远程打印、录制上传 | 四者都有 | RustDesk 仍多三项 |
+| 主机增值功能 | 有主机侧截图、协作光标颜色/姓名/点击波纹；无自由标注、远程打印、主机入站录制上传 | 四者都有 | RustDesk 仍多三项（查看端出站录制上传双方都有） |
 
 ### 1.1 功能缺口清单
 
@@ -60,7 +80,7 @@
 | 白板/协作光标 | [src/whiteboard/mod.rs](../../rustdesk-ref/src/whiteboard/mod.rs) 的 `Cursor/Clear/Exit` 事件，光标带颜色、按键、文字 | v71 起覆盖层有颜色、姓名和点击波纹；无自由标注 | 自由标注缺失 |
 | 远程打印 | `OPTION_ENABLE_REMOTE_PRINTER`、`PrinterData`、`JobType::Printer`（[connection.rs:1010](../../rustdesk-ref/src/server/connection.rs#L1010)） | 无 | 打印重定向缺失 |
 | 切换控制方向 | `SwitchSidesRequest` 拉起反向连接并关闭原会话（[connection.rs:3646](../../rustdesk-ref/src/server/connection.rs#L3646)） | 无对应协议 | 角色互换缺失 |
-| 录制后上传 | [record_upload.rs:23](../../rustdesk-ref/src/hbbs_http/record_upload.rs#L23)，录制时把 `RecordState` 交给 hbbs_http | 只写本地 MP4 | 录制集中归档缺失 |
+| 录制后上传 | [record_upload.rs:23](../../rustdesk-ref/src/hbbs_http/record_upload.rs#L23)，录制时把 `RecordState` 交给 hbbs_http | 主机入站录制只写本地 MP4；查看端出站录制已可上传 | 主机侧集中归档缺失 |
 | 软件 AV1 | libaom（[video_service.rs:1026](../../rustdesk-ref/src/server/video_service.rs#L1026)），可按观看端能力启用 4:4:4 | 只有硬件 AV1，Auto 不产生软 AV1 | 无 AV1 硬件且观看端只声明 AV1 时无法接入 |
 | VP8 | libvpx（[video_service.rs:1015](../../rustdesk-ref/src/server/video_service.rs#L1015)） | 无 | 只支持 VP8 的旧客户端无法接入 |
 | AV1 4:4:4 | 软编支持（[codec.rs:403](../../rustdesk-ref/libs/scrap/src/common/codec.rs#L403)） | 仅 VP9 支持 4:4:4 | 全色度只在 VP9 可用 |
@@ -96,9 +116,9 @@
 
 | 功能 | chast | RustDesk 7423dce | 影响 |
 | --- | --- | --- | --- |
-| HDR 桌面 | FP16 scRGB→SDR 色调映射，失败回退 | 只请求 8-bit BGRA/420_OPAQUE | HDR 桌面颜色由系统 8-bit 转换决定 |
+| HDR 桌面 | FP16 scRGB→SDR 色调映射，失败回退 | 7423dce 只请求 8-bit BGRA/420_OPAQUE；55786aa 已加入 FP16 + 归一化 | 新基线双方都归一化到 SDR，均非端到端 HDR |
 | 主机侧合并多屏 | 单画布、单 NV12 pass | 无 | 查看端需自行排列多路流 |
-| 静止画面刷新预算 | 按编码器/后端出刷新帧，且不计入动态画面 | 仅 WouldBlock 时重复 10 帧 | 长时间静止后的恢复依赖编码器自身行为 |
+| 静止画面刷新预算 | 按编码器/后端出刷新帧，且不计入动态画面 | 7423dce 仅 WouldBlock 时重复 10 帧；55786aa 已有同一预算表 | 只在旧基线上是 chast 独有；新基线对齐 |
 | 新观看者不重启现有流 | prepare→证明 IDR→commit | 已有观看者时新订阅触发 `SWITCH` | 多人陆续加入会中断现有流 |
 | 每订阅背压隔离 | 有界队列、溢出等 IDR、全满暂停采集 | 无界通道 + 每帧等 3 s | 慢连接拖慢整屏，内存无上界 |
 | 控制面/视频面分离 | QUIC 双流 | 单消息流 | 视频阻塞时输入/剪贴板排队 |
@@ -148,7 +168,8 @@ pass 处理；合并多屏由 [src/capture/merged_capturer.cc](../src/capture/me
 RustDesk 本机基线的 DXGI 只请求 `B8G8R8A8_UNORM` 和
 `420_OPAQUE`（[libs/scrap/src/dxgi/mod.rs:132](../../rustdesk-ref/libs/scrap/src/dxgi/mod.rs#L132)），
 没有 FP16 scRGB 输入和显式白点映射；`libs/scrap/src/dxgi/` 下只有
-`gdi.rs`、`mag.rs`、`mod.rs`，不存在旧审核文档引用的 `hdr.rs`。HDR 桌面
+`gdi.rs`、`mag.rs`、`mod.rs`；旧基线 `7423dce` 不存在 `hdr.rs`，当前基线
+`55786aa` 已加入 `hdr.rs`（FP16 scRGB 归一化 + WCG 处理）。旧基线的 HDR 桌面
 的颜色由系统的 8-bit 转换决定，chast 则显式做色调映射并提供失败回退。
 它也没有主机侧合并采集，多屏由查看端排列。
 
@@ -163,12 +184,13 @@ RustDesk 本机基线的 DXGI 只请求 `B8G8R8A8_UNORM` 和
 
 chast 的选择顺序在 [src/codec/encoder_factory.cc](../src/codec/encoder_factory.cc)：
 VP9 走软件 libvpx；其余格式走 oneVPL，失败后 FFmpeg 厂商编码器
-（NVENC/AMF/QSV），Auto 最后落到 OpenH264。硬件路径只接受 4:2:0；
+（NVENC/AMF/QSV）。2026-11-12 起软件编码只剩 VP9，Auto 在硬件全失败时
+由 DesktopStream 把共享流协商为软件 VP9；固定 H.264 请求不会被静默改码流，
+而是明确失败。硬件路径只接受 4:2:0；
 VP9 软件额外支持 4:4:4，4:4:4 时直接读原始 BGRA 并用 libyuv 转 I444
 （[src/codec/vpx_encoder.cc:1](../src/codec/vpx_encoder.cc#L1)）。AV1
 只有硬件实现，Auto 不会生成软件 AV1；这是“不新增软件 AV1/VP8 后端”
-的既定策略，不是遗漏（Auto 在硬件全失败时仍有 OpenH264 软件 H.264
-兜底，见 [encoder_factory.cc:100](../src/codec/encoder_factory.cc#L100)）。
+的既定策略，不是遗漏（软件兜底现为 VP9，与 RustDesk 的无硬件回退一致）。
 
 RustDesk 的顺序在 [video_service.rs:965](../../rustdesk-ref/src/server/video_service.rs#L965)
 的 `get_encoder_config`：H.264/H.265 依次尝试 VRAM、HWRAM，失败退到
@@ -309,17 +331,17 @@ VP9 与第一帧至少 100 ms；VP9 允许刷新失败，其他编码器连续 3
 `nv12_updated/desktop_updated`，因此不会伪装成新的桌面变化，也不会
 进入共享 QoS 的动态画面计数。
 
-RustDesk 固定基线没有这个模块，只有 WouldBlock 时最多 10 次重复编码；
-关键帧策略是“录制时 240 帧间隔，否则不定时”（
+RustDesk 旧基线 `7423dce` 没有这个模块，只有 WouldBlock 时最多 10 次重复编码；
+当前基线 `55786aa` 已加入 `static_refresh.rs`，预算表、初期间隔、失败/无输出
+上限与 VP9 例外均与我方一致。其关键帧策略是“录制时 240 帧间隔，否则不定时”（
 [video_service.rs:981](../../rustdesk-ref/src/server/video_service.rs#L981)），
 新观看者通过 `SWITCH` 重建来获得首个 IDR。chast 则通过
 `StreamRecorder::needs_keyframe`、订阅等待 IDR 和显式
 `DisplayKeyframeRequest` 驱动关键帧，录制与在线观看互不牵制。
 
-效果判断：chast 的静止刷新更接近新版本 RustDesk 的行为，能在长时间
-静止画面上维持解码器参考链，同时避免把刷新帧误算成运动；代价是
-每个编码器/后端需要一张预算表，本机 Intel GPU 只验证了“可解码、
-继续取帧”，没有跨机画质对比。RustDesk 基线更简单，但静止画面在
+效果判断：静止刷新已不是 chast 独有优势；双方的差别主要在失败停止规则、
+刷新帧是否进入 QoS 动态统计（双方都不计入）和跨机画质表现。本机 Intel GPU
+只验证了“可解码、继续取帧”，没有跨机同内容对比。
 长时间无 IDR 时依赖编码器自身行为，且新观看者必须重启流。
 
 ## 8. 光标
@@ -345,32 +367,46 @@ RustDesk 有独立的光标服务、`capture_cursor_embedded` 选项和更成熟
 
 ## 9. 音频
 
-两端都是单一音频服务向多个连接扇出，Opus 48 kHz、10 ms 帧。
-RustDesk 用 magnum_opus `LowDelay`（[audio_service.rs:103](../../rustdesk-ref/src/server/audio_service.rs#L103)），
-10 ms 数据块（[audio_service.rs:22](../../rustdesk-ref/src/server/audio_service.rs#L22)），
-并对连续约 8 s 的静音做零门，停止发送直到出现非零样本
-（[audio_service.rs:469](../../rustdesk-ref/src/server/audio_service.rs#L469)）。
+两端都是单一音频服务向多个连接扇出，Opus 48 kHz。2026-11-12 晚起 chast
+的帧长已与 RustDesk 一致为 10 ms（480 样本，
+[protocol.h:1113](../include/chast/protocol.h#L1113)）；此前 chast 为
+20 ms（960 样本）。
+RustDesk 用 magnum_opus `LowDelay`
+（[audio_service.rs:116](../../rustdesk/src/server/audio_service.rs#L116)），
+10 ms 数据块（[audio_service.rs:24](../../rustdesk/src/server/audio_service.rs#L24)、
+每秒 100 包 [audio_service.rs:213](../../rustdesk/src/server/audio_service.rs#L213)），
+未显式设置 Opus 码率，走 libopus 默认；并对连续约 8 s 的静音
+做零门，停止发送直到出现非零样本（800 包，
+[audio_service.rs:628](../../rustdesk/src/server/audio_service.rs#L628)）。
 它支持“语音通话输入设备”热切换和 `audio-input` 选项。
 
 chast 的 [src/host/shared_loopback.cc](../src/host/shared_loopback.cc)
 把一路 WASAPI loopback 分发给每个订阅，每个订阅 25 包队列、溢出丢最旧；
-Opus 固定 48 kHz（[src/audio/opus_codec.cc:31](../src/audio/opus_codec.cc#L31)），
-loopback 默认 160 kbps、其它 128 kbps、麦克风 32 kbps；loopback 有静音门
-（默认 2000 ms，[include/chast/audio.h:250](../include/chast/audio.h#L250)），
-麦克风侧用 SpeexDSP 做 AEC/AGC/NS（[src/audio/audio_dsp.cc:37](../src/audio/audio_dsp.cc#L37)），
+Opus 固定 48 kHz、10 ms 帧（2026-11-12 起；此前为 20 ms，
+[src/audio/opus_codec.cc:140](../src/audio/opus_codec.cc#L140)），
+loopback 128 kbps 立体声（[include/chast/audio.h:238](../include/chast/audio.h#L238)），
+麦克风/语音通话 32 kbps（[include/chast/audio.h:328](../include/chast/audio.h#L328)），
+两端统一 `OPUS_APPLICATION_RESTRICTED_LOWDELAY`（对齐 RustDesk）；
+loopback 有静音门（默认 2000 ms，
+[include/chast/audio.h:247](../include/chast/audio.h#L247)），
+主机设置开启回声消除时用 SpeexDSP 做 AEC/AGC/NS
+（[src/audio/audio_dsp.cc:37](../src/audio/audio_dsp.cc#L37)），
 AEC 参考来自同一路 loopback。协议 v35 起音频可走 QUIC DATAGRAM，
 解码端用 Opus PLC 补最多 5 帧（100 ms）。主机语音通话走单独的通话
 采集与 `send_voice_audio`，设备配置来自 `settings_.voice_microphone`；
 `WasapiMicrophoneCapture` 在设备消失时按原 id 重试并上报 recovering，
 未指定设备时跟随默认通信设备。
 
-效果判断：chast 在发送侧 DSP、共享扇出和不可靠音频传输上更完整。
+效果判断：两端的取舍不同。RustDesk 的 10 ms 帧 + `LowDelay` 应用模式
+把音频算法延迟压到约 10 ms，码率交给 libopus 默认值，静音 8 s 后才停发；
+chast 在 2026-11-12 起也改为 10 ms 帧 + `RESTRICTED_LOWDELAY`，算法延迟
+对齐，但仍显式设置 loopback 128 kbps、麦克风 32 kbps，可开 AEC/NS，
+并使用 DATAGRAM + PLC 抗丢包。
 `docs/weak-network-acceptance.md` 的实测显示，在同一 1 Mbps/3% 丢包档，
 DATAGRAM 音频相对可靠流的平均迟到从 −882 ms 降到约 −100 ms；PLC 让
 每个前跳缺口都有输出。RustDesk 基线未在本地源码中找到 AEC/NS 实现、
-没有 DATAGRAM 音频，静音门也更粗（8 s）。两端的音频设备选择/切换
-细节（主机语音通话、输入设备热切换）都没有做同场景实测，不能仅凭
-代码量判定优劣。
+没有 DATAGRAM 音频。哪一端“听起来更好/更同步”没有同内容 A/B：
+两端算法延迟接近，chast 的码率策略、弱网连续性更强，需按场景取舍。
 
 ## 10. 主机侧截图
 
@@ -442,7 +478,7 @@ chast 的每连接队列更保守，RustDesk 与摄像头相关的移动端缩�
 - UAC/安全桌面：两端都会在桌面切换时重建采集；本机无法制造真实
   UAC/SAS 场景，未验收。
 - 协作光标/白板：v71 起 chast 已有颜色、姓名和点击波纹；自由标注、
-  远程打印、录制后上传、切换控制方向 RustDesk 有，chast 没有（见 1.1）。
+  远程打印、主机入站录制上传、切换控制方向 RustDesk 有，chast 没有（见 1.1）。
 - 主机语音通话与音频设备选择：两端都有（RustDesk 的 `audio-input`/
   voice-call，chast 的 `voice_microphone` + `send_voice_audio`）；
   设备消失时的实际恢复体感未做对比。
@@ -457,8 +493,8 @@ chast 的每连接队列更保守，RustDesk 与摄像头相关的移动端缩�
    慢连接不拖住其他屏/其他观看者，内存有上界。
 3. **控制面不被视频阻塞**：QUIC 控制流与视频流分离；RustDesk 的
    `select!` 会在视频 `send` 等待时排队控制消息。
-4. **HDR、合并采集、光标独立采样**：普通 SDR 单屏之外的覆盖面更大；
-   32×32 光标缺陷已有像素级修复证据。
+4. **合并采集、光标独立采样与主机侧跟随**：普通 SDR 单屏之外的覆盖面更大；
+   32×32 光标缺陷已有像素级修复证据。HDR 在 55786aa 已不再是单方优势。
 5. **音频发送侧更有内容**：SpeexDSP AEC/AGC/NS、静音门、DATAGRAM + PLC；
    netem 实测平均迟到从 −882 ms 改善到约 −100 ms。
 
@@ -467,20 +503,21 @@ chast 的每连接队列更保守，RustDesk 与摄像头相关的移动端缩�
 1. **编码格式矩阵更宽**：软件 AV1、VP8、VP9/AV1 4:4:4，对没有 AV1
    硬件的机器和特殊解码端更友好；chast 的硬件优先策略是有意取舍，
    但需要产品层明确“没有共同格式”时的降级话术。
-2. **主机侧增值功能**：远程打印、录制后上传、切换控制方向；chast 已有
+2. **主机侧增值功能**：远程打印、主机入站录制上传、切换控制方向；chast 已有
    主机原始帧截图、本地录制和协作光标（颜色/姓名/波纹），自由标注仍缺。
 3. **白板自由绘制**：RustDesk 的标注工具可留下绘制内容；chast 的覆盖层
    只跟随指针，不保留笔迹。
 4. **音频设备与移动端覆盖**：RustDesk 的 `audio-input`、voice-call
    设备切换和平台覆盖更成熟；chast 已有主机语音通话与设备恢复路径，
    但只到代码审查，未做同场景设备热切换对比。
-5. **实现更简单、路径更少**：没有 HDR/合并/事务协商等额外分支，故障面
-   更小；chast 的复杂度需要用测试矩阵守住。
+5. **实现更简单、路径更少**：没有合并采集/事务协商等额外分支（55786aa 已加入
+   HDR 与静止刷新），故障面更小；chast 的复杂度需要用测试矩阵守住。
 
 ### 持平或基本对齐
 
 - DXGI 采集与 GDI 回退、硬件编码零拷贝、码率/画质公式、QoS 阈值与
-  票序、Opus 48 kHz/10 ms、编码包直写录制、多屏独立服务模型。
+  票序、Opus 48 kHz / 10 ms 帧（2026-11-12 晚已对齐，见第 9、16、17 节）、编码包直写录制、
+  多屏独立服务模型。
 - 两端都没有在“同一台机器、同一内容、同一观看端”的条件下做
   跨产品画质/延迟 A/B；因此**不能**用本文结论宣称 chast 的端到端
   观感优于 RustDesk，只能说在若干机制上更有优势或更完整。
@@ -510,10 +547,146 @@ chast 的每连接队列更保守，RustDesk 与摄像头相关的移动端缩�
 
 1. 先做同内容 A/B 画质/延迟基线，把“结构优势”变成可比较的数字；
 2. 明确 AV1 无硬件时的降级路径与提示（保持硬件优先策略，不引入软件 AV1）；
-3. 远程打印、录制后上传按产品需求取舍；主机截图已按“采集线程旁路取原始帧”
+3. 远程打印、主机入站录制上传按产品需求取舍；查看端出站录制上传已存在，主机截图已按“采集线程旁路取原始帧”
    实现（见第 10 节），剩余验收是旋屏/多屏和与 RustDesk 的同内容对比；
 4. 主机语音通话与音频设备热切换做同场景验收（chast 已实现通话中换源，
    见 1.1；设备消失重连和默认通信设备跟随见第 9 节）；协作光标的颜色、
    姓名和点击波纹已于 v71 落地，512 px 光标按产品优先级排期；
-5. 用现有 `chast-host-parity-test` 增加“新观看者加入不重启编码器”和
-   “慢观看者不拖住其他屏”的断言，把本次对照的结构结论固化为回归。
+5. “新观看者加入不重启编码器”“慢观看者不拖住其他屏”无需新增断言：
+   现有 `chast-host-parity-test` 的 `independent_displays`（同屏新观看者
+   复用现有管线并拿到静态 IDR，`tests/host_parity_test.cc:1466`）和
+   `slow_viewer_independent_display`（慢观看者不阻塞其他屏 ≥20 帧、
+   切屏 <1 s、复用目标管线，`tests/host_parity_test.cc:2261`）已覆盖。
+
+## 16. 2026-11-12 效果复核（v73 / RustDesk 55786aa）
+
+### 16.1 复核口径
+
+- chast 侧：工作区协议 v73，基线提交 deb64b8 加未提交的 v73 改动；
+  RustDesk 侧：本机 D:/rustdesk 的 55786aa（2026-11-03）。
+- 本轮只做源码级参数与机制复核，没有运行 RustDesk，也没有跨产品
+  A/B。下文的“对齐”指参数/机制层面一致，不等于端到端观感相同；
+  “差异”是取舍或待测项，不直接等同于缺陷。
+
+### 16.2 已对齐的效果参数
+
+- **码率/画质公式**：同一个基准码率表乘画质比例再乘编码器系数；
+  High/Best=1.5、Balanced=0.67、Smooth/Low=0.5；自定义 10..100%
+  线性映射到 0.2..2.0（chast `StreamQuality`，RustDesk
+  `libs/scrap/src/common/codec.rs` 的 `BR_BEST`/`BR_BALANCED`/`BR_SPEED`）。
+- **颜色路径**：两端都是 BT.601 limited NV12；HDR 桌面都做
+  scRGB→SDR 归一化（除以 SDR 白点、截断、sRGB 传递函数），
+  数学完全一致，都**不做**色调映射、都不透传 HDR。
+- **刷新与关键帧**：静止刷新预算、按需 IDR、无周期性 IDR
+  （直播中）、光标采样 33 ms 均对齐；录制时的 GOP 差异见 16.3。
+- **QoS**：阈值与票序、静态/活动切换逻辑对齐；硬件编码零拷贝、
+  采集包直写录制的路径一致。
+
+### 16.3 仍存在的效果差异
+
+1. **VP9 码控与调优**：chast 固定 q 0..56、`rc_dropframe_thresh=0`、
+   RC 缓冲 500/600/1000 ms、`VP9E_CONTENT_SCREEN`、row_mt、
+   线程上限 8；RustDesk 用画质比例推导 q 区间（1.0 → 18..47，
+   1.5 → 9..38）、`rc_dropframe_thresh=25`、libvpx 默认缓冲、
+   tile columns 4、不设 screen tune、线程可到 64。
+   效果取向不同：拥塞时 chast 保帧率、可能整体变糊；RustDesk 允许
+   丢帧保单帧清晰度。文字/办公内容可能对我方有利，运动画面可能对
+   RustDesk 有利，未实测。
+2. **无硬件时的软件回退**：2026-11-12 晚已按产品决定改为与 RustDesk
+   一致的 libvpx VP9，OpenH264 全部移除。此前编码器级同帧实测
+   （1440p/1080p、同内容、生产配置，详见
+   `docs/encoder-quality-comparison-2026-11-11.md` 的追加节）显示
+   H.264 画质高约 2.9–3.3 dB PSNR / 0.007–0.009 SSIM，但多用约
+   34–39% 码率，且 OpenH264 仅 15.6 fps（1440p）/ 25.9 fps（1080p），
+   达不到 30 fps；VP9 为 52.0 / 83.7 fps。现在 Auto 在硬件全失败时
+   由 DesktopStream 把共享流协商为软件 VP9；固定 H.264 请求不再被
+   静默改写，而是在没有硬件编码器时明确失败。
+3. **音频**：2026-11-12 晚已改为 10 ms 帧 +
+   `OPUS_APPLICATION_RESTRICTED_LOWDELAY`，算法延迟与 RustDesk 对齐。
+   仍保留的差异是：chast 显式设置回环 128 kbps/麦克风 32 kbps
+   （RustDesk 用 libopus 默认码率）、静音门 2 s（RustDesk 约 8 s）、
+   DATAGRAM + PLC（RustDesk 可靠传输）。码率/音质与弱网连续性是我方
+   有意取舍，主观听感未做 ABX。
+4. **合并多屏**：画布长边超过 4096 或面积超过 4096×2304 时整体缩放；
+   RustDesk 没有合并采集，逐屏原生分辨率。仅在启用合并模式时存在，
+   单屏与逐屏路径不受影响。
+5. **录制 GOP**：chast 录制不追加周期 IDR；RustDesk 录制时把关键帧
+   间隔设为 240 帧。影响录制文件的拖动/播放器兼容性，不影响直播。
+
+格式矩阵差异（4:4:4 仅 VP9、无软件 AV1/VP8）已在 1.1 记录，
+这里不重复。
+
+### 16.4 本轮判断与下一步
+
+未发现会让画质/延迟系统性劣于 RustDesk 的参数级 P0/P1 缺陷；
+上述五项属于“有意的取舍”或“需要用数据判断的调优”，不是已确认的
+缺陷。仍然**不能**宣称 chast 端到端观感优于 RustDesk。
+
+建议顺序（沿用第 15 节，补充具体动作）：
+
+1. 同内容 A/B 已启动：2026-11-12 完成 1440p/1080p 的软件
+   H.264 vs VP9 编码器级同帧对比（见 16.3 第 2 项与
+   `docs/encoder-quality-comparison-2026-11-11.md` 追加节）。
+   仍缺 4K、原生 1080p 采集、HEVC、静态/视频两类内容、VMAF、
+   端到端帧龄与 CPU/GPU 整机数据。
+2. 软件回退已落地：OpenH264 移除、VP9 成为唯一软件后端（见第 17 节）。
+   剩余验证是查看端 VP9 软解 CPU 开销、无硬件低端主机的真实帧率，
+   以及双机同内容的端到端观感。
+3. 音频 10 ms/LowDelay 已落地；剩余验证是主观 ABX、带宽对比，
+   以及静音门 2 s vs 8 s 的产品取舍。
+4. VP9 码控按 A/B 结果调：固定 q / 不丢帧 与 画质推导 q / 丢帧 25
+   在文字、滚动、视频三类内容上的表现分别比较，只按数据改。
+5. 合并模式在界面上注明“超 4096 会缩放”，或对超限画布改为逐屏；
+   录制拖动体验有需求时，仅在录制会话内设置关键帧间隔。
+
+第 16 节最初只做文档复核；2026-11-12 晚已按第 17 节把软件回退与音频
+落地为代码，并重新构建、跑测试。
+
+## 17. 2026-11-12 晚落地：软件回退为 VP9、移除 OpenH264、Opus 10 ms
+
+### 17.1 落地内容
+
+- **软件回退**：删除 `src/codec/openh264_encoder.cc`，移除 CMake 的
+  OpenH264 导入、`chast.codec` 源文件和链接，以及 `THIRD-PARTY-NOTICES.md`
+  中的 OpenH264 声明。`EncoderBackend::Software` 只接受 VP9；
+  H.264/HEVC/AV1 的软件请求明确报错，不再静默改格式
+  （[encoder_factory.cc](../src/codec/encoder_factory.cc)、[encoder.h](../include/chast/encoder.h)）。
+- **Auto 顺序**：oneVPL → FFmpeg NVENC/AMF/QSV → 软件 VP9。固定
+  `Vpl`/`Ffmpeg` 保持硬件-only，不回退。
+- **协商与恢复**：`DesktopStream` 的软件回退候选只保留 VP9；CPU 采集
+  （`GdiCpu`）只允许 VP9；硬件连续失败后的恢复消息为
+  “negotiating software VP9”；固定后端的 VP9 请求继续报“该后端没有
+  VP9 编码器”（[desktop_stream.cc](../src/host/desktop_stream.cc)）。
+- **音频**：`kOpusFrameSamples` 960 → 480，编码器改用
+  `OPUS_APPLICATION_RESTRICTED_LOWDELAY`，每包固定 10 ms；删除
+  `AudioEncoderConfig::voice`。回环仍 128 kbps 立体声、麦克风
+  32 kbps 单声道，静音门 2 s，传输仍是 DATAGRAM + Opus PLC
+  （[protocol.h:1113](../include/chast/protocol.h#L1113)、
+  [opus_codec.cc](../src/audio/opus_codec.cc)、[audio.h](../include/chast/audio.h)）。
+- **测试替身与工具**：软件后端默认产出 VP9；音频头帧长取协议常量；
+  相机恢复、CPU 采集、运行时恢复用例按 VP9 断言；`chast-encode`
+  接受 `--codec vp9`；`chast-quic` 的软件编码识别与 VP9 调码率断言
+  同步更新（[host_media_stub.h](../tests/host_media_stub.h)、
+  [desktop_stream_test.cc](../tests/desktop_stream_test.cc)、
+  [host_parity_test.cc](../tests/host_parity_test.cc)、
+  [audio_codec_test.cc](../tests/audio_codec_test.cc)）。
+
+### 17.2 验证记录
+
+- 构建：`chast-protocol-test`、`chast-desktop-stream-test`、
+  `chast-host-parity-test`、`chast-audio-codec-test`、`chast-host-voice-test`、
+  `chast-host`、`chast-viewer-probe`、`chast-quic`、`chast-encode`
+  Release 构建成功，退出码 0（`build/build-align.log`、
+  `build/build-align2.log`、`build/build-align3.log`）。
+- 定向 CTest：`protocol`、`desktop_stream`、`host_voice`、`audio_playout`、
+  `audio` 通过；`host_parity` 在并发运行时出现过一次与本次改动无关的
+  剪贴板撤销用例超时，单独运行该场景与整套复跑均通过（127.88 s），
+  按偶发时序记录，未修改该用例（`build/ctest-align.log`、
+  `build/ctest-align2.log`、`build/ctest-hostparity3.log`）。
+- 全量 CTest：74/74 通过（979.81 s），`clipboard_listener` 与
+  `clipboard_listener_startup` 按既有配置 Skip
+  （`build/ctest-align-all.log`）。
+- 证据边界：单机自动化，没有在无硬件编码器的机器上验证 VP9 回退的
+  真实帧率，没有双机真实链路、查看端 VP9 软解 CPU 占用或音频 ABX；
+  未运行 RustDesk 二进制。以上只能证明机制、参数与自动化行为，
+  不能证明端到端观感已经与 RustDesk 相同或更好。

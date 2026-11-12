@@ -555,3 +555,180 @@
    邮件登录码（两步验证备用通道，`POST /v1/account/login/sms|email` +
    `sms_code|email_code`），WebAuthn 安全密钥也于 2026-10-28 补齐（密码 +
    Windows Hello/FIDO2 或免密码断言，服务端只存公钥）。
+
+## 7. 2026-11-12 服务端对照与效果复核
+
+- 参照物：`D:\ref\rustdesk-server` @ `680b603`（2026-11-08，hbbs/hbbr 源码
+  齐全），重点读 `src/rendezvous_server.rs`、`src/relay_server.rs`、
+  `src/peer.rs`、`src/main.rs`；客户端节奏取 `/d/rustdesk` 的
+  `libs/hbb_common/src/config.rs:50`（`REG_INTERVAL = 15_000`）。
+- 范围：只比较服务端控制面与中继面（注册/保活、在线查询、打洞协调、中继
+  配对与限速、滥用限制）。媒体编解码已在发射端对照中完成，不在本节。
+- 判定口径：**已实现**＝代码在仓库；**已构建**＝`go vet`/编译通过；
+  **自动化通过**＝单测或基准在本机执行成功；**真实链路通过**＝双机/跨网
+  实测；**待人工验证**＝尚无上述证据。
+
+### 7.1 功能结论
+
+逐消息对照后，hbbs/hbbr 的功能面在该版本中已全覆盖（协议格式、数据面形态
+按 §2 保持有意差异）：
+
+| 能力 | RustDesk 依据 | chast 实现 | 结论 |
+| --- | --- | --- | --- |
+| 注册与保活 | `RegisterPk`、`register_pk`、`REG_TIMEOUT = 30_000` | `POST /v1/hosts` + UDP `keepalive/challenge/auth`，`--offline-after 30s`、`--host-ttl 60s` | 一致 |
+| 在线与批量查询 | `RegisterPeer`/`OnlineRequest` | `GET /v1/hosts(/{id})`，批量上限 200 | 一致 |
+| 打洞协调 | `PunchHoleRequest`/`PunchHole`/`PunchHoleSent` | `punch_request`/`punch_peer`，观察地址 + 服务端签名绑定 | 一致（不转发 `PunchHoleSent`，见 §2） |
+| NAT/LAN 规则 | `TestNatRequest`、`-m` 掩码 XOR → `SYMMETRIC` | `nat_probe` 两会合点、`--lan-mask` 同规则 | 一致 |
+| 中继配对 | hbbr `RequestRelay` uuid 配对，等待 30 s（`relay_server.rs:490,525`） | 按主机端口租约 + `relay_hello/challenge/auth`，`punchTTL 30s` | 一致 |
+| 中继限速 | single 128M / total 1G / blacklist 32M，1800 s 后 0.66 阈值降级（`relay_server.rs:42-46,632`） | `policy.go` 同默认值同阈值 | 一致 |
+| 名单与复查 | `blacklist.txt`/`blocklist.txt`，每秒复查 | 同文件、同 1 s 复查、可落盘/控制台增删 | 一致 |
+| 中继注册节流与 IP 阻断 | 每 ID 3 次/6 s；每 IP >30 次/60 s、>300 ID/天（`rendezvous_server.rs:978-1000`） | `--register-id-throttle 3/6s`、`--register-max 30/1m`、`--register-max-ids 300/24h` | 一致 |
+| 软件更新通告 | `SoftwareUpdate` | `software` 块 + `/software/{name}` 托管与签名 | 一致 |
+| 中继节点健康检查 | `check_relay_servers` 每 3 s | `--relay-nodes` 10 s 探测 + 本机回退 | 等价/增强 |
+
+发现并修复的功能缺口只有一处：
+
+- **中继端口池耗尽会让主机整体下线**（2026-11-12 修复）。chast 按注册主机
+  一对一租用中继端口，默认 `--relay-ports 41000-41099` 只有 100 个；此前池
+  耗尽时 `/v1/hosts` 返回 503，导致第 101 台主机即使直连可打洞也不可达。
+  hbbr 用一个监听转发任意多对端，不存在该失败模式。现在
+  `internal/api/api.go` 在 `relay.ErrNoFreePort` 时降级为“仅直连”注册：
+  主机保持在线、响应不带 `relay`/`relays`/`carrier`、清除可能是节点租约的旧
+  地址、记 `relay ports exhausted` 警告并累加
+  `chast_relay_lease_missing_total`；`--relay-only` 没有直连兜底，仍返回
+  503。端口释放后的下一次注册自动重新获租。验收：
+  `TestExhaustedRelayPoolKeepsHostsOnline`（单端口池：第二台主机 200、查询
+  无中继、指标为 1、释放后重新获租）与
+  `TestRelayOnlyRefusesWhenPoolExhausted`（relay-only 仍 503），已通过。
+
+结构性容量差异保留并写进运维文档：**每个获租主机独占一个中继端口**。需要
+超过端口池的主机数时，扩大 `--relay-ports` 或部署 `--relay-nodes`；直连
+用户不占端口，池耗尽也不再是硬失败。`server/README.md` 已加容量说明。
+
+### 7.2 效果实测（2026-11-12 基线 / 2026-11-13 复测，本机回环）
+
+环境：Windows 11 / i5-11320H / 8 逻辑核，Go 1.27.3 windows/amd64，基线工作树
+`deb64b8`（协议 v73），2026-11-13 复测包含本轮未提交的策略缓存与挑战重放表
+清理修复。方法：
+`-benchmem -count=5 -benchtime=2s`，取 5 次中位数；服务端与客户端同进程，
+因此数值包含本机 TCP/UDP 回环与 Go 运行时开销，不含真实 RTT。
+
+| 场景 | 基准 | 中位数 | 备注 |
+| --- | --- | --- | --- |
+| 注册续约（HTTP，含 Ed25519 校验、设备策略查库、中继续租） | `BenchmarkRegister` | 215 µs/op，15.6 KB，190 allocs | 每 30 s 一次（TTL/2）；基线 334 µs/18.7 KB/265 |
+| 并发注册（8 路） | `BenchmarkRegisterParallel` | 82 µs/op ≈ 12k 次/s | 注册表串行化后的进程吞吐；基线 171 µs |
+| 单主机查询 | `BenchmarkLookup` | 185 µs/op，186 allocs | 查看者连接前一次 |
+| 并发查询（8 路） | `BenchmarkLookupParallel` | 110 µs/op ≈ 9.1k 次/s | 读锁共享 |
+| 批量查询 50 台 | `BenchmarkBatchLookup` | 2.65 ms/op ≈ 53 µs/台 | 地址簿刷新 |
+| 保活挑战应答（UDP，含双方签名与注册表刷新） | `BenchmarkKeepalive` | 159 µs/往返 | 每 10 s 一次；旧实现 221 µs（含随运行增长的重放表扫描） |
+| 打洞协调（查询 + 两端指令 + 服务端签名绑定） | `BenchmarkPunch` | 93 µs/往返 | 每次连接 |
+| 中继租约分配+释放 | `BenchmarkRelayLease` | 101 ns/op，0 allocs | 注册/下线路径 |
+| 中继转发 1200 B（往返） | `BenchmarkRelayForward` | 30.4 µs/往返 | 关掉整形以测转发代码 |
+| 中继转发吞吐（1200 B ×16 突发） | `BenchmarkRelayBurst` | 79 MB/s | 同上，单会话单核 |
+
+2026-11-13 修掉了注册续约里的重复物化：此前每次续约都用
+`ReconcileDevicePolicies` 把设备策略重算一遍，pprof 中约 37% 时间花在它的
+SQLite 查询上。现在账号库在内存里记录“该设备在当前策略代上已确认无变化”，
+任何会改变分配结果的写（策略对象、分配、账号组设备关系、手动策略）都递增
+策略代并清空记录；SQLite 只有一个服务进程写，这份代是精确的，PostgreSQL
+后端保持关闭缓存以兼容多进程。复测单次续约 334→215 µs（-35%），8 路并发
+171→82 µs（约 12k 次/s），分配 265→190 次/op；pprof 中
+`ReconcileDevicePolicies` 已退出前 60 个累计节点，SQLite 解析占比 20%→7.6%。
+
+2026-11-13 还修掉了保活挑战路径上的隐性 O(N)：`issueChallenge` 每次签发前都
+全量扫描 `usedChallenges` 重放表清理过期 nonce。表大小等于 30 s 内验证成功
+的证明数——双栈代理每 10 s 各保活一次，N 台主机约 6N 条常驻——于是每次保活
+O(N)、整体 O(N²)。新增 `BenchmarkIssueChallengeScale`（0/1 千/1 万/
+3 万台，按 6 条/台预填）复现：**1.2 µs → 52 µs → 725 µs → 1.85 ms/次**，
+按此曲线约 9 千台双栈主机就能让单核全部耗在清理扫描上。改成时间门控摊销
+清理（`challengeSweepInterval = challengeTTL/3`，最多每 10 s 全扫一次；过期
+条目本就会被签名自带的过期时间拒绝，多滞留一个间隔不削弱重放防护）后，
+四个规模均为 **1.06–1.4 µs/次**，30k 台时下降约 1750 倍且不再随规模增长；
+摊销后每次挑战只多约 TTL/间隔 ≈ 3 次 map 访问。`BenchmarkKeepalive` 也由
+221 降到 159 µs/往返，`TestChallengeSweepIsGated` 固定“门未开不扫、开门清
+过期、活条目不动”的语义。
+
+按实测值推算稳态成本：每台在线主机 = 保活 159 µs / 10 s + 续约 215 µs /
+30 s ≈ **23 µs/s**，即约 0.002% 单核；在这些操作成本下，单核约可承载
+**4.3 万台**单栈主机（双栈主机保活翻倍时约 2.6 万台；未计网络中断与磁盘
+抖动，保守量级）。此前的 3.4 万台未计重放表扫描，重放表摊销后该量级才
+真正成立。8 路并发提升到
+约 2.6 倍（12k 次注册/s），说明剩余的串行点是注册表而不是账号库的 SQLite；
+`pprof` 中续约后读取设备策略（`DevicePolicy`）仍是注册路径上最大的一块，
+那是注册回包必须携带的数据本身，不再有可跳过的重复计算。
+
+中继效果与 hbbr 对齐：转发代码在单核上可跑 79 MB/s，而默认策略把单会话
+限制在 128 Mbit/s（16.8 MB/s）、总量 1 Gbit/s、黑名单 32 Mbit/s，与
+hbbr 的默认值一致，因此实际瓶颈是双方约定的整形参数而非转发实现；租约
+分配是纳秒级，注册/下线不会成为瓶颈。唯一需要容量规划的是 7.1 的
+“每主机一个端口”。
+
+### 7.3 节奏与参数对齐
+
+| 项 | RustDesk | chast | 判定 |
+| --- | --- | --- | --- |
+| 注册/保活周期 | 15 s（`config.rs:50`） | UDP 保活 10 s + HTTP 续约 30 s | 检测更快，控制流量略高 |
+| 离线判定 | 30 s 无注册（`rendezvous_server.rs:50`） | `--offline-after 30s`；租约 TTL 60 s | 一致 |
+| 注册租约 | 内存/库长期保留，在线看 30 s | 60 s 租约，代理按 TTL/2 续约 | 等价（状态更短） |
+| 打洞窗口 | 客户端 3/6/9 s 重试，探测窗口 3 s | `punchTTL 30s`，客户端同节奏 | 一致 |
+| 中继配对等待 | 30 s（`relay_server.rs:490,525`） | `punchTTL 30s` | 一致 |
+| 中继空闲回收 | 30 s（`relay_server.rs:566-608`） | 主机 90 s / 查看者 60 s | 有意更容忍（避免误拆静默映射） |
+| 单会话/总量/黑名单带宽 | 128M / 1G / 32M | 同 | 一致 |
+| 持续会话降级 | 1800 s，平均 >0.66×single | 同 | 一致 |
+| 每 IP 注册限速 | >30 次/60 s，>300 ID/天 | 30/1m，300/24h | 一致 |
+| 每 ID 注册节流 | 3 次/6 s | 3/6 s | 一致 |
+| 握手限速 | 无按 IP 限制（仅带宽） | 中继 120/10 s、会合保活 120/10 s、打洞 30/10 s | 更严（防反射/洪水） |
+| 中继并发模型 | 单监听 uuid 配对，任意多对端 | 每主机端口 + 共享载体 | 有意差异（容量见 7.1） |
+
+### 7.4 证据等级与边界
+
+- **已实现**：7.1 的降级注册与指标；`chast_relay_lease_missing_total` 接入
+  `/metrics`；`server/README.md` 容量说明；本节记录的参数对照；注册续约的
+  设备策略物化缓存与策略代失效（2026-11-13，仅 SQLite 后端）；保活挑战
+  重放表的门控摊销清理（2026-11-13，`challengeSweepInterval = TTL/3`）。
+- **已构建**：`go vet ./internal/account ./internal/api ./internal/rendezvous ./internal/relay ./internal/registry`
+  通过；新增基准文件随包编译。
+- **自动化通过**：`go test ./internal/api ./internal/rendezvous ./internal/relay`
+  全部通过（2026-11-12）；`TestExhaustedRelayPoolKeepsHostsOnline`、
+  `TestRelayOnlyRefusesWhenPoolExhausted`；7.2 全部基准各 5 轮成功（2026-11-12）。
+  2026-11-13 复跑：`go test ./internal/account -count=1` 与
+  `go test ./internal/api -count=1` 通过，随后 `go test ./... -count=1`
+  全模块通过；`TestPolicyReconcileCacheTracksPolicyWrites` 覆盖缓存与失效；
+  `BenchmarkRegister` / `BenchmarkRegisterParallel` 各 5 轮，数值见 7.2。
+  `go test ./internal/registry ./internal/rendezvous -count=1` 与两包
+  `go vet` 通过；`TestChallengeSweepIsGated` 覆盖门控清理；
+  `BenchmarkIssueChallengeScale` 修复前后各 3 轮、`BenchmarkKeepalive` 5 轮。
+- **真实链路通过**：本节无新增。此前单机真实进程回环（双栈注册/中继、
+  载体、软件更新）仍有效，但不是双机/跨网证据。
+- **待人工验证**：双机跨 NAT 打洞与中继、真实网卡上的中继吞吐与整形、
+  500+ 主机长稳（观察注册表串行点与 SQLite 抖动）、`--relay-nodes` 故障
+  切换、真实 IPv6 跨网。数值取自回环且客户端/服务端同机，不能当作生产
+  容量承诺；跨网 RTT 会主导 7.2 的往返项，服务端自身成本以单程扣除后为准。
+
+复现：
+
+```sh
+cd server
+go test ./internal/account -run 'PolicyReconcileCacheTracksPolicyWrites' -count=1
+go test ./internal/account ./internal/api -count=1
+go test ./internal/registry ./internal/rendezvous -count=1
+go test ./internal/api -run '^$' -bench 'Benchmark(Register|Lookup|BatchLookup|RegisterParallel|LookupParallel)$' -benchmem -count=5 -benchtime=2s
+go test ./internal/rendezvous -run '^$' -bench 'Benchmark(Keepalive|Punch)$' -benchmem -count=5 -benchtime=2s
+go test ./internal/relay -run '^$' -bench 'Benchmark(RelayLease|RelayForward|RelayBurst)$' -benchmem -count=5 -benchtime=2s
+go test ./internal/registry -run '^$' -bench 'BenchmarkIssueChallengeScale' -benchmem -count=3 -benchtime=1s
+```
+
+
+## 8. 传输栈原理差异（2026-11-13）
+
+本文与 `docs/nat-traversal-2026-11-07.md` 都在“功能与场景是否覆盖”这一层对照。
+更上层的问题是：RustDesk 的 WebRTC/ICE/STUN/TURN 与我们的 QUIC + 自有穿透 + 自有
+中继租约是否**在原理上**不同，以及这种不同在拓扑覆盖、延迟结构、运维成本、故障域
+与演进路线上意味着什么。
+
+结论与可执行的验收方法（直连率、对称 NAT 兜底时延、会话中网络切换、UDP 全封与
+443 等价、音频流隔离、中继容量、信任锚）见
+`docs/transport-stack-differences-2026-11-13.md`。其中一条影响本节判断的事实：
+开源 `rustdesk-server` 1.1.17 与 2026-11-13 的 master 都不携带
+`webrtc_sdp_offer`/`IceCandidate` 字段，`PunchHole` 逐字段重建时把它们丢弃，因此
+WebRTC 路径依赖转发这些字段的服务端实现，不能假设开源 hbbs 可复现。

@@ -2,6 +2,8 @@
 
 > 2026-11-09 v61 更新：主表已按 `codex/development-checkpoint-2026-11-09`（`ddf75d2` + 工作区 R01–R05 修复，协议 v61）重新核对。此前“首观看者生产、其他人跟随”的结构性差距已由 v50–v55 关闭；v56–v61 补齐分页、剪贴板方向、空目录、按需文件剪贴板、事件监听、防休眠、主机录屏、会话内提权、服务审批和 VP9 4:4:4。下方历史更新记录保留，主表和“剩余差距”为当前结论。
 
+> 2026-11-12 基线更新：本机 RustDesk 参照已从 `7423dce` 推进到 `55786aa`（2026-11-03），后者已有 `dxgi/hdr.rs` 与 `video_service/static_refresh.rs`，静止刷新预算表与我方一致，HDR 双方都归一化到 SDR。主表相关行已更新；最新审计见 [发射端审计](sender-audit-2026-11-12.md)。
+
 > 静止刷新更新（2026-11-09）：已按 RustDesk `video_service/static_refresh.rs` 接入按编码器/厂商后端/画质分档的静止刷新预算（VP9、H.264、HEVC 表格；AV1 关闭）、首次与 VP9 至少 100 ms、其余不超过 30 fps、桌面变化才重置计数；刷新帧不计入共享 QoS 的发送计数与动态画面窗口，只有真实捕获帧提供 `dynamic` 证据（2026-11-11 复核：RustDesk `static_refresh.rs` 的 `try_encode` 不增加 `send_counter`；2026-11-10 曾改为计入并声称对齐，该判断错误，已撤销），仍以不占发送窗口的 best-effort 方式发送。发布 IDR 时清空该订阅旧刷新帧，修复静止桌面关键帧请求被排队刷新掩埋的问题。测试证据见 [共享视频质量](shared-video-qos-rustdesk-2026-11-08.md)。
 
 > 2026-11-11 二次比对（固定提交 `7423dce`）：宿主侧常用路径没有新的 P0/P1 缺口，新增三项 P3 差异并登记为 G21–G23。① **显示我的光标/白板**：RustDesk 在固定提交已进入 Flutter 产品面（`show_my_cursor` 工具栏与快捷键、主机端 `src/whiteboard` 透明覆盖层），把观看端光标画到主机屏幕；我方只有主机光标回发观看端，没有反向覆盖层，旧任务文档“白板未进入产品面”的判断已过期。② **主机语音呼叫麦克风选择**：RustDesk 主机可为语音呼叫选择本机麦克风（`audio-input`、Flutter `AudioInput(isCm: true, isVoiceCall: true)`），我方主机语音固定默认通信设备（`host_server.cc:8417` 传空 `MicrophoneCaptureConfig`）。③ **会话期间移除壁纸**：RustDesk `allow-remove-wallpaper` 在入站授权后移除并在会话结束恢复壁纸，我方未实现，属带宽优化。另核实并**不计缺口**：直连 `host:port` 不经会合（`app/lib/target.dart`）、观看端麦克风设备选择（`list_microphones`）、LAN 发现（`server/internal/lan`）、WebSocket 载体（`server/internal/carrier/ws.go`）、IPv6 打洞、临时密码、空闲自动断开、双向语音、自动更新均已实现。**截图改为部分对齐**：我方在观看端把最新解码帧写成 PNG（`viewer_engine.cc:1423`），RustDesk 由主机处理 `ScreenshotRequest`，因此截图分辨率和可截取范围受当前订阅限制，不能称为完全等价。
@@ -40,7 +42,7 @@
 
 > 摄像头后续更新：同设备已共享采集编码，并与桌面共同协商格式；桌面附带摄像头复用连接投票，Camera-only 支持运行中参数修改、停止释放策略和硬编失败后的软件恢复。验证覆盖模拟媒体与真实 QUIC，本机无物理摄像头，设备实测仍待补齐。详见 [摄像头共享视频](camera-shared-video-2026-11-08.md)。
 
-> 编码兜底更新：已加入通过 vcpkg 安装的 OpenH264，Auto 在 oneVPL/FFmpeg 创建失败后使用软件 H.264；运行中普通硬件编码连续三次失败也会触发全局兼容协商及软件恢复。具体能力、验证与剩余边界见 [软件编码](software-encoder-2026-11-08.md)。以下旧快照中“没有 CPU 编码兜底”的描述已由此更新。
+> 编码兜底更新（2026-11-12 晚）：软件回退已改为 **VP9（libvpx）**，与 RustDesk 的无硬件回退一致；OpenH264 及软件 H.264 已从仓库移除。`Auto` 顺序为 oneVPL → FFmpeg 厂商编码 → 软件 VP9；运行中普通硬件编码连续三次失败会触发兼容协商并切到软件 VP9；CPU 采集只允许 VP9。旧 OpenH264 记录见 [软件编码（已废弃）](software-encoder-2026-11-08.md)，现行依据见 [发射端效果对照](sender-effectiveness-rustdesk-2026-11-11.md) 第 16、17 节。
 
 > 后续修复更新：多人独立选屏 F05 已实现，旧发布者/跟随者结构已移除；每屏使用独立视频服务线程，系统音源独立共享。v50 增加实际 GPU 解码能力与同屏交集，v51 接入全局多人 FPS/画质及主机延迟探测，v52 补视频取帧反馈、有限发送窗口与积压恢复，并移除连接线程重复的 FPS 等待。v53 已实现全部桌面连接的解码能力交集、有效编码偏好多数票和 Auto 顺序，并补齐临时切屏订阅的回退清理。当时未等同项（F08 色度能力、多窗口复用同一连接、复杂拓扑恢复等）随后由 v55/v61 继续处理；v55 已接入原生逐屏解码和 Flutter 独立画面，最新范围见 [观看端对照](D:/ds-chcast/docs/multidisplay-viewer-rustdesk-2026-11-08.md)。当前行为与验证见 [独立选屏修复对照](D:/ds-chcast/docs/independent-displays-rustdesk-2026-11-08.md)、[共享质量控制](D:/ds-chcast/docs/shared-video-qos-rustdesk-2026-11-08.md)、[全局编码协商](D:/ds-chcast/docs/global-codec-rustdesk-2026-11-08.md) 和 [同一会话的显示器窗口](D:/ds-chcast/docs/shared-display-windows-2026-11-09.md)。
 
@@ -68,10 +70,10 @@
 | 多连接与本地管理 | 默认 2、上限 8；稳定连接 ID；按 ID 聊天、发文件、改权限、断开；原生目标选择窗口 | 连接 id；CM 按 `conn_id` 操作 | **已实现**。跨进程服务 worker 管理与完整多用户界面体验待验收。[P04][R04] |
 | 全局策略与实时撤权 | 共享策略掩码、版本同步和传输层限制；全局关闭传播到已有及待审批连接；重新启用不自动恢复旧授权 | 按连接权限、全局选项和服务订阅控制 | **已实现**。逐项授权语义仍按 G03 扩展，不宣称全部规则相同。[P05] |
 | 单屏、合并屏与多人选屏 | `DesktopStreamPool` 按显示源共享采集/编码；每连接独立订阅、独立发送；发布者离开不再重建他人仍在使用的流；支持拓扑/热插拔恢复 | 按显示器创建视频服务；连接可 add/sub/set 订阅 | **已实现**。真实多物理屏、混合 DPI、多 GPU 和虚拟/隐私拓扑待验；单连接多屏规则已接入。[P06][R05] |
-| 编码与能力协商 | Hello 携带 `decoding_codecs`、`decoding_444` 和色度偏好；共享 codec 组取全部订阅连接的交集，偏好多数票，Auto 失败回退 OpenH264；v61 支持 VP9 4:4:4 | `supported_decoding` 与编码协商状态，硬件/软件路径 | **已实现**。AV1 4:4:4 和更多软件格式未提供；异构 GPU 组合待真机验证。[P07][R06] |
+| 编码与能力协商 | Hello 携带 `decoding_codecs`、`decoding_444` 和色度偏好；共享 codec 组取全部订阅连接的交集，偏好多数票；Auto 硬件失败回退软件 VP9（OpenH264 已移除）；v61 支持 VP9 4:4:4 | `supported_decoding` 与编码协商状态，硬件/软件路径 | **已实现**。AV1 4:4:4 和软件 AV1/VP8 未提供；异构 GPU 组合待真机验证。[P07][R06] |
 | 色彩与文字清晰度 | VP9 profile 1（I444）原始 BGRA → I444，解码后 BGRA 上传 GPU；H.264/HEVC/AV1 仍为 4:2:0；HDR 采集归一为 SDR | 按能力选择 I444；I444 仅用于 VP9/AV1 | **部分对齐**：VP9 4:4:4 与 RustDesk 的 VP9 路径等价；AV1 4:4:4 缺失，H.264/HEVC 两边都不提供 I444。HDR 只到 SDR 输出。[P08][R06][R20] |
-| 静止桌面与关键帧 | `NoNewFrame` 时按编码器/后端/画质分档重复编码缓存画面（VP9/H.264/HEVC，AV1 关闭），首次与 VP9 ≥100 ms、其余 ≤30 fps；IDR 入队清空旧刷新帧 | snapshot + 受限重复编码 | **已实现**。真实硬件静态画质收益、各后端预算和长时间功耗待测。[P09][R07] |
-| 采集/编码异常恢复 | DXGI `DuplicateOutput` 失败或不可用时切 GDI 上传路径；GPU 重建、桌面切换、缓存失效、硬件后端尝试；普通硬件编码连续失败回退软件 H.264 | DXGI → GDI、编码创建失败 → VP9 等分支 | **已实现（方向一致）**。驱动复位、RDP 进出、热插拔仍待真机复验；GDI 不是零拷贝路径，只作可用性兜底。[P10][R07] |
+| 静止桌面与关键帧 | `NoNewFrame` 时按编码器/后端/画质分档重复编码缓存画面（VP9/H.264/HEVC，AV1 关闭），首次与 VP9 ≥100 ms、其余 ≤30 fps；IDR 入队清空旧刷新帧 | `video_service/static_refresh.rs` 的 `max_repeat_frames()` 分档预算、100 ms 初期间隔、30 fps 上限与失败/无输出上限（55786aa；7423dce 仅有 WouldBlock 重复 10 次） | **已实现且预算表对齐**。真实硬件静态画质收益、各后端预算和长时间功耗待测。[P09][R07] |
+| 采集/编码异常恢复 | DXGI `DuplicateOutput` 失败或不可用时切 GDI 上传路径；GPU 重建、桌面切换、缓存失效、硬件后端尝试；普通硬件编码连续失败回退软件 VP9 | DXGI → GDI、编码创建失败 → VP9 等分支 | **已实现（方向一致）**。驱动复位、RDP 进出、热插拔仍待真机复验；GDI 不是零拷贝路径，只作可用性兜底。[P10][R07] |
 | 媒体发送与弱网 | 每显示源独立服务线程；全局 `VideoQos` 汇总所有订阅者的延迟/FPS/画质；每连接独立发送队列、积压丢弃和关键帧恢复；不再以生产连接发送成功作为全体广播前提；光标在采集线程内经每订阅 sink 直接投递（33 ms 节流），视频队列满时采样不暂停 | 多用户 QoS、帧反馈、有限等待；独立 cursor 服务 | **已实现**。极端拥塞/跨机弱网下共享降质规则和恢复时延仍需实测；RustDesk 同样受慢连接影响，不承诺完全隔离。500 kbps/30 ms 回环中视频帧年龄 3553 ms 时光标仍 291 次/0 丢弃。[P11][R08] |
 | 系统声音与双向语音 | 注册表级 `SharedLoopback` 系统音源，按会话订阅/退订，各连接独立权限和发送；麦克风上行、呼叫、AEC、静音门 | 共享音频服务，按连接订阅 | **已实现**。主机语音麦克风可在设置页/托盘固定，设备缺失时回退默认通信设备并记日志（G22）；真实回声、热插拔、多人争用和观看端麦克风设备切换待实机验证。[P12][R09] |
 | 键鼠、触摸、笔 | HID/扫描码物理映射、Unicode 文本、本地输入法模式、v63 Legacy 虚拟键码注入、相对鼠标、触控/笔、释放屏障、卡键清理、注入回环过滤 | Map / Translate / Legacy 三种模式 | **已实现/待验**：Map、本地输入法（Translate 方向）与 Legacy 三种模式均已接入；非 US 布局、AltGr、死键、其他 IME、安全桌面输入待实测。[P13][R10] |
@@ -115,7 +117,7 @@
 - F05 独立选屏：`DesktopStreamPool` 按显示源共享采集/编码，每连接独立订阅和发送；发布者离开不重建他人仍在使用的流。
 - F06 全订阅者 QoS：全局 `VideoQos` 汇总所有订阅者，每连接独立发送队列、积压丢弃和关键帧恢复。
 - F07 按 ID 管理：稳定连接 ID，聊天/文件/权限/断开都有显式目标接口，不再依赖 `focused` 会话。
-- F08 编解码能力协商：Hello 携带 `decoding_codecs`/`decoding_444`，共享 codec 组取订阅连接交集，Auto 回退 OpenH264；v61 支持 VP9 4:4:4。
+- F08 编解码能力协商：Hello 携带 `decoding_codecs`/`decoding_444`，共享 codec 组取订阅连接交集，Auto 回退软件 VP9（OpenH264 已于 2026-11-12 移除）；v61 支持 VP9 4:4:4。
 
 这些行为分别有 `tests/desktop_stream_test.cc`、`tests/host_parity_test.cc`、`tests/host_multi_test.cc`、`tests/host_voice_test.cc`、`tests/clipboard_async_test.cc`、`tests/mp4_recorder_test.cc` 等回归。本轮做文档比对时只核对了源码和测试断言，没有重新运行完整产品测试，也没有触发本机输入、登录、锁屏或修改显示拓扑；旧测试成绩不能被改写为本轮双机 A/B 结果。
 

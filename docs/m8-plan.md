@@ -567,8 +567,8 @@ Opus 直接使用 vcpkg 安装的独立 `opus.lib`（`Opus::opus`），编码/�
 继续承担 AAC 解码与 libswresample；`chast.ffmpeg` 因编解码器注册表仍需
 链接 `Opus::opus`，但那只是链接依赖，Opus 数据路径不经过它。
 
-- 系统声音：48 kHz 立体声，20 ms（960 样本），128 kbps，`OPUS_APPLICATION_AUDIO`。
-- 麦克风：48 kHz 单声道，20 ms（960 样本），32 kbps，`OPUS_APPLICATION_VOIP`。
+- 系统声音：48 kHz 立体声，**10 ms（480 样本）**，128 kbps，`OPUS_APPLICATION_RESTRICTED_LOWDELAY`（2026-11-12 起；此前为 20 ms/960、AUDIO）。
+- 麦克风：48 kHz 单声道，**10 ms（480 样本）**，32 kbps，`OPUS_APPLICATION_RESTRICTED_LOWDELAY`（2026-11-12 起；此前为 20 ms/960、VOIP）。
 - 编码器通过 `opus_encoder_ctl(OPUS_GET_LOOKAHEAD)` 取得 pre-skip，写出
   标准 19 字节 `OpusHead` 作为 extradata；解码器从中读取 pre-skip，首包
   丢弃这段预热样本，之后的包按 `AudioHeader` 时间戳调度。
