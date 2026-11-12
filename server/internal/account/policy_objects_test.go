@@ -442,6 +442,39 @@ func TestPolicyResolutionMaterialisesDevicePolicies(t *testing.T) {
 	}
 }
 
+// TestPolicyReconcileCacheTracksPolicyWrites proves the registration fast path:
+// an unchanged device is remembered at the current generation, and any write
+// that can change assignment resolution makes the next reconcile run again.
+func TestPolicyReconcileCacheTracksPolicyWrites(t *testing.T) {
+	store := openGroupStore(t)
+	if _, _, err := store.ReconcileDevicePolicies([]string{"devbox"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if gen, ok := store.policyClean["devbox"]; !ok || gen != store.policyGen {
+		t.Fatalf("steady reconcile cached = %v at %d, want generation %d", ok, gen, store.policyGen)
+	}
+
+	if _, err := store.CreateGroup("lab", "Lab", "", 0, 0); err != nil {
+		t.Fatalf("create lab: %v", err)
+	}
+	if _, err := store.AddGroupDevice("lab", "devbox", "root"); err != nil {
+		t.Fatalf("add devbox to lab: %v", err)
+	}
+	if _, ok := store.policyClean["devbox"]; ok {
+		t.Fatal("group membership write left the reconciled device cached")
+	}
+	if _, _, err := store.ReconcileDevicePolicies([]string{"devbox"}); err != nil {
+		t.Fatalf("reconcile after membership write: %v", err)
+	}
+
+	if err := store.DeleteDevicePolicy("devbox"); !errors.Is(err, ErrUnknownDevicePolicy) {
+		t.Fatalf("delete absent policy = %v", err)
+	}
+	if gen, ok := store.policyClean["devbox"]; !ok || gen != store.policyGen {
+		t.Fatalf("failed write dropped cache = %v at %d", ok, gen)
+	}
+}
+
 // TestPolicyReconcileAllCoversGroupDevices proves that devices that joined a
 // group before any assignment existed are reached by the bulk reconcile, and
 // that deleting the group removes its group-scoped assignment.

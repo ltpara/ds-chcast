@@ -119,6 +119,10 @@ type Options struct {
 	// CarrierV6 adds an IPv6 shared-carrier listener on ::1 and advertises it,
 	// so tests can cover dual-stack carrier endpoints.
 	CarrierV6 bool
+	// RelayPorts overrides the local relay port pool. Zero values ask for an
+	// ephemeral port; nil keeps the default two-port pool. A one-port pool
+	// makes exhaustion reachable in a test.
+	RelayPorts []int
 	// RegistryOfflineAfter controls how long a host remains UDP-online after
 	// its last rendezvous keepalive. Zero keeps the production default.
 	RegistryOfflineAfter time.Duration
@@ -226,7 +230,11 @@ func StartWith(t testing.TB, opts Options) *Server {
 		}
 		relayOpts = append(relayOpts, relay.WithTransportVerifier(transportVerifier))
 	}
-	rm, err := relay.NewManager("127.0.0.1", []int{0, 0}, reg, log, relayOpts...)
+	relayPorts := opts.RelayPorts
+	if relayPorts == nil {
+		relayPorts = []int{0, 0}
+	}
+	rm, err := relay.NewManager("127.0.0.1", relayPorts, reg, log, relayOpts...)
 	if err != nil {
 		t.Fatalf("relay: %v", err)
 	}

@@ -41,6 +41,14 @@ var (
 
 const challengeTTL = 30 * time.Second
 
+// challengeSweepInterval gates the expired-entry sweep of the replay map.
+// Scanning it on every issue made each keepalive O(live proofs), i.e. O(online
+// fleet); sweeping at most once per interval makes the amortized sweep work
+// per challenge TTL/interval map visits, independent of the fleet size, while
+// expired entries linger at most one extra interval (they are already rejected
+// by their signed expiry).
+const challengeSweepInterval = challengeTTL / 3
+
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 // ValidID keeps IDs readable (they end up in URLs and logs) and bounded.
@@ -167,6 +175,10 @@ type Registry struct {
 	// usedChallenges remembers successful proofs until they expire, keeping
 	// nonces one-time without tracking every issued challenge.
 	usedChallenges map[string]time.Time
+	// nextChallengeSweep is when the replay map is next pruned. A single full
+	// sweep per interval keeps the cost of cleanup proportional to the
+	// challenge rate instead of the map size on every issue.
+	nextChallengeSweep time.Time
 }
 
 // New creates a registry without persistence. Tests and embedders that manage
@@ -759,15 +771,21 @@ func (r *Registry) IssueChallengeScoped(id, purpose, scope string) (string, erro
 func (r *Registry) issueChallenge(id, purpose, scope string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := r.now()
 	host, ok := r.hosts[id]
-	if !ok || r.now().After(host.ExpiresAt) {
+	if !ok || now.After(host.ExpiresAt) {
 		return "", ErrUnknownHost
 	}
-	now := r.now()
-	for nonce, expires := range r.usedChallenges {
-		if now.After(expires) {
-			delete(r.usedChallenges, nonce)
+	if !now.Before(r.nextChallengeSweep) {
+		// Deletion only frees entries that already failed their signed expiry
+		// check in verifyChallenge, so letting them linger until this gate
+		// opens never weakens replay rejection.
+		for nonce, expires := range r.usedChallenges {
+			if now.After(expires) {
+				delete(r.usedChallenges, nonce)
+			}
 		}
+		r.nextChallengeSweep = now.Add(challengeSweepInterval)
 	}
 	return r.mintChallenge(id, purpose, scope, now.Add(challengeTTL))
 }

@@ -175,6 +175,7 @@ func (s *Store) SetDevicePolicy(peerID, mode string, ceiling uint32, usernames, 
 	if err := tx.Commit(); err != nil {
 		return DevicePolicy{}, fmt.Errorf("account store %s: commit device policy: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return s.devicePolicyLocked(peerID)
 }
 
@@ -457,6 +458,7 @@ func (s *Store) DeleteDevicePolicy(peerID string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit device policy delete: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return nil
 }
 

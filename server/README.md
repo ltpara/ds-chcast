@@ -1057,6 +1057,13 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   仍按双栈处理，原有配置行为不变。会合与打洞本身仍需要服务器提供可达的
   地址族（`--punch-listen [::]` + `--advertise-v6`，或 IPv4 会合）；无
   IPv4 回环的纯 IPv6 主机应让 `--local` 与 C++ 主机监听都使用 `::1`。
+- 中继容量：每个获租主机独占一个 `--relay-ports` 端口（同一端口的 v4/v6
+  监听共用租约），所以端口池大小就是并发获租主机数的上限；需要更多主机时
+  扩大范围或部署 `--relay-nodes`（每个节点自带端口集合）。池耗尽时注册
+  不再失败（2026-11-12 起）：主机保持在线，响应不带 `relay`/`relays`/
+  `carrier`，只走直连打洞，服务端记 `relay ports exhausted` 警告并累加
+  `/metrics` 的 `chast_relay_lease_missing_total`；端口释放后下一次续约
+  自动重新获租。`--relay-only` 部署没有直连兜底，池耗尽仍返回 503。
 - `--carrier-listen-v6` 为共享载体在同一端口号上再开一组 IPv6 TCP 监听，
   例如 `--carrier-listen 0.0.0.0:8445 --carrier-listen-v6 ::`；`--advertise-v6`
   同时给出时，注册、查询与 `/v1/server` 会在 `carrier` 之外下发

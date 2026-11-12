@@ -294,6 +294,14 @@ type Store struct {
 	tokenTTL     time.Duration
 	accessTTL    time.Duration
 	refreshGrace time.Duration
+
+	// policyClean remembers devices whose assignment was already proven
+	// unchanged at policyGen, so registration renewals do not re-resolve an
+	// unchanged policy against SQLite. Nil on PostgreSQL: another process can
+	// write the assignment tables, so only SQLite's single writer keeps the
+	// in-memory generation exact.
+	policyGen   uint64
+	policyClean map[string]uint64
 }
 
 type dialect int
@@ -342,6 +350,7 @@ func Open(path string) (*Store, error) {
 		tokenTTL:     TokenTTL,
 		accessTTL:    AccessTokenTTL,
 		refreshGrace: RefreshReuseGrace,
+		policyClean:  make(map[string]uint64),
 	}, nil
 }
 

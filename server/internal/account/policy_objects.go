@@ -160,6 +160,7 @@ func (s *Store) CreatePolicyObject(name, mode string, ceiling uint32, usernames,
 	if err := tx.Commit(); err != nil {
 		return PolicyObject{}, fmt.Errorf("account store %s: commit policy object: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return s.policyObjectLocked(id)
 }
 
@@ -252,6 +253,7 @@ func (s *Store) UpdatePolicyObject(id, name, mode string, ceiling uint32, userna
 	if err := tx.Commit(); err != nil {
 		return PolicyObject{}, fmt.Errorf("account store %s: commit policy object update: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return s.policyObjectLocked(id)
 }
 
@@ -395,6 +397,7 @@ func (s *Store) DeletePolicyObject(id string) error {
 	if affected == 0 {
 		return ErrUnknownPolicyObject
 	}
+	s.invalidatePolicyReconcileLocked()
 	return nil
 }
 
@@ -450,6 +453,7 @@ func (s *Store) CreatePolicyAssignment(policyID, scopeKind, scopeValue string, p
 		}
 		return PolicyAssignment{}, fmt.Errorf("account store %s: create policy assignment: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return s.policyAssignmentLocked(id)
 }
 
@@ -552,6 +556,7 @@ func (s *Store) CreateDevicePolicyAssignments(policyID string, devices []string,
 	if err := tx.Commit(); err != nil {
 		return PolicyAssignmentBatch{}, fmt.Errorf("account store %s: commit policy assignment batch: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return batch, nil
 }
 
@@ -623,6 +628,7 @@ func (s *Store) DeletePolicyAssignment(id string) error {
 	if affected == 0 {
 		return ErrUnknownPolicyAssignment
 	}
+	s.invalidatePolicyReconcileLocked()
 	return nil
 }
 
@@ -814,19 +820,41 @@ func (s *Store) ReconcileDevicePolicies(peerIDs []string) ([]DevicePolicy, []str
 	changed := make([]DevicePolicy, 0)
 	unmanaged := make([]string, 0)
 	for _, peerID := range ordered {
+		if gen, ok := s.policyClean[peerID]; ok && gen == s.policyGen {
+			continue
+		}
 		policy, removed, err := s.reconcileDevicePolicyLocked(peerID)
 		if err != nil {
 			return nil, nil, err
 		}
 		if removed {
 			unmanaged = append(unmanaged, peerID)
+			delete(s.policyClean, peerID)
 			continue
 		}
 		if policy != nil {
 			changed = append(changed, *policy)
+			delete(s.policyClean, peerID)
+			continue
+		}
+		if s.policyClean != nil {
+			s.policyClean[peerID] = s.policyGen
 		}
 	}
 	return changed, unmanaged, nil
+}
+
+// invalidatePolicyReconcileLocked forgets which devices were proven unchanged
+// after a write that can alter assignment resolution. It must run under s.mu
+// on every path that writes the assignment, template, group or manual-policy
+// tables; a missed path would keep serving the pre-write policy until the
+// process restarts.
+func (s *Store) invalidatePolicyReconcileLocked() {
+	if s.policyClean == nil {
+		return
+	}
+	s.policyGen++
+	clear(s.policyClean)
 }
 
 // ReconcileAllDevicePolicies covers every device the store knows about: rows

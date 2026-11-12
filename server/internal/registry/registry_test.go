@@ -439,6 +439,41 @@ func TestChallengeIsOneTimeAndBound(t *testing.T) {
 	}
 }
 
+func TestChallengeSweepIsGated(t *testing.T) {
+	reg := New(time.Minute)
+	now := time.Unix(8000, 0)
+	reg.SetClock(func() time.Time { return now })
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	// The first issue arms the sweep gate at t0+interval.
+	if _, err := reg.IssueChallenge("devbox", identity.DomainKeepalive); err != nil {
+		t.Fatal(err)
+	}
+	reg.usedChallenges["expired"] = now.Add(time.Second)
+	reg.usedChallenges["live"] = now.Add(challengeTTL)
+
+	now = now.Add(2 * time.Second)
+	if _, err := reg.IssueChallenge("devbox", identity.DomainKeepalive); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reg.usedChallenges["expired"]; !ok {
+		t.Fatal("expired proof was swept before the gate opened")
+	}
+
+	now = now.Add(challengeSweepInterval - 2*time.Second)
+	if _, err := reg.IssueChallenge("devbox", identity.DomainKeepalive); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reg.usedChallenges["expired"]; ok {
+		t.Fatal("expired proof survived the sweep")
+	}
+	if _, ok := reg.usedChallenges["live"]; !ok {
+		t.Fatal("live proof was swept")
+	}
+}
+
 func TestChallengeSurvivesInterleavedIssues(t *testing.T) {
 	reg := New(time.Minute)
 	priv, pub := hostKey("host-secret")

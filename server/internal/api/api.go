@@ -229,7 +229,10 @@ type server struct {
 	durationCount   map[string]uint64
 	durationBuckets map[string][]uint64
 	rateLimited     uint64
-	inFlight        atomic.Int64
+	// relayLeaseMissing counts registrations that stayed online without a
+	// relay lease because every local port was held by another host.
+	relayLeaseMissing uint64
+	inFlight          atomic.Int64
 
 	recoveryMu   sync.Mutex
 	recoveryLast map[string]time.Time
@@ -730,8 +733,24 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	relayEndpoint, relays, carrier, carrierV6, err := s.assignRelay(req.ID, req.PublicKey, host, s.clientLocation(clientAddr))
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "no relay port is available")
-		return
+		// Every registered host competes for one relay port, while hbbs relays
+		// any number of peers through one listener. Refusing the registration
+		// would take a host offline even when a direct punch still works, so an
+		// exhausted local pool degrades to direct-only. Relay-only mode has no
+		// direct path to fall back to and keeps refusing.
+		if !errors.Is(err, relay.ErrNoFreePort) || s.relayOnly() {
+			writeError(w, http.StatusServiceUnavailable, "no relay port is available")
+			return
+		}
+		s.mu.Lock()
+		s.relayLeaseMissing++
+		s.mu.Unlock()
+		// A lease that moved from a relay node cannot survive the fallback. Clear
+		// it so a lookup stops advertising an endpoint that was just released.
+		s.cfg.Registry.SetRelay(req.ID, 0, "")
+		s.cfg.Logger.Warn("relay ports exhausted; host registers without a relay lease",
+			"id", req.ID, "ip", clientAddr, "direct_only", true)
+		relayEndpoint, relays, carrier, carrierV6 = "", nil, "", ""
 	}
 	// The register reply addresses the host itself. A host on the server's LAN
 	// is given the local relay address so it never has to hairpin through the
@@ -1688,6 +1707,7 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	rateLimited := s.rateLimited
+	leaseMissing := s.relayLeaseMissing
 	requests := make(map[string]uint64, len(s.requests))
 	for key, value := range s.requests {
 		requests[key] = value
@@ -1709,6 +1729,8 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 	inFlight := s.inFlight.Load()
 	fmt.Fprintf(&b, "# HELP chast_http_requests_in_flight API requests currently being served.\n# TYPE chast_http_requests_in_flight gauge\nchast_http_requests_in_flight %d\n", inFlight)
 	counter("chast_http_rate_limited_total", "API requests rejected by the per-IP limiter.", "", rateLimited)
+	counter("chast_relay_lease_missing_total",
+		"Registrations kept online without a relay lease because the local pool was exhausted.", "", leaseMissing)
 
 	keys := make([]string, 0, len(requests))
 	for key := range requests {

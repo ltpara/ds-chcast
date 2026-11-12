@@ -352,6 +352,7 @@ func (s *Store) DeleteAccountGroup(groupID string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit group delete: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return nil
 }
 
@@ -744,6 +745,7 @@ func (s *Store) AddGroupDevice(groupID, peerID, addedBy string) (GroupDevice, er
 	if err := tx.Commit(); err != nil {
 		return GroupDevice{}, fmt.Errorf("account store %s: commit group device add: %w", s.path, err)
 	}
+	s.invalidatePolicyReconcileLocked()
 	return GroupDevice{PeerID: peerID, AddedBy: addedBy, CreatedAt: created}, nil
 }
 
@@ -772,6 +774,7 @@ func (s *Store) RemoveGroupDevice(groupID, peerID string) error {
 	if affected == 0 {
 		return ErrUnknownGroupDevice
 	}
+	s.invalidatePolicyReconcileLocked()
 	return nil
 }
 
