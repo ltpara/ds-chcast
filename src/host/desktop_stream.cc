@@ -504,6 +504,11 @@ struct DesktopStreamPool::Source {
         }
         const auto requested = wanted.codec;
         std::unique_ptr<IVideoEncoder> next;
+        // The first candidate is the requested family, so its refusal explains
+        // the session. Later candidates exist only as fallbacks; their errors
+        // are usually less specific (VP9's "software only" instead of NVENC's
+        // driver message), so keep the first one for the caller.
+        std::string first_failure;
         std::vector<VideoCodec> candidates{wanted.codec};
         if (!strict_codec)
             for (auto codec : {VideoCodec::Hevc, VideoCodec::H264, VideoCodec::Av1, VideoCodec::Vp9})
@@ -532,12 +537,16 @@ struct DesktopStreamPool::Source {
             } else if (software_fallback) actual.backend = EncoderBackend::Software;
             auto candidate = factory(capture->adapter_device().device, actual, failure);
             if (!candidate || !(common & video_codec_bit(candidate->codec())) ||
-                (strict_codec && candidate->codec() != requested)) continue;
+                (strict_codec && candidate->codec() != requested)) {
+                if (first_failure.empty()) first_failure = *failure;
+                continue;
+            }
             next = std::move(candidate);
             break;
         }
         if (!next) {
-            if (failure->empty()) *failure = "no common encoder and decoder format";
+            if (!first_failure.empty()) *failure = std::move(first_failure);
+            else if (failure->empty()) *failure = "no common encoder and decoder format";
             return false;
         }
         // Prove a replacement before changing the format used by live peers.

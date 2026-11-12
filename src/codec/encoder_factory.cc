@@ -71,7 +71,11 @@ std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device,
     if (config.codec == VideoCodec::Vp9) {
         if (config.backend == EncoderBackend::Auto || config.backend == EncoderBackend::Software)
             return create_vpx_encoder(device, config, error);
-        if (error) *error = "VP9 is available through the software backend";
+        if (error) {
+            *error = std::string("VP9 has no encoder in the ") +
+                     encoder_backend_name(config.backend) +
+                     " backend (it is software only); use the auto or software backend";
+        }
         return nullptr;
     }
     if (config.chroma != VideoChroma::Yuv420) {

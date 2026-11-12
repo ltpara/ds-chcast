@@ -37,10 +37,20 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
+// The NVENC headers libavcodec itself compiled against. Their version is what
+// decides the minimum driver, so the diagnostic below reports the same
+// numbers instead of hard-coding one.
+#if __has_include(<ffnvcodec/nvEncodeAPI.h>)
+#include <ffnvcodec/nvEncodeAPI.h>
+#define CHAST_HAVE_NVENC_HEADERS 1
+#endif
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -124,6 +134,91 @@ bool adapter_vendor(ID3D11Device* device, UINT* vendor) {
     }
     *vendor = desc.VendorId;
     return true;
+}
+
+bool adapter_luid(ID3D11Device* device, LUID* luid) {
+    ComPtr<IDXGIDevice> dxgi;
+    if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice),
+                                      reinterpret_cast<void**>(dxgi.put())))) {
+        return false;
+    }
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgi->GetAdapter(adapter.put()))) {
+        return false;
+    }
+    DXGI_ADAPTER_DESC desc{};
+    if (FAILED(adapter->GetDesc(&desc))) {
+        return false;
+    }
+    *luid = desc.AdapterLuid;
+    return true;
+}
+
+// What the installed driver reports versus what this build compiled against.
+// libavcodec compares exactly these two numbers and fails with ENOSYS before
+// it touches a frame, so reading them turns "Function not implemented" into an
+// actionable message. Both are packed as major << 4 | minor, as NVENC does.
+struct NvencApi {
+    bool driver_known = false;
+    uint32_t driver_version = 0;
+    uint32_t build_version = 0;
+};
+
+NvencApi nvenc_api() {
+    NvencApi api;
+#ifdef CHAST_HAVE_NVENC_HEADERS
+    api.build_version = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
+#endif
+    const HMODULE module = LoadLibraryW(L"nvEncodeAPI64.dll");
+    if (!module) {
+        return api;
+    }
+    using QueryFn = int (*)(uint32_t*);
+    const FARPROC symbol = GetProcAddress(module, "NvEncodeAPIGetMaxSupportedVersion");
+    QueryFn query = nullptr;
+    static_assert(sizeof(query) == sizeof(symbol));
+    std::memcpy(&query, &symbol, sizeof(query));
+    uint32_t version = 0;
+    const bool answered = query != nullptr && query(&version) == 0;
+    FreeLibrary(module);
+    if (answered) {
+        api.driver_known = true;
+        api.driver_version = version;
+    }
+    return api;
+}
+
+std::string api_version_text(uint32_t version) {
+    return std::to_string(version >> 4) + "." + std::to_string(version & 0xf);
+}
+
+// NVIDIA's table from libavcodec's nvenc_print_driver_requirement().
+const char* nvenc_min_driver(uint32_t build_version) {
+    switch (build_version) {
+        case (13u << 4) | 0u: return "570.0";
+        case (12u << 4) | 2u: return "551.76";
+        case (12u << 4) | 1u: return "531.61";
+        case (12u << 4) | 0u: return "522.25";
+        case (11u << 4) | 1u: return "471.41";
+        default: return nullptr;
+    }
+}
+
+// Empty when the driver satisfies this build (or the answer is unknown).
+std::string nvenc_driver_note() {
+    const NvencApi api = nvenc_api();
+    if (!api.driver_known || api.build_version == 0 ||
+        api.driver_version >= api.build_version) {
+        return {};
+    }
+    std::string note = "the installed NVIDIA driver reports NVENC API " +
+                       api_version_text(api.driver_version) +
+                       ", but this build requires " + api_version_text(api.build_version);
+    if (const char* minimum = nvenc_min_driver(api.build_version)) {
+        note += " (driver " + std::string(minimum) + " or newer)";
+    }
+    note += "; use a newer driver or the software backend";
+    return note;
 }
 
 // IDR detection for key-frame packets. Encoders without GLOBAL_HEADER emit
@@ -507,6 +602,16 @@ Error FFmpegEncoder::open_codec_impl() {
 
     status = avcodec_open2(c, codec_api_, nullptr);
     if (status < 0) {
+        // A driver too old for this build's NVENC headers is the one failure
+        // the bare libavcodec error cannot explain.
+        if (driver_.driver == Driver::Nvenc) {
+            const std::string note = nvenc_driver_note();
+            if (!note.empty()) {
+                return Error(Status::Unsupported,
+                             "avcodec_open2(" + std::string(encoder_name(driver_, codec_)) +
+                                 ") failed: " + av_error_text(status) + "; " + note);
+            }
+        }
         return av_error(status, "avcodec_open2");
     }
 
@@ -901,15 +1006,51 @@ bool ffmpeg_encoder_available(VideoCodec codec, ID3D11Device* device) {
         return false;
     }
 
-    if (avcodec_find_encoder_by_name(encoder_name(driver, codec))) {
-        return true;
+    const auto carries = [&driver](VideoCodec wanted) {
+        if (avcodec_find_encoder_by_name(encoder_name(driver, wanted))) {
+            return true;
+        }
+        if (wanted == VideoCodec::Av1 &&
+            avcodec_find_encoder_by_name(encoder_name(driver, VideoCodec::Hevc))) {
+            return true;
+        }
+        return wanted != VideoCodec::H264 &&
+               avcodec_find_encoder_by_name(encoder_name(driver, VideoCodec::H264));
+    };
+    if (!carries(codec)) {
+        return false;
     }
-    if (codec == VideoCodec::Av1 &&
-        avcodec_find_encoder_by_name(encoder_name(driver, VideoCodec::Hevc))) {
-        return true;
+
+    // Carrying the encoder in the build is not the same as the driver running
+    // it: an old NVENC driver refuses an API-13 build, and a disabled AMF
+    // runtime refuses too. Open one at a small size, which is the same check
+    // create_encoder() would make later, and remember the answer because the
+    // open costs a device setup and a test encode.
+    LUID luid{};
+    if (!adapter_luid(device, &luid)) {
+        return false;
     }
-    return codec != VideoCodec::H264 &&
-           avcodec_find_encoder_by_name(encoder_name(driver, VideoCodec::H264));
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(luid.HighPart)) << 32) |
+                         luid.LowPart;
+    static std::mutex mutex;
+    static std::map<std::pair<uint64_t, VideoCodec>, bool> probed;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = probed.find({key, codec});
+        if (found != probed.end()) {
+            return found->second;
+        }
+    }
+    EncoderConfig config;
+    config.codec = codec;
+    config.width = 640;
+    config.height = 360;
+    const bool available = create_ffmpeg_encoder(device, config, nullptr) != nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        probed[{key, codec}] = available;
+    }
+    return available;
 }
 
 }  // namespace chast

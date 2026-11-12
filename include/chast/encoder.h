@@ -199,7 +199,10 @@ public:
 // device lives on, which is the adapter the frames come from. A non-H.264
 // codec counts as available when its own implementation exists or when one a
 // lower tier falls back to does: create_encoder() may answer an HEVC request
-// with AVC, and an AV1 request with HEVC or AVC. The device is not opened.
+// with AVC, and an AV1 request with HEVC or AVC. With a device, a hardware
+// family is opened once at a small size and its answer cached per adapter and
+// codec: a build can carry nvenc/amf/qsv that the installed driver refuses
+// (NVENC API 13.0 needs driver 570.0 or newer).
 bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device = nullptr,
                                 EncoderBackend backend = EncoderBackend::Auto);
 
