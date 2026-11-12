@@ -977,6 +977,14 @@ public:
     // caller caches it by `shape_id`. Returns false when nothing new arrived.
     bool TakeCursor(chast::CursorUpdate& update);
 
+    // Asks the host to send a cursor sprite again (v73) when this viewer's
+    // cache no longer holds it. `stream_id` names a subscribed display; the
+    // default selects the focused stream. Only the newest request is kept and
+    // repeats of the same stream and shape are throttled to one per second.
+    // Returns false when no session is streaming or the request is throttled.
+    bool RequestCursorShape(uint64_t shape_id,
+                            uint32_t stream_id = chast::kCursorCurrentStream);
+
     // Mutes or unmutes system sound. Safe from the UI thread; the session
     // thread applies it to the render session. Returns false when no audio
     // pipeline is running, so the caller knows the tap had no effect.
@@ -1269,6 +1277,12 @@ private:
     mutable std::mutex session_mutex_;
     bool pending_session_list_ = false;
     std::optional<uint32_t> pending_session_select_;
+    // One cursor sprite re-request at a time, throttled per stream and shape.
+    std::optional<std::pair<uint32_t, uint64_t>> pending_cursor_shape_;
+    uint32_t cursor_request_stream_ = 0;
+    uint64_t cursor_request_shape_ = 0;
+    bool cursor_request_valid_ = false;
+    std::chrono::steady_clock::time_point cursor_request_at_{};
 
     // Port-forward commands cross to the session thread here. The queue keeps
     // order between starts and stops, so a stop cannot overtake the start it

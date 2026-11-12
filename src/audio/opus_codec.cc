@@ -5,6 +5,10 @@
 // speaks 48 kHz here: its other rates would add resampling without a benefit
 // for either the loopback mix or a speech uplink.
 //
+// Both directions use 10 ms frames in OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+// matching RustDesk's audio service. The frame length is a protocol constant:
+// OpusInfo and microphone stream headers are validated against it.
+//
 // Timestamps are assigned from the capture timeline, exactly like the AAC
 // path: libopus returns bytes, not a presentation clock. Each packet carries
 // the steady-clock time of its first input sample, and the decoder rebuilds
@@ -120,7 +124,7 @@ Error OpusEncoderImpl::open() {
     int status = OPUS_OK;
     encoder_ = opus_encoder_create(
         static_cast<opus_int32>(kOpusRate), config_.channels,
-        config_.voice ? OPUS_APPLICATION_VOIP : OPUS_APPLICATION_AUDIO, &status);
+        OPUS_APPLICATION_RESTRICTED_LOWDELAY, &status);
     if (!encoder_ || status != OPUS_OK) {
         return Error(Status::CaptureFailed, opus_error(status, "opus_encoder_create"));
     }

@@ -3454,9 +3454,10 @@ void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
     }
     std::string error;
     if (!remote_cursor_.Activate(last_cursor_.shape_id, scale, &error)) {
-        // The sprite for the shape the host is showing has not arrived yet (a
-        // shape id can precede its image after a cache eviction). Keep the
-        // previous cursor and try again on the next poll.
+        // The sprite for the shape the host is showing is not in the cache: a
+        // shape id can precede its image after eviction. Ask the host to send
+        // it again (v73); the engine throttles the retry.
+        viewer_->RequestCursorShape(last_cursor_.shape_id);
         if (error != "the cursor shape was never registered") {
             std::fprintf(stderr, "chast_viewer: remote cursor: %s\n", error.c_str());
         }

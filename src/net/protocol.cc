@@ -2875,7 +2875,7 @@ std::string truncate_voice_reason(const std::string& reason) {
     return valid_utf8(text) ? text : std::string();
 }
 
-// The host microphone is always 48 kHz Opus in 20 ms frames, one or two
+// The host microphone is always 48 kHz Opus in 10 ms frames, one or two
 // channels. Anything else would describe a stream the viewer cannot decode
 // with the microphone decoder.
 bool valid_voice_info(const AudioInfo& info) {
@@ -3802,6 +3802,32 @@ bool parse_display_cursor_update(const std::vector<uint8_t>& payload,
         return false;
     }
     return parse_cursor_update({payload.begin() + 4, payload.end()}, update.cursor, error);
+}
+
+std::vector<uint8_t> make_cursor_shape_request(const CursorShapeRequest& request) {
+    std::vector<uint8_t> payload(16);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request.stream_id);
+    put_u32(cursor, 0);
+    put_u64(cursor, request.shape_id);
+    return make_control(ControlType::CursorShapeRequest, payload);
+}
+
+bool parse_cursor_shape_request(const std::vector<uint8_t>& payload,
+                                CursorShapeRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint32_t reserved = 0;
+    request = {};
+    if (!reader.u32(request.stream_id) || !reader.u32(reserved) ||
+        !reader.u64(request.shape_id) || !reader.at_end()) {
+        set_error(error, "malformed CursorShapeRequest");
+        return false;
+    }
+    if (reserved != 0) {
+        set_error(error, "CursorShapeRequest has non-zero reserved bytes");
+        return false;
+    }
+    return true;
 }
 
 std::vector<uint8_t> make_permission_update(PermissionMask permissions) {

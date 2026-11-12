@@ -153,26 +153,29 @@ void independent_cursor_sampling() {
 
 void cpu_encoding_without_device() {
     std::vector<uint8_t> pixels(64 * 48 * 4, 255);
-    for (auto codec : {VideoCodec::H264, VideoCodec::Vp9}) {
-        EncoderConfig config;
-        config.width = 64; config.height = 48; config.framerate = 30;
-        config.gop_size = 0; config.codec = codec; config.backend = EncoderBackend::Software;
-        for (auto chroma : {VideoChroma::Yuv420, VideoChroma::Yuv444}) {
-            if (codec == VideoCodec::H264 && chroma == VideoChroma::Yuv444) continue;
-            config.chroma = chroma;
-            std::string error;
-            auto encoder = create_encoder(nullptr, config, &error);
-            check(encoder != nullptr, "software encoder opens with no D3D device");
-            std::vector<EncodedPacket> packets;
-            check(encoder->encode_cpu_bgra(pixels.data(), 64, 48, 0, true, packets).ok() &&
-                !packets.empty() && packets.front().idr, "CPU BGRA produces an initial IDR");
-            packets.clear();
-            check(encoder->encode_cpu_bgra(pixels.data(), 64, 48, 33, false, packets).ok(),
-                  "CPU BGRA encodes subsequent delta input");
-            packets.clear();
-            check(encoder->encode_repeat(66, true, packets).ok() && !packets.empty() && packets.front().idr,
-                  "CPU repeat honors an on-demand IDR without a capture device");
-        }
+    EncoderConfig h264;
+    h264.width = 64; h264.height = 48;
+    h264.codec = VideoCodec::H264; h264.backend = EncoderBackend::Software;
+    std::string h264_error;
+    check(create_encoder(nullptr, h264, &h264_error) == nullptr,
+          "software H.264 is unavailable; VP9 is the only CPU codec");
+    EncoderConfig config;
+    config.width = 64; config.height = 48; config.framerate = 30;
+    config.gop_size = 0; config.codec = VideoCodec::Vp9; config.backend = EncoderBackend::Software;
+    for (auto chroma : {VideoChroma::Yuv420, VideoChroma::Yuv444}) {
+        config.chroma = chroma;
+        std::string error;
+        auto encoder = create_encoder(nullptr, config, &error);
+        check(encoder != nullptr, "software encoder opens with no D3D device");
+        std::vector<EncodedPacket> packets;
+        check(encoder->encode_cpu_bgra(pixels.data(), 64, 48, 0, true, packets).ok() &&
+            !packets.empty() && packets.front().idr, "CPU BGRA produces an initial IDR");
+        packets.clear();
+        check(encoder->encode_cpu_bgra(pixels.data(), 64, 48, 33, false, packets).ok(),
+              "CPU BGRA encodes subsequent delta input");
+        packets.clear();
+        check(encoder->encode_repeat(66, true, packets).ok() && !packets.empty() && packets.front().idr,
+              "CPU repeat honors an on-demand IDR without a capture device");
     }
 }
 
@@ -191,11 +194,11 @@ void cpu_capture_pipeline() {
     frame(*capture);
     check(capture->frame().cpu_bgra && !capture->frame().nv12_texture && !capture->adapter_device().device,
           "shared CPU frame has pixels and no GPU texture or device");
-    EncoderConfig encoder_config; encoder_config.codec = VideoCodec::H264; encoder_config.gop_size = 0;
+    EncoderConfig encoder_config; encoder_config.codec = VideoCodec::Vp9; encoder_config.gop_size = 0;
     auto encoder = DesktopStreamPool::encoder(*capture, encoder_config, &error);
     if (!encoder) std::printf("     CPU encoder: %s\n", error.c_str());
     check(encoder && encoder->backend() == EncoderBackend::Software,
-          "Auto selects software H.264 for CPU-only capture");
+          "Auto selects software VP9 for CPU-only capture");
     std::vector<EncodedPacket> packets;
     check(encoder->encode(nullptr, 0, true, packets).ok() && !packets.empty() && packets.front().idr,
           "shared CPU pipeline delivers an encoded keyframe");
@@ -531,7 +534,7 @@ void runtime_encoder_recovery() {
           "failed global fallback preserves other display delivery");
     b.encoder.reset(); b.capture.reset(); b.peer.reset();
     a.encoder = DesktopStreamPool::encoder(*a.capture, config, &error);
-    check(a.encoder && a.encoder->codec() == VideoCodec::H264 &&
+    check(a.encoder && a.encoder->codec() == VideoCodec::Vp9 &&
               a.encoder->backend() == EncoderBackend::Software,
           "restrictive peer leaving completes software fallback without reconnecting");
     check(error.empty(), "successful software negotiation clears rejected candidates' errors");
@@ -540,8 +543,8 @@ void runtime_encoder_recovery() {
               !resumed.empty() && resumed.front().idr,
           "software recovery starts from a newly encoded IDR");
     b = open(L"runtime-right", right, kVideoCodecAll);
-    check(b.encoder->codec() == VideoCodec::H264 && b.encoder->backend() == EncoderBackend::Vpl,
-          "all displays agree on H264 while a healthy display keeps hardware encoding");
+    check(b.encoder->codec() == VideoCodec::Vp9 && b.encoder->backend() == EncoderBackend::Vpl,
+          "all displays agree on VP9 while a healthy display keeps hardware encoding");
     const auto software_count = left->software_created.load();
     a.encoder = DesktopStreamPool::vote_codec(*a.capture, config, VideoCodec::Hevc, &error);
     check(a.encoder && a.encoder->backend() == EncoderBackend::Software &&

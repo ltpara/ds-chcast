@@ -749,7 +749,7 @@ std::unique_ptr<chast::HostServer> start_host(
         config.settings.allow_input = false;
         config.settings.allow_terminal = false;
         config.settings.max_viewers = 2;
-        config.settings.codec = chast::VideoCodec::H264;
+        config.settings.codec = chast::VideoCodec::Vp9;
         config.encoder_backend = chast::EncoderBackend::Software;
     }
     // Loopback acceptance must not read or write the operator's clipboard.
@@ -1990,7 +1990,7 @@ int host_recording_probe() {
             ++files;
         }
         require(files == 1, "stable shared stream should produce exactly one finished MP4");
-        std::puts("host-recording-probe: PASS real QUIC + OpenH264, two viewers, publisher departure, final save and Unicode folder");
+        std::puts("host-recording-probe: PASS real QUIC + Auto encoder, two viewers, publisher departure, final save and Unicode folder");
         ok = true;
     } catch (const std::exception& exception) {
         std::fprintf(stderr, "host-recording-probe: FAIL %s\n", exception.what());
@@ -2037,7 +2037,7 @@ int elevation_probe() {
                 config.settings.allow_input = true;
                 config.settings.allow_audio = config.settings.allow_clipboard = false;
                 config.settings.allow_terminal = false;
-                config.settings.codec = VideoCodec::H264;
+                config.settings.codec = VideoCodec::Vp9;
                 config.encoder_backend = EncoderBackend::Software;
                 config.elevation_state = [] { return ElevationState{0, ElevationCode::Available, {}}; };
                 config.request_elevation = [task] { return task; };
@@ -2076,7 +2076,7 @@ int elevation_probe() {
         task->code = ElevationCode::Restarting;
         require(wait([&] { return task->committed && viewer->Snapshot().elevation.code == ElevationCode::Restarting; }),
                 "native viewer receives restart state before handoff");
-        std::puts("elevation-probe: PASS real DXGI/OpenH264/QUIC/ViewerEngine, 22-second UAC pause, cancel/resume, retry and restart state");
+        std::puts("elevation-probe: PASS real DXGI/Auto encoder/QUIC/ViewerEngine, 22-second UAC pause, cancel/resume, retry and restart state");
         success = true;
     } catch (const std::exception& e) { std::fprintf(stderr, "elevation-probe: FAIL %s\n", e.what()); }
     if (viewer) viewer->Stop();

@@ -3,16 +3,16 @@
 //   DXGI duplication -> Nv12Pass -> FrameInfo::nv12_texture
 //     -> oneVPL ImportFrameSurface (2.10+) or direct wrap (legacy mfxhw64)
 //        or FFmpeg's nvenc/amf/qsv pool (GPU copy)
-//        or OpenH264 (GPU readback and I420 CPU encoding)
-//     -> MFXVideoENCODE / libavcodec / OpenH264 -> elementary stream file
+//        or libvpx VP9 (GPU readback and I420 CPU encoding)
+//     -> MFXVideoENCODE / libavcodec / libvpx -> elementary stream file
 //
 // Hardware backends keep the desktop image in VRAM: the runtime either maps the
 // NV12 texture, GPU-copies it into its own pool, or reads it in place on the
 // legacy path. The only bytes that reach the CPU are the compressed access
 // units this tool writes out, which is what the real server hands to the
-// network. OpenH264 stages the image into CPU memory instead.
+// network. The software backend stages the image into CPU memory instead.
 //
-//   chast-encode [--display N] [--seconds S] [--codec h264|hevc] [--out file]
+//   chast-encode [--display N] [--seconds S] [--codec h264|hevc|av1|vp9] [--out file]
 //                [--encoder auto|vpl|ffmpeg|software] [--bitrate kbps]
 //                [--capture auto|dxgi|gdi] [--dump-input DIR]
 //                [--keyframe-interval MS] [--bitrate-switch MS:KBPS[:FPS]]
@@ -72,6 +72,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                     options.codec = chast::VideoCodec::Hevc;
                 } else if (value == "av1") {
                     options.codec = chast::VideoCodec::Av1;
+                } else if (value == "vp9") {
+                    options.codec = chast::VideoCodec::Vp9;
                 } else {
                     std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                     return false;
@@ -149,6 +151,8 @@ const char* codec_name(chast::VideoCodec codec) {
             return "HEVC";
         case chast::VideoCodec::Av1:
             return "AV1";
+        case chast::VideoCodec::Vp9:
+            return "VP9";
     }
     return "unknown";
 }
@@ -541,12 +545,12 @@ int main(int argc, char** argv) {
                 codec_name(encoder ? encoder->codec() : options.codec),
                 static_cast<unsigned long long>(bytes));
     // Hardware backends report whether they mapped or copied the GPU texture.
-    // OpenH264 reports copy because it stages the frame into system memory.
+    // The software backend always reports copy: libvpx reads system memory.
     if (encoder) {
         const bool software = encoder->backend() == chast::EncoderBackend::Software;
         std::printf("import: %s\n", encoder->shared_import()
                                         ? "shared (texture mapped, no copy)"
-                                        : (software ? "copy (GPU readback to OpenH264)"
+                                        : (software ? "copy (GPU readback to libvpx)"
                                                     : "copy (GPU to GPU)"));
     }
     return errors == 0 ? 0 : 1;

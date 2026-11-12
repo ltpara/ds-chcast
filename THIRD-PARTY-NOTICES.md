@@ -3,39 +3,6 @@
 本文件记录随 chast 分发或由 chast 工具获取的第三方组件。其他第三方组件
 （包括 MsQuic、Opus、Flutter 及其依赖）按各自发行树中的许可文件处理。
 
-## OpenH264（软件 H.264 编码）
-
-- 版本：2.6.0，vcpkg port revision 4。
-- 构建：通过 vcpkg 的 `openh264:x64-windows-static-md` 从源码构建并静态链接。
-- 来源：Cisco OpenH264，`cisco/openh264` 的 `v2.6.0` 标签。
-- 以下保留该 vcpkg 包 `share/openh264/copyright` 的完整声明：
-
-```text
-Copyright (c) 2013, Cisco Systems
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice, this
-  list of conditions and the following disclaimer in the documentation and/or
-  other materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
 ## Amyuni usbmmidd_v2（可选虚拟显示驱动）
 
 - 组件：USB Mobile Monitor Virtual Display（`usbmmidd_v2`）

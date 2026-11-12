@@ -107,6 +107,11 @@ void SharedViewerSession::CollectCursors() {
         }
         cached.value = std::move(update.cursor);
         cached.revision = ++cursor_revision_;
+        // A shape id whose sprite was evicted cannot be drawn. Ask the host to
+        // send it again; the engine throttles repeats per stream and shape.
+        if (cached.value.sprite.empty() && cached.value.shape_id != 0) {
+            viewer.RequestCursorShape(cached.value.shape_id, update.stream_id);
+        }
     }
 }
 

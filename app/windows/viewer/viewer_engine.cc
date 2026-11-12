@@ -597,6 +597,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(session_mutex_);
         pending_session_list_ = false;
         pending_session_select_.reset();
+        pending_cursor_shape_.reset();
+        cursor_request_valid_ = false;
     }
     // Port forwarding belongs to one session too; the listeners live on the
     // session thread and go away with it.
@@ -1434,6 +1436,30 @@ bool ViewerEngine::TakeCursor(chast::CursorUpdate& update) {
     pending_cursor_.reset();
     std::lock_guard<std::mutex> status_lock(mutex_);
     status_.cursor_pending = false;
+    return true;
+}
+
+bool ViewerEngine::RequestCursorShape(uint64_t shape_id, uint32_t stream_id) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming) {
+            return false;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    // The caller retries on every pointer poll; one request per second for the
+    // same missing shape is enough for the host to answer.
+    if (cursor_request_valid_ && cursor_request_stream_ == stream_id &&
+        cursor_request_shape_ == shape_id &&
+        now - cursor_request_at_ < std::chrono::seconds(1)) {
+        return false;
+    }
+    cursor_request_valid_ = true;
+    cursor_request_stream_ = stream_id;
+    cursor_request_shape_ = shape_id;
+    cursor_request_at_ = now;
+    pending_cursor_shape_ = std::make_pair(stream_id, shape_id);
     return true;
 }
 
@@ -7065,11 +7091,21 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto drain_session_requests = [&] {
                     bool list = false;
                     std::optional<uint32_t> select;
+                    std::optional<std::pair<uint32_t, uint64_t>> cursor_shape;
                     {
                         std::lock_guard<std::mutex> lock(session_mutex_);
                         list = pending_session_list_;
                         pending_session_list_ = false;
                         select.swap(pending_session_select_);
+                        cursor_shape.swap(pending_cursor_shape_);
+                    }
+                    if (cursor_shape) {
+                        const chast::Error sent = session->request_cursor_shape(
+                            cursor_shape->first, cursor_shape->second);
+                        if (!sent.ok()) {
+                            std::fprintf(stderr, "viewer: cursor shape request failed: %s\n",
+                                         sent.to_string().c_str());
+                        }
                     }
                     if (list) {
                         const chast::Error sent = session->request_session_list();

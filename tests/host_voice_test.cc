@@ -154,7 +154,7 @@ chast::AudioInfo voice_info() {
     return info;
 }
 
-// Emits one 20 ms Opus-shaped packet whenever the clock has advanced one
+// Emits one 10 ms Opus-shaped packet whenever the clock has advanced one
 // frame, so the relay drains a realistic cadence instead of spinning on an
 // always-ready source.
 class FakeMicCapture : public chast::IMicrophoneCapture {

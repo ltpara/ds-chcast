@@ -111,28 +111,6 @@ if(DEFINED ZSTD_ROOT)
 endif()
 find_package(zstd CONFIG REQUIRED)
 
-# OpenH264 software fallback. Use the static-library/dynamic-CRT triplet so it
-# matches the MSVC runtime used by the application. The vcpkg port exports
-# pkg-config metadata but no CMake package, so import it from the prefix.
-if(NOT DEFINED OPENH264_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static-md/include/wels/codec_api.h")
-    set(OPENH264_ROOT "D:/vcpkg/installed/x64-windows-static-md" CACHE PATH "OpenH264 install prefix")
-endif()
-if(NOT DEFINED OPENH264_ROOT OR
-   NOT EXISTS "${OPENH264_ROOT}/include/wels/codec_api.h" OR
-   NOT EXISTS "${OPENH264_ROOT}/lib/openh264.lib")
-    message(FATAL_ERROR "OpenH264 not found; set OPENH264_ROOT to an install prefix with include/wels and lib/openh264.lib")
-endif()
-add_library(OpenH264::openh264 STATIC IMPORTED)
-set_target_properties(OpenH264::openh264 PROPERTIES
-    IMPORTED_CONFIGURATIONS "RELEASE;DEBUG"
-    IMPORTED_LOCATION "${OPENH264_ROOT}/lib/openh264.lib"
-    IMPORTED_LOCATION_RELEASE "${OPENH264_ROOT}/lib/openh264.lib"
-    IMPORTED_LOCATION_RELWITHDEBINFO "${OPENH264_ROOT}/lib/openh264.lib"
-    IMPORTED_LOCATION_MINSIZEREL "${OPENH264_ROOT}/lib/openh264.lib"
-    IMPORTED_LOCATION_DEBUG "${OPENH264_ROOT}/debug/lib/openh264.lib"
-    MAP_IMPORTED_CONFIG_PROFILE Release
-    INTERFACE_INCLUDE_DIRECTORIES "${OPENH264_ROOT}/include")
-
 # VP9 software encoding/decoding and direct full-chroma pixel conversion.
 if(NOT DEFINED VPX_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static-md/include/vpx/vpx_codec.h")
     set(VPX_ROOT "D:/vcpkg/installed/x64-windows-static-md" CACHE PATH "libvpx and libyuv install prefix")
@@ -190,7 +168,6 @@ target_link_libraries(chast.ffmpeg PUBLIC
 add_library(chast.codec STATIC
     src/codec/encoder_factory.cc
     src/codec/ffmpeg_encoder.cc
-    src/codec/openh264_encoder.cc
     src/codec/vpx_encoder.cc
     src/codec/vpx_decoder.cc
     src/codec/vpl_encoder.cc
@@ -199,7 +176,7 @@ add_library(chast.codec STATIC
 target_include_directories(chast.codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(chast.codec PRIVATE ONEVPL_EXPERIMENTAL)
-target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg OpenH264::openh264
+target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg
     unofficial::libvpx::libvpx yuv)
 
 # Audio: Opus on the wire, WASAPI loopback capture and render (host) plus

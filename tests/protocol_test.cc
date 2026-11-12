@@ -3546,6 +3546,40 @@ void test_cursor_update() {
     check(got.sprite.empty(), "changed geometry cannot inherit the old sprite");
 }
 
+void test_cursor_shape_request() {
+    std::string error;
+    chast::CursorShapeRequest request;
+    check(request.stream_id == chast::kCursorCurrentStream && request.shape_id == 0,
+          "CursorShapeRequest defaults to the current stream and shape");
+    const std::vector<uint8_t> message = chast::make_cursor_shape_request(request);
+    check(message.size() == chast::kControlHeaderSize + 16 &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::CursorShapeRequest),
+          "CursorShapeRequest has a fixed payload and names its control type");
+    chast::CursorShapeRequest got;
+    check(chast::parse_cursor_shape_request(payload_of(message), got, &error) &&
+              got.stream_id == chast::kCursorCurrentStream && got.shape_id == 0,
+          "CursorShapeRequest round-trips the current-stream sentinel");
+    request.stream_id = 0;
+    request.shape_id = 0x1122334455667788ull;
+    const auto explicit_payload = payload_of(chast::make_cursor_shape_request(request));
+    check(chast::parse_cursor_shape_request(explicit_payload, got, &error) &&
+              got.stream_id == 0 && got.shape_id == request.shape_id,
+          "CursorShapeRequest round-trips an explicit stream and shape");
+    auto reserved = explicit_payload;
+    reserved[4] = 1;
+    check(!chast::parse_cursor_shape_request(reserved, got, &error),
+          "CursorShapeRequest with non-zero reserved bytes is rejected");
+    bool truncations_rejected = true;
+    for (size_t length = 0; length < explicit_payload.size(); ++length)
+        truncations_rejected &= !chast::parse_cursor_shape_request(
+            {explicit_payload.begin(), explicit_payload.begin() + length}, got, &error);
+    check(truncations_rejected, "CursorShapeRequest rejects every truncated message");
+    auto trailing = explicit_payload;
+    trailing.push_back(0);
+    check(!chast::parse_cursor_shape_request(trailing, got, &error),
+          "CursorShapeRequest rejects trailing bytes");
+}
+
 void test_stream_info() {
     chast::ServerInfo sent;
     sent.codec = chast::VideoCodec::H264;
@@ -5154,6 +5188,7 @@ int main(int argc, char** argv) {
     test_voice_call();
     test_screenshot_messages();
     test_cursor_update();
+    test_cursor_shape_request();
     test_stream_info();
     test_input_events();
     test_identity();

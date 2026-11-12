@@ -1,6 +1,6 @@
 // WASAPI microphone capture for the viewer's uplink.
 //
-// One capture endpoint, one thread, 48 kHz mono s16 on the wire as 20 ms Opus
+// One capture endpoint, one thread, 48 kHz mono s16 on the wire as 10 ms Opus
 // packets. The queue and the recovery policy mirror the loopback capture, but
 // there is no silence gate: opening the CMIC stream is the user's consent, and
 // a stream that pauses on silence would look like a failure to the host.
@@ -288,7 +288,6 @@ bool WasapiMicrophoneCapture::open_encoder(std::string* error) {
     encoder_config.sample_rate = kMicRate;
     encoder_config.channels = kMicChannels;
     encoder_config.bitrate = config_.bitrate;
-    encoder_config.voice = true;
     encoder_ = create_audio_encoder(encoder_config, error);
     if (!encoder_) {
         return false;

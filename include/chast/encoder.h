@@ -14,9 +14,10 @@
 // without oneVPL; it copies the capture texture into an encoder-owned D3D11VA
 // frame pool on the GPU, so the frame still never reaches system memory.
 //
-// Auto uses OpenH264 as a final CPU fallback when no vendor runtime can encode
-// on the capture adapter. That path stages NV12 through system memory and
-// converts it to I420; pinned Vpl and Ffmpeg backends remain hardware-only.
+// Auto falls back to software VP9 when no vendor runtime can encode on the
+// capture adapter, matching RustDesk's software fallback. VP9 stages the frame
+// through system memory (NV12 for 4:2:0, BGRA for 4:4:4); pinned Vpl and Ffmpeg
+// backends remain hardware-only and never fall back.
 //
 // On oneVPL 2.10+ runtimes the D3D11 texture in capture device memory
 // either maps the texture (shared import) or GPU-copies it into its internal
@@ -46,8 +47,8 @@ enum class VideoCodec {
     H264,
     Hevc,
     // AV1 is only produced by hardware encoders (oneVPL on AV1-capable Intel
-    // GPUs, the FFmpeg vendor encoders on Ada/RDNA3/Arc). Auto may fall back to
-    // HEVC/H.264, including OpenH264; it never produces software AV1.
+    // GPUs, the FFmpeg vendor encoders on Ada/RDNA3/Arc). Auto may fall back
+    // to hardware HEVC/H.264; it never produces software AV1.
     Av1,
     Vp9,
 };
@@ -71,8 +72,9 @@ inline constexpr VideoCodecMask video_codec_bit(VideoCodec codec) {
 }
 
 // Which implementation create_encoder() may use. Auto tries oneVPL, then
-// FFmpeg's vendor encoder, then OpenH264 software encoding.
-// Vpl and Ffmpeg pin hardware backends; Software forces the CPU fallback.
+// FFmpeg's vendor encoder; a VP9 request then reaches libvpx. Software is VP9
+// only and never produces H.264/HEVC/AV1. Vpl and Ffmpeg pin hardware
+// backends; Software forces the CPU encoder.
 enum class EncoderBackend {
     Auto,
     Vpl,
@@ -94,8 +96,7 @@ struct EncoderConfig {
     // size and quality, which is what its VRAM encoder starts with.
     UINT bitrate = 0;
     UINT framerate = 30;
-    // In frames. 0 disables periodic IDRs. OpenH264 screen mode may still
-    // generate an IDR for a scene change; every backend honours explicit requests.
+    // In frames. 0 disables periodic IDRs; every backend honours explicit requests.
     UINT gop_size = 0;
     // RustDesk's Quality knob, applied on top of base_bitrate() only when
     // `bitrate` is zero: Best 1.5, Balanced 0.67, Low 0.5.
@@ -158,7 +159,7 @@ public:
     // `keyframe_required` reports whether the next frame has to be an IDR. A
     // bitrate-only change can continue the coded sequence (the encoder keeps
     // its reference frames, so the viewer decodes on). Some backends restart
-    // the sequence on a frame-rate change; OpenH264 updates it in place. The
+    // the sequence on a frame-rate change; software VP9 updates it in place. The
     // caller must honour this flag when a restart or reopen needs an IDR,
     // and forcing one anyway wastes a whole frame on every quality step.
     virtual Error set_rate(UINT bits_per_second, UINT framerate,
@@ -182,8 +183,8 @@ public:
     // How the most recent frame reached the encoder's internal surfaces: true
     // when the runtime mapped the application's texture directly (shared
     // import) or, on legacy runtimes, used it in place through the frame
-    // allocator; false for GPU copies and OpenH264's CPU readback. This flag
-    // alone does not distinguish GPU copies from software encoding.
+    // allocator; false for GPU copies and CPU readback. This flag alone does
+    // not distinguish GPU copies from software encoding.
     // Meaningful after the first encode().
     virtual bool shared_import() const noexcept = 0;
 };
@@ -217,9 +218,10 @@ UINT hardware_bitrate(UINT width, UINT height, float quality_ratio, bool h264);
 
 // Creates an encoder for `config.width x config.height` on `device`.
 // The device is the adapter selection: implementations on another DXGI LUID
-// are rejected for hardware backends. With Auto, oneVPL is tried first and FFmpeg's vendor
-// encoder is the hardware fallback and OpenH264 is the final software tier; a
-// pinned backend does not fall back at all.
+// are rejected for hardware backends. With Auto, oneVPL is tried first and
+// FFmpeg's vendor encoder is the hardware fallback; VP9 then reaches the
+// software encoder. A pinned backend does not fall back at all. Software H.264
+// (and any other non-VP9 software request) is refused.
 //
 // VPL encoding tiers are tried in order -- VDENC+HEVC, VDENC+AVC, VME+AVC --
 // and each tier must return a test frame before it is accepted, so a runtime

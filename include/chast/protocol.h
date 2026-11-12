@@ -56,7 +56,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 72;
+inline constexpr uint16_t kProtocolVersion = 73;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -499,6 +499,14 @@ enum class ControlType : uint16_t {
     // slice; a successful one is split into fixed-size slices so no control
     // message exceeds the transport's payload bound.
     ScreenshotResponse = 87,
+    // Viewer -> host (v73): ask for a cursor sprite again after the viewer's
+    // cache lost it. Payload: stream id (u32, kCursorCurrentStream selects the
+    // focused stream; every other value is literal), four reserved zero
+    // bytes, shape id (u64, 0 selects whatever shape the host holds now).
+    // The host answers with a full CursorUpdate or DisplayCursorUpdate for
+    // that stream; a request naming a shape the host no longer holds is
+    // ignored, because the next pointer sample will bring the current shape.
+    CursorShapeRequest = 88,
 };
 
 // ----- input -----
@@ -1067,6 +1075,22 @@ struct DisplayCursorUpdate {
     CursorUpdate cursor;
 };
 
+// Only CursorUpdate carries a sprite, and only while the shape is new to the
+// viewer. A viewer that lost its cache can ask for one shape again; the host
+// keeps the last full sprite so the request costs no new capture.
+inline constexpr uint32_t kCursorCurrentStream = UINT32_MAX;
+
+struct CursorShapeRequest {
+    // Every stream id, including zero, is literal; the sentinel selects current.
+    uint32_t stream_id = kCursorCurrentStream;
+    // 0 selects the shape the host is showing now.
+    uint64_t shape_id = 0;
+};
+
+std::vector<uint8_t> make_cursor_shape_request(const CursorShapeRequest& request);
+bool parse_cursor_shape_request(const std::vector<uint8_t>& payload,
+                                CursorShapeRequest& request, std::string* error);
+
 // Keep a not-yet-consumed shape when a later update only moves that shape.
 void coalesce_cursor_update(CursorUpdate& pending, CursorUpdate update);
 
@@ -1081,12 +1105,12 @@ void coalesce_cursor_update(CursorUpdate& pending, CursorUpdate update);
 // recordings and the codec tests, but no session creates an AAC stream.
 enum class AudioCodec : uint8_t {
     AAC = 1,   // AAC-LC, raw access units
-    Opus = 2,  // raw Opus packets, 20 ms frames
+    Opus = 2,  // raw Opus packets, 10 ms frames
 };
 
 inline constexpr size_t kMaxAudioExtradata = 64;
 inline constexpr uint32_t kAudioFrameSamples = 1024;
-inline constexpr uint32_t kOpusFrameSamples = 960;  // 20 ms at 48 kHz
+inline constexpr uint32_t kOpusFrameSamples = 480;  // 10 ms at 48 kHz
 
 struct AudioInfo {
     bool enabled = false;
@@ -2093,7 +2117,7 @@ struct VoiceCallResponse {
     VoiceCallCode code = VoiceCallCode::Ok;
     std::string reason;
     // The host microphone format when code is Ok; empty otherwise. Only Opus
-    // is accepted, at 48 kHz with one or two channels and 20 ms frames.
+    // is accepted, at 48 kHz with one or two channels and 10 ms frames.
     AudioInfo audio;
 };
 

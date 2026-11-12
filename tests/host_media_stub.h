@@ -175,7 +175,7 @@ public:
     Encoder(std::shared_ptr<MediaState> state, EncoderConfig config)
         : state_(std::move(state)), config_(config) {
         if (config_.backend == EncoderBackend::Software) {
-            config_.codec = VideoCodec::H264;
+            config_.codec = VideoCodec::Vp9;
             name_ = "deterministic software encoder";
             ++state_->software_created;
         }
@@ -270,7 +270,7 @@ public:
         AudioInfo info;
         info.enabled = true;
         info.codec = AudioCodec::Opus;
-        info.frame_samples = 960;
+        info.frame_samples = kOpusFrameSamples;
         info.bitrate = 96000;
         info.extradata = {'O','p','u','s','H','e','a','d',1,2,0,0,0x80,0xbb,0,0,0,0,0};
         return info;

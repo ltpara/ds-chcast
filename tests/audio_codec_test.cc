@@ -96,7 +96,6 @@ void test_opus_round_trip(uint16_t channels, uint32_t bitrate, const char* label
     config.sample_rate = kRate;
     config.channels = channels;
     config.bitrate = bitrate;
-    config.voice = channels == 1;
     std::string error;
     auto encoder = chast::create_audio_encoder(config, &error);
     check(encoder != nullptr, label);
@@ -106,7 +105,7 @@ void test_opus_round_trip(uint16_t channels, uint32_t bitrate, const char* label
     }
     check(encoder->sample_rate() == kRate && encoder->channels() == channels &&
               encoder->frame_samples() == chast::kOpusFrameSamples,
-          "the Opus encoder reports 20 ms frames at 48 kHz");
+          "the Opus encoder reports 10 ms frames at 48 kHz");
     check(encoder->extradata().size() == 19 &&
               std::memcmp(encoder->extradata().data(), "OpusHead", 8) == 0,
           "the Opus encoder produces an OpusHead");
@@ -306,7 +305,7 @@ void test_opus_conceal() {
         concealed.front().samples.size() ==
             static_cast<size_t>(chast::kOpusFrameSamples) * kChannels &&
         concealed.front().sample_rate == kRate && concealed.front().channels == kChannels;
-    check(shape_ok, "the concealed block is one 20 ms frame in the announced format");
+    check(shape_ok, "the concealed block is one 10 ms frame in the announced format");
     if (!shape_ok || expected.size() != 1) {
         return;
     }

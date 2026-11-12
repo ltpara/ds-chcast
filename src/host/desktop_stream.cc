@@ -515,7 +515,7 @@ struct DesktopStreamPool::Source {
                 if (codec != wanted.codec) candidates.push_back(codec);
         for (auto codec : candidates) {
             if (!(common & video_codec_bit(codec))) continue;
-            if (software_fallback && codec != VideoCodec::H264) continue;
+            if (software_fallback && codec != VideoCodec::Vp9) continue;
             wanted.codec = codec;
             if (!valid_video_format(codec, wanted.chroma)) wanted.chroma = VideoChroma::Yuv420;
             if (qos) {
@@ -532,7 +532,7 @@ struct DesktopStreamPool::Source {
                     *failure = "CPU capture requires an Auto or Software encoder";
                     return false;
                 }
-                if (actual.codec != VideoCodec::H264 && actual.codec != VideoCodec::Vp9) continue;
+                if (actual.codec != VideoCodec::Vp9) continue;
                 actual.backend = EncoderBackend::Software;
             } else if (software_fallback) actual.backend = EncoderBackend::Software;
             auto candidate = factory(capture->adapter_device().device, actual, failure);
@@ -595,8 +595,8 @@ struct DesktopStreamPool::Source {
         }
         wanted.width = image->frame.nv12_width;
         wanted.height = image->frame.nv12_height;
-        if (software_fallback && codec != VideoCodec::H264) {
-            *failure = "the recovering display requires software H.264";
+        if (software_fallback && codec != VideoCodec::Vp9) {
+            *failure = "the recovering display requires software VP9";
             return false;
         }
         if (chroma == VideoChroma::Yuv444 && !image->bgra && !image->frame.cpu_bgra) {
@@ -618,8 +618,8 @@ struct DesktopStreamPool::Source {
         auto actual = wanted;
         if (image->frame.cpu_bgra) {
             if ((wanted.backend != EncoderBackend::Auto && wanted.backend != EncoderBackend::Software) ||
-                (codec != VideoCodec::H264 && codec != VideoCodec::Vp9)) {
-                *failure = "CPU capture requires software H.264 or VP9";
+                codec != VideoCodec::Vp9) {
+                *failure = "CPU capture requires software VP9";
                 return false;
             }
             actual.backend = EncoderBackend::Software;
@@ -780,7 +780,7 @@ struct DesktopStreamPool::Source {
             needs_group_rebuild = global_codec;
             due = {};
             error = Error(Status::Unavailable,
-                "hardware encoding failed repeatedly; negotiating software H.264: " + result.to_string());
+                "hardware encoding failed repeatedly; negotiating software VP9: " + result.to_string());
             return false;
         }
         encode_failures = 0;

@@ -1,10 +1,11 @@
-// Encoder backend selection: oneVPL, FFmpeg vendor encoders, then OpenH264.
+// Encoder backend selection: oneVPL, FFmpeg vendor encoders, then libvpx VP9.
 //
 // The public API lives in chast/encoder.h; this file is the only place that
 // knows all backends exist. Auto keeps the long-standing oneVPL behaviour on
 // Intel and gives NVIDIA/AMD adapters a hardware path through FFmpeg. A pinned
-// backend never falls back. Auto reaches OpenH264 only after both hardware
-// families fail.
+// backend never falls back. Auto reaches software VP9 only after both hardware
+// families fail for the requested family; DesktopStream renegotiates the
+// stream codec to VP9 when that happens.
 
 #include "chast/encoder.h"
 
@@ -83,7 +84,10 @@ std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device,
         return nullptr;
     }
     if (config.backend == EncoderBackend::Software) {
-        return create_openh264_encoder(device, config, error);
+        if (error)
+            *error = std::string(encoder_backend_name(config.backend)) +
+                     " encoding is VP9 only; there is no software codec for this request";
+        return nullptr;
     }
     if (config.backend != EncoderBackend::Ffmpeg) {
         std::string vpl_error;
@@ -100,13 +104,9 @@ std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device,
         if (auto encoder = create_ffmpeg_encoder(device, config, &ffmpeg_error)) {
             return encoder;
         }
-        std::string software_error;
-        if (auto encoder = create_openh264_encoder(device, config, &software_error)) {
-            return encoder;
-        }
         if (error) {
             *error = "oneVPL: " + vpl_error + "; FFmpeg: " + ffmpeg_error +
-                     "; software: " + software_error;
+                     "; no hardware encoder for this codec (software encoding is VP9 only)";
         }
         return nullptr;
     }

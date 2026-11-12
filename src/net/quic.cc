@@ -55,12 +55,12 @@ constexpr size_t kMaxPendingVideoBytes = 8u * 1024u * 1024u;
 constexpr uint64_t kVideoDeliveryWindowUs = 500000;
 constexpr uint64_t kKeepAliveMs = 5000;
 
-// v35 datagram audio. A 20 ms stereo packet at the configured 128 kbps is
-// about 370 bytes; requiring 512 bytes of payload budget keeps datagram mode
+// v35 datagram audio. A 10 ms stereo packet at the configured 128 kbps is
+// about 185 bytes; requiring 512 bytes of payload budget keeps datagram mode
 // off a path whose first datagram would not even carry one frame.
 constexpr size_t kMinAudioDatagramBudget = kAudioHeaderSize + 512;
 // The viewer drains this queue on every media poll. The bound is generous
-// (several seconds of 20 ms packets) but stops a stalled consumer from
+// (several seconds of 10 ms packets) but stops a stalled consumer from
 // growing without limit.
 constexpr size_t kMaxAudioDatagramQueue = 256;
 
@@ -1147,6 +1147,9 @@ struct QuicSession::Impl {
     // current pointer, not a replay, so a newer update replaces an older one
     // that was never taken.
     std::optional<CursorUpdate> cursor_update;
+    // Host side (v73): sprites the viewer asked to have sent again. The
+    // queue only absorbs a burst; the viewer throttles its own retries.
+    std::deque<CursorShapeRequest> cursor_shape_requests;
     uint64_t cursor_received = 0;
     // Client: last clock-sync result. `last_reply_probe_us` rejects a reply
     // that overtook a newer one on the control stream.
@@ -4551,6 +4554,27 @@ struct QuicSession::Impl {
                 }
                 break;
             }
+            case ControlType::CursorShapeRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                CursorShapeRequest request;
+                if (!parse_cursor_shape_request(payload, request, &error)) {
+                    control_protocol_failure("CursorShapeRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // A viewer sends at most one retry per second; the cap only
+                    // absorbs a broken client. Repeating the same request is
+                    // harmless, so the entry is kept rather than merged.
+                    if (cursor_shape_requests.size() < 8) {
+                        cursor_shape_requests.push_back(request);
+                    }
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::FileOffer: {
                 FileOffer offer;
                 if (!parse_file_offer(payload, offer, &error)) {
@@ -5271,7 +5295,7 @@ struct QuicSession::Impl {
         }
         const size_t limit = datagram_max_send_length.load();
         if (limit == 0 || bytes.size() > limit) {
-            // One frame that does not fit the path is a 20 ms gap, not a
+            // One frame that does not fit the path is a 10 ms gap, not a
             // reason to stop audio; the announcement already required room
             // for a full packet when the mode was latched.
             return Error(Status::WaitTimeout, "the audio packet does not fit a datagram");
@@ -5713,6 +5737,7 @@ struct QuicSession::Impl {
             clipboard_updates.clear();
             clipboard_received = 0;
             cursor_update.reset();
+            cursor_shape_requests.clear();
             cursor_received = 0;
             latency = LatencySample{};
             last_reply_probe_us = 0;
@@ -11585,6 +11610,34 @@ bool QuicSession::take_display_cursor_update(DisplayCursorUpdate& update) {
 uint64_t QuicSession::cursor_updates_received() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->cursor_received;
+}
+
+bool QuicSession::take_cursor_shape_request(CursorShapeRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->role != Impl::Role::Server || impl_->cursor_shape_requests.empty()) {
+        return false;
+    }
+    request = impl_->cursor_shape_requests.front();
+    impl_->cursor_shape_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::request_cursor_shape(uint32_t stream_id, uint64_t shape_id) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_cursor_shape is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    CursorShapeRequest request;
+    request.stream_id = stream_id;
+    request.shape_id = shape_id;
+    return impl.send_bytes(impl.control.load(), make_cursor_shape_request(request),
+                           QUIC_SEND_FLAG_NONE);
 }
 
 Error QuicSession::finish_client(const ClientStats& stats, std::chrono::milliseconds timeout) {

@@ -1392,8 +1392,25 @@ void multiple_display_cursors() {
             cursors[left_id].hotspot_y == 3 && cursors[left_id].sprite == left.bitmap &&
             cursors[right_id].sprite == right.bitmap,
             "multi-stream activation snapshots each source including an already-delivered static shape");
+    cursors.clear();
+    require(viewer->request_cursor_shape(left_id, left.content_id).ok(),
+            "viewer can ask for a cursor sprite again");
+    require(until([&] {
+        drain();
+        return cursors.count(left_id) != 0 && cursors[left_id].sprite == left.bitmap;
+    }), "host resends a cached sprite without waiting for pointer motion");
+    cursors.clear();
+    require(viewer->request_cursor_shape(left_id, left.content_id + 1).ok(),
+            "viewer can ask for a shape the host has already left");
+    std::this_thread::sleep_for(150ms);
+    drain();
+    require(cursors.count(left_id) == 0, "a request for an unknown cursor shape is ignored");
     require(until([&] { return other->take_cursor_update(legacy); }) && !legacy.visible &&
             legacy.x == -560, "another viewer retains its independently selected source cursor");
+    require(other->request_cursor_shape(kCursorCurrentStream, right.content_id).ok() &&
+            until([&] { return other->take_cursor_update(legacy); }) &&
+            legacy.sprite == right.bitmap,
+            "legacy cursor re-request resends the selected screen's sprite");
 
     left.visible = false; left.position.x = 672;
     right.visible = true; right.position.x = 32;
@@ -1710,14 +1727,14 @@ void runtime_software_recovery() {
             finish(b);
         }
         bool left_announced = false;
-        bool right_announced = initial == VideoCodec::H264 || !b;
+        bool right_announced = !b;
         require(until([&] {
             ServerInfo info;
             if (a->take_stream_update(info))
-                left_announced = info.codec == VideoCodec::H264 &&
+                left_announced = info.codec == VideoCodec::Vp9 &&
                     info.encoder == "deterministic software encoder";
             if (b && b->take_stream_update(info))
-                right_announced = info.codec == VideoCodec::H264 &&
+                right_announced = info.codec == VideoCodec::Vp9 &&
                     info.encoder == "deterministic test encoder";
             FrameHeader header;
             std::vector<uint8_t> bytes;
@@ -1861,8 +1878,8 @@ void shared_camera_service() {
     finish(second);
 
     camera_media->fail_hardware = true;
-    require(camera_frame(*desktop, VideoCodec::H264) && codec_update(*desktop, VideoCodec::H264),
-            "runtime camera encoder failure falls back and renegotiates the desktop");
+    require(camera_frame(*desktop, VideoCodec::Vp9) && codec_update(*desktop, VideoCodec::Vp9),
+            "runtime camera encoder failure falls back to software VP9 and renegotiates the desktop");
     require(camera_media->software_created == 1 && f.media->software_created == 0 &&
                 camera_media->resets == 0 && f.media->resets == 0,
             "only the failed camera switches backend without resetting capture");

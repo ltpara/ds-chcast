@@ -50,10 +50,7 @@ struct AudioEncoderConfig {
     AudioCodec codec = AudioCodec::Opus;
     uint32_t sample_rate = 48000;
     uint16_t channels = 2;
-    uint32_t bitrate = 160000;  // bits per second
-    // Opus only: OPUS_APPLICATION_VOIP instead of OPUS_APPLICATION_AUDIO.
-    // Voice disables music tuning and keeps the bitrate spent on speech.
-    bool voice = false;
+    uint32_t bitrate = 160000;  // bits per second, set explicitly on the encoder
 };
 
 // One encoded access unit plus the steady-clock time of its first sample. The
@@ -94,9 +91,10 @@ public:
 };
 
 // Opens the standalone libopus encoder. Only 48 kHz is accepted, channels 1 or
-// 2, and one packet is always 20 ms. The returned AudioInfo carries a 19-byte
-// OpusHead whose pre-skip comes from OPUS_GET_LOOKAHEAD. This is the only
-// encoder the product creates: system sound and microphone both use it.
+// 2, and one packet is always 10 ms in the restricted low-delay application,
+// matching RustDesk. The returned AudioInfo carries a 19-byte OpusHead whose
+// pre-skip comes from OPUS_GET_LOOKAHEAD. This is the only encoder the product
+// creates: system sound and microphone both use it.
 std::unique_ptr<IAudioEncoder> create_opus_encoder(const AudioEncoderConfig& config,
                                                    std::string* error);
 
@@ -338,7 +336,7 @@ struct MicrophoneCaptureConfig {
 };
 
 // Captures one microphone on its own thread, converts it to 48 kHz mono s16
-// and encodes 20 ms Opus packets. Unlike loopback there is no silence gate:
+// and encodes 10 ms Opus packets. Unlike loopback there is no silence gate:
 // the viewer's explicit on/off switch is the only privacy boundary, and a
 // paused stream would look like a device failure to the host.
 class IMicrophoneCapture {

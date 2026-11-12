@@ -175,6 +175,8 @@ public:
         if (stream_id_ != stream_id || multiple_streams_ != multiple_streams) {
             sent_once_ = false;
             sent_ = CursorUpdate{};
+            shape_cached_ = false;
+            shape_cache_ = CursorUpdate{};
         }
         stream_id_ = stream_id;
         multiple_streams_ = multiple_streams;
@@ -190,6 +192,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         sent_once_ = false;
         sent_ = CursorUpdate{};
+        shape_cached_ = false;
+        shape_cache_ = CursorUpdate{};
     }
     void publish(const CursorInfo& info) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -228,28 +232,26 @@ public:
         // control queue with identical state.
         const auto now = Clock::now();
         if (sent_once_ && now - sent_at_ < std::chrono::milliseconds(33)) return;
-        const Error sent = multiple_streams_
-            ? session_->send_display_cursor({stream_id_, update})
-            : session_->send_cursor(update);
-        if (!sent.ok()) {
-            if (sent.status() == Status::WaitTimeout) {
-                // The control queue is full; the next sample carries the same
-                // state again, so nothing is lost by skipping this one.
-                ++dropped_;
-            } else {
-                ++errors_;
-                if (last_error_.empty()) last_error_ = sent.to_string();
-            }
+        deliver(update, new_shape);
+    }
+    // The viewer lost a sprite it had already been sent (its cache evicted it).
+    // Reply from the cached copy instead of waiting for the pointer to change
+    // shape again. A request for a shape the host has already left is ignored:
+    // the next pointer sample carries the current one.
+    void resend_shape(uint64_t shape_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (session_ == nullptr || !shape_cached_ || !sent_once_ ||
+            sent_.shape_id != shape_cache_.shape_id ||
+            (shape_id != 0 && shape_id != shape_cache_.shape_id)) {
             return;
         }
-        ++sent_count_;
-        if (new_shape) {
-            ++shape_count_;
-            byte_count_ += update.sprite.size();
-        }
-        sent_ = std::move(update);
-        sent_once_ = true;
-        sent_at_ = now;
+        CursorUpdate update = sent_;
+        update.width = shape_cache_.width;
+        update.height = shape_cache_.height;
+        update.hotspot_x = shape_cache_.hotspot_x;
+        update.hotspot_y = shape_cache_.hotspot_y;
+        update.sprite = shape_cache_.sprite;
+        deliver(update, true);
     }
     struct Snapshot {
         uint64_t sent = 0, shapes = 0, bytes = 0, dropped = 0, errors = 0;
@@ -264,6 +266,34 @@ public:
         return result;
     }
 private:
+    bool deliver(CursorUpdate& update, bool new_shape) {
+        const Error sent = multiple_streams_
+            ? session_->send_display_cursor({stream_id_, update})
+            : session_->send_cursor(update);
+        if (!sent.ok()) {
+            if (sent.status() == Status::WaitTimeout) {
+                // The control queue is full; the next sample carries the same
+                // state again, so nothing is lost by skipping this one.
+                ++dropped_;
+            } else {
+                ++errors_;
+                if (last_error_.empty()) last_error_ = sent.to_string();
+            }
+            return false;
+        }
+        const auto now = Clock::now();
+        ++sent_count_;
+        if (new_shape) {
+            ++shape_count_;
+            byte_count_ += update.sprite.size();
+            shape_cache_ = update;
+            shape_cached_ = true;
+        }
+        sent_ = std::move(update);
+        sent_once_ = true;
+        sent_at_ = now;
+        return true;
+    }
     mutable std::mutex mutex_;
     QuicSession* session_ = nullptr;
     const IDxgiCapturer* capture_ = nullptr;
@@ -272,6 +302,11 @@ private:
     bool sent_once_ = false;
     Clock::time_point sent_at_{};
     CursorUpdate sent_;
+    // The last update that actually carried a sprite, kept for the viewer's
+    // v73 re-request. Only one is needed: a request for any other shape is
+    // answered by the next pointer sample.
+    CursorUpdate shape_cache_;
+    bool shape_cached_ = false;
     uint64_t sent_count_ = 0, shape_count_ = 0, byte_count_ = 0, dropped_ = 0, errors_ = 0;
     std::string last_error_;
 };
@@ -5807,6 +5842,19 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if (!capture_displays(display_subscriptions)) { drain_peer(stats); return error->empty(); }
         }
         pump_screenshot();
+        CursorShapeRequest cursor_shape_request;
+        if (session_->take_cursor_shape_request(cursor_shape_request)) {
+            touch_viewer_activity();
+            std::shared_ptr<CursorPublisher> publisher;
+            if (cursor_shape_request.stream_id == kCursorCurrentStream ||
+                cursor_shape_request.stream_id == video.id) {
+                publisher = video.cursor;
+            } else {
+                const auto found = other_videos.find(cursor_shape_request.stream_id);
+                if (found != other_videos.end()) publisher = found->second.cursor;
+            }
+            if (publisher) publisher->resend_shape(cursor_shape_request.shape_id);
+        }
         ShowCursorHint cursor_hint;
         if (session_->take_show_cursor_hint(cursor_hint)) {
             touch_viewer_activity();

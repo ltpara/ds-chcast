@@ -574,7 +574,6 @@ std::unique_ptr<chast::IMicrophoneCapture> make_synthetic_microphone_capture(
     config.sample_rate = 48000;
     config.channels = 1;
     config.bitrate = 32000;
-    config.voice = true;
     std::unique_ptr<chast::IAudioEncoder> encoder =
         chast::create_opus_encoder(config, error);
     if (!encoder) {
@@ -5630,9 +5629,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         static_cast<uint16_t>(options.framerate == 0 ? 30 : options.framerate);
     const uint16_t capped_fps = (std::min)(host_fps, probe_fps);
     const chast::VideoCodec stream_base_codec = info.codec;
-    // The other family must be one the host can actually produce as a base
-    // comparison; H.264 is always available through OpenH264, while HEVC and
-    // AV1 may not be. VP9 itself is software-only.
+    // The other family is only a comparison vote. H.264 and HEVC need a
+    // matching vendor runtime, so the host may report it unsupported; the
+    // checks below accept that outcome and verify the working codec stays.
     const chast::VideoCodec stream_alt_codec = stream_base_codec == chast::VideoCodec::H264
                                                    ? chast::VideoCodec::Hevc
                                                    : chast::VideoCodec::H264;
@@ -9429,12 +9428,11 @@ int run_verify(const Options& options) {
           "every received frame carried its capture timestamp");
     // A software encoder shares the CPU with the receiver, so a 1080p30
     // composited stream can trail capture by about a second on a machine with
-    // no hardware encoder (an NVIDIA-only box falls back to OpenH264). The
-    // hardware paths keep the one-second bound, so a real stall there fails.
+    // no hardware encoder (Auto falls back to software VP9). The hardware
+    // paths keep the one-second bound, so a real stall there fails.
     const auto software_encoder = [](const std::string& name) {
-        return name.starts_with("OpenH264") ||
+        return name.find("libvpx") != std::string::npos ||
                name.find("libx264") != std::string::npos ||
-               name.find("libvpx") != std::string::npos ||
                name.find("libaom") != std::string::npos;
     };
     const double frame_age_limit_ms = software_encoder(sent.encoder) ? 3000.0 : 1000.0;
@@ -9483,15 +9481,16 @@ int run_verify(const Options& options) {
               "the restored quality and frame rate were announced");
         check(received.stream_option_rate_update_seen,
               "a quality-only change was applied and announced");
-        if (received.stream_option_rate_encoder.starts_with("OpenH264")) {
-            // OpenH264 mandates scene-change detection in screen mode and
-            // may emit IDRs without an application request. A live desktop
-            // cannot attribute their count to set_rate(). The checks above
-            // still require the lower bitrate, unchanged format/FPS and
-            // successful decoding throughout the transition.
-            std::printf("     OpenH264 rate update: %llu keyframe(s); "
-                        "screen scene changes can independently emit IDRs\n",
-                        static_cast<unsigned long long>(received.stream_option_rate_keyframes));
+        if (received.stream_option_rate_encoder.find("libvpx") != std::string::npos) {
+            // libvpx applies a new rate through the encoder config without a
+            // restart, so a bitrate-only change must not cost a key frame.
+            check(received.stream_option_rate_keyframes == 0,
+                  "a VP9 bitrate-only change kept the coded sequence (no IDR)");
+            if (received.stream_option_rate_keyframes != 0) {
+                std::printf("     VP9 rate update: %llu keyframe(s)\n",
+                            static_cast<unsigned long long>(
+                                received.stream_option_rate_keyframes));
+            }
         } else if (received.stream_option_base_codec == chast::VideoCodec::H264) {
             // libavcodec's QSV encoder flushes and resets the MFX session for
             // a rate change, so the host must force the one IDR the encoder

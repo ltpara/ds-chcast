@@ -1442,6 +1442,17 @@ public:
     bool take_display_cursor_update(DisplayCursorUpdate& update);
     // Total CursorUpdates received since the connection started.
     uint64_t cursor_updates_received() const;
+    // Host side (v73): pops the next sprite re-request the viewer queued.
+    // kCursorCurrentStream selects the focused stream; shape_id 0 selects the
+    // shape the host holds now. The host answers on the same stream with a
+    // full CursorUpdate or DisplayCursorUpdate.
+    bool take_cursor_shape_request(CursorShapeRequest& request);
+    // Viewer side (v73): asks the host to send a cursor sprite again after the
+    // viewer's cache lost it. The request is advisory; a host that no longer
+    // holds that shape ignores it and the next pointer sample carries the
+    // current one.
+    Error request_cursor_shape(uint32_t stream_id = kCursorCurrentStream,
+                               uint64_t shape_id = 0);
 
     // True after the server shut down its send direction of the video stream.
     bool video_finished() const;
