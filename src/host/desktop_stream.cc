@@ -29,6 +29,7 @@ struct Picture {
     uint64_t generation = 0;
     uint64_t sequence = 0;
     uint64_t capture_ms = 0;
+    uint64_t published_ms = 0;
     size_t bytes = 0;
     bool idr = false;
 };
@@ -44,6 +45,10 @@ struct Subscription {
     bool waiting_idr = true;
     bool consumed = false;
     uint64_t delivered_capture_ms = 0;
+    // Effective publication time for a picture handed to the reader. Do not
+    // charge time spent waiting for the service to process capture() twice.
+    uint64_t current_available_ms = 0;
+    std::atomic<uint64_t> delivered_wait_ms{0}, expired_frames{0}, age_resyncs{0};
     VideoCodecMask decoding_codecs = kVideoCodecAll;
     // Desktop sources invoke this from their independent pointer worker;
     // sources without a sampler publish captured cursor metadata before encode.
@@ -674,6 +679,7 @@ struct DesktopStreamPool::Source {
     }
     void publish(const std::shared_ptr<Picture>& picture) {
         picture->sequence = ++sequence;
+        picture->published_ms = now_ms();
         if (recorder) recorder->submit(picture->codec, encoder->width(), encoder->height(),
                                        recording_generation, picture->packets, picture->chroma);
         for (auto it = subscribers.begin(); it != subscribers.end();) {
@@ -826,12 +832,34 @@ struct DesktopStreamPool::Source {
     bool pop(Subscription& sub) {
         if (sub.queue.empty()) return false;
         sub.current = std::move(sub.queue.front());
+        sub.current_available_ms = sub.current->published_ms;
         sub.queue.pop_front();
         sub.queued_bytes -= sub.current->bytes;
         sub.consumed = false;
         return true;
     }
-    CaptureResult read(Subscription& sub) {
+    bool expire_backlog(Subscription& sub, uint64_t now) {
+        const bool has_current = sub.current && !sub.consumed && !sub.current->packets.empty();
+        const auto pending = has_current
+            ? sub.current : sub.queue.empty() ? nullptr : sub.queue.front();
+        const auto published = has_current && sub.current_available_ms
+            ? sub.current_available_ms : pending ? pending->published_ms : 0;
+        if (pending && now >= published && now - published > kMaxSubscriberQueueAgeMs) {
+            // Do not drop a middle P frame and keep its dependants. Clear this
+            // subscriber's chain and generate an IDR from the latest retained
+            // desktop. Other readers and the shared encoder remain intact.
+            sub.expired_frames += sub.queue.size() + (has_current ? 1 : 0);
+            ++sub.age_resyncs;
+            sub.queue.clear();
+            sub.queued_bytes = 0;
+            sub.consumed = true;
+            sub.waiting_idr = true;
+            keyframe = true;
+            return true;
+        }
+        return false;
+    }
+    CaptureResult read(Subscription& sub, uint64_t requested_ms) {
         if (fatal) return CaptureResult::FatalError;
         if (lost || sub.generation != generation) return CaptureResult::ReinitNeeded;
         if (needs_group_rebuild && image) {
@@ -839,9 +867,15 @@ struct DesktopStreamPool::Source {
             sub.consumed = false;
             return CaptureResult::Frame;
         }
+        if (expire_backlog(sub, requested_ms)) return CaptureResult::NoNewFrame;
         if (sub.current && !sub.consumed && !sub.current->packets.empty())
             return CaptureResult::Frame;
-        if (pop(sub)) return CaptureResult::Frame;
+        if (pop(sub)) {
+            const auto queued_age = requested_ms > sub.current->published_ms
+                ? requested_ms - sub.current->published_ms : 0;
+            sub.current_available_ms = now_ms() - queued_age;
+            return CaptureResult::Frame;
+        }
         if (!configured && image) {
             sub.current = image;
             sub.consumed = false;
@@ -999,8 +1033,9 @@ public:
     }
     ~Capture() override;
     CaptureResult capture(std::chrono::milliseconds timeout) override {
+        const auto requested_ms = now_ms();
         const auto result = source->call([&] {
-            const auto result = source->read(*sub);
+            const auto result = source->read(*sub, requested_ms);
             error = source->error;
             return result;
         });
@@ -1139,9 +1174,15 @@ public:
     }
     Error encode(ID3D11Texture2D*, uint64_t pts, bool force,
                  std::vector<EncodedPacket>& out) override {
+        // Source dispatch can wait behind a slow encode or capture tick.
+        // Only waiting before this reader requested delivery is its backlog.
+        const auto requested_ms = now_ms();
         return source->call([&] {
             if (!sub->current || sub->current->generation != source->generation)
                 return Error::success();
+            // A reader can also stall between capture() and encode(). Keep
+            // current alive: the session may still hold its FrameInfo by reference.
+            if (source->expire_backlog(*sub, requested_ms)) return Error::success();
             if (sub->consumed) {
                 if (force) source->request_keyframe(*sub);
                 return Error::success();
@@ -1153,6 +1194,10 @@ public:
                 sub->queued_bytes -= pending->bytes;
             }
             const auto& picture = *pending;
+            const auto available_ms = pending == sub->current && sub->current_available_ms
+                ? sub->current_available_ms : picture.published_ms;
+            if (!picture.packets.empty())
+                sub->delivered_wait_ms = requested_ms > available_ms ? requested_ms - available_ms : 0;
             sub->delivered_capture_ms = picture.capture_ms;
             if (force && !picture.idr) {
                 source->request_keyframe(*sub);
@@ -1520,6 +1565,11 @@ void DesktopStreamPool::discard_backlog(IDxgiCapturer& capturer) {
 
 uint64_t DesktopStreamPool::capture_time(const IDxgiCapturer& capturer) {
     return dynamic_cast<const Capture&>(capturer).sub->delivered_capture_ms;
+}
+
+DesktopStreamPool::QueueStats DesktopStreamPool::queue_stats(const IDxgiCapturer& capturer) {
+    const auto& sub = *dynamic_cast<const Capture&>(capturer).sub;
+    return {sub.delivered_wait_ms.load(), sub.expired_frames.load(), sub.age_resyncs.load()};
 }
 
 std::future<DesktopStreamPool::Screenshot> DesktopStreamPool::screenshot_async(IDxgiCapturer& capturer) {

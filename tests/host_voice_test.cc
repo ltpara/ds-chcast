@@ -3,8 +3,7 @@
 // packets until the viewer stops the call, restarts capture when the operator
 // picks another microphone mid-call, and tears the call down when the
 // microphone permission is revoked. A synthetic capture stands in for the
-// device so the check needs no microphone; it still needs an interactive
-// desktop because the call lives inside a desktop session.
+// device and a synthetic desktop so the check needs no microphone or display.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -25,6 +24,7 @@
 #include "chast/audio.h"
 #include "chast/host_server.h"
 #include "clipboard_stub.h"
+#include "host_media_stub.h"
 #include "chast/security.h"
 #include "chast/wallpaper.h"
 
@@ -37,10 +37,6 @@ void check(bool condition, const char* what) {
     if (!condition) {
         ++failures;
     }
-}
-
-void skip(const char* what) {
-    std::printf("skip %s\n", what);
 }
 
 const std::string& password() {
@@ -98,11 +94,39 @@ struct MicState {
     std::atomic<uint64_t> created{0};
     std::mutex devices_mutex;
     std::vector<std::string> requested_devices;
+    std::vector<chast::MicrophoneCaptureConfig> requested_configs;
+    std::atomic<uint64_t> playback_frames{0};
+    std::atomic<bool> fail_playback{false};
 
     std::vector<std::string> devices() {
         std::lock_guard<std::mutex> lock(devices_mutex);
         return requested_devices;
     }
+    chast::MicrophoneCaptureConfig last_config() {
+        std::lock_guard<std::mutex> lock(devices_mutex);
+        return requested_configs.empty() ? chast::MicrophoneCaptureConfig{} : requested_configs.back();
+    }
+};
+
+class FakeMicPlayer : public chast::IAudioPlayer {
+public:
+    explicit FakeMicPlayer(std::shared_ptr<MicState> state) : state_(std::move(state)) {}
+    chast::Error start() override { return chast::Error::success(); }
+    void stop() override {}
+    chast::Error push(const chast::DecodedAudio& block) override {
+        if (state_->fail_playback)
+            return chast::Error(chast::Status::Unavailable, "synthetic playback failure");
+        state_->playback_frames += block.samples.size() / block.channels;
+        return chast::Error::success();
+    }
+    void set_clock_offset(int64_t) override {}
+    void set_lead_ms(uint32_t) override {}
+    void set_mute(bool) override {}
+    bool muted() const override { return false; }
+    chast::AudioPlayerStats stats() const override { return {}; }
+    std::string error() const override { return {}; }
+private:
+    std::shared_ptr<MicState> state_;
 };
 
 struct WallpaperState {
@@ -215,8 +239,9 @@ private:
 std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesystem::path& dir,
                                               std::shared_ptr<MicState> mic,
                                               std::shared_ptr<WallpaperState> wallpaper,
-                                              std::string* error) {
+                                              std::string* error, bool voice_dsp = true) {
     chast::HostServerConfig config;
+    host_test::use_media(config);
     use_empty_clipboard(config);
     config.dry_run_input = true;
     config.settings.bind_address = "127.0.0.1";
@@ -228,6 +253,8 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
     config.settings.allow_audio = false;
     config.settings.allow_microphone = true;
     config.settings.voice_microphone = "test-mic-id";
+    config.settings.voice_aec = voice_dsp;
+    config.settings.voice_noise_suppression = voice_dsp;
     config.settings.remove_wallpaper = true;
     config.settings.auth_mode = chast::HostAuthMode::Password;
     config.settings.password_hash = chast::hash_password(password());
@@ -242,6 +269,7 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
         {
             std::lock_guard<std::mutex> lock(mic->devices_mutex);
             mic->requested_devices.push_back(microphone.device_id);
+            mic->requested_configs.push_back(microphone);
         }
         ++mic->created;
         // "test-mic-id" answers "unplugged" so the start path exercises the
@@ -251,6 +279,9 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
             return nullptr;
         }
         return std::make_unique<FakeMicCapture>(mic);
+    };
+    config.microphone_player = [mic](std::string*) {
+        return std::make_unique<FakeMicPlayer>(mic);
     };
     config.wallpaper_remover =
         [wallpaper](std::string*) -> std::unique_ptr<chast::WallpaperRemoval> {
@@ -342,10 +373,11 @@ int main() {
         check(viewer != nullptr, "the desktop viewer is admitted");
         if (viewer) {
             check(info.microphone_enabled, "the viewer is offered the microphone");
-            std::this_thread::sleep_for(std::chrono::milliseconds(600));
-            if (host->status().state != chast::HostState::Streaming) {
-                skip("the voice-call check needs a desktop stream");
-            } else {
+            const bool streaming = wait_for([&] {
+                return host->status().state == chast::HostState::Streaming;
+            }, std::chrono::seconds(5));
+            check(streaming, "the synthetic desktop is streaming");
+            if (streaming) {
                 session_streamed = true;
                 check(viewer->request_voice_call().ok(), "the viewer requests a voice call");
                 chast::VoiceCallResponse response;
@@ -361,6 +393,12 @@ int main() {
                                std::chrono::seconds(5)),
                       "the host reports the call as active");
                 check(mic->started.load(), "the host started the capture device");
+                const auto dsp_config = mic->last_config();
+                const auto reference = dsp_config.reference;
+                check(dsp_config.echo_cancellation && dsp_config.noise_suppression && reference,
+                      "default voice capture receives AEC, NS and a reference with system sound off");
+                check(reference && !reference->active(),
+                      "AEC reference stays inactive until incoming playback starts");
                 {
                     const std::vector<std::string> devices = mic->devices();
                     check(devices.size() >= 2 && devices[0] == "test-mic-id" &&
@@ -390,6 +428,60 @@ int main() {
                 check(seq_ok, "the voice packets carry increasing sequence numbers");
                 check(payload_ok, "the voice packets keep their Opus payload");
 
+                // Real Opus encode/decode feeds a silent fake player. No
+                // sound endpoint or microphone is opened by this check.
+                chast::AudioEncoderConfig incoming_config;
+                incoming_config.channels = 1;
+                incoming_config.bitrate = 32000;
+                incoming_config.voice = true;
+                auto incoming = chast::create_opus_encoder(incoming_config, &error);
+                check(incoming != nullptr, "create incoming speech encoder");
+                auto incoming_info = voice_info();
+                if (incoming) incoming_info.extradata = incoming->extradata();
+                check(viewer->start_microphone(incoming_info).ok(), "start incoming voice playback");
+                std::vector<int16_t> samples(chast::kOpusFrameSamples);
+                for (size_t i = 0; i < samples.size(); ++i)
+                    samples[i] = (i % 48 < 24) ? 1000 : -1000;
+                uint64_t incoming_seq = 0;
+                auto send_incoming = [&] {
+                    if (!incoming) return;
+                    const auto now = static_cast<uint64_t>(std::chrono::duration_cast<
+                        std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    std::vector<chast::EncodedAudio> encoded;
+                    check(incoming->encode(samples.data(), samples.size(), now, encoded).ok(),
+                          "encode incoming speech");
+                    for (const auto& packet : encoded) {
+                        chast::AudioHeader header;
+                        header.seq = incoming_seq++;
+                        header.capture_ms = header.pts_ms = packet.capture_ms;
+                        header.sample_rate = incoming_info.sample_rate;
+                        header.channels = incoming_info.channels;
+                        header.frame_samples = incoming_info.frame_samples;
+                        header.codec = incoming_info.codec;
+                        check(viewer->send_microphone(header, packet.data.data(), packet.data.size()).ok(),
+                              "send incoming speech to the host");
+                    }
+                };
+                for (unsigned i = 0; i < 10; ++i) {
+                    send_incoming();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                std::vector<int16_t> reference_pcm(480 * 2);
+                check(wait_for([&] {
+                    return reference && reference->active() &&
+                        reference->read_delayed(480, 120, reference_pcm.data());
+                }, std::chrono::seconds(5)),
+                      "accepted incoming playback feeds usable AEC history without system sound");
+                check(wait_for([&] { return reference && !reference->active(); },
+                               std::chrono::seconds(3)),
+                      "a stalled open playback stream stops training AEC with old PCM");
+                check(reference && !reference->read_delayed(480, 0, reference_pcm.data()),
+                      "an incoming playback gap clears its reference history");
+                send_incoming();
+                check(wait_for([&] { return reference && reference->active(); },
+                               std::chrono::seconds(5)),
+                      "fresh incoming audio reactivates AEC after a playback gap");
+
                 // The operator pins another microphone from the tray. The
                 // capture restarts on it while the call and the viewer's
                 // decoder stay up.
@@ -406,6 +498,10 @@ int main() {
                       "the switch opened a new capture device");
                 check(host->status().stats.voice_call_active,
                       "the voice call stays active across the microphone switch");
+                const auto switched_config = mic->last_config();
+                check(switched_config.echo_cancellation && switched_config.noise_suppression &&
+                          switched_config.reference == reference && reference && reference->active(),
+                      "microphone switch retains DSP options and the live playback reference");
                 uint64_t after_switch = 0;
                 wait_for(
                     [&] {
@@ -426,6 +522,30 @@ int main() {
                                std::chrono::seconds(5)),
                       "the host clears the call when the viewer stops it");
                 check(mic->stopped.load(), "the host released the capture device");
+                check(reference && reference->active(),
+                      "ending outgoing voice capture preserves incoming playback's reference");
+                mic->fail_playback = true;
+                send_incoming();
+                check(wait_for([&] { return reference && !reference->active(); },
+                               std::chrono::seconds(5)),
+                      "playback failure deactivates the voice reference");
+                check(reference && !reference->read_delayed(480, 0, reference_pcm.data()),
+                      "playback failure clears stale AEC history");
+                check(viewer->stop_microphone().ok(), "close failed incoming playback");
+                mic->fail_playback = false;
+                const auto played_before = mic->playback_frames.load();
+                check(viewer->start_microphone(incoming_info).ok(), "restart incoming playback");
+                send_incoming();
+                check(wait_for([&] { return mic->playback_frames > played_before; },
+                               std::chrono::seconds(5)),
+                      "restarted playback accepts a new block");
+                check(reference && reference->active() &&
+                          !reference->read_delayed(480, 120, reference_pcm.data()),
+                      "restarted playback cannot reuse history from the failed player");
+                check(viewer->stop_microphone().ok(), "stop healthy incoming playback");
+                check(wait_for([&] { return reference && !reference->active(); },
+                               std::chrono::seconds(5)),
+                      "closing incoming playback deactivates the reference");
 
                 // A start cancelled before the host answers must not leave a
                 // pending call behind; the next start has to be accepted.
@@ -468,6 +588,29 @@ int main() {
                            std::chrono::seconds(5)),
                   "the wallpaper is restored when the session ends");
         }
+    }
+    // Explicit opt-out reaches the production capture factory as well.
+    auto raw_mic = std::make_shared<MicState>();
+    const auto raw_port = free_udp_port();
+    auto raw_host = start_host(raw_port, dir, raw_mic, wallpaper, &error, false);
+    check(raw_host != nullptr, "start a host with voice DSP disabled");
+    if (raw_host) {
+        chast::ServerInfo info;
+        auto viewer = connect_viewer(raw_port, raw_host->status().fingerprint, &info, &error);
+        check(viewer != nullptr, "connect to the host with voice DSP disabled");
+        if (viewer) {
+            check(viewer->request_voice_call().ok(), "request raw voice capture");
+            chast::VoiceCallResponse response;
+            check(take_accepted(*viewer, response, std::chrono::seconds(5)) &&
+                      response.code == chast::VoiceCallCode::Ok,
+                  "raw voice capture is accepted");
+            const auto raw_config = raw_mic->last_config();
+            check(!raw_config.echo_cancellation && !raw_config.noise_suppression,
+                  "both explicit voice DSP opt-outs reach the capture factory");
+            chast::ClientStats stats;
+            viewer->finish_client(stats, std::chrono::seconds(5));
+        }
+        raw_host->stop();
     }
     WSACleanup();
     std::error_code ec;

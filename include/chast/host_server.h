@@ -114,6 +114,13 @@ struct HostServerStats {
     double video_pending_ms = 0.0;
     uint64_t video_receipts = 0;
     uint64_t video_pending_frames = 0;
+    // Local post-encode queue waiting on the most recently delivered stream,
+    // its session maximum, and dependency chains discarded for age. These
+    // exclude transport/decoder/presentation and source-thread dispatch.
+    uint64_t video_queue_wait_ms = 0;
+    uint64_t video_max_queue_wait_ms = 0;
+    uint64_t video_expired_frames = 0;
+    uint64_t video_age_resyncs = 0;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
     bool client_connected = false;  // at least one viewer got through
     bool peer_left = false;         // the last session ended with the peer gone
@@ -468,7 +475,7 @@ struct HostServerConfig {
     // The config carries settings.voice_microphone as device_id; empty follows
     // the default communications capture device. The loopback check
     // substitutes a synthetic packet source and inspects the requested
-    // device. Called only while settings.allow_microphone is set; returning
+    // device and DSP options. Called only while settings.allow_microphone is set; returning
     // nullptr (with `error`) answers the call with Failed.
     std::function<std::unique_ptr<IMicrophoneCapture>(const MicrophoneCaptureConfig&,
                                                       std::string*)>
@@ -1091,6 +1098,11 @@ private:
     bool microphone_broken_ = false;
     // All viewers feed the reference used by the shared loopback echo canceller.
     std::shared_ptr<AudioReference> audio_reference_;
+    // This worker's incoming playback also feeds host voice AEC, including
+    // calls with system sound disabled. Its lifetime follows playback, not
+    // voice capture, so changing microphones retains a live reference.
+    std::shared_ptr<AudioReference> voice_reference_ = std::make_shared<AudioReference>();
+    std::chrono::steady_clock::time_point voice_reference_last_push_{};
 
     // Voice call of this worker's viewer. The capture is created when the
     // viewer asks and stopped on close, permission loss or capture failure.

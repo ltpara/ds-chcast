@@ -2241,6 +2241,37 @@ void video_backpressure() {
     finish(viewer);
 }
 
+void sender_queue_freshness() {
+    Fixture f;
+    f.config.settings.max_viewers = 1;
+    f.media->moving = true;
+    auto paused = std::make_shared<std::atomic<bool>>(false);
+    auto resume = std::make_shared<std::atomic<bool>>(false);
+    f.config.packet = [paused, resume](const FrameHeader&, const uint8_t*, size_t) {
+        if (paused->exchange(true)) return;
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (!resume->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(5ms);
+    };
+    f.start();
+    auto viewer = f.connect(SessionMode::Desktop, kPermissionAll & ~kPermissionInput);
+    require(until([&] { return paused->load(); }), "pause the sender after its first delivered packet");
+    std::this_thread::sleep_for(400ms);
+    resume->store(true);
+    require(keyframe(*viewer), "consume the initial video receipt after the sender pause");
+    require(until([&] {
+        FrameHeader header;
+        std::vector<uint8_t> bytes;
+        viewer->receive_frame(header, bytes, 20ms);
+        const auto stats = f.host->status().stats;
+        return stats.video_age_resyncs > 0 && stats.video_expired_frames > 0;
+    }), "host status exposes expired local frames and age-triggered recovery");
+    require(f.host->status().stats.video_max_queue_wait_ms <= 250,
+            "delivered local queue waiting stays within its age budget");
+    require(f.media->encoder_created == 1, "sender age recovery retains the shared encoder");
+    finish(viewer);
+}
+
 void slow_viewer_independent_display() {
     TwoDisplays f;
     f.left->moving = f.right->moving = true;
@@ -2431,6 +2462,16 @@ int main(int argc, char** argv) {
         WSACleanup();
         return failures ? 1 : 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--display-streams") {
+        run("multiple display streams in one connection", multiple_displays_one_connection);
+        WSACleanup();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--freshness") {
+        run("sender queue age and observable recovery", sender_queue_freshness);
+        WSACleanup();
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--cursors") {
         run("multiple display cursor snapshots", multiple_display_cursors);
         WSACleanup();
@@ -2501,6 +2542,7 @@ int main(int argc, char** argv) {
     run("authenticated service connection management", service_connection_management);
     run("host application latency probes", application_latency);
     run("video application backpressure and recovery", video_backpressure);
+    run("sender queue age and observable recovery", sender_queue_freshness);
     run("slow viewer independent display", slow_viewer_independent_display);
     WSACleanup();
     std::printf("host parity: %d failed scenario(s)\n", failures);

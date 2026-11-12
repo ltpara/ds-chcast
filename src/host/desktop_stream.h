@@ -22,6 +22,10 @@ class DesktopStreamPool {
     class Capture;
     class Encoder;
 public:
+    // Bound waiting after encoding, independently of queue size or producer
+    // FPS. Expired references are discarded only as a reader resumes; it then
+    // waits for an on-demand IDR instead of receiving an orphan P frame.
+    static constexpr uint64_t kMaxSubscriberQueueAgeMs = 250;
     using CaptureFactory = std::function<std::unique_ptr<IDxgiCapturer>(std::string*)>;
     using EncoderFactory = std::function<std::unique_ptr<IVideoEncoder>(
         ID3D11Device*, const EncoderConfig&, std::string*)>;
@@ -98,6 +102,14 @@ public:
     // Resume this subscriber at a fresh IDR after network backpressure.
     static void discard_backlog(IDxgiCapturer& capture);
     static uint64_t capture_time(const IDxgiCapturer& capture);
+    struct QueueStats {
+        uint64_t delivered_wait_ms = 0;
+        uint64_t expired_frames = 0;
+        uint64_t age_resyncs = 0;
+    };
+    // Local post-encode waiting only; excludes source dispatch, transport,
+    // decode and presentation. Sampling never waits on capture or encoding.
+    static QueueStats queue_stats(const IDxgiCapturer& capture);
     // Copies this subscription's retained raw frame into BGRA8 memory for a
     // host-side screenshot. Runs between capture ticks on the display service
     // thread, so no encode or session loop touches the GPU while it copies.
