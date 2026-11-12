@@ -10,7 +10,7 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/jimlambrt/gldap v0.1.14
 	golang.org/x/crypto v0.58.1-0.20261009181718-2f1f834330b2
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	modernc.org/sqlite v1.61.1
 )
 
