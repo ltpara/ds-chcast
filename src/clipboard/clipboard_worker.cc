@@ -63,7 +63,11 @@ ClipboardWorker::ClipboardWorker(ClipboardBackend backend) : state_(std::make_sh
                 if (job.operation == Operation::Read) {
                     auto& snapshot = result.snapshot;
                     std::vector<std::string> found;
+                    // A stubbed reader owns the clipboard. Reading the real
+                    // CF_HDROP behind its back would make a harness depend on
+                    // whatever the operator happened to copy.
                     const auto files = backend.read_files ? backend.read_files(found)
+                        : backend.read ? ClipboardReadState::Empty
                         : read_clipboard_files_state(found, &snapshot.error);
                     if (current() && files == ClipboardReadState::Content) {
                         snapshot.has_files = collect_clipboard_files(found, snapshot.entries,
@@ -82,7 +86,7 @@ ClipboardWorker::ClipboardWorker(ClipboardBackend backend) : state_(std::make_sh
                         // bypassed.
                         std::vector<ClipboardFileEntry> virtual_entries;
                         std::shared_ptr<ClipboardVirtualFiles> virtual_files;
-                        const ClipboardReadState ole = backend.read_files
+                        const ClipboardReadState ole = (backend.read || backend.read_files)
                             ? ClipboardReadState::Empty
                             : read_ole_clipboard_files_state(
                                   virtual_entries, virtual_files, &snapshot.error);

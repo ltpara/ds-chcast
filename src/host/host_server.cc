@@ -8408,6 +8408,15 @@ void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats&
     if (!clipboard_transfer_allowed()) return;
     if (content.seq && content.seq <= last_peer_clipboard_seq_) return;
     if (content.seq) last_peer_clipboard_seq_ = content.seq;
+    // A completed write of the previous item may still be waiting for the
+    // poll, and cancel_clipboard_work() discards it. Settle it first: the item
+    // is already on the local clipboard, so it must be counted and remembered
+    // even though a newer one is about to replace it.
+    {
+        ClipboardWorker::Result settled;
+        bool ignored = false;
+        take_clipboard_result(settled, ignored, stats, Clock::now());
+    }
     if (const ClipboardFormatData* list = content.find(ClipboardFormat::FileList)) {
         // Protocol v34: the viewer copied files. Only the list crosses the
         // clipboard stream; the bytes follow as clipboard-marked FileOffers
@@ -8503,6 +8512,50 @@ void HostServer::drain_peer(HostServerStats& stats) {
     }
 }
 
+void HostServer::take_clipboard_result(ClipboardWorker::Result& result, bool& have_read,
+                                       HostServerStats& stats,
+                                       std::chrono::steady_clock::time_point now) {
+    have_read = false;
+    if (!clipboard_worker_ || !clipboard_worker_->Take(result)) return;
+    if (result.epoch != clipboard_epoch_) return;
+    if (result.operation == ClipboardWorker::Operation::Read) {
+        have_read = !clipboard_write_pending_;
+        return;
+    }
+    clipboard_write_inflight_ = false;
+    if (!result.written) {
+        ++stats.clipboard_write_failures;
+        if (++clipboard_write_attempts_ >= 10) {
+            clipboard_write_pending_ = false;
+            log("clipboard: write failed after 10 attempts");
+            if (pending_virtual_files_ && clipboard_channel_) { clipboard_channel_->CancelRemote(); pending_virtual_files_.reset(); }
+            if (clipboard_write_is_files_) reset_clipboard_incoming(true);
+        }
+        clipboard_write_retry_ = now + std::chrono::milliseconds(250);
+        return;
+    }
+    clipboard_write_pending_ = false;
+    clipboard_baseline_pending_ = false;
+    // The peer's item is on the local clipboard now; never send it back, even
+    // if the opening baseline had not gone out yet.
+    clipboard_initial_send_ = false;
+    if (clipboard_write_is_files_) {
+        last_file_entries_ = pending_virtual_files_ ? pending_virtual_files_->entries() : clipboard_incoming_.entries;
+        last_file_identity_ = clipboard_file_identity_hash(last_file_entries_);
+        last_file_source_version_ = 0;
+        last_file_paths_ = pending_clipboard_paths_;
+        clipboard_incoming_.active = false;
+        pending_virtual_files_.reset();
+    } else {
+        last_clipboard_hash_ = clipboard_content_hash(pending_clipboard_content_);
+        last_clipboard_ = std::move(pending_clipboard_content_);
+        last_file_identity_ = 0;
+        last_file_entries_.clear();
+        last_file_paths_.clear();
+    }
+    ++stats.clipboard_received;
+}
+
 void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
                                 HostServerStats& stats) {
     const bool clipboard_send = clipboard_allowed() && clipboard_from_host(settings_.clipboard_direction);
@@ -8525,46 +8578,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     }
     ClipboardWorker::Result result;
     bool have_read = false;
-    if (clipboard_worker_ && clipboard_worker_->Take(result)) {
-        if (result.epoch == clipboard_epoch_) {
-            if (result.operation == ClipboardWorker::Operation::Read) {
-                have_read = !clipboard_write_pending_;
-            } else {
-                clipboard_write_inflight_ = false;
-                if (result.written) {
-                    clipboard_write_pending_ = false;
-                    clipboard_baseline_pending_ = false;
-                    // The peer's item is on the local clipboard now; never send
-                    // it back, even if the opening baseline had not gone out yet.
-                    clipboard_initial_send_ = false;
-                    if (clipboard_write_is_files_) {
-                        last_file_entries_ = pending_virtual_files_ ? pending_virtual_files_->entries() : clipboard_incoming_.entries;
-                        last_file_identity_ = clipboard_file_identity_hash(last_file_entries_);
-                        last_file_source_version_ = 0;
-                        last_file_paths_ = pending_clipboard_paths_;
-                        clipboard_incoming_.active = false;
-                        pending_virtual_files_.reset();
-                    } else {
-                        last_clipboard_hash_ = clipboard_content_hash(pending_clipboard_content_);
-                        last_clipboard_ = std::move(pending_clipboard_content_);
-                        last_file_identity_ = 0;
-                        last_file_entries_.clear();
-                        last_file_paths_.clear();
-                    }
-                    ++stats.clipboard_received;
-                } else {
-                    ++stats.clipboard_write_failures;
-                    if (++clipboard_write_attempts_ >= 10) {
-                        clipboard_write_pending_ = false;
-                        log("clipboard: write failed after 10 attempts");
-                        if (pending_virtual_files_ && clipboard_channel_) { clipboard_channel_->CancelRemote(); pending_virtual_files_.reset(); }
-                        if (clipboard_write_is_files_) reset_clipboard_incoming(true);
-                    }
-                    clipboard_write_retry_ = now + std::chrono::milliseconds(250);
-                }
-            }
-        }
-    }
+    take_clipboard_result(result, have_read, stats, now);
     if (clipboard_write_pending_) {
         if (!clipboard_write_inflight_ && now >= clipboard_write_retry_ && clipboard_worker_) {
             clipboard_write_inflight_ = pending_virtual_files_

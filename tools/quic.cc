@@ -9235,8 +9235,8 @@ int run_verify(const Options& options) {
 
     std::printf("---- loopback check ----\n");
     bool failed = false;
-    auto check = [&](bool condition, const char* what) {
-        std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
+    auto check = [&](bool condition, const std::string& what) {
+        std::printf("%s %s\n", condition ? "ok  " : "FAIL", what.c_str());
         if (!condition) {
             failed = true;
         }
@@ -9427,8 +9427,22 @@ int run_verify(const Options& options) {
           "the measured round trip is plausible");
     check(received.frames_without_capture == 0,
           "every received frame carried its capture timestamp");
-    check(received.last_frame_age_ms >= -100.0 && received.last_frame_age_ms <= 1000.0,
-          "the measured frame age is plausible");
+    // A software encoder shares the CPU with the receiver, so a 1080p30
+    // composited stream can trail capture by about a second on a machine with
+    // no hardware encoder (an NVIDIA-only box falls back to OpenH264). The
+    // hardware paths keep the one-second bound, so a real stall there fails.
+    const auto software_encoder = [](const std::string& name) {
+        return name.starts_with("OpenH264") ||
+               name.find("libx264") != std::string::npos ||
+               name.find("libvpx") != std::string::npos ||
+               name.find("libaom") != std::string::npos;
+    };
+    const double frame_age_limit_ms = software_encoder(sent.encoder) ? 3000.0 : 1000.0;
+    check(received.last_frame_age_ms >= -100.0 &&
+              received.last_frame_age_ms <= frame_age_limit_ms,
+          "the measured frame age is plausible (" +
+              std::to_string(static_cast<long long>(received.last_frame_age_ms)) +
+              " ms via " + sent.encoder + ")");
     check(received.desktop_states > 0 && received.desktop_kind == chast::DesktopKind::Default,
           "the host reported the Default desktop to the viewer");
     if (local.privacy) {
@@ -9797,7 +9811,8 @@ int run_verify(const Options& options) {
         check(received.clipboard_sent == 2 && received.clipboard_errors == 0,
               "the viewer uploaded two valid rich clipboard items");
         check(sent.clipboard_received == 2,
-              "the host accepted both valid items and dropped the over-limit blob");
+              "the host accepted both valid items and dropped the over-limit blob (host received=" +
+                  std::to_string(sent.clipboard_received) + ")");
         const chast::ClipboardContent upload =
             rich_clipboard_probe("chast clipboard: viewer upload \xE2\x9C\x93");
         const chast::ClipboardContent followup = rich_clipboard_probe(kClipboardAfterOverflow);
@@ -9806,7 +9821,9 @@ int run_verify(const Options& options) {
                   same_clipboard_content(local.fake_clipboard->written[0], upload) &&
                   same_clipboard_content(local.fake_clipboard->written[1], followup),
               "the session survived the over-limit blob and the host wrote only the "
-              "valid items");
+              "valid items (writes=" +
+                  std::to_string(local.fake_clipboard->writes) + " recorded=" +
+                  std::to_string(local.fake_clipboard->written.size()) + ")");
         check(sent.clipboard_sent == 1, "the host sent exactly one clipboard change");
         check(received.clipboard_received == 1,
               "the viewer received exactly one clipboard item");

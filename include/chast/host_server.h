@@ -681,6 +681,12 @@ private:
     long long idle_disconnect_seconds() const;
     // A viewer request that counts as activity resets the idle clock.
     void touch_viewer_activity();
+    // Takes one completed clipboard job and applies its bookkeeping, including
+    // counting a finished write. Callers about to cancel pending work drain it
+    // first so an item the peer already placed is neither lost nor re-sent.
+    void take_clipboard_result(ClipboardWorker::Result& result, bool& have_read,
+                               HostServerStats& stats,
+                               std::chrono::steady_clock::time_point now);
     void poll_clipboard(std::chrono::steady_clock::time_point now, HostServerStats& stats);
     void stop_microphone(HostServerStats& stats, const std::string& reason);
     void drain_microphone(HostServerStats& stats);
