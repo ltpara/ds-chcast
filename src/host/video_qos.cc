@@ -224,6 +224,13 @@ void VideoQos::open(uint64_t id, uint64_t now) {
     if (users_.empty()) last_ratio_ = now;
     User user;
     user.joined_at = now;
+    for (const auto& [peer_id, peer] : users_) {
+        if (now >= peer.joined_at && now - peer.joined_at >= 1000 &&
+            peer.delay.fps && peer.delay.good >= 2) {
+            user.joining_fps = fps_;
+            break;
+        }
+    }
     users_.try_emplace(id, user);
     adjust_fps(now);
 }
@@ -272,11 +279,11 @@ void VideoQos::adjust_fps(uint64_t now) {
     }
     uint32_t fps = std::numeric_limits<uint32_t>::max();
     for (const auto& [id, user] : users_)
-        fps = std::min(fps, user.delay.fps.value_or(kInitFps));
-    // Every viewer inside its first second keeps the stream at INIT_FPS to
-    // ensure stability; each viewer carries its own start-up clock.
+        fps = std::min(fps, user.delay.fps.value_or(user.joining_fps.value_or(kInitFps)));
+    // A new viewer must not restart the initial cohort's warm-up. Its own
+    // feedback (including a stalled first receipt) still constrains the stream.
     for (const auto& [id, user] : users_)
-        if (now - user.joined_at < 1000) {
+        if (!user.joining_fps && now - user.joined_at < 1000) {
             fps = std::min(fps, kInitFps);
             break;
         }
@@ -303,7 +310,7 @@ void VideoQos::delay(uint64_t id, uint32_t value, uint64_t now) {
     delay.add(sample);
     const auto average = std::max(delay.average(), 10u);
     const uint32_t cap = fps_cap(user);
-    const uint32_t current = delay.fps.value_or(std::min<uint32_t>(kInitFps, cap));
+    const uint32_t current = delay.fps.value_or(std::min(user.joining_fps.value_or(kInitFps), cap));
     uint32_t fps = current;
     if (average < 50) {
         auto step = fps < normal_fps ? 1u : 0u;
@@ -364,7 +371,7 @@ void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
     if (delay.stall_reference_fps) {
         reference = *delay.stall_reference_fps;
     } else {
-        reference = delay.fps.value_or(std::min<uint32_t>(kInitFps, cap));
+        reference = delay.fps.value_or(std::min(user.joining_fps.value_or(kInitFps), cap));
         delay.stall_reference_fps = reference;
         delay.on_reduction(reference);
     }

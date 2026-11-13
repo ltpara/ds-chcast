@@ -117,6 +117,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device &&
            a.voice_microphone == b.voice_microphone && a.audio_aec == b.audio_aec &&
+           a.voice_aec == b.voice_aec && a.voice_noise_suppression == b.voice_noise_suppression &&
            a.audio_silence_gate_ms == b.audio_silence_gate_ms &&
            a.allow_privacy_mode == b.allow_privacy_mode &&
            a.allow_os_login == b.allow_os_login &&
@@ -174,6 +175,8 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.audio_device = "{0.0.1.00000000}.{5f3a2c1b-9d4e-4a6f-8b7c-1234567890ab}";
     settings.voice_microphone = "{0.0.1.00000000}.{a1b2c3d4-1111-2222-3333-444455556666}";
     settings.audio_aec = false;
+    settings.voice_aec = false;
+    settings.voice_noise_suppression = false;
     settings.audio_silence_gate_ms = 0;
     settings.allow_privacy_mode = true;
     settings.allow_os_login = true;
@@ -281,6 +284,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.voice_microphone.empty(),
           "a fresh host follows the default communications microphone");
     check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
+    check(loaded.settings.voice_aec && loaded.settings.voice_noise_suppression,
+          "a fresh host enables voice echo cancellation and noise suppression");
     check(loaded.settings.audio_silence_gate_ms == 2000,
           "a fresh host gates digital silence after two seconds");
     check(!loaded.settings.allow_privacy_mode, "a fresh host does not blank the local screen");
@@ -337,6 +342,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "audio_device=" + std::string(1100, 'd') + "\n"
                "voice_microphone=" + std::string(1100, 'm') + "\n"
                "audio_aec=perhaps\n"
+               "voice_aec=perhaps\n"
+               "voice_noise_suppression=perhaps\n"
                "audio_silence_gate_ms=99999\n"
                "microphone=perhaps\n"
                "remove_wallpaper=perhaps\n"
@@ -389,6 +396,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.audio_device.empty(), "an oversized output id is dropped");
     check(settings.voice_microphone.empty(), "an oversized microphone id is dropped");
     check(settings.audio_aec, "an unparsable AEC toggle keeps the default");
+    check(settings.voice_aec && settings.voice_noise_suppression,
+          "invalid voice DSP toggles keep their defaults");
     check(settings.audio_silence_gate_ms == 2000,
           "an out-of-range silence gate falls back");
     check(!settings.allow_microphone,
@@ -437,6 +446,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
                             "audio_device", "voice_microphone", "audio_aec",
+                            "voice_aec", "voice_noise_suppression",
                             "audio_silence_gate_ms",
                             "microphone", "privacy_mode",
                             "auto_disconnect_minutes",

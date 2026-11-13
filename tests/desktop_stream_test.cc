@@ -651,6 +651,106 @@ void static_refresh_budget() {
     display.reset();
 }
 
+void subscriber_queue_age() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto subscribe = [&] {
+        return pool.subscribe(L"queue-age", [state](std::string*) {
+            return std::make_unique<host_test::Capture>(state);
+        }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+            return std::make_unique<host_test::Encoder>(state, config);
+        }, &error);
+    };
+    auto fast = subscribe();
+    check(fast != nullptr, "subscribe the fast queue-age viewer");
+    frame(*fast);
+    EncoderConfig config;
+    config.framerate = 30;
+    auto fast_encoder = DesktopStreamPool::encoder(*fast, config, &error);
+    auto slow = subscribe();
+    check(fast_encoder && slow, "a second viewer shares the queue-age source");
+    frame(*slow);
+    auto slow_encoder = DesktopStreamPool::encoder(*slow, config, &error);
+    check(slow_encoder != nullptr, "create the slow viewer's encoder adapter");
+    const auto encoders = state->encoder_created.load();
+    const auto before = state->encodes.load();
+    unsigned fast_frames = 0;
+    // The slow viewer holds the frame returned by capture(), but does not
+    // call encode(). The fast viewer keeps draining the same source.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(DesktopStreamPool::kMaxSubscriberQueueAgeMs + 150);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (fast->capture(5ms) != CaptureResult::Frame) continue;
+        std::vector<EncodedPacket> packets;
+        check(fast_encoder->encode(nullptr, 0, false, packets).ok(), "fast viewer drains normally");
+        if (!packets.empty()) ++fast_frames;
+    }
+    check(fast_frames >= 3 && state->encodes - before < 60,
+          "fast viewer advances while the slow queue stays below its frame-count limit");
+    std::vector<EncodedPacket> packets;
+    check(slow_encoder->encode(nullptr, 0, false, packets).ok() && packets.empty(),
+          "a stall between capture and encode discards the expired dependency chain");
+    frame(*slow);
+    check(slow_encoder->encode(nullptr, 0, false, packets).ok() &&
+              !packets.empty() && packets.front().idr,
+          "slow viewer resumes on a fresh on-demand IDR");
+    check(state->encoder_created == encoders,
+          "stale queue recovery retains the shared encoder");
+    const auto expired = DesktopStreamPool::queue_stats(*slow);
+    check(expired.age_resyncs == 1 && expired.expired_frames > 0 &&
+              expired.delivered_wait_ms <= DesktopStreamPool::kMaxSubscriberQueueAgeMs,
+          "queue telemetry counts the expired chain and fresh delivery waiting");
+    check(DesktopStreamPool::queue_stats(*fast).age_resyncs == 0,
+          "queue recovery counters belong to the affected subscriber");
+
+    // Also cover a stalled reader with no unconsumed current picture.
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        DesktopStreamPool::kMaxSubscriberQueueAgeMs + 150));
+    check(slow->capture(0ms) == CaptureResult::NoNewFrame,
+          "capture rejects an aged queue before returning any stale frame");
+    packets.clear();
+    frame(*slow);
+    check(slow_encoder->encode(nullptr, 0, false, packets).ok() &&
+              !packets.empty() && packets.front().idr,
+          "an expired unread queue also restarts with an IDR");
+    check(DesktopStreamPool::queue_stats(*slow).age_resyncs == 2,
+          "both capture and encode age recovery are observable");
+    frame(*fast);
+    packets.clear();
+    check(fast_encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty(),
+          "the other viewer remains usable after stale queue recovery");
+    slow_encoder.reset(); slow.reset();
+    fast_encoder.reset(); fast.reset();
+    check(state->wrong_thread == 0, "age recovery keeps GPU operations on the source thread");
+}
+
+void slow_encode_is_not_queue_wait() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->encode_delay_ms = DesktopStreamPool::kMaxSubscriberQueueAgeMs + 100;
+    std::string error;
+    auto viewer = pool.subscribe(L"slow-encode-age", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe with a slow encoder");
+    frame(*viewer);
+    EncoderConfig config;
+    config.framerate = 1;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "slow encoder proves its initial IDR");
+    frame(*viewer);
+    std::vector<EncodedPacket> packets;
+    check(encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty(),
+          "encoding longer than the queue budget does not expire freshly published output");
+    check(DesktopStreamPool::queue_stats(*viewer).age_resyncs == 0,
+          "slow source work produces no false backlog recovery events");
+    encoder.reset(); viewer.reset();
+}
+
 void slow_viewer_backpressure() {
     DesktopStreamPool pool;
     auto state = std::make_shared<host_test::MediaState>();
@@ -869,6 +969,8 @@ int main() {
         multi_display_full_color();
         global_codec_voting();
         static_refresh_budget();
+        subscriber_queue_age();
+        slow_encode_is_not_queue_wait();
         slow_viewer_backpressure();
         {
             DesktopStreamPool quality_pool;

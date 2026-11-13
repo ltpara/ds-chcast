@@ -24,7 +24,23 @@ int main() {
         policy.delay(1, 10, 2100);
         check(policy.state(2100).fps == 30, "startup acceleration stops at the cap");
         policy.open(2, 2200);
-        check(policy.state(2200).fps == 15, "a new viewer's first second clamps the stream to 15");
+        check(policy.state(2200).fps == 30, "a late viewer preserves the established shared rate");
+        policy.delay(2, 10, 2250);
+        check(policy.state(2250).fps == 30, "a late viewer's first reply starts from the proven rate");
+        policy.open(3, 2300);
+        check(policy.state(2300).fps == 30, "repeated joins do not restart the shared warm-up");
+        policy.pending(3, 3000, 5300);
+        check(policy.state(5300).fps < 30, "a late viewer with no receipt still triggers congestion protection");
+        policy.close(3, 5400);
+        check(policy.state(5400).fps == 30, "removing the stalled late viewer releases its constraint");
+        policy.options(2, 10, std::nullopt, 5500);
+        check(policy.state(5500).fps == 10, "late viewer startup isolation retains explicit FPS caps");
+
+        VideoQos initial_cohort(60);
+        initial_cohort.open(1, 0);
+        initial_cohort.open(2, 100);
+        check(initial_cohort.state(100).fps == 15,
+              "viewers joining before a proven stream retain conservative startup");
 
         VideoQos jitter;
         jitter.open(1, 0);

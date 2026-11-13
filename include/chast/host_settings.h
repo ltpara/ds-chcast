@@ -136,6 +136,11 @@ struct HostSettings {
     // Cancel the viewer's microphone out of the loopback capture. Needs a live
     // microphone playback reference; with no CMIC stream it stays bypassed.
     bool audio_aec = true;
+    // Host voice capture uses this viewer's incoming microphone playback as
+    // its echo reference, independently of system-sound streaming. No live
+    // playback means AEC is bypassed; noise suppression still runs.
+    bool voice_aec = true;
+    bool voice_noise_suppression = true;
     // Stop feeding the encoder after this much digital silence; 0 disables the
     // gate. The gate never moves the playout timeline, it only stops producing
     // packets while nothing is audible.

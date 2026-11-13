@@ -2818,6 +2818,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         bool encoder_recovery_only = false;
         bool force_keyframe = true, have_input = false, resolution_fixed = false;
         bool probe_pending = false, needs_resync = false;
+        uint64_t observed_expired_frames = 0, observed_age_resyncs = 0;
         uint32_t extra_idrs = 0, frames_without_nv12 = 0, framerate = 30;
         uint16_t resolution_request = 100, resolution_percent = 100;
         uint32_t target_bitrate = 0;
@@ -3968,6 +3969,17 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     };
 
     auto& video_needs_resync = video.needs_resync;
+    auto sample_video_queue = [&] {
+        const auto queue = DesktopStreamPool::queue_stats(*capturer);
+        stats.video_queue_wait_ms = queue.delivered_wait_ms;
+        stats.video_max_queue_wait_ms = std::max(stats.video_max_queue_wait_ms, queue.delivered_wait_ms);
+        stats.video_expired_frames += queue.expired_frames >= video.observed_expired_frames
+            ? queue.expired_frames - video.observed_expired_frames : queue.expired_frames;
+        stats.video_age_resyncs += queue.age_resyncs >= video.observed_age_resyncs
+            ? queue.age_resyncs - video.observed_age_resyncs : queue.age_resyncs;
+        video.observed_expired_frames = queue.expired_frames;
+        video.observed_age_resyncs = queue.age_resyncs;
+    };
     auto process_frame = [&](uint64_t pts_ms, bool idle = false) -> bool {
         const FrameInfo& frame = idle ? cached_frame : capturer->frame();
         if (!frame.has_video_image()) {
@@ -4016,6 +4028,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return false;
         }
         have_input = true;
+        sample_video_queue();
         if (!idle) {
             if (frame.nv12_texture) frame.nv12_texture->AddRef();
             cached_nv12 = ComPtr<ID3D11Texture2D>(frame.nv12_texture);
@@ -5424,6 +5437,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (force_keyframe) DesktopStreamPool::request_keyframe(*capturer);
         const CaptureResult result = capturer->capture(
             std::chrono::milliseconds(other_videos.empty() ? (audio_active ? 5 : 100) : 0));
+        sample_video_queue();
         // The endpoint keeps producing while capture waits for the next
         // present; drain here so audio does not wait behind a slow frame.
         drain_audio();
@@ -8755,6 +8769,7 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
 }
 
 void HostServer::stop_microphone(HostServerStats& stats, const std::string& reason) {
+    voice_reference_->set_active(false);
     if (audio_reference_) {
         audio_reference_->set_active(false);
     }
@@ -8774,6 +8789,12 @@ void HostServer::stop_microphone(HostServerStats& stats, const std::string& reas
 }
 
 void HostServer::drain_microphone(HostServerStats& stats) {
+    // An open but stalled stream must not repeatedly train voice AEC with
+    // the same old PCM. Leave room for the render lead and acoustic tail;
+    // the first block after the gap reactivates an empty reference.
+    if (voice_reference_->active() &&
+        std::chrono::steady_clock::now() - voice_reference_last_push_ > std::chrono::milliseconds(500))
+        voice_reference_->set_active(false);
     stats.microphone_streams = session_->microphone_streams();
     if (!settings_.allow_microphone || stats.microphone_streams == 0) {
         return;
@@ -8848,6 +8869,8 @@ void HostServer::drain_microphone(HostServerStats& stats) {
                     microphone_decoder_.reset();
                     log("microphone playback failed: " + started.to_string());
                 } else {
+                    voice_reference_last_push_ = std::chrono::steady_clock::now();
+                    voice_reference_->set_active(true);
                     if (audio_reference_) {
                         // Only live playback may train the canceller; the
                         // pushed blocks are the reference for loopback.
@@ -8881,10 +8904,6 @@ void HostServer::drain_microphone(HostServerStats& stats) {
             if (block.channels != 0) {
                 stats.microphone_frames += block.samples.size() / block.channels;
             }
-            if (audio_reference_ && block.channels >= 1 && block.channels <= 2) {
-                audio_reference_->push(block.samples.data(),
-                                       block.samples.size() / block.channels, block.channels);
-            }
             Error pushed = microphone_player_->push(block);
             if (!pushed.ok()) {
                 ++stats.microphone_errors;
@@ -8892,6 +8911,16 @@ void HostServer::drain_microphone(HostServerStats& stats) {
                 stop_microphone(stats, "playback failed");
                 push_failed = true;
                 break;
+            }
+            // Only accepted playback belongs in the echo reference. Both
+            // decoders deliver 48 kHz PCM, the reference's fixed sample rate.
+            if (block.sample_rate == 48000 && block.channels >= 1 && block.channels <= 2) {
+                const auto frames = block.samples.size() / block.channels;
+                voice_reference_last_push_ = std::chrono::steady_clock::now();
+                voice_reference_->set_active(true);
+                voice_reference_->push(block.samples.data(), frames, block.channels);
+                if (audio_reference_)
+                    audio_reference_->push(block.samples.data(), frames, block.channels);
             }
         }
         if (push_failed) {
@@ -8941,6 +8970,9 @@ std::unique_ptr<IMicrophoneCapture> HostServer::create_voice_capture(
     std::string& device_id, std::string* error) {
     MicrophoneCaptureConfig microphone_config;
     microphone_config.device_id = device_id;
+    microphone_config.reference = voice_reference_;
+    microphone_config.echo_cancellation = settings_.voice_aec;
+    microphone_config.noise_suppression = settings_.voice_noise_suppression;
     std::unique_ptr<IMicrophoneCapture> capture =
         config_.voice_capture ? config_.voice_capture(microphone_config, error)
                               : create_microphone_capture(microphone_config, error);

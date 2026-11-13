@@ -78,6 +78,9 @@ private:
         std::optional<float> custom_ratio;
         uint64_t quality_order = 0;
         uint64_t joined_at = 0;
+        // Late viewers inherit a proven shared rate. Only the initial cohort
+        // needs the conservative 15 FPS start and its one-second guard.
+        std::optional<uint32_t> joining_fps;
         Delay delay;
     };
     struct Display { uint32_t encoded = 0; bool variable = true; };
