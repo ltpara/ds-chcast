@@ -44,6 +44,14 @@ add_library(chast.base STATIC
     src/win/error.cc)
 target_include_directories(chast.base PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# PNG encoding/decoding shared by screenshots and the clipboard image path.
+# WIC keeps this independent of the capture stack so clipboard-only binaries do
+# not pull in D3D11 just to convert a large DIB.
+add_library(chast.png STATIC
+    src/win/png_writer.cc)
+target_include_directories(chast.png PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chast.png PUBLIC chast.base ole32 windowscodecs)
+
 # Password hashing, TOTP, DPAPI protection and the viewer's device key. CNG
 # supplies PBKDF2/HMAC/ECDSA, crypt32 the data-protection API; neither has a
 # dependency on the capture or network stacks.
@@ -55,7 +63,6 @@ target_link_libraries(chast.security PUBLIC chast.base bcrypt crypt32)
 
 add_library(chast.dxgi STATIC
     src/win/com.cc
-    src/win/png_writer.cc
     src/capture/display.cc
     src/capture/display_mode.cc
     src/capture/rotation.cc
@@ -77,8 +84,11 @@ target_include_directories(chast.dxgi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # system without the DLL falls back instead of failing to load.
 target_link_libraries(chast.dxgi PUBLIC
     chast.base
+    chast.png
     d3d11
     dxgi
+    shcore
+    advapi32
     user32
     gdi32
     ole32
@@ -252,7 +262,7 @@ add_library(chast.clipboard STATIC
     src/clipboard/clipboard_listener.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32 ole32 uuid shlwapi zstd::libzstd)
+target_link_libraries(chast.clipboard PUBLIC chast.base chast.security chast.png user32 shell32 ole32 uuid shlwapi zstd::libzstd)
 
 # Receive-side file handling: name sanitizing, resumable .part files, digest
 # verification. The receiver side only; the viewer hashes what it sends through
@@ -304,6 +314,9 @@ add_library(chast.host STATIC
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
     src/host/virtual_display.cc
+    src/win/annotation_history.cc
+    src/win/annotation_overlay.cc
+    src/win/annotation_paint.cc
     src/win/display_privacy.cc
     src/win/privacy.cc
     src/win/power_request.cc
@@ -476,7 +489,7 @@ if(CHAST_BUILD_TESTS)
     # PNG writing for screenshots: signature, decoded pixels and alpha forcing
     # through WIC. No GPU, no network.
     add_executable(chast-png-writer-test tests/png_writer_test.cc)
-    target_link_libraries(chast-png-writer-test PRIVATE chast.dxgi ole32 windowscodecs)
+    target_link_libraries(chast-png-writer-test PRIVATE chast.png)
 
     # The viewer's sprite installer: validation, the scaled-handle cache and
     # release. Builds handles from a screen DC only, so it needs no desktop.
@@ -491,6 +504,14 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-cursor-hint-test tests/cursor_hint_paint_test.cc
                    src/win/cursor_hint_paint.cc)
     target_include_directories(chast-cursor-hint-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    # Freehand annotation raster: clipping, round caps and premultiplied BGRA.
+    add_executable(chast-annotation-paint-test tests/annotation_paint_test.cc
+                   src/win/annotation_history.cc
+                   src/win/annotation_paint.cc)
+    target_include_directories(chast-annotation-paint-test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
     # Pure-logic checks for the wire format and the HID -> scan-code table.
     add_executable(chast-protocol-test tests/protocol_test.cc)
@@ -725,6 +746,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME cursor_hint COMMAND chast-cursor-hint-test)
+    add_test(NAME annotation_paint COMMAND chast-annotation-paint-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
     add_test(NAME keyboard COMMAND chast-keyboard-test)
     add_test(NAME protocol_fuzz COMMAND chast-protocol-fuzz-test)
@@ -896,6 +918,18 @@ if(CHAST_BUILD_TESTS)
     # the queue, and one remembered answer covers uploads and downloads.
     add_test(NAME viewer_file_conflict COMMAND chast-viewer-probe --file-conflict)
     set_tests_properties(viewer_file_conflict PROPERTIES TIMEOUT 180)
+    # Protocol v74 directory offers: empty and nested folders are created without
+    # being counted as sent files, zero-byte files remain files, and Windows
+    # junctions are refused as roots and skipped inside ordinary trees.
+    add_test(NAME viewer_directory_upload COMMAND chast-viewer-probe --directory-upload)
+    set_tests_properties(viewer_directory_upload PROPERTIES TIMEOUT 180)
+    # Native clipboard formats, including independent PNG/image-png handles,
+    # oversized DIB conversion and a broken PNG falling back to a valid DIB.
+    # The private window station may be prohibited by a runner's token policy;
+    # that environment limitation is reported as skipped, never as a pass.
+    add_test(NAME viewer_clipboard_native COMMAND chast-viewer-probe --clipboard-native)
+    set_tests_properties(viewer_clipboard_native PROPERTIES
+        TIMEOUT 60 SKIP_RETURN_CODE 77)
     # The FFmpeg backend serves the adapters oneVPL does not cover and is the
     # second attempt on Intel. Pin it to exercise its D3D11VA frame pool, rate
     # programming and replay path instead of Auto's oneVPL choice.

@@ -149,8 +149,8 @@ public:
         if (config_.capture_cursor) sample_desktop_cursor(display_, cursor_);
         if (cpu_only() || !device_) {
             const auto* begin = static_cast<const uint8_t*>(pixels_);
-            frame_.cpu_bgra = std::make_shared<const std::vector<uint8_t>>(
-                begin, begin + size_t(width_) * height_ * 4);
+            frame_.cpu_bgra = cpu_frames_.copy(
+                begin, static_cast<size_t>(width_) * height_ * 4);
             frame_.nv12_width = scaled_even(width_, nv12_percent_);
             frame_.nv12_height = scaled_even(height_, nv12_percent_);
             frame_.desktop_updated = frame_.nv12_updated = true;
@@ -300,6 +300,7 @@ private:
     HGDIOBJ previous_bitmap_ = nullptr;
     void* pixels_ = nullptr;
     HANDLE shared_handle_ = nullptr;
+    detail::CpuFramePool cpu_frames_;
     UINT width_ = 0;
     UINT height_ = 0;
     UINT vendor_id_ = 0;

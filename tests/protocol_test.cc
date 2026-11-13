@@ -17,7 +17,9 @@
 #include "chast/clipboard.h"
 #include "chast/identity.h"
 #include "chast/input.h"
+#include "chast/png.h"
 #include "chast/protocol.h"
+#include "test_workdir.h"
 
 namespace {
 
@@ -25,6 +27,7 @@ int failures = 0;
 
 void check(bool condition, const char* what) {
     std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
+    std::fflush(stdout);
     if (!condition) {
         ++failures;
     }
@@ -467,6 +470,84 @@ void test_show_cursor() {
     reserved[9] = 0x01;
     check(!chast::parse_show_cursor(reserved, got, &error),
           "ShowCursor with non-zero reserved bytes is rejected");
+}
+
+void test_annotation() {
+    chast::AnnotationMessage sent;
+    sent.action = chast::AnnotationAction::Begin;
+    sent.stroke_id = 7;
+    sent.points = {{-1920, 120}, {40, 50}};
+    chast::AnnotationMessage got;
+    std::string error;
+    const std::vector<uint8_t> message = chast::make_annotation(sent);
+    check(!message.empty() &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::Annotation),
+          "Annotation uses its own control type");
+    check(chast::parse_annotation(payload_of(message), got, &error) &&
+              got.action == chast::AnnotationAction::Begin && got.stroke_id == 7 &&
+              got.points.size() == 2 && got.points[0].x == -1920 &&
+              got.points[1].y == 50,
+          "Annotation round-trips a batched begin stroke");
+
+    sent = chast::AnnotationMessage{};
+    sent.action = chast::AnnotationAction::Clear;
+    check(chast::parse_annotation(payload_of(chast::make_annotation(sent)), got, &error) &&
+              got.action == chast::AnnotationAction::Clear && got.stroke_id == 0 &&
+              got.points.empty(),
+          "Annotation round-trips clear");
+
+    const std::vector<uint8_t> payload = payload_of(message);
+    check(!chast::parse_annotation(
+              std::vector<uint8_t>(payload.begin(), payload.end() - 3), got, &error),
+          "a truncated Annotation point is rejected");
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    check(!chast::parse_annotation(trailing, got, &error),
+          "Annotation with trailing bytes is rejected");
+    std::vector<uint8_t> unknown_action = payload;
+    unknown_action[0] = 5;
+    check(!chast::parse_annotation(unknown_action, got, &error),
+          "Annotation with an unknown action is rejected");
+    std::vector<uint8_t> reserved = payload;
+    reserved[1] = 1;
+    check(!chast::parse_annotation(reserved, got, &error),
+          "Annotation with a non-zero reserved byte is rejected");
+    std::vector<uint8_t> zero_stroke = payload;
+    zero_stroke[4] = 0;
+    zero_stroke[5] = 0;
+    zero_stroke[6] = 0;
+    zero_stroke[7] = 0;
+    check(!chast::parse_annotation(zero_stroke, got, &error),
+          "a drawing Annotation requires a stroke id");
+
+    sent.action = chast::AnnotationAction::Move;
+    sent.stroke_id = 9;
+    sent.points.assign(chast::kMaxAnnotationPoints + 1, chast::AnnotationPoint{});
+    check(chast::make_annotation(sent).empty(),
+          "Annotation refuses more than the point bound");
+    sent.points = {{chast::kMaxAnnotationCoordinate + 1, 0}};
+    check(chast::make_annotation(sent).empty(),
+          "Annotation refuses an out-of-range coordinate");
+    sent.points.clear();
+    check(chast::make_annotation(sent).empty(),
+          "Annotation refuses a drawing action with no points");
+
+    sent.action = chast::AnnotationAction::Clear;
+    sent.stroke_id = 0;
+    sent.points.clear();
+    std::vector<uint8_t> clear_with_points = payload_of(chast::make_annotation(sent));
+    clear_with_points[10] = 1;
+    clear_with_points[11] = 0;
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    clear_with_points.push_back(0);
+    check(!chast::parse_annotation(clear_with_points, got, &error),
+          "clear cannot carry a point");
 }
 
 void test_hello_ack() {
@@ -2774,15 +2855,15 @@ void test_clipboard_files() {
     check(chast::encode_clipboard_file_list({{"dir", 0, "tree/other", true}}).empty(),
           "directory basename must agree with its path");
 
-    const auto root = std::filesystem::temp_directory_path() /
-        ("chast-clipboard-tree-" + std::to_string(GetCurrentProcessId()));
+    const auto root = chast_test::scratch_directory("chast-clipboard-tree");
     std::error_code ec;
     std::filesystem::create_directories(root / "tree" / "empty" / "leaf", ec);
     std::filesystem::create_directories(root / "standalone", ec);
     { std::ofstream out(root / "tree" / "zero"); }
     std::vector<chast::ClipboardFileEntry> collected;
     std::vector<std::string> paths;
-    check(chast::collect_clipboard_files({(root / "tree").string(), (root / "standalone").string()}, collected, paths, &error) &&
+    check(chast::collect_clipboard_files({(root / "tree").string(), (root / "standalone").string()},
+                                         collected, paths, &error) &&
               collected.size() == 3 && paths.size() == 3 &&
               std::count_if(collected.begin(), collected.end(), [](const auto& entry) { return entry.directory; }) == 2,
           "collection retains standalone and nested empty directories without inventing file entries");
@@ -4245,7 +4326,7 @@ void test_file_transfer() {
     check(chast::parse_file_offer(payload_of(chast::make_file_offer(offer)), got_offer,
                                   &error) &&
               got_offer.transfer_id == 7 && got_offer.size == 12 && got_offer.resume &&
-              !got_offer.clipboard && got_offer.name == offer.name &&
+              !got_offer.clipboard && !got_offer.directory && got_offer.name == offer.name &&
               got_offer.sha256 == offer.sha256 &&
               got_offer.relative_path == offer.relative_path &&
               got_offer.modified_time == 1762999999,
@@ -4260,6 +4341,45 @@ void test_file_transfer() {
               got_clipboard.name == offer.name &&
               got_clipboard.relative_path == offer.relative_path,
           "the v34 clipboard flag rides beside the resume flag");
+
+    chast::FileOffer directory_offer;
+    directory_offer.transfer_id = 8;
+    directory_offer.name = "empty";
+    directory_offer.relative_path = "Trip/2026";
+    directory_offer.directory = true;
+    chast::FileOffer got_directory;
+    check(chast::parse_file_offer(payload_of(chast::make_file_offer(directory_offer)),
+                                  got_directory, &error) &&
+              got_directory.transfer_id == 8 && got_directory.directory &&
+              got_directory.size == 0 && !got_directory.resume &&
+              !got_directory.clipboard && got_directory.name == "empty" &&
+              got_directory.relative_path == "Trip/2026" &&
+              got_directory.modified_time == 0,
+          "FileOffer round-trips a directory with its parent path");
+
+    auto directory_payload = [&] {
+        return payload_of(chast::make_file_offer(directory_offer));
+    };
+    chast::FileOffer bad_directory = directory_offer;
+    bad_directory.clipboard = true;
+    check(chast::make_file_offer(bad_directory).empty(),
+          "the maker refuses a clipboard directory FileOffer");
+    bad_directory = directory_offer;
+    bad_directory.resume = true;
+    check(chast::make_file_offer(bad_directory).empty(),
+          "the maker refuses a resumable directory FileOffer");
+    bad_directory = directory_offer;
+    bad_directory.size = 1;
+    check(chast::make_file_offer(bad_directory).empty(),
+          "the maker refuses a non-empty directory FileOffer");
+    bad_directory = directory_offer;
+    bad_directory.modified_time = 1;
+    check(chast::make_file_offer(bad_directory).empty(),
+          "the maker refuses a directory FileOffer with a modification time");
+    bad_directory = directory_offer;
+    bad_directory.sha256[0] = 1;
+    check(chast::make_file_offer(bad_directory).empty(),
+          "the maker refuses a directory FileOffer with a digest");
 
     chast::FileOffer legacy_offer = offer;
     legacy_offer.relative_path.clear();
@@ -4286,17 +4406,36 @@ void test_file_transfer() {
         chast::FileOffer dropped;
         check(!chast::parse_file_offer(payload, dropped, &error), what);
     };
-    auto rejects_relative = [&](std::string relative, const char* what) {
+    auto rejects_relative = [&](const std::string& relative,
+                                const char* maker_what, const char* parser_what) {
         chast::FileOffer bad = offer;
-        bad.relative_path = std::move(relative);
-        rejects_offer(payload_of(chast::make_file_offer(bad)), what);
+        bad.relative_path = relative;
+        check(chast::make_file_offer(bad).empty(), maker_what);
+
+        // The maker refuses the path, so replace the empty directory field in
+        // an otherwise valid root offer to exercise the parser independently.
+        chast::FileOffer rooted_offer = offer;
+        rooted_offer.relative_path.clear();
+        std::vector<uint8_t> payload = payload_of(chast::make_file_offer(rooted_offer));
+        payload.resize(payload.size() - 8);  // append the directory in place of the time
+        payload.push_back(static_cast<uint8_t>(relative.size() & 0xFF));
+        payload.push_back(static_cast<uint8_t>((relative.size() >> 8) & 0xFF));
+        payload.insert(payload.end(), relative.begin(), relative.end());
+        rejects_offer(std::move(payload), parser_what);
     };
-    rejects_relative("/absolute", "an absolute FileOffer directory is rejected");
-    rejects_relative("C:/Windows", "a drive-letter FileOffer directory is rejected");
-    rejects_relative("reports/../secret", "a FileOffer directory with .. is rejected");
-    rejects_relative("reports/./2026", "a FileOffer directory with . is rejected");
-    rejects_relative("reports//2026", "a FileOffer directory with an empty part is rejected");
-    rejects_relative("reports\\2026", "a FileOffer directory with a backslash is rejected");
+    rejects_relative("/absolute", "the maker refuses an absolute FileOffer directory",
+                     "an absolute FileOffer directory is rejected");
+    rejects_relative("C:/Windows", "the maker refuses a drive-letter FileOffer directory",
+                     "a drive-letter FileOffer directory is rejected");
+    rejects_relative("reports/../secret", "the maker refuses a FileOffer directory with ..",
+                     "a FileOffer directory with .. is rejected");
+    rejects_relative("reports/./2026", "the maker refuses a FileOffer directory with .",
+                     "a FileOffer directory with . is rejected");
+    rejects_relative("reports//2026",
+                     "the maker refuses a FileOffer directory with an empty part",
+                     "a FileOffer directory with an empty part is rejected");
+    rejects_relative("reports\\2026", "the maker refuses a FileOffer directory with a backslash",
+                     "a FileOffer directory with a backslash is rejected");
     // make_file_offer clears an over-long directory, so build the wire form by
     // hand to prove the parser rejects it rather than truncating.
     chast::FileOffer rooted = offer;
@@ -4315,10 +4454,32 @@ void test_file_transfer() {
         }
         deep.push_back('a');
     }
-    rejects_relative(std::move(deep), "a too-deep FileOffer directory is rejected");
+    rejects_relative(deep, "the maker refuses a too-deep FileOffer directory",
+                     "a too-deep FileOffer directory is rejected");
     std::vector<uint8_t> unknown_flags = payload_of(chast::make_file_offer(offer));
-    unknown_flags[12] = 0x04;  // id(4) + size(8), then flags
+    unknown_flags[12] = 0x08;  // id(4) + size(8), then flags
     rejects_offer(std::move(unknown_flags), "FileOffer with unknown flags is rejected");
+
+    std::vector<uint8_t> directory_clipboard = directory_payload();
+    directory_clipboard[12] = static_cast<uint8_t>(directory_clipboard[12] |
+                                                    chast::kFileOfferFlagClipboard);
+    rejects_offer(std::move(directory_clipboard),
+                  "parsing rejects a clipboard directory FileOffer");
+    std::vector<uint8_t> directory_resume = directory_payload();
+    directory_resume[12] = static_cast<uint8_t>(directory_resume[12] |
+                                                 chast::kFileOfferFlagResume);
+    rejects_offer(std::move(directory_resume), "parsing rejects a resumable directory FileOffer");
+    std::vector<uint8_t> directory_size = directory_payload();
+    directory_size[4] = 1;
+    rejects_offer(std::move(directory_size), "parsing rejects a non-empty directory FileOffer");
+    std::vector<uint8_t> directory_time = directory_payload();
+    directory_time.back() = 1;
+    rejects_offer(std::move(directory_time),
+                  "parsing rejects a directory FileOffer with a modification time");
+    std::vector<uint8_t> directory_digest = directory_payload();
+    directory_digest[13] = 1;
+    rejects_offer(std::move(directory_digest),
+                  "parsing rejects a directory FileOffer with a digest");
 
     std::vector<uint8_t> empty_name = payload_of(chast::make_file_offer(offer));
     // id(4) size(8) flags(1) digest(32), then the u16 name length.
@@ -5003,10 +5164,20 @@ void test_clipboard_container() {
     dib.data[14] = 32; // bit count
     content.formats.push_back(dib);
 
+    chast::ClipboardFormatData png;
+    png.format = chast::ClipboardFormat::Png;
+    const uint8_t png_pixels[16] = {
+        10, 20, 30, 255, 40, 50, 60, 255,
+        70, 80, 90, 255, 100, 110, 120, 255};
+    check(chast::encode_png_bgra(png_pixels, 2, 2, 8, png.data, &error) &&
+              !png.data.empty(),
+          "the clipboard PNG fixture is encoded");
+    content.formats.push_back(png);
+
     const uint64_t hash = chast::clipboard_content_hash(content);
     check(hash != 0, "clipboard content hashes to a non-zero value");
     chast::ClipboardContent reordered = content;
-    std::swap(reordered.formats[0], reordered.formats[3]);
+    std::swap(reordered.formats[0], reordered.formats[4]);
     check(chast::clipboard_content_hash(reordered) == hash,
           "the clipboard hash ignores entry order");
 
@@ -5018,14 +5189,16 @@ void test_clipboard_container() {
     chast::ClipboardContent decoded;
     check(chast::decode_clipboard_stream(stream.data(), stream.size(), decoded, &error),
           "CCLB stream round-trips");
-    check(decoded.seq == content.seq && decoded.hash == hash && decoded.formats.size() == 4 &&
+    check(decoded.seq == content.seq && decoded.hash == hash && decoded.formats.size() == 5 &&
               decoded.formats[0].format == chast::ClipboardFormat::Text &&
               decoded.formats[1].format == chast::ClipboardFormat::Html &&
               decoded.formats[2].format == chast::ClipboardFormat::Rtf &&
               decoded.formats[3].format == chast::ClipboardFormat::Dib &&
+              decoded.formats[4].format == chast::ClipboardFormat::Png &&
               decoded.formats[0].data == text.data &&
               decoded.formats[1].data == html.data &&
-              decoded.formats[3].data == dib.data,
+              decoded.formats[3].data == dib.data &&
+              decoded.formats[4].data == png.data,
           "CCLB stream keeps every format and byte");
 
     auto alters = [&](size_t at, uint8_t value, const char* what) {
@@ -5036,7 +5209,7 @@ void test_clipboard_container() {
               what);
     };
     alters(8, static_cast<uint8_t>(stream[8] ^ 0xFF), "a CCLB with a wrong hash is rejected");
-    alters(4, 2, "a v2 CCLB is rejected by the v3 decoder");
+    alters(4, 2, "a v2 CCLB is rejected by the v4 decoder");
     alters(5, 9, "a CCLB with too many formats is rejected");
     chast::ClipboardContent dropped;
     check(!chast::decode_clipboard_stream(stream.data(), stream.size() - 1, dropped, &error),
@@ -5097,6 +5270,38 @@ void test_clipboard_container() {
     no_palette[14] = 8;
     rejects_dib(std::move(no_palette),
                 "a DIB whose color table is missing is rejected");
+    check(chast::valid_clipboard_dib(dib.data, &error),
+          "the public DIB validator accepts the source image");
+
+    auto rejects_png = [&](std::vector<uint8_t> bytes, const char* what) {
+        chast::ClipboardContent candidate;
+        chast::ClipboardFormatData entry;
+        entry.format = chast::ClipboardFormat::Png;
+        entry.data = std::move(bytes);
+        candidate.formats.push_back(std::move(entry));
+        check(!chast::valid_clipboard_content(candidate, &error), what);
+    };
+    std::vector<uint8_t> bad_signature = png.data;
+    bad_signature[1] ^= 0xFF;
+    rejects_png(std::move(bad_signature), "a PNG with a bad signature is rejected");
+    std::vector<uint8_t> truncated_png = png.data;
+    truncated_png.pop_back();
+    rejects_png(std::move(truncated_png), "a truncated PNG is rejected");
+    std::vector<uint8_t> bad_png_crc = png.data;
+    bad_png_crc.back() ^= 0xFF;
+    rejects_png(std::move(bad_png_crc), "a PNG with a bad CRCs is rejected");
+    std::vector<uint8_t> trailing_png = png.data;
+    trailing_png.push_back(0);
+    rejects_png(std::move(trailing_png), "bytes after a PNG IEND are rejected");
+    std::vector<uint8_t> wide_pixels(
+        static_cast<size_t>(chast::kMaxClipboardPngDimension + 1) * 4, 0);
+    std::vector<uint8_t> wide_png;
+    check(chast::encode_png_bgra(wide_pixels.data(),
+                                 chast::kMaxClipboardPngDimension + 1, 1,
+                                 (chast::kMaxClipboardPngDimension + 1) * 4,
+                                 wide_png, &error),
+          "an oversized PNG fixture is encoded");
+    rejects_png(std::move(wide_png), "a PNG wider than the dimension cap is rejected");
 
     // A rich item's text rides the CCLB stream, not the legacy control
     // message, so it must not inherit that message's 256 KiB limit.
@@ -5124,8 +5329,8 @@ void test_clipboard_container() {
     {
         std::vector<uint8_t> broken = large_stream;
         broken[chast::kClipboardStreamHeaderSize + chast::kClipboardEntryHeaderSize] ^= 0xFF;
-        chast::ClipboardContent dropped;
-        check(!chast::decode_clipboard_stream(broken.data(), broken.size(), dropped, &error),
+        chast::ClipboardContent rejected;
+        check(!chast::decode_clipboard_stream(broken.data(), broken.size(), rejected, &error),
               "a CCLB with a corrupt compressed payload is rejected");
     }
     {
@@ -5154,6 +5359,7 @@ int main(int argc, char** argv) {
     test_access_denied();
     test_ticket_renew();
     test_show_cursor();
+    test_annotation();
     test_hello_ack();
     test_files_only_hello_ack();
     test_control_only_hello_ack();

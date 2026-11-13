@@ -17,6 +17,7 @@
 
 #include "chast/com_ptr.h"
 #include "chast/png.h"
+#include "test_workdir.h"
 
 namespace {
 
@@ -169,6 +170,145 @@ void test_memory_encode(const std::filesystem::path& directory) {
               decoded[2] == source[2] && decoded[3] == 0xFF,
           "the in-memory PNG decodes to the encoded pixels");
 
+    uint32_t memory_width = 0;
+    uint32_t memory_height = 0;
+    std::vector<uint8_t> memory_pixels;
+    error.clear();
+    check(chast::decode_png_bgra(png.data(), png.size(), memory_width, memory_height,
+                                 memory_pixels, &error) &&
+              memory_width == kWidth && memory_height == kHeight &&
+              memory_pixels.size() == source.size() &&
+              memory_pixels[0] == source[0] && memory_pixels[1] == source[1] &&
+              memory_pixels[2] == source[2] && memory_pixels[3] == 0xFF,
+          "PNG bytes decode directly from memory");
+    const std::vector<uint8_t> expected_png_pixels = memory_pixels;
+    check(!chast::decode_png_bgra(nullptr, 0, memory_width, memory_height,
+                                  memory_pixels, &error) &&
+              memory_width == 0 && memory_height == 0 && memory_pixels.empty(),
+          "empty PNG memory is refused");
+    std::vector<uint8_t> bad_png = png;
+    bad_png[1] ^= 0xFF;
+    check(!chast::decode_png_bgra(bad_png.data(), bad_png.size(), memory_width,
+                                  memory_height, memory_pixels, &error),
+          "PNG memory with a bad signature is refused");
+
+    // CF_DIB has no BITMAPFILEHEADER. The conversion helper builds that header
+    // in memory and WIC decodes the resulting BMP without touching the disk.
+    std::vector<uint8_t> dib(40 + static_cast<size_t>(kWidth) * kHeight * 4, 0);
+    auto put32 = [&dib](size_t offset, uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+            dib[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    put32(0, 40);
+    put32(4, kWidth);
+    // A negative DIB height marks top-down rows, matching the BGRA fixture.
+    put32(8, static_cast<uint32_t>(-static_cast<int32_t>(kHeight)));
+    dib[12] = 1;
+    dib[14] = 32;
+    put32(20, static_cast<uint32_t>(kWidth) * kHeight * 4);
+    std::memcpy(dib.data() + 40, source.data(), source.size());
+    std::vector<uint8_t> dib_png;
+    check(chast::encode_dib_png(dib, dib_png, &error) && !dib_png.empty(),
+          "a CF_DIB image converts to PNG in memory");
+    std::vector<uint8_t> dib_pixels;
+    check(chast::decode_png_bgra(dib_png.data(), dib_png.size(), memory_width,
+                                 memory_height, dib_pixels, &error) &&
+              memory_width == kWidth && memory_height == kHeight &&
+              dib_pixels == expected_png_pixels,
+          "the converted DIB PNG has the same pixels");
+
+    // Clipboard screenshots commonly exceed the 32 MiB network DIB limit before
+    // being represented as PNG. Exercise the same 4096x2048 top-down BI_RGB
+    // shape as the native clipboard probe so this path is covered without a
+    // window station.
+    constexpr uint32_t kLargeWidth = 4096;
+    constexpr uint32_t kLargeHeight = 2048;
+    const size_t large_pixels = static_cast<size_t>(kLargeWidth) * kLargeHeight * 4;
+    std::vector<uint8_t> large_dib(40 + large_pixels, 0);
+    std::fill(large_dib.begin() + 40, large_dib.end(), static_cast<uint8_t>(0x80));
+    auto put_large32 = [&large_dib](size_t offset, uint32_t value) {
+        for (int i = 0; i != 4; ++i) {
+            large_dib[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    put_large32(0, 40);
+    put_large32(4, kLargeWidth);
+    put_large32(8, static_cast<uint32_t>(-static_cast<int32_t>(kLargeHeight)));
+    large_dib[12] = 1;
+    large_dib[14] = 32;
+    put_large32(20, static_cast<uint32_t>(large_pixels));
+    std::vector<uint8_t> large_png;
+    error.clear();
+    const bool large_converted = chast::encode_dib_png(large_dib, large_png, &error);
+    check(large_converted, "a 4096x2048 top-down DIB converts to PNG");
+    if (!large_converted) {
+        std::printf("     conversion error: %s\n", error.c_str());
+    }
+    std::vector<uint8_t> large_decoded;
+    check(chast::decode_png_bgra(large_png.data(), large_png.size(), memory_width,
+                                 memory_height, large_decoded, &error) &&
+              memory_width == kLargeWidth && memory_height == kLargeHeight &&
+              large_decoded.size() == large_pixels,
+          "the large DIB PNG decodes to the expected dimensions");
+
+    constexpr uint32_t kBottomWidth = 3;
+    constexpr uint32_t kBottomHeight = 2;
+    constexpr size_t kBottomStride = 12;
+    std::vector<uint8_t> bottom_up_dib(40 + kBottomStride * kBottomHeight, 0);
+    auto put_bottom32 = [&bottom_up_dib](size_t offset, uint32_t value) {
+        for (int i = 0; i != 4; ++i) {
+            bottom_up_dib[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    put_bottom32(0, 40);
+    put_bottom32(4, kBottomWidth);
+    put_bottom32(8, kBottomHeight);
+    bottom_up_dib[12] = 1;
+    bottom_up_dib[14] = 24;
+    put_bottom32(20, static_cast<uint32_t>(kBottomStride * kBottomHeight));
+    std::vector<uint8_t> bottom_pixels(kBottomStride * kBottomHeight);
+    for (uint32_t y = 0; y < kBottomHeight; ++y) {
+        for (uint32_t x = 0; x < kBottomWidth; ++x) {
+            uint8_t* pixel = bottom_pixels.data() + y * kBottomStride + x * 3;
+            pixel[0] = static_cast<uint8_t>(10 + y * 20 + x);
+            pixel[1] = static_cast<uint8_t>(40 + y * 20 + x);
+            pixel[2] = static_cast<uint8_t>(70 + y * 20 + x);
+        }
+    }
+    std::memcpy(bottom_up_dib.data() + 40, bottom_pixels.data(), bottom_pixels.size());
+    std::vector<uint8_t> bottom_png;
+    check(chast::encode_dib_png(bottom_up_dib, bottom_png, &error),
+          "a bottom-up 24-bit DIB converts to PNG");
+    std::vector<uint8_t> bottom_decoded;
+    bool bottom_pixels_match = false;
+    if (chast::decode_png_bgra(bottom_png.data(), bottom_png.size(), memory_width,
+                               memory_height, bottom_decoded, &error) &&
+        memory_width == kBottomWidth && memory_height == kBottomHeight &&
+        bottom_decoded.size() == kBottomWidth * kBottomHeight * 4) {
+        bottom_pixels_match = true;
+        for (uint32_t x = 0; x < kBottomWidth; ++x) {
+            const uint8_t* expected = bottom_pixels.data() + kBottomStride + x * 3;
+            const uint8_t* actual = bottom_decoded.data() + x * 4;
+            bottom_pixels_match = bottom_pixels_match && actual[0] == expected[0] &&
+                                  actual[1] == expected[1] && actual[2] == expected[2] &&
+                                  actual[3] == 0xFF;
+        }
+    }
+    const bool bottom_ok = bottom_pixels_match;
+    check(bottom_ok, "bottom-up rows are flipped and 24-bit colours are preserved");
+    if (!bottom_ok) {
+        std::printf("     decoded: ");
+        for (size_t i = 0; i < bottom_decoded.size(); ++i) std::printf("%02X", bottom_decoded[i]);
+        std::printf("\n     expected BGR: ");
+        for (size_t i = 0; i < 9; ++i) std::printf("%02X", bottom_pixels[kBottomStride + i]);
+        std::printf("\n");
+    }
+
+    std::vector<uint8_t> empty_dib;
+    check(!chast::encode_dib_png(empty_dib, dib_png, &error) && dib_png.empty(),
+          "an empty DIB is refused");
+
     std::vector<uint8_t> empty;
     check(!chast::encode_png_bgra(nullptr, 1, 1, 4, empty, &error) && empty.empty() &&
               !error.empty(),
@@ -222,20 +362,13 @@ void test_validation() {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     // The writer initialises COM itself; the decode helper below needs it on
     // this thread as well.
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    wchar_t temp[MAX_PATH];
-    const DWORD length = GetTempPathW(MAX_PATH, temp);
-    std::filesystem::path directory;
-    if (length > 0) {
-        directory = std::filesystem::path(temp) /
-                    ("chast-png-test-" + std::to_string(GetCurrentProcessId()));
-    }
+    const std::filesystem::path directory = chast_test::scratch_directory("chast-png-test");
     std::error_code ignored;
-    std::filesystem::remove_all(directory, ignored);
-    std::filesystem::create_directories(directory, ignored);
 
     test_validation();
     if (!directory.empty()) {

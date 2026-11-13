@@ -2,6 +2,7 @@
 
 #include "chast/clipboard.h"
 #include "chast/clipboard_virtual.h"
+#include "chast/png.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -38,6 +39,16 @@ UINT html_format() {
 
 UINT rtf_format() {
     static const UINT format = RegisterClipboardFormatW(L"Rich Text Format");
+    return format;
+}
+
+UINT png_format() {
+    static const UINT format = RegisterClipboardFormatW(L"PNG");
+    return format;
+}
+
+UINT png_mime_format() {
+    static const UINT format = RegisterClipboardFormatW(L"image/png");
     return format;
 }
 
@@ -143,8 +154,20 @@ UINT win32_format(ClipboardFormat format) {
             return rtf_format();
         case ClipboardFormat::Dib:
             return CF_DIB;
+        case ClipboardFormat::Png:
+            return png_format();
+        case ClipboardFormat::FileList:
+            return 0;  // travels through read/write_clipboard_files
     }
     return 0;
+}
+
+std::vector<UINT> win32_formats(ClipboardFormat format) {
+    if (format == ClipboardFormat::Png) {
+        return {png_format(), png_mime_format()};
+    }
+    const UINT value = win32_format(format);
+    return value == 0 ? std::vector<UINT>{} : std::vector<UINT>{value};
 }
 
 // Builds the handle a format is published with, without touching the
@@ -213,10 +236,15 @@ ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* 
         ~Closer() { CloseClipboard(); }
     } closer;
 
+    const bool png_available = (png_format() != 0 &&
+                                IsClipboardFormatAvailable(png_format())) ||
+                               (png_mime_format() != 0 &&
+                                IsClipboardFormatAvailable(png_mime_format()));
+    const bool dib_available = IsClipboardFormatAvailable(CF_DIB);
     if (!IsClipboardFormatAvailable(CF_UNICODETEXT) &&
         !IsClipboardFormatAvailable(html_format()) &&
         !IsClipboardFormatAvailable(rtf_format()) &&
-        !IsClipboardFormatAvailable(CF_DIB)) {
+        !dib_available && !png_available) {
         return ClipboardReadState::Empty;
     }
 
@@ -226,12 +254,72 @@ ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* 
         if (!read_text(data)) failed = true;
         else if (!data.empty() && !accepts(content, ClipboardFormat::Text, std::move(data))) failed = true;
     }
-    const UINT formats[] = {html_format(), rtf_format(), CF_DIB};
-    const ClipboardFormat kinds[] = {ClipboardFormat::Html, ClipboardFormat::Rtf, ClipboardFormat::Dib};
-    for (size_t i = 0; i < 3; ++i) {
+    const UINT formats[] = {html_format(), rtf_format()};
+    const ClipboardFormat kinds[] = {ClipboardFormat::Html, ClipboardFormat::Rtf};
+    for (size_t i = 0; i < 2; ++i) {
         if (!IsClipboardFormatAvailable(formats[i])) continue;
-        if (!read_bytes(formats[i], i == 2 ? kMaxClipboardImageBytes : kMaxClipboardMarkupBytes,
-                        i != 2, data) || !accepts(content, kinds[i], std::move(data))) failed = true;
+        if (!read_bytes(formats[i], kMaxClipboardMarkupBytes, true, data) ||
+            !accepts(content, kinds[i], std::move(data))) {
+            failed = true;
+        }
+    }
+
+    const auto valid_single = [](ClipboardFormat format,
+                                 const std::vector<uint8_t>& payload) {
+        ClipboardContent single;
+        ClipboardFormatData entry;
+        entry.format = format;
+        entry.data = payload;
+        single.formats.push_back(std::move(entry));
+        return valid_clipboard_content(single, nullptr);
+    };
+
+    std::vector<uint8_t> png_data;
+    bool have_png = false;
+    if (png_available) {
+        const UINT candidates[] = {png_format(), png_mime_format()};
+        for (UINT format : candidates) {
+            if (format == 0 || !IsClipboardFormatAvailable(format)) continue;
+            std::vector<uint8_t> candidate;
+            if (read_bytes(format, kMaxClipboardPngBytes, false, candidate) &&
+                valid_single(ClipboardFormat::Png, candidate)) {
+                png_data = std::move(candidate);
+                have_png = true;
+                break;
+            }
+        }
+    }
+
+    std::vector<uint8_t> dib_data;
+    bool have_dib = false;
+    if (dib_available &&
+        read_bytes(CF_DIB, kMaxClipboardDibSourceBytes, false, dib_data) &&
+        valid_clipboard_dib(dib_data, nullptr)) {
+        have_dib = true;
+    }
+    if (have_dib && !have_png) {
+        std::vector<uint8_t> converted;
+        if (!encode_dib_png(dib_data, converted, error)) {
+            // Keep the codec's detailed error for the caller.
+        } else if (converted.empty() || converted.size() > kMaxClipboardPngBytes) {
+            if (error) *error = "the converted clipboard PNG has an invalid size";
+        } else if (!valid_single(ClipboardFormat::Png, converted)) {
+            if (error) *error = "the converted clipboard PNG failed validation";
+        } else {
+            png_data = std::move(converted);
+            have_png = true;
+        }
+    }
+
+    // Images are alternative representations. A broken PNG must not hide a
+    // usable DIB, nor a large DIB that converted successfully. Append in
+    // format-id order because the CCLB container requires ascending ids.
+    if (have_dib && dib_data.size() <= kMaxClipboardImageBytes &&
+        !accepts(content, ClipboardFormat::Dib, std::move(dib_data))) {
+        have_dib = false;
+    }
+    if (have_png && !accepts(content, ClipboardFormat::Png, std::move(png_data))) {
+        have_png = false;
     }
     // A partially rendered item is not a valid baseline either: otherwise a
     // format that becomes readable later would look like a new local copy.
@@ -240,7 +328,15 @@ ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* 
         if (error) *error = "a clipboard format could not be read";
         return ClipboardReadState::Failed;
     }
-    if (content.formats.empty()) return ClipboardReadState::Empty;
+    if (content.formats.empty()) {
+        if (dib_available || png_available) {
+            if (error && error->empty()) {
+                *error = "the clipboard image could not be decoded";
+            }
+            return ClipboardReadState::Failed;
+        }
+        return ClipboardReadState::Empty;
+    }
     if (!valid_clipboard_content(content, error)) {
         content = ClipboardContent{};
         return ClipboardReadState::Failed;
@@ -262,23 +358,26 @@ bool write_clipboard(const ClipboardContent& content, std::string* error) {
         HGLOBAL handle = nullptr;
     };
     std::vector<Staged> staged;
-    staged.reserve(content.formats.size());
+    staged.reserve(content.formats.size() * 2);
     // Prepare every handle before EmptyClipboard(). A preparation failure must
     // leave the clipboard alone; once it is emptied nothing may fail.
     // Text goes in last: a paste target that knows none of the richer
     // formats should still find the plain fallback.
     for (auto it = content.formats.rbegin(); it != content.formats.rend(); ++it) {
-        const UINT format = win32_format(it->format);
-        HGLOBAL handle = nullptr;
-        if (format == CF_UNICODETEXT) {
-            handle = make_text(it->data);
-        } else if (format != 0) {
-            handle = make_global(it->data);
+        // PNG is exposed under both the de-facto "PNG" name and the MIME name.
+        // SetClipboardData transfers ownership, so every target format gets an
+        // independent HGLOBAL rather than sharing one handle.
+        for (UINT format : win32_formats(it->format)) {
+            HGLOBAL handle = nullptr;
+            if (format == CF_UNICODETEXT) {
+                handle = make_text(it->data);
+            } else if (format != 0) {
+                handle = make_global(it->data);
+            }
+            if (handle != nullptr) {
+                staged.push_back({format, handle});
+            }
         }
-        if (handle == nullptr) {
-            continue;
-        }
-        staged.push_back({format, handle});
     }
     auto release = [&staged] {
         for (const Staged& item : staged) {

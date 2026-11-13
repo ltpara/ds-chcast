@@ -1,9 +1,27 @@
 #include "capture/detail.h"
 
+#include <shellscalingapi.h>
+
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace chast {
+namespace {
+
+bool read_cursor_registry_dword(HKEY key, const wchar_t* subkey, const wchar_t* value,
+                                DWORD& result) {
+    DWORD bytes = sizeof(result);
+    return RegGetValueW(key, subkey, value, RRF_RT_REG_DWORD, nullptr, &result,
+                        &bytes) == ERROR_SUCCESS &&
+        bytes == sizeof(result);
+}
+
+// The capture API runs at per-monitor DPI awareness. CursorBaseSize is stored
+// DPI-independently, so the physical diameter must be resolved against this
+// output's monitor rather than the process or primary monitor.
+}  // namespace
+
 bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor) {
     CURSORINFO info{sizeof(info)};
     if (!GetCursorInfo(&info)) return false;
@@ -22,28 +40,34 @@ bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor) {
         } bitmaps{icon.hbmColor, icon.hbmMask};
         BITMAP size{};
         if (!GetObjectW(icon.hbmColor ? icon.hbmColor : icon.hbmMask, sizeof(size), &size)) return false;
-        const UINT width = size.bmWidth;
-        const UINT height = icon.hbmColor ? size.bmHeight : size.bmHeight / 2;
-        if (!width || !height || width > 510 || height > 510) return false;
+        const UINT source_width = size.bmWidth;
+        const UINT source_height = icon.hbmColor ? size.bmHeight : size.bmHeight / 2;
+        if (!source_width || !source_height || source_width > 2048 ||
+            source_height > 2048) {
+            return false;
+        }
         HDC dc = CreateCompatibleDC(nullptr);
         if (!dc) return false;
         BITMAPINFO format{};
-        format.bmiHeader = {sizeof(BITMAPINFOHEADER), static_cast<LONG>(width),
-            -static_cast<LONG>(height), 1, 32, BI_RGB};
+        format.bmiHeader = {sizeof(BITMAPINFOHEADER), static_cast<LONG>(source_width),
+            -static_cast<LONG>(source_height), 1, 32, BI_RGB};
         void* pixels = nullptr;
         HBITMAP dib = CreateDIBSection(dc, &format, DIB_RGB_COLORS, &pixels, nullptr, 0);
         if (!dib) { DeleteDC(dc); return false; }
         const auto previous = SelectObject(dc, dib);
-        const size_t bytes = static_cast<size_t>(width) * height * 4;
+        const size_t bytes = static_cast<size_t>(source_width) * source_height * 4;
         std::memset(pixels, 0, bytes);
-        const bool black_ok = DrawIconEx(dc, 0, 0, info.hCursor, width, height, 0, nullptr, DI_NORMAL) != FALSE;
+        const bool black_ok = DrawIconEx(dc, 0, 0, info.hCursor, source_width,
+                                        source_height, 0, nullptr, DI_NORMAL) != FALSE;
         GdiFlush();
         detail::CursorBitmap bitmap;
-        bitmap.width = width; bitmap.height = height;
+        bitmap.width = source_width;
+        bitmap.height = source_height;
         bitmap.color.assign(static_cast<uint8_t*>(pixels), static_cast<uint8_t*>(pixels) + bytes);
         bitmap.invert.resize(bytes / 4);
         std::memset(pixels, 255, bytes);
-        const bool white_ok = DrawIconEx(dc, 0, 0, info.hCursor, width, height, 0, nullptr, DI_NORMAL) != FALSE;
+        const bool white_ok = DrawIconEx(dc, 0, 0, info.hCursor, source_width,
+                                        source_height, 0, nullptr, DI_NORMAL) != FALSE;
         GdiFlush();
         const auto* white = static_cast<const uint8_t*>(pixels);
         for (size_t i = 0; i < bytes / 4; ++i) {
@@ -56,21 +80,27 @@ bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor) {
         }
         SelectObject(dc, previous); DeleteObject(dib); DeleteDC(dc);
         if (!black_ok || !white_ok) return false;
-        detail::CursorBitmap outlined;
-        if (detail::outline_cursor(bitmap, width, height, outlined)) {
-            bitmap = std::move(outlined);
-            next.origin_offset = {1, 1};
+
+        // GetIconInfo normally returns the cursor's base bitmap, not the size
+        // Windows displays after the accessibility slider or monitor DPI
+        // scaling. GetCursorInfo reports the hotspot in that source bitmap;
+        // the shared derivation scales both and adds any outline offset.
+        const POINT source_hotspot{static_cast<LONG>(icon.xHotspot),
+                                   static_cast<LONG>(icon.yHotspot)};
+        detail::CursorBitmap sprite;
+        if (!detail::derive_cursor_sprite(bitmap, source_hotspot,
+                                          detail::cursor_target_size(display), sprite,
+                                          next.hotspot, next.origin_offset)) {
+            return false;
         }
-        // GetCursorInfo reports the screen hotspot. Preserve that coordinate:
-        // viewers subtract the sprite hotspot (including the outline offset).
-        next.hotspot = {static_cast<LONG>(icon.xHotspot) + next.origin_offset.x,
-                        static_cast<LONG>(icon.yHotspot) + next.origin_offset.y};
+        bitmap = std::move(sprite);
         next.width = bitmap.width; next.height = bitmap.height; next.pitch = next.width * 4;
         next.bitmap = std::move(bitmap.color); next.invert = std::move(bitmap.invert);
         next.outlined = bitmap.outlined;
         next.shape_type = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
         next.shape_valid = true;
-        next.content_id = detail::cursor_content_id(next.width, next.height, next.hotspot, next.bitmap);
+        next.content_id = detail::cursor_content_id(
+            next.width, next.height, next.hotspot, next.bitmap, next.invert);
         detail::cursor_shape_cache().put(next);
     }
     next.revision = cursor.revision + (next.position.x != cursor.position.x ||
@@ -82,6 +112,36 @@ bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor) {
 } // namespace chast
 
 namespace chast::detail {
+
+UINT cursor_target_size(const DisplayInfo& display) {
+    DWORD base_size = 0;
+    DWORD accessibility_size = 0;
+    const bool have_base = read_cursor_registry_dword(
+        HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"CursorBaseSize", base_size);
+    const bool have_accessibility = read_cursor_registry_dword(
+        HKEY_CURRENT_USER, L"Software\\Microsoft\\Accessibility", L"CursorSize",
+        accessibility_size);
+    const UINT base = cursor_diameter_from_settings(
+        have_base ? base_size : 0, have_accessibility ? accessibility_size : 0);
+    if (base == 0) {
+        return 0;
+    }
+
+    HMONITOR monitor = display.monitor;
+    if (monitor == nullptr) {
+        RECT rect{display.rect.left, display.rect.top, display.rect.right,
+                  display.rect.bottom};
+        monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    }
+    UINT dpi_x = 96;
+    UINT dpi_y = 96;
+    if (monitor == nullptr ||
+        FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y)) ||
+        dpi_x == 0) {
+        dpi_x = 96;
+    }
+    return cursor_size_at_dpi(base, dpi_x);
+}
 
 // Pointer decoding. DXGI reports pointer shapes in three formats whose alpha
 // handling differs, so each is normalized here into one of two forms the
@@ -258,8 +318,162 @@ bool pointer_shape_valid(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shape, UINT data
     return width <= static_cast<uint64_t>(max_bytes) / 4u / decoded_height;
 }
 
+UINT cursor_diameter_from_settings(UINT cursor_base_size, UINT accessibility_size) {
+    UINT diameter = 0;
+    if (cursor_base_size >= 32 && cursor_base_size <= 256) {
+        diameter = cursor_base_size;
+    }
+    if (accessibility_size >= 1 && accessibility_size <= 15) {
+        diameter = std::max<UINT>(diameter, 32u + (accessibility_size - 1u) * 16u);
+    }
+    return diameter;
+}
+
+UINT cursor_size_at_dpi(UINT base_diameter, UINT dpi) {
+    if (base_diameter == 0) {
+        return 0;
+    }
+    if (dpi == 0) {
+        dpi = 96;
+    }
+    const uint64_t scaled = (static_cast<uint64_t>(base_diameter) * dpi + 48u) / 96u;
+    return static_cast<UINT>(std::clamp<uint64_t>(
+        scaled, 1u, static_cast<uint64_t>(kMaxCursorSourceSize)));
+}
+
+void fit_cursor_dimensions(UINT source_width, UINT source_height,
+                           UINT target_diameter, UINT& width, UINT& height) {
+    width = source_width;
+    height = source_height;
+    if (source_width == 0 || source_height == 0 || target_diameter == 0) {
+        return;
+    }
+    const UINT longest = std::max<UINT>(source_width, source_height);
+    const UINT target = std::min<UINT>(target_diameter, kMaxCursorSourceSize);
+    const uint64_t scaled_width =
+        (static_cast<uint64_t>(source_width) * target + longest / 2u) / longest;
+    const uint64_t scaled_height =
+        (static_cast<uint64_t>(source_height) * target + longest / 2u) / longest;
+    width = static_cast<UINT>(std::clamp<uint64_t>(scaled_width, 1u, target));
+    height = static_cast<UINT>(std::clamp<uint64_t>(scaled_height, 1u, target));
+}
+
+POINT scale_cursor_hotspot(POINT hotspot, UINT source_width, UINT source_height,
+                           UINT width, UINT height) {
+    if (source_width == 0 || source_height == 0 || width == 0 || height == 0) {
+        return hotspot;
+    }
+    auto scale_axis = [](LONG value, UINT source, UINT target) {
+        if (value <= 0) {
+            return LONG{0};
+        }
+        const uint64_t scaled =
+            (static_cast<uint64_t>(value) * target + source / 2u) / source;
+        return static_cast<LONG>(std::min<uint64_t>(scaled, target - 1u));
+    };
+    return POINT{scale_axis(hotspot.x, source_width, width),
+                 scale_axis(hotspot.y, source_height, height)};
+}
+
+bool scale_cursor_bitmap(const CursorBitmap& bitmap, UINT width, UINT height,
+                         CursorBitmap& out) {
+    if (width == 0 || height == 0 || bitmap.width == 0 || bitmap.height == 0 ||
+        bitmap.color.size() < static_cast<size_t>(bitmap.width) * bitmap.height * 4u ||
+        (!bitmap.invert.empty() &&
+         bitmap.invert.size() < static_cast<size_t>(bitmap.width) * bitmap.height)) {
+        return false;
+    }
+    if (width == bitmap.width && height == bitmap.height) {
+        out = bitmap;
+        return true;
+    }
+
+    out.width = width;
+    out.height = height;
+    out.color.resize(static_cast<size_t>(width) * height * 4u);
+    out.invert.resize(static_cast<size_t>(width) * height);
+    out.outlined = bitmap.outlined;
+    const double scale_x = static_cast<double>(bitmap.width) / width;
+    const double scale_y = static_cast<double>(bitmap.height) / height;
+
+    for (UINT y = 0; y < height; ++y) {
+        const double sy = std::clamp((y + 0.5) * scale_y - 0.5, 0.0,
+                                     static_cast<double>(bitmap.height - 1u));
+        const UINT y0 = static_cast<UINT>(std::floor(sy));
+        const UINT y1 = std::min<UINT>(y0 + 1u, bitmap.height - 1u);
+        const double fy = sy - y0;
+        const UINT invert_y = std::min<UINT>(
+            static_cast<UINT>((y + 0.5) * scale_y), bitmap.height - 1u);
+        for (UINT x = 0; x < width; ++x) {
+            const double sx = std::clamp((x + 0.5) * scale_x - 0.5, 0.0,
+                                         static_cast<double>(bitmap.width - 1u));
+            const UINT x0 = static_cast<UINT>(std::floor(sx));
+            const UINT x1 = std::min<UINT>(x0 + 1u, bitmap.width - 1u);
+            const double fx = sx - x0;
+            const double weights[4] = {
+                (1.0 - fx) * (1.0 - fy), fx * (1.0 - fy),
+                (1.0 - fx) * fy, fx * fy,
+            };
+            const UINT xs[4] = {x0, x1, x0, x1};
+            const UINT ys[4] = {y0, y0, y1, y1};
+            uint8_t* dst = out.color.data() + (static_cast<size_t>(y) * width + x) * 4u;
+            for (size_t channel = 0; channel < 4; ++channel) {
+                double value = 0.0;
+                for (size_t sample = 0; sample < 4; ++sample) {
+                    const size_t source_index =
+                        (static_cast<size_t>(ys[sample]) * bitmap.width + xs[sample]) * 4u;
+                    value += bitmap.color[source_index + channel] * weights[sample];
+                }
+                dst[channel] = static_cast<uint8_t>(std::clamp(
+                    std::lround(value), 0l, 255l));
+            }
+            const UINT invert_x = std::min<UINT>(
+                static_cast<UINT>((x + 0.5) * scale_x), bitmap.width - 1u);
+            out.invert[static_cast<size_t>(y) * width + x] =
+                bitmap.invert.empty()
+                    ? 0
+                    : bitmap.invert[static_cast<size_t>(invert_y) * bitmap.width + invert_x];
+        }
+    }
+    return true;
+}
+
+bool derive_cursor_sprite(const CursorBitmap& decoded, POINT source_hotspot,
+                          UINT target_diameter, CursorBitmap& sprite,
+                          POINT& hotspot, POINT& origin_offset) {
+    if (decoded.width == 0 || decoded.height == 0 ||
+        decoded.color.size() < static_cast<size_t>(decoded.width) * decoded.height * 4u) {
+        return false;
+    }
+
+    CursorBitmap scaled;
+    UINT width = decoded.width;
+    UINT height = decoded.height;
+    fit_cursor_dimensions(decoded.width, decoded.height, target_diameter, width, height);
+    if ((width != decoded.width || height != decoded.height) &&
+        !scale_cursor_bitmap(decoded, width, height, scaled)) {
+        return false;
+    }
+    const CursorBitmap& source = scaled.color.empty() ? decoded : scaled;
+
+    CursorBitmap outlined;
+    if (outline_cursor(source, source.width, source.height, outlined)) {
+        sprite = std::move(outlined);
+        origin_offset = POINT{1, 1};
+    } else {
+        sprite = source;
+        origin_offset = POINT{0, 0};
+    }
+    const POINT scaled_hotspot = scale_cursor_hotspot(
+        source_hotspot, decoded.width, decoded.height, source.width, source.height);
+    hotspot = POINT{scaled_hotspot.x + origin_offset.x,
+                    scaled_hotspot.y + origin_offset.y};
+    return true;
+}
+
 uint64_t cursor_content_id(UINT width, UINT height, POINT hotspot,
-                           const std::vector<uint8_t>& color) {
+                           const std::vector<uint8_t>& color,
+                           const std::vector<uint8_t>& invert) {
     uint64_t hash = 0xCBF29CE484222325ull;  // FNV-1a offset basis
     hash = mix(hash, width);
     hash = mix(hash, height);
@@ -283,6 +497,21 @@ uint64_t cursor_content_id(UINT width, UINT height, POINT hotspot,
     std::memcpy(&tail, bytes + blocks * sizeof(uint64_t), color.size() % sizeof(uint64_t));
     hash = mix(hash, tail);
     hash = mix(hash, color.size());
+    // The same colour bytes with a different inversion mask are not the same
+    // sprite: consumers composite the masked pixels with DST_INVERT.
+    hash = mix(hash, invert.size());
+    const size_t invert_blocks = invert.size() / sizeof(uint64_t);
+    for (size_t i = 0; i < invert_blocks; ++i) {
+        uint64_t word = 0;
+        std::memcpy(&word, invert.data() + i * sizeof(uint64_t), sizeof(word));
+        hash = mix(hash, word);
+    }
+    uint64_t invert_tail = 0;
+    if (!invert.empty()) {
+        std::memcpy(&invert_tail, invert.data() + invert_blocks * sizeof(uint64_t),
+                    invert.size() % sizeof(uint64_t));
+    }
+    hash = mix(hash, invert_tail);
     // 53 bits: survives a JavaScript number, which RustDesk's web client needs.
     return hash & ((1ull << 53) - 1);
 }
@@ -367,6 +596,35 @@ void CursorDecoder::update_position(const POINT& position, bool visible) {
     visible_ = visible;
 }
 
+void CursorDecoder::set_target_size(UINT diameter) {
+    if (target_size_ == diameter) {
+        return;
+    }
+    target_size_ = diameter;
+    if (decoded_.width != 0 && decoded_.height != 0) {
+        derive_sprite();
+        revision_++;
+    }
+}
+
+void CursorDecoder::derive_sprite() {
+    if (decoded_.width == 0 || decoded_.height == 0) {
+        return;
+    }
+
+    // DXGI's HotSpot is relative to the unscaled shape it returned. Scale it
+    // with the sprite, then add the outline offset introduced above.
+    const POINT source_hotspot{static_cast<LONG>(shape_.HotSpot.x),
+                               static_cast<LONG>(shape_.HotSpot.y)};
+    if (!derive_cursor_sprite(decoded_, source_hotspot, target_size_, bitmap_, hotspot_,
+                              origin_offset_)) {
+        clear_shape();
+        return;
+    }
+    content_id_ = cursor_content_id(bitmap_.width, bitmap_.height, hotspot_, bitmap_.color,
+                                    bitmap_.invert);
+}
+
 void CursorDecoder::update_shape(IDXGIOutputDuplication* duplication) {
     if (!duplication) {
         return;
@@ -434,29 +692,19 @@ void CursorDecoder::update_shape(IDXGIOutputDuplication* duplication) {
             return;
     }
 
-    // DXGI places the shape's top-left at the pointer position; outlining
-    // wrapped it in a ring, so the sprite's own origin is one pixel up-left.
-    CursorBitmap outlined;
-    const bool applied = outline_cursor(decoded, actual.Width, actual.Height, outlined);
-    if (applied) {
-        bitmap_ = std::move(outlined);
-        origin_offset_ = POINT{1, 1};
-    } else {
-        bitmap_ = std::move(decoded);
-        origin_offset_ = POINT{0, 0};
-    }
-    // DXGI's HotSpot is relative to the shape it returned. The sprite carries
-    // an extra ring pixel after outlining, so the hotspot moves with it.
-    hotspot_ = POINT{static_cast<LONG>(actual.HotSpot.x) + origin_offset_.x,
-                     static_cast<LONG>(actual.HotSpot.y) + origin_offset_.y};
-    content_id_ = cursor_content_id(bitmap_.width, bitmap_.height, hotspot_, bitmap_.color);
+    // Keep the unscaled DXGI decode. Accessibility size and DPI can change
+    // while the driver reports that the shape itself is unchanged; deriving
+    // the published sprite from this cache lets that update still take effect.
     shape_ = actual;
+    decoded_ = std::move(decoded);
+    derive_sprite();
     revision_++;
 }
 
 void CursorDecoder::clear_shape() {
     const bool had_shape = has_shape();
     shape_ = {};
+    decoded_ = {};
     bitmap_.width = 0;
     bitmap_.height = 0;
     bitmap_.color.clear();

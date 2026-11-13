@@ -443,7 +443,7 @@ bool create_receive_directory(const std::string& root, const std::string& relati
                               std::string* error) {
     std::string safe;
     if (relative.empty() || !sanitize_received_directory(relative, safe) || safe != relative) {
-        if (error) *error = "the clipboard directory path is not usable";
+        if (error) *error = "the receive directory path is not usable";
         return false;
     }
     const auto directory = absolute_path(utf8_to_wide(root));
@@ -451,7 +451,7 @@ bool create_receive_directory(const std::string& root, const std::string& relati
         GetFileAttributesW(long_path(directory).c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        if (error) *error = "the clipboard staging root is not a plain directory";
+        if (error) *error = "the receive root is not a plain directory";
         return false;
     }
     std::wstring created;

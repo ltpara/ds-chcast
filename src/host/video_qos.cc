@@ -151,11 +151,22 @@ void VideoQos::Delay::on_reduction(uint32_t current) {
 }
 
 bool VideoQos::Delay::needs_bitrate_reduction() const {
-    return consecutive_bad >= 2 || stall_ticks >= 2;
+    // An outstanding video receipt is not probe jitter: it is application
+    // delay already visible to the viewer. Waiting for a second tick past two
+    // seconds lets the delivery window grow beyond the three-second latency
+    // budget before the first rate cut. A single sub-two-second probe remains
+    // jitter and never reaches this path.
+    return consecutive_bad >= 2 || stall_ticks >= 1;
 }
 
 std::optional<float> VideoQos::Delay::ratio_reduction() const {
     if (!needs_bitrate_reduction()) return std::nullopt;
+    // A delivery stall beyond two seconds is direct evidence that the current
+    // target cannot drain the transport queue. An ordinary "unconfirmed"
+    // 0.8 step leaves a 3 Mbps stream above a 1 Mbps bottleneck and produces
+    // another multi-second backlog. Cut hard enough for the confirmed stall
+    // while retaining the configured quality floor.
+    if (stall_ticks) return 0.3f;
     const auto excess = average();
     const bool confirmed = consecutive_bad >= 3;
     if (excess < 200) return 0.95f;
@@ -385,6 +396,10 @@ void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
     fps = std::min(fps, current);
     delay.fps = fps;
     adjust_fps(now);
+    // The periodic ratio tick has a three-second cooldown. An active delivery
+    // stall cannot spend that budget before its first congestion action: apply
+    // one bounded reduction as soon as the receipt is beyond two seconds.
+    if (now - last_ratio_ >= 1000) adjust_ratio(false, now);
 }
 void VideoQos::adjust_ratio(bool dynamic, uint64_t now) {
     if (!variable() || users_.empty()) return;

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "chast/audio.h"
+#include "chast/annotation_overlay.h"
 #include "chast/audit_spool.h"
 #include "chast/camera_relay.h"
 #include "chast/clipboard_listener.h"
@@ -3025,6 +3026,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // the failure is logged once and never blocks the session.
     std::unique_ptr<CursorHintOverlay> cursor_overlay;
     bool cursor_overlay_failed = false;
+    // Freehand ink is also session-only. The overlay owns the layered windows
+    // and destroys them on every return path, so leaving the session always
+    // restores the operator's desktop without a separate cleanup request.
+    std::unique_ptr<AnnotationOverlay> annotation_overlay;
+    bool annotation_overlay_failed = false;
     // Assigned with the capture-rebuild helpers below: restoring a virtual
     // display topology must wait for GPU capture to work again, and those
     // helpers need the pointer state declared later in this function. The
@@ -5937,6 +5943,32 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 }
             }
         }
+        AnnotationMessage annotation;
+        while (session_->take_annotation(annotation)) {
+            touch_viewer_activity();
+            if (!annotation_overlay &&
+                (annotation.action == AnnotationAction::Clear ||
+                 annotation.action == AnnotationAction::Undo)) {
+                continue;
+            }
+            if (!annotation_overlay && !annotation_overlay_failed) {
+                std::string overlay_error;
+                annotation_overlay =
+                    AnnotationOverlay::create(&overlay_error, pending_security_.device_name);
+                if (!annotation_overlay) {
+                    annotation_overlay_failed = true;
+                    log("freehand annotations are unavailable: " + overlay_error);
+                }
+            }
+            if (annotation_overlay) {
+                std::string overlay_error;
+                if (!annotation_overlay->apply(annotation, &overlay_error)) {
+                    annotation_overlay.reset();
+                    annotation_overlay_failed = true;
+                    log("freehand annotation overlay failed: " + overlay_error);
+                }
+            }
+        }
         uint16_t switch_index = kDisplayAuto;
         if (session_->take_display_switch_request(switch_index)) {
             touch_viewer_activity();
@@ -6748,6 +6780,61 @@ void HostServer::drain_file_offers(HostServerStats& stats) {
             continue;
         }
         if (!file_transfer_allowed()) {
+            continue;
+        }
+        if (offer.directory) {
+            // Protocol v74: a folder is a metadata-only offer. Create its
+            // parent chain idempotently, then close the transfer immediately;
+            // no CFIL stream or FileReceiver belongs to this entry.
+            if (file_receive_directory_.empty()) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(offer.transfer_id, FileCode::Refused, 0,
+                                                 "the host has no receive directory");
+                log("file: refused folder " + offer.name +
+                    ": no receive directory is configured");
+                continue;
+            }
+            std::string upload_root = file_receive_directory_;
+            std::string upload_relative = offer.relative_path;
+            if (!file_shares_.empty() && !offer.relative_path.empty()) {
+                std::string split_error;
+                const FileCode split =
+                    split_file_share_path(file_shares_, file_receive_directory_,
+                                          offer.relative_path, upload_root, upload_relative,
+                                          split_error);
+                if (split != FileCode::Ok) {
+                    ++stats.file_failures;
+                    (void)session_->send_file_answer(offer.transfer_id, split, 0, split_error);
+                    log("file: refused folder " + offer.name + ": " + split_error);
+                    continue;
+                }
+            }
+            const std::string folder_name = sanitize_received_name(offer.name);
+            const std::string directory_relative =
+                make_offer_relative_path(upload_relative, folder_name);
+            std::string create_error;
+            if (!create_receive_directory(upload_root, directory_relative, &create_error)) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(offer.transfer_id, FileCode::Refused, 0,
+                                                 create_error);
+                log("file: refused folder " + offer.name + ": " + create_error);
+                continue;
+            }
+            const Error answered =
+                session_->send_file_answer(offer.transfer_id, FileCode::Ok, 0);
+            if (!answered.ok()) {
+                ++stats.file_failures;
+                log("file: cannot accept folder " + directory_relative + ": " +
+                    answered.to_string());
+                continue;
+            }
+            const Error completed =
+                session_->send_file_result(offer.transfer_id, FileCode::Ok, 0);
+            if (!completed.ok()) {
+                log("file: cannot report folder " + directory_relative + ": " +
+                    completed.to_string());
+            }
+            log("file: created directory " + directory_relative);
             continue;
         }
         if (upload_ || held_upload_) {

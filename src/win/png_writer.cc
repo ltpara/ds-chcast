@@ -7,6 +7,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -36,7 +37,11 @@ std::wstring widen(const std::string& text) {
 }
 
 std::string fail(const char* what, HRESULT hr) {
-    return std::string(what) + " failed: " + hresult_message(hr);
+    // Keep this library independent of com.cc: clipboard-only binaries should
+    // not pull in the DXGI helper library just to format an HRESULT.
+    char code[16];
+    std::snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned>(hr));
+    return std::string(what) + " failed: " + code;
 }
 
 void set_error(std::string* error, std::string message) {
@@ -284,6 +289,245 @@ bool encode_png_bgra(const uint8_t* pixels, uint32_t width, uint32_t height,
     if (FAILED(hr) || read != png.size()) {
         png.clear();
         set_error(error, fail("reading the PNG bytes", hr));
+        return false;
+    }
+    return true;
+}
+
+bool encode_dib_png(const std::vector<uint8_t>& dib, std::vector<uint8_t>& png,
+                    std::string* error) {
+    png.clear();
+    constexpr size_t kBitmapFileHeaderSize = 14;
+    if (dib.size() < 12 || dib.size() > 160u * 1024u * 1024u ||
+        dib.size() > UINT_MAX - kBitmapFileHeaderSize) {
+        set_error(error, "invalid DIB memory buffer");
+        return false;
+    }
+    const auto read_u32 = [&dib](size_t offset) {
+        return static_cast<uint32_t>(dib[offset]) |
+               (static_cast<uint32_t>(dib[offset + 1]) << 8) |
+               (static_cast<uint32_t>(dib[offset + 2]) << 16) |
+               (static_cast<uint32_t>(dib[offset + 3]) << 24);
+    };
+    const uint32_t header_size = read_u32(0);
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool top_down = false;
+    uint32_t bit_count = 0;
+    uint32_t compression = 0;
+    uint32_t colors_used = 0;
+    uint32_t palette_entry_bytes = 4;
+    if (header_size == 12) {
+        width = static_cast<uint32_t>(dib[4]) |
+                (static_cast<uint32_t>(dib[5]) << 8);
+        height = static_cast<uint32_t>(dib[6]) |
+                 (static_cast<uint32_t>(dib[7]) << 8);
+        bit_count = static_cast<uint32_t>(dib[10]) |
+                    (static_cast<uint32_t>(dib[11]) << 8);
+        palette_entry_bytes = 3;
+    } else if (header_size == 40 || header_size == 52 || header_size == 56 ||
+               header_size == 64 || header_size == 108 || header_size == 124) {
+        if (dib.size() < 40) {
+            set_error(error, "DIB memory buffer is shorter than its header");
+            return false;
+        }
+        width = read_u32(4);
+        const int32_t signed_height = static_cast<int32_t>(read_u32(8));
+        if (read_u32(8) == 0x80000000u) {
+            set_error(error, "DIB memory buffer has an invalid height");
+            return false;
+        }
+        top_down = signed_height < 0;
+        height = static_cast<uint32_t>(top_down ? -signed_height : signed_height);
+        bit_count = static_cast<uint32_t>(dib[14]) |
+                    (static_cast<uint32_t>(dib[15]) << 8);
+        compression = read_u32(16);
+        if (header_size >= 40) {
+            colors_used = read_u32(32);
+        }
+    } else {
+        set_error(error, "DIB memory buffer has an unknown header");
+        return false;
+    }
+    if (dib.size() < header_size) {
+        set_error(error, "DIB memory buffer is shorter than its header");
+        return false;
+    }
+    constexpr uint64_t kMaxDibDimension = 8192;
+    constexpr uint64_t kMaxDecodedPixels = 64ull * 1024ull * 1024ull;
+    const uint64_t pixel_count = static_cast<uint64_t>(width) * height;
+    if (width == 0 || height == 0 || width > kMaxDibDimension ||
+        height > kMaxDibDimension || pixel_count == 0 ||
+        pixel_count > kMaxDecodedPixels) {
+        set_error(error, "DIB memory buffer has an unusable size");
+        return false;
+    }
+    uint64_t mask_bytes = 0;
+    if (compression == 3 && (header_size == 40 || header_size == 64)) {
+        mask_bytes = 12;
+    }
+    uint64_t palette_bytes = 0;
+    if (compression <= 3) {
+        uint64_t entries = colors_used;
+        if (entries == 0 && bit_count > 0 && bit_count <= 8) {
+            entries = uint64_t{1} << bit_count;
+        }
+        if (entries > 256) {
+            set_error(error, "DIB memory buffer has an invalid color table");
+            return false;
+        }
+        palette_bytes = entries * palette_entry_bytes;
+    }
+    const uint64_t dib_pixel_offset = header_size + mask_bytes + palette_bytes;
+    const uint64_t pixel_offset = kBitmapFileHeaderSize + dib_pixel_offset;
+    if (dib_pixel_offset > dib.size()) {
+        set_error(error, "DIB memory buffer is shorter than its color table");
+        return false;
+    }
+
+    std::vector<uint8_t> pixels;
+    const bool direct_bgr = bit_count == 24 || bit_count == 32;
+    if (compression == 0 && direct_bgr) {
+        const uint64_t stride = ((static_cast<uint64_t>(width) * bit_count + 31) / 32) * 4;
+        if (stride == 0 || stride > dib.size() ||
+            height > (dib.size() - dib_pixel_offset) / stride) {
+            set_error(error, "DIB memory buffer is shorter than its pixel data");
+            return false;
+        }
+        pixels.resize(static_cast<size_t>(pixel_count) * 4);
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint32_t source_y = top_down ? y : height - 1 - y;
+            const uint8_t* source = dib.data() + dib_pixel_offset + stride * source_y;
+            uint8_t* destination = pixels.data() + static_cast<size_t>(y) * width * 4;
+            for (uint32_t x = 0; x < width; ++x) {
+                uint8_t* output = destination + static_cast<size_t>(x) * 4;
+                const size_t bytes = bit_count / 8;
+                std::memcpy(output, source + static_cast<size_t>(x) * bytes, bytes);
+                output[3] = 0xFF;
+            }
+        }
+    } else {
+        // WIC is the general BMP decoder, but its current Windows build rejects
+        // large top-down DIBs with WINCODEC_ERR_BADIMAGE. Common clipboard DIBs
+        // are uncompressed BGRA/BGR, so decode those directly above and retain
+        // WIC for bitfields, RLE and embedded JPEG/PNG payloads.
+        std::vector<uint8_t> bmp(kBitmapFileHeaderSize + dib.size(), 0);
+        bmp[0] = 'B';
+        bmp[1] = 'M';
+        const uint32_t file_size = static_cast<uint32_t>(bmp.size());
+        const uint32_t offset = static_cast<uint32_t>(pixel_offset);
+        for (int i = 0; i < 4; ++i) {
+            bmp[2 + i] = static_cast<uint8_t>(file_size >> (8 * i));
+            bmp[10 + i] = static_cast<uint8_t>(offset >> (8 * i));
+        }
+        std::memcpy(bmp.data() + kBitmapFileHeaderSize, dib.data(), dib.size());
+
+        if (!decode_png_bgra(bmp.data(), bmp.size(), width, height, pixels, error)) {
+            // decode_png_bgra() names the exact WIC stage and HRESULT. Preserve it
+            // so clipboard diagnostics can distinguish stream, header and pixel
+            // failures instead of collapsing them into a generic message.
+            if (error != nullptr && error->empty()) {
+                *error = "the DIB could not be decoded";
+            }
+            return false;
+        }
+    }
+    if (!encode_png_bgra(pixels.data(), width, height, width * 4, png, error)) {
+        png.clear();
+        return false;
+    }
+    return true;
+}
+
+bool decode_png_bgra(const uint8_t* data, size_t size, uint32_t& width,
+                     uint32_t& height, std::vector<uint8_t>& pixels,
+                     std::string* error) {
+    width = 0;
+    height = 0;
+    pixels.clear();
+    if (data == nullptr || size == 0 || size > static_cast<size_t>(ULONG_MAX)) {
+        set_error(error, "invalid PNG memory buffer");
+        return false;
+    }
+
+    ComScope com;
+    if (!com.ok()) {
+        set_error(error, fail("COM initialisation", com.error()));
+        return false;
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.put()));
+    if (FAILED(hr) || !factory) {
+        set_error(error, fail("WIC factory creation", hr));
+        return false;
+    }
+
+    ComPtr<IStream> memory;
+    hr = CreateStreamOnHGlobal(nullptr, TRUE, memory.put());
+    ULONG written = 0;
+    if (SUCCEEDED(hr)) {
+        hr = memory->Write(data, static_cast<ULONG>(size), &written);
+    }
+    if (SUCCEEDED(hr) && static_cast<size_t>(written) != size) {
+        hr = HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    }
+    LARGE_INTEGER begin{};
+    if (SUCCEEDED(hr)) {
+        hr = memory->Seek(begin, STREAM_SEEK_SET, nullptr);
+    }
+    ComPtr<IWICStream> stream;
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateStream(stream.put());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = stream->InitializeFromIStream(memory.get());
+    }
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateDecoderFromStream(stream.get(), nullptr,
+                                              WICDecodeMetadataCacheOnLoad,
+                                              decoder.put());
+    }
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (SUCCEEDED(hr)) {
+        hr = decoder->GetFrame(0, frame.put());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = frame->GetSize(&width, &height);
+    }
+    constexpr uint64_t kMaxDecodedPixels = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t kMaxDecodedBytes = static_cast<uint64_t>(UINT_MAX);
+    const uint64_t count = static_cast<uint64_t>(width) * height;
+    if (SUCCEEDED(hr) && (count == 0 || count > kMaxDecodedPixels ||
+                          count * 4 > kMaxDecodedBytes ||
+                          static_cast<uint64_t>(width) * 4 > UINT_MAX)) {
+        hr = WINCODEC_ERR_BADIMAGE;
+    }
+    ComPtr<IWICFormatConverter> converter;
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateFormatConverter(converter.put());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = converter->Initialize(frame.get(), GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+    }
+    if (FAILED(hr)) {
+        width = 0;
+        height = 0;
+        set_error(error, fail("reading the PNG", hr));
+        return false;
+    }
+    pixels.resize(static_cast<size_t>(count) * 4);
+    hr = converter->CopyPixels(nullptr, width * 4,
+                               static_cast<UINT>(pixels.size()), pixels.data());
+    if (FAILED(hr)) {
+        width = 0;
+        height = 0;
+        pixels.clear();
+        set_error(error, fail("reading the PNG pixels", hr));
         return false;
     }
     return true;

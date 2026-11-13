@@ -2,7 +2,7 @@
 
 // Multi-format clipboard content, its wire container, and the Win32 backend.
 //
-// A copied item carries whichever of text, HTML, RTF and DIB the source
+// A copied item carries whichever of text, HTML, RTF, DIB and PNG the source
 // application published. One CCLB stream carries the whole set; the receiver
 // writes every format back to its own clipboard in one ownership change, so a
 // paste target can pick the richest one it understands.
@@ -31,23 +31,35 @@ enum class ClipboardFormat : uint8_t {
     Rtf = 2,       // "Rich Text Format", ASCII/UTF-8
     Dib = 3,       // CF_DIB bytes: BITMAPINFOHEADER + palette + pixels
     FileList = 4,  // cf. ClipboardFileEntry below; never carries bytes
+    Png = 5,       // Complete PNG file; v75, preferred for large images
 };
 
-inline constexpr uint8_t kMaxClipboardFormats = 5;
+inline constexpr uint8_t kMaxClipboardFormats = 6;
 // Text travels on the CCLB stream outside the control queue, so the legacy
 // 256 KiB ClipboardUpdate limit (kMaxClipboardBytes) no longer applies to a
 // rich item; text gets the same budget as HTML/RTF.
 inline constexpr uint32_t kMaxClipboardTextBytes = 4u * 1024u * 1024u;
 inline constexpr uint32_t kMaxClipboardMarkupBytes = 4u * 1024u * 1024u;
+// DIB remains the broadly compatible fallback. PNG takes the larger image
+// budget and is also produced from a DIB that cannot travel inside this cap.
 inline constexpr uint32_t kMaxClipboardImageBytes = 32u * 1024u * 1024u;
-inline constexpr uint32_t kMaxClipboardTotalBytes = 40u * 1024u * 1024u;
+// Local DIB input may be larger so a screenshot can be converted before it
+// enters the stream. It is never sent at this size.
+inline constexpr uint32_t kMaxClipboardDibSourceBytes = 160u * 1024u * 1024u;
+inline constexpr uint32_t kMaxClipboardPngBytes = 64u * 1024u * 1024u;
+inline constexpr uint32_t kMaxClipboardPngDimension = 16384;
+inline constexpr uint64_t kMaxClipboardPngPixels = 64ull * 1024ull * 1024ull;
+// Text (4), HTML (4), RTF (4), DIB (32), PNG (64) and FileList (64 KiB).
+// Keep room for every valid format even when an item carries both images.
+inline constexpr uint32_t kMaxClipboardTotalBytes = 112u * 1024u * 1024u;
 inline constexpr uint32_t kMaxClipboardFileListBytes = 64u * 1024u;
 inline constexpr uint16_t kMaxClipboardFileEntries = 256;
 
 inline constexpr char kClipboardStreamMagic[4] = {'C', 'C', 'L', 'B'};
-// v3 (protocol v69): per-entry zstd compression. Older peers are refused by
-// the Hello version check, so no v2 fallback is needed on the stream.
-inline constexpr uint8_t kClipboardStreamVersion = 3;
+// v4 (protocol v75): adds ClipboardFormat::Png. Per-entry zstd compression was
+// introduced in stream v3. The Hello version gate makes old CCLB versions
+// unreachable, so the stream codec has no down-version fallback.
+inline constexpr uint8_t kClipboardStreamVersion = 4;
 // magic (4) + version (1) + format count (1) + reserved (2) + hash (8) +
 // total raw payload length (8) + sender generation (8, v59).
 inline constexpr size_t kClipboardStreamHeaderSize = 32;
@@ -122,10 +134,13 @@ bool collect_clipboard_files(const std::vector<std::string>& top_level_paths,
 uint64_t clipboard_content_hash(const ClipboardContent& content);
 
 // Structural and limit checks shared by the encoder and both receivers:
-// at most four formats, strictly ascending ids, per-format caps, total at or
+// at most six formats, strictly ascending ids, per-format caps, total at or
 // below kMaxClipboardTotalBytes, Text valid UTF-8 without NUL, HTML valid
 // UTF-8, RTF starting with "{\rtf" and DIB carrying a known header size.
 bool valid_clipboard_content(const ClipboardContent& content, std::string* error);
+// Validates a CF_DIB payload independently of the wire size cap. The Windows
+// clipboard reader uses this before converting an oversized local DIB to PNG.
+bool valid_clipboard_dib(const std::vector<uint8_t>& data, std::string* error);
 
 // Full CCLB stream bytes, magic included. Returns an empty vector when the
 // content is invalid; entries are written in ascending format order and the

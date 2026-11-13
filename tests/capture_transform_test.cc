@@ -429,11 +429,42 @@ void test_nv12_scale(ID3D11Device* device, ID3D11DeviceContext* context) {
           "NV12 pass separates the image size from the aligned surface");
 }
 
+void test_cpu_frame_pool() {
+    chast::detail::CpuFramePool pool(2);
+    const uint8_t first_pixels[] = {1, 2, 3, 4};
+    const uint8_t second_pixels[] = {5, 6, 7, 8};
+    const uint8_t third_pixels[] = {9, 10, 11, 12};
+    const uint8_t fourth_pixels[] = {13, 14, 15, 16};
+
+    auto first = pool.copy(first_pixels, sizeof(first_pixels));
+    const uint8_t* first_storage = first->data();
+    auto second = pool.copy(second_pixels, sizeof(second_pixels));
+    check(second->data() != first_storage &&
+              std::memcmp(first->data(), first_pixels, sizeof(first_pixels)) == 0,
+          "a retained CPU frame is never overwritten by the next capture");
+    check(pool.cached_buffers() == 2 && pool.reusable_buffers() == 0,
+          "the CPU frame pool does not recycle retained surfaces");
+
+    first.reset();
+    check(pool.reusable_buffers() == 1,
+          "a released CPU frame becomes reusable");
+    auto third = pool.copy(third_pixels, sizeof(third_pixels));
+    check(third->data() == first_storage &&
+              std::memcmp(third->data(), third_pixels, sizeof(third_pixels)) == 0,
+          "a released CPU frame reuses its allocation");
+
+    auto fourth = pool.copy(fourth_pixels, sizeof(fourth_pixels));
+    check(fourth->data() != second->data() && fourth->data() != third->data() &&
+              pool.cached_buffers() == 2,
+          "a bounded pool falls back to a transient frame when all slots are retained");
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_cpu_rotation();
+    test_cpu_frame_pool();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     if (!create_device(&device, &context)) {

@@ -51,6 +51,10 @@ constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
 constexpr size_t kMaxPendingVideoFrames = 60;
 constexpr size_t kMaxDisplaySubscriptionRequests = 32;
+// Annotation messages are ordered, so a stalled host loop is allowed a short
+// backlog. Past the bound the oldest message is dropped; the overlay treats a
+// missing stroke prefix as a harmless orphan rather than corrupting newer data.
+constexpr size_t kMaxPendingAnnotations = 512;
 constexpr size_t kMaxPendingVideoBytes = 8u * 1024u * 1024u;
 constexpr uint64_t kVideoDeliveryWindowUs = 500000;
 constexpr uint64_t kKeepAliveMs = 5000;
@@ -761,6 +765,9 @@ struct QuicSession::Impl {
     bool cursor_hint_ready = false;
     ShowCursorHint cursor_hint;
     uint64_t cursor_hints_seen = 0;
+    // Server: ordered draw-only annotation messages.
+    std::deque<AnnotationMessage> annotations;
+    uint64_t annotations_seen = 0;
     // Server: the newest SetPrivacyMode request. Client: the newest state the
     // host sent, also used for a host-initiated disable.
     bool privacy_mode_request_ready = false;
@@ -1049,7 +1056,11 @@ struct QuicSession::Impl {
     std::deque<FileChunk> file_chunks;
     size_t buffered_file_bytes = 0;
     std::map<uint32_t, ReceivedUpload> received_uploads;
-    struct IncomingFileOffer { bool clipboard = false; bool accepted = false; };
+    struct IncomingFileOffer {
+        bool clipboard = false;
+        bool directory = false;
+        bool accepted = false;
+    };
     std::map<uint32_t, IncomingFileOffer> incoming_file_offers;
     std::deque<FileCancel> file_cancels;
     std::deque<FileConflict> file_conflicts;
@@ -1769,12 +1780,17 @@ struct QuicSession::Impl {
                 if (!header_ready) return;
                 const auto offered = incoming_file_offers.find(header.transfer_id);
                 const bool allowed = header_ok && offered != incoming_file_offers.end() &&
-                    offered->second.accepted && file_allowed(offered->second.clipboard, false);
+                    offered->second.accepted && !offered->second.directory &&
+                    file_allowed(offered->second.clipboard, false);
                 if (!allowed) {
                     // Revoking file transfer must not end a live session that
                     // still has a CFIL stream in flight. When the header is
                     // already here, the upload is failed explicitly.
-                    if (header_ok) {
+                    if (header_ok && offered != incoming_file_offers.end() &&
+                        offered->second.directory) {
+                        file_rejection = FileResult{header.transfer_id, FileCode::Refused, 0,
+                                                    "a directory offer has no file stream"};
+                    } else if (header_ok) {
                         file_rejection = FileResult{header.transfer_id, FileCode::Refused, 0,
                                                     "file transfer is disabled"};
                     }
@@ -3814,6 +3830,26 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::Annotation: {
+                if (role != Role::Server) {
+                    break;
+                }
+                AnnotationMessage annotation;
+                if (!parse_annotation(payload, annotation, &error)) {
+                    control_protocol_failure("Annotation: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (annotations.size() >= kMaxPendingAnnotations) {
+                        annotations.pop_front();
+                    }
+                    annotations.push_back(std::move(annotation));
+                    ++annotations_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::SetPrivacyMode: {
                 if (role != Role::Server ||
                     (effective_permissions() & kPermissionPrivacyMode) == 0) {
@@ -4599,7 +4635,9 @@ struct QuicSession::Impl {
                         incoming_file_offers.count(offer.transfer_id) != 0) {
                         break;
                     }
-                    incoming_file_offers.emplace(offer.transfer_id, IncomingFileOffer{offer.clipboard, false});
+                    incoming_file_offers.emplace(
+                        offer.transfer_id,
+                        IncomingFileOffer{offer.clipboard, offer.directory, false});
                     file_offers.push_back(std::move(offer));
                     ++file_offers_seen;
                 }
@@ -5734,6 +5772,8 @@ struct QuicSession::Impl {
             cursor_hint_ready = false;
             cursor_hint = ShowCursorHint{};
             cursor_hints_seen = 0;
+            annotations.clear();
+            annotations_seen = 0;
             clipboard_updates.clear();
             clipboard_received = 0;
             cursor_update.reset();
@@ -8246,6 +8286,39 @@ Error QuicSession::request_show_cursor(const ShowCursorHint& hint) {
                            QUIC_SEND_FLAG_NONE);
 }
 
+bool QuicSession::take_annotation(AnnotationMessage& annotation) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->annotations.empty()) {
+        return false;
+    }
+    annotation = std::move(impl_->annotations.front());
+    impl_->annotations.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::annotations_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->annotations_seen;
+}
+
+Error QuicSession::request_annotation(const AnnotationMessage& annotation) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_annotation is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    std::vector<uint8_t> message = make_annotation(annotation);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the annotation payload is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), message, QUIC_SEND_FLAG_NONE);
+}
+
 Error QuicSession::send_audio(AudioHeader header, const uint8_t* payload, size_t size) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
@@ -9439,6 +9512,10 @@ Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_
             if (it == impl.incoming_file_offers.end() || !impl.file_allowed(it->second.clipboard, false)) {
                 return Error(Status::PermissionDenied, "file offer is missing or permission was revoked");
             }
+            if (it->second.directory && resume_offset != 0) {
+                return Error(Status::InvalidCall,
+                             "a directory offer cannot carry a resume offset");
+            }
             it->second.accepted = true;
         } else if (code != FileCode::Conflict) {
             // Conflict keeps the offer held until the decision arrives.
@@ -9633,6 +9710,9 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
             return Error(Status::InvalidCall, "the upload was not accepted");
         }
         Impl::OutgoingUpload& upload = it->second;
+        if (upload.offer.directory) {
+            return Error(Status::InvalidCall, "a directory offer has no file data");
+        }
         if (!impl.file_allowed(upload.offer.clipboard, true)) {
             return Error(Status::PermissionDenied, "file or clipboard permission was disabled");
         }
@@ -9723,6 +9803,9 @@ Error QuicSession::finish_file_upload(uint32_t transfer_id) {
             return Error(Status::InvalidCall, "the upload was not accepted");
         }
         Impl::OutgoingUpload& upload = it->second;
+        if (upload.offer.directory) {
+            return Error(Status::InvalidCall, "a directory offer has no file stream");
+        }
         if (!impl.file_allowed(upload.offer.clipboard, true)) {
             return Error(Status::PermissionDenied, "file or clipboard permission was disabled");
         }

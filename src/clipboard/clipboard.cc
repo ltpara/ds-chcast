@@ -26,7 +26,7 @@ namespace {
 constexpr size_t kMaxFormats = kMaxClipboardFormats;
 
 bool valid_format_id(uint8_t raw, ClipboardFormat& format) {
-    if (raw > static_cast<uint8_t>(ClipboardFormat::FileList)) {
+    if (raw > static_cast<uint8_t>(ClipboardFormat::Png)) {
         return false;
     }
     format = static_cast<ClipboardFormat>(raw);
@@ -42,6 +42,8 @@ uint32_t format_limit(ClipboardFormat format) {
             return kMaxClipboardMarkupBytes;
         case ClipboardFormat::Dib:
             return kMaxClipboardImageBytes;
+        case ClipboardFormat::Png:
+            return kMaxClipboardPngBytes;
         case ClipboardFormat::FileList:
             return kMaxClipboardFileListBytes;
     }
@@ -97,11 +99,161 @@ uint64_t read_u64(const uint8_t* data) {
     return value;
 }
 
+uint32_t read_be32(const uint8_t* data) {
+    return (static_cast<uint32_t>(data[0]) << 24) |
+           (static_cast<uint32_t>(data[1]) << 16) |
+           (static_cast<uint32_t>(data[2]) << 8) | static_cast<uint32_t>(data[3]);
+}
+
+const std::array<uint32_t, 256>& png_crc_table() {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> values{};
+        for (uint32_t n = 0; n < values.size(); ++n) {
+            uint32_t value = n;
+            for (int bit = 0; bit < 8; ++bit) {
+                value = (value & 1) != 0 ? 0xEDB88320u ^ (value >> 1) : value >> 1;
+            }
+            values[n] = value;
+        }
+        return values;
+    }();
+    return table;
+}
+
+uint32_t png_crc_update(uint32_t crc, const uint8_t* data, size_t size) {
+    const std::array<uint32_t, 256>& table = png_crc_table();
+    for (size_t i = 0; i < size; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+bool valid_ihdr(const uint8_t* data, uint32_t& width, uint32_t& height) {
+    width = read_be32(data);
+    height = read_be32(data + 4);
+    const uint8_t bit_depth = data[8];
+    const uint8_t color_type = data[9];
+    bool depth_ok = false;
+    switch (color_type) {
+        case 0:  // grayscale
+            depth_ok = bit_depth == 1 || bit_depth == 2 || bit_depth == 4 ||
+                       bit_depth == 8 || bit_depth == 16;
+            break;
+        case 3:  // indexed
+            depth_ok = bit_depth == 1 || bit_depth == 2 || bit_depth == 4 ||
+                       bit_depth == 8;
+            break;
+        case 2:  // truecolor
+        case 4:  // grayscale + alpha
+        case 6:  // truecolor + alpha
+            depth_ok = bit_depth == 8 || bit_depth == 16;
+            break;
+        default:
+            return false;
+    }
+    return depth_ok && data[10] == 0 && data[11] == 0 &&
+           (data[12] == 0 || data[12] == 1);
+}
+
+bool chunk_type(const uint8_t* type, const char (&value)[5]) {
+    return std::memcmp(type, value, 4) == 0;
+}
+
+// Validate the complete PNG framing before WIC sees it. In particular, chunk
+// lengths and CRCs bound every read and the IHDR cannot request more pixels
+// than the decoder is willing to allocate.
+bool valid_png(const std::vector<uint8_t>& data, std::string* error) {
+    const auto fail = [error](const char* message) {
+        if (error) {
+            *error = message;
+        }
+        return false;
+    };
+    static constexpr uint8_t kSignature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (data.size() < 8 || std::memcmp(data.data(), kSignature, sizeof(kSignature)) != 0) {
+        return fail("PNG clipboard data has a bad signature");
+    }
+    size_t cursor = sizeof(kSignature);
+    bool first = true;
+    bool saw_ihdr = false;
+    bool saw_idat = false;
+    bool saw_iend = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    while (cursor < data.size()) {
+        if (data.size() - cursor < 12) {
+            return fail("PNG clipboard data has a truncated chunk");
+        }
+        const uint32_t length = read_be32(data.data() + cursor);
+        if (length > data.size() - cursor - 12) {
+            return fail("PNG clipboard data has a chunk past its end");
+        }
+        const uint8_t* type = data.data() + cursor + 4;
+        const uint8_t* payload = type + 4;
+        const uint32_t stored_crc = read_be32(payload + length);
+        for (int i = 0; i < 4; ++i) {
+            if (!((type[i] >= 'A' && type[i] <= 'Z') ||
+                  (type[i] >= 'a' && type[i] <= 'z'))) {
+                return fail("PNG clipboard data has an invalid chunk type");
+            }
+        }
+        uint32_t crc = png_crc_update(0xFFFFFFFFu, type, 4);
+        crc = png_crc_update(crc, payload, length) ^ 0xFFFFFFFFu;
+        if (crc != stored_crc) {
+            return fail("PNG clipboard data has a bad chunk CRC");
+        }
+
+        const bool is_ihdr = chunk_type(type, "IHDR");
+        const bool is_plte = chunk_type(type, "PLTE");
+        const bool is_idat = chunk_type(type, "IDAT");
+        const bool is_iend = chunk_type(type, "IEND");
+        if (first && !is_ihdr) {
+            return fail("PNG clipboard data does not start with IHDR");
+        }
+        if (is_ihdr) {
+            if (!first || saw_ihdr || length != 13 ||
+                !valid_ihdr(payload, width, height)) {
+                return fail("PNG clipboard data has an invalid IHDR");
+            }
+            const uint64_t pixels = static_cast<uint64_t>(width) * height;
+            if (width > kMaxClipboardPngDimension || height > kMaxClipboardPngDimension ||
+                pixels == 0 || pixels > kMaxClipboardPngPixels) {
+                return fail("PNG clipboard dimensions exceed the decode limit");
+            }
+            saw_ihdr = true;
+        } else if (!saw_ihdr) {
+            return fail("PNG clipboard data has a chunk before IHDR");
+        } else if (is_idat) {
+            saw_idat = true;
+        } else if (is_iend) {
+            if (length != 0 || !saw_idat) {
+                return fail("PNG clipboard data has an invalid IEND");
+            }
+            saw_iend = true;
+        } else if (!is_plte && (type[0] >= 'A' && type[0] <= 'Z')) {
+            return fail("PNG clipboard data has an unknown critical chunk");
+        }
+
+        cursor += 12 + static_cast<size_t>(length);
+        first = false;
+        if (is_iend) {
+            if (cursor != data.size()) {
+                return fail("PNG clipboard data has bytes after IEND");
+            }
+            break;
+        }
+    }
+    if (!saw_ihdr || !saw_idat || !saw_iend || cursor != data.size()) {
+        return fail("PNG clipboard data is incomplete");
+    }
+    return true;
+}
+
 // Paste targets trust the DIB header and allocate/read according to it, so a
 // header that promises more pixels than the blob carries turns into an
 // out-of-bounds read on the host. Derive the exact palette and pixel byte
 // counts from the header instead of only checking that the header itself fits.
-bool valid_dib(const std::vector<uint8_t>& data, std::string* error) {
+bool valid_dib_impl(const std::vector<uint8_t>& data, std::string* error) {
     constexpr uint64_t kMaxDimension = 8192;
     const auto fail = [error](const char* message) {
         if (error) {
@@ -227,6 +379,10 @@ bool valid_dib(const std::vector<uint8_t>& data, std::string* error) {
 }
 
 }  // namespace
+
+bool valid_clipboard_dib(const std::vector<uint8_t>& data, std::string* error) {
+    return valid_dib_impl(data, error);
+}
 
 const ClipboardFormatData* ClipboardContent::find(ClipboardFormat format) const {
     for (const ClipboardFormatData& entry : formats) {
@@ -710,7 +866,12 @@ bool valid_clipboard_content(const ClipboardContent& content, std::string* error
                 }
                 break;
             case ClipboardFormat::Dib:
-                if (!valid_dib(entry.data, error)) {
+                if (!valid_dib_impl(entry.data, error)) {
+                    return false;
+                }
+                break;
+            case ClipboardFormat::Png:
+                if (!valid_png(entry.data, error)) {
                     return false;
                 }
                 break;

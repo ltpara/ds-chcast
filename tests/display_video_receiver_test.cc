@@ -14,6 +14,7 @@
 #include "../app/windows/viewer/viewer_engine.h"
 #include "chast/quic.h"
 #include "mp4_recorder.h"
+#include "test_workdir.h"
 
 using namespace chast;
 using namespace chast_viewer;
@@ -294,9 +295,8 @@ void engine_transport() {
     streams.push_back(description(13, 0, 640));
     operation({5, {0}, {}, {}}, streams);
     check(viewer.BindDisplay(13, left) && viewer.FocusDisplay(11), "bind another output before focused recording");
-    const auto folder = std::filesystem::temp_directory_path() /
-        ("chast-display-recording-" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(folder);
+    const auto folder = chast_test::scratch_directory("chast-display-recording");
+    check(!folder.empty(), "a writable display recording directory is available");
     check(viewer.SetRecording(true, folder.string()) && viewer.FocusDisplay(13),
           "recording captures its target before focus changes");
     // SPS/PPS and the start of a real H.264 IDR from mp4_recorder_test.cc.

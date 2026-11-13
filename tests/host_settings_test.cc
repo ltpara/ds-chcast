@@ -1201,6 +1201,12 @@ void test_managed_policy_ack(const std::filesystem::path& dir) {
           "the acknowledgement records the policy update time");
     check(ack.find("\"applied\": true") != std::string::npos,
           "the acknowledgement records success");
+    check(ack.find("\"detail\": \"managed policy applied: new sessions require a valid access ticket\"") !=
+              std::string::npos,
+          "the acknowledgement reports current ticket enforcement");
+    check(ack.find("not implemented") == std::string::npos &&
+              ack.find("(v62)") == std::string::npos,
+          "the acknowledgement does not claim that access tickets are unimplemented");
 
     write_text(folder / L"host.policy.json", "{\"managed\":false}");
     check(!chast::write_managed_policy_ack(ack_path, state_path, "restricted", 3, 15, 1000,

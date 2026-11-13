@@ -10,7 +10,9 @@
 #include <dxgi1_6.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -23,6 +25,51 @@
 #include "chast/error.h"
 
 namespace chast::detail {
+
+// Reuses CPU capture buffers only when the pool is their sole owner. Published
+// frames keep the FrameInfo immutability contract: a vector is never rewritten
+// while a reader still holds it. GDI-only merged members use this instead of
+// allocating and copying a new vector for every desktop frame.
+class CpuFramePool final {
+public:
+    explicit CpuFramePool(size_t max_buffers = 4) : max_buffers_(max_buffers) {}
+
+    std::shared_ptr<const std::vector<uint8_t>> copy(const uint8_t* data, size_t bytes) {
+        std::shared_ptr<std::vector<uint8_t>> target;
+        for (const auto& candidate : buffers_) {
+            if (candidate.use_count() == 1) {
+                target = candidate;
+                break;
+            }
+        }
+        if (!target && buffers_.size() < max_buffers_) {
+            target = std::make_shared<std::vector<uint8_t>>();
+            buffers_.push_back(target);
+        }
+        // More simultaneous readers than cached surfaces retain the old
+        // immutable frames. Use a transient buffer rather than overwriting
+        // them or growing without bound.
+        if (!target) target = std::make_shared<std::vector<uint8_t>>();
+        target->resize(bytes);
+        if (bytes != 0) std::memcpy(target->data(), data, bytes);
+        return target;
+    }
+
+    size_t cached_buffers() const noexcept { return buffers_.size(); }
+
+    size_t reusable_buffers() const noexcept {
+        size_t count = 0;
+        for (const auto& buffer : buffers_) {
+            if (buffer.use_count() == 1) ++count;
+        }
+        return count;
+    }
+
+private:
+    // Captures on one pool are serialized by the owning capturer.
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> buffers_;
+    size_t max_buffers_;
+};
 
 // Color state of an output as the compositor is currently using it.
 struct ColorState {
@@ -326,10 +373,60 @@ struct CursorBitmap {
 size_t cursor_buffer_size(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shape);
 
 // Content id of a sprite, modelled on RustDesk's cursor_content_id: a 53-bit
-// hash of its dimensions, hotspot and pixels (53 bits so it survives a JS
-// number, which its web client needs). Equal ids mean the same sprite.
+// hash of its dimensions, hotspot, pixels and inversion mask (53 bits so it
+// survives a JS number, which its web client needs). Equal ids mean the same
+// sprite and the same compositing operation.
 uint64_t cursor_content_id(UINT width, UINT height, POINT hotspot,
-                           const std::vector<uint8_t>& color);
+                           const std::vector<uint8_t>& color,
+                           const std::vector<uint8_t>& invert);
+
+// The protocol caps a published cursor at 512 px. Scaling is solved in the
+// public 512 px space, while the accessibility outline still needs one pixel
+// on each side, hence a 510 px source bound when deriving the sprite.
+inline constexpr UINT kMaxCursorSpriteSize = 512;
+inline constexpr UINT kMaxCursorSourceSize = kMaxCursorSpriteSize - 2;
+
+// Windows stores the pointer diameter as a DPI-independent value (32..256).
+// The accessibility slider is the equivalent one-based level (1..15), using
+// 16 px steps from the normal 32 px pointer. Settings writes both; taking the
+// maximum also tolerates a partially applied registry update. Zero means the
+// value was absent or invalid, and lets the other representation win.
+UINT cursor_diameter_from_settings(UINT cursor_base_size, UINT accessibility_size);
+// Reads the current per-user pointer settings and resolves them to this
+// monitor's physical diameter. Zero means neither registry representation was
+// usable; callers then keep the shape as reported instead of failing capture.
+UINT cursor_target_size(const DisplayInfo& display);
+
+// Physical pixels for one monitor. Windows scales CursorBaseSize by the
+// monitor's DPI; this is the size at which the OS draws the pointer. Invalid
+// input keeps the protocol-safe fallback rather than producing a zero sprite.
+UINT cursor_size_at_dpi(UINT base_diameter, UINT dpi);
+
+// Fits a source sprite into the accessibility diameter without distorting its
+// aspect ratio. The longest side is at most min(target_diameter, 510), so an
+// outline can still fit the protocol's 512 px limit. A zero target means
+// "leave the source dimensions alone".
+void fit_cursor_dimensions(UINT source_width, UINT source_height,
+                           UINT target_diameter, UINT& width, UINT& height);
+
+// Maps a source hotspot to the scaled sprite, clamping it to the last pixel.
+POINT scale_cursor_hotspot(POINT hotspot, UINT source_width, UINT source_height,
+                           UINT width, UINT height);
+
+// Bilinearly scales premultiplied BGRA pixels. Pixels are already
+// premultiplied, so interpolating channels directly is the correct alpha
+// treatment and avoids dark fringes. The inversion mask stays binary and is
+// sampled nearest-neighbour. An invalid bitmap leaves `out` untouched.
+bool scale_cursor_bitmap(const CursorBitmap& bitmap, UINT width, UINT height,
+                         CursorBitmap& out);
+
+// Produces the published sprite from an unscaled decoded shape. It applies the
+// accessibility/DPI diameter, scales premultiplied pixels and the inversion
+// mask, outlines inverted sprites, and maps the source hotspot through the same
+// transform. Both GDI and DXGI use this so their size semantics cannot drift.
+bool derive_cursor_sprite(const CursorBitmap& decoded, POINT source_hotspot,
+                          UINT target_diameter, CursorBitmap& sprite,
+                          POINT& hotspot, POINT& origin_offset);
 
 // RustDesk's cursor outline, applied to sprites that contain inverted desktop
 // pixels. Those cannot be sent as an image, so the inverted pixels are made
@@ -363,6 +460,10 @@ public:
 
     void update_position(const POINT& position, bool visible);
     void update_shape(IDXGIOutputDuplication* duplication);
+    // Re-derives the published sprite when the accessibility size or monitor
+    // DPI changes. DXGI may report a zero-byte "shape unchanged" update, so a
+    // cached unscaled decode is required to rebuild without recapturing it.
+    void set_target_size(UINT diameter);
     void clear_shape();
     void reset();
 
@@ -389,14 +490,18 @@ public:
     uint64_t revision() const noexcept { return revision_; }
 
 private:
+    void derive_sprite();
+
     UINT max_bitmap_bytes_;
     DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_{};
+    CursorBitmap decoded_;
     CursorBitmap bitmap_;
     std::vector<uint8_t> raw_;
     POINT position_{};
     POINT origin_offset_{};
     POINT hotspot_{};
     uint64_t content_id_ = 0;
+    UINT target_size_ = 0;
     bool position_valid_ = false;
     bool visible_ = false;
     uint64_t revision_ = 0;

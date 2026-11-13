@@ -39,6 +39,7 @@
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
+#include "chast/png.h"
 #include "chast/protocol.h"
 #include "chast/security.h"
 #include "viewer_engine.h"
@@ -60,6 +61,16 @@ std::string utf8(const fs::path& path) {
 
 fs::path from_utf8(const std::string& text) {
     return fs::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
+fs::path probe_scratch_root() {
+    std::error_code ec;
+    const fs::path current = fs::current_path(ec);
+    if (!ec) {
+        return current / "test-temp";
+    }
+    ec.clear();
+    return fs::temp_directory_path(ec) / "chast-probes";
 }
 
 // A sink that keeps the decoder on the GPU but publishes nothing: the walk
@@ -187,87 +198,31 @@ bool read_file(const fs::path& path, std::string* bytes, std::string* error) {
     return true;
 }
 
-// The viewer saves transfers into the real Downloads\chast folder. A hardened
-// profile can deny creating files in directories that predate the process, so
-// when that root or its partial folder is not writable, move the existing
-// folder aside for the probe and let the receiver create it; the original is
-// restored on every exit path.
-class ReceiveDirectoryGuard {
-public:
-    explicit ReceiveDirectoryGuard(const fs::path& directory) : directory_(directory) {
-        if (writable(directory_)) {
-            return;
-        }
-        backup_ = directory_;
-        backup_ += ".probe-backup-" + std::to_string(GetCurrentProcessId());
-        std::error_code ec;
-        fs::remove_all(backup_, ec);
-        ec.clear();
-        fs::rename(directory_, backup_, ec);
-        if (ec) {
-            std::fprintf(stderr, "viewer-probe: cannot move %s aside: %s\n",
-                         utf8(directory_).c_str(), ec.message().c_str());
-            backup_.clear();
-            return;
-        }
-        std::printf("viewer-probe: the receive folder is not writable here; "
-                    "using a fresh one and restoring it afterwards\n");
-        fs::create_directories(directory_, ec);
+bool prepare_receive_directory(const fs::path& directory, std::string* error) {
+    const fs::path probe =
+        directory / (".chast-probe-" + std::to_string(GetCurrentProcessId()));
+    if (!write_file(probe, {}, error)) {
+        return false;
     }
-    ~ReceiveDirectoryGuard() {
-        if (backup_.empty()) {
-            return;
-        }
-        std::error_code ignored;
-        fs::remove_all(directory_, ignored);
-        fs::rename(backup_, directory_, ignored);
+    std::error_code ec;
+    fs::remove(probe, ec);
+    if (ec) {
+        *error = "cannot clean the receive probe in " + utf8(directory) + ": " +
+                 ec.message();
+        return false;
     }
-    ReceiveDirectoryGuard(const ReceiveDirectoryGuard&) = delete;
-    ReceiveDirectoryGuard& operator=(const ReceiveDirectoryGuard&) = delete;
+    return true;
+}
 
-private:
-    static bool writable(const fs::path& directory) {
-        std::error_code ec;
-        fs::create_directories(directory, ec);
-        if (ec) {
-            return false;
-        }
-        const std::string probe_name =
-            ".chast-probe-" + std::to_string(GetCurrentProcessId());
-        const fs::path root_probe = directory / probe_name;
-        {
-            std::ofstream out(root_probe, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                return false;
-            }
-        }
-        fs::remove(root_probe, ec);
-        if (ec) {
-            return false;
-        }
-        const fs::path partial = directory / ".chast-partial";
-        if (!fs::exists(partial, ec)) {
-            return true;
-        }
-        ec.clear();
-        fs::create_directories(partial, ec);
-        if (ec) {
-            return false;
-        }
-        const fs::path partial_probe = partial / probe_name;
-        {
-            std::ofstream out(partial_probe, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                return false;
-            }
-        }
-        fs::remove(partial_probe, ec);
-        return !ec;
+std::unique_ptr<chast_viewer::ViewerEngine> make_probe_viewer(
+    ProbeSink* sink, const fs::path& receive_directory, std::string* error) {
+    auto viewer = std::make_unique<chast_viewer::ViewerEngine>(sink);
+    if (!viewer->SetFileReceiveDirectoryForTesting(utf8(receive_directory))) {
+        *error = "the probe receive directory is not an absolute UTF-8 path";
+        return nullptr;
     }
-
-    fs::path directory_;
-    fs::path backup_;
-};
+    return viewer;
+}
 
 struct ShareSeed {
     std::string tree_name;
@@ -1084,6 +1039,110 @@ bool seed_upload(const fs::path& work, const fs::path& share, std::string* error
                       std::string("\x10\x20\x30\xFE\xFF", 5) + "deep", error);
 }
 
+bool run_process(const std::wstring& command, DWORD* exit_code, std::string* error) {
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+    if (!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        *error = "CreateProcessW failed: " +
+                 std::to_string(static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    WaitForSingleObject(process.hProcess, 10000);
+    DWORD code = ERROR_TIMEOUT;
+    if (GetExitCodeProcess(process.hProcess, &code) && code == STILL_ACTIVE) {
+        TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(process.hProcess, INFINITE);
+        code = ERROR_TIMEOUT;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    *exit_code = code;
+    return code != ERROR_TIMEOUT;
+}
+
+// A junction is the Windows reparse point that often looks like an ordinary
+// directory to std::filesystem. Prefer it for the acceptance test and fall
+// back to a symlink when the volume cannot host a mount point.
+bool create_directory_reparse(const fs::path& link, const fs::path& target,
+                              std::string* error) {
+    std::wstring command = L"cmd.exe /d /s /c mklink /J \"" + link.wstring() +
+                           L"\" \"" + target.wstring() + L"\"";
+    DWORD exit_code = 0;
+    std::string process_error;
+    if (run_process(command, &exit_code, &process_error) && exit_code == 0) {
+        return true;
+    }
+    constexpr DWORD kAllowUnprivilegedCreate = 0x2;
+    if (CreateSymbolicLinkW(link.c_str(), target.c_str(),
+                            SYMBOLIC_LINK_FLAG_DIRECTORY |
+                                kAllowUnprivilegedCreate)) {
+        return true;
+    }
+    *error = "cannot create a directory reparse point (junction exit " +
+             std::to_string(static_cast<unsigned long>(exit_code)) + ", link error " +
+             std::to_string(static_cast<unsigned long>(GetLastError())) + ")";
+    if (!process_error.empty()) *error += ": " + process_error;
+    return false;
+}
+
+void remove_directory_reparse(const fs::path& path) {
+    std::error_code ignored;
+    fs::remove(path, ignored);
+}
+
+bool wait_upload_settled(chast_viewer::ViewerEngine& engine, uint64_t expected_sent,
+                         uint64_t expected_failures,
+                         const std::vector<fs::path>& expected_directories,
+                         std::chrono::milliseconds timeout, std::string* error) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::optional<std::chrono::steady_clock::time_point> settled_since;
+    for (;;) {
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        std::error_code ec;
+        bool directories_ready = true;
+        for (const fs::path& directory : expected_directories) {
+            if (!fs::is_directory(directory, ec) || ec) {
+                directories_ready = false;
+                ec.clear();
+                break;
+            }
+        }
+        if (status.files_sent == expected_sent &&
+            status.file_failures == expected_failures && status.file_queue == 0 &&
+            directories_ready) {
+            // A second poll catches the short window where the file worker has
+            // not yet published a completed directory into the queue.
+            if (!settled_since) settled_since = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() - *settled_since >= 50ms) return true;
+        } else {
+            settled_since.reset();
+        }
+        if (status.state != chast_viewer::ViewerState::kStreaming) {
+            *error = "the session ended during the directory upload";
+            return false;
+        }
+        if (status.files_sent > expected_sent || status.file_failures > expected_failures) {
+            *error = "the directory upload counted " + std::to_string(status.files_sent) +
+                     " files sent and " + std::to_string(status.file_failures) +
+                     " failures, expected " + std::to_string(expected_sent) + " and " +
+                     std::to_string(expected_failures) + " (" + status.last_file_error + ")";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error = "the directory upload did not settle: queue=" +
+                     std::to_string(status.file_queue) + ", files=" +
+                     std::to_string(status.files_sent) + ", failures=" +
+                     std::to_string(status.file_failures) + " (" + status.file_error + ")";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+}
+
 // Queues the staged file and folder into the browsed folder, the same way a
 // drop on the window reaches SendFiles. Waits until all three files finish.
 bool run_upload(chast_viewer::ViewerEngine& engine, const fs::path& staging,
@@ -1853,13 +1912,160 @@ bool verify_file_pages(chast_viewer::ViewerEngine& engine, const ShareSeed& name
     return true;
 }
 
+struct RawClipboardFormat {
+    UINT format = 0;
+    std::vector<uint8_t> bytes;
+};
+
+struct ClipboardHandleInfo {
+    HGLOBAL handle = nullptr;
+    SIZE_T bytes = 0;
+};
+
+bool open_clipboard_with_retry() {
+    for (int attempt = 0; attempt != 50; ++attempt) {
+        if (OpenClipboard(nullptr)) return true;
+        std::this_thread::sleep_for(10ms);
+    }
+    return false;
+}
+
+bool publish_raw_clipboard(const std::vector<RawClipboardFormat>& formats,
+                           std::string* error) {
+    std::vector<HGLOBAL> handles;
+    handles.reserve(formats.size());
+    for (const RawClipboardFormat& format : formats) {
+        if (format.format == 0 || format.bytes.empty()) {
+            *error = "raw clipboard format has no data";
+            return false;
+        }
+        HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, format.bytes.size());
+        if (handle == nullptr) {
+            for (HGLOBAL staged : handles) GlobalFree(staged);
+            *error = "cannot allocate a raw clipboard handle";
+            return false;
+        }
+        void* target = GlobalLock(handle);
+        if (target == nullptr) {
+            GlobalFree(handle);
+            for (HGLOBAL staged : handles) GlobalFree(staged);
+            *error = "cannot lock a raw clipboard handle";
+            return false;
+        }
+        std::memcpy(target, format.bytes.data(), format.bytes.size());
+        GlobalUnlock(handle);
+        handles.push_back(handle);
+    }
+
+    if (!open_clipboard_with_retry()) {
+        for (HGLOBAL handle : handles) GlobalFree(handle);
+        *error = "cannot open the private clipboard";
+        return false;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        for (HGLOBAL handle : handles) GlobalFree(handle);
+        *error = "cannot clear the private clipboard";
+        return false;
+    }
+    size_t published = 0;
+    for (size_t i = 0; i < formats.size(); ++i) {
+        if (SetClipboardData(formats[i].format, handles[i]) != nullptr) {
+            handles[i] = nullptr;  // ownership moved to the clipboard
+            ++published;
+        }
+    }
+    CloseClipboard();
+    for (HGLOBAL handle : handles) {
+        if (handle != nullptr) GlobalFree(handle);
+    }
+    if (published != formats.size()) {
+        *error = "the private clipboard refused a raw format";
+        return false;
+    }
+    return true;
+}
+
+bool inspect_raw_clipboard(const std::vector<RawClipboardFormat>& formats,
+                           std::vector<ClipboardHandleInfo>* handles,
+                           std::string* error) {
+    handles->clear();
+    if (!open_clipboard_with_retry()) {
+        *error = "cannot inspect the private clipboard";
+        return false;
+    }
+    struct Closer {
+        ~Closer() { CloseClipboard(); }
+    } closer;
+    for (const RawClipboardFormat& expected : formats) {
+        HGLOBAL handle =
+            static_cast<HGLOBAL>(GetClipboardData(expected.format));
+        if (handle == nullptr) {
+            *error = "a published raw clipboard format is missing";
+            return false;
+        }
+        const SIZE_T size = GlobalSize(handle);
+        const void* data = GlobalLock(handle);
+        if (data == nullptr || size != expected.bytes.size() ||
+            std::memcmp(data, expected.bytes.data(), size) != 0) {
+            if (data != nullptr) GlobalUnlock(handle);
+            *error = "a published raw clipboard format has the wrong bytes";
+            return false;
+        }
+        GlobalUnlock(handle);
+        handles->push_back({handle, size});
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_clipboard_dib(uint32_t width, uint32_t height) {
+    const uint64_t pixel_bytes = uint64_t{width} * height * 4;
+    std::vector<uint8_t> dib(40 + static_cast<size_t>(pixel_bytes), 0);
+    std::fill(dib.begin() + 40, dib.end(), static_cast<uint8_t>(0x80));
+    const auto put32 = [&dib](size_t offset, uint32_t value) {
+        for (int i = 0; i != 4; ++i) {
+            dib[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    put32(0, 40);
+    put32(4, width);
+    // A negative height makes the rows top-down, matching the stored BGRA.
+    put32(8, static_cast<uint32_t>(-static_cast<int32_t>(height)));
+    dib[12] = 1;  // planes
+    dib[14] = 32; // bits per pixel
+    put32(20, static_cast<uint32_t>(pixel_bytes));
+    return dib;
+}
+
 int native_clipboard_probe() {
     // A private window station has its own clipboard. No interactive user's
     // clipboard is saved, cleared or replaced by this integration check.
     const std::wstring station_name = L"ChastClipboardProbe-" + std::to_wstring(GetCurrentProcessId());
     HWINSTA station = CreateWindowStationW(station_name.c_str(), 0, WINSTA_ALL_ACCESS, nullptr);
-    if (!station || !SetProcessWindowStation(station)) {
-        std::fprintf(stderr, "viewer-probe: cannot create private clipboard station (%lu)\n", GetLastError()); return 1;
+    if (!station) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_ACCESS_DENIED) {
+            std::fprintf(stderr,
+                         "skipped: the process token cannot create a private clipboard station (%lu)\n",
+                         static_cast<unsigned long>(error));
+            return 77;
+        }
+        std::fprintf(stderr, "viewer-probe: cannot create private clipboard station (%lu)\n",
+                     static_cast<unsigned long>(error));
+        return 1;
+    }
+    if (!SetProcessWindowStation(station)) {
+        const DWORD error = GetLastError();
+        CloseWindowStation(station);
+        if (error == ERROR_ACCESS_DENIED) {
+            std::fprintf(stderr,
+                         "skipped: the process cannot select its private clipboard station (%lu)\n",
+                         static_cast<unsigned long>(error));
+            return 77;
+        }
+        std::fprintf(stderr, "viewer-probe: cannot select private clipboard station (%lu)\n",
+                     static_cast<unsigned long>(error));
+        return 1;
     }
     HDESK desktop = CreateDesktopW(L"ChastProbe", nullptr, nullptr, 0,
                                   DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS, nullptr);
@@ -1882,16 +2088,110 @@ int native_clipboard_probe() {
     auto source = std::make_shared<Source>();
     int result = 1;
     {
-        chast::VirtualClipboard owner;
+        const UINT png_format = RegisterClipboardFormatW(L"PNG");
+        const UINT png_mime_format = RegisterClipboardFormatW(L"image/png");
+        const uint8_t png_pixels[16] = {
+            0, 0, 255, 255, 0, 255, 0, 255,
+            255, 0, 0, 255, 255, 255, 255, 0};
+        std::vector<uint8_t> png;
         std::string error;
+        std::string failed_stage;
+        const auto stage = [&failed_stage](bool ok, const char* name) {
+            if (!ok && failed_stage.empty()) failed_stage = name;
+            return ok;
+        };
+        bool raw_ok = stage(png_format != 0 && png_mime_format != 0 &&
+                                chast::encode_png_bgra(png_pixels, 2, 2, 8, png, &error),
+                            "encode source PNG");
+        chast::ClipboardContent png_content;
+        chast::ClipboardFormatData png_entry;
+        png_entry.format = chast::ClipboardFormat::Png;
+        png_entry.data = png;
+        png_content.formats.push_back(std::move(png_entry));
+        if (raw_ok) raw_ok = stage(chast::write_clipboard(png_content, &error),
+                                   "write PNG through clipboard API");
+
+        const std::vector<RawClipboardFormat> png_formats{{png_format, png},
+                                                          {png_mime_format, png}};
+        std::vector<ClipboardHandleInfo> png_handles;
+        if (raw_ok) {
+            raw_ok = stage(inspect_raw_clipboard(png_formats, &png_handles, &error) &&
+                               png_handles.size() == 2 &&
+                               png_handles[0].handle != png_handles[1].handle,
+                           "inspect independent PNG handles");
+        }
+        chast::ClipboardContent png_readback;
+        if (raw_ok) {
+            raw_ok = stage(chast::read_clipboard(png_readback, &error) &&
+                               png_readback.formats.size() == 1 &&
+                               png_readback.find(chast::ClipboardFormat::Png) != nullptr &&
+                               png_readback.find(chast::ClipboardFormat::Png)->data == png,
+                           "read back PNG through clipboard API");
+        }
+
+        constexpr uint32_t kLargeWidth = 4096;
+        constexpr uint32_t kLargeHeight = 2048;
+        const std::vector<uint8_t> large_dib =
+            make_clipboard_dib(kLargeWidth, kLargeHeight);
+        if (raw_ok) {
+            raw_ok = stage(large_dib.size() > chast::kMaxClipboardImageBytes &&
+                               large_dib.size() < chast::kMaxClipboardDibSourceBytes &&
+                               publish_raw_clipboard({{CF_DIB, large_dib}}, &error),
+                           "publish oversized DIB");
+        }
+        chast::ClipboardContent large_readback;
+        if (raw_ok) {
+            raw_ok = stage(chast::read_clipboard_state(large_readback, &error) ==
+                                   chast::ClipboardReadState::Content &&
+                               large_readback.formats.size() == 1 &&
+                               large_readback.find(chast::ClipboardFormat::Dib) == nullptr &&
+                               large_readback.find(chast::ClipboardFormat::Png) != nullptr,
+                           "convert oversized DIB to PNG");
+        }
+
+        std::vector<uint8_t> bad_png = png;
+        bad_png[1] ^= 0xFF;
+        const std::vector<uint8_t> small_dib = make_clipboard_dib(2, 2);
+        if (raw_ok) {
+            raw_ok = stage(publish_raw_clipboard({{png_format, bad_png},
+                                                  {png_mime_format, bad_png},
+                                                  {CF_DIB, small_dib}},
+                                                 &error),
+                           "publish broken PNG with DIB");
+        }
+        chast::ClipboardContent fallback_readback;
+        if (raw_ok) {
+            raw_ok = stage(chast::read_clipboard_state(fallback_readback, &error) ==
+                                   chast::ClipboardReadState::Content &&
+                               fallback_readback.find(chast::ClipboardFormat::Dib) != nullptr &&
+                               fallback_readback.find(chast::ClipboardFormat::Png) != nullptr,
+                           "fall back from broken PNG to DIB");
+        }
+        if (!raw_ok) {
+            std::fprintf(stderr,
+                         "viewer-probe: native PNG clipboard contract failed at %s: %s\n",
+                         failed_stage.c_str(), error.c_str());
+        } else {
+            std::puts("viewer-probe: private native clipboard: independent PNG and "
+                      "image/png handles, oversized DIB to PNG, and broken-PNG DIB "
+                      "fallback passed");
+        }
+
+        chast::VirtualClipboard owner;
+        error.clear();
         ComPtr<IDataObject> object;
-        if (!OpenClipboard(nullptr)) return 1;
+        if (!raw_ok) {
+            result = 1;
+        } else if (!OpenClipboard(nullptr)) {
+            std::fprintf(stderr, "viewer-probe: cannot reserve the private clipboard\n");
+            result = 1;
+        } else {
         const bool published_while_busy = owner.Publish(source, &error);
         CloseClipboard();
         if (published_while_busy || !source->Active() || source->reads != 0) {
-            std::fprintf(stderr, "viewer-probe: busy clipboard did not preserve the offer for retry\n"); return 1;
-        }
-        if (!owner.Publish(source, &error) || OleGetClipboard(&object) != S_OK || !object) {
+            std::fprintf(stderr, "viewer-probe: busy clipboard did not preserve the offer for retry\n");
+            result = 1;
+        } else if (!owner.Publish(source, &error) || OleGetClipboard(&object) != S_OK || !object) {
             std::fprintf(stderr, "viewer-probe: native publication failed: %s\n", error.c_str());
         } else {
             FORMATETC format{static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileGroupDescriptorW")),
@@ -1923,6 +2223,7 @@ int native_clipboard_probe() {
             if (ok) { std::puts("viewer-probe: private OLE clipboard: metadata-only publish, marshalled IStream read and ownership cancellation passed"); result = 0; }
             else std::fprintf(stderr, "viewer-probe: native clipboard contract failed (reads=%u)\n", source->reads.load());
         }
+        }
     }
     OleUninitialize();
     // The OS closes private station/desktop handles when this dedicated probe exits.
@@ -1931,7 +2232,7 @@ int native_clipboard_probe() {
 
 int host_recording_probe() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const auto root = fs::temp_directory_path() / ("chast-host-recording-probe-" +
+    const auto root = probe_scratch_root() / ("chast-host-recording-probe-" +
         std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
     const auto recordings = root / L"录像 archive";
     std::string error;
@@ -2093,24 +2394,20 @@ int elevation_probe() {
 int multi_share_probe() {
     const uint64_t suffix =
         (static_cast<uint64_t>(GetCurrentProcessId()) << 20) ^ GetTickCount64();
-    const fs::path work = fs::temp_directory_path() /
+    const fs::path work = probe_scratch_root() /
                           ("chast-multi-share-probe-" + std::to_string(suffix));
     const fs::path receive = work / "receive";
     const fs::path share_a = work / "share-a";
     const fs::path share_b = work / "share-b";
     const fs::path staging = work / "staging";
     const std::string tree = "tree-" + std::to_string(suffix);
-    const std::string downloads_text = chast::default_receive_directory();
-    if (downloads_text.empty()) {
-        std::fprintf(stderr, "viewer-probe: the viewer has no download directory\n");
-        return 1;
-    }
-    const fs::path downloads = from_utf8(downloads_text);
-    ReceiveDirectoryGuard receive_guard(downloads);
+    const fs::path downloads = work / "downloads";
+    const std::string downloads_text = utf8(downloads);
 
     std::string error;
     bool success = false;
-    if (!write_file(receive / "receive-only.txt", "receive", &error) ||
+    if (!prepare_receive_directory(downloads, &error) ||
+        !write_file(receive / "receive-only.txt", "receive", &error) ||
         !write_file(share_a / tree / "a.txt", "alpha", &error) ||
         !write_file(share_a / tree / "sub" / "inner.txt", "inner", &error) ||
         !write_file(share_b / "b.txt", "bravo", &error) ||
@@ -2138,7 +2435,7 @@ int multi_share_probe() {
     }
     std::unique_ptr<chast_viewer::ViewerEngine> engine;
     if (host) {
-        engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        engine = make_probe_viewer(&sink, downloads, &error);
         engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
         engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
         if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
@@ -2357,23 +2654,18 @@ int multi_share_probe() {
 int file_conflict_probe() {
     const uint64_t suffix =
         (static_cast<uint64_t>(GetCurrentProcessId()) << 20) ^ GetTickCount64();
-    const fs::path work = fs::temp_directory_path() /
+    const fs::path work = probe_scratch_root() /
                           ("chast-file-conflict-probe-" + std::to_string(suffix));
     const fs::path receive = work / "receive";
     const fs::path share = work / "share";
     const fs::path staging = work / "staging";
     const std::string upload_name = "clash-" + std::to_string(suffix) + ".txt";
     const std::string download_name = "remote-" + std::to_string(suffix) + ".txt";
-    const std::string downloads_text = chast::default_receive_directory();
-    if (downloads_text.empty()) {
-        std::fprintf(stderr, "viewer-probe: the viewer has no download directory\n");
-        return 1;
-    }
-    const fs::path downloads = from_utf8(downloads_text);
-    ReceiveDirectoryGuard receive_guard(downloads);
+    const fs::path downloads = work / "downloads";
 
     std::string error;
-    if (!write_file(receive / "incoming" / upload_name, "host-old", &error) ||
+    if (!prepare_receive_directory(downloads, &error) ||
+        !write_file(receive / "incoming" / upload_name, "host-old", &error) ||
         !write_file(share / download_name, "host-remote", &error) ||
         !write_file(downloads / download_name, "local-old", &error) ||
         !write_file(staging / upload_name, "viewer-new", &error)) {
@@ -2399,7 +2691,7 @@ int file_conflict_probe() {
     }
     std::unique_ptr<chast_viewer::ViewerEngine> engine;
     if (host) {
-        engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        engine = make_probe_viewer(&sink, downloads, &error);
         engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
         engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
         if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
@@ -2696,6 +2988,282 @@ int file_conflict_probe() {
     std::error_code ignored;
     fs::remove_all(work, ignored);
     fs::remove(downloads / download_name, ignored);
+    return success ? 0 : 1;
+}
+
+// Protocol v74: selected folders travel as directory offers. The receiver must
+// create even an empty tree, while only regular files count as sent files or
+// produce file-audit entries. A Windows junction is never a folder to follow:
+// as a selected root it fails, and inside a tree it is skipped.
+int directory_upload_probe() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const uint64_t suffix =
+        (static_cast<uint64_t>(GetCurrentProcessId()) << 20) ^ GetTickCount64();
+    const std::string work_name =
+        "chast-directory-upload-probe-" + std::to_string(suffix);
+    fs::path work = probe_scratch_root() / work_name;
+    std::error_code prepare;
+    fs::create_directories(work, prepare);
+    if (prepare) {
+        // Some Windows test hosts run downloaded/build binaries with a token
+        // that cannot write the user temp directory. Keep the fallback inside
+        // the current build tree instead of turning a host-policy restriction
+        // into a directory-upload failure.
+        work = fs::current_path() / "test-temp" / work_name;
+        prepare.clear();
+        fs::create_directories(work, prepare);
+    }
+    if (prepare) {
+        std::fprintf(stderr, "viewer-probe: cannot create the test work directory: %s\n",
+                     prepare.message().c_str());
+        return 1;
+    }
+    const fs::path receive = work / "receive";
+    const fs::path staging = work / "staging";
+    const fs::path outside = work / "outside";
+    const fs::path root_junction = staging / "root-junction";
+    const fs::path tree_junction = staging / "junction-tree" / "jump";
+    const std::string payload = std::string("\x00payload\x01", 9);
+    const std::string nested_payload = "nested payload";
+    const std::string marker_payload = "must not escape the junction";
+
+    std::string error;
+    if (!write_file(staging / "mixed-tree" / "payload.bin", payload, &error) ||
+        !write_file(staging / "mixed-tree" / "nested-empty" / "a" / "nested.txt",
+                    nested_payload, &error) ||
+        !write_file(staging / "zero.txt", {}, &error) ||
+        !write_file(staging / "junction-tree" / "before.txt", "before", &error) ||
+        !write_file(staging / "junction-tree" / "after" / "after.txt", "after",
+                    &error) ||
+        !write_file(outside / "marker.txt", marker_payload, &error)) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        std::error_code ignored;
+        fs::remove_all(work, ignored);
+        return 1;
+    }
+    std::error_code ec;
+    fs::create_directories(staging / "empty-root", ec);
+    if (!ec) fs::create_directories(staging / "nested-empty" / "level-one" / "level-two", ec);
+    if (!ec) {
+        fs::create_directories(staging / "mixed-tree" / "empty-child", ec);
+    }
+    if (!ec) {
+        fs::create_directories(staging / "mixed-tree" / "nested-empty" / "a" / "b", ec);
+    }
+    if (!ec) fs::create_directories(receive / "incoming", ec);
+    if (ec) {
+        std::fprintf(stderr, "viewer-probe: cannot seed directory upload: %s\n",
+                     ec.message().c_str());
+        fs::remove_all(work, ec);
+        return 1;
+    }
+    if (!create_directory_reparse(root_junction, outside, &error) ||
+        !create_directory_reparse(tree_junction, outside, &error)) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        remove_directory_reparse(tree_junction);
+        remove_directory_reparse(root_junction);
+        std::error_code ignored;
+        fs::remove_all(work, ignored);
+        return 1;
+    }
+
+    const uint16_t port = pick_free_port();
+    ProbeSink sink;
+    std::unique_ptr<chast::HostServer> host;
+    if (port == 0) {
+        error = "no free loopback port";
+    } else if (!sink.create(&error)) {
+        // keep the error
+    } else {
+        host = start_host(utf8(receive), port, &error);
+    }
+    std::unique_ptr<chast_viewer::ViewerEngine> engine;
+    if (host) {
+        engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
+        engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
+        if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
+                           kPassword, {}, {}, false,
+                           chast_viewer::ViewerTransport::kAuto, {}, 0, {}, {},
+                           true)) {
+            error = "ViewerEngine::Start was refused";
+            engine.reset();
+        }
+    }
+
+    bool success = false;
+    if (engine && wait_streaming(*engine, 20s, &error) &&
+        wait_file_permission(*engine, 10s)) {
+        chast_viewer::ViewerEngine& viewer = *engine;
+        auto fail = [&](std::string message) {
+            error = std::move(message);
+            return false;
+        };
+        auto check_bytes = [&](const fs::path& path, const std::string& expected) {
+            std::string actual;
+            return read_file(path, &actual, &error) && actual == expected;
+        };
+        do {
+            const chast_viewer::ViewerStatus before = viewer.Snapshot();
+            const std::vector<std::string> roots = {
+                utf8(staging / "empty-root"), utf8(staging / "nested-empty"),
+                utf8(staging / "mixed-tree"), utf8(staging / "zero.txt")};
+            if (!viewer.SendFiles(roots, "incoming")) {
+                fail("SendFiles for directories and files was refused");
+                break;
+            }
+            const std::vector<fs::path> directories = {
+                receive / "incoming" / "empty-root",
+                receive / "incoming" / "nested-empty",
+                receive / "incoming" / "nested-empty" / "level-one",
+                receive / "incoming" / "nested-empty" / "level-one" / "level-two",
+                receive / "incoming" / "mixed-tree",
+                receive / "incoming" / "mixed-tree" / "empty-child",
+                receive / "incoming" / "mixed-tree" / "nested-empty",
+                receive / "incoming" / "mixed-tree" / "nested-empty" / "a",
+                receive / "incoming" / "mixed-tree" / "nested-empty" / "a" / "b"};
+            if (!wait_upload_settled(viewer, before.files_sent + 3,
+                                     before.file_failures, directories, 30s, &error)) {
+                break;
+            }
+            const chast_viewer::ViewerStatus after = viewer.Snapshot();
+            if (after.file_failures != before.file_failures ||
+                after.files_skipped != before.files_skipped) {
+                fail("successful directory offers affected the upload failure counters");
+                break;
+            }
+            if (!check_bytes(receive / "incoming" / "mixed-tree" / "payload.bin",
+                             payload) ||
+                !check_bytes(receive / "incoming" / "mixed-tree" / "nested-empty" /
+                                 "a" / "nested.txt", nested_payload)) {
+                fail("uploaded file bytes do not match their sources");
+                break;
+            }
+            const fs::path zero = receive / "incoming" / "zero.txt";
+            if (!fs::is_regular_file(zero, ec) || ec ||
+                fs::file_size(zero, ec) != 0 || ec) {
+                fail("a zero-byte regular file did not arrive as a file");
+                break;
+            }
+            std::vector<chast_viewer::ViewerEngine::CompletedFile> completed;
+            if (!viewer.TakeCompletedFiles(completed) || completed.size() != 3) {
+                fail("directory upload produced " + std::to_string(completed.size()) +
+                     " audit entries for 3 regular files");
+                break;
+            }
+            bool saw_payload = false;
+            bool saw_nested = false;
+            bool saw_zero = false;
+            bool audit_ok = true;
+            for (const auto& file : completed) {
+                audit_ok = audit_ok && file.upload && file.success;
+                saw_payload = saw_payload || (file.name == "payload.bin" &&
+                                               file.size == payload.size());
+                saw_nested = saw_nested || (file.name == "nested.txt" &&
+                                             file.size == nested_payload.size());
+                saw_zero = saw_zero || (file.name == "zero.txt" && file.size == 0);
+            }
+            if (!audit_ok || !saw_payload || !saw_nested || !saw_zero) {
+                fail("the file audit did not contain exactly the three regular files");
+                break;
+            }
+
+            // A junction selected as an upload root is a failed folder, not a
+            // file or an empty directory, and it must not enter the file audit.
+            const chast_viewer::ViewerStatus root_before = viewer.Snapshot();
+            if (!viewer.SendFiles({utf8(root_junction)}, "incoming")) {
+                fail("SendFiles for a junction root was refused locally");
+                break;
+            }
+            if (!wait_upload_settled(viewer, root_before.files_sent,
+                                     root_before.file_failures + 1, {}, 15s, &error)) {
+                break;
+            }
+            const chast_viewer::ViewerStatus root_failed = viewer.Snapshot();
+            if (root_failed.last_file_name != "root-junction" ||
+                root_failed.last_file_error.find("reparse points") == std::string::npos) {
+                fail("the junction root did not report a reparse-point failure");
+                break;
+            }
+            if (fs::exists(receive / "incoming" / "root-junction", ec) || ec) {
+                fail("the failed junction root created a destination entry");
+                break;
+            }
+            std::vector<chast_viewer::ViewerEngine::CompletedFile> failed_audit;
+            if (viewer.TakeCompletedFiles(failed_audit)) {
+                fail("a failed directory offer entered the file audit");
+                break;
+            }
+
+            // Inside an ordinary tree the junction (and its outside target) is
+            // skipped without becoming a failure or an empty destination folder.
+            const chast_viewer::ViewerStatus tree_before = viewer.Snapshot();
+            if (!viewer.SendFiles({utf8(staging / "junction-tree")}, "incoming")) {
+                fail("SendFiles for a tree containing a junction was refused");
+                break;
+            }
+            const std::vector<fs::path> tree_directories = {
+                receive / "incoming" / "junction-tree",
+                receive / "incoming" / "junction-tree" / "after"};
+            if (!wait_upload_settled(viewer, tree_before.files_sent + 2,
+                                     tree_before.file_failures, tree_directories,
+                                     15s, &error)) {
+                break;
+            }
+            if (!check_bytes(receive / "incoming" / "junction-tree" / "before.txt",
+                             "before") ||
+                !check_bytes(receive / "incoming" / "junction-tree" / "after" /
+                                 "after.txt", "after")) {
+                fail("the ordinary files around a junction were not uploaded");
+                break;
+            }
+            if (fs::exists(receive / "incoming" / "junction-tree" / "jump", ec) || ec) {
+                fail("a junction inside the tree created a destination folder");
+                break;
+            }
+            std::vector<chast_viewer::ViewerEngine::CompletedFile> tree_audit;
+            if (!viewer.TakeCompletedFiles(tree_audit) || tree_audit.size() != 2 ||
+                tree_audit[0].name == "jump" || tree_audit[1].name == "jump") {
+                fail("the tree audit did not contain only its two regular files");
+                break;
+            }
+            fs::recursive_directory_iterator entry(receive, ec);
+            const fs::recursive_directory_iterator end;
+            bool marker_uploaded = false;
+            while (!ec && entry != end) {
+                if (entry->is_regular_file(ec) && entry->path().filename() == "marker.txt") {
+                    marker_uploaded = true;
+                    break;
+                }
+                entry.increment(ec);
+            }
+            if (ec || marker_uploaded) {
+                fail("a junction target file escaped into the receive tree");
+                break;
+            }
+            if (!check_bytes(outside / "marker.txt", marker_payload)) {
+                fail("the junction target was modified");
+                break;
+            }
+            success = true;
+        } while (false);
+        if (!success && !error.empty()) {
+            std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        }
+    } else if (!error.empty()) {
+        std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+    }
+    if (engine) engine->Stop();
+    if (host) host->stop();
+    remove_directory_reparse(tree_junction);
+    remove_directory_reparse(root_junction);
+    std::error_code ignored;
+    fs::remove_all(work, ignored);
+    if (success) {
+        std::printf("viewer-probe: directory upload -> 9 folders (including empty trees), "
+                    "3 regular files, zero-byte file, junction root refused, nested "
+                    "junction skipped, no directory audit entries\n");
+    }
     return success ? 0 : 1;
 }
 
@@ -3097,6 +3665,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
     if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();
     if (argc == 2 && std::string(argv[1]) == "--file-conflict") return file_conflict_probe();
+    if (argc == 2 && std::string(argv[1]) == "--directory-upload") return directory_upload_probe();
     if (argc == 2 && std::string(argv[1]) == "--keyboard") return keyboard_probe();
     bool files_only = false;
     bool file_pages = false;
@@ -3122,7 +3691,8 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: chast-viewer-probe [--files-only | --file-pages | --files-only-denied | "
-                         "--clipboard-files | --clipboard-files-up | --file-conflict | --keyboard] "
+                         "--clipboard-files | --clipboard-files-up | --file-conflict | "
+                         "--directory-upload | --keyboard] "
                          "[--clipboard-empty]\n");
             return 2;
         }
@@ -3138,20 +3708,17 @@ int main(int argc, char** argv) {
                           "probe-" + std::to_string(suffix) + "-loose.txt",
                           "probe-" + std::to_string(suffix) + "-cancel.bin"};
     const fs::path work_directory =
-        fs::temp_directory_path() / ("chast-viewer-probe-" + std::to_string(suffix));
+        probe_scratch_root() / ("chast-viewer-probe-" + std::to_string(suffix));
     const fs::path share = work_directory / "share";
-    const std::string downloads_text = chast::default_receive_directory();
-    if (downloads_text.empty()) {
-        std::fprintf(stderr, "viewer-probe: the viewer has no download directory\n");
-        return 1;
-    }
-    const fs::path downloads = from_utf8(downloads_text);
-    ReceiveDirectoryGuard receive_guard(downloads);
+    const fs::path downloads = work_directory / "downloads";
+    const std::string downloads_text = utf8(downloads);
 
     int exit_code = 1;
     {
         std::string error;
-        if (!seed_share(share, names, &error)) {
+        if (!prepare_receive_directory(downloads, &error)) {
+            std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+        } else if (!seed_share(share, names, &error)) {
             std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
         } else if (!seed_upload(work_directory, share, &error)) {
             std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
@@ -3173,7 +3740,7 @@ int main(int argc, char** argv) {
             }
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
-                engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine = make_probe_viewer(&sink, downloads, &error);
                 engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
                 engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
@@ -3309,7 +3876,7 @@ int main(int argc, char** argv) {
             auto reads = std::make_shared<std::atomic<unsigned>>(0);
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
-                engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine = make_probe_viewer(&sink, downloads, &error);
                 engine->SetClipboardSource([reads](chast::ClipboardContent&) { ++*reads; return true; });
                 engine->SetClipboardFileSource([reads](std::vector<std::string>&) { ++*reads; return false; });
                 engine->SetClipboardVirtualSink(
@@ -3429,7 +3996,7 @@ int main(int argc, char** argv) {
             auto viewer_clipboard = std::make_shared<ClipboardCapture>();
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
-                engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine = make_probe_viewer(&sink, downloads, &error);
                 engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
                 engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
                 engine->SetClipboardFileSource(
@@ -3533,7 +4100,7 @@ int main(int argc, char** argv) {
 
             std::unique_ptr<chast_viewer::ViewerEngine> engine;
             if (host) {
-                engine = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+                engine = make_probe_viewer(&sink, downloads, &error);
                 engine->SetClipboardSource([](chast::ClipboardContent&) { return true; });
                 engine->SetClipboardFileSource([](std::vector<std::string>&) { return false; });
                 if (!engine->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},

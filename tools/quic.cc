@@ -1,10 +1,10 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
 //   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio [--audio-silence-gate-ms N]] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal] [--allow-camera]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--adaptive-jitter] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--adaptive-jitter] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX] [--access-ticket B64URL --access-ticket-seed B64URL [--access-ticket-renewal B64URL ...]]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--file-browse] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
-//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--idle-disconnect] [--encoder auto|vpl|ffmpeg]
+//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--idle-disconnect] [--annotation-overlay] [--encoder auto|vpl|ffmpeg]
 //                      [--netem [--audio [--audio-stream] [--play [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]]]]] [--record out.mp4]
 //                      [--netem-delay-ms N] [--netem-jitter-ms N] [--netem-loss-percent X] [--netem-rate-kbps N]
 //
@@ -151,6 +151,7 @@
 #include <vector>
 
 #include "annexb.h"
+#include "chast/access_ticket.h"
 #include "chast/audio.h"
 #include "chast/capture.h"
 #include "chast/carrier.h"
@@ -161,6 +162,7 @@
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
 #include "chast/identity.h"
+#include "chast/png.h"
 #include "chast/port_forward_client.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
@@ -171,9 +173,9 @@
 
 namespace {
 
-// A four-format clipboard item for verify: text, HTML, RTF and a 2x2 32bpp
-// DIB. The sizes stay far below the protocol caps; the point is that every
-// format survives both the CCLB stream and the host's write-back.
+// A five-format clipboard item for verify: text, HTML, RTF, a 2x2 32bpp DIB
+// and the same pixels as PNG. Every format survives both the CCLB stream and
+// the host's write-back.
 chast::ClipboardContent rich_clipboard_probe(const std::string& text) {
     chast::ClipboardContent content;
     chast::ClipboardFormatData plain;
@@ -210,6 +212,15 @@ chast::ClipboardContent rich_clipboard_probe(const std::string& text) {
         dib.data[i] = static_cast<uint8_t>(0x10 + i);
     }
     content.formats.push_back(std::move(dib));
+    chast::ClipboardFormatData png;
+    png.format = chast::ClipboardFormat::Png;
+    const uint8_t png_pixels[16] = {
+        0x20, 0x30, 0x40, 0xFF, 0x21, 0x31, 0x41, 0xFF,
+        0x28, 0x38, 0x48, 0xFF, 0x29, 0x39, 0x49, 0xFF};
+    std::string png_error;
+    if (chast::encode_png_bgra(png_pixels, 2, 2, 8, png.data, &png_error)) {
+        content.formats.push_back(std::move(png));
+    }
     return content;
 }
 
@@ -328,12 +339,15 @@ std::vector<uint8_t> compression_probe_content(size_t size) {
     return bytes;
 }
 
-// The upload probe's five offers: a complete fresh file, the prefix of the
-// same payload under another name, the rest of that file, a complete file with
-// a relative directory, and an honest payload with a digest that cannot match.
+// The upload probe keeps its original file cases and adds metadata-only folder
+// offers. The folder cases cover empty roots, nested empty trees, idempotent
+// repeats, a mixed tree and a path that collides with a regular file.
 inline constexpr size_t kFileProbeBytes = 300u * 1024u;
 inline constexpr size_t kFileResumePrefix = 100u * 1024u;
 inline constexpr size_t kFileDigestBytes = 64u * 1024u;
+inline constexpr size_t kFileProbeOffers = 12;
+inline constexpr size_t kFileProbeResults = 11;
+inline constexpr size_t kFileProbeStoredFiles = 4;
 // The browse probe seeds this text in a subfolder of the host's shared
 // directory; its size and name let the listing check tell folder and file
 // entries apart.
@@ -931,6 +945,10 @@ struct Options {
     // session alive across the timeout; a quiet session must be closed by the
     // host itself, and a host with the timeout off must leave it open.
     bool idle_disconnect = false;
+    // verify only: draw through the real HostServer so its per-monitor layered
+    // annotation windows are created, then inspect visibility, styles, pixels
+    // and teardown. This needs an interactive Default desktop.
+    bool annotation_overlay = false;
     // verify only: walk the viewer's picture preferences. A quality/frame-rate
     // change and its restore must be answered with the effective values and
     // followed by a StreamInfo; the other encoder family is requested to prove
@@ -1020,6 +1038,11 @@ struct Options {
     // channel, walk into a subfolder, check that escapes are refused, then
     // download a seeded file and compare it byte for byte.
     bool file_browse = false;
+    // connect only: request one file listing before a permission update and
+    // require the same request to be refused after the host narrows the
+    // session. This is the real-host counterpart to the in-process browse
+    // probe, which cannot exercise a mid-session permission change.
+    bool file_list_probe = false;
     // verify only: ask the host to relay a loopback TCP echo endpoint, push a
     // deterministic payload through it and require the same bytes back.
     bool port_forward = false;
@@ -1074,6 +1097,17 @@ struct Options {
     // connect: compute the current six-digit code from it, or send `totp`.
     std::string totp_secret;
     std::string totp;
+    // connect: a managed host needs both a signed access ticket and the
+    // Ed25519 seed named by that ticket, so the tool can produce the Hello
+    // possession proof. The values are unpadded base64url.
+    std::string access_ticket;
+    std::string access_ticket_seed;
+    std::vector<uint8_t> access_ticket_bytes;
+    std::vector<uint8_t> access_ticket_key;
+    // connect: additional signed tickets consumed at 20 s intervals. This
+    // mirrors the GUI viewer's renewal cadence without embedding its account
+    // lookup in the transport harness.
+    std::vector<std::vector<uint8_t>> access_ticket_renewals;
     // connect: reference sent in Hello so the host's inbound audit records and
     // the viewer's own report can be merged. serve: JSONL spool the host
     // appends its inbound audit records to (the tunnel agent forwards them).
@@ -1276,6 +1310,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.sas = true;
             } else if (arg == "--idle-disconnect") {
                 options.idle_disconnect = true;
+            } else if (arg == "--annotation-overlay") {
+                options.annotation_overlay = true;
             } else if (arg == "--stream-options") {
                 options.stream_options = true;
             } else if (arg == "--send-clipboard" && i + 1 < argc) {
@@ -1317,6 +1353,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.file_compression = true;
             } else if (arg == "--file-browse") {
                 options.file_browse = true;
+            } else if (arg == "--file-list-probe") {
+                options.file_list_probe = true;
             } else if (arg == "--port-forward") {
                 options.port_forward = true;
             } else if (arg == "--port-forward-denied") {
@@ -1358,6 +1396,18 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.totp = argv[++i];
             } else if (arg == "--totp-secret" && i + 1 < argc) {
                 options.totp_secret = argv[++i];
+            } else if (arg == "--access-ticket" && i + 1 < argc) {
+                options.access_ticket = argv[++i];
+            } else if (arg == "--access-ticket-seed" && i + 1 < argc) {
+                options.access_ticket_seed = argv[++i];
+            } else if (arg == "--access-ticket-renewal" && i + 1 < argc) {
+                std::vector<uint8_t> renewal;
+                if (!chast::decode_ticket_base64url(argv[++i], &renewal) || renewal.empty()) {
+                    std::fprintf(stderr,
+                                 "--access-ticket-renewal is not unpadded base64url\n");
+                    return false;
+                }
+                options.access_ticket_renewals.push_back(std::move(renewal));
             } else if (arg == "--audit-ref" && i + 1 < argc) {
                 options.audit_ref = argv[++i];
             } else if (arg == "--audit-spool" && i + 1 < argc) {
@@ -1402,6 +1452,33 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "--token is longer than %u bytes\n",
                      static_cast<unsigned>(chast::kMaxAccessTokenLength));
         return false;
+    }
+    if (options.access_ticket.empty() != options.access_ticket_seed.empty()) {
+        std::fprintf(stderr, "--access-ticket and --access-ticket-seed go together\n");
+        return false;
+    }
+    if (!options.access_ticket_renewals.empty() && options.access_ticket.empty()) {
+        std::fprintf(stderr,
+                     "--access-ticket-renewal needs --access-ticket and --access-ticket-seed\n");
+        return false;
+    }
+    if (!options.access_ticket.empty()) {
+        if (options.mode != "connect") {
+            std::fprintf(stderr, "--access-ticket only applies to connect\n");
+            return false;
+        }
+        if (!chast::decode_ticket_base64url(options.access_ticket,
+                                            &options.access_ticket_bytes) ||
+            options.access_ticket_bytes.empty()) {
+            std::fprintf(stderr, "--access-ticket is not unpadded base64url\n");
+            return false;
+        }
+        if (!chast::decode_ticket_base64url(options.access_ticket_seed,
+                                            &options.access_ticket_key) ||
+            options.access_ticket_key.size() != 32) {
+            std::fprintf(stderr, "--access-ticket-seed must be a 32-byte base64url Ed25519 seed\n");
+            return false;
+        }
     }
     if (options.transport != "udp" && options.mode == "serve") {
         std::fprintf(stderr, "--transport only applies to connect and verify; "
@@ -1479,6 +1556,10 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.file_browse && options.mode != "verify") {
         std::fprintf(stderr, "--file-browse only applies to verify\n");
+        return false;
+    }
+    if (options.file_list_probe && options.mode != "connect") {
+        std::fprintf(stderr, "--file-list-probe only applies to connect\n");
         return false;
     }
     if (options.file_browse && (options.file_upload || options.file_download)) {
@@ -1874,6 +1955,8 @@ struct ReceiverStats {
     std::vector<chast::InputEvent> input_sent;
     bool input_enabled = false;
     uint64_t input_errors = 0;
+    chast::PermissionMask permissions = 0;
+    uint64_t permission_updates = 0;
     // The host's desktop reports: a clean loopback stays on Default.
     uint64_t desktop_states = 0;
     chast::DesktopKind desktop_kind = chast::DesktopKind::Default;
@@ -2408,7 +2491,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     }
     if (options.microphone && options.microphone_recorder) {
         std::shared_ptr<MicrophoneRecorder> recorder = options.microphone_recorder;
-        config.microphone_player = [recorder](std::string*) -> std::unique_ptr<chast::IAudioPlayer> {
+        config.microphone_player =
+            [recorder](const chast::AudioPlayerConfig&, std::string*)
+            -> std::unique_ptr<chast::IAudioPlayer> {
             return std::make_unique<RecordingMicrophonePlayer>(recorder);
         };
     }
@@ -2870,6 +2955,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     client_config.access_token = options.token;
     client_config.password = options.password;
     client_config.totp = options.totp;
+    client_config.access_ticket = options.access_ticket_bytes;
+    client_config.access_ticket_key = options.access_ticket_key;
     client_config.audit_ref = options.audit_ref;
     client_config.audio_datagram = !options.audio_stream;
     client_config.codec_preference = options.codec == chast::VideoCodec::Hevc ? chast::StreamCodecPreference::Hevc :
@@ -3017,7 +3104,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             return fail("the server refused clipboard (it was not started with --clipboard)");
         }
         if (options.mode == "verify") {
-            // The fake backend proves the exact four-format item, so verify
+            // The fake backend proves the exact five-format item, so verify
             // uploads a fixed one; connect may still upload a text given on
             // the command line through the legacy message.
             chast::ClipboardContent content =
@@ -3083,8 +3170,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         size_t send_from = 0;
         size_t send_to = 0;
         uint64_t answer_offset = 0;
+        chast::FileCode answer = chast::FileCode::Ok;
         chast::FileCode result = chast::FileCode::Ok;
         uint64_t result_received = 0;
+        bool expect_result = true;
         const char* label = "";
     };
     std::vector<FileProbeStage> file_stages;
@@ -3150,11 +3239,60 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         digest_stage.result = chast::FileCode::IoError;
         digest_stage.result_received = digest_stage.content.size();
         file_stages.push_back(std::move(digest_stage));
+
+        auto add_directory_stage = [&](const char* label, const std::string& name,
+                                       const std::string& parent,
+                                       chast::FileCode answer = chast::FileCode::Ok,
+                                       bool expect_result = true) {
+            FileProbeStage stage;
+            stage.label = label;
+            stage.offer.transfer_id =
+                kFileProbeId + static_cast<uint32_t>(file_stages.size());
+            stage.offer.name = name;
+            stage.offer.relative_path = parent;
+            stage.offer.directory = true;
+            stage.answer = answer;
+            stage.expect_result = expect_result;
+            file_stages.push_back(std::move(stage));
+        };
+        // The selected root itself, an empty child two levels below it, and a
+        // repeated root prove that metadata-only offers survive an otherwise
+        // empty tree and that creating an existing directory is idempotent.
+        add_directory_stage("empty-root", "chast-verify-empty", "");
+        add_directory_stage("nested-empty", "leaf", "chast-verify-empty/parent");
+        add_directory_stage("repeated-empty", "chast-verify-empty", "");
+
+        // A mixed tree needs the parent before its zero-byte leaf, matching the
+        // viewer's directory-first walk.
+        add_directory_stage("mixed-root", "chast-verify-mixed", "");
+        add_directory_stage("mixed-nested-empty", "empty", "chast-verify-mixed/tree");
+        FileProbeStage zero_stage;
+        zero_stage.label = "zero-byte";
+        zero_stage.offer.transfer_id =
+            kFileProbeId + static_cast<uint32_t>(file_stages.size());
+        zero_stage.offer.name = "empty.bin";
+        zero_stage.offer.relative_path = "chast-verify-mixed";
+        std::array<uint8_t, 1> empty_byte{};
+        if (!chast::sha256(empty_byte.data(), 0, zero_stage.offer.sha256)) {
+            return fail("could not hash the empty-file probe payload");
+        }
+        file_stages.push_back(std::move(zero_stage));
+
+        // The nested file above makes this leaf path a regular file. The host
+        // must refuse the directory without converting or replacing it, and a
+        // refusal has no FileResult.
+        add_directory_stage("file-conflict", "chast-verify-nested.bin",
+                            "chast-verify/nested", chast::FileCode::Refused, false);
     }
     auto advance_file_upload = [&]() -> bool {
         if (!stats.file_probe || file_step == FileStep::Done) {
             return true;
         }
+        auto finish_stage = [&]() {
+            ++file_stage_index;
+            file_step = file_stage_index < file_stages.size() ? FileStep::Offer
+                                                              : FileStep::Done;
+        };
         if (file_step == FileStep::Offer) {
             const FileProbeStage& stage = file_stages[file_stage_index];
             if (chast::Error offered = session->offer_file(stage.offer); !offered.ok()) {
@@ -3165,8 +3303,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             ++stats.file_offers_sent;
             file_step = FileStep::WaitAnswer;
             if (!options.quiet) {
-                std::printf("quic: offering %s (%llu bytes%s)\n", stage.offer.name.c_str(),
+                std::printf("quic: offering %s (%llu bytes%s%s)\n", stage.offer.name.c_str(),
                             static_cast<unsigned long long>(stage.offer.size),
+                            stage.offer.directory ? ", directory" : "",
                             stage.offer.resume ? ", resumable" : "");
             }
             return true;
@@ -3183,11 +3322,32 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 stats.error = "the host answered a transfer the probe did not offer";
                 return false;
             }
-            if (answer.code != chast::FileCode::Ok) {
+            if (answer.code != stage.answer) {
                 ++stats.file_errors;
-                stats.error = std::string("the host refused the ") + stage.label +
-                              " file: " + answer.reason;
+                stats.error = std::string("the ") + stage.label + " offer was answered as " +
+                              std::to_string(static_cast<int>(answer.code)) + ", expected " +
+                              std::to_string(static_cast<int>(stage.answer)) +
+                              (answer.reason.empty() ? std::string()
+                                                     : ": " + answer.reason);
                 return false;
+            }
+            if (answer.code != chast::FileCode::Ok) {
+                if (answer.reason.empty()) {
+                    ++stats.file_errors;
+                    stats.error = std::string("the host refused the ") + stage.label +
+                                  " offer without a reason";
+                    return false;
+                }
+                if (!stage.expect_result) {
+                    if (!options.quiet) {
+                        std::printf("quic: host refused the %s folder as planned: %s\n",
+                                    stage.label, answer.reason.c_str());
+                    }
+                    finish_stage();
+                    return true;
+                }
+                file_step = FileStep::WaitResult;
+                continue;
             }
             if (answer.resume_offset != stage.answer_offset) {
                 ++stats.file_errors;
@@ -3195,6 +3355,24 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                               std::to_string(answer.resume_offset) + " instead of " +
                               std::to_string(stage.answer_offset);
                 return false;
+            }
+            if (stage.offer.directory) {
+                // A metadata-only offer must never open a CFIL stream, including
+                // through the public data/finish calls.
+                const uint8_t probe_byte = 1;
+                const chast::Error data = session->send_file_data(
+                    stage.offer.transfer_id, &probe_byte, 1);
+                const chast::Error finish =
+                    session->finish_file_upload(stage.offer.transfer_id);
+                if (data.status() != chast::Status::InvalidCall ||
+                    finish.status() != chast::Status::InvalidCall) {
+                    ++stats.file_errors;
+                    stats.error = std::string("the ") + stage.label +
+                                  " directory accepted file-stream calls";
+                    return false;
+                }
+                file_step = FileStep::WaitResult;
+                continue;
             }
             file_position = stage.send_from;
             file_step = FileStep::SendData;
@@ -3243,17 +3421,19 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             if (!options.quiet) {
                 if (result.code == chast::FileCode::Ok) {
-                    std::printf("quic: host stored the %s file (%llu bytes)\n",
-                                stage.label,
-                                static_cast<unsigned long long>(result.received));
+                    if (stage.offer.directory) {
+                        std::printf("quic: host created the %s folder\n", stage.label);
+                    } else {
+                        std::printf("quic: host stored the %s file (%llu bytes)\n",
+                                    stage.label,
+                                    static_cast<unsigned long long>(result.received));
+                    }
                 } else {
                     std::printf("quic: host refused the %s upload as planned: %s\n",
                                 stage.label, result.reason.c_str());
                 }
             }
-            ++file_stage_index;
-            file_step = file_stage_index < file_stages.size() ? FileStep::Offer
-                                                              : FileStep::Done;
+            finish_stage();
         }
         return true;
     };
@@ -4782,6 +4962,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
 
     const auto start = std::chrono::steady_clock::now();
+    size_t next_access_ticket_renewal = 0;
+    auto access_ticket_renewal_at = start + std::chrono::seconds(20);
     // A finite window bounds a stalled peer. The extra 20 s covers the
     // sender's own duration and the closing Stats/Bye exchange, so the normal
     // end is always the server's FIN, not this deadline.
@@ -4907,6 +5089,76 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             info.width, info.height,
                             info.source_width, info.source_height, info.origin_x,
                             info.origin_y);
+            }
+        }
+        return true;
+    };
+
+    auto drain_permission_updates = [&] {
+        chast::PermissionMask permission_mask = 0;
+        while (session->take_permission_update(permission_mask)) {
+            stats.permissions = permission_mask;
+            ++stats.permission_updates;
+            if (!options.quiet) {
+                std::printf("quic: host permissions updated to 0x%08X\n", permission_mask);
+            }
+        }
+    };
+
+    // A real-host permission narrowing is only useful if the viewer actually
+    // stops offering the revoked feature. Ask once before the update so the
+    // real host has answered through the browse channel, then require the
+    // same request to fail with PermissionDenied after the update arrives.
+    bool file_list_before_sent = false;
+    bool file_list_before_answered = false;
+    bool file_list_after_checked = false;
+    uint32_t file_list_before_id = 0;
+    uint32_t file_list_after_id = 0;
+    auto advance_file_list_probe = [&]() -> bool {
+        if (!options.file_list_probe) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!file_list_before_sent && now - start >= std::chrono::seconds(2)) {
+            file_list_before_id = 0x0AC1E001u;
+            const chast::Error asked = session->request_file_list(file_list_before_id, "");
+            if (!asked.ok()) {
+                stats.error = "file list before narrowing: " + asked.to_string();
+                return false;
+            }
+            file_list_before_sent = true;
+            if (!options.quiet) {
+                std::printf("quic: file list request sent before permission narrowing\n");
+            }
+        }
+        if (file_list_before_sent && !file_list_before_answered) {
+            chast::FileListResult result;
+            while (session->take_file_list_result(result)) {
+                if (result.request_id != file_list_before_id) {
+                    continue;
+                }
+                file_list_before_answered = true;
+                if (!options.quiet) {
+                    std::printf("quic: file list before narrowing answered code=%u reason=%s\n",
+                                static_cast<unsigned>(result.code), result.reason.c_str());
+                }
+                break;
+            }
+        }
+        if (file_list_before_answered && stats.permission_updates > 0 &&
+            !file_list_after_checked) {
+            file_list_after_id = 0x0AC1E002u;
+            const chast::Error denied =
+                session->request_file_list(file_list_after_id, "");
+            if (denied.status() != chast::Status::PermissionDenied) {
+                stats.error = "file list after narrowing was not denied: " +
+                              denied.to_string();
+                return false;
+            }
+            file_list_after_checked = true;
+            if (!options.quiet) {
+                std::printf("quic: file list after narrowing denied: %s\n",
+                            denied.to_string().c_str());
             }
         }
         return true;
@@ -5980,6 +6232,22 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     };
 
     while (std::chrono::steady_clock::now() < deadline) {
+        if (next_access_ticket_renewal < options.access_ticket_renewals.size() &&
+            std::chrono::steady_clock::now() >= access_ticket_renewal_at) {
+            const chast::Error renewed = session->renew_access_ticket(
+                options.access_ticket_renewals[next_access_ticket_renewal],
+                std::chrono::seconds(10));
+            if (!renewed.ok()) {
+                return fail("renew_access_ticket: " + renewed.to_string());
+            }
+            ++next_access_ticket_renewal;
+            access_ticket_renewal_at += std::chrono::seconds(20);
+            if (!options.quiet) {
+                std::printf("quic: access ticket renewed (%zu/%zu)\n",
+                            next_access_ticket_renewal,
+                            options.access_ticket_renewals.size());
+            }
+        }
         // The mode probe's answers arrive on the control stream, so take them
         // before waiting on video: a host that is rebuilding capture sends no
         // frames while a mode change is applied.
@@ -5987,6 +6255,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             return fail(stats.error);
         }
         if (!drain_stream_updates()) {
+            return fail(stats.error);
+        }
+        drain_permission_updates();
+        if (!advance_file_list_probe()) {
             return fail(stats.error);
         }
         if (stats.clipboard_over_limit_sent && !stats.clipboard_followup_sent &&
@@ -6037,6 +6309,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             return fail(stats.error);
         }
         drain_display_switch_results();
+        drain_permission_updates();
+        if (!advance_file_list_probe()) {
+            return fail(stats.error);
+        }
         drain_audio(std::chrono::milliseconds(0));
         if (options.microphone && !stats.microphone_started &&
             std::chrono::steady_clock::now() >= microphone_start_at) {
@@ -6606,6 +6882,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         stats.record_error.empty() ? "" : " error=",
                         stats.record_error.c_str());
         }
+    }
+
+    if (options.file_list_probe && (!file_list_before_answered || !file_list_after_checked)) {
+        return fail("file list probe did not complete before the session ended");
     }
 
     const uint64_t elapsed_ms = static_cast<uint64_t>(
@@ -7760,6 +8040,488 @@ bool clipboard_gate_works(uint16_t port, std::string* detail) {
         return false;
     }
     serving.join();
+    return true;
+}
+
+// Annotation is a draw-only control path: it must cross the real QUIC control
+// stream and preserve message order even when input permission is closed.
+bool annotation_roundtrip_works(uint16_t port, std::string* detail) {
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = port;
+    server_config.idle_timeout_ms = 3000;
+    server_config.allow_input = false;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "server: " + error;
+        return false;
+    }
+    const std::string pin = server->server_fingerprint();
+    std::thread serving([&] {
+        if (!server->wait_for_client(std::chrono::seconds(5)).ok()) {
+            return;
+        }
+        chast::ServerInfo info;
+        info.width = 64;
+        info.height = 64;
+        info.source_width = 64;
+        info.source_height = 64;
+        info.framerate = 30;
+        info.bitrate = 100000;
+        info.encoder = "annotation probe";
+        server->announce(info);
+    });
+
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 3000;
+    client_config.pinned_fingerprint = pin;
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        serving.join();
+        return false;
+    }
+    if (chast::Error connected = client->connect(std::chrono::seconds(5)); !connected.ok()) {
+        *detail = "connect: " + connected.to_string();
+        serving.join();
+        return false;
+    }
+    chast::ServerInfo info;
+    if (chast::Error handshaken =
+            client->handshake(info, std::chrono::seconds(5), chast::kDisplayAuto);
+        !handshaken.ok()) {
+        *detail = "handshake: " + handshaken.to_string();
+        serving.join();
+        return false;
+    }
+    if (info.input_enabled) {
+        *detail = "the annotation probe unexpectedly enabled input";
+        serving.join();
+        return false;
+    }
+
+    const std::vector<chast::AnnotationMessage> messages = {
+        {chast::AnnotationAction::Begin, 41, {{-320, -180}}},
+        {chast::AnnotationAction::Move, 41, {{-300, -160}, {-280, -140}}},
+        {chast::AnnotationAction::End, 41, {{-280, -140}}},
+        {chast::AnnotationAction::Undo, 0, {}},
+        {chast::AnnotationAction::Clear, 0, {}},
+    };
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (chast::Error sent = client->request_annotation(messages[i]); !sent.ok()) {
+            *detail = "annotation " + std::to_string(i) + ": " + sent.to_string();
+            serving.join();
+            return false;
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (server->annotations_received() < messages.size() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (server->annotations_received() != messages.size()) {
+        *detail = "received " + std::to_string(server->annotations_received()) +
+                  " annotation messages, expected " + std::to_string(messages.size());
+        serving.join();
+        return false;
+    }
+    for (size_t i = 0; i < messages.size(); ++i) {
+        chast::AnnotationMessage received;
+        if (!server->take_annotation(received)) {
+            *detail = "annotation " + std::to_string(i) + " was not queued";
+            serving.join();
+            return false;
+        }
+        const chast::AnnotationMessage& expected = messages[i];
+        if (received.action != expected.action || received.stroke_id != expected.stroke_id ||
+            received.points.size() != expected.points.size()) {
+            *detail = "annotation " + std::to_string(i) + " did not preserve its header";
+            serving.join();
+            return false;
+        }
+        for (size_t point = 0; point < expected.points.size(); ++point) {
+            if (received.points[point].x != expected.points[point].x ||
+                received.points[point].y != expected.points[point].y) {
+                *detail = "annotation " + std::to_string(i) + " point " +
+                          std::to_string(point) + " changed in transit";
+                serving.join();
+                return false;
+            }
+        }
+    }
+    serving.join();
+    return true;
+}
+
+BOOL CALLBACK collect_annotation_window(HWND window, LPARAM context) {
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id != GetCurrentProcessId()) {
+        return TRUE;
+    }
+    wchar_t class_name[64]{};
+    if (GetClassNameW(window, class_name, static_cast<int>(std::size(class_name))) == 0 ||
+        std::wstring(class_name) != L"chast_annotation_overlay") {
+        return TRUE;
+    }
+    reinterpret_cast<std::vector<HWND>*>(context)->push_back(window);
+    return TRUE;
+}
+
+void collect_annotation_windows(std::vector<HWND>* windows) {
+    windows->clear();
+    EnumWindows(&collect_annotation_window, reinterpret_cast<LPARAM>(windows));
+}
+
+BOOL CALLBACK collect_annotation_monitor(HMONITOR monitor_handle, HDC, LPRECT, LPARAM context) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor_handle, &info) != FALSE) {
+        reinterpret_cast<std::vector<RECT>*>(context)->push_back(info.rcMonitor);
+    }
+    return TRUE;
+}
+
+std::vector<RECT> annotation_monitor_rects() {
+    std::vector<RECT> monitors;
+    EnumDisplayMonitors(nullptr, nullptr, &collect_annotation_monitor,
+                        reinterpret_cast<LPARAM>(&monitors));
+    return monitors;
+}
+
+bool same_rect(const RECT& left, const RECT& right) {
+    return left.left == right.left && left.top == right.top && left.right == right.right &&
+           left.bottom == right.bottom;
+}
+
+void sort_rects(std::vector<RECT>* rects) {
+    std::sort(rects->begin(), rects->end(), [](const RECT& left, const RECT& right) {
+        if (left.left != right.left) {
+            return left.left < right.left;
+        }
+        if (left.top != right.top) {
+            return left.top < right.top;
+        }
+        if (left.right != right.right) {
+            return left.right < right.right;
+        }
+        return left.bottom < right.bottom;
+    });
+}
+
+bool wait_for_annotation_windows(bool visible, std::vector<HWND>* windows,
+                                 std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        collect_annotation_windows(windows);
+        if (!windows->empty()) {
+            bool state_matches = true;
+            for (HWND window : *windows) {
+                if (!IsWindow(window) || (IsWindowVisible(window) != FALSE) != visible) {
+                    state_matches = false;
+                    break;
+                }
+            }
+            if (state_matches) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    collect_annotation_windows(windows);
+    return false;
+}
+
+bool capture_screen_patch(const RECT& rect, std::vector<uint8_t>* pixels, std::string* error) {
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    if (width <= 0 || height <= 0) {
+        *error = "invalid screen patch extent";
+        return false;
+    }
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        *error = "GetDC returned no desktop surface";
+        return false;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        *error = "CreateCompatibleDC failed";
+        return false;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        if (bitmap != nullptr) {
+            DeleteObject(bitmap);
+        }
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        *error = "CreateDIBSection failed";
+        return false;
+    }
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    const BOOL copied = BitBlt(memory, 0, 0, width, height, screen, rect.left, rect.top,
+                               SRCCOPY | CAPTUREBLT);
+    GdiFlush();
+    if (previous != nullptr) {
+        SelectObject(memory, previous);
+    }
+    if (copied != FALSE) {
+        const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+        const auto* source = static_cast<const uint8_t*>(bits);
+        pixels->assign(source, source + bytes);
+    }
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    if (copied == FALSE) {
+        *error = "BitBlt could not read the desktop";
+        return false;
+    }
+    return true;
+}
+
+size_t changed_screen_pixels(const std::vector<uint8_t>& before,
+                             const std::vector<uint8_t>& after) {
+    if (before.size() != after.size() || before.size() % 4 != 0) {
+        return 0;
+    }
+    size_t changed = 0;
+    for (size_t offset = 0; offset < before.size(); offset += 4) {
+        const int blue = std::abs(static_cast<int>(before[offset]) - after[offset]);
+        const int green = std::abs(static_cast<int>(before[offset + 1]) - after[offset + 1]);
+        const int red = std::abs(static_cast<int>(before[offset + 2]) - after[offset + 2]);
+        if (blue + green + red >= 24) {
+            ++changed;
+        }
+    }
+    return changed;
+}
+
+// Unlike annotation_roundtrip_works, this check goes through the production
+// HostServer. It therefore proves the per-monitor Win32 overlay is really
+// created, rendered, made click-through and hidden, then destroyed with the
+// session rather than merely proving that messages crossed QUIC.
+bool annotation_overlay_works(uint16_t port, std::string* detail) {
+    std::vector<HWND> existing;
+    collect_annotation_windows(&existing);
+    if (!existing.empty()) {
+        *detail = "an annotation overlay already exists before the probe starts";
+        return false;
+    }
+
+    std::unique_ptr<chast::HostServer> server;
+    std::unique_ptr<chast::QuicSession> client;
+    std::vector<HWND> planes;
+    auto cleanup = [&] {
+        client.reset();
+        if (server) {
+            server->stop();
+        }
+    };
+    auto fail = [&](std::string message) {
+        cleanup();
+        *detail = std::move(message);
+        return false;
+    };
+
+    chast::HostServerConfig config;
+    config.settings.bind_address = "127.0.0.1";
+    config.settings.port = port;
+    config.settings.carrier = false;
+    config.settings.max_viewers = 1;
+    config.settings.allow_input = false;
+    config.settings.allow_clipboard = false;
+    config.settings.allow_audio = false;
+    config.settings.allow_microphone = false;
+    config.settings.allow_file_transfer = false;
+    config.settings.allow_port_forward = false;
+    config.settings.allow_terminal = false;
+    config.settings.allow_camera = false;
+    config.settings.token_auth = true;
+    config.settings.access_token = "chast-annotation-overlay-probe";
+    config.settings.token_mode = chast::HostTokenMode::OneTime;
+    config.settings.codec = chast::VideoCodec::H264;
+    config.settings.framerate = 30;
+    config.settings.bitrate_kbps = 1000;
+    config.serve_once = true;
+    config.run_seconds = 8.0;
+    config.first_client_timeout_ms = 10000;
+    config.finish_timeout_ms = 5000;
+    config.adaptive_bitrate = false;
+    config.adaptive_fps = false;
+    std::string error;
+    server = chast::HostServer::create(std::move(config), &error);
+    if (!server) {
+        *detail = "annotation host: " + error;
+        return false;
+    }
+    const std::string pin = server->status().fingerprint;
+    server->start();
+
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 10000;
+    client_config.pinned_fingerprint = pin;
+    client_config.access_token = "chast-annotation-overlay-probe";
+    client_config.requested_permissions = 0;
+    client = chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        return fail("annotation client: " + error);
+    }
+    if (chast::Error connected = client->connect(std::chrono::seconds(10)); !connected.ok()) {
+        return fail("annotation connect: " + connected.to_string());
+    }
+    chast::ServerInfo info;
+    if (chast::Error handshaken =
+            client->handshake(info, std::chrono::seconds(10), chast::kDisplayAuto);
+        !handshaken.ok()) {
+        return fail("annotation handshake: " + handshaken.to_string());
+    }
+    if (info.input_enabled) {
+        return fail("the annotation host unexpectedly enabled input permission");
+    }
+
+    std::vector<RECT> monitors = annotation_monitor_rects();
+    if (monitors.empty()) {
+        return fail("no monitor was reported for overlay placement");
+    }
+    sort_rects(&monitors);
+    const RECT primary = monitors.front();
+    const int monitor_width =
+        static_cast<int>(primary.right - primary.left);
+    const int monitor_height =
+        static_cast<int>(primary.bottom - primary.top);
+    const int patch_width = (std::min)(320, monitor_width - 40);
+    const int patch_height = (std::min)(180, monitor_height - 40);
+    if (patch_width < 80 || patch_height < 80) {
+        return fail("the primary monitor is too small for the pixel probe");
+    }
+    RECT patch{primary.left + (primary.right - primary.left - patch_width) / 2,
+               primary.top + (primary.bottom - primary.top - patch_height) / 2, 0, 0};
+    patch.right = patch.left + patch_width;
+    patch.bottom = patch.top + patch_height;
+    std::vector<uint8_t> before;
+    if (!capture_screen_patch(patch, &before, &error)) {
+        return fail("baseline screenshot: " + error);
+    }
+
+    std::vector<chast::AnnotationPoint> path;
+    constexpr uint32_t stroke_id = 0x43484153;
+    constexpr int rows = 12;
+    for (int row = 0; row < rows; ++row) {
+        const int y = patch.top + 20 + row * ((patch_height - 40) / (rows - 1));
+        const int first_x = patch.left + 20;
+        const int last_x = patch.right - 20;
+        if ((row & 1) == 0) {
+            path.push_back({first_x, y});
+            path.push_back({last_x, y});
+        } else {
+            path.push_back({last_x, y});
+            path.push_back({first_x, y});
+        }
+    }
+    chast::AnnotationMessage begin;
+    begin.action = chast::AnnotationAction::Begin;
+    begin.stroke_id = stroke_id;
+    begin.points.push_back(path.front());
+    chast::AnnotationMessage move;
+    move.action = chast::AnnotationAction::Move;
+    move.stroke_id = stroke_id;
+    move.points.assign(path.begin() + 1, path.end());
+    chast::AnnotationMessage end;
+    end.action = chast::AnnotationAction::End;
+    end.stroke_id = stroke_id;
+    end.points.push_back(path.back());
+    for (const chast::AnnotationMessage& message : {begin, move, end}) {
+        if (chast::Error sent = client->request_annotation(message); !sent.ok()) {
+            return fail("annotation draw: " + sent.to_string());
+        }
+    }
+
+    if (!wait_for_annotation_windows(true, &planes, std::chrono::seconds(8))) {
+        collect_annotation_windows(&planes);
+        return fail("HostServer did not show " + std::to_string(monitors.size()) +
+                    " annotation plane(s); saw " + std::to_string(planes.size()));
+    }
+    if (planes.size() != monitors.size()) {
+        return fail("HostServer created " + std::to_string(planes.size()) +
+                    " overlays for " + std::to_string(monitors.size()) + " monitor(s)");
+    }
+    std::vector<RECT> plane_rects;
+    for (HWND window : planes) {
+        const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+        const LONG_PTR ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        const LONG_PTR required = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                                  WS_EX_TRANSPARENT | WS_EX_LAYERED;
+        if ((style & WS_POPUP) == 0 || (ex_style & required) != required) {
+            return fail("annotation plane lacks popup/no-activate/click-through/layered style");
+        }
+        RECT rect{};
+        if (GetWindowRect(window, &rect) == FALSE) {
+            return fail("GetWindowRect failed for an annotation plane");
+        }
+        plane_rects.push_back(rect);
+        const LRESULT hit = SendMessageW(window, WM_NCHITTEST, 0,
+                                        MAKELPARAM((rect.left + rect.right) / 2,
+                                                   (rect.top + rect.bottom) / 2));
+        if (hit != HTTRANSPARENT) {
+            return fail("annotation plane did not answer WM_NCHITTEST as transparent");
+        }
+    }
+    sort_rects(&plane_rects);
+    for (size_t i = 0; i < monitors.size(); ++i) {
+        if (!same_rect(monitors[i], plane_rects[i])) {
+            return fail("annotation plane bounds do not match monitor " + std::to_string(i));
+        }
+    }
+
+    std::vector<uint8_t> after;
+    if (!capture_screen_patch(patch, &after, &error)) {
+        return fail("annotation screenshot: " + error);
+    }
+    const size_t changed = changed_screen_pixels(before, after);
+    if (changed < 1000) {
+        return fail("the visible annotation changed only " + std::to_string(changed) +
+                    " screen pixels");
+    }
+
+    chast::AnnotationMessage clear;
+    clear.action = chast::AnnotationAction::Clear;
+    if (chast::Error sent = client->request_annotation(clear); !sent.ok()) {
+        return fail("annotation clear: " + sent.to_string());
+    }
+    if (!wait_for_annotation_windows(false, &planes, std::chrono::seconds(5))) {
+        return fail("the annotation plane stayed visible after Clear");
+    }
+
+    client.reset();
+    server->stop();
+    for (HWND window : planes) {
+        if (IsWindow(window)) {
+            return fail("an annotation plane survived its HostServer session");
+        }
+    }
+    std::vector<HWND> remaining;
+    collect_annotation_windows(&remaining);
+    if (!remaining.empty()) {
+        return fail("annotation windows remain after the HostServer stopped");
+    }
     return true;
 }
 
@@ -8920,10 +9682,11 @@ int run_verify(const Options& options) {
         local.seconds = 20.0;
     }
     if (local.file_upload) {
-        // Five serialized offers, two of which wait for the host to reject the
-        // finished stream, need more than the default short session.
-        if (local.seconds < 6.0) {
-            local.seconds = 6.0;
+        // Twelve serialized offers include streamed files, metadata-only
+        // folders and two planned refusals. Keep the loopback observation long
+        // enough to complete every stage on a slow debugger host.
+        if (local.seconds < 10.0) {
+            local.seconds = 10.0;
         }
         // Keep the probe out of the operator's Downloads folder: the host gets
         // a fresh temporary directory it can write into without prompting.
@@ -9166,6 +9929,9 @@ int run_verify(const Options& options) {
     bool fresh_file_on_disk_ok = false;
     bool resumed_file_on_disk_ok = false;
     bool nested_file_on_disk_ok = false;
+    bool zero_file_on_disk_ok = false;
+    bool empty_directories_on_disk_ok = false;
+    bool conflict_file_preserved_ok = false;
     bool digest_file_absent = false;
     bool no_partial_left = false;
     std::string file_check_detail;
@@ -9188,7 +9954,7 @@ int run_verify(const Options& options) {
         const std::filesystem::path nested_directory =
             directory / "chast-verify" / "nested";
         std::vector<uint8_t> stored;
-        if (sent.received_file_paths.size() == 3) {
+        if (sent.received_file_paths.size() == kFileProbeStoredFiles) {
             fresh_file_on_disk_ok =
                 read_all(sent.received_file_paths[0], stored) && stored == expected;
             stored.clear();
@@ -9203,7 +9969,30 @@ int run_verify(const Options& options) {
                                             nested_ec) &&
                 !nested_ec && read_all(sent.received_file_paths[2], stored) &&
                 stored == expected;
+            stored.clear();
+            const std::filesystem::path zero_path =
+                from_utf8(sent.received_file_paths[3]);
+            std::error_code zero_ec;
+            zero_file_on_disk_ok =
+                std::filesystem::equivalent(zero_path.parent_path(),
+                                            directory / "chast-verify-mixed", zero_ec) &&
+                !zero_ec && std::filesystem::is_regular_file(zero_path, zero_ec) &&
+                !zero_ec && std::filesystem::file_size(zero_path, zero_ec) == 0 && !zero_ec;
         }
+        auto plain_empty_directory = [](const std::filesystem::path& path) {
+            std::error_code ec;
+            return std::filesystem::is_directory(path, ec) && !ec &&
+                   std::filesystem::is_empty(path, ec) && !ec;
+        };
+        empty_directories_on_disk_ok =
+            plain_empty_directory(directory / "chast-verify-empty" / "parent" / "leaf") &&
+            plain_empty_directory(directory / "chast-verify-mixed" / "tree" / "empty");
+        const std::filesystem::path conflict_path =
+            directory / "chast-verify" / "nested" / "chast-verify-nested.bin";
+        std::error_code conflict_ec;
+        conflict_file_preserved_ok =
+            std::filesystem::is_regular_file(conflict_path, conflict_ec) && !conflict_ec &&
+            read_all(conflict_path.string(), stored) && stored == expected;
         file_check_detail =
             "the host reported " + std::to_string(sent.received_file_paths.size()) +
             " stored file(s)";
@@ -9332,6 +10121,24 @@ int run_verify(const Options& options) {
         check(passed, "a clipboard-disabled server refuses to send and drops viewer updates");
         if (!passed) {
             std::printf("     clipboard gate probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
+        const bool passed =
+            annotation_roundtrip_works(static_cast<uint16_t>(probe_base + 24), &detail);
+        check(passed, "annotation crosses QUIC in order without input permission");
+        if (!passed) {
+            std::printf("     annotation probe: %s\n", detail.c_str());
+        }
+    }
+    if (local.annotation_overlay) {
+        std::string detail;
+        const bool passed =
+            annotation_overlay_works(static_cast<uint16_t>(probe_base + 25), &detail);
+        check(passed, "HostServer draws a visible click-through annotation overlay and tears it down");
+        if (!passed) {
+            std::printf("     annotation overlay probe: %s\n", detail.c_str());
         }
     }
     {
@@ -9829,7 +10636,11 @@ int run_verify(const Options& options) {
         check(received.clipboard_contents.size() == 1 &&
                   same_clipboard_content(received.clipboard_contents.front(),
                                          local.fake_clipboard->updated),
-              "the received item carried the host's text, HTML, RTF and DIB");
+              "the received item carried the host's text, HTML, RTF, DIB and PNG");
+        check(!received.clipboard_contents.empty() &&
+                  received.clipboard_contents.front().find(
+                      chast::ClipboardFormat::Png) != nullptr,
+              "the received clipboard item carried PNG image bytes");
         check(!received.clipboard_contents.empty() &&
                   received.clipboard_contents.front().text().size() >
                       chast::kMaxClipboardBytes,
@@ -9872,52 +10683,73 @@ int run_verify(const Options& options) {
 
     if (local.file_upload) {
         check(received.file_probe, "the viewer ran the file upload probe");
-        check(received.file_offers_sent == 5 && received.file_answers == 5,
-              "the viewer made five offers and the host answered each");
-        check(received.file_answer_codes.size() == 5 &&
+        check(received.file_offers_sent == kFileProbeOffers &&
+                  received.file_answers == kFileProbeOffers,
+              "the viewer made twelve file and folder offers and the host answered each");
+        check(received.file_answer_codes.size() == kFileProbeOffers &&
                   std::all_of(received.file_answer_codes.begin(),
-                              received.file_answer_codes.end(),
-                              [](chast::FileCode code) { return code == chast::FileCode::Ok; }),
-              "the host accepted all five offers");
-        check(received.file_answer_offsets.size() == 5 &&
+                              received.file_answer_codes.end() - 1,
+                              [](chast::FileCode code) { return code == chast::FileCode::Ok; }) &&
+                  received.file_answer_codes.back() == chast::FileCode::Refused,
+              "the host accepted every valid offer and refused the file collision");
+        check(received.file_answer_offsets.size() == kFileProbeOffers &&
                   received.file_answer_offsets[0] == 0 &&
                   received.file_answer_offsets[1] == 0 &&
                   received.file_answer_offsets[2] == kFileResumePrefix &&
-                  received.file_answer_offsets[3] == 0 &&
-                  received.file_answer_offsets[4] == 0,
-              "the retry resumed at the prefix the truncated upload left");
+                  std::all_of(received.file_answer_offsets.begin() + 3,
+                              received.file_answer_offsets.end(),
+                              [](uint64_t offset) { return offset == 0; }),
+              "only the retry resumed at the prefix the truncated upload left");
+        check(received.file_answer_reasons.size() == kFileProbeOffers &&
+                  !received.file_answer_reasons.back().empty(),
+              "the refused folder collision carried the host's reason");
         check(received.file_bytes_sent == 3 * kFileProbeBytes + kFileDigestBytes,
-              "the viewer streamed 964 KiB across the five offers");
-        check(received.file_results == 5 && received.file_result_codes.size() == 5 &&
+              "folders and the zero-byte file added no streamed bytes");
+        check(received.file_results == kFileProbeResults &&
+                  received.file_result_codes.size() == kFileProbeResults &&
                   received.file_result_codes[0] == chast::FileCode::Ok &&
                   received.file_result_codes[1] == chast::FileCode::IoError &&
                   received.file_result_codes[2] == chast::FileCode::Ok &&
                   received.file_result_codes[3] == chast::FileCode::Ok &&
-                  received.file_result_codes[4] == chast::FileCode::IoError,
+                  received.file_result_codes[4] == chast::FileCode::IoError &&
+                  std::all_of(received.file_result_codes.begin() + 5,
+                              received.file_result_codes.end(),
+                              [](chast::FileCode code) { return code == chast::FileCode::Ok; }),
               "the truncated and mis-hashed uploads were refused, the complete ones "
-              "stored");
-        check(received.file_result_received.size() == 5 &&
+              "and folders completed");
+        check(received.file_result_received.size() == kFileProbeResults &&
                   received.file_result_received[0] == kFileProbeBytes &&
                   received.file_result_received[1] == kFileResumePrefix &&
                   received.file_result_received[2] == kFileProbeBytes &&
                   received.file_result_received[3] == kFileProbeBytes &&
-                  received.file_result_received[4] == kFileDigestBytes,
+                  received.file_result_received[4] == kFileDigestBytes &&
+                  std::all_of(received.file_result_received.begin() + 5,
+                              received.file_result_received.end(),
+                              [](uint64_t received) { return received == 0; }),
               "every result reported the bytes the host actually holds");
-        check(received.file_result_reasons.size() == 5 &&
+        check(received.file_result_reasons.size() == kFileProbeResults &&
                   !received.file_result_reasons[1].empty() &&
                   !received.file_result_reasons[4].empty(),
               "both refusals carried the host's reason");
         check(received.file_errors == 0, "the uploader saw no protocol errors");
-        check(sent.files_received == 3 && sent.file_bytes_received == 3 * kFileProbeBytes,
-              "the host finalized exactly the three complete files");
+        check(sent.files_received == kFileProbeStoredFiles &&
+                  sent.file_bytes_received == 3 * kFileProbeBytes,
+              "the host finalized four files while folders changed neither counter");
         check(fresh_file_on_disk_ok, "the fresh upload matches the offered payload");
         check(resumed_file_on_disk_ok, "the resumed upload matches the offered payload");
         check(nested_file_on_disk_ok,
               "the folder upload landed below its relative directory");
+        check(zero_file_on_disk_ok, "the zero-byte file landed in the mixed folder");
+        check(empty_directories_on_disk_ok,
+              "the top-level and nested empty folders exist on disk");
+        check(conflict_file_preserved_ok,
+              "the refused folder collision left the regular file unchanged");
         check(digest_file_absent && no_partial_left,
               "the digest refusal left neither the file nor a partial behind");
         if (!fresh_file_on_disk_ok || !resumed_file_on_disk_ok ||
-            !nested_file_on_disk_ok || !digest_file_absent || !no_partial_left) {
+            !nested_file_on_disk_ok || !zero_file_on_disk_ok ||
+            !empty_directories_on_disk_ok || !conflict_file_preserved_ok ||
+            !digest_file_absent || !no_partial_left) {
             std::printf("     %s\n", file_check_detail.c_str());
         }
     }

@@ -696,8 +696,9 @@ bool write_managed_policy_ack(const std::string& ack_path, const std::string& st
                                       .count();
     const std::string detail =
         (mode == "open" || mode == "restricted")
-            ? "managed fail-closed: access tickets are not implemented (v62)"
-            : "unknown managed mode enforced fail-closed: access tickets are not implemented (v62)";
+            ? "managed policy applied: new sessions require a valid access ticket"
+            : "managed policy applied with an unrecognized mode: new sessions still require a "
+              "valid access ticket";
     std::string body = "{\n  \"policy_version\": " + std::to_string(version) +
                        ",\n  \"mode\": " + json_quote(mode) +
                        ",\n  \"permission_ceiling\": " + std::to_string(permission_ceiling) +

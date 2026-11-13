@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 72.
+// The chast wire protocol, version 76.
 //
 // One QUIC connection carries:
 //
@@ -56,7 +56,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 73;
+inline constexpr uint16_t kProtocolVersion = 76;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -507,6 +507,15 @@ enum class ControlType : uint16_t {
     // that stream; a request naming a shape the host no longer holds is
     // ignored, because the next pointer sample will bring the current shape.
     CursorShapeRequest = 88,
+    // Viewer -> host (v76): a temporary session annotation stroke. Draw-only:
+    // no point reaches the input injector and no input permission is required.
+    // Payload: action (u8, see AnnotationAction), three reserved zero bytes,
+    // stroke id (u32), point count (u16), two reserved zero bytes, then one or
+    // more points as x (i32), y (i32) in virtual-desktop pixels. Clear and
+    // undo carry zero points and stroke id 0; begin, move and end carry 1..64
+    // points and a non-zero stroke id. A client throttles moves and batches
+    // nearby samples so the host never sees an unbounded control stream.
+    Annotation = 89,
 };
 
 // ----- input -----
@@ -726,6 +735,39 @@ std::vector<uint8_t> make_show_cursor(const ShowCursorHint& hint);
 bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint,
                        std::string* error);
 
+// Temporary freehand annotations. A stroke belongs to the viewer session and
+// disappears when that session ends; this is deliberately not a persistent
+// whiteboard. Coordinates are virtual-desktop pixels, like ShowCursorHint and
+// InputEvent::mouse, and are never injected.
+enum class AnnotationAction : uint8_t {
+    Clear = 0,
+    Begin = 1,
+    Move = 2,
+    End = 3,
+    Undo = 4,
+};
+
+inline constexpr uint16_t kMaxAnnotationPoints = 64;
+// Keeps malformed coordinates from carrying absurd canvas positions while
+// still allowing virtual desktops with monitors far to the left or above the
+// primary output.
+inline constexpr int32_t kMaxAnnotationCoordinate = 1 << 20;
+
+struct AnnotationPoint {
+    int32_t x = 0;
+    int32_t y = 0;
+};
+
+struct AnnotationMessage {
+    AnnotationAction action = AnnotationAction::Clear;
+    uint32_t stroke_id = 0;
+    std::vector<AnnotationPoint> points;
+};
+
+std::vector<uint8_t> make_annotation(const AnnotationMessage& annotation);
+bool parse_annotation(const std::vector<uint8_t>& payload, AnnotationMessage& annotation,
+                      std::string* error);
+
 // ----- clipboard -----
 //
 // Rich clipboard content (text, HTML, RTF and DIB) travels on its own
@@ -805,8 +847,13 @@ inline constexpr uint8_t kFileOfferFlagResume = 0x01;
 // stages it for CF_HDROP instead of filing it into the receive directory, and
 // the clipboard permission, not file transfer, gates it.
 inline constexpr uint8_t kFileOfferFlagClipboard = 0x02;
+// The offer describes a directory rather than a file (protocol v74). A
+// directory has no CFIL stream and its answer is followed by a zero-byte
+// FileResult. `name` is the directory leaf and `relative_path` is its parent
+// below the receive root.
+inline constexpr uint8_t kFileOfferFlagDirectory = 0x04;
 inline constexpr uint8_t kFileOfferFlagsKnown =
-    kFileOfferFlagResume | kFileOfferFlagClipboard;
+    kFileOfferFlagResume | kFileOfferFlagClipboard | kFileOfferFlagDirectory;
 inline constexpr uint8_t kFileConflictFlagIdentical = 0x01;
 inline constexpr uint8_t kFileConflictFlagsKnown = kFileConflictFlagIdentical;
 
@@ -833,6 +880,7 @@ struct FileOffer {
     uint64_t size = 0;
     bool resume = false;
     bool clipboard = false;  // a clipboard copy staged for CF_HDROP
+    bool directory = false;  // create `relative_path/name`, no CFIL stream
     std::array<uint8_t, 32> sha256{};
     std::string name;
     // Directory below the receiver's root, '/'-separated and without the

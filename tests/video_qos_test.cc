@@ -136,6 +136,31 @@ int main() {
         check(near(bitrate.state(6700).ratio, 1.5f),
               "any fixed-quality display disables adaptive ratio globally");
 
+        VideoQos delivery_stall(30, 1.5f);
+        delivery_stall.open(1, 0);
+        delivery_stall.display(10, 1, 5000, true, 0);
+        delivery_stall.delay(1, 10, 1100);
+        delivery_stall.pending(1, 1900, 2000);
+        check(near(delivery_stall.state(2000).ratio, 1.5f),
+              "a sub-two-second outstanding receipt is treated as jitter");
+        delivery_stall.pending(1, 2100, 2500);
+        check(near(delivery_stall.state(2500).ratio, 0.45f),
+              "the first receipt beyond two seconds cuts bitrate to the quality floor");
+        delivery_stall.delay(1, 10, 2600);
+        delivery_stall.delay(1, 10, 2700);
+        delivery_stall.delay(1, 10, 2800);
+        check(delivery_stall.state(2800).fps > 15,
+              "completing a delivery stall starts frame-rate recovery");
+        delivery_stall.delay(1, 10, 2900);
+        delivery_stall.delay(1, 10, 3000);
+        delivery_stall.delay(1, 10, 3100);
+        check(delivery_stall.state(3100).fps == 30,
+              "a clean delivery path still restores the previous frame rate");
+        delivery_stall.display(10, 6, 5000, true, 5500);
+        const auto delivery_ratio = delivery_stall.state(5500).ratio;
+        check(near(delivery_ratio, 0.5175f),
+              "normal bounded bitrate recovery follows the urgent cut");
+
         // RustDesk feeds its periodic adjustment once a second. An elevated
         // but unconfirmed delay must not clear the dynamic counter on every
         // tick, or a moving screen loses the evidence needed to recover.

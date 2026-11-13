@@ -1954,6 +1954,137 @@ bool parse_show_cursor(const std::vector<uint8_t>& payload, ShowCursorHint& hint
     return true;
 }
 
+namespace {
+
+bool annotation_action_value(AnnotationAction action, uint8_t* value) {
+    switch (action) {
+        case AnnotationAction::Clear: *value = 0; return true;
+        case AnnotationAction::Begin: *value = 1; return true;
+        case AnnotationAction::Move: *value = 2; return true;
+        case AnnotationAction::End: *value = 3; return true;
+        case AnnotationAction::Undo: *value = 4; return true;
+    }
+    return false;
+}
+
+bool annotation_action_from_value(uint8_t value, AnnotationAction* action) {
+    switch (value) {
+        case 0: *action = AnnotationAction::Clear; return true;
+        case 1: *action = AnnotationAction::Begin; return true;
+        case 2: *action = AnnotationAction::Move; return true;
+        case 3: *action = AnnotationAction::End; return true;
+        case 4: *action = AnnotationAction::Undo; return true;
+        default: return false;
+    }
+}
+
+bool valid_annotation_point(const AnnotationPoint& point) {
+    return point.x >= -kMaxAnnotationCoordinate && point.x <= kMaxAnnotationCoordinate &&
+           point.y >= -kMaxAnnotationCoordinate && point.y <= kMaxAnnotationCoordinate;
+}
+
+bool annotation_shape_valid(AnnotationAction action, uint32_t stroke_id,
+                            size_t point_count) {
+    if (action == AnnotationAction::Clear || action == AnnotationAction::Undo) {
+        return stroke_id == 0 && point_count == 0;
+    }
+    return stroke_id != 0 && point_count >= 1 && point_count <= kMaxAnnotationPoints;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_annotation(const AnnotationMessage& annotation) {
+    uint8_t action_value = 0;
+    if (!annotation_action_value(annotation.action, &action_value) ||
+        !annotation_shape_valid(annotation.action, annotation.stroke_id,
+                                annotation.points.size())) {
+        return {};
+    }
+    for (const AnnotationPoint& point : annotation.points) {
+        if (!valid_annotation_point(point)) {
+            return {};
+        }
+    }
+    std::vector<uint8_t> payload(12 + 8 * annotation.points.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, action_value);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u32(cursor, annotation.stroke_id);
+    put_u16(cursor, static_cast<uint16_t>(annotation.points.size()));
+    put_u16(cursor, 0);
+    for (const AnnotationPoint& point : annotation.points) {
+        put_u32(cursor, static_cast<uint32_t>(point.x));
+        put_u32(cursor, static_cast<uint32_t>(point.y));
+    }
+    return make_control(ControlType::Annotation, payload);
+}
+
+bool parse_annotation(const std::vector<uint8_t>& payload, AnnotationMessage& annotation,
+                      std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t action_value = 0;
+    uint8_t reserved0 = 0;
+    uint8_t reserved1 = 0;
+    uint8_t reserved2 = 0;
+    uint32_t stroke_id = 0;
+    uint16_t point_count = 0;
+    uint16_t reserved3 = 0;
+    if (!reader.u8(action_value) || !reader.u8(reserved0) || !reader.u8(reserved1) ||
+        !reader.u8(reserved2) || !reader.u32(stroke_id) || !reader.u16(point_count) ||
+        !reader.u16(reserved3)) {
+        set_error(error, "truncated Annotation");
+        return false;
+    }
+    AnnotationAction action;
+    if (!annotation_action_from_value(action_value, &action)) {
+        set_error(error, "Annotation names an unknown action");
+        return false;
+    }
+    if (reserved0 != 0 || reserved1 != 0 || reserved2 != 0 || reserved3 != 0) {
+        set_error(error, "Annotation carries non-zero reserved bytes");
+        return false;
+    }
+    if (point_count > kMaxAnnotationPoints) {
+        set_error(error, "Annotation carries too many points");
+        return false;
+    }
+    if (!annotation_shape_valid(action, stroke_id, point_count)) {
+        set_error(error, "Annotation action, stroke id and point count disagree");
+        return false;
+    }
+    if (payload.size() != 12 + 8 * static_cast<size_t>(point_count)) {
+        set_error(error, payload.size() < 12 + 8 * static_cast<size_t>(point_count)
+                              ? "truncated Annotation points"
+                              : "Annotation carries trailing bytes");
+        return false;
+    }
+    annotation.action = action;
+    annotation.stroke_id = stroke_id;
+    annotation.points.clear();
+    annotation.points.reserve(point_count);
+    for (uint16_t i = 0; i < point_count; ++i) {
+        uint32_t x = 0;
+        uint32_t y = 0;
+        if (!reader.u32(x) || !reader.u32(y)) {
+            set_error(error, "truncated Annotation point");
+            return false;
+        }
+        AnnotationPoint point{static_cast<int32_t>(x), static_cast<int32_t>(y)};
+        if (!valid_annotation_point(point)) {
+            set_error(error, "Annotation point is outside the coordinate bound");
+            return false;
+        }
+        annotation.points.push_back(point);
+    }
+    if (!reader.at_end()) {
+        set_error(error, "Annotation carries trailing bytes");
+        return false;
+    }
+    return true;
+}
+
 bool valid_clipboard_text(const std::string& text) {
     return !text.empty() && text.size() <= kMaxClipboardBytes && valid_utf8(text);
 }
@@ -4758,19 +4889,29 @@ std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
         // transfer until the peer's timeout.
         return {};
     }
+    if (offer.directory) {
+        std::string path_error;
+        if (offer.clipboard || offer.resume || offer.size != 0 || offer.modified_time != 0 ||
+            std::any_of(offer.sha256.begin(), offer.sha256.end(),
+                        [](uint8_t byte) { return byte != 0; }) ||
+            offer.name.size() > kMaxFileNameBytes ||
+            !parse_file_relative_path(offer.relative_path, &path_error)) {
+            return {};
+        }
+    }
     const std::string name = truncate_utf8_reason(offer.name, kMaxFileNameBytes);
     std::string relative = offer.relative_path;
-    if (relative.size() > kMaxFileRelativePathBytes) {
-        // The parser refuses over-long paths; clearing keeps the length field
-        // honest instead of truncating a UTF-8 byte sequence in half.
-        relative.clear();
+    std::string path_error;
+    if (!parse_file_relative_path(relative, &path_error)) {
+        return {};
     }
     std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size() + 2 + relative.size() + 8);
     uint8_t* cursor = payload.data();
     put_u32(cursor, offer.transfer_id);
     put_u64(cursor, offer.size);
     put_u8(cursor, static_cast<uint8_t>((offer.resume ? kFileOfferFlagResume : 0) |
-                                        (offer.clipboard ? kFileOfferFlagClipboard : 0)));
+                                        (offer.clipboard ? kFileOfferFlagClipboard : 0) |
+                                        (offer.directory ? kFileOfferFlagDirectory : 0)));
     std::memcpy(cursor, offer.sha256.data(), offer.sha256.size());
     cursor += offer.sha256.size();
     put_u16(cursor, static_cast<uint16_t>(name.size()));
@@ -4806,6 +4947,7 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
     }
     offer.resume = (flags & kFileOfferFlagResume) != 0;
     offer.clipboard = (flags & kFileOfferFlagClipboard) != 0;
+    offer.directory = (flags & kFileOfferFlagDirectory) != 0;
     if (offer.size > kMaxFileTransferBytes) {
         set_error(error, "FileOffer names a file past the protocol limit");
         return false;
@@ -4843,6 +4985,22 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
     if (offer.name.empty() || !valid_utf8(offer.name)) {
         set_error(error, "FileOffer carries an unusable name");
         return false;
+    }
+    if (offer.directory) {
+        if (offer.clipboard || offer.resume) {
+            set_error(error, "a directory FileOffer cannot be a clipboard or resume offer");
+            return false;
+        }
+        if (offer.size != 0) {
+            set_error(error, "a directory FileOffer has a non-zero size");
+            return false;
+        }
+        if (offer.modified_time != 0 ||
+            std::any_of(offer.sha256.begin(), offer.sha256.end(),
+                        [](uint8_t byte) { return byte != 0; })) {
+            set_error(error, "a directory FileOffer carries file metadata");
+            return false;
+        }
     }
     return true;
 }

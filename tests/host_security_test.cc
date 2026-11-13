@@ -143,7 +143,7 @@ void test_managed_policy() {
     result = security.evaluate(hello, "192.0.2.5:5001", 5002);
     check(result.decision == Decision::Deny &&
               result.reason.find("managed") != std::string::npos,
-          "a managed device refuses a valid password until access tickets exist");
+          "a managed device refuses a valid password when no access ticket is supplied");
 
     write("not a policy file");
     result = security.evaluate(hello, "192.0.2.5:5002", 5003);

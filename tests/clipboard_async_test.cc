@@ -14,9 +14,11 @@
 #include <mutex>
 #include <thread>
 #include "chast/host_server.h"
+#include "chast/png.h"
 #include "chast/security.h"
 #include "viewer_engine.h"
 #include "clipboard_stub.h"
+#include "test_workdir.h"
 
 namespace {
 using namespace std::chrono_literals;
@@ -73,6 +75,8 @@ struct Clipboard {
     int reads = 0;
     int attempts = 0;
     std::vector<std::string> written;
+    std::vector<uint8_t> png;
+    std::vector<std::vector<uint8_t>> written_png;
     bool read(chast::ClipboardContent& content) {
         std::unique_lock lock(mutex);
         ++reads;
@@ -83,6 +87,7 @@ struct Clipboard {
         if (fail_reads > 0) { --fail_reads; return false; }
         if (!text.empty()) content.formats.push_back({chast::ClipboardFormat::Text,
                                                      {text.begin(), text.end()}});
+        if (!png.empty()) content.formats.push_back({chast::ClipboardFormat::Png, png});
         return true;
     }
     bool write(const chast::ClipboardContent& content) {
@@ -94,9 +99,20 @@ struct Clipboard {
         }
         text = content.text();
         written.push_back(text);
+        const auto* image = content.find(chast::ClipboardFormat::Png);
+        written_png.push_back(image ? image->data : std::vector<uint8_t>{});
         return true;
     }
-    void set(std::string value) { std::lock_guard lock(mutex); text = std::move(value); }
+    void set(std::string value) {
+        std::lock_guard lock(mutex);
+        text = std::move(value);
+        png.clear();
+    }
+    void set_png(std::vector<uint8_t> value) {
+        std::lock_guard lock(mutex);
+        text.clear();
+        png = std::move(value);
+    }
     void hold(bool value) { std::lock_guard lock(mutex); held = value; cv.notify_all(); }
     bool blocked() { std::lock_guard lock(mutex); return held && reading; }
     bool busy() { std::lock_guard lock(mutex); return reading; }
@@ -106,6 +122,10 @@ struct Clipboard {
     bool has(const std::string& value) {
         std::lock_guard lock(mutex);
         return !written.empty() && written.back() == value;
+    }
+    bool has_png(const std::vector<uint8_t>& value) {
+        std::lock_guard lock(mutex);
+        return !written_png.empty() && written_png.back() == value;
     }
     void refuse(int count) { std::lock_guard lock(mutex); fail_writes = count; }
 };
@@ -138,9 +158,11 @@ void worker_reconnect() {
 }
 
 void local_file_lifetime() {
-    const auto root = std::filesystem::temp_directory_path() /
-        ("chast-clipboard-source-" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(root);
+    const auto root = chast_test::scratch_directory("chast-clipboard-source");
+    if (root.empty()) {
+        check(false, "a writable clipboard source directory is available");
+        return;
+    }
     const auto path = root / "copied.bin", saved = root / "old.bin";
     { std::ofstream output(path, std::ios::binary); output << "old"; }
     std::vector<chast::ClipboardFileEntry> entries;
@@ -189,6 +211,7 @@ void cancelled_virtual_read() {
 } // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
     worker_reconnect();
@@ -198,9 +221,12 @@ int main() {
     if (!sink.create()) { std::puts("skip: no D3D desktop"); WSACleanup(); return 77; }
     auto local = std::make_shared<Clipboard>();
     auto remote = std::make_shared<Clipboard>();
-    const auto root = std::filesystem::temp_directory_path() /
-        ("chast-clipboard-async-" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(root);
+    const auto root = chast_test::scratch_directory("chast-clipboard-async");
+    if (root.empty()) {
+        check(false, "a writable clipboard test directory is available");
+        WSACleanup();
+        return 1;
+    }
     chast::HostServerConfig config;
     use_empty_clipboard(config);
     config.clipboard_read = [local](chast::ClipboardContent& item) { return local->read(item); };
@@ -241,6 +267,33 @@ int main() {
           "both first-read failures recovered");
     check(local->write_count() == 0 && remote->write_count() == 0,
           "neither endpoint sends historical content after baseline failure");
+
+    auto make_png = [](uint8_t base) {
+        constexpr uint32_t kWidth = 17;
+        constexpr uint32_t kHeight = 9;
+        std::vector<uint8_t> pixels(static_cast<size_t>(kWidth) * kHeight * 4);
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            pixels[i] = static_cast<uint8_t>(base + i);
+            pixels[i + 1] = static_cast<uint8_t>(base * 3 + i / 4);
+            pixels[i + 2] = static_cast<uint8_t>(base * 7 + i / 8);
+            pixels[i + 3] = 0xFF;
+        }
+        std::vector<uint8_t> png;
+        std::string png_error;
+        check(chast::encode_png_bgra(pixels.data(), kWidth, kHeight, kWidth * 4, png,
+                                     &png_error) &&
+                  !png.empty(),
+              "the clipboard PNG fixture is encoded");
+        return png;
+    };
+    const std::vector<uint8_t> host_png = make_png(11);
+    local->set_png(host_png);
+    check(wait_for([&] { return remote->has_png(host_png); }, 10s),
+          "host-to-viewer clipboard carries PNG bytes");
+    const std::vector<uint8_t> viewer_png = make_png(71);
+    remote->set_png(viewer_png);
+    check(wait_for([&] { return local->has_png(viewer_png); }, 10s),
+          "viewer-to-host clipboard carries PNG bytes");
 
     // A confirmed empty baseline must not swallow the first subsequent copy.
     viewer->SetClipboardSync(false);

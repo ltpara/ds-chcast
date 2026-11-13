@@ -996,6 +996,11 @@ Error DxgiCapturer::rotate_cpu(ID3D11Texture2D* source) {
 }
 
 void DxgiCapturer::pump_cursor(const DXGI_OUTDUPL_FRAME_INFO& info) {
+    // Accessibility size and per-monitor DPI are independent of the shape
+    // update. Refresh the target before deciding whether this frame moved the
+    // pointer: GetFramePointerShape may then return zero bytes while the user
+    // has only changed the pointer-size slider.
+    cursor_decoder_.set_target_size(detail::cursor_target_size(display_));
     // PointerPosition is only filled in on frames that carry a mouse update;
     // on other frames it reads as zero and would mark a visible pointer hidden.
     if (info.LastMouseUpdateTime.QuadPart == 0) {

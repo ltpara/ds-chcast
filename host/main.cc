@@ -1255,7 +1255,7 @@ void acknowledge_managed_policy(const TunnelPolicy& statement, bool announce) {
     if (!statement.mode.empty()) {
         line += tr(L" · 模式 ") + widen(statement.mode);
     }
-    append_log_line(line + tr(L" · 新会话失败关闭"));
+    append_log_line(line + tr(L" · 新会话需有效访问票据"));
 }
 
 void apply_tunnel_event(const TunnelEvent& event) {

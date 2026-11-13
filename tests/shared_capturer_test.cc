@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -107,6 +108,17 @@ void cpu_readers() {
         return;
     }
     check(frame(*a) && frame(*b), "CPU-only readers produce frames");
+    std::shared_ptr<const std::vector<uint8_t>> retained = a->frame().cpu_bgra;
+    const uint8_t* retained_storage = retained->data();
+    const std::vector<uint8_t> retained_pixels = *retained;
+    check(frame(*a) && frame(*b) &&
+              a->frame().cpu_bgra->data() != retained_storage &&
+              std::memcmp(retained->data(), retained_pixels.data(),
+                          retained_pixels.size()) == 0,
+          "a retained CPU frame stays immutable while another frame is published");
+    retained.reset();
+    check(frame(*a) && a->frame().cpu_bgra->data() == retained_storage,
+          "GDI CPU capture reuses a released frame allocation");
     check(a->frame().cpu_bgra && !a->frame().nv12_texture &&
               !a->adapter_device().device && !a->frame().device,
           "CPU-only frames carry no GPU texture or device");
