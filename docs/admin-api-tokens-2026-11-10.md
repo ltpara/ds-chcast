@@ -69,7 +69,7 @@ Content-Type: application/json
 - 令牌管理界面只对“以账号登录且具有 admin 角色”的管理台会话可见；server key 会话看不到该页，因为令牌必须由账号持有。列表只展示元数据，明文 secret 没有再次读取入口。
 - 组范围已覆盖账号组、组审计、设备与录制；`accounts`、`ops` 等全部署面仍不能带组范围，创建时直接拒绝。
 - 令牌不能在服务端重启后恢复明文；遗失只能撤销重建。没有自动清理过期行的后台任务，过期行保留用于解释失效。
-- Postgres 迁移语句已同步，但本机未连接真实 Postgres 验证；SQLite 迁移与升级路径由自动化覆盖。
+- Postgres 迁移语句已同步；2026-11-14 已在 PostgreSQL 13.23/14.25 真库通过账号/对等存储集成、v17→v18 迁移、版本间恢复和双实例冷启动。生产 PostgreSQL 部署升级仍未验收，证据见 [PostgreSQL 13/14 真库验收](postgres-acceptance-2026-11-14.md)。
 - 录制范围以“所有者在组内或目标设备在组内”判定；跨组的单条录制在读取/删除时返回 403，并在所有者的审计里记录一次被拒删除。设备组范围只覆盖控制台设备面，不改变连接 ACL、票据签发或主机注册。
 
 ## 验证
@@ -79,7 +79,7 @@ Content-Type: application/json
 | 已实现 | v11 schema（SQLite/Postgres）、令牌创建/列表/撤销/认证、资源裁剪、组范围（账号组/审计/设备/录制）、角色上限与降级收窄、封禁拒绝、配额、到期、最近使用、创建/撤销审计、控制台各面接入；设备与录制按组过滤，全局策略/签发状态拒绝组范围令牌；webadmin“API 令牌”页（仅 admin 账号可见） |
 | 已构建 | `go build ./...` 通过（2026-11-10） |
 | 自动化通过 | `go test ./...` 全绿、`go vet ./...` 无问题；`TestAPITokenLifecycle`、`TestAPITokenRejectsOutOfScopeRequests`、`TestAPITokenExpiryDemotionAndBan`、`TestAPITokenQuotaAndGroups`、`TestRecordingGroupScope` 覆盖存储层；`TestAPITokenScopesAndLifecycle`、`TestAPITokenExpiryAndOwnerDemotion`、`TestAPITokenDeviceGroupScope`、`TestConsoleRecordingsGroupScope` 经真实 HTTP 回环覆盖资源拒绝、组范围列表过滤、单设备越组 403、全局面拒绝、设备策略读写、跨组录制下载/删除拒绝、审计、撤销与过期；`TestConsoleExposesAPITokenManagement` 锁定管理台页面接线 |
-| 真实链路通过 | 待人工验证：真实部署升级到 v11、Postgres 实例、用外部脚本长期运行令牌 |
+| 真库集成通过 | PostgreSQL 13.23/14.25 账号/对等测试、v17→v18 迁移、13→14 dump/restore 与双实例冷启动通过；真实生产部署升级到 v11 和外部脚本长期运行令牌仍待验证 |
 | 待人工验证 | 管理台令牌页已在本地真实浏览器冒烟（admin 账号可见并可创建/撤销、server key 不可见、分组范围禁用全局资源、一次性 secret 对话框、无控制台错误）；生产反向代理下的浏览器行为、真实运维脚本的令牌轮换流程、20 个配额边界操作、跨天到期与时钟偏差、审计导出中令牌事件的可读性仍待验证 |
 
-自动化测试使用临时 SQLite 数据库和 HTTP 回环，不证明真实反向代理、Postgres 或外部调度系统的行为。
+自动化测试同时覆盖临时 SQLite、真实 PostgreSQL 13/14 和 HTTP 回环；真库结果不证明生产反向代理、托管 PostgreSQL 或外部调度系统的行为。
