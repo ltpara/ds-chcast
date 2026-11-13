@@ -290,7 +290,7 @@ func (s *Store) devicePolicyLocked(peerID string) (DevicePolicy, error) {
 		ceiling        int64
 		updated        int64
 		receipt        DevicePolicyReceipt
-		applied        int
+		applied        bool
 		reported       int64
 		hasResult      bool
 		sourceKind     string
@@ -374,7 +374,7 @@ func (s *Store) devicePolicyLocked(peerID string) (DevicePolicy, error) {
 	switch {
 	case err == nil:
 		hasResult = true
-		receipt.Applied = applied != 0
+		receipt.Applied = applied
 		receipt.ReportedAt = timeFromMillis(reported)
 	case errors.Is(err, sql.ErrNoRows):
 	default:
@@ -490,10 +490,6 @@ func (s *Store) RecordDevicePolicyReceipt(peerID string, version uint32, applied
 	if version != current {
 		return DevicePolicyReceipt{}, fmt.Errorf("%w: got %d, current %d", ErrStaleDevicePolicyVersion, version, current)
 	}
-	stored := 0
-	if applied {
-		stored = 1
-	}
 	var exists int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM device_policy_receipts WHERE peer_id = ?`, peerID).Scan(&exists); err != nil {
 		return DevicePolicyReceipt{}, fmt.Errorf("account store %s: check device policy receipt: %w", s.path, err)
@@ -502,13 +498,13 @@ func (s *Store) RecordDevicePolicyReceipt(peerID string, version uint32, applied
 		_, err = tx.Exec(
 			`INSERT INTO device_policy_receipts (peer_id, policy_version, applied, detail, reported_at)
 			 VALUES (?, ?, ?, ?, ?)`,
-			peerID, version, stored, detail, unixMillis(reported),
+			peerID, version, applied, detail, unixMillis(reported),
 		)
 	} else {
 		_, err = tx.Exec(
 			`UPDATE device_policy_receipts SET policy_version = ?, applied = ?, detail = ?, reported_at = ?
 			 WHERE peer_id = ?`,
-			version, stored, detail, unixMillis(reported), peerID,
+			version, applied, detail, unixMillis(reported), peerID,
 		)
 	}
 	if err != nil {
@@ -571,7 +567,7 @@ func (s *Store) CheckDeviceAdmission(peerID, userID string) (DeviceAdmission, er
 		admission.Reason = "no account subject"
 		return admission, nil
 	}
-	var banned int
+	var banned bool
 	err = s.db.QueryRow(`SELECT banned FROM users WHERE id = ?`, userID).Scan(&banned)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -579,7 +575,7 @@ func (s *Store) CheckDeviceAdmission(peerID, userID string) (DeviceAdmission, er
 		return admission, nil
 	case err != nil:
 		return DeviceAdmission{}, fmt.Errorf("account store %s: read policy subject: %w", s.path, err)
-	case banned != 0:
+	case banned:
 		admission.Reason = "account disabled"
 		return admission, nil
 	}

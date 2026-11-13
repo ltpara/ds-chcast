@@ -286,6 +286,150 @@ func TestPostgresConcurrentLoginLocks(t *testing.T) {
 	}
 }
 
+// TestPostgresSchemaMigrationBackfillsSessionActivity exercises the v17 to v18
+// application migration on a real PostgreSQL database. The SQLite migration
+// has an equivalent raw-database test, but PostgreSQL needs its own ALTER and
+// backfill syntax verified against a real server.
+func TestPostgresSchemaMigrationBackfillsSessionActivity(t *testing.T) {
+	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
+	}
+	store, err := OpenPostgres(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	username := "PgMigrate" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	const password = "correct horse battery"
+	user, err := store.CreateUser(username, password)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	_, token, _, err := store.Login(username, password)
+	if err != nil {
+		store.DeleteUser(username)
+		store.Close()
+		t.Fatal(err)
+	}
+	var createdAt int64
+	if err := store.db.QueryRow(
+		`SELECT created_at FROM user_tokens WHERE token_hash = ?`, tokenHash(token),
+	).Scan(&createdAt); err != nil {
+		store.DeleteUser(username)
+		store.Close()
+		t.Fatalf("read login creation time: %v", err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE user_tokens DROP COLUMN IF EXISTS login_at,
+			DROP COLUMN IF EXISTS last_seen_at`,
+		`DELETE FROM schema_migrations WHERE version = 18`,
+	} {
+		if _, err := store.db.Exec(statement); err != nil {
+			store.DeleteUser(username)
+			store.Close()
+			t.Fatalf("seed pre-v18 database: %v", err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenPostgres(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	defer store.DeleteUser(username)
+	var loginAt, lastSeenAt int64
+	if err := store.db.QueryRow(
+		`SELECT login_at, last_seen_at FROM user_tokens WHERE token_hash = ?`, tokenHash(token),
+	).Scan(&loginAt, &lastSeenAt); err != nil {
+		t.Fatalf("read migrated activity: %v", err)
+	}
+	if loginAt != createdAt || lastSeenAt != createdAt {
+		t.Fatalf("migrated activity = %d/%d, want %d/%d",
+			loginAt, lastSeenAt, createdAt, createdAt)
+	}
+	sessions, _, err := store.SessionsPage(user.ID, token, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || !sessions[0].CreatedAt.Equal(timeFromMillis(createdAt)) ||
+		!sessions[0].LastSeenAt.Equal(timeFromMillis(createdAt)) {
+		t.Fatalf("migrated sessions = %+v", sessions)
+	}
+}
+
+// TestPostgresDevicePolicyReceipt exercises both branches of receipt storage
+// against PostgreSQL, where applied is a BOOLEAN rather than SQLite's INTEGER.
+func TestPostgresDevicePolicyReceipt(t *testing.T) {
+	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
+	}
+	store, err := OpenPostgres(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	peerID := "pgreceipt" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	username := "PgReceiptUser" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	user, err := store.CreateUser(username, "correct horse battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.DeleteUser(username)
+	policy, err := store.SetDevicePolicy(peerID, DevicePolicyOpen, 15, nil, nil, "postgres-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.DeleteDevicePolicy(peerID)
+
+	for _, applied := range []bool{true, false} {
+		detail := "PostgreSQL receipt probe"
+		receipt, err := store.RecordDevicePolicyReceipt(peerID, policy.PolicyVersion, applied, detail)
+		if err != nil {
+			t.Fatalf("record applied=%v: %v", applied, err)
+		}
+		if receipt.PolicyVersion != policy.PolicyVersion || receipt.Applied != applied ||
+			receipt.Detail != detail || receipt.ReportedAt.IsZero() {
+			t.Fatalf("recorded receipt for applied=%v: %+v", applied, receipt)
+		}
+		stored, managed, err := store.DevicePolicy(peerID)
+		if err != nil {
+			t.Fatalf("read applied=%v: %v", applied, err)
+		}
+		if !managed || stored.Receipt == nil || stored.Receipt.Applied != applied ||
+			stored.Receipt.PolicyVersion != policy.PolicyVersion || stored.Receipt.Detail != detail {
+			t.Fatalf("stored receipt for applied=%v: managed=%v policy=%+v", applied, managed, stored)
+		}
+	}
+
+	if _, err := store.SetDevicePolicy(peerID, DevicePolicyRestricted, 15,
+		[]string{username}, nil, "postgres-test"); err != nil {
+		t.Fatal(err)
+	}
+	admission, err := store.CheckDeviceAdmission(peerID, user.ID)
+	if err != nil {
+		t.Fatalf("restricted admission: %v", err)
+	}
+	if !admission.Allowed || admission.Reason != "user allowed" {
+		t.Fatalf("restricted admission = %+v", admission)
+	}
+	if _, err := store.SetBanned(username, true); err != nil {
+		t.Fatal(err)
+	}
+	admission, err = store.CheckDeviceAdmission(peerID, user.ID)
+	if err != nil {
+		t.Fatalf("banned admission: %v", err)
+	}
+	if admission.Allowed || admission.Reason != "account disabled" {
+		t.Fatalf("banned admission = %+v", admission)
+	}
+}
+
 // TestPostgresAccountGroups runs the group CRUD, quota and scoped-history
 // paths against PostgreSQL. The FOR UPDATE quota lock and the group event
 // subqueries are the parts most likely to differ from SQLite.
@@ -310,11 +454,11 @@ func TestPostgresAccountGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := store.DeleteUser(alice.Username); err != nil {
-			t.Errorf("delete alice: %v", err)
-		}
 		if err := store.DeleteUser(bob.Username); err != nil {
 			t.Errorf("delete bob: %v", err)
+		}
+		if err := store.DeleteUser(alice.Username); err != nil {
+			t.Errorf("delete alice: %v", err)
 		}
 	}()
 	groupID := "pg" + suffix
