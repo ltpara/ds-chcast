@@ -121,6 +121,10 @@ func TestConsoleExposesDevicePolicyReceipts(t *testing.T) {
 		`data-tab="policies"`,
 		`id="panel-policies"`,
 		`id="policy-rows"`,
+		`id="policy-export-json"`,
+		`id="policy-import-json"`,
+		`id="policy-import-file"`,
+		`id="policy-import-conflict"`,
 		`id="policy-dialog"`,
 		`id="policy-ceiling"`,
 	} {
@@ -135,6 +139,9 @@ func TestConsoleExposesDevicePolicyReceipts(t *testing.T) {
 	js := string(script)
 	for _, want := range []string{
 		"/v1/device-policies",
+		"/v1/policies/export",
+		"/v1/policies/import",
+		"chast-policy-objects-",
 		"receipt.policy_version !== policy.policy_version",
 		"receipt.policy_version === policy.policy_version",
 		"'已应用版本 '",
@@ -483,9 +490,13 @@ func TestConsoleExposesAccountSessions(t *testing.T) {
 	for _, want := range []string{
 		`id="account-sessions-dialog"`,
 		`id="account-session-rows"`,
+		`id="account-sessions-summary"`,
+		`id="account-sessions-prev"`,
+		`id="account-sessions-next"`,
 		`id="account-sessions-revoke-all"`,
 		`id="account-session-empty"`,
 		`<th>登录 IP</th>`,
+		`<th>最近活动</th>`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("index.html is missing %q", want)
@@ -500,7 +511,12 @@ func TestConsoleExposesAccountSessions(t *testing.T) {
 		"function openAccountSessionsDialog",
 		"function loadAccountSessions",
 		"function adminSessionRow",
+		"function renderSessionPager",
+		"function sessionPageQuery",
 		"function revokeAllAccountSessions",
+		"state.accountSessionsLimit",
+		"last_seen_at_ms",
+		"session.online",
 		"'/sessions/revoke-all'",
 		"'登录会话'",
 	} {
@@ -511,8 +527,8 @@ func TestConsoleExposesAccountSessions(t *testing.T) {
 }
 
 // TestConsoleExposesAccountDirectory keeps the account table on the paged,
-// searchable directory endpoint: a username search, a role filter, a pager and
-// a CSV export that follows the same filter.
+// searchable directory endpoint: username/contact search, role and sort
+// controls, a pager and a CSV export that follows the same filter.
 func TestConsoleExposesAccountDirectory(t *testing.T) {
 	index, err := assets.ReadFile("assets/index.html")
 	if err != nil {
@@ -522,6 +538,8 @@ func TestConsoleExposesAccountDirectory(t *testing.T) {
 	for _, want := range []string{
 		`id="account-query"`,
 		`id="account-role-filter"`,
+		`id="account-sort"`,
+		`id="account-order"`,
 		`id="account-prev"`,
 		`id="account-next"`,
 		`id="account-page"`,
@@ -538,7 +556,10 @@ func TestConsoleExposesAccountDirectory(t *testing.T) {
 	}
 	js := string(script)
 	for _, want := range []string{
+		"function accountDirectoryParams",
 		"function exportAccounts",
+		"params.set('sort'",
+		"params.set('order'",
 		"state.accountLimit",
 		"state.accountOffset",
 		"params.set('limit', String(state.accountLimit))",
@@ -566,6 +587,9 @@ func TestConsoleExposesAccountSelfService(t *testing.T) {
 		`id="mine-key-form"`,
 		`id="mine-key-rows"`,
 		`id="mine-session-rows"`,
+		`id="mine-sessions-summary"`,
+		`id="mine-sessions-prev"`,
+		`id="mine-sessions-next"`,
 		`id="mine-recovery-download"`,
 	} {
 		if !strings.Contains(page, want) {
@@ -597,6 +621,11 @@ func TestConsoleExposesAccountSelfService(t *testing.T) {
 		"function registerMineSecurityKey",
 		"function renderMineKeys",
 		"function renderMineSessions",
+		"function renderSessionPager",
+		"function sessionPageQuery",
+		"state.mineSessionsLimit",
+		"last_seen_at_ms",
+		"session.online",
 		"function downloadMineRecoveryCodes",
 	} {
 		if !strings.Contains(js, want) {
@@ -646,7 +675,9 @@ func TestConsoleExposesAuditUserFilter(t *testing.T) {
 	page := string(index)
 	for _, want := range []string{
 		`id="audit-user"`,
+		`id="audit-host"`,
 		`placeholder="账号（可选，精确匹配）"`,
+		`placeholder="主机 ID（可选）"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("index.html is missing %q", want)
@@ -659,8 +690,13 @@ func TestConsoleExposesAuditUserFilter(t *testing.T) {
 	js := string(script)
 	for _, want := range []string{
 		`hasUser: true`,
+		`hasHost: true`,
 		`$('audit-user').classList.toggle('hidden', !spec.hasUser)`,
+		`$('audit-host').classList.toggle('hidden', !spec.hasHost)`,
 		`params.set('user', user)`,
+		`params.set('host', host)`,
+		`'主机', '结果'`,
+		`event.host_id || '—'`,
 		`[$('audit-filter'), $('audit-host'), $('audit-user')]`,
 	} {
 		if !strings.Contains(js, want) {

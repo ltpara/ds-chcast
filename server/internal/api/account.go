@@ -10,6 +10,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/ldapauth"
+	"github.com/ltpara/ds-chcast/server/internal/registry"
 )
 
 const accountUnavailable = "accounts require persistent server state"
@@ -90,6 +91,8 @@ type accountSessionView struct {
 	DeviceName  string `json:"device_name,omitempty"`
 	CreatedAtMS int64  `json:"created_at_ms"`
 	ExpiresAtMS int64  `json:"expires_at_ms"`
+	LastSeenMS  int64  `json:"last_seen_at_ms"`
+	Online      bool   `json:"online"`
 	Current     bool   `json:"current"`
 	LoginIP     string `json:"login_ip,omitempty"`
 	Location    string `json:"location,omitempty"`
@@ -97,6 +100,7 @@ type accountSessionView struct {
 
 type accountSessionsResponse struct {
 	Sessions []accountSessionView `json:"sessions"`
+	Total    int                  `json:"total"`
 }
 
 type renameSessionRequest struct {
@@ -144,6 +148,22 @@ type addressBookPeerRequest struct {
 	GroupID    *string   `json:"group_id"`
 	Position   *int64    `json:"position"`
 	IfRevision *int64    `json:"if_revision"`
+}
+
+type addressBookBulkMovePeer struct {
+	ID         string `json:"id"`
+	IfRevision *int64 `json:"if_revision"`
+}
+
+type addressBookBulkMoveRequest struct {
+	Peers   []addressBookBulkMovePeer `json:"peers"`
+	GroupID *string                   `json:"group_id"`
+}
+
+type addressBookBulkMoveResponse struct {
+	Revision  int64             `json:"revision"`
+	Moved     []addressBookPeer `json:"moved"`
+	Unchanged []string          `json:"unchanged"`
 }
 
 type addressBookGroupRequest struct {
@@ -224,10 +244,24 @@ func viewAccountSession(session account.Session) accountSessionView {
 		DeviceName:  session.DeviceName,
 		CreatedAtMS: session.CreatedAt.UnixMilli(),
 		ExpiresAtMS: session.ExpiresAt.UnixMilli(),
+		LastSeenMS:  session.LastSeenAt.UnixMilli(),
+		Online:      session.Online,
 		Current:     session.Current,
 		LoginIP:     session.LoginIP,
 		Location:    session.Location,
 	}
+}
+
+func sessionPageParams(w http.ResponseWriter, r *http.Request) (int, int, bool) {
+	limit, ok := intQuery(w, r, "limit", 0, 0, 1000)
+	if !ok {
+		return 0, 0, false
+	}
+	offset, ok := intQuery(w, r, "offset", 0, 0, 1_000_000)
+	if !ok {
+		return 0, 0, false
+	}
+	return limit, offset, true
 }
 
 func viewAddressBookPeer(peer account.Peer) addressBookPeer {
@@ -516,6 +550,40 @@ func (s *server) recordAudit(r *http.Request, username, action, detail string, s
 	}
 }
 
+// recordAddressBookTargetRevocations writes one event per removed group or
+// everyone grant. Separate action names make the two target kinds filterable
+// without parsing free-form detail text.
+func (s *server) recordAddressBookTargetRevocations(r *http.Request, actor, cause string, revoked []account.RevokedTargetGrant) {
+	for _, grant := range revoked {
+		action := account.AuditAddressBookGroupRevoke
+		if grant.TargetKind == account.ShareTargetEveryone {
+			action = account.AuditAddressBookEveryoneRevoke
+		}
+		s.recordAudit(r, actor, action, addressBookTargetRevokeDetail(grant, cause), true)
+	}
+}
+
+func addressBookTargetRevokeDetail(grant account.RevokedTargetGrant, cause string) string {
+	detail := "target_kind=" + strconv.Quote(grant.TargetKind)
+	if grant.TargetID != "" {
+		detail += " target_id=" + strconv.Quote(grant.TargetID)
+	}
+	if grant.TargetName != "" {
+		detail += " target_name=" + strconv.Quote(grant.TargetName)
+	}
+	detail += " permission=" + strconv.Quote(grant.Permission)
+	if grant.GroupID == "" {
+		detail += " scope=\"whole\""
+	} else {
+		detail += " scope_id=" + strconv.Quote(grant.GroupID)
+		if grant.GroupName != "" {
+			detail += " scope_name=" + strconv.Quote(grant.GroupName)
+		}
+	}
+	detail += " owner=" + strconv.Quote(grant.OwnerUsername) + " cause=" + strconv.Quote(cause)
+	return detail
+}
+
 // clientLocation resolves an address through the optional GeoIP table. An
 // absent table or uncovered address yields an empty label; the IP is stored
 // either way.
@@ -794,14 +862,21 @@ func (s *server) accountSessions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	limit, offset, ok := sessionPageParams(w, r)
+	if !ok {
+		return
+	}
 	token, _ := bearerToken(r)
-	sessions, err := s.cfg.Accounts.Sessions(user.ID, token)
+	sessions, total, err := s.cfg.Accounts.SessionsPage(user.ID, token, limit, offset)
 	if err != nil {
 		s.cfg.Logger.Error("account sessions", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the account sessions")
 		return
 	}
-	out := accountSessionsResponse{Sessions: make([]accountSessionView, 0, len(sessions))}
+	out := accountSessionsResponse{
+		Sessions: make([]accountSessionView, 0, len(sessions)),
+		Total:    total,
+	}
 	for _, session := range sessions {
 		out.Sessions = append(out.Sessions, viewAccountSession(session))
 	}
@@ -1020,15 +1095,21 @@ func (s *server) unshareAddressBookTarget(w http.ResponseWriter, r *http.Request
 		return
 	}
 	query := r.URL.Query()
-	var err error
+	var (
+		revoked []account.RevokedTargetGrant
+		cause   string
+		err     error
+	)
 	if query.Has("group_id") {
-		err = s.cfg.Accounts.UnshareBookTargetScope(
+		revoked, err = s.cfg.Accounts.UnshareBookTargetScopeWithRevocations(
 			user.ID, query.Get("kind"), query.Get("target_id"), query.Get("group_id"),
 		)
+		cause = "explicit_scope"
 	} else {
-		err = s.cfg.Accounts.UnshareBookTarget(
+		revoked, err = s.cfg.Accounts.UnshareBookTargetWithRevocations(
 			user.ID, query.Get("kind"), query.Get("target_id"),
 		)
+		cause = "explicit_all"
 	}
 	switch {
 	case errors.Is(err, account.ErrUnknownShare):
@@ -1048,6 +1129,7 @@ func (s *server) unshareAddressBookTarget(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "could not revoke the address book share")
 		return
 	}
+	s.recordAddressBookTargetRevocations(r, user.Username, cause, revoked)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1378,6 +1460,88 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, viewAddressBookPeer(peer))
 }
 
+// bulkMoveAddressBookPeers changes the group of up to 200 peers in one
+// transaction. Every peer and revision is validated before the first update,
+// so a stale or unknown selection cannot partially move the address book.
+func (s *server) bulkMoveAddressBookPeers(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	var req addressBookBulkMoveRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.GroupID == nil {
+		writeError(w, http.StatusBadRequest, "group_id is required (use an empty string for Ungrouped)")
+		return
+	}
+	if len(req.Peers) == 0 || len(req.Peers) > account.MaxAddressBookMoveBatch {
+		writeError(w, http.StatusBadRequest, "peers must contain between 1 and "+
+			strconv.Itoa(account.MaxAddressBookMoveBatch)+" entries")
+		return
+	}
+	groupID := strings.TrimSpace(*req.GroupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		writeError(w, http.StatusBadRequest, "group id is invalid")
+		return
+	}
+	moves := make([]account.PeerGroupMove, 0, len(req.Peers))
+	seen := make(map[string]bool, len(req.Peers))
+	for _, item := range req.Peers {
+		id := strings.TrimSpace(item.ID)
+		if !registry.ValidID(id) {
+			writeError(w, http.StatusBadRequest, "peer id is invalid")
+			return
+		}
+		if item.IfRevision != nil && *item.IfRevision <= 0 {
+			writeError(w, http.StatusBadRequest, "if_revision must be positive")
+			return
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		var ifRevision int64
+		if item.IfRevision != nil {
+			ifRevision = *item.IfRevision
+		}
+		moves = append(moves, account.PeerGroupMove{ID: id, IfRevision: ifRevision})
+	}
+	batch, err := s.cfg.Accounts.MovePeersToGroup(user.ID, groupID, moves)
+	switch {
+	case errors.Is(err, account.ErrInvalidPeerBatch):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidPeerBatch.Error())
+		return
+	case errors.Is(err, account.ErrInvalidGroupID):
+		writeError(w, http.StatusBadRequest, "group id is invalid")
+		return
+	case errors.Is(err, account.ErrUnknownGroup):
+		writeError(w, http.StatusBadRequest, "address book group is unknown")
+		return
+	case errors.Is(err, account.ErrUnknownPeer):
+		writeError(w, http.StatusNotFound, "an address book peer is unknown")
+		return
+	case errors.Is(err, account.ErrPeerConflict):
+		writeError(w, http.StatusConflict, "an address book peer changed elsewhere")
+		return
+	case err != nil:
+		s.cfg.Logger.Error("address book bulk move", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not move the address book peers")
+		return
+	}
+	out := addressBookBulkMoveResponse{
+		Revision:  batch.Revision,
+		Moved:     make([]addressBookPeer, 0, len(batch.Moved)),
+		Unchanged: batch.Unchanged,
+	}
+	for _, peer := range batch.Moved {
+		out.Moved = append(out.Moved, viewAddressBookPeer(peer))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *server) updateAddressBookGroup(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.accountUser(w, r)
 	if !ok {
@@ -1451,7 +1615,7 @@ func (s *server) deleteAddressBookGroup(w http.ResponseWriter, r *http.Request) 
 		}
 		ifRevision = parsed
 	}
-	removed, err := s.cfg.Accounts.DeleteGroupAt(user.ID, r.PathValue("id"), ifRevision)
+	removed, revoked, err := s.cfg.Accounts.DeleteGroupAtWithRevocations(user.ID, r.PathValue("id"), ifRevision)
 	if errors.Is(err, account.ErrInvalidGroupID) {
 		writeError(w, http.StatusBadRequest, "group id is invalid")
 		return
@@ -1469,6 +1633,7 @@ func (s *server) deleteAddressBookGroup(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "address book group is unknown")
 		return
 	}
+	s.recordAddressBookTargetRevocations(r, user.Username, "address_book_group_deleted", revoked)
 	w.WriteHeader(http.StatusNoContent)
 }
 

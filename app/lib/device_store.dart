@@ -306,8 +306,8 @@ class PendingDeletion {
 /// is retried instead of being pulled back on the next sync.
 class DeviceStore {
   DeviceStore({File? file, File? deletionsFile})
-      : _injected = file,
-        _injectedDeletions = deletionsFile;
+    : _injected = file,
+      _injectedDeletions = deletionsFile;
 
   static const int maxRecent = 8;
 
@@ -541,6 +541,36 @@ class DeviceStore {
         );
       }
       return _save(devices);
+    });
+  }
+
+  /// Applies one already-committed server group move to several local entries.
+  /// Every moved peer shares the same book revision, so the update and clear
+  /// flag cleanup are saved together instead of rewriting the store per peer.
+  Future<List<Device>> settleGroupMoves(
+    Set<String> keys,
+    String groupId,
+    int revision,
+  ) async {
+    return withStoreLock(_file(), () async {
+      if (keys.isEmpty) {
+        return load();
+      }
+      final String value = groupId.trim();
+      final List<Device> devices = await load();
+      bool changed = false;
+      for (int i = 0; i < devices.length; i++) {
+        if (!keys.contains(devices[i].key)) {
+          continue;
+        }
+        devices[i] = devices[i].copyWith(
+          groupId: value,
+          groupCleared: value.isEmpty,
+          revision: revision > 0 ? revision : null,
+        );
+        changed = true;
+      }
+      return changed ? _save(devices) : devices;
     });
   }
 

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -51,11 +52,13 @@ type Config struct {
 }
 
 type Archive struct {
-	dir      string
-	quota    int64
-	max      int64
-	accounts *account.Store
-	logger   *slog.Logger
+	dir           string
+	quota         int64
+	max           int64
+	accounts      *account.Store
+	logger        *slog.Logger
+	uploadBeginMu sync.Mutex
+	uploadLocks   [uploadLockStripes]sync.Mutex
 }
 
 func New(cfg Config) (*Archive, error) {

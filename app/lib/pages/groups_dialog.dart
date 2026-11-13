@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../address_book_sync.dart';
 import '../server_api.dart';
@@ -24,6 +25,18 @@ typedef GroupDeleter =
       int? ifRevision,
     });
 typedef GroupReloader = Future<List<AddressBookGroup>> Function();
+typedef GroupExporter =
+    Future<AddressBookGroupTransferDocument> Function(
+      ServerSettings settings,
+      String token,
+    );
+typedef GroupImporter =
+    Future<AddressBookGroupImportResult> Function(
+      ServerSettings settings,
+      String token,
+      AddressBookGroupTransferDocument document, {
+      required String conflict,
+    });
 
 /// Creates, edits, reorders and deletes groups in the signed-in account's
 /// address book. Groups form a shallow tree: an edit dialog picks the parent,
@@ -42,6 +55,8 @@ class GroupsDialog extends StatefulWidget {
     this.rename,
     this.remove,
     this.reload,
+    this.exportGroups,
+    this.importGroups,
   });
 
   final ServerSettings server;
@@ -51,6 +66,8 @@ class GroupsDialog extends StatefulWidget {
   final GroupWriter? create;
   final GroupWriter? rename;
   final GroupDeleter? remove;
+  final GroupExporter? exportGroups;
+  final GroupImporter? importGroups;
 
   /// Fetches the latest groups after a 409 so the dialog can show the state
   /// that actually won instead of retrying against stale revisions.
@@ -270,6 +287,50 @@ class _GroupsDialogState extends State<GroupsDialog> {
     });
   }
 
+  Future<void> _transferGroups() async {
+    final AddressBookGroupImportResult?
+    imported = await showDialog<AddressBookGroupImportResult>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) => _GroupTransferDialog(
+        server: widget.server,
+        token: widget.token,
+        exportGroups: widget.exportGroups ?? ServerApi.exportAddressBookGroups,
+        importGroups: widget.importGroups ?? ServerApi.importAddressBookGroups,
+      ),
+    );
+    if (imported == null || !imported.hasChanges || !mounted) {
+      return;
+    }
+    await _run(() async {
+      if (widget.reload != null) {
+        final List<AddressBookGroup> latest = await widget.reload!();
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _groups = List<AddressBookGroup>.of(latest)
+            ..sort(compareAddressBookGroups);
+          _changed = true;
+        });
+        return;
+      }
+      final Map<String, AddressBookGroup> byID = <String, AddressBookGroup>{
+        for (final AddressBookGroup group in _groups) group.id: group,
+      };
+      for (final AddressBookGroup group in <AddressBookGroup>[
+        ...imported.created,
+        ...imported.updated,
+      ]) {
+        byID[group.id] = group;
+      }
+      setState(() {
+        _groups = byID.values.toList()..sort(compareAddressBookGroups);
+        _changed = true;
+      });
+    });
+  }
+
   Future<void> _conflict() async {
     _changed = true;
     List<AddressBookGroup>? latest;
@@ -343,6 +404,13 @@ class _GroupsDialogState extends State<GroupsDialog> {
             key: const Key('group-create'),
             onPressed: _busy ? null : _create,
             icon: const Icon(Icons.create_new_folder_outlined, size: 19),
+            color: kAccent,
+          ),
+          IconButton(
+            tooltip: tr('分组导入/导出'),
+            key: const Key('group-transfer'),
+            onPressed: _busy ? null : _transferGroups,
+            icon: const Icon(Icons.swap_vert_rounded, size: 19),
             color: kAccent,
           ),
         ],
@@ -551,6 +619,327 @@ class _GroupsDialogState extends State<GroupsDialog> {
         TextButton(
           onPressed: () => Navigator.of(context).pop(_changed),
           child: Text(tr('关闭')),
+        ),
+      ],
+    );
+  }
+}
+
+class _GroupTransferDialog extends StatefulWidget {
+  const _GroupTransferDialog({
+    required this.server,
+    required this.token,
+    required this.exportGroups,
+    required this.importGroups,
+  });
+
+  final ServerSettings server;
+  final String token;
+  final GroupExporter exportGroups;
+  final GroupImporter importGroups;
+
+  @override
+  State<_GroupTransferDialog> createState() => _GroupTransferDialogState();
+}
+
+class _GroupTransferDialogState extends State<_GroupTransferDialog> {
+  final TextEditingController _exportText = TextEditingController();
+  final TextEditingController _importText = TextEditingController();
+  String _conflict = 'reject';
+  String _error = '';
+  String _notice = '';
+  bool _busy = false;
+  AddressBookGroupImportResult? _lastImport;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadExport();
+  }
+
+  @override
+  void dispose() {
+    _exportText.dispose();
+    _importText.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadExport() async {
+    setState(() {
+      _busy = true;
+      _error = '';
+    });
+    try {
+      final AddressBookGroupTransferDocument document = await widget
+          .exportGroups(widget.server, widget.token);
+      if (mounted) {
+        setState(() => _exportText.text = document.toJsonText());
+      }
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = tr('读取分组导出失败：{error}', <String, Object?>{
+            'error': error.message,
+          }),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = tr('读取分组导出失败：{error}', <String, Object?>{
+            'error': '$error',
+          }),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _copyExport() async {
+    try {
+      await Clipboard.setData(ClipboardData(text: _exportText.text));
+      if (mounted) {
+        setState(() {
+          _error = '';
+          _notice = tr('已复制分组 JSON');
+        });
+      }
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = tr('复制分组 JSON 失败：{error}', <String, Object?>{
+            'error': error.message ?? error.code,
+          }),
+        );
+      }
+    }
+  }
+
+  Future<void> _pasteImport() async {
+    try {
+      final ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
+      if (!mounted) {
+        return;
+      }
+      if (data?.text == null || data!.text!.trim().isEmpty) {
+        setState(() => _error = tr('剪贴板中没有文本'));
+        return;
+      }
+      setState(() {
+        _importText.text = data.text!;
+        _error = '';
+      });
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = tr('读取剪贴板失败：{error}', <String, Object?>{
+            'error': error.message ?? error.code,
+          }),
+        );
+      }
+    }
+  }
+
+  Future<void> _submitImport() async {
+    if (_busy) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+      _notice = '';
+    });
+    try {
+      final AddressBookGroupTransferDocument document =
+          AddressBookGroupTransferDocument.parse(_importText.text);
+      final AddressBookGroupImportResult result = await widget.importGroups(
+        widget.server,
+        widget.token,
+        document,
+        conflict: _conflict,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _lastImport = result;
+        _notice = tr(
+          '导入结果：新建 {created}，更新 {updated}，跳过 {skipped}，未变 {unchanged}',
+          <String, Object?>{
+            'created': result.created.length,
+            'updated': result.updated.length,
+            'skipped': result.skipped.length,
+            'unchanged': result.unchanged.length,
+          },
+        );
+      });
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() => _error = error.message);
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = tr('导入分组失败：{error}', <String, Object?>{
+            'error': '$error',
+          }),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  void _close() {
+    Navigator.of(context).pop(_lastImport);
+  }
+
+  String _conflictLabel(String mode) {
+    switch (mode) {
+      case 'skip':
+        return tr('跳过已有分组');
+      case 'update':
+        return tr('更新已有分组');
+      default:
+        return tr('拒绝整个导入');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    return AlertDialog(
+      backgroundColor: theme.colorScheme.surface,
+      title: Text(tr('分组导入/导出')),
+      content: SizedBox(
+        width: 600,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(
+                      tr('导出 JSON'),
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    key: const Key('group-export-copy'),
+                    onPressed: _busy || _exportText.text.isEmpty
+                        ? null
+                        : _copyExport,
+                    icon: const Icon(Icons.copy_rounded, size: 16),
+                    label: Text(tr('复制 JSON')),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                key: const Key('group-export-text'),
+                controller: _exportText,
+                readOnly: true,
+                maxLines: 6,
+                style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+                decoration: InputDecoration(
+                  border: const OutlineInputBorder(),
+                  hintText: _busy ? tr('正在读取…') : null,
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(
+                      tr('导入 JSON'),
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  TextButton.icon(
+                    key: const Key('group-import-paste'),
+                    onPressed: _busy ? null : _pasteImport,
+                    icon: const Icon(Icons.content_paste_rounded, size: 16),
+                    label: Text(tr('粘贴')),
+                  ),
+                ],
+              ),
+              Text(
+                tr('导入只迁移分组结构，不包含设备、成员关系或连接信息。'),
+                style: mutedStyle(context, size: 11),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                key: const Key('group-import-text'),
+                controller: _importText,
+                minLines: 6,
+                maxLines: 10,
+                style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+                decoration: InputDecoration(
+                  border: const OutlineInputBorder(),
+                  hintText: tr('粘贴分组 JSON'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                key: const Key('group-import-conflict'),
+                initialValue: _conflict,
+                decoration: InputDecoration(labelText: tr('冲突模式')),
+                items: <DropdownMenuItem<String>>[
+                  for (final String mode in addressBookGroupImportConflictModes)
+                    DropdownMenuItem<String>(
+                      key: Key('group-import-conflict-$mode'),
+                      value: mode,
+                      child: Text(_conflictLabel(mode)),
+                    ),
+                ],
+                onChanged: _busy
+                    ? null
+                    : (String? value) {
+                        if (value != null) {
+                          setState(() => _conflict = value);
+                        }
+                      },
+              ),
+              if (_error.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 10),
+                Text(
+                  _error,
+                  key: const Key('group-transfer-error'),
+                  style: TextStyle(
+                    color: theme.colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+              if (_notice.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 10),
+                Text(
+                  _notice,
+                  key: const Key('group-transfer-notice'),
+                  style: TextStyle(color: kAccent, fontSize: 12),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          key: const Key('group-transfer-close'),
+          onPressed: _busy ? null : _close,
+          child: Text(_lastImport == null ? tr('取消') : tr('完成')),
+        ),
+        FilledButton(
+          key: const Key('group-import-confirm'),
+          onPressed: _busy ? null : _submitImport,
+          child: Text(tr('导入分组')),
         ),
       ],
     );

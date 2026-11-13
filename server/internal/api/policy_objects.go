@@ -1,7 +1,10 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,6 +31,35 @@ type policyObjectRequest struct {
 	PermissionCeiling uint32   `json:"permission_ceiling"`
 	AllowedUsers      []string `json:"allowed_users"`
 	AllowedGroups     []string `json:"allowed_groups"`
+}
+
+const maxPolicyImportBody = 1 << 20
+
+type policyObjectExport struct {
+	Name              string   `json:"name"`
+	Mode              string   `json:"mode"`
+	PermissionCeiling uint32   `json:"permission_ceiling"`
+	AllowedUsers      []string `json:"allowed_users"`
+	AllowedGroups     []string `json:"allowed_groups"`
+}
+
+type policyExportDocument struct {
+	Format   string               `json:"format"`
+	Version  int                  `json:"version"`
+	Policies []policyObjectExport `json:"policies"`
+}
+
+type policyImportRequest struct {
+	Format   string                `json:"format"`
+	Version  int                   `json:"version"`
+	Conflict string                `json:"conflict,omitempty"`
+	Policies []policyObjectRequest `json:"policies"`
+}
+
+type policyImportView struct {
+	Created   []policyObjectView `json:"created"`
+	Updated   []policyObjectView `json:"updated"`
+	Unchanged []policyObjectView `json:"unchanged"`
 }
 
 type policyAssignmentView struct {
@@ -109,6 +141,124 @@ func (s *server) listPolicyObjects(w http.ResponseWriter, r *http.Request) {
 		out = append(out, viewPolicyObject(policy))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"policies": out})
+}
+
+func (s *server) exportPolicyObjects(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
+		return
+	}
+	policies, err := s.cfg.Accounts.PolicyObjects()
+	if err != nil {
+		s.cfg.Logger.Error("export policy objects", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not export policy objects")
+		return
+	}
+	doc := policyExportDocument{
+		Format:   "chast-policy-objects",
+		Version:  1,
+		Policies: make([]policyObjectExport, 0, len(policies)),
+	}
+	for _, policy := range policies {
+		item := policyObjectExport{
+			Name:              policy.Name,
+			Mode:              policy.Mode,
+			PermissionCeiling: policy.PermissionCeiling,
+			AllowedUsers:      policy.AllowedUsers,
+			AllowedGroups:     policy.AllowedGroups,
+		}
+		if item.AllowedUsers == nil {
+			item.AllowedUsers = []string{}
+		}
+		if item.AllowedGroups == nil {
+			item.AllowedGroups = []string{}
+		}
+		doc.Policies = append(doc.Policies, item)
+	}
+	writeJSON(w, http.StatusOK, doc)
+}
+
+func (s *server) importPolicyObjects(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	if !ok || !requireUnscoped(w, principal) {
+		return
+	}
+	var req policyImportRequest
+	if err := decodePolicyImportBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Format != "chast-policy-objects" {
+		writeError(w, http.StatusBadRequest, "format must be chast-policy-objects")
+		return
+	}
+	if req.Version != 1 {
+		writeError(w, http.StatusBadRequest, "version must be 1")
+		return
+	}
+	if req.Policies == nil {
+		writeError(w, http.StatusBadRequest, "policies is required")
+		return
+	}
+	items := make([]account.PolicyObjectImport, 0, len(req.Policies))
+	for _, policy := range req.Policies {
+		items = append(items, account.PolicyObjectImport{
+			Name:              policy.Name,
+			Mode:              policy.Mode,
+			PermissionCeiling: policy.PermissionCeiling,
+			AllowedUsers:      policy.AllowedUsers,
+			AllowedGroups:     policy.AllowedGroups,
+		})
+	}
+	result, err := s.cfg.Accounts.ImportPolicyObjects(items, req.Conflict, principal.Actor)
+	if err != nil {
+		writePolicyObjectError(w, err)
+		return
+	}
+	conflict := strings.TrimSpace(req.Conflict)
+	if conflict == "" {
+		conflict = account.PolicyImportConflictReject
+	}
+	s.recordAudit(r, principal.Actor, account.AuditPolicyObjectImport,
+		"imported policy objects with conflict="+conflict+": "+
+			strconv.Itoa(len(result.Created))+" created, "+
+			strconv.Itoa(len(result.Updated))+" updated, "+
+			strconv.Itoa(len(result.Unchanged))+" unchanged", true)
+	if len(result.Created) > 0 || len(result.Updated) > 0 {
+		s.reconcileAllPolicies()
+	}
+	out := policyImportView{
+		Created:   make([]policyObjectView, 0, len(result.Created)),
+		Updated:   make([]policyObjectView, 0, len(result.Updated)),
+		Unchanged: make([]policyObjectView, 0, len(result.Unchanged)),
+	}
+	for _, policy := range result.Created {
+		out.Created = append(out.Created, viewPolicyObject(policy))
+	}
+	for _, policy := range result.Updated {
+		out.Updated = append(out.Updated, viewPolicyObject(policy))
+	}
+	for _, policy := range result.Unchanged {
+		out.Unchanged = append(out.Unchanged, viewPolicyObject(policy))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func decodePolicyImportBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxPolicyImportBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("invalid JSON: trailing data")
+		}
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	return nil
 }
 
 func (s *server) createPolicyObject(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +515,9 @@ func writePolicyObjectError(w http.ResponseWriter, err error) {
 		errors.Is(err, account.ErrInvalidPolicyScope),
 		errors.Is(err, account.ErrInvalidPolicyPriority),
 		errors.Is(err, account.ErrInvalidPolicyAssignmentBatch),
+		errors.Is(err, account.ErrInvalidPolicyImportConflict),
+		errors.Is(err, account.ErrPolicyImportDuplicateName),
+		errors.Is(err, account.ErrPolicyImportTooMany),
 		errors.Is(err, account.ErrInvalidDevicePolicyMode),
 		errors.Is(err, account.ErrDevicePolicyUser),
 		errors.Is(err, account.ErrDevicePolicyGroup),

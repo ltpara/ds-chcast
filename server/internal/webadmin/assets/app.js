@@ -48,6 +48,9 @@
     accountCapUser: null,
     accountRecoveryUser: null,
     accountSessionsUser: null,
+    accountSessionsOffset: 0,
+    accountSessionsTotal: 0,
+    accountSessionsLimit: 20,
     accountLimit: 50,
     accountOffset: 0,
     // Set by probeSingleSignOn when the server has an identity provider.
@@ -58,6 +61,9 @@
     // TOTP secret between start and enable.
     accountInfo: null,
     accountSessions: [],
+    mineSessionsOffset: 0,
+    mineSessionsTotal: 0,
+    mineSessionsLimit: 20,
     account2faPending: null,
     // Security keys: null until loaded; enabled=false when the server has no
     // WebAuthn relying party configured (the list route answers 503).
@@ -88,6 +94,25 @@
 
   function clear(node) {
     while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function renderSessionPager(prefix, shown, total, offset, limit) {
+    const summary = $(prefix + '-summary');
+    if (total === 0) {
+      summary.textContent = '没有登录会话';
+    } else {
+      summary.textContent = '第 ' + (offset + 1) + '–' +
+        Math.min(offset + shown, total) + ' 个，共 ' + total + ' 个会话';
+    }
+    $(prefix + '-prev').disabled = offset <= 0;
+    $(prefix + '-next').disabled = offset + limit >= total;
+  }
+
+  function sessionPageQuery(limit, offset) {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    params.set('offset', String(offset));
+    return '?' + params.toString();
   }
 
   function cell(value) {
@@ -1443,6 +1468,32 @@
     }
   }
 
+  async function exportPolicyObjects() {
+    await downloadFile('/v1/policies/export',
+      'chast-policy-objects-' + csvStamp() + '.json', '已导出策略对象 JSON');
+  }
+
+  async function importPolicyObjects(file) {
+    if (!file) return;
+    if (file.size > (1 << 20)) throw new Error('JSON 文件不能超过 1 MiB');
+    let document;
+    try {
+      document = JSON.parse(await file.text());
+    } catch {
+      throw new Error('策略对象 JSON 格式无效');
+    }
+    if (!document || typeof document !== 'object' || Array.isArray(document)) {
+      throw new Error('策略对象 JSON 顶层必须是对象');
+    }
+    document.conflict = $('policy-import-conflict').value;
+    const result = await api('/v1/policies/import', { method: 'POST', body: document });
+    await loadPolicies();
+    const created = Array.isArray(result && result.created) ? result.created.length : 0;
+    const updated = Array.isArray(result && result.updated) ? result.updated.length : 0;
+    const unchanged = Array.isArray(result && result.unchanged) ? result.unchanged.length : 0;
+    toast('导入完成：新建 ' + created + '，更新 ' + updated + '，未变 ' + unchanged);
+  }
+
   function renderPolicies() {
     const objectBody = $('policy-object-rows');
     clear(objectBody);
@@ -1894,13 +1945,22 @@
 
   // ---------- accounts ----------
 
-  async function loadAccounts() {
+  function accountDirectoryParams(includePaging) {
     const params = new URLSearchParams();
     const query = ($('account-query').value || '').trim();
     if (query) params.set('q', query);
     if ($('account-role-filter').value) params.set('role', $('account-role-filter').value);
-    params.set('limit', String(state.accountLimit));
-    params.set('offset', String(state.accountOffset));
+    params.set('sort', $('account-sort').value || 'username');
+    params.set('order', $('account-order').value || 'asc');
+    if (includePaging) {
+      params.set('limit', String(state.accountLimit));
+      params.set('offset', String(state.accountOffset));
+    }
+    return params;
+  }
+
+  async function loadAccounts() {
+    const params = accountDirectoryParams(true);
     const data = await api('/v1/accounts?' + params.toString());
     renderAccounts(Array.isArray(data && data.users) ? data.users : [],
       data && data.total === undefined ? null : data.total);
@@ -1930,12 +1990,9 @@
   }
 
   async function exportAccounts() {
-    const params = new URLSearchParams();
-    const query = ($('account-query').value || '').trim();
-    if (query) params.set('q', query);
-    if ($('account-role-filter').value) params.set('role', $('account-role-filter').value);
+    const params = accountDirectoryParams(false);
     params.set('format', 'csv');
-    await downloadCSV('/v1/accounts?' + params.toString(),
+    await downloadFile('/v1/accounts?' + params.toString(),
       'chast-accounts-' + csvStamp() + '.csv', '已导出账号 CSV');
   }
 
@@ -2097,6 +2154,8 @@
   // on its next unlock unless the account is banned.
   function openAccountSessionsDialog(user) {
     state.accountSessionsUser = user;
+    state.accountSessionsOffset = 0;
+    state.accountSessionsTotal = 0;
     $('account-sessions-title').textContent = '登录会话 · ' + user.username;
     $('account-sessions-note').textContent =
       '这里列出该账号当前仍然有效的登录（管理台与其他设备）。撤销后该设备的令牌立即失效；' +
@@ -2104,6 +2163,7 @@
     clear($('account-session-rows'));
     $('account-session-empty').classList.add('hidden');
     $('account-sessions-revoke-all').disabled = true;
+    renderSessionPager('account-sessions', 0, 0, 0, state.accountSessionsLimit);
     $('account-sessions-dialog').showModal();
     loadAccountSessions().catch(reportError);
   }
@@ -2111,13 +2171,22 @@
   async function loadAccountSessions() {
     const user = state.accountSessionsUser;
     if (!user) return [];
-    const data = await api('/v1/accounts/' + encodeURIComponent(user.username) + '/sessions');
+    const query = sessionPageQuery(state.accountSessionsLimit, state.accountSessionsOffset);
+    const data = await api('/v1/accounts/' + encodeURIComponent(user.username) + '/sessions' + query);
     const sessions = data && Array.isArray(data.sessions) ? data.sessions : [];
+    state.accountSessionsTotal = data && Number.isInteger(data.total) ? data.total : sessions.length;
+    if (!sessions.length && state.accountSessionsTotal > 0 && state.accountSessionsOffset > 0) {
+      state.accountSessionsOffset = Math.max(0,
+        Math.floor((state.accountSessionsTotal - 1) / state.accountSessionsLimit) * state.accountSessionsLimit);
+      return loadAccountSessions();
+    }
     const body = $('account-session-rows');
     clear(body);
     sessions.forEach((session) => body.appendChild(adminSessionRow(user, session)));
-    $('account-session-empty').classList.toggle('hidden', sessions.length > 0);
-    $('account-sessions-revoke-all').disabled = sessions.length === 0;
+    $('account-session-empty').classList.toggle('hidden', state.accountSessionsTotal !== 0);
+    $('account-sessions-revoke-all').disabled = state.accountSessionsTotal === 0;
+    renderSessionPager('account-sessions', sessions.length, state.accountSessionsTotal,
+      state.accountSessionsOffset, state.accountSessionsLimit);
     return sessions;
   }
 
@@ -2127,8 +2196,12 @@
     tr.appendChild(cell(session.login_ip || '—'));
     tr.appendChild(cell(session.location || '—'));
     tr.appendChild(cell(fmtTime(session.created_at_ms)));
+    tr.appendChild(cell(fmtTime(session.last_seen_at_ms)));
     tr.appendChild(cell(fmtTime(session.expires_at_ms)));
-    tr.appendChild(cell(session.current ? pill('当前会话', 'ok') : pill('有效', '')));
+    const status = session.current
+      ? pill('当前会话', 'ok')
+      : (session.online ? pill('在线', 'ok') : pill('离线', ''));
+    tr.appendChild(cell(status));
 
     const actions = el('div', 'actions-wrap');
     const revoke = button('撤销', 'small danger');
@@ -2816,9 +2889,9 @@
       path: '/v1/audit',
       filterKey: 'action',
       filterPlaceholder: '动作（可选，如 login）',
-      hasHost: false,
+      hasHost: true,
       hasUser: true,
-      columns: ['时间', '用户', '动作', '详情', '客户端 IP', '地点', '结果'],
+      columns: ['时间', '用户', '动作', '详情', '客户端 IP', '地点', '主机', '结果'],
       row(event) {
         return [
           fmtTime(event.created_at_ms),
@@ -2827,6 +2900,7 @@
           event.detail || '—',
           event.client_ip || '—',
           event.location || '—',
+          event.host_id || '—',
           pillBool(event.success),
         ];
       },
@@ -3000,7 +3074,7 @@
       (state.auditBefore ? '，还有更多' : state.auditRows.length ? '，已到末尾' : '');
   }
 
-  async function downloadCSV(target, filename, message) {
+  async function downloadFile(target, filename, message) {
     let resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
     if (resp.status === 401 && await refreshSession()) {
       resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
@@ -3036,7 +3110,7 @@
     const spec = AUDIT[state.auditTab];
     const params = auditParams(spec);
     params.set('format', 'csv');
-    await downloadCSV(spec.path + '?' + params.toString(),
+    await downloadFile(spec.path + '?' + params.toString(),
       'chast-' + state.auditTab + '-' + csvStamp() + '.csv', '已导出 CSV');
   }
 
@@ -3048,7 +3122,7 @@
     if (query) params.set('q', query);
     if ($('device-online').checked) params.set('online', '1');
     params.set('format', 'csv');
-    await downloadCSV('/v1/identities?' + params.toString(),
+    await downloadFile('/v1/identities?' + params.toString(),
       'chast-devices-' + csvStamp() + '.csv', '已导出设备 CSV');
   }
 
@@ -3215,6 +3289,14 @@
       await loadPolicies();
       toast('已刷新');
     }));
+    $('policy-export-json').addEventListener('click', (event) =>
+      withButton(event.currentTarget, exportPolicyObjects));
+    $('policy-import-json').addEventListener('click', () => $('policy-import-file').click());
+    $('policy-import-file').addEventListener('change', (event) => {
+      const file = event.currentTarget.files && event.currentTarget.files[0];
+      event.currentTarget.value = '';
+      if (file) withButton($('policy-import-json'), () => importPolicyObjects(file));
+    });
     $('policy-create').addEventListener('click', () => openPolicyDialog(null));
     $('policy-form').addEventListener('submit', (event) => {
       event.preventDefault();
@@ -3240,6 +3322,15 @@
     });
 
     $('account-sessions-revoke-all').addEventListener('click', revokeAllAccountSessions);
+    $('account-sessions-prev').addEventListener('click', () => {
+      state.accountSessionsOffset = Math.max(0,
+        state.accountSessionsOffset - state.accountSessionsLimit);
+      loadAccountSessions().catch(reportError);
+    });
+    $('account-sessions-next').addEventListener('click', () => {
+      state.accountSessionsOffset += state.accountSessionsLimit;
+      loadAccountSessions().catch(reportError);
+    });
     $('account-sessions-close').addEventListener('click', () =>
       $('account-sessions-dialog').close());
     $('account-sessions-dialog').addEventListener('close', () => {
@@ -3301,6 +3392,14 @@
       state.accountOffset = 0;
       loadAccounts().catch(reportError);
     });
+    $('account-sort').addEventListener('change', () => {
+      state.accountOffset = 0;
+      loadAccounts().catch(reportError);
+    });
+    $('account-order').addEventListener('change', () => {
+      state.accountOffset = 0;
+      loadAccounts().catch(reportError);
+    });
     $('account-prev').addEventListener('click', () => {
       state.accountOffset = Math.max(0, state.accountOffset - state.accountLimit);
       loadAccounts().catch(reportError);
@@ -3337,6 +3436,15 @@
       await loadMine();
       toast('已刷新');
     }));
+    $('mine-sessions-prev').addEventListener('click', () => {
+      state.mineSessionsOffset = Math.max(0,
+        state.mineSessionsOffset - state.mineSessionsLimit);
+      loadMine().catch(reportError);
+    });
+    $('mine-sessions-next').addEventListener('click', () => {
+      state.mineSessionsOffset += state.mineSessionsLimit;
+      loadMine().catch(reportError);
+    });
     $('mine-password-form').addEventListener('submit', (event) => {
       event.preventDefault();
       changeMinePassword(event).catch(reportError);
@@ -3441,7 +3549,7 @@
         node.classList.toggle('active', node.dataset.audit === 'events');
       });
       $('audit-filter').placeholder = AUDIT.events.filterPlaceholder;
-      $('audit-host').classList.add('hidden');
+      $('audit-host').classList.remove('hidden');
       $('audit-host').value = '';
       $('audit-user').classList.remove('hidden');
       $('audit-user').value = '';
@@ -3502,6 +3610,8 @@
   function resetMine() {
     state.accountInfo = null;
     state.accountSessions = [];
+    state.mineSessionsOffset = 0;
+    state.mineSessionsTotal = 0;
     state.account2faPending = null;
     state.accountKeys = null;
     $('mine-2fa-secret').textContent = '';
@@ -3518,6 +3628,7 @@
     clear($('mine-summary'));
     clear($('mine-session-rows'));
     clear($('mine-key-rows'));
+    renderSessionPager('mine-sessions', 0, 0, 0, state.mineSessionsLimit);
   }
 
   async function loadMine(silent) {
@@ -3526,9 +3637,10 @@
       return;
     }
     try {
+      const query = sessionPageQuery(state.mineSessionsLimit, state.mineSessionsOffset);
       const [info, sessions, keys] = await Promise.all([
         api('/v1/account'),
-        api('/v1/account/sessions'),
+        api('/v1/account/sessions' + query),
         api('/v1/account/webauthn/credentials')
           .then((data) => ({ enabled: true, credentials: (data && data.credentials) || [] }))
           .catch((err) => {
@@ -3538,6 +3650,14 @@
       ]);
       state.accountInfo = info || null;
       state.accountSessions = sessions && Array.isArray(sessions.sessions) ? sessions.sessions : [];
+      state.mineSessionsTotal = sessions && Number.isInteger(sessions.total)
+        ? sessions.total
+        : state.accountSessions.length;
+      if (!state.accountSessions.length && state.mineSessionsTotal > 0 && state.mineSessionsOffset > 0) {
+        state.mineSessionsOffset = Math.max(0,
+          Math.floor((state.mineSessionsTotal - 1) / state.mineSessionsLimit) * state.mineSessionsLimit);
+        return loadMine(silent);
+      }
       state.accountKeys = keys;
       renderMine();
     } catch (err) {
@@ -3739,9 +3859,10 @@
     const body = $('mine-session-rows');
     clear(body);
     state.accountSessions.forEach((session) => body.appendChild(mineSessionRow(session)));
-    $('mine-session-empty').classList.toggle('hidden', state.accountSessions.length !== 0);
-    $('mine-sessions-revoke-others').disabled =
-      !state.accountSessions.some((session) => !session.current);
+    $('mine-session-empty').classList.toggle('hidden', state.mineSessionsTotal !== 0);
+    $('mine-sessions-revoke-others').disabled = state.mineSessionsTotal <= 1;
+    renderSessionPager('mine-sessions', state.accountSessions.length, state.mineSessionsTotal,
+      state.mineSessionsOffset, state.mineSessionsLimit);
   }
 
   function mineSessionRow(session) {
@@ -3750,8 +3871,12 @@
     tr.appendChild(cell(session.login_ip || '—'));
     tr.appendChild(cell(session.location || '—'));
     tr.appendChild(cell(fmtTime(session.created_at_ms)));
+    tr.appendChild(cell(fmtTime(session.last_seen_at_ms)));
     tr.appendChild(cell(fmtTime(session.expires_at_ms)));
-    tr.appendChild(cell(session.current ? pill('当前会话', 'ok') : pill('其他设备', '')));
+    const status = session.current
+      ? pill('当前会话', 'ok')
+      : (session.online ? pill('在线', 'ok') : pill('离线', ''));
+    tr.appendChild(cell(status));
 
     const actions = el('div', 'actions-wrap');
     const rename = button('重命名', 'small');
@@ -3975,7 +4100,7 @@
   }
 
   async function revokeOtherMineSessions() {
-    const others = state.accountSessions.filter((session) => !session.current).length;
+    const others = Math.max(0, state.mineSessionsTotal - 1);
     if (!others) {
       toast('没有其他会话', true);
       return;

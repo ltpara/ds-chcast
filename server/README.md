@@ -2,7 +2,7 @@
 
 Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打洞协调和不可达时
 的中继/载体回退。服务端只转发加密的 QUIC 数据报，不解析、不终止 chast 协议，
-因此协议 v28 的令牌、审批、证书指纹和输入通道都保持端到端语义。
+因此协议 v75 的令牌、审批、证书指纹和输入通道都保持端到端语义。
 
 参考实现是 RustDesk 的 `hbbs`（会合/信令）与 `hbbr`（中继）：
 
@@ -21,10 +21,10 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | HTTPS 与 mTLS | `--tls-cert`/`--tls-key` 或 `--acme-domain` + `--tls-client-ca`；代理与隧道 `--tls-ca`/`--tls-client-cert`/`--tls-client-key` | 服务端与节点控制面可直接 HTTPS；给出客户端 CA 时要求并校验客户端证书。证书既可来自文件，也可由内建 ACME（HTTP-01）自动申请与续期；证书文件与客户端 CA 都在替换后自动热加载（最迟 5 秒，坏文件保留旧内容），ACME 模式下的客户端 CA 同样热加载。代理、`chast-tunnel` 与节点池可信任私有 CA 并出示客户端证书，未配置时行为不变 |
 | 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名与起止时间过滤 |
 | 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名与起止时间过滤，同样保留最新 10000 条 |
-| 录制归档（可选上传） | `--recordings-dir` + `/v1/account/recordings` + 管理台 `recordings` | 查看器结束本地录制后可按设置把 MP4 上传到账号（原始字节流，元数据在查询串）；服务端按账号隔离存储、校验 SHA-256、限制单文件与账号配额，并在审计中记录上传/删除；账号可列出、下载和删除自己的录制，超过保留天数的文件随每 6 小时清理；运营者经 `readonly` 即可跨账号列出/下载，`operator` 可删除，删除审计记在属主名下并注明操作者 |
+| 录制归档（可选上传） | `--recordings-dir` + `/v1/account/recordings` + `/v1/account/recordings/uploads` + 管理台 `recordings` | 查看器结束本地录制后可按设置把 MP4 上传到账号。大文件使用持久化上传会话：开始、查询偏移、分批 PATCH、完成、取消；每片最多 32 MiB，每账号最多 8 个活动会话，查看器默认 8 MiB/片并在断线后从服务端偏移续传。服务端按账号隔离存储、完成时校验长度和 SHA-256、限制单文件与账号配额，并在审计中记录发布/删除；旧单次上传保留兼容。账号可列出、下载和删除自己的录制，超过保留天数的文件随每 6 小时清理；运营者经 `readonly` 即可跨账号列出/下载，`operator` 可删除，删除审计记在属主名下并注明操作者 |
 | Web 管理台（RustDesk 仅在 Pro 侧提供） | `GET /admin/`（与 HTTP API 同端口的内嵌页面） | 无需额外进程或前端构建：可用部署 server-key，或用账号密码（可带 TOTP/恢复码）登录；账号角色决定可见页签，仅有分组授权的账号只能查看所属分组；已注册安全密钥的账号可改用“使用安全密钥登录”（填写密码时为密码+断言，密码留空为免密码通行密钥，需要 HTTPS 或 localhost 且服务端配置 `--webauthn-rp-id`/`--webauthn-origin`）；服务端配置 `--oidc-*` 时登录页另有“使用 <提供方> 登录”走 OIDC 授权码流程（新标签页打开身份提供方，回调后页面轮询取会话）；凭据存于浏览器 `sessionStorage`，不设 cookie 或服务端会话。覆盖总览、设备（全量含离线、搜索/在线过滤、每页 200 台的上一页/下一页与范围提示、别名标签、所有者、单台与多选批量禁用/启用、重置身份、按当前过滤导出 CSV）、账号（创建/角色/封禁/密码/2FA/删除）、我的账号（账号登录者自助改密码、找回邮箱/手机、启停 TOTP、生成恢复码、登记/删除安全密钥、查看/重命名/撤销登录会话）、录制（跨账号列出/按用户过滤/下载/删除）、三类审计分页、起止时间过滤与 CSV 下载、服务器与软件更新信息；401 自动锁屏，调用仍是同源 Bearer `/v1/*` |
 | 主机入站审计 | `POST /v1/hosts/{id}/audit` + `GET /v1/audit/connections?host=` + `GET /v1/audit/file-transfers?host=` | 查看器每会话生成 `audit_ref` 随 Hello 传给主机（协议 v25）；主机把会话与入站上传写 JSONL spool，`chast-tunnel host --audit-spool` 用主机 Ed25519 密钥逐条签名上报。服务端按引用合并两侧，会话一条主记录（`source`=viewer/host/both），文件保留主机逐文件行；运营者可按主机过滤 |
-| 地址簿分组 | `/v1/addressbook/groups/{id}` + peer `group_id` | 每个账号可创建、改名、删除分组；分组可嵌套（`parent_id`，成环/深度超 8 拒绝）并手工排序（`position`）；条目通过 `group_id` 归组，删除分组只解除归组且每个被移动条目各自推进修订号；查看器“我的设备”按分组树缩进展示并支持组内排序 |
+| 地址簿分组 | `/v1/addressbook/groups/{id}`、`/v1/addressbook/groups/export|import` + peer `group_id` | 每个账号可创建、改名、删除分组；分组可嵌套（`parent_id`，成环/深度超 8 拒绝）并手工排序（`position`）；条目通过 `group_id` 归组，删除分组只解除归组且每个被移动条目各自推进修订号；查看器“我的设备”按分组树缩进展示，支持组内排序、多设备原子批量移动和仅包含分组结构的严格 JSON 导入/导出 |
 | 地址簿搜索与筛选 | 查看器本地 | 名称/ID/标签的大小写不敏感子串搜索；标签芯片多选按并集匹配，筛选同时收窄分组标题与成员计数，可一键清除 |
 | 按分组共享与分组 ACL | `/v1/addressbook/grants`、`/v1/addressbook/shared/{owner}/...` | 授权可选 `group_id`（空为整本）；读取按授权范围过滤条目与分组，读写权限只作用于被授权分组，整本 `control` 才能管理授权；删除分组时同一事务撤销其授权；授权目标还可为账号组或 Everyone，按成员关系实时生效 |
 | 离线清空标签/分组 | 查看器本地意图 + 同步 `PATCH` | 清空全部标签或移出分组会持久化显式意图；离线期间不被服务端旧值回填，恢复后上传空值，成功或服务端已匹配才撤销意图 |
@@ -312,7 +312,7 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/account/login/webauthn/finish` | 无 | 提交 `username`、`credential_id`、`client_data_json`、`authenticator_data`、`signature`（base64url）与可选 `device_id`/`device_name`；校验断言并原子消费密码登录挑战，返回与 `/v1/account/login` 相同的令牌字段；签名/挑战无效、凭据不属于该账号或重放 401，封禁 403 |
 | `POST` | `/v1/account/login/webauthn/passwordless/begin` | 用户名 | 免密码登录：账号存在且有凭据时返回断言选项；未知账号与无凭据都返回 202 `{"status":"accepted"}`，既不签发挑战也不计限流失败，避免枚举与误锁；已限流 429 |
 | `POST` | `/v1/account/login/webauthn/passwordless/finish` | 无 | 与密码版 finish 相同的断言字段，但只消费免密码 purpose 的挑战；返回相同令牌字段；用密码版挑战重放 401，封禁账号仅在本人生成有效断言后返回 403 |
-| `GET` | `/v1/account/sessions` | Bearer account token | 当前账号未过期的登录会话：公开 `id`、`device_id`、`device_name`、创建/到期毫秒时间、`current`，以及登录来源 `login_ip`/`location`（未配置 GeoIP 时地点为空） |
+| `GET` | `/v1/account/sessions?limit=N&offset=N` | Bearer account token | 当前账号未过期的登录会话，响应为 `{"sessions":[...],"total":N}`：公开 `id`、`device_id`、`device_name`、`created_at_ms`（登录时间）、`expires_at_ms`、`last_seen_at_ms`、`online`、`current`，以及登录来源 `login_ip`/`location`（未配置 GeoIP 时地点为空）。`limit` 为 0–1000，`offset` 非负，按 `created_at_ms` 倒序并以会话 ID 决胜；省略分页参数仍返回全部会话。`online` 仅表示最近 5 分钟有已认证请求，不代表长连接，会话是否存活仍由 refresh token 有效期决定 |
 | `POST` | `/v1/account/sessions/revoke-others` | Bearer account token | 保留当前会话令牌并撤销该账号全部其他会话，返回 `{"revoked":N}`；无其他会话时为 0 |
 | `PATCH` | `/v1/account/sessions/{id}` | Bearer account token | 提交 `device_name` 改名本账号的一个会话（去空白/控制字符、最长 128 字符），返回 204；空名为 400，不存在、已过期或属于他人为 404 |
 | `DELETE` | `/v1/account/sessions/{id}` | Bearer account token | 撤销本账号的一个会话，返回 204；不存在或属于他人返回 404；撤销当前会话会使本设备令牌失效 |
@@ -329,18 +329,21 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/accounts/{username}/sms` | Bearer server-key 或 admin 账号令牌 | 为账号签发一个短信验证码并交给网关，返回 202 `{"status":"sent"}`，响应与审计都不含验证码；未知账号或未设手机 400，网关失败 502，未配置短信 503 |
 | `POST` | `/v1/accounts/{username}/2fa/reset` | Bearer server-key 或 admin 账号令牌 | 清除账号的两步验证密钥，返回 204；未知账号 404 |
 | `POST` | `/v1/accounts/{username}/permissions` | Bearer server-key 或 admin 账号令牌 | 提交 `permission_ceiling` 设置该账号的会话权限上限（0 表示不限制），返回更新后的账号；与设备策略上限取交集，下次签发接入票据时生效（已签发票据最长 60 秒后失效）；未知账号 404，负数或超出 32 位 400，写入 `account_session_cap` 审计 |
-| `GET` | `/v1/accounts/{username}/sessions` | Bearer server-key 或 admin 账号令牌 | 列出该账号当前有效的登录会话（`id`、`device_id`/`device_name`、`created_at_ms`、`expires_at_ms`、`login_ip`、`location`、`current`）；调用者查看自己的账号时当前会话带 `current:true`，未知账号 404，普通账号令牌 403 |
+| `GET` | `/v1/accounts/{username}/sessions?limit=N&offset=N` | Bearer server-key 或 admin 账号令牌 | 分页列出该账号当前有效的登录会话，响应含 `sessions` 与 `total`（字段同账号自助接口，包括登录时间、最近活动、`online` 与 `current`）；`limit` 为 0–1000、`offset` 非负，非法值 400。调用者查看自己的账号时当前会话带 `current:true`，未知账号 404，普通账号令牌 403 |
 | `DELETE` | `/v1/accounts/{username}/sessions/{id}` | Bearer server-key 或 admin 账号令牌 | 撤销该账号的一个登录会话（访问与刷新令牌一并删除），返回 204；会话不属于该账号或已过期 404，撤销调用者自身当前会话 409；写入 `session_revoke` 审计 |
 | `POST` | `/v1/accounts/{username}/sessions/revoke-all` | Bearer server-key 或 admin 账号令牌 | 撤销该账号的全部登录会话并返回 `{"revoked":N}`；调用者以该账号登录时保留调用会话（相当于“其他设备全部退出”）；写入 `session_revoke` 审计 |
 | `GET` | `/v1/addressbook?since=N` | Bearer account token | 返回当前 `revision`、存活条目 `peers`、存活分组 `groups`，以及 `since` 之后的条目变更/墓碑 `changes` 与分组变更 `group_changes`；省略 `since` 时从 0 开始，越界值回落到全量历史 |
 | `PATCH` | `/v1/addressbook/peers/{id}` | Bearer account token | 添加或部分更新名称/标签/`group_id`/`position`；省略字段保持不变，`""`/`[]` 清除，标签去重，`position` 必须非负；只带 `group_id` 时要求条目与目标分组都存在；可选正整数 `if_revision` 作为条目级并发令牌，过期/缺失/已删除返回 409，省略时仍为最后写入者优先 |
+| `POST` | `/v1/addressbook/peers/bulk-move` | Bearer account token | 原子移动 1–200 个条目到 `group_id`（空串为未分组）；请求中的重复 peer ID 自动去重，每项可带正整数 `if_revision`；任一未知条目、未知分组或过期修订都整批回滚。实际移动项共享一个新修订号，已在目标分组的项回列 `unchanged`，全部未变化时不推进修订 |
 | `DELETE` | `/v1/addressbook/peers/{id}` | Bearer account token | 删除条目；不存在返回 404 |
 | `PATCH` | `/v1/addressbook/groups/{id}` | Bearer account token | 创建、改名、改上级或排序分组；名称去除首尾空白且最长 64 字符，重复使用同一 ID 会复活已删除分组；`parent_id` 空串表示根，上级须为同一账号的存活分组，挂到自己/后代之下或深度超 8 返回 400；`position` 必须非负；可选正整数 `if_revision` 作为分组级并发令牌，过期/缺失返回 409 |
 | `DELETE` | `/v1/addressbook/groups/{id}` | Bearer account token | 删除分组并写分组墓碑，子分组上移到被删组的上级，组内存活条目逐个解除归组并推进修订，同一事务撤销该分组的共享授权；可选 `?if_revision` 校验，不存在返回 404 |
+| `GET` | `/v1/addressbook/groups/export` | Bearer account token | 导出当前账号全部存活分组，固定返回 `format=chast-addressbook-groups`、`version=1` 与稳定的 `groups` 数组；每项只含 `id`/`name`/`parent_id`/`position`，不导出设备、成员关系、修订号、时间戳或墓碑 |
+| `POST` | `/v1/addressbook/groups/import` | Bearer account token | 原子导入严格 JSON 分组结构；请求体限 1 MiB、单包最多 256 个分组，拒绝未知字段和尾随 JSON。`conflict=reject`（默认）遇任一存活 ID 整包 409，`skip` 保留已有分组，`update` 创建新分组并更新变化分组；所有校验完成后才写库，实际写入共享一个新修订号和时间戳，响应按 `created`/`updated`/`skipped`/`unchanged` 分类 |
 | `GET` | `/v1/addressbook/grants` | Bearer account token | 返回授出 `outgoing` 与收到 `incoming` 两组授权；每项含 `username`、`permission` 与可选的 `group_id`（空表示整本）；`target_kind` 为 `group`/`everyone` 时 `username` 为空，`target_id`/`target_name` 标明账号组 |
 | `POST` | `/v1/addressbook/grants` | Bearer account token | 提交 `username`、`permission` 与可选 `group_id` 授权整本或某个分组；同一范围重复提交幂等并可改权限；未知用户/分组 404、非法分组 ID 400、自共享 400。可用 `target` 改为 `group`（配 `target_id`，要求调用者是该组成员）或 `everyone`，此时不能再带 `username` |
 | `DELETE` | `/v1/addressbook/grants/{username}` | Bearer account token | 不带查询参数撤销该用户全部授权；带 `?group_id=<id>`（可为空串）只撤销该范围；不存在 404 |
-| `DELETE` | `/v1/addressbook/grants/targets` | Bearer account token | 撤销账号组/Everyone 授权：`?kind=group&target_id=<id>` 或 `?kind=everyone`；带 `group_id` 只撤销该范围；不存在 404 |
+| `DELETE` | `/v1/addressbook/grants/targets` | Bearer account token | 撤销账号组/Everyone 授权：`?kind=group&target_id=<id>` 或 `?kind=everyone`；带 `group_id` 只撤销该范围；不存在 404。每条实际删除的授权分别写入 `address_book_group_revoke` 或 `address_book_everyone_revoke` 审计，`detail` 含属主、目标名称、权限、地址簿范围及 `explicit_scope`/`explicit_all` 原因 |
 | `GET` | `/v1/addressbook/shared` | Bearer account token | 授权给我的地址簿：`books[].peers`/`groups` 只含授权范围，`scopes` 列出整本与分组权限，`permission` 为最高权限 |
 | `POST` | `/v1/addressbook/shared/{owner}/peers` | Bearer account token | 在属主地址簿新增条目，可选 `group_id`；需要整本或目标分组的读写权限；可选 `if_revision`（属主地址簿修订号），409 时需重新读取 |
 | `PATCH` | `/v1/addressbook/shared/{owner}/peers/{id}` | Bearer account token | 修改属主条目；需要整本或该条目所属分组的读写权限，可选 `if_revision`，409 时需重新读取 |
@@ -353,13 +356,13 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/hosts/{id}/audit` | 主机 Ed25519 签名（按 `audit_ref`） | 主机上报一条入站审计：`kind`（`session`/`file`）、`audit_ref`、时间/方向/文件名/大小/结果/说明，以及 `signature`。签名覆盖域分隔的规范消息 `chast-host-audit-v1`；未知主机 404、签名无效 401、时间偏差超过 2 分钟或字段非法 400。会话与查看器记录按引用合并，文件保存为主机逐文件行；返回 201 与规范化后的记录 |
 | `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、TCP 打洞协调地址（`tcp_punch`）、共享载体（`carrier`/`carrier_v6`）、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
-| `GET` | `/v1/audit?limit=N&action=<action>&user=<name>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤，`user` 按用户名精确过滤（含未知账号的失败登录，可与管理台分组过滤叠加），`before_id` 取上一页返回的 `next_before_id` 续页；`since`/`until` 按 `created_at` 收窄为闭区间，接受 unix 毫秒或 RFC3339，任一端可省略，负数、无法解析或 `since` 晚于 `until` 返回 400；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数，保留 `action`/`user` 与时间窗），未启用账号存储返回 503 |
+| `GET` | `/v1/audit?limit=N&group=<id>&action=<action>&user=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key 或具备审计资源的账号令牌 | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`group` 将范围收窄到当前成员，`action` 精确过滤，`user` 按用户名精确过滤（含未知账号的失败登录），`host` 按 `host_id` 大小写不敏感精确过滤；所有非空条件取交集，`before_id` 取上一页返回的 `next_before_id` 续页；`since`/`until` 按 `created_at` 收窄为闭区间，接受 unix 毫秒或 RFC3339，任一端可省略，负数、无法解析或 `since` 晚于 `until` 返回 400；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location`、`host_id` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数，保留全部分组/账号/主机/动作与时间条件），未启用账号存储返回 503 |
 | `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail` 与 `direction`；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大或方向非法返回 400 |
 | `GET` | `/v1/account/connections?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的连接记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
-| `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；`since`/`until` 按 `started_at` 收窄为闭区间（unix 毫秒或 RFC3339，任一端可省略，非法窗口返回 400）；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；`format=csv` 下载整表并沿用 `username`/`host` 与时间窗，忽略分页参数；未启用账号存储返回 503 |
+| `GET` | `/v1/audit/connections?limit=N&group=<id>&username=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key 或具备审计资源的账号令牌 | 运营者连接审计，可按分组、用户名与主机 ID 同时过滤（大小写不敏感，空值表示全部；主机匹配 `host_id` 或 `peer_id`，所有非空条件取交集），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；`since`/`until` 按 `started_at` 收窄为闭区间（unix 毫秒或 RFC3339，任一端可省略，非法窗口返回 400）；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；`format=csv` 下载整表并沿用分组/用户名/主机与时间窗，忽略分页参数；未启用账号存储返回 503 |
 | `POST` | `/v1/account/file-transfers` | Bearer account token | 查看器上报一个轮询窗口内结束的文件传输：`peer_id`、`direction`（`upload`/`download`）、可选 `name`/`size`、`files`（默认 1）、`success`、可选 `detail` 与 `occurred_at_ms`；返回 201；空对端、未知方向、负大小或文件数越界返回 400 |
 | `GET` | `/v1/account/file-transfers?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的文件传输记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
-| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；`since`/`until` 按 `occurred_at` 收窄为闭区间（unix 毫秒或 RFC3339，任一端可省略，非法窗口返回 400）；主机逐文件行与查看器汇总行并存；`format=csv` 下载整表并沿用过滤与时间窗，忽略分页参数；未启用账号存储返回 503 |
+| `GET` | `/v1/audit/file-transfers?limit=N&group=<id>&username=<name>&host=<id>&before_id=<id>&since=<ms\|RFC3339>&until=<ms\|RFC3339>&format=json\|csv` | Bearer server-key 或具备审计资源的账号令牌 | 运营者文件传输审计，可按分组、用户名与主机 ID 同时过滤（大小写不敏感，空值表示全部；主机匹配 `host_id` 或 `peer_id`，所有非空条件取交集），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；`since`/`until` 按 `occurred_at` 收窄为闭区间（unix 毫秒或 RFC3339，任一端可省略，非法窗口返回 400）；主机逐文件行与查看器汇总行并存；`format=csv` 下载整表并沿用分组/用户名/主机与时间窗，忽略分页参数；未启用账号存储返回 503 |
 | `POST` | `/v1/account/recordings?name=<文件名>&peer_id=<id>&started_ms=<毫秒>&duration_ms=<毫秒>` | Bearer account token | 上传一段查看器录制：请求体为 MP4 原始字节，元数据在查询串（文件名可为 UTF-8，响应与下载用 RFC 5987 名称）；服务端边写边算 SHA-256，超出 `--recordings-max-mb` 或账号配额返回 413，空请求体返回 400，成功返回 201 与录制记录、`usage_bytes`、`quota_bytes`；未启用归档返回 503 |
 | `GET` | `/v1/account/recordings` | Bearer account token | 当前账号的上传录制，最新在前，附带 `usage_bytes`、`quota_bytes` 与 `max_upload_bytes`（0 表示不限） |
 | `GET` | `/v1/account/recordings/{id}` | Bearer account token | 下载自己的录制，`video/mp4` 附件；只按账号隔离，未知 ID 或文件已缺失返回 404 |
@@ -459,14 +462,17 @@ Authorization: Bearer <account token>
 {"password":"<password>","code":"123456"}
 → 200 {"codes":["ABCD-EFGH-IJKL-MNOP", "QRST-UVWX-YZ23-4567", "..."]}
 
-GET /v1/account/sessions
+GET /v1/account/sessions?limit=20&offset=0
 Authorization: Bearer <account token>
 → 200 {"sessions":[
          {"id":"<12 random bytes hex>","device_id":"office-pc",
           "device_name":"Office PC","created_at_ms":1761300000000,
-          "expires_at_ms":1763892000000,"current":true},
+          "expires_at_ms":1763892000000,"last_seen_at_ms":1761300120000,
+          "online":true,"current":true},
          {"id":"<12 random bytes hex>","created_at_ms":1761200000000,
-          "expires_at_ms":1763792000000}]}
+          "expires_at_ms":1763792000000,"last_seen_at_ms":1761200000000,
+          "online":false,"current":false}],
+        "total":2}
 
 GET /v1/addressbook?since=12
 Authorization: Bearer <account token>
@@ -513,6 +519,11 @@ Authorization: Bearer <account token>
 `GET ?since=N` 能同时返回分组墓碑与被解绑条目的新修订。分组 ID 与 peer ID
 使用同一套 ID 校验，组名去空白后最长 64 字符；只改 `group_id` 的 `PATCH`
 要求条目与目标分组都存在，已删除的分组不能再被归入。
+批量移动使用 `POST /v1/addressbook/peers/bulk-move`，请求形如
+`{"group_id":"lab","peers":[{"id":"peer-a","if_revision":3},{"id":"peer-b"}]}`
+；服务端在读取任一存活条目前先校验数量、ID、目标分组和重复项，随后在同一
+事务内核对全部条目与可选修订，任一失败都不改行。所有实际移动项共享一个新
+条目修订号；全部已在目标分组时返回当前书修订和 `unchanged`，不再推进书修订。
 分组树与排序：`parent_id` 只能指向同一账号的存活分组（空串为根），自指、
 挂到后代或超过 8 层返回 400；`position` 必须非负，分组按
 `position, name, group_id` 排序、条目按 `position, peer_id` 排序，默认 0
@@ -522,7 +533,9 @@ Authorization: Bearer <account token>
 第一次同步固定发送 `since=0`，因为分组名称只保存在内存中；之后沿用缓存修订
 号增量同步。本地非空分组优先并回传到服务端，本地分组 ID 已不在服务端存活
 列表时归一为未分组。设备菜单“移动到分组”先写本地 `devices.json`，再尽力
-`PATCH`，失败时保留本地修改并在下次同步重试。首页“我的设备”支持大小写不
+`PATCH`，失败时保留本地修改并在下次同步重试。首页标题栏“批量移动”支持多选
+已保存设备、选择目标分组并发送一次原子请求；成功响应的实际移动项共享修订号
+并一次写回 `devices.json`，冲突时重新拉取整批所选设备。首页“我的设备”支持大小写不
 敏感的名称/ID/标签搜索与标签芯片筛选：芯片取卡片上实际展示的标签（账号标签
 优先，否则主机自报标签），多选按并集匹配；筛选会同步收窄分组标题与成员计数，
 无匹配时可一键清除，已选标签从所有卡片消失后自动失效。
@@ -594,7 +607,11 @@ admin 不能降级或封禁；只有当库中还有别的账号时也不能删�
 每次登录生成独立的公开 `session_id`，并保存登录请求可选的
 `device_id`/`device_name`（去控制字符，限 64/128 字符）；会话记录不返回令牌
 本身，`DELETE /v1/account/sessions/{id}` 只允许撤销同一用户的会话。旧库启动
-时自动补齐这三列并为存量令牌回填公开会话 ID，公开 ID 有部分唯一索引。查看器
+时自动补齐会话列并为存量令牌回填公开会话 ID，公开 ID 有部分唯一索引。账号
+schema v18 的令牌记录同时保存 `login_at` 与 `last_seen_at`：认证最多每分钟
+刷新一次最近活动，刷新令牌不会改变登录顺序；会话列表按登录时间倒序、会话 ID
+决胜，并以最近 5 分钟有已认证请求计算 `online`。两个会话列表都接受
+`limit=0..1000` 与非负 `offset` 并返回 `total`，省略时保持全部列表兼容。查看器
 登录默认携带本机主机名，账号对话框的“设备会话”列出设备、标记当前设备并允许
 逐个退出或一键退出全部其他设备：`POST /v1/account/sessions/revoke-others`
 保留调用者令牌并删除该账号其余会话，返回 `{"revoked":N}` 并写
@@ -667,7 +684,11 @@ admin 不能降级或封禁；只有当库中还有别的账号时也不能删�
 `next_before_id`）与 `since`/`until` 时间窗（闭区间，unix 毫秒或 RFC3339），
 管理台默认 20 条、最多 200 条，审计页签还提供账号输入框，并可在审计/连接/文件
 三个页签用起止时间输入框收窄范围。`audit prune <days>` 立即按时间清理账号
-安全审计、连接和文件传输三类历史。
+安全审计、连接和文件传输三类历史。地址簿向账号组或 Everyone 授出的权限被撤销时，按实际删除行逐条记录
+`address_book_group_revoke`/`address_book_everyone_revoke`；删除地址簿分组或
+账号组也会在同一事务确认删除后补记 `address_book_group_deleted`/
+`account_group_deleted` 原因，并保留属主、目标、权限和分组范围，避免批量级联
+撤权只留下父操作记录。
 
 连接审计与账号安全审计分开存放：查看器在会话结束时（首帧到达后才开始计时，
 纯握手失败不计入）向 `POST /v1/account/connections` 上报对端 ID、起止时间、
@@ -898,11 +919,12 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   状态的一部分；备份时应停服，或用 SQLite 的在线备份接口，不要只复制主文件。
   状态库带前向版本化迁移：账号与对等记录分别在 `schema_migrations`/
   `registry_schema_migrations` 记录版本，启动只执行未应用的步骤；账号库当前
-  为 v16（v3 增加分组嵌套与排序，v4 增加录制元数据，v5 增加刷新令牌重放
+  为 v18（v3 增加分组嵌套与排序，v4 增加录制元数据，v5 增加刷新令牌重放
   标记，v6 增加 OIDC 身份关联，v7 增加账号组，v8 增加审计地点/路由，v9 增加
   主机审计身份与去重，v10 增加设备策略，v11 增加机器令牌，v12 增加退役签发
   `kid`，v13 增加策略对象/分配，v14 增加按设备单调策略版本序列，v15 增加
-  地址簿组/全员共享目标，v16 增加账号级会话权限上限）；没有版本表
+  地址簿组/全员共享目标，v16 增加账号级会话权限上限，v17 增加 LDAP 身份关联，
+  v18 增加登录时间与最近活动时间）；没有版本表
   的旧库会自动补跑基线并补记 v1，版本高于当前二进制时服务端拒绝启动并提示
   升级（`schema version N is newer than this binary supports (M)`）。升级前
   应停止旧实例；只支持前向迁移，降级需从备份恢复。
@@ -1318,7 +1340,7 @@ chast-server --postgres-dsn "postgres://chast:secret@db.example.com:5432/chast?s
 - 无需单独的迁移命令：启动时账号库与对等库分别以 `schema_migrations` /
   `registry_schema_migrations` 记录版本，只执行未应用步骤；多个实例同时冷
   启动时用 PostgreSQL 会话级 advisory lock 串行化建表。PostgreSQL 支持从
-  当前 schema 开始（账号基线 v6、对等基线 v1），不支持从 SQLite 文件在线
+  当前 schema 开始（账号基线 v8、对等基线 v1），不支持从 SQLite 文件在线
   搬迁；迁移只前向追加，新增迁移必须同时补到 SQLite 与 PostgreSQL 两份列表。
   版本高于二进制支持范围时拒绝启动。
 - 连接池不再限制为单连接，并发由数据库行锁与每登录键的
@@ -1579,10 +1601,12 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   其他设备会话被撤销，当前令牌保留）；两步验证按 `2fa/start` → `2fa/enable`
   展示密钥与 `otpauth://` 链接，已启用时可用 `2fa/disable` 关闭、用
   `2fa/recovery` 生成一次性恢复码（面板可“下载文件”，保存为
-  `chast-recovery-codes-<用户名>.txt`）；登录会话来自 `GET /v1/account/sessions`，
-  当前会话标记“当前会话”，可 `PATCH` 改名、`DELETE` 撤销其他设备，或按
-  `sessions/revoke-others` 一键撤销其余会话。server-key 登录没有账号主体，
-  该页签保持隐藏。
+  `chast-recovery-codes-<用户名>.txt`）；登录会话来自
+  `GET /v1/account/sessions?limit=20&offset=N`，显示登录时间、最近活动与
+  在线/离线，当前会话单独标记“当前会话”，列表支持上下页；可 `PATCH` 改名、
+  `DELETE` 撤销其他设备，或按 `sessions/revoke-others` 一键撤销其余会话。
+  `online` 只表示最近 5 分钟有已认证请求，不表示长连接。server-key 登录没有
+  账号主体，该页签保持隐藏。
 - “账号找回”一栏调用 `POST /v1/account/email` 与 `POST /v1/account/phone`：
   保存或清除找回邮箱/手机都需要当前密码，空值即清除；手机号按服务端规则去掉
   空白/`-`/`(`/`)`/`.` 与开头 `+` 后校验 6–15 位数字。原密码错误提示 403、
@@ -1609,10 +1633,67 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   `device_policies`，手动 `PUT /v1/device-policies/{peer}` 覆盖分配，删除手动
   策略后回退；生效版本由 `device_policy_versions` 按设备单调分配，回退不会
   降低版本。变更经 `GET /v1/hosts/{id}/events` 推送 `policy` 或
-  `managed=false`，账号库 schema 当前为 v16。账号级会话权限
+  `managed=false`，账号库 schema 当前为 v18。账号级会话权限
   （`POST /v1/accounts/{username}/permissions`）在签发接入票据时与设备策略
   上限取交集，因此只收紧不放宽；未受管设备由主机本机认证，不受服务端票据
   约束。
+- 策略对象 JSON 导入/导出（admin `devices` 资源，仅全局范围）：
+  `GET /v1/policies/export` 按名称导出可移植对象，固定返回
+  `format=chast-policy-objects`、`version=1`，不包含本地 `id`、对象版本、
+  时间戳或更新者。`POST /v1/policies/import` 接受同一格式并可带
+  `conflict=reject|update`：
+
+  ```json
+  {
+    "format": "chast-policy-objects",
+    "version": 1,
+    "conflict": "reject",
+    "policies": [
+      {
+        "name": "lab profile",
+        "mode": "restricted",
+        "permission_ceiling": 5,
+        "allowed_users": ["alice"],
+        "allowed_groups": ["lab"]
+      }
+    ]
+  }
+  ```
+
+  默认 `reject` 在任一同名对象存在时返回 409，整包不写入；`update` 创建新
+  对象、更新内容变化的同名对象，并把内容相同的对象放入 `unchanged`，未变对象
+  不升版本、不改更新时间。所有校验完成后才开启写事务，创建、更新及子表替换
+  同事务提交；成功响应分别回列 `created`、`updated`、`unchanged`。请求体限
+  1 MiB，拒绝未知字段和尾随 JSON，`policies` 必须存在但可为空，单包最多 256
+  个对象；只导入策略对象，不导入分配。有变化时服务端使策略缓存失效、全量
+  reconcile 并记 `policy_object_import` 审计。管理台“设备策略”的策略对象区
+  提供“导出 JSON”“导入 JSON”和同名拒绝/同名更新选择，前端同样限制 1 MiB。
+- 地址簿分组 JSON 导入/导出：`GET /v1/addressbook/groups/export` 只导出当前
+  账号的存活分组结构，`POST /v1/addressbook/groups/import` 接受同一格式并可带
+  `conflict=reject|skip|update`（省略为 `reject`）：
+
+  ```json
+  {
+    "format": "chast-addressbook-groups",
+    "version": 1,
+    "conflict": "reject",
+    "groups": [
+      {"id": "lab", "name": "Lab", "parent_id": "", "position": 0},
+      {"id": "windows", "name": "Windows", "parent_id": "lab", "position": 1}
+    ]
+  }
+  ```
+
+  分组项只含 `id`、`name`、`parent_id` 与 `position`；设备 ID、设备列表、
+  成员关系、名称备注标签、连接参数、修订号、时间戳和墓碑都不进入文档。
+  导入先验证格式、类型、ID、名称、重复 ID、父级、自引用、环、深度 8 和
+  256 项上限，再读取账号存活分组形成最终合并树；全部校验完成后才开启写事务。
+  `reject` 遇到已有 ID 返回 409 且不创建同包中的其他分组；`skip` 保留已有
+  分组；`update` 更新变化项，内容相同的项回列 `unchanged` 且不重写。实际
+  创建/更新共享一个新修订号和时间戳，成功响应分别回列 `created`/`updated`/
+  `skipped`/`unchanged`，审计动作为 `address_book_group_import`。查看器分组
+  对话框提供导出预览、复制 JSON、粘贴导入和三档冲突选择，导入成功后重新同步
+  地址簿；不新增文件选择依赖。
 - 总览与设备页每 15 s 自动刷新，页面隐藏时暂停；账号、录制与审计表格不
   自动刷新，避免翻页或输入时被打断。
 - 静态资源在编译时用 `//go:embed` 打入二进制，只放行上述三个文件名；CSP
@@ -2337,8 +2418,9 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   时间清理、不能导出；主机侧入站会话与逐文件完成事件已由签名审计上报补齐），
   但没有传输中的实时进度；
   地址簿只保存
-  peer ID、名称、标签与分组 ID，不保存连接参数；按组授权、分组导入/导出与批量
-  移动尚未实现。
+  peer ID、名称、标签与分组 ID，不保存连接参数；按组授权与最多 200 条原子
+  批量移动以及仅含分组结构的严格 JSON 导入/导出均已实现；导入不会携带共享
+  授权或设备数据，跨账号共享簿仍需按现有授权流程单独管理。
 
 2026-10-26，查看器固定服务器公钥在单机回环上验证（`--server-key testkey`）：
 
@@ -2777,9 +2859,13 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   分别向 `schema_migrations`/`registry_schema_migrations` 写入 v2 后启动，
   均退出 1 并打印上述错误；`go vet ./...`、`go test ./... -count=1`、
   `go build ./...` 通过。
-- 边界：只做前向迁移，无回滚/降级路径；Postgres 后端仍未实现（开发机无
-  PostgreSQL/Docker，无法做真实库验收）；升级需停止旧实例，不支持新旧
-  二进制同时写同一状态库。
+- 边界（2026-10-28 当时）：只做前向迁移，无回滚/降级路径；Postgres 后端当时
+  仍未实现，开发机无 PostgreSQL/Docker，无法做真实库验收；升级需停止旧实例，
+  不支持新旧二进制同时写同一状态库。2026-11-14 后续已在 PostgreSQL
+  13.23/14.25 真库通过账号 v18、对等 v3 集成测试、v17→v18 迁移、13→14
+  `pg_dump`/`pg_restore` 与双实例空库冷启动；生产部署、权限/TLS/高可用和
+  PostgreSQL 上的完整 ACL 整链仍未验收。证据见
+  `docs/postgres-acceptance-2026-11-14.md`。
 
 2026-10-28，查看器录制归档（M11 P2-29）实现并验证：
 
@@ -2805,9 +2891,39 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   对同一进程完成上传→列表→下载（逐字节与 SHA-256 比对）→删除。
   `go build ./...`、`go vet ./...`、全量 `go test ./...` 与 Flutter 全量
   382 项测试、Windows Release 构建通过。
-- 边界：配额/单文件上限与保留期清理由单测覆盖，回环未制造超大文件；上传
-  超时（查看器侧 10 分钟）与大文件断点续传未实现，中断的半成品由清理轮次
-  删除。
+- 边界（2026-10-28 当时）：配额/单文件上限与保留期清理由单测覆盖，回环未制造
+  超大文件；上传超时（查看器侧 10 分钟）与大文件断点续传未实现，中断的半成品
+  由清理轮次删除。
+
+2026-11-14，大文件录制归档支持断点续传：
+
+- API：`POST /v1/account/recordings/uploads` 以 JSON 元数据（`name`、`peer_id`、
+  `size`、`started_at_ms`、`duration_ms`）创建上传，返回 upload id 与当前偏移；
+  `GET .../uploads/{id}` 查询持久偏移，`PATCH` 携带 `X-Upload-Offset` 和精确
+  `Content-Length` 追加 1 B–32 MiB，`POST .../complete` 校验完整长度、计算
+  SHA-256 并发布录制，`DELETE` 丢弃未完成会话。偏移落后或超前返回 409 和实际
+  偏移；跨账号访问统一 404。旧 `POST /v1/account/recordings` 保留兼容。
+- 存储：活动会话状态和 `.part` 位于账号目录，偏移直接取 `.part` 的持久大小，
+  因而服务重启后仍可续传；开始会话按声明大小预占配额，完成时数据库事务再按
+  实际字节校验。每账号最多 8 个活动会话；分片短写、超写或同步失败会截断回原
+  偏移。录制完成时先落正式文件，再插入元数据，插入失败会恢复分片。
+- 客户端：`ServerApi.uploadRecording` 默认开始上传会话、按 8 MiB 分片发送；
+  网络超时或断线后查询服务端偏移重试，单请求有独立超时，不再让整个大文件和
+  一个 10 分钟总预算绑定。完成响应丢失时刷新账号录制列表，用名称、大小、
+  对端与时间元数据核对是否已发布；会话结束或终端失败后 best-effort 删除未完成
+  上传。服务端不暴露新路由时自动回退旧单次流式上传。
+- 验证：`TestResumableUploadSurvivesArchiveRestart` 覆盖服务重启、未完成拒绝、
+  SHA-256 和完成后会话消失；短分片测试同时覆盖 Windows 截断回滚与跨账号隔离。
+  HTTP 测试覆盖开始→两次 PATCH→状态→完成→下载字节/SHA-256、丢失响应后按持久
+  偏移恢复、409 实际偏移、400 未完成、404 跨账号、DELETE、配额预占、32 MiB
+  分片上限、8 会话上限和匿名 401。Flutter 覆盖中断重试、完成响应丢失核对和
+  旧服务端回退；全量 763/763 通过。真实 `chast-server.exe` 回环在 1,048,576 B
+  首片后强杀并重启，从相同偏移续传至 2,109,497 B，下载逐字节与 SHA-256 一致，
+  跨账号上传/成品均 404。
+- 边界：活动会话使用现有 24 小时 orphan 阈值；连续 24 小时无写入的会话可能在
+  下一次清理轮次被删除，不是永久续传。上传锁是进程内锁，多个服务进程不应同时
+  写同一个 recordings 目录；共享目录的多实例方案仍需外部租约。真实跨 NAT
+  长断线、反向代理请求体/超时限制、生产磁盘满/只读和超大文件实传尚待环境验收。
 
 2026-10-28，运营者录制管理（管理台）实现并验证：
 

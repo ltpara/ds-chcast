@@ -24,30 +24,41 @@ void main() {
   });
 
   for (final int status in <int>[401, 403, 404, 408, 429, 503]) {
-    test('identity request HTTP $status keeps its retry classification', () async {
-      server.listen((HttpRequest request) async {
-        request.response.statusCode = status;
-        await request.response.close();
-      });
-      await expectLater(
-        ServerApi.serverIdentity(settings),
-        throwsA(isA<ServerApiException>().having(
-          (ServerApiException e) => e.retryable,
-          'retryable',
-          status == 408 || status == 429 || status >= 500,
-        )),
-      );
-    });
+    test(
+      'identity request HTTP $status keeps its retry classification',
+      () async {
+        server.listen((HttpRequest request) async {
+          request.response.statusCode = status;
+          await request.response.close();
+        });
+        await expectLater(
+          ServerApi.serverIdentity(settings),
+          throwsA(
+            isA<ServerApiException>().having(
+              (ServerApiException e) => e.retryable,
+              'retryable',
+              status == 408 || status == 429 || status >= 500,
+            ),
+          ),
+        );
+      },
+    );
   }
 
   test('identity request timeout is retryable', () async {
     server.listen((HttpRequest request) {});
     await expectLater(
-      ServerApi.serverIdentity(settings,
-          timeout: const Duration(milliseconds: 100)),
-      throwsA(isA<ServerApiException>().having(
-        (ServerApiException e) => e.retryable, 'retryable', isTrue,
-      )),
+      ServerApi.serverIdentity(
+        settings,
+        timeout: const Duration(milliseconds: 100),
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.retryable,
+          'retryable',
+          isTrue,
+        ),
+      ),
     );
   });
 
@@ -121,8 +132,10 @@ void main() {
       clientPublicKey: 'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg',
     );
     expect(requested?.path, '/v1/hosts/devbox');
-    expect(requested?.queryParameters['client_public_key'],
-        'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg');
+    expect(
+      requested?.queryParameters['client_public_key'],
+      'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg',
+    );
     expect(authorization, 'Bearer account-token');
     final HostAccessTicket? ticket = host.accessTicket;
     expect(ticket, isNotNull);
@@ -278,24 +291,27 @@ void main() {
     expect(batch.software, isNull);
   });
 
-  test('lookupBatch keeps an unsigned offer without marking it installable', () async {
-    server.listen((HttpRequest request) async {
-      request.response.headers.contentType = ContentType.json;
-      request.response.write(
-        '{"hosts":[],"software":{"version":"2.1.0",'
-        '"url":"https://downloads.example.com/chast-2.1.0.exe",'
-        '"sha256":"","size":0,"signature":""}}',
-      );
-      await request.response.close();
-    });
+  test(
+    'lookupBatch keeps an unsigned offer without marking it installable',
+    () async {
+      server.listen((HttpRequest request) async {
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          '{"hosts":[],"software":{"version":"2.1.0",'
+          '"url":"https://downloads.example.com/chast-2.1.0.exe",'
+          '"sha256":"","size":0,"signature":""}}',
+        );
+        await request.response.close();
+      });
 
-    final BatchLookupResult batch = await ServerApi.lookupBatch(
-      settings,
-      <String>['devbox'],
-    );
-    expect(batch.software?.version, '2.1.0');
-    expect(batch.software?.installable, isFalse);
-  });
+      final BatchLookupResult batch = await ServerApi.lookupBatch(
+        settings,
+        <String>['devbox'],
+      );
+      expect(batch.software?.version, '2.1.0');
+      expect(batch.software?.installable, isFalse);
+    },
+  );
 
   test('lookupBatch rejects a response without a host list', () async {
     server.listen((HttpRequest request) async {
@@ -452,9 +468,7 @@ void main() {
               as Map<String, Object?>;
       request.response.statusCode = HttpStatus.accepted;
       request.response.headers.contentType = ContentType.json;
-      request.response.write(
-        '{"queued":true,"job":"abc","expires_in_sec":60}',
-      );
+      request.response.write('{"queued":true,"job":"abc","expires_in_sec":60}');
       await request.response.close();
     });
 
@@ -2343,7 +2357,8 @@ void main() {
     }
   });
 
-  test('address book groups are created, deleted and validated', () async {    final List<String> requests = <String>[];
+  test('address book groups are created, deleted and validated', () async {
+    final List<String> requests = <String>[];
     int deletes = 0;
     server.listen((HttpRequest request) async {
       final String body = await utf8.decoder.bind(request).join();
@@ -2467,6 +2482,141 @@ void main() {
     );
   });
 
+  test('address book groups export and import strict portable JSON', () async {
+    final List<String> requests = <String>[];
+    final List<Map<String, Object?>> importBodies = <Map<String, Object?>>[];
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType.json;
+      if (request.method == 'GET') {
+        requests.add('GET ${request.uri.path}');
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'format': 'chast-addressbook-groups',
+            'version': 1,
+            'groups': <Object?>[
+              <String, Object?>{
+                'id': 'team',
+                'name': 'Team',
+                'parent_id': '',
+                'position': 1,
+              },
+              <String, Object?>{
+                'id': 'dev',
+                'name': 'Dev',
+                'parent_id': 'team',
+                'position': 2,
+              },
+            ],
+          }),
+        );
+      } else {
+        final Map<String, Object?> body =
+            jsonDecode(await utf8.decoder.bind(request).join())
+                as Map<String, Object?>;
+        importBodies.add(body);
+        requests.add('POST ${request.uri.path} ${body['conflict']}');
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'revision': 12,
+            'created': <Object?>[
+              <String, Object?>{
+                'id': 'team',
+                'name': 'Team',
+                'parent_id': '',
+                'position': 1,
+                'revision': 12,
+              },
+            ],
+            'updated': <Object?>[],
+            'skipped': <Object?>['team'],
+            'unchanged': <Object?>[],
+          }),
+        );
+      }
+      await request.response.close();
+    });
+
+    final AddressBookGroupTransferDocument exported =
+        await ServerApi.exportAddressBookGroups(settings, 'account-token');
+    expect(requests, <String>['GET /v1/addressbook/groups/export']);
+    expect(exported.groups, hasLength(2));
+    expect(exported.groups.last.parentId, 'team');
+    final Map<String, Object?> encoded = exported.toJson();
+    expect(encoded.keys, <String>['format', 'version', 'conflict', 'groups']);
+    expect((encoded['groups']! as List<Object?>).first, <String, Object?>{
+      'id': 'team',
+      'name': 'Team',
+      'parent_id': '',
+      'position': 1,
+    });
+    expect(encoded.toString(), isNot(contains('revision')));
+    expect(encoded.toString(), isNot(contains('device')));
+
+    for (final String conflict in <String>['reject', 'skip', 'update']) {
+      final AddressBookGroupImportResult result =
+          await ServerApi.importAddressBookGroups(
+            settings,
+            'account-token',
+            exported,
+            conflict: conflict,
+          );
+      expect(result.revision, 12);
+      expect(result.created.single.id, 'team');
+      expect(result.skipped, <String>['team']);
+    }
+    expect(importBodies, hasLength(3));
+    expect(
+      importBodies.map((Map<String, Object?> body) => body['conflict']),
+      <String>['reject', 'skip', 'update'],
+    );
+    expect(importBodies.first['format'], 'chast-addressbook-groups');
+    expect(importBodies.first['version'], 1);
+    expect(importBodies.first.toString(), isNot(contains('device')));
+
+    await expectLater(
+      ServerApi.importAddressBookGroups(
+        settings,
+        'account-token',
+        exported,
+        conflict: 'merge',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('冲突模式'),
+        ),
+      ),
+    );
+  });
+
+  test('portable group JSON rejects unknown fields and trailing data', () {
+    const String valid =
+        '{"format":"chast-addressbook-groups","version":1,'
+        '"groups":[{"id":"lab","name":"Lab","parent_id":"","position":0}]}';
+    final AddressBookGroupTransferDocument document =
+        AddressBookGroupTransferDocument.parse(valid);
+    expect(document.groups.single.id, 'lab');
+
+    for (final String invalid in <String>[
+      '{"format":"chast-addressbook-groups","version":1,"groups":[],'
+          '"extra":true}',
+      '{"format":"chast-addressbook-groups","version":1,"groups":[{'
+          '"id":"lab","name":"Lab","parent_id":"","position":0,'
+          '"device_id":"secret"}]}',
+      '{"format":"chast-addressbook-groups","version":1,"conflict":"merge",'
+          '"groups":[]}',
+      '{"format":"chast-addressbook-groups","version":1,"groups":[]} {}',
+      '{"format":"chast-addressbook-groups","version":1,"groups":[{'
+          '"id":"lab","name":"Lab","parent_id":"","position":-1}]}',
+    ]) {
+      expect(
+        () => AddressBookGroupTransferDocument.parse(invalid),
+        throwsA(isA<ServerApiException>()),
+      );
+    }
+  });
+
   test('address book peer group moves send only the group id', () async {
     Object? body;
     server.listen((HttpRequest request) async {
@@ -2521,6 +2671,107 @@ void main() {
           (ServerApiException e) => e.message,
           'message',
           contains('排序位置'),
+        ),
+      ),
+    );
+  });
+
+  test('address book bulk move dedupes peers and parses the batch', () async {
+    String? method;
+    String? path;
+    String? authorization;
+    Object? body;
+    server.listen((HttpRequest request) async {
+      method = request.method;
+      path = request.uri.path;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'revision': 7,
+          'moved': <Object?>[
+            <String, Object?>{'id': 'peer-a', 'group_id': 'lab', 'revision': 7},
+          ],
+          'unchanged': <String>['peer-b'],
+        }),
+      );
+      await request.response.close();
+    });
+
+    final AddressBookBulkMoveResult result =
+        await ServerApi.moveAddressBookPeers(
+          settings,
+          'account-token',
+          const <AddressBookPeerMove>[
+            AddressBookPeerMove(id: 'peer-a', ifRevision: 3),
+            AddressBookPeerMove(id: 'peer-a', ifRevision: 4),
+            AddressBookPeerMove(id: 'peer-b'),
+          ],
+          ' lab ',
+        );
+    expect(method, 'POST');
+    expect(path, '/v1/addressbook/peers/bulk-move');
+    expect(authorization, 'Bearer account-token');
+    expect(body, <String, Object?>{
+      'group_id': 'lab',
+      'peers': <Object?>[
+        <String, Object?>{'id': 'peer-a', 'if_revision': 3},
+        <String, Object?>{'id': 'peer-b'},
+      ],
+    });
+    expect(result.revision, 7);
+    expect(result.moved.single.id, 'peer-a');
+    expect(result.moved.single.groupId, 'lab');
+    expect(result.unchanged, <String>['peer-b']);
+
+    await expectLater(
+      ServerApi.moveAddressBookPeers(
+        settings,
+        'account-token',
+        const <AddressBookPeerMove>[],
+        'lab',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException error) => error.message,
+          'message',
+          contains('1 到 200'),
+        ),
+      ),
+    );
+    await expectLater(
+      ServerApi.moveAddressBookPeers(
+        settings,
+        'account-token',
+        <AddressBookPeerMove>[
+          for (int i = 0; i <= ServerApi.maxBatchIds; ++i)
+            AddressBookPeerMove(id: 'peer-$i'),
+        ],
+        'lab',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException error) => error.message,
+          'message',
+          contains('1 到 200'),
+        ),
+      ),
+    );
+    await expectLater(
+      ServerApi.moveAddressBookPeers(
+        settings,
+        'account-token',
+        const <AddressBookPeerMove>[
+          AddressBookPeerMove(id: 'peer-a', ifRevision: -1),
+        ],
+        'lab',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException error) => error.message,
+          'message',
+          contains('版本无效'),
         ),
       ),
     );
@@ -3381,8 +3632,10 @@ void main() {
     expect(archive.recordings.single.name, '会话录制.mp4');
     expect(archive.recordings.single.peerId, 'devbox');
     expect(archive.recordings.single.durationMs, 60000);
-    expect(archive.recordings.single.createdAt?.toUtc().millisecondsSinceEpoch,
-        1761400060000);
+    expect(
+      archive.recordings.single.createdAt?.toUtc().millisecondsSinceEpoch,
+      1761400060000,
+    );
     expect(archive.usageBytes, 2048);
     expect(archive.quotaBytes, 8192);
     expect(archive.maxUploadBytes, 4096);
@@ -3394,7 +3647,10 @@ void main() {
     );
     addTearDown(() => dir.delete(recursive: true));
     final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
-    final List<int> bytes = List<int>.generate(1024, (int index) => index % 251);
+    final List<int> bytes = List<int>.generate(
+      1024,
+      (int index) => index % 251,
+    );
     await file.writeAsBytes(bytes);
 
     Uri? requested;
@@ -3446,6 +3702,7 @@ void main() {
         lastSent = sent;
         lastTotal = total;
       },
+      resumable: false,
     );
 
     expect(requested?.path, '/v1/account/recordings');
@@ -3462,6 +3719,321 @@ void main() {
     expect(recorded.id, 'b' * 32);
     expect(recorded.name, '会话录制.mp4');
   });
+
+  test(
+    'uploadRecording resumes from the durable offset after a lost chunk response',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-resume-upload-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
+      final List<int> bytes = List<int>.generate(10, (int index) => index + 1);
+      await file.writeAsBytes(bytes);
+
+      const String uploadId = 'cccccccccccccccccccccccccccccccc';
+      final List<int> received = <int>[];
+      final List<int> patchOffsets = <int>[];
+      int patchCount = 0;
+      int deleteCount = 0;
+      server.listen((HttpRequest request) async {
+        final String path = request.uri.path;
+        request.response.headers.contentType = ContentType.json;
+        if (request.method == 'POST' &&
+            path == '/v1/account/recordings/uploads') {
+          final Map<String, Object?> begin =
+              jsonDecode(await utf8.decoder.bind(request).join())
+                  as Map<String, Object?>;
+          expect(begin['name'], 'resume.mp4');
+          expect(begin['size'], bytes.length);
+          request.response.statusCode = HttpStatus.created;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'upload': <String, Object?>{
+                'id': uploadId,
+                'offset': 0,
+                'size': bytes.length,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'PATCH' &&
+            path == '/v1/account/recordings/uploads/$uploadId') {
+          final int offset = int.parse(
+            request.headers.value('X-Upload-Offset')!,
+          );
+          patchOffsets.add(offset);
+          final List<int> chunk = await request.fold<List<int>>(
+            <int>[],
+            (List<int> all, List<int> part) => all..addAll(part),
+          );
+          expect(offset, received.length);
+          received.addAll(chunk);
+          patchCount++;
+          if (patchCount == 1) {
+            request.response.statusCode = HttpStatus.internalServerError;
+            request.response.write(
+              jsonEncode(<String, Object?>{'error': 'response lost'}),
+            );
+          } else {
+            request.response.statusCode = HttpStatus.accepted;
+            request.response.write(
+              jsonEncode(<String, Object?>{
+                'upload': <String, Object?>{
+                  'id': uploadId,
+                  'offset': received.length,
+                  'size': bytes.length,
+                },
+              }),
+            );
+          }
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'GET' &&
+            path == '/v1/account/recordings/uploads/$uploadId') {
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'upload': <String, Object?>{
+                'id': uploadId,
+                'offset': received.length,
+                'size': bytes.length,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'POST' &&
+            path == '/v1/account/recordings/uploads/$uploadId/complete') {
+          expect(received, bytes);
+          request.response.statusCode = HttpStatus.created;
+          final String digest = sha256.convert(bytes).toString();
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'recording': <String, Object?>{
+                'id': 'd' * 32,
+                'name': 'resume.mp4',
+                'peer_id': 'devbox',
+                'size': bytes.length,
+                'sha256': digest,
+                'duration_ms': 5000,
+                'started_at_ms': 1761400000000,
+                'created_at_ms': DateTime.now().millisecondsSinceEpoch,
+              },
+              'usage_bytes': bytes.length,
+              'quota_bytes': 8192,
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'DELETE' &&
+            path == '/v1/account/recordings/uploads/$uploadId') {
+          deleteCount++;
+          request.response.statusCode = HttpStatus.noContent;
+          await request.response.close();
+          return;
+        }
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+      });
+
+      final List<int> progress = <int>[];
+      final RemoteRecording recorded = await ServerApi.uploadRecording(
+        settings,
+        'account-token',
+        file: file,
+        name: 'resume.mp4',
+        peerId: 'devbox',
+        startedAtMs: 1761400000000,
+        durationMs: 5000,
+        chunkSize: 4,
+        onProgress: (int sent, int total) => progress.add(sent),
+      );
+
+      expect(patchOffsets, <int>[0, 4, 8]);
+      expect(received, bytes);
+      expect(progress, <int>[0, 4, 8, 10, 10]);
+      expect(recorded.id, 'd' * 32);
+      expect(recorded.name, 'resume.mp4');
+      expect(deleteCount, 1);
+    },
+  );
+
+  test(
+    'uploadRecording reconciles a completed upload when its response is lost',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-complete-upload-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      final File file = File('${dir.path}${Platform.pathSeparator}done.mp4');
+      final List<int> bytes = <int>[1, 2, 3, 4];
+      await file.writeAsBytes(bytes);
+
+      const String uploadId = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+      int offset = 0;
+      int completeCalls = 0;
+      int listCalls = 0;
+      final int createdAt = DateTime.now().millisecondsSinceEpoch;
+      server.listen((HttpRequest request) async {
+        final String path = request.uri.path;
+        request.response.headers.contentType = ContentType.json;
+        if (request.method == 'POST' &&
+            path == '/v1/account/recordings/uploads') {
+          request.response.statusCode = HttpStatus.created;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'upload': <String, Object?>{
+                'id': uploadId,
+                'offset': 0,
+                'size': bytes.length,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'PATCH') {
+          final int start = int.parse(
+            request.headers.value('X-Upload-Offset')!,
+          );
+          final List<int> chunk = await request.fold<List<int>>(
+            <int>[],
+            (List<int> all, List<int> part) => all..addAll(part),
+          );
+          expect(start, offset);
+          offset += chunk.length;
+          request.response.statusCode = HttpStatus.accepted;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'upload': <String, Object?>{
+                'id': uploadId,
+                'offset': offset,
+                'size': bytes.length,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'POST' && path.endsWith('/complete')) {
+          completeCalls++;
+          request.response.statusCode = HttpStatus.internalServerError;
+          request.response.write(
+            jsonEncode(<String, Object?>{'error': 'completion response lost'}),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'GET' && path == '/v1/account/recordings') {
+          listCalls++;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'recordings': <Object?>[
+                <String, Object?>{
+                  'id': 'f' * 32,
+                  'name': 'done.mp4',
+                  'peer_id': 'devbox',
+                  'size': bytes.length,
+                  'sha256': sha256.convert(bytes).toString(),
+                  'duration_ms': 5000,
+                  'started_at_ms': 1761400000000,
+                  'created_at_ms': createdAt,
+                },
+              ],
+              'usage_bytes': bytes.length,
+              'quota_bytes': 8192,
+              'max_upload_bytes': 4096,
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'DELETE') {
+          request.response.statusCode = HttpStatus.notFound;
+          await request.response.close();
+          return;
+        }
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+      });
+
+      final RemoteRecording recorded = await ServerApi.uploadRecording(
+        settings,
+        'account-token',
+        file: file,
+        name: 'done.mp4',
+        peerId: 'devbox',
+        startedAtMs: 1761400000000,
+        durationMs: 5000,
+        chunkSize: 8 << 20,
+      );
+      expect(recorded.id, 'f' * 32);
+      expect(completeCalls, 1);
+      expect(listCalls, 1);
+    },
+  );
+
+  test(
+    'uploadRecording falls back to the legacy route on an older server',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-legacy-upload-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      final File file = File('${dir.path}${Platform.pathSeparator}legacy.mp4');
+      final List<int> bytes = <int>[9, 8, 7, 6];
+      await file.writeAsBytes(bytes);
+      final List<String> paths = <String>[];
+      server.listen((HttpRequest request) async {
+        await request.drain<void>();
+        paths.add(request.uri.path);
+        if (request.uri.path == '/v1/account/recordings/uploads') {
+          request.response.statusCode = HttpStatus.methodNotAllowed;
+          await request.response.close();
+          return;
+        }
+        request.response.statusCode = HttpStatus.created;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'recording': <String, Object?>{
+              'id': 'a' * 32,
+              'name': 'legacy.mp4',
+              'peer_id': 'devbox',
+              'size': bytes.length,
+              'sha256': sha256.convert(bytes).toString(),
+              'duration_ms': 5000,
+              'started_at_ms': 1761400000000,
+              'created_at_ms': DateTime.now().millisecondsSinceEpoch,
+            },
+            'usage_bytes': bytes.length,
+            'quota_bytes': 8192,
+          }),
+        );
+        await request.response.close();
+      });
+
+      final RemoteRecording recorded = await ServerApi.uploadRecording(
+        settings,
+        'account-token',
+        file: file,
+        name: 'legacy.mp4',
+        peerId: 'devbox',
+        startedAtMs: 1761400000000,
+        durationMs: 5000,
+      );
+      expect(recorded.id, 'a' * 32);
+      expect(paths, <String>[
+        '/v1/account/recordings/uploads',
+        '/v1/account/recordings',
+      ]);
+    },
+  );
 
   test('uploadRecording maps a quota refusal to a readable reason', () async {
     final Directory dir = await Directory.systemTemp.createTemp(
@@ -3487,77 +4059,89 @@ void main() {
         settings,
         'account-token',
         file: file,
+        resumable: false,
       ),
       throwsA(
         isA<ServerApiException>()
             .having((ServerApiException e) => e.statusCode, 'status', 413)
-            .having((ServerApiException e) => e.message, 'message', '录制存储配额已用尽'),
+            .having(
+              (ServerApiException e) => e.message,
+              'message',
+              '录制存储配额已用尽',
+            ),
       ),
     );
   });
 
-  test('downloadRecording saves without overwriting and sends the token', () async {
-    final Directory dir = await Directory.systemTemp.createTemp(
-      'chast-download-',
-    );
-    addTearDown(() => dir.delete(recursive: true));
-    String? authorization;
-    server.listen((HttpRequest request) async {
-      authorization = request.headers.value(HttpHeaders.authorizationHeader);
-      request.response.headers.contentType = ContentType('video', 'mp4');
-      request.response.add(<int>[0, 1, 2, 3, 4]);
-      await request.response.close();
-    });
-    final RemoteRecording recording = RemoteRecording(
-      id: 'c' * 32,
-      name: r'..\会话/录制 2026.mp4',
-      size: 5,
-      sha256: sha256.convert(<int>[0, 1, 2, 3, 4]).toString(),
-    );
+  test(
+    'downloadRecording saves without overwriting and sends the token',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-download-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      String? authorization;
+      server.listen((HttpRequest request) async {
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        request.response.headers.contentType = ContentType('video', 'mp4');
+        request.response.add(<int>[0, 1, 2, 3, 4]);
+        await request.response.close();
+      });
+      final RemoteRecording recording = RemoteRecording(
+        id: 'c' * 32,
+        name: r'..\会话/录制 2026.mp4',
+        size: 5,
+        sha256: sha256.convert(<int>[0, 1, 2, 3, 4]).toString(),
+      );
 
-    final File first = await ServerApi.downloadRecording(
-      settings,
-      'account-token',
-      recording,
-      directory: dir,
-    );
-    final File second = await ServerApi.downloadRecording(
-      settings,
-      'account-token',
-      recording,
-      directory: dir,
-    );
+      final File first = await ServerApi.downloadRecording(
+        settings,
+        'account-token',
+        recording,
+        directory: dir,
+      );
+      final File second = await ServerApi.downloadRecording(
+        settings,
+        'account-token',
+        recording,
+        directory: dir,
+      );
 
-    expect(authorization, 'Bearer account-token');
-    expect(first.path, endsWith('会话_录制 2026.mp4'));
-    expect(second.path, endsWith('会话_录制 2026 (1).mp4'));
-    expect(await first.readAsBytes(), <int>[0, 1, 2, 3, 4]);
-    expect(await second.readAsBytes(), <int>[0, 1, 2, 3, 4]);
-  });
+      expect(authorization, 'Bearer account-token');
+      expect(first.path, endsWith('会话_录制 2026.mp4'));
+      expect(second.path, endsWith('会话_录制 2026 (1).mp4'));
+      expect(await first.readAsBytes(), <int>[0, 1, 2, 3, 4]);
+      expect(await second.readAsBytes(), <int>[0, 1, 2, 3, 4]);
+    },
+  );
 
-  test('downloadRecording avoids Windows device names and trailing dots', () async {
-    final Directory dir = await Directory.systemTemp.createTemp(
-      'chast-download-',
-    );
-    addTearDown(() => dir.delete(recursive: true));
-    server.listen((HttpRequest request) async {
-      request.response.headers.contentType = ContentType('video', 'mp4');
-      request.response.add(<int>[0, 1, 2, 3, 4]);
-      await request.response.close();
-    });
-    final String digest = sha256.convert(<int>[0, 1, 2, 3, 4]).toString();
-    Future<File> download(String id, String name) => ServerApi.downloadRecording(
-      settings,
-      'account-token',
-      RemoteRecording(id: id, name: name, size: 5, sha256: digest),
-      directory: dir,
-    );
+  test(
+    'downloadRecording avoids Windows device names and trailing dots',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-download-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      server.listen((HttpRequest request) async {
+        request.response.headers.contentType = ContentType('video', 'mp4');
+        request.response.add(<int>[0, 1, 2, 3, 4]);
+        await request.response.close();
+      });
+      final String digest = sha256.convert(<int>[0, 1, 2, 3, 4]).toString();
+      Future<File> download(String id, String name) =>
+          ServerApi.downloadRecording(
+            settings,
+            'account-token',
+            RemoteRecording(id: id, name: name, size: 5, sha256: digest),
+            directory: dir,
+          );
 
-    final File device = await download('d' * 32, 'CON.mp4');
-    final File dotted = await download('e' * 32, 'notes...');
-    expect(device.path, endsWith('_CON.mp4'));
-    expect(dotted.path, endsWith('notes.mp4'));
-  });
+      final File device = await download('d' * 32, 'CON.mp4');
+      final File dotted = await download('e' * 32, 'notes...');
+      expect(device.path, endsWith('_CON.mp4'));
+      expect(dotted.path, endsWith('notes.mp4'));
+    },
+  );
 
   test('downloadRecording deletes a body that fails its digest', () async {
     final Directory dir = await Directory.systemTemp.createTemp(
@@ -3643,7 +4227,11 @@ void main() {
       throwsA(
         isA<ServerApiException>()
             .having((ServerApiException e) => e.statusCode, 'status', 404)
-            .having((ServerApiException e) => e.message, 'message', '录制不存在或已被删除'),
+            .having(
+              (ServerApiException e) => e.message,
+              'message',
+              '录制不存在或已被删除',
+            ),
       ),
     );
   });

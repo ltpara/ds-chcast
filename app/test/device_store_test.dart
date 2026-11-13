@@ -294,6 +294,51 @@ void main() {
   });
 
   test(
+    'settling one batch updates every moved row and shared revision',
+    () async {
+      const String server = 'http://127.0.0.1:8443';
+      final DateTime addedAt = DateTime.fromMillisecondsSinceEpoch(0);
+      for (final (String id, String group, int revision)
+          in <(String, String, int)>[
+            ('alpha', 'work', 3),
+            ('beta', 'work', 4),
+            ('gamma', 'lab', 5),
+          ]) {
+        await store.save(
+          Device(
+            id: id,
+            server: server,
+            groupId: group,
+            revision: revision,
+            addedAt: addedAt,
+          ),
+        );
+      }
+      final List<Device> before = await store.load();
+      final String alphaKey = before
+          .firstWhere((Device item) => item.id == 'alpha')
+          .key;
+      final String betaKey = before
+          .firstWhere((Device item) => item.id == 'beta')
+          .key;
+
+      await store.settleGroupMoves(<String>{alphaKey, betaKey}, '', 12);
+
+      final Map<String, Device> after = <String, Device>{
+        for (final Device device in await store.load()) device.id: device,
+      };
+      for (final String id in <String>['alpha', 'beta']) {
+        expect(after[id]!.groupId, isEmpty);
+        expect(after[id]!.groupCleared, isTrue);
+        expect(after[id]!.revision, 12);
+      }
+      expect(after['gamma']!.groupId, 'lab');
+      expect(after['gamma']!.groupCleared, isFalse);
+      expect(after['gamma']!.revision, 5);
+    },
+  );
+
+  test(
     'clearing tags or a group records an offline intent until settled',
     () async {
       await store.save(

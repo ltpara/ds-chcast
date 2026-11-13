@@ -215,10 +215,9 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	if groupID != "" {
 		events, err = s.cfg.Accounts.ConnectionsForGroupBeforeRange(
 			groupID, username, host, bounds, beforeID, limit)
-	} else if host != "" {
-		events, err = s.cfg.Accounts.ConnectionsForHostBeforeRange(host, bounds, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.ConnectionsForBeforeRange(username, bounds, beforeID, limit)
+		events, err = s.cfg.Accounts.ConnectionsForOperatorBeforeRange(
+			username, host, bounds, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account connection audit query", "error", err)

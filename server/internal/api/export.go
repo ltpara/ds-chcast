@@ -137,6 +137,7 @@ func (e *csvExport) done() {
 func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 	user := strings.TrimSpace(r.URL.Query().Get("user"))
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	group := strings.TrimSpace(r.URL.Query().Get("group"))
 	bounds, ok := reportTimeBounds(w, r)
 	if !ok {
@@ -148,15 +149,9 @@ func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 	})
 	var before int64
 	for {
-		var (
-			events []account.AuditEvent
-			err    error
-		)
-		if group != "" {
-			events, err = s.cfg.Accounts.AuditEventsForGroupBeforeRange(group, action, user, bounds, before, exportBatch)
-		} else {
-			events, err = s.cfg.Accounts.AuditEventsForBeforeRange(action, user, bounds, before, exportBatch)
-		}
+		events, err := s.cfg.Accounts.AuditEventsForFilterBefore(group, account.AuditFilter{
+			Action: action, Username: user, HostID: host, Bounds: bounds,
+		}, before, exportBatch)
 		if err != nil {
 			export.fail(err, "could not read the audit log")
 			return
@@ -208,10 +203,9 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 		if group != "" {
 			events, err = s.cfg.Accounts.ConnectionsForGroupBeforeRange(
 				group, username, host, bounds, before, exportEventBatch)
-		} else if host != "" {
-			events, err = s.cfg.Accounts.ConnectionsForHostBeforeRange(host, bounds, before, exportEventBatch)
 		} else {
-			events, err = s.cfg.Accounts.ConnectionsForBeforeRange(username, bounds, before, exportEventBatch)
+			events, err = s.cfg.Accounts.ConnectionsForOperatorBeforeRange(
+				username, host, bounds, before, exportEventBatch)
 		}
 		if err != nil {
 			export.fail(err, "could not read the connection log")
@@ -270,10 +264,9 @@ func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request) {
 		if group != "" {
 			events, err = s.cfg.Accounts.FileTransfersForGroupBeforeRange(
 				group, username, host, bounds, before, exportEventBatch)
-		} else if host != "" {
-			events, err = s.cfg.Accounts.FileTransfersForHostBeforeRange(host, bounds, before, exportEventBatch)
 		} else {
-			events, err = s.cfg.Accounts.FileTransfersForBeforeRange(username, bounds, before, exportEventBatch)
+			events, err = s.cfg.Accounts.FileTransfersForOperatorBeforeRange(
+				username, host, bounds, before, exportEventBatch)
 		}
 		if err != nil {
 			export.fail(err, "could not read the file transfer log")

@@ -29,8 +29,25 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[14].Apply = applyAddressBookTargetGrantsPostgres
 	list[15].Apply = applySessionPermissionCapsPostgres
 	list[16].Apply = applyLDAPIdentitiesPostgres
+	list[17].Apply = applyAccountSessionActivityPostgres
 	return list
 }()
+
+// applyAccountSessionActivityPostgres mirrors the stable login and recent-use
+// timestamps used by the paginated session directory.
+func applyAccountSessionActivityPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS login_at BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS last_seen_at BIGINT NOT NULL DEFAULT 0`,
+		`UPDATE user_tokens SET login_at = created_at WHERE login_at = 0`,
+		`UPDATE user_tokens SET last_seen_at = created_at WHERE last_seen_at = 0`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("migrate account session activity: %w", err)
+		}
+	}
+	return nil
+}
 
 // applyLDAPIdentitiesPostgres mirrors the SQLite directory link table.
 func applyLDAPIdentitiesPostgres(db *sql.DB) error {

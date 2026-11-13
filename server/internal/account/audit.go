@@ -68,12 +68,22 @@ const (
 	AuditDevicePolicyDelete  = "device_policy_delete"
 	AuditDevicePolicyReceipt = "device_policy_receipt"
 
+	// Address-book target revocations are split by target kind so operators
+	// can filter account-group and everyone withdrawals independently. Details
+	// identify the book owner, permission, optional address-book scope and why
+	// the grant was removed (explicit request, account-group deletion or
+	// address-book group deletion).
+	AuditAddressBookGroupRevoke    = "address_book_group_revoke"
+	AuditAddressBookEveryoneRevoke = "address_book_everyone_revoke"
+	AuditAddressBookGroupImport    = "address_book_group_import"
+
 	// AuditPolicyObject* and AuditPolicyAssignment* record the central policy
 	// authoring layer; the materialised per-device rows still report through
 	// the device policy actions above.
 	AuditPolicyObjectCreate     = "policy_object_create"
 	AuditPolicyObjectUpdate     = "policy_object_update"
 	AuditPolicyObjectDelete     = "policy_object_delete"
+	AuditPolicyObjectImport     = "policy_object_import"
 	AuditPolicyAssignmentCreate = "policy_assignment_create"
 	AuditPolicyAssignmentDelete = "policy_assignment_delete"
 
@@ -105,6 +115,15 @@ type AuditEvent struct {
 	// when no GeoIP table is configured or the address is not covered.
 	Location string
 	Success  bool
+}
+
+// AuditFilter describes the optional dimensions shared by the account audit
+// views. Empty strings leave that dimension unrestricted.
+type AuditFilter struct {
+	Action   string
+	Username string
+	HostID   string
+	Bounds   TimeBounds
 }
 
 func (s *Store) AppendAudit(event AuditEvent) error {
@@ -175,20 +194,9 @@ func (s *Store) AuditEventsForBefore(action string, beforeID int64, limit int) (
 // millisecond window and optionally to one username. Usernames are stored as
 // attempted, so filtering finds failed logins of existing accounts too.
 func (s *Store) AuditEventsForBeforeRange(action, user string, bounds TimeBounds, beforeID int64, limit int) ([]AuditEvent, error) {
-	action = strings.TrimSpace(action)
-	user = strings.TrimSpace(user)
-	clauses := make([]string, 0, 3)
-	args := make([]any, 0, 4)
-	if action != "" {
-		clauses = append(clauses, "action = ?")
-		args = append(args, action)
-	}
-	if user != "" {
-		clauses = append(clauses, "username = ?")
-		args = append(args, user)
-	}
-	clauses, args = addTimeBounds(clauses, args, "created_at", bounds)
-	return s.auditEvents(clauses, args, beforeID, limit)
+	return s.AuditEventsForFilterBefore("", AuditFilter{
+		Action: action, Username: user, Bounds: bounds,
+	}, beforeID, limit)
 }
 
 // AuditEventsForGroupBefore pages the audit trail of one group's members.
@@ -202,17 +210,31 @@ func (s *Store) AuditEventsForGroupBefore(groupID, action string, beforeID int64
 // AuditEventsForGroupBeforeRange is AuditEventsForGroupBefore narrowed to an
 // inclusive millisecond window and optionally to one username.
 func (s *Store) AuditEventsForGroupBeforeRange(groupID, action, user string, bounds TimeBounds, beforeID int64, limit int) ([]AuditEvent, error) {
+	return s.AuditEventsForFilterBefore(groupID, AuditFilter{
+		Action: action, Username: user, Bounds: bounds,
+	}, beforeID, limit)
+}
+
+// AuditEventsForFilterBefore combines an optional account-group scope with
+// action, username, host and time filters. Host filtering matches the host_id
+// recorded by signed host reports; an empty group keeps the global scope.
+func (s *Store) AuditEventsForFilterBefore(groupID string, filter AuditFilter, beforeID int64, limit int) ([]AuditEvent, error) {
 	groupID = strings.TrimSpace(groupID)
-	if !registry.ValidID(groupID) {
-		return nil, ErrInvalidAccountGroupID
-	}
-	action = strings.TrimSpace(action)
-	user = strings.TrimSpace(user)
-	clauses := []string{`username IN (
+	action := strings.TrimSpace(filter.Action)
+	user := strings.TrimSpace(filter.Username)
+	hostID := strings.TrimSpace(filter.HostID)
+	clauses := make([]string, 0, 5)
+	args := make([]any, 0, 6)
+	if groupID != "" {
+		if !registry.ValidID(groupID) {
+			return nil, ErrInvalidAccountGroupID
+		}
+		clauses = append(clauses, `username IN (
 		SELECT u.username FROM account_group_members m
 		JOIN users u ON u.id = m.user_id
-		WHERE m.group_id = ?)`}
-	args := []any{groupID}
+		WHERE m.group_id = ?)`)
+		args = append(args, groupID)
+	}
 	if action != "" {
 		clauses = append(clauses, "action = ?")
 		args = append(args, action)
@@ -221,7 +243,11 @@ func (s *Store) AuditEventsForGroupBeforeRange(groupID, action, user string, bou
 		clauses = append(clauses, "username = ?")
 		args = append(args, user)
 	}
-	clauses, args = addTimeBounds(clauses, args, "created_at", bounds)
+	if hostID != "" {
+		clauses = append(clauses, "host_id = ? COLLATE NOCASE")
+		args = append(args, hostID)
+	}
+	clauses, args = addTimeBounds(clauses, args, "created_at", filter.Bounds)
 	return s.auditEvents(clauses, args, beforeID, limit)
 }
 

@@ -946,6 +946,100 @@ func TestAddressBookGroups(t *testing.T) {
 	}
 }
 
+func TestAddressBookBulkGroupMove(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "studio", "Studio"); err != nil {
+		t.Fatalf("create studio: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "lab", "Lab"); err != nil {
+		t.Fatalf("create lab: %v", err)
+	}
+
+	studio, lab := "studio", "lab"
+	peers := make(map[string]Peer)
+	for _, item := range []struct {
+		id    string
+		name  string
+		group string
+	}{
+		{"peer-a", "A", studio},
+		{"peer-b", "B", studio},
+		{"peer-c", "C", lab},
+	} {
+		name, group := item.name, item.group
+		peer, err := store.UpdatePeerWithGroup(alice.ID, item.id, &name, nil, &group)
+		if err != nil {
+			t.Fatalf("create %s: %v", item.id, err)
+		}
+		peers[item.id] = peer
+	}
+
+	batch, err := store.MovePeersToGroup(alice.ID, lab, []PeerGroupMove{
+		{ID: "peer-a", IfRevision: peers["peer-a"].Revision},
+		{ID: "peer-b", IfRevision: peers["peer-b"].Revision},
+		{ID: "peer-c", IfRevision: peers["peer-c"].Revision},
+	})
+	if err != nil {
+		t.Fatalf("bulk move: %v", err)
+	}
+	if batch.Revision != 6 || len(batch.Moved) != 2 || len(batch.Unchanged) != 1 ||
+		batch.Unchanged[0] != "peer-c" {
+		t.Fatalf("bulk move result = %+v", batch)
+	}
+	for _, peer := range batch.Moved {
+		if peer.GroupID != lab || peer.Revision != batch.Revision {
+			t.Fatalf("moved peer = %+v, batch revision %d", peer, batch.Revision)
+		}
+	}
+
+	noop, err := store.MovePeersToGroup(alice.ID, lab, []PeerGroupMove{
+		{ID: "peer-a", IfRevision: batch.Revision},
+		{ID: "peer-b", IfRevision: batch.Revision},
+		{ID: "peer-c", IfRevision: peers["peer-c"].Revision},
+	})
+	if err != nil || noop.Revision != batch.Revision || len(noop.Moved) != 0 || len(noop.Unchanged) != 3 {
+		t.Fatalf("no-op bulk move = %+v, %v", noop, err)
+	}
+
+	name := "D"
+	if _, err := store.UpdatePeerWithGroup(alice.ID, "peer-d", &name, nil, &lab); err != nil {
+		t.Fatalf("create peer-d: %v", err)
+	}
+	if _, err := store.MovePeersToGroup(alice.ID, studio, []PeerGroupMove{
+		{ID: "peer-a", IfRevision: batch.Revision},
+		{ID: "peer-b", IfRevision: peers["peer-b"].Revision},
+	}); !errors.Is(err, ErrPeerConflict) {
+		t.Fatalf("stale bulk move error = %v", err)
+	}
+	if peer, err := store.SetPeerGroup(alice.ID, "peer-a", lab); err != nil || peer.Revision != batch.Revision {
+		t.Fatalf("stale batch changed peer-a = %+v, %v", peer, err)
+	}
+	if _, err := store.MovePeersToGroup(alice.ID, studio, []PeerGroupMove{
+		{ID: "peer-a", IfRevision: batch.Revision},
+		{ID: "missing", IfRevision: 0},
+	}); !errors.Is(err, ErrUnknownPeer) {
+		t.Fatalf("unknown peer batch error = %v", err)
+	}
+	if _, err := store.MovePeersToGroup(alice.ID, "missing", []PeerGroupMove{{ID: "peer-a"}}); !errors.Is(err, ErrUnknownGroup) {
+		t.Fatalf("unknown group batch error = %v", err)
+	}
+	if _, err := store.MovePeersToGroup(alice.ID, lab, []PeerGroupMove{{ID: "peer-a"}, {ID: "peer-a"}}); !errors.Is(err, ErrInvalidPeerBatch) {
+		t.Fatalf("duplicate peer batch error = %v", err)
+	}
+
+	oversized := make([]PeerGroupMove, MaxAddressBookMoveBatch+1)
+	for i := range oversized {
+		oversized[i].ID = fmt.Sprintf("peer-%03d", i)
+	}
+	if _, err := store.MovePeersToGroup(alice.ID, lab, oversized); !errors.Is(err, ErrInvalidPeerBatch) {
+		t.Fatalf("oversized batch error = %v", err)
+	}
+}
+
 func TestAddressBookGroupOptimisticConcurrency(t *testing.T) {
 	store := openTemp(t, "state.db")
 	alice, err := store.CreateUser("alice", "correct horse")
@@ -2054,6 +2148,71 @@ func TestSessionsTrackDevicesAndRevoke(t *testing.T) {
 	}
 }
 
+func TestSessionsPageTracksLoginOrderAndOnlineActivity(t *testing.T) {
+	store := openTemp(t, "state.db")
+	user, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+	type login struct {
+		token   string
+		created time.Time
+	}
+	logins := make([]login, 0, 3)
+	for i, device := range []string{"device-a", "device-b", "device-c"} {
+		if i > 0 {
+			now = now.Add(time.Minute)
+		}
+		_, token, _, err := store.LoginWithDevice("alice", "correct horse", device, device)
+		if err != nil {
+			t.Fatalf("login %s: %v", device, err)
+		}
+		logins = append(logins, login{token: token, created: now})
+	}
+
+	page, total, err := store.SessionsPage(user.ID, logins[2].token, 2, 0)
+	if err != nil || total != 3 || len(page) != 2 {
+		t.Fatalf("first page = %+v total=%d err=%v", page, total, err)
+	}
+	if page[0].DeviceID != "device-c" || !page[0].Current || !page[0].Online ||
+		page[1].DeviceID != "device-b" || page[1].Current || !page[1].Online {
+		t.Fatalf("first page order/state = %+v", page)
+	}
+	page, total, err = store.SessionsPage(user.ID, "", 1, 1)
+	if err != nil || total != 3 || len(page) != 1 || page[0].DeviceID != "device-b" {
+		t.Fatalf("stable second page = %+v total=%d err=%v", page, total, err)
+	}
+
+	now = now.Add(SessionOnlineWindow + time.Minute)
+	if _, err := store.Authenticate(logins[0].token); err != nil {
+		t.Fatalf("touch oldest session: %v", err)
+	}
+	if _, err := store.Authenticate(logins[1].token); err != nil {
+		t.Fatalf("touch middle session: %v", err)
+	}
+	all, total, err := store.SessionsPage(user.ID, "", 0, 0)
+	if err != nil || total != 3 || len(all) != 3 {
+		t.Fatalf("all sessions = %+v total=%d err=%v", all, total, err)
+	}
+	byDevice := make(map[string]Session, len(all))
+	for _, session := range all {
+		byDevice[session.DeviceID] = session
+	}
+	if !byDevice["device-a"].Online || !byDevice["device-b"].Online || byDevice["device-c"].Online {
+		t.Fatalf("online activity = %+v", byDevice)
+	}
+	if !byDevice["device-a"].CreatedAt.Equal(logins[0].created) ||
+		!byDevice["device-b"].CreatedAt.Equal(logins[1].created) ||
+		!byDevice["device-b"].LastSeenAt.Equal(now) {
+		t.Fatalf("stable login/activity timestamps = %+v", byDevice)
+	}
+	if all[0].DeviceID != "device-c" || all[1].DeviceID != "device-b" || all[2].DeviceID != "device-a" {
+		t.Fatalf("refresh changed login order = %+v", all)
+	}
+}
+
 func TestRevokeOtherSessionsKeepsCurrent(t *testing.T) {
 	store := openTemp(t, "state.db")
 	alice, err := store.CreateUser("alice", "correct horse")
@@ -2103,57 +2262,105 @@ func TestRevokeOtherSessionsKeepsCurrent(t *testing.T) {
 func TestListUsersPage(t *testing.T) {
 	store := openTemp(t, "state.db")
 	seed := []struct {
-		name string
-		role string
+		name  string
+		role  string
+		email string
+		phone string
 	}{
-		{"alice", RoleAdmin},
-		{"bob", RoleUser},
-		{"bob_1", RoleUser},
-		{"carol", RoleReadonly},
-		{"dave", RoleOperator},
+		{"alice", RoleAdmin, "zed@example.com", "13900000005"},
+		{"bob", RoleUser, "bob@example.com", "13800000001"},
+		{"bob_1", RoleUser, "lab@example.com", "13700000002"},
+		{"carol", RoleReadonly, "", ""},
+		{"dave", RoleOperator, "other@example.com", ""},
 	}
-	for _, user := range seed {
-		if _, err := store.CreateUserWithRole(user.name, "correct horse", "", "", user.role); err != nil {
+	for i, user := range seed {
+		created := time.Date(2026, 11, 1+i, 12, 0, 0, 0, time.UTC)
+		store.SetClock(func() time.Time { return created })
+		if _, err := store.CreateUserWithRole(user.name, "correct horse", user.email, user.phone, user.role); err != nil {
 			t.Fatalf("create %s: %v", user.name, err)
 		}
 	}
+	names := func(users []User) string {
+		t.Helper()
+		out := make([]string, 0, len(users))
+		for _, user := range users {
+			out = append(out, user.Username)
+		}
+		return strings.Join(out, ",")
+	}
 
-	users, total, err := store.ListUsersPage("", "", 2, 0)
+	users, total, err := store.ListUsersPage(UserListOptions{Limit: 2})
 	if err != nil || total != 5 || len(users) != 2 ||
 		users[0].Username != "alice" || users[1].Username != "bob" {
 		t.Fatalf("first page = %+v total=%d err=%v", users, total, err)
 	}
-	users, total, err = store.ListUsersPage("", "", 2, 4)
+	users, total, err = store.ListUsersPage(UserListOptions{Limit: 2, Offset: 4})
 	if err != nil || total != 5 || len(users) != 1 || users[0].Username != "dave" {
 		t.Fatalf("last page = %+v total=%d err=%v", users, total, err)
 	}
-	users, total, err = store.ListUsersPage("", "", 0, 0)
+	users, total, err = store.ListUsersPage(UserListOptions{})
 	if err != nil || total != 5 || len(users) != 5 {
 		t.Fatalf("unlimited = %d users total=%d err=%v", len(users), total, err)
 	}
 
-	users, total, err = store.ListUsersPage("AR", "", 10, 0)
+	users, total, err = store.ListUsersPage(UserListOptions{Query: "AR"})
 	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "carol" {
 		t.Fatalf("case-insensitive query = %+v total=%d err=%v", users, total, err)
 	}
-	users, total, err = store.ListUsersPage("", RoleOperator, 10, 0)
+	users, total, err = store.ListUsersPage(UserListOptions{Query: "BOB@EXAMPLE"})
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "bob" {
+		t.Fatalf("email through query = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Query: "138-0000"})
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "bob" {
+		t.Fatalf("phone fragment through query = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Email: "example.com"})
+	if err != nil || total != 4 || names(users) != "alice,bob,bob_1,dave" {
+		t.Fatalf("email filter = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Phone: "138 0000"})
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "bob" {
+		t.Fatalf("phone filter = %+v total=%d err=%v", users, total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Role: RoleOperator})
 	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "dave" {
 		t.Fatalf("role filter = %+v total=%d err=%v", users, total, err)
 	}
-	users, total, err = store.ListUsersPage("bob", RoleUser, 10, 0)
+	users, total, err = store.ListUsersPage(UserListOptions{Query: "bob", Role: RoleUser})
 	if err != nil || total != 2 || len(users) != 2 {
 		t.Fatalf("query+role = %+v total=%d err=%v", users, total, err)
 	}
 	// LIKE wildcards in the search text are literals, not patterns.
-	users, total, err = store.ListUsersPage("_", "", 10, 0)
+	users, total, err = store.ListUsersPage(UserListOptions{Query: "_"})
 	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "bob_1" {
 		t.Fatalf("underscore query = %+v total=%d err=%v", users, total, err)
 	}
-	if _, total, err = store.ListUsersPage("%", "", 10, 0); err != nil || total != 0 {
+	if _, total, err = store.ListUsersPage(UserListOptions{Query: "%"}); err != nil || total != 0 {
 		t.Fatalf("percent query total=%d err=%v", total, err)
 	}
-	if _, _, err := store.ListUsersPage("", "owner", 10, 0); !errors.Is(err, ErrInvalidRole) {
+	if _, _, err := store.ListUsersPage(UserListOptions{Role: "owner"}); !errors.Is(err, ErrInvalidRole) {
 		t.Fatalf("invalid role = %v", err)
+	}
+	if _, _, err := store.ListUsersPage(UserListOptions{Sort: "banned"}); !errors.Is(err, ErrInvalidUserSort) {
+		t.Fatalf("invalid sort = %v", err)
+	}
+
+	users, total, err = store.ListUsersPage(UserListOptions{Sort: UserSortEmail, Desc: true})
+	if err != nil || total != 5 || names(users) != "alice,dave,bob_1,bob,carol" {
+		t.Fatalf("email descending = %s total=%d err=%v", names(users), total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Sort: UserSortPhone})
+	if err != nil || total != 5 || names(users) != "bob_1,bob,alice,carol,dave" {
+		t.Fatalf("phone ascending = %s total=%d err=%v", names(users), total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Sort: UserSortCreatedAt, Desc: true})
+	if err != nil || total != 5 || names(users) != "dave,carol,bob_1,bob,alice" {
+		t.Fatalf("created descending = %s total=%d err=%v", names(users), total, err)
+	}
+	users, total, err = store.ListUsersPage(UserListOptions{Sort: UserSortRole, Limit: 2, Offset: 2})
+	if err != nil || total != 5 || names(users) != "carol,bob" {
+		t.Fatalf("stable role page = %s total=%d err=%v", names(users), total, err)
 	}
 }
 

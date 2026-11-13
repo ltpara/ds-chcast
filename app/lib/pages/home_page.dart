@@ -117,6 +117,13 @@ typedef AddressBookPeerOrderWriter =
     });
 typedef AddressBookPeerDeleter =
     Future<void> Function(ServerSettings server, String token, String peerId);
+typedef AddressBookBulkMover =
+    Future<AddressBookBulkMoveResult> Function(
+      ServerSettings server,
+      String token,
+      List<AddressBookPeerMove> peers,
+      String groupId,
+    );
 typedef TrashDialogBuilder =
     Widget Function(ServerSettings server, String token);
 typedef ViewerUpdateInstaller =
@@ -154,6 +161,7 @@ class HomePage extends StatefulWidget {
     this.addressBookPeerWriter,
     this.addressBookPeerOrderWriter,
     this.addressBookPeerDeleter,
+    this.addressBookBulkMover,
     this.trashDialogBuilder,
     this.wakeSender,
     this.relayWaker,
@@ -190,6 +198,7 @@ class HomePage extends StatefulWidget {
   final AddressBookPeerWriter? addressBookPeerWriter;
   final AddressBookPeerOrderWriter? addressBookPeerOrderWriter;
   final AddressBookPeerDeleter? addressBookPeerDeleter;
+  final AddressBookBulkMover? addressBookBulkMover;
 
   /// Test seam for the recycle-bin dialog; product code opens [TrashDialog].
   final TrashDialogBuilder? trashDialogBuilder;
@@ -232,6 +241,7 @@ class _HomePageState extends State<HomePage> {
   late final AddressBookPeerWriter _writeAddressBookPeer;
   late final AddressBookPeerOrderWriter _writePeerOrder;
   late final AddressBookPeerDeleter _deleteAddressBookPeer;
+  late final AddressBookBulkMover _bulkMoveAddressBookPeers;
   late final WakeSender _wakeSender;
   late final RelayWaker _relayWake;
   late final LanDiscovery _lanDiscovery;
@@ -420,6 +430,14 @@ class _HomePageState extends State<HomePage> {
         widget.addressBookPeerDeleter ??
         (ServerSettings server, String token, String peerId) =>
             ServerApi.deleteAddressBookPeer(server, token, peerId);
+    _bulkMoveAddressBookPeers =
+        widget.addressBookBulkMover ??
+        (
+          ServerSettings server,
+          String token,
+          List<AddressBookPeerMove> peers,
+          String groupId,
+        ) => ServerApi.moveAddressBookPeers(server, token, peers, groupId);
     try {
       _hostname = Platform.localHostname;
     } catch (_) {
@@ -505,10 +523,7 @@ class _HomePageState extends State<HomePage> {
       final String target = widget.initialTarget!;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          _connect(
-            target,
-            fileTransferOnly: widget.initialFileTransferOnly,
-          );
+          _connect(target, fileTransferOnly: widget.initialFileTransferOnly);
         }
       });
     }
@@ -846,9 +861,7 @@ class _HomePageState extends State<HomePage> {
                 ),
                 TextButton(
                   onPressed: () {
-                    final int? value = int.tryParse(
-                      portController.text.trim(),
-                    );
+                    final int? value = int.tryParse(portController.text.trim());
                     if (value == null || value < 1 || value > 65535) {
                       setDialogState(() => error = tr('端口须为 1–65535'));
                       return;
@@ -1273,6 +1286,98 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {
       if (mounted) {
         _showSnack(tr('分组已保存在本机，将在下次同步上传'));
+      }
+    }
+  }
+
+  Future<void> _bulkMoveDevicesToGroup() async {
+    final AccountSession? account = _account;
+    if (account == null || account.server != _server.url) {
+      _showSnack(tr('请先登录账号'));
+      return;
+    }
+    final List<Device> movable =
+        <Device>[
+          for (final Device device in _devices)
+            if (_isMovablePeer(device)) device,
+        ]..sort((Device a, Device b) {
+          final int group = a.groupId.compareTo(b.groupId);
+          return group != 0 ? group : a.displayName.compareTo(b.displayName);
+        });
+    if (movable.isEmpty) {
+      return;
+    }
+    final List<AddressBookGroup> liveGroups = <AddressBookGroup>[
+      for (final AddressBookGroup group in _groups)
+        if (!group.deleted) group,
+    ];
+    final _BulkMoveChoice? choice = await showDialog<_BulkMoveChoice>(
+      context: context,
+      builder: (BuildContext context) =>
+          _BulkGroupMoveDialog(devices: movable, groups: liveGroups),
+    );
+    if (choice == null || !mounted) {
+      return;
+    }
+    final Set<String> selectedKeys = choice.deviceKeys;
+    final List<Device> selected = <Device>[
+      for (final Device device in movable)
+        if (selectedKeys.contains(device.key)) device,
+    ];
+    if (selected.isEmpty) {
+      return;
+    }
+    try {
+      final AddressBookBulkMoveResult result = await _bulkMoveAddressBookPeers(
+        _server,
+        account.token,
+        <AddressBookPeerMove>[
+          for (final Device device in selected)
+            AddressBookPeerMove(
+              id: device.id,
+              ifRevision: device.revision > 0 ? device.revision : 0,
+            ),
+        ],
+        choice.groupId,
+      );
+      final Set<String> movedIds = <String>{
+        for (final AddressBookPeer peer in result.moved) peer.id,
+      };
+      final Set<String> movedKeys = <String>{
+        for (final Device device in selected)
+          if (movedIds.contains(device.id)) device.key,
+      };
+      final List<Device> devices = await _deviceStore.settleGroupMoves(
+        movedKeys,
+        choice.groupId,
+        result.revision,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() => _devices = devices);
+      if (result.moved.isEmpty) {
+        _showSnack(tr('所选设备已在目标分组'));
+      } else {
+        _showSnack(choice.groupId.isEmpty ? tr('已批量移到未分组') : tr('已批量移动到分组'));
+      }
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.unauthorized) {
+        await _recoverAccountSession();
+        return;
+      }
+      if (error.statusCode == HttpStatus.conflict) {
+        await _refreshAfterConflicts(<String>{
+          for (final Device device in selected) device.id,
+        });
+        return;
+      }
+      if (mounted) {
+        _showSnack(tr('批量移动未完成，服务器未修改任何设备'));
+      }
+    } catch (_) {
+      if (mounted) {
+        _showSnack(tr('批量移动未完成，服务器未修改任何设备'));
       }
     }
   }
@@ -1746,6 +1851,10 @@ class _HomePageState extends State<HomePage> {
   /// Replaces a stale local entry with the server copy after a rejected write.
   /// A peer deleted elsewhere is removed locally instead of being recreated.
   Future<void> _refreshAfterConflict(String peerId) async {
+    await _refreshAfterConflicts(<String>{peerId});
+  }
+
+  Future<void> _refreshAfterConflicts(Set<String> peerIds) async {
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
       if (mounted) {
@@ -1765,7 +1874,9 @@ class _HomePageState extends State<HomePage> {
       final List<Device> current = await _deviceStore.load();
       final List<Device> next = <Device>[];
       for (final Device item in current) {
-        if (item.id != peerId || !item.saved || item.server != _server.url) {
+        if (!peerIds.contains(item.id) ||
+            !item.saved ||
+            item.server != _server.url) {
           next.add(item);
           continue;
         }
@@ -2581,6 +2692,17 @@ class _HomePageState extends State<HomePage> {
                         icon: const Icon(Icons.folder_outlined, size: 16),
                         label: Text(tr('分组'), style: TextStyle(fontSize: 12)),
                       ),
+                    if (saved.any(_isMovablePeer))
+                      TextButton.icon(
+                        key: const Key('bulk-move-devices'),
+                        onPressed: _bulkMoveDevicesToGroup,
+                        style: TextButton.styleFrom(foregroundColor: kAccent),
+                        icon: const Icon(
+                          Icons.drive_file_move_outline,
+                          size: 16,
+                        ),
+                        label: Text(tr('批量移动'), style: TextStyle(fontSize: 12)),
+                      ),
                     if (_account != null && _account!.server == _server.url)
                       TextButton.icon(
                         key: const Key('address-book-trash'),
@@ -2638,9 +2760,7 @@ class _HomePageState extends State<HomePage> {
                       icon: favoritesEmpty
                           ? Icons.star_border_rounded
                           : Icons.search_off_rounded,
-                      text: favoritesEmpty
-                          ? tr('还没有收藏的设备')
-                          : tr('没有匹配的设备'),
+                      text: favoritesEmpty ? tr('还没有收藏的设备') : tr('没有匹配的设备'),
                       height: 118,
                       action: TextButton(
                         key: const Key('device-filter-reset-empty'),
@@ -4341,6 +4461,234 @@ class _GroupPickerDialog extends StatelessWidget {
   }
 }
 
+class _BulkMoveChoice {
+  const _BulkMoveChoice({required this.deviceKeys, required this.groupId});
+
+  final Set<String> deviceKeys;
+  final String groupId;
+}
+
+/// Selects several saved peers and one destination before one atomic move.
+class _BulkGroupMoveDialog extends StatefulWidget {
+  const _BulkGroupMoveDialog({required this.devices, required this.groups});
+
+  final List<Device> devices;
+  final List<AddressBookGroup> groups;
+
+  @override
+  State<_BulkGroupMoveDialog> createState() => _BulkGroupMoveDialogState();
+}
+
+class _BulkGroupMoveDialogState extends State<_BulkGroupMoveDialog> {
+  final Set<String> _selected = <String>{};
+  String? _targetGroupId;
+
+  void _toggleDevice(Device device, bool? selected) {
+    setState(() {
+      if (selected == true) {
+        if (_selected.length < ServerApi.maxBatchIds) {
+          _selected.add(device.key);
+        }
+      } else {
+        _selected.remove(device.key);
+      }
+    });
+  }
+
+  void _toggleAll() {
+    final int limit = widget.devices.length < ServerApi.maxBatchIds
+        ? widget.devices.length
+        : ServerApi.maxBatchIds;
+    final bool allSelected = widget.devices
+        .take(limit)
+        .every((Device device) => _selected.contains(device.key));
+    setState(() {
+      _selected.clear();
+      if (!allSelected) {
+        _selected.addAll(
+          widget.devices.take(limit).map((Device device) => device.key),
+        );
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final List<AddressBookGroupNode> nodes = addressBookGroupTreeOrder(
+      widget.groups,
+    );
+    final Map<String, String> groupNames = <String, String>{
+      for (final AddressBookGroup group in widget.groups)
+        group.id: group.name.isEmpty ? group.id : group.name,
+    };
+    final int limit = widget.devices.length < ServerApi.maxBatchIds
+        ? widget.devices.length
+        : ServerApi.maxBatchIds;
+    final bool allSelected = widget.devices
+        .take(limit)
+        .every((Device device) => _selected.contains(device.key));
+
+    Widget targetTile({
+      required String id,
+      required String label,
+      int depth = 0,
+    }) {
+      final bool selected = _targetGroupId == id;
+      return ListTile(
+        key: Key('bulk-move-target-$id'),
+        dense: true,
+        selected: selected,
+        contentPadding: EdgeInsets.only(left: 12 + depth * 18.0, right: 12),
+        leading: Icon(
+          id.isEmpty
+              ? Icons.inbox_outlined
+              : depth == 0
+              ? Icons.folder_outlined
+              : Icons.subdirectory_arrow_right_rounded,
+          size: 18,
+          color: selected
+              ? kAccent
+              : theme.colorScheme.onSurface.withValues(alpha: 0.58),
+        ),
+        title: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 13),
+        ),
+        trailing: selected
+            ? Icon(Icons.check_circle_rounded, size: 18, color: kAccent)
+            : null,
+        onTap: () => setState(() => _targetGroupId = id),
+      );
+    }
+
+    return AlertDialog(
+      backgroundColor: theme.colorScheme.surface,
+      title: Text(tr('批量移动到分组')),
+      content: SizedBox(
+        width: 540,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                tr('选择设备和目标分组。一次最多移动 200 台设备。'),
+                style: mutedStyle(context, size: 12),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: <Widget>[
+                  Text(
+                    tr('已选择 {count} 台', <String, Object?>{
+                      'count': _selected.length,
+                    }),
+                    key: const Key('bulk-move-count'),
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    key: const Key('bulk-move-select-all'),
+                    onPressed: _toggleAll,
+                    child: Text(tr(allSelected ? '清空' : '全选')),
+                  ),
+                ],
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 240),
+                child: widget.devices.isEmpty
+                    ? Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Text(tr('没有可移动的设备')),
+                      )
+                    : ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: widget.devices.length,
+                        itemBuilder: (BuildContext context, int index) {
+                          final Device device = widget.devices[index];
+                          final bool selected = _selected.contains(device.key);
+                          final String group = device.groupId.isEmpty
+                              ? tr('未分组')
+                              : groupNames[device.groupId] ?? device.groupId;
+                          return CheckboxListTile(
+                            key: Key('bulk-move-device-${device.key}'),
+                            value: selected,
+                            dense: true,
+                            controlAffinity: ListTileControlAffinity.leading,
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                            ),
+                            title: Text(
+                              device.displayName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              '$group · ${device.id}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            onChanged:
+                                selected ||
+                                    _selected.length < ServerApi.maxBatchIds
+                                ? (bool? value) => _toggleDevice(device, value)
+                                : null,
+                          );
+                        },
+                      ),
+              ),
+              const Divider(height: 24),
+              Text(
+                tr('目标分组'),
+                style: theme.textTheme.labelLarge?.copyWith(fontSize: 13),
+              ),
+              const SizedBox(height: 4),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 220),
+                child: ListView(
+                  shrinkWrap: true,
+                  children: <Widget>[
+                    targetTile(id: '', label: tr('未分组')),
+                    for (final AddressBookGroupNode node in nodes)
+                      targetTile(
+                        id: node.group.id,
+                        label: node.group.name.isEmpty
+                            ? node.group.id
+                            : node.group.name,
+                        depth: node.depth,
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          key: const Key('bulk-move-cancel'),
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
+        FilledButton(
+          key: const Key('bulk-move-confirm'),
+          onPressed: _selected.isEmpty || _targetGroupId == null
+              ? null
+              : () => Navigator.of(context).pop(
+                  _BulkMoveChoice(
+                    deviceKeys: Set<String>.of(_selected),
+                    groupId: _targetGroupId!,
+                  ),
+                ),
+          child: Text(tr('移动')),
+        ),
+      ],
+    );
+  }
+}
+
 class _WakeChoice {
   const _WakeChoice(this.mac, {required this.relay});
 
@@ -4658,10 +5006,7 @@ class _DeviceCard extends StatelessWidget {
                                   Icons.sticky_note_2_outlined,
                                   key: Key('device-note-${device.id}'),
                                   size: 12,
-                                  color: mutedStyle(
-                                    context,
-                                    size: 12,
-                                  ).color,
+                                  color: mutedStyle(context, size: 12).color,
                                 ),
                               ),
                             ),
@@ -4753,9 +5098,7 @@ class _DeviceCard extends StatelessWidget {
                         ),
                         PopupMenuItem<String>(
                           value: 'favorite',
-                          child: Text(
-                            device.favorite ? tr('取消收藏') : tr('收藏'),
-                          ),
+                          child: Text(device.favorite ? tr('取消收藏') : tr('收藏')),
                         ),
                         PopupMenuItem<String>(
                           value: 'wake',

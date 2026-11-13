@@ -43,6 +43,13 @@ const (
 	// retry would look like a replay and revoke the whole session. Only one
 	// such retry is allowed per session.
 	RefreshReuseGrace = 2 * time.Minute
+	// SessionOnlineWindow is the recent-activity window used by the session
+	// directory. It is not a persistent connection state: an authenticated
+	// request refreshes last_seen_at, and a quiet session becomes offline while
+	// its refresh token remains usable.
+	SessionOnlineWindow = 5 * time.Minute
+
+	sessionTouchInterval = time.Minute
 
 	maxName           = 128
 	maxTag            = 32
@@ -70,6 +77,7 @@ var (
 	ErrInvalidUsername    = errors.New("username must match [A-Za-z0-9][A-Za-z0-9_.@-]{0,63}")
 	ErrWeakPassword       = errors.New("password must be 8..128 bytes")
 	ErrInvalidPeerID      = errors.New("invalid peer id")
+	ErrInvalidPeerBatch   = errors.New("address book peer batch must contain 1 to 200 unique entries")
 	ErrInvalidGroupID     = errors.New("invalid address book group id")
 	ErrInvalidGroupName   = errors.New("address book group name is required")
 	ErrUnknownGroup       = errors.New("unknown address book group")
@@ -92,6 +100,7 @@ var (
 	ErrTwoFactorNotStarted  = errors.New("two-factor enrollment has not started")
 	ErrTwoFactorNotEnabled  = errors.New("two-factor is not enabled")
 	ErrInvalidRole          = errors.New("role must be admin, operator, readonly or user")
+	ErrInvalidUserSort      = errors.New("sort must be username, role, created_at, email or phone")
 	ErrLastAdmin            = errors.New("at least one admin account must remain")
 	ErrAccountBanned        = errors.New("account is banned")
 
@@ -170,6 +179,39 @@ func ValidRole(role string) bool {
 	return false
 }
 
+// Account directory sort keys. The values are also the HTTP query values.
+const (
+	UserSortUsername  = "username"
+	UserSortRole      = "role"
+	UserSortCreatedAt = "created_at"
+	UserSortEmail     = "email"
+	UserSortPhone     = "phone"
+)
+
+// ValidUserSort reports whether value names an account directory sort key.
+func ValidUserSort(value string) bool {
+	switch value {
+	case UserSortUsername, UserSortRole, UserSortCreatedAt, UserSortEmail, UserSortPhone:
+		return true
+	}
+	return false
+}
+
+// UserListOptions describes an account directory query. Query is a literal,
+// case-insensitive substring matched against username, email and phone.
+// Email and Phone are separate optional contact filters used by automation.
+// Empty contact values sort after populated ones.
+type UserListOptions struct {
+	Query  string
+	Email  string
+	Phone  string
+	Role   string
+	Sort   string
+	Desc   bool
+	Limit  int
+	Offset int
+}
+
 // Session describes one live login. The ID is random and reveals nothing
 // about the bearer token, so a viewer can revoke another device without ever
 // seeing its secret.
@@ -179,6 +221,8 @@ type Session struct {
 	DeviceName string    `json:"device_name,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	Online     bool      `json:"online"`
 	Current    bool      `json:"current"`
 	// LoginIP and Location describe where the session signed in. Location is
 	// empty without a GeoIP table or outside its coverage.
@@ -227,6 +271,10 @@ type Group struct {
 // and cycle checks stay bounded even on damaged data.
 const maxGroupDepth = 8
 
+// MaxAddressBookMoveBatch bounds one atomic address-book group move. The same
+// limit is shared by the HTTP endpoint and viewer client.
+const MaxAddressBookMoveBatch = 200
+
 // Snapshot is a complete alive address book plus the changes after the
 // caller's last seen revision. Peers is always authoritative for the current
 // state, while Changes carries tombstones that Peers omits.
@@ -251,6 +299,21 @@ type Grant struct {
 	TargetKind string `json:"target_kind,omitempty"`
 	TargetID   string `json:"target_id,omitempty"`
 	TargetName string `json:"target_name,omitempty"`
+}
+
+// RevokedTargetGrant describes one group or everyone grant removed by an
+// unshare operation or a cascading group deletion. The API records one audit
+// event per value so a bulk deletion cannot hide which books and scopes lost
+// access. OwnerUsername is included because deleting an account group can
+// revoke grants from several owners in one transaction.
+type RevokedTargetGrant struct {
+	OwnerUsername string
+	TargetKind    string
+	TargetID      string
+	TargetName    string
+	Permission    string
+	GroupID       string
+	GroupName     string
 }
 
 // Address-book share targets. Direct user grants keep using
@@ -887,18 +950,38 @@ func (s *Store) ListUsers() ([]User, error) {
 	return out, rows.Err()
 }
 
-// ListUsersPage filters the account list by a username substring and an exact
-// role. An empty role matches every account and limit <= 0 returns every
-// match, so existing callers keep the old whole-table listing. The second
-// result is the total row count under the same filter.
-func (s *Store) ListUsersPage(query, role string, limit, offset int) ([]User, int, error) {
-	query = strings.ToLower(strings.TrimSpace(query))
-	role = strings.TrimSpace(role)
-	clauses := make([]string, 0, 2)
-	args := make([]any, 0, 2)
+// ListUsersPage filters and sorts the account list. A limit <= 0 returns every
+// match, which preserves the older whole-table listing. The second result is
+// the total row count under the same filters.
+func (s *Store) ListUsersPage(opts UserListOptions) ([]User, int, error) {
+	query := strings.ToLower(strings.TrimSpace(opts.Query))
+	email := strings.ToLower(strings.TrimSpace(opts.Email))
+	phone := normalizePhoneSearch(opts.Phone)
+	role := strings.TrimSpace(opts.Role)
+	sortBy := strings.ToLower(strings.TrimSpace(opts.Sort))
+	if sortBy == "" {
+		sortBy = UserSortUsername
+	}
+	if !ValidUserSort(sortBy) {
+		return nil, 0, ErrInvalidUserSort
+	}
+	clauses := make([]string, 0, 3)
+	args := make([]any, 0, 7)
 	if query != "" {
-		clauses = append(clauses, `LOWER(username) LIKE ? ESCAPE '\'`)
-		args = append(args, "%"+likeEscape(query)+"%")
+		pattern := "%" + likeEscape(query) + "%"
+		phonePattern := "%" + likeEscape(normalizePhoneSearch(query)) + "%"
+		clauses = append(clauses,
+			`(LOWER(username) LIKE ? ESCAPE '\' OR LOWER(COALESCE(email, '')) LIKE ? ESCAPE '\' OR COALESCE(phone, '') LIKE ? ESCAPE '\' OR COALESCE(phone, '') LIKE ? ESCAPE '\')`,
+		)
+		args = append(args, pattern, pattern, pattern, phonePattern)
+	}
+	if email != "" {
+		clauses = append(clauses, `LOWER(COALESCE(email, '')) LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+likeEscape(email)+"%")
+	}
+	if phone != "" {
+		clauses = append(clauses, `COALESCE(phone, '') LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+likeEscape(phone)+"%")
 	}
 	if role != "" {
 		if !ValidRole(role) {
@@ -918,11 +1001,11 @@ func (s *Store) ListUsersPage(query, role string, limit, offset int) ([]User, in
 		return nil, 0, fmt.Errorf("account store %s: count users: %w", s.path, err)
 	}
 	statement := `SELECT id, username, role, created_at, banned, email, phone FROM users` + where +
-		` ORDER BY username`
+		` ORDER BY ` + userOrderBy(sortBy, opts.Desc)
 	pageArgs := append([]any{}, args...)
-	if limit > 0 {
+	if opts.Limit > 0 {
 		statement += ` LIMIT ? OFFSET ?`
-		pageArgs = append(pageArgs, limit, offset)
+		pageArgs = append(pageArgs, opts.Limit, opts.Offset)
 	}
 	rows, err := s.db.Query(statement, pageArgs...)
 	if err != nil {
@@ -944,6 +1027,51 @@ func (s *Store) ListUsersPage(query, role string, limit, offset int) ([]User, in
 		out = append(out, user)
 	}
 	return out, total, rows.Err()
+}
+
+// normalizePhoneSearch removes the separators accepted by SetPhone without
+// imposing the minimum length of a stored number, so short fragments remain
+// useful for directory filtering.
+func normalizePhoneSearch(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '+' && i == 0:
+		case r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+		default:
+			return strings.ToLower(value)
+		}
+	}
+	return b.String()
+}
+
+// userOrderBy returns SQL made only from fixed identifiers. Every key has a
+// username/id tie-breaker so offset pagination cannot reorder equal values.
+func userOrderBy(sortBy string, desc bool) string {
+	direction := " ASC"
+	if desc {
+		direction = " DESC"
+	}
+	switch sortBy {
+	case UserSortRole:
+		return "role" + direction + ", LOWER(username) ASC, id ASC"
+	case UserSortCreatedAt:
+		return "created_at" + direction + ", LOWER(username) ASC, id ASC"
+	case UserSortEmail:
+		return "CASE WHEN COALESCE(email, '') = '' THEN 1 ELSE 0 END ASC, LOWER(COALESCE(email, ''))" +
+			direction + ", LOWER(username) ASC, id ASC"
+	case UserSortPhone:
+		return "CASE WHEN COALESCE(phone, '') = '' THEN 1 ELSE 0 END ASC, COALESCE(phone, '')" +
+			direction + ", LOWER(username) ASC, id ASC"
+	default:
+		return "LOWER(username)" + direction + ", id ASC"
+	}
 }
 
 // likeEscape makes a user-supplied substring literal inside a LIKE pattern.
@@ -1283,10 +1411,11 @@ func (s *Store) LoginWithRefreshFactors(username, password, deviceID, deviceName
 	if _, err := tx.Exec(
 		`INSERT INTO user_tokens
 			(token_hash, user_id, created_at, expires_at, access_expires_at,
-			 session_id, device_id, device_name)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			 session_id, device_id, device_name, login_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		tokenHash(token), user.ID, unixMillis(now), unixMillis(sessionExpires),
 		unixMillis(accessExpires), sessionID, deviceID, deviceName,
+		unixMillis(now), unixMillis(now),
 	); err != nil {
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: save token: %w", s.path, err)
 	}
@@ -1684,6 +1813,16 @@ func (s *Store) Authenticate(token string) (User, error) {
 		)
 		return User{}, ErrInvalidToken
 	}
+	now := s.now().UTC()
+	// Authenticated traffic is the only evidence that a login is active. Touch
+	// at most once a minute so normal API reads do not turn into hot writes.
+	if _, err := s.db.Exec(
+		`UPDATE user_tokens SET last_seen_at = ?
+		 WHERE token_hash = ? AND last_seen_at < ?`,
+		unixMillis(now), tokenHash(token), unixMillis(now.Add(-sessionTouchInterval)),
+	); err != nil {
+		return User{}, fmt.Errorf("account store %s: record session activity: %w", s.path, err)
+	}
 	user.CreatedAt = timeFromMillis(created)
 	return user, nil
 }
@@ -1827,10 +1966,11 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 	sessionExpires := now.Add(s.tokenTTL)
 	res, err := tx.Exec(
 		`UPDATE user_tokens
-		 SET token_hash = ?, created_at = ?, expires_at = ?, access_expires_at = ?
+		 SET token_hash = ?, created_at = ?, expires_at = ?, access_expires_at = ?,
+		     last_seen_at = ?
 		 WHERE user_id = ? AND session_id = ?`,
 		tokenHash(token), unixMillis(now), unixMillis(sessionExpires),
-		unixMillis(accessExpires), userID, sessionID,
+		unixMillis(accessExpires), unixMillis(now), userID, sessionID,
 	)
 	if err != nil {
 		return User{}, "", time.Time{}, "", time.Time{},
@@ -1917,28 +2057,47 @@ func (s *Store) Logout(token string) error {
 	return nil
 }
 
-// Sessions lists the user's live logins, newest first. currentToken marks the
-// caller's own session; expired rows are pruned so the list only shows tokens
-// that still authenticate.
+// Sessions lists every live login. It retains the original all-sessions
+// contract for existing clients; the console uses SessionsPage for stable,
+// bounded pages and online activity.
 func (s *Store) Sessions(userID, currentToken string) ([]Session, error) {
+	sessions, _, err := s.SessionsPage(userID, currentToken, 0, 0)
+	return sessions, err
+}
+
+// SessionsPage lists stable pages of live logins, newest login first. A zero
+// limit returns every live login, preserving the older API behaviour. Expired
+// rows are pruned before both COUNT and SELECT so total never includes a login
+// that cannot authenticate. Online means an authenticated request in the last
+// SessionOnlineWindow; it is deliberately separate from refresh-token validity.
+func (s *Store) SessionsPage(userID, currentToken string, limit, offset int) ([]Session, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now().UTC()
 	if _, err := s.db.Exec(`DELETE FROM user_tokens WHERE expires_at <= ?`, unixMillis(now)); err != nil {
-		return nil, fmt.Errorf("account store %s: prune sessions: %w", s.path, err)
+		return nil, 0, fmt.Errorf("account store %s: prune sessions: %w", s.path, err)
 	}
 	if _, err := s.db.Exec(`DELETE FROM refresh_tokens WHERE expires_at <= ?`, unixMillis(now)); err != nil {
-		return nil, fmt.Errorf("account store %s: prune refresh tokens: %w", s.path, err)
+		return nil, 0, fmt.Errorf("account store %s: prune refresh tokens: %w", s.path, err)
 	}
-	rows, err := s.db.Query(
-		`SELECT session_id, device_id, device_name, created_at, expires_at, token_hash,
-		        login_ip, login_location
-		 FROM user_tokens WHERE user_id = ?
-		 ORDER BY created_at DESC, session_id`,
-		userID,
-	)
+	var total int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM user_tokens WHERE user_id = ?`, userID,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("account store %s: count sessions: %w", s.path, err)
+	}
+	query := `SELECT session_id, device_id, device_name, login_at, expires_at,
+	                last_seen_at, token_hash, login_ip, login_location
+	          FROM user_tokens WHERE user_id = ?
+	          ORDER BY login_at DESC, session_id`
+	args := []any{userID}
+	if limit > 0 {
+		query += ` LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("account store %s: list sessions: %w", s.path, err)
+		return nil, 0, fmt.Errorf("account store %s: list sessions: %w", s.path, err)
 	}
 	defer rows.Close()
 	current := ""
@@ -1948,21 +2107,29 @@ func (s *Store) Sessions(userID, currentToken string) ([]Session, error) {
 	out := make([]Session, 0)
 	for rows.Next() {
 		var (
-			session   Session
-			created   int64
-			expires   int64
-			tokenHash string
+			session    Session
+			loginAt    int64
+			expires    int64
+			lastSeenAt int64
+			hash       string
 		)
 		if err := rows.Scan(&session.ID, &session.DeviceID, &session.DeviceName,
-			&created, &expires, &tokenHash, &session.LoginIP, &session.Location); err != nil {
-			return nil, err
+			&loginAt, &expires, &lastSeenAt, &hash, &session.LoginIP,
+			&session.Location); err != nil {
+			return nil, 0, err
 		}
-		session.CreatedAt = timeFromMillis(created)
+		session.CreatedAt = timeFromMillis(loginAt)
 		session.ExpiresAt = timeFromMillis(expires)
-		session.Current = tokenHash == current
+		session.LastSeenAt = timeFromMillis(lastSeenAt)
+		session.Current = hash == current
+		session.Online = session.Current || !session.LastSeenAt.IsZero() &&
+			now.Before(session.LastSeenAt.Add(SessionOnlineWindow))
 		out = append(out, session)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
 }
 
 // SetSessionOrigin records where a login token was issued. It runs after the
@@ -2520,6 +2687,140 @@ func (s *Store) SetPeerGroupAt(userID, peerID, groupID string, ifRevision int64)
 	return peer, nil
 }
 
+// PeerGroupMove identifies one live address-book peer and, when positive, the
+// per-peer revision the caller read before requesting the move.
+type PeerGroupMove struct {
+	ID         string
+	IfRevision int64
+}
+
+// PeerGroupMoveBatch is the result of one atomic group move. Revision is the
+// shared new peer revision when at least one row moved, or the unchanged book
+// revision when every requested peer already belonged to the target group.
+type PeerGroupMoveBatch struct {
+	Revision  int64
+	Moved     []Peer
+	Unchanged []string
+}
+
+// MovePeersToGroup atomically moves up to MaxAddressBookMoveBatch live peers
+// into groupID. An empty groupID moves them to Ungrouped. Every peer must
+// exist and every supplied if-revision must match before any row is changed;
+// unknown peers, stale revisions or an unknown group therefore roll back the
+// whole call. All rows actually moved share one new revision, and a batch that
+// only repeats the current group does not advance the book revision.
+func (s *Store) MovePeersToGroup(userID, groupID string, moves []PeerGroupMove) (PeerGroupMoveBatch, error) {
+	if len(moves) == 0 || len(moves) > MaxAddressBookMoveBatch {
+		return PeerGroupMoveBatch{}, ErrInvalidPeerBatch
+	}
+	if groupID != "" && !registry.ValidID(groupID) {
+		return PeerGroupMoveBatch{}, ErrInvalidGroupID
+	}
+	seen := make(map[string]bool, len(moves))
+	for _, move := range moves {
+		if !registry.ValidID(move.ID) || move.IfRevision < 0 || seen[move.ID] {
+			return PeerGroupMoveBatch{}, ErrInvalidPeerBatch
+		}
+		seen[move.ID] = true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: begin address book batch move: %w", s.path, err)
+	}
+	defer tx.Rollback()
+
+	if groupID != "" {
+		live, err := liveGroupLocked(tx, userID, groupID)
+		if err != nil {
+			return PeerGroupMoveBatch{}, err
+		}
+		if !live {
+			return PeerGroupMoveBatch{}, ErrUnknownGroup
+		}
+	}
+	var bookRevision int64
+	err = tx.QueryRow(`SELECT book_revision FROM users WHERE id = ?`, userID).Scan(&bookRevision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PeerGroupMoveBatch{}, ErrUnknownUser
+	}
+	if err != nil {
+		return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: read address book revision: %w", s.path, err)
+	}
+
+	result := PeerGroupMoveBatch{
+		Revision:  bookRevision,
+		Moved:     make([]Peer, 0, len(moves)),
+		Unchanged: make([]string, 0, len(moves)),
+	}
+	pending := make([]Peer, 0, len(moves))
+	for _, move := range moves {
+		var (
+			peer      Peer
+			tags      string
+			updatedAt int64
+		)
+		err := tx.QueryRow(
+			`SELECT peer_id, name, tags, note, group_id, position, updated_at, revision FROM address_book
+			 WHERE user_id = ? AND peer_id = ? AND deleted = 0`,
+			userID, move.ID,
+		).Scan(&peer.ID, &peer.Name, &tags, &peer.Note, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision)
+		if errors.Is(err, sql.ErrNoRows) {
+			return PeerGroupMoveBatch{}, ErrUnknownPeer
+		}
+		if err != nil {
+			return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: read address book entry: %w", s.path, err)
+		}
+		if move.IfRevision > 0 && peer.Revision != move.IfRevision {
+			return PeerGroupMoveBatch{}, ErrPeerConflict
+		}
+		peer.Tags = decodeTags(tags)
+		peer.UpdatedAt = timeFromMillis(updatedAt)
+		if peer.GroupID == groupID {
+			result.Unchanged = append(result.Unchanged, peer.ID)
+			continue
+		}
+		pending = append(pending, peer)
+	}
+	if len(pending) == 0 {
+		return result, nil
+	}
+
+	revision, err := nextRevision(tx, userID)
+	if err != nil {
+		return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
+	}
+	now := s.now().UTC()
+	for _, peer := range pending {
+		res, err := tx.Exec(
+			`UPDATE address_book SET group_id = ?, updated_at = ?, revision = ?
+			 WHERE user_id = ? AND peer_id = ? AND deleted = 0`,
+			groupID, unixMillis(now), revision, userID, peer.ID,
+		)
+		if err != nil {
+			return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: move address book entry: %w", s.path, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: count address book move: %w", s.path, err)
+		}
+		if affected != 1 {
+			return PeerGroupMoveBatch{}, ErrUnknownPeer
+		}
+		peer.GroupID = groupID
+		peer.UpdatedAt = now
+		peer.Revision = revision
+		result.Moved = append(result.Moved, peer)
+	}
+	if err := tx.Commit(); err != nil {
+		return PeerGroupMoveBatch{}, fmt.Errorf("account store %s: commit address book batch move: %w", s.path, err)
+	}
+	result.Revision = revision
+	return result, nil
+}
+
 // UpsertGroup creates or renames one of the user's groups. Reusing a
 // tombstoned id revives it with a new revision.
 func (s *Store) UpsertGroup(userID, groupID, name string) (Group, error) {
@@ -2751,14 +3052,22 @@ func (s *Store) DeleteGroup(userID, groupID string) (bool, error) {
 // positive ifRevision that no longer matches the live group reports
 // ErrGroupConflict before anything is written.
 func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, error) {
+	removed, _, err := s.DeleteGroupAtWithRevocations(userID, groupID, ifRevision)
+	return removed, err
+}
+
+// DeleteGroupAtWithRevocations performs DeleteGroupAt and returns every group
+// or everyone target grant scoped to the deleted address-book group. The rows
+// are captured before the group name is cleared by the tombstone update.
+func (s *Store) DeleteGroupAtWithRevocations(userID, groupID string, ifRevision int64) (bool, []RevokedTargetGrant, error) {
 	if !registry.ValidID(groupID) {
-		return false, ErrInvalidGroupID
+		return false, nil, ErrInvalidGroupID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return false, fmt.Errorf("account store %s: begin address book group delete: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: begin address book group delete: %w", s.path, err)
 	}
 	defer tx.Rollback()
 	var (
@@ -2772,17 +3081,22 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		userID, groupID,
 	).Scan(&deleted, &live, &parentID)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted) {
-		return false, nil
+		return false, nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
 	}
 	if ifRevision > 0 && live != ifRevision {
-		return false, ErrGroupConflict
+		return false, nil, ErrGroupConflict
+	}
+	revoked, err := s.revokedTargetGrantsLocked(tx,
+		`t.owner_user_id = ? AND t.group_id = ?`, userID, groupID)
+	if err != nil {
+		return false, nil, err
 	}
 	revision, err := nextRevision(tx, userID)
 	if err != nil {
-		return false, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
 	}
 	now := s.now().UTC()
 	if _, err := tx.Exec(
@@ -2790,7 +3104,7 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		 WHERE user_id = ? AND group_id = ?`,
 		unixMillis(now), revision, userID, groupID,
 	); err != nil {
-		return false, fmt.Errorf("account store %s: delete address book group: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: delete address book group: %w", s.path, err)
 	}
 	// Child groups move up to the deleted group's parent so the rest of the
 	// tree keeps its shape. Each child gets its own revision so incremental
@@ -2801,33 +3115,33 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		userID, groupID,
 	)
 	if err != nil {
-		return false, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
 	}
 	var childIDs []string
 	for childRows.Next() {
 		var childID string
 		if err := childRows.Scan(&childID); err != nil {
 			childRows.Close()
-			return false, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
+			return false, nil, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
 		}
 		childIDs = append(childIDs, childID)
 	}
 	if err := childRows.Err(); err != nil {
 		childRows.Close()
-		return false, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
 	}
 	childRows.Close()
 	for _, childID := range childIDs {
 		childRevision, err := nextRevision(tx, userID)
 		if err != nil {
-			return false, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
+			return false, nil, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
 		}
 		if _, err := tx.Exec(
 			`UPDATE address_book_groups SET parent_id = ?, updated_at = ?, revision = ?
 			 WHERE user_id = ? AND group_id = ?`,
 			parentID, unixMillis(now), childRevision, userID, childID,
 		); err != nil {
-			return false, fmt.Errorf("account store %s: promote child group: %w", s.path, err)
+			return false, nil, fmt.Errorf("account store %s: promote child group: %w", s.path, err)
 		}
 	}
 	rows, err := tx.Query(
@@ -2836,33 +3150,33 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		userID, groupID,
 	)
 	if err != nil {
-		return false, fmt.Errorf("account store %s: list grouped peers: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: list grouped peers: %w", s.path, err)
 	}
 	var peerIDs []string
 	for rows.Next() {
 		var peerID string
 		if err := rows.Scan(&peerID); err != nil {
 			rows.Close()
-			return false, fmt.Errorf("account store %s: list grouped peers: %w", s.path, err)
+			return false, nil, fmt.Errorf("account store %s: list grouped peers: %w", s.path, err)
 		}
 		peerIDs = append(peerIDs, peerID)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return false, fmt.Errorf("account store %s: list grouped peers: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: list grouped peers: %w", s.path, err)
 	}
 	rows.Close()
 	for _, peerID := range peerIDs {
 		peerRevision, err := nextRevision(tx, userID)
 		if err != nil {
-			return false, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
+			return false, nil, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
 		}
 		if _, err := tx.Exec(
 			`UPDATE address_book SET group_id = '', updated_at = ?, revision = ?
 			 WHERE user_id = ? AND peer_id = ?`,
 			unixMillis(now), peerRevision, userID, peerID,
 		); err != nil {
-			return false, fmt.Errorf("account store %s: ungroup address book entry: %w", s.path, err)
+			return false, nil, fmt.Errorf("account store %s: ungroup address book entry: %w", s.path, err)
 		}
 	}
 	// A scoped grant for a tombstoned group would otherwise linger and cover
@@ -2871,18 +3185,18 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		`DELETE FROM address_book_grants WHERE owner_user_id = ? AND group_id = ?`,
 		userID, groupID,
 	); err != nil {
-		return false, fmt.Errorf("account store %s: revoke group grants: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: revoke group grants: %w", s.path, err)
 	}
 	if _, err := tx.Exec(
 		`DELETE FROM address_book_target_grants WHERE owner_user_id = ? AND group_id = ?`,
 		userID, groupID,
 	); err != nil {
-		return false, fmt.Errorf("account store %s: revoke group target grants: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: revoke group target grants: %w", s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("account store %s: commit address book group delete: %w", s.path, err)
+		return false, nil, fmt.Errorf("account store %s: commit address book group delete: %w", s.path, err)
 	}
-	return true, nil
+	return true, revoked, nil
 }
 
 func liveGroupLocked(tx *sql.Tx, userID, groupID string) (bool, error) {
@@ -3264,9 +3578,16 @@ func (s *Store) ShareBookTarget(ownerID, targetKind, targetID, permission, group
 
 // UnshareBookTarget revokes every scope granted to one target.
 func (s *Store) UnshareBookTarget(ownerID, targetKind, targetID string) error {
+	_, err := s.UnshareBookTargetWithRevocations(ownerID, targetKind, targetID)
+	return err
+}
+
+// UnshareBookTargetWithRevocations revokes every scope granted to one target
+// and returns the deleted rows for auditing.
+func (s *Store) UnshareBookTargetWithRevocations(ownerID, targetKind, targetID string) ([]RevokedTargetGrant, error) {
 	targetKind, targetID, err := normalizeShareTarget(targetKind, targetID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3276,39 +3597,97 @@ func (s *Store) UnshareBookTarget(ownerID, targetKind, targetID string) error {
 // UnshareBookTargetScope revokes one target grant: the whole-book scope when
 // groupID is empty, otherwise that address-book group.
 func (s *Store) UnshareBookTargetScope(ownerID, targetKind, targetID, groupID string) error {
+	_, err := s.UnshareBookTargetScopeWithRevocations(ownerID, targetKind, targetID, groupID)
+	return err
+}
+
+// UnshareBookTargetScopeWithRevocations revokes one target grant and returns
+// the deleted row for auditing.
+func (s *Store) UnshareBookTargetScopeWithRevocations(ownerID, targetKind, targetID, groupID string) ([]RevokedTargetGrant, error) {
 	targetKind, targetID, err := normalizeShareTarget(targetKind, targetID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	groupID = strings.TrimSpace(groupID)
 	if groupID != "" && !registry.ValidID(groupID) {
-		return ErrInvalidGroupID
+		return nil, ErrInvalidGroupID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.deleteTargetGrantLocked(ownerID, targetKind, targetID, &groupID)
 }
 
-func (s *Store) deleteTargetGrantLocked(ownerID, targetKind, targetID string, groupID *string) error {
-	query := `DELETE FROM address_book_target_grants
-		WHERE owner_user_id = ? AND target_kind = ? AND target_id = ?`
+func (s *Store) deleteTargetGrantLocked(ownerID, targetKind, targetID string, groupID *string) ([]RevokedTargetGrant, error) {
+	where := `t.owner_user_id = ? AND t.target_kind = ? AND t.target_id = ?`
 	args := []any{ownerID, targetKind, targetID}
 	if groupID != nil {
-		query += ` AND group_id = ?`
+		where += ` AND t.group_id = ?`
 		args = append(args, *groupID)
 	}
-	res, err := s.db.Exec(query, args...)
+	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("account store %s: unshare address book target: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: begin target unshare: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	revoked, err := s.revokedTargetGrantsLocked(tx, where, args...)
+	if err != nil {
+		return nil, err
+	}
+	query := `DELETE FROM address_book_target_grants
+		WHERE owner_user_id = ? AND target_kind = ? AND target_id = ?`
+	if groupID != nil {
+		query += ` AND group_id = ?`
+	}
+	res, err := tx.Exec(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: unshare address book target: %w", s.path, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if affected == 0 {
-		return ErrUnknownShare
+		return nil, ErrUnknownShare
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("account store %s: commit target unshare: %w", s.path, err)
+	}
+	return revoked, nil
+}
+
+func (s *Store) revokedTargetGrantsLocked(tx *sql.Tx, where string, args ...any) ([]RevokedTargetGrant, error) {
+	rows, err := tx.Query(
+		`SELECT owner.username, t.target_kind, t.target_id, COALESCE(account_group.name, ''),
+		        t.permission, t.group_id, COALESCE(book_group.name, '')
+		 FROM address_book_target_grants t
+		 JOIN users owner ON owner.id = t.owner_user_id
+		 LEFT JOIN account_groups account_group
+		   ON t.target_kind = 'group' AND account_group.id = t.target_id
+		 LEFT JOIN address_book_groups book_group
+		   ON book_group.user_id = t.owner_user_id AND book_group.group_id = t.group_id
+		 WHERE `+where+`
+		 ORDER BY owner.username COLLATE NOCASE, t.target_kind, t.group_id`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: list revoked target grants: %w", s.path, err)
+	}
+	defer rows.Close()
+	revoked := make([]RevokedTargetGrant, 0)
+	for rows.Next() {
+		var grant RevokedTargetGrant
+		if err := rows.Scan(
+			&grant.OwnerUsername, &grant.TargetKind, &grant.TargetID, &grant.TargetName,
+			&grant.Permission, &grant.GroupID, &grant.GroupName,
+		); err != nil {
+			return nil, fmt.Errorf("account store %s: scan revoked target grant: %w", s.path, err)
+		}
+		revoked = append(revoked, grant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("account store %s: list revoked target grants: %w", s.path, err)
+	}
+	return revoked, nil
 }
 
 func normalizeShareTarget(targetKind, targetID string) (string, string, error) {

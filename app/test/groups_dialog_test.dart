@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/pages/groups_dialog.dart';
@@ -47,11 +50,18 @@ void main() {
       token: 'account-token',
       groups: const <AddressBookGroup>[],
       create:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        created.add('$groupId/$name');
-        return AddressBookGroup(id: groupId, name: name ?? '', revision: 1);
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            created.add('$groupId/$name');
+            return AddressBookGroup(id: groupId, name: name ?? '', revision: 1);
+          },
     );
     final _Result result = await open(tester, dialog);
 
@@ -85,11 +95,18 @@ void main() {
       groups: groups,
       peerCounts: const <String, int>{'lab': 3, 'work': 1},
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        renamed.add('$groupId/$name@$ifRevision');
-        return AddressBookGroup(id: groupId, name: name ?? '', revision: 8);
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            renamed.add('$groupId/$name@$ifRevision');
+            return AddressBookGroup(id: groupId, name: name ?? '', revision: 8);
+          },
     );
     final _Result result = await open(tester, dialog);
 
@@ -118,10 +135,14 @@ void main() {
       token: 'account-token',
       groups: groups,
       remove:
-          (ServerSettings server, String token, String groupId,
-              {int? ifRevision}) async {
-        deleted.add('$groupId@$ifRevision');
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId, {
+            int? ifRevision,
+          }) async {
+            deleted.add('$groupId@$ifRevision');
+          },
     );
     final _Result result = await open(tester, dialog);
 
@@ -149,11 +170,18 @@ void main() {
       token: 'account-token',
       groups: groups,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        attempts++;
-        throw const ServerApiException('地址簿分组名称重复', statusCode: 400);
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            attempts++;
+            throw const ServerApiException('地址簿分组名称重复', statusCode: 400);
+          },
     );
     final _Result result = await open(tester, dialog);
 
@@ -188,13 +216,20 @@ void main() {
       token: 'account-token',
       groups: groups,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        throw const ServerApiException(
-          'address book group changed elsewhere',
-          statusCode: 409,
-        );
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            throw const ServerApiException(
+              'address book group changed elsewhere',
+              statusCode: 409,
+            );
+          },
       reload: () async {
         reloads++;
         return const <AddressBookGroup>[
@@ -230,16 +265,23 @@ void main() {
         AddressBookGroup(id: 'team', name: 'Team', revision: 2),
       ],
       create:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        seenParent = parentId;
-        return AddressBookGroup(
-          id: groupId,
-          name: name ?? '',
-          parentId: parentId ?? '',
-          revision: 1,
-        );
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            seenParent = parentId;
+            return AddressBookGroup(
+              id: groupId,
+              name: name ?? '',
+              parentId: parentId ?? '',
+              revision: 1,
+            );
+          },
     );
     await open(tester, dialog);
 
@@ -269,20 +311,27 @@ void main() {
       token: 'account-token',
       groups: flat,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        writes.add('$groupId/$name/$position@$ifRevision');
-        final AddressBookGroup old = flat.firstWhere(
-          (AddressBookGroup group) => group.id == groupId,
-        );
-        return AddressBookGroup(
-          id: groupId,
-          name: name ?? old.name,
-          parentId: parentId ?? old.parentId,
-          position: position ?? old.position,
-          revision: (ifRevision ?? old.revision) + 1,
-        );
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            writes.add('$groupId/$name/$position@$ifRevision');
+            final AddressBookGroup old = flat.firstWhere(
+              (AddressBookGroup group) => group.id == groupId,
+            );
+            return AddressBookGroup(
+              id: groupId,
+              name: name ?? old.name,
+              parentId: parentId ?? old.parentId,
+              position: position ?? old.position,
+              revision: (ifRevision ?? old.revision) + 1,
+            );
+          },
     );
     await open(tester, dialog);
 
@@ -304,20 +353,27 @@ void main() {
       token: 'account-token',
       groups: nested,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        seenParent = parentId;
-        writes.add('$groupId/$name/$parentId@$ifRevision');
-        final AddressBookGroup old = nested.firstWhere(
-          (AddressBookGroup group) => group.id == groupId,
-        );
-        return AddressBookGroup(
-          id: groupId,
-          name: name ?? old.name,
-          parentId: parentId ?? old.parentId,
-          revision: (ifRevision ?? old.revision) + 1,
-        );
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            seenParent = parentId;
+            writes.add('$groupId/$name/$parentId@$ifRevision');
+            final AddressBookGroup old = nested.firstWhere(
+              (AddressBookGroup group) => group.id == groupId,
+            );
+            return AddressBookGroup(
+              id: groupId,
+              name: name ?? old.name,
+              parentId: parentId ?? old.parentId,
+              revision: (ifRevision ?? old.revision) + 1,
+            );
+          },
     );
     await open(tester, dialog);
 
@@ -345,27 +401,36 @@ void main() {
       token: 'account-token',
       groups: flat,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        writes.add('$groupId/$position@$ifRevision');
-        final AddressBookGroup old = flat.firstWhere(
-          (AddressBookGroup group) => group.id == groupId,
-        );
-        return AddressBookGroup(
-          id: groupId,
-          name: name ?? old.name,
-          parentId: parentId ?? old.parentId,
-          position: position ?? old.position,
-          revision: (ifRevision ?? old.revision) + 1,
-        );
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            writes.add('$groupId/$position@$ifRevision');
+            final AddressBookGroup old = flat.firstWhere(
+              (AddressBookGroup group) => group.id == groupId,
+            );
+            return AddressBookGroup(
+              id: groupId,
+              name: name ?? old.name,
+              parentId: parentId ?? old.parentId,
+              position: position ?? old.position,
+              revision: (ifRevision ?? old.revision) + 1,
+            );
+          },
     );
     await open(tester, dialog);
 
-    final Offset start =
-        tester.getCenter(find.byKey(const Key('group-drag-beta')));
-    final Offset end =
-        tester.getCenter(find.byKey(const Key('group-row-alpha')));
+    final Offset start = tester.getCenter(
+      find.byKey(const Key('group-drag-beta')),
+    );
+    final Offset end = tester.getCenter(
+      find.byKey(const Key('group-row-alpha')),
+    );
     final TestGesture gesture = await tester.startGesture(start);
     await tester.pump();
     await gesture.moveTo(end);
@@ -388,18 +453,25 @@ void main() {
       token: 'account-token',
       groups: nested,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        writes.add('$groupId/$position');
-        return AddressBookGroup(id: groupId, name: name ?? '');
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            writes.add('$groupId/$position');
+            return AddressBookGroup(id: groupId, name: name ?? '');
+          },
     );
     await open(tester, dialog);
 
-    final Offset start =
-        tester.getCenter(find.byKey(const Key('group-drag-dev')));
-    final Offset end =
-        tester.getCenter(find.byKey(const Key('group-row-ops')));
+    final Offset start = tester.getCenter(
+      find.byKey(const Key('group-drag-dev')),
+    );
+    final Offset end = tester.getCenter(find.byKey(const Key('group-row-ops')));
     final TestGesture gesture = await tester.startGesture(start);
     await tester.pump();
     await gesture.moveTo(end);
@@ -423,10 +495,17 @@ void main() {
       token: 'account-token',
       groups: nested,
       rename:
-          (ServerSettings server, String token, String groupId, String? name,
-              {String? parentId, int? position, int? ifRevision}) async {
-        return AddressBookGroup(id: groupId, name: name ?? '');
-      },
+          (
+            ServerSettings server,
+            String token,
+            String groupId,
+            String? name, {
+            String? parentId,
+            int? position,
+            int? ifRevision,
+          }) async {
+            return AddressBookGroup(id: groupId, name: name ?? '');
+          },
     );
     await open(tester, dialog);
 
@@ -439,5 +518,174 @@ void main() {
     expect(find.text('Ops'), findsWidgets);
     // Only the row behind the dialog remains; the dropdown must not offer it.
     expect(find.text('Dev'), findsOneWidget);
+  });
+
+  testWidgets('group JSON can be exported and copied', (tester) async {
+    String? clipboard;
+    final TestDefaultBinaryMessenger messenger =
+        tester.binding.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (
+      MethodCall call,
+    ) async {
+      if (call.method == 'Clipboard.setData') {
+        clipboard = (call.arguments as Map<Object?, Object?>)['text'] as String;
+      }
+      if (call.method == 'Clipboard.getData') {
+        return <String, Object?>{'text': clipboard};
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+    final GroupsDialog dialog = GroupsDialog(
+      server: settings,
+      token: 'account-token',
+      groups: groups,
+      exportGroups: (ServerSettings server, String token) async =>
+          const AddressBookGroupTransferDocument(
+            groups: <AddressBookGroupTransfer>[
+              AddressBookGroupTransfer(id: 'lab', name: 'Lab', position: 2),
+            ],
+          ),
+    );
+    await open(tester, dialog);
+
+    await tester.tap(find.byKey(const Key('group-transfer')));
+    await tester.pumpAndSettle();
+    expect(find.text('分组导入/导出'), findsOneWidget);
+    final TextField exportField = tester.widget<TextField>(
+      find.byKey(const Key('group-export-text')),
+    );
+    expect(exportField.controller!.text, contains('chast-addressbook-groups'));
+    expect(exportField.controller!.text, contains('"lab"'));
+    expect(exportField.controller!.text, isNot(contains('device')));
+
+    await tester.tap(find.byKey(const Key('group-export-copy')));
+    await tester.pumpAndSettle();
+    expect(clipboard, contains('chast-addressbook-groups'));
+    expect(jsonDecode(clipboard!), isA<Map<String, Object?>>());
+    expect(find.text('已复制分组 JSON'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('group-transfer-close')));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('group import supports all conflict modes and refreshes', (
+    tester,
+  ) async {
+    final List<String> conflicts = <String>[];
+    int reloads = 0;
+    final GroupsDialog dialog = GroupsDialog(
+      server: settings,
+      token: 'account-token',
+      groups: groups,
+      exportGroups: (ServerSettings server, String token) async =>
+          const AddressBookGroupTransferDocument(
+            groups: <AddressBookGroupTransfer>[],
+          ),
+      importGroups:
+          (
+            ServerSettings server,
+            String token,
+            AddressBookGroupTransferDocument document, {
+            required String conflict,
+          }) async {
+            conflicts.add(conflict);
+            return const AddressBookGroupImportResult(
+              revision: 8,
+              created: <AddressBookGroup>[
+                AddressBookGroup(id: 'office', name: 'Office', revision: 8),
+              ],
+            );
+          },
+      reload: () async {
+        reloads++;
+        return <AddressBookGroup>[
+          ...groups,
+          const AddressBookGroup(id: 'office', name: 'Office', revision: 8),
+        ];
+      },
+    );
+    final _Result result = await open(tester, dialog);
+
+    await tester.tap(find.byKey(const Key('group-transfer')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('group-import-text')),
+      '{"format":"chast-addressbook-groups","version":1,"groups":[{'
+      '"id":"office","name":"Office","parent_id":"","position":1}]}',
+    );
+    for (final String mode in <String>['reject', 'skip', 'update']) {
+      await tester.ensureVisible(
+        find.byKey(const Key('group-import-conflict')),
+      );
+      await tester.tap(find.byKey(const Key('group-import-conflict')));
+      await tester.pumpAndSettle();
+      final String label = switch (mode) {
+        'skip' => '跳过已有分组',
+        'update' => '更新已有分组',
+        _ => '拒绝整个导入',
+      };
+      await tester.tap(find.text(label).last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('group-import-confirm')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('导入结果：新建 1'), findsOneWidget);
+    }
+    expect(conflicts, <String>['reject', 'skip', 'update']);
+
+    await tester.tap(find.byKey(const Key('group-transfer-close')));
+    await tester.pumpAndSettle();
+    expect(reloads, 1);
+    expect(find.text('Office'), findsOneWidget);
+    await tester.tap(find.text('关闭'));
+    await tester.pumpAndSettle();
+    expect(result.changed, isTrue);
+  });
+
+  testWidgets('invalid or conflicting group imports show an error', (
+    tester,
+  ) async {
+    final GroupsDialog dialog = GroupsDialog(
+      server: settings,
+      token: 'account-token',
+      groups: groups,
+      exportGroups: (ServerSettings server, String token) async =>
+          const AddressBookGroupTransferDocument(
+            groups: <AddressBookGroupTransfer>[],
+          ),
+      importGroups:
+          (
+            ServerSettings server,
+            String token,
+            AddressBookGroupTransferDocument document, {
+            required String conflict,
+          }) async {
+            throw const ServerApiException(
+              '分组 ID 已存在，已取消本次导入',
+              statusCode: 409,
+            );
+          },
+    );
+    await open(tester, dialog);
+    await tester.tap(find.byKey(const Key('group-transfer')));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const Key('group-import-text')),
+      '{"format":"wrong","version":1,"groups":[]}',
+    );
+    await tester.tap(find.byKey(const Key('group-import-confirm')));
+    await tester.pumpAndSettle();
+    expect(find.text('分组导入文档格式不受支持'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('group-import-text')),
+      '{"format":"chast-addressbook-groups","version":1,"groups":[{'
+      '"id":"lab","name":"Lab","parent_id":"","position":0}]}',
+    );
+    await tester.tap(find.byKey(const Key('group-import-confirm')));
+    await tester.pumpAndSettle();
+    expect(find.text('分组 ID 已存在，已取消本次导入'), findsOneWidget);
   });
 }

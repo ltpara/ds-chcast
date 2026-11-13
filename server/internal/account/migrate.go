@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 17
+const accountSchemaVersion = 18
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -31,6 +31,28 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 15, Name: "address book target grants", Apply: applyAddressBookTargetGrants},
 	{Version: 16, Name: "account session permission caps", Apply: applySessionPermissionCaps},
 	{Version: 17, Name: "ldap identities", Apply: applyLDAPIdentities},
+	{Version: 18, Name: "account session activity", Apply: applyAccountSessionActivity},
+}
+
+// applyAccountSessionActivity separates a login's stable start time from its
+// most recent authenticated use. Existing rows can only be backfilled from
+// created_at; future rotations leave login_at alone and refresh last_seen_at.
+func applyAccountSessionActivity(db *sql.DB) error {
+	if err := ensureColumn(db, "user_tokens", "login_at",
+		"login_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate user_tokens.login_at: %w", err)
+	}
+	if err := ensureColumn(db, "user_tokens", "last_seen_at",
+		"last_seen_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate user_tokens.last_seen_at: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE user_tokens SET login_at = created_at WHERE login_at = 0`); err != nil {
+		return fmt.Errorf("backfill user_tokens.login_at: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE user_tokens SET last_seen_at = created_at WHERE last_seen_at = 0`); err != nil {
+		return fmt.Errorf("backfill user_tokens.last_seen_at: %w", err)
+	}
+	return nil
 }
 
 // applyLDAPIdentities links a directory entry's DN to the local account that

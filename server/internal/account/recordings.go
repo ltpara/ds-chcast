@@ -41,9 +41,10 @@ func (s *Store) AddRecording(rec Recording) (Recording, error) {
 	return s.AddRecordingWithQuota(rec, 0)
 }
 
-// AddRecordingWithQuota checks account usage and inserts in one SQLite write
-// statement, including when multiple stores share the same database.
-// Zero quota means unlimited.
+// AddRecordingWithQuota checks account usage and inserts in one write
+// statement, including when multiple stores share the same database. Explicit
+// casts keep the untyped parameters unambiguous in PostgreSQL while SQLite
+// applies the same INTEGER affinity. Zero quota means unlimited.
 func (s *Store) AddRecordingWithQuota(rec Recording, quota int64) (Recording, error) {
 	if quota < 0 {
 		return Recording{}, fmt.Errorf("recording quota must not be negative")
@@ -74,7 +75,9 @@ func (s *Store) AddRecordingWithQuota(rec Recording, quota int64) (Recording, er
 		`INSERT INTO recordings (id, user_id, name, peer_id, size, sha256,
 			duration_ms, started_at, created_at)
 		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-		 WHERE ? = 0 OR COALESCE((SELECT SUM(size) FROM recordings WHERE user_id = ?), 0) <= ? - ?`,
+		 WHERE CAST(? AS BIGINT) = 0 OR
+			COALESCE((SELECT SUM(size) FROM recordings WHERE user_id = ?), 0) <=
+			CAST(? AS BIGINT) - CAST(? AS BIGINT)`,
 		rec.ID, rec.UserID, rec.Name, strings.TrimSpace(rec.PeerID), rec.Size,
 		rec.SHA256, rec.DurationMS, rec.StartedAtMS, rec.CreatedAtMS,
 		quota, rec.UserID, quota, rec.Size,

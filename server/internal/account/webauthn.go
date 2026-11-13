@@ -483,10 +483,11 @@ func (s *Store) CompleteWebAuthnLogin(username, purpose string, credentialID, ex
 	if _, err := tx.Exec(
 		`INSERT INTO user_tokens
 			(token_hash, user_id, created_at, expires_at, access_expires_at,
-			 session_id, device_id, device_name)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			 session_id, device_id, device_name, login_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		tokenHash(token), user.ID, unixMillis(now), unixMillis(sessionExpires),
 		unixMillis(accessExpires), sessionID, deviceID, deviceName,
+		unixMillis(now), unixMillis(now),
 	); err != nil {
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: save token: %w", s.path, err)
 	}

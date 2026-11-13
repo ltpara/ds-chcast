@@ -258,10 +258,9 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 	if groupID != "" {
 		events, err = s.cfg.Accounts.FileTransfersForGroupBeforeRange(
 			groupID, username, host, bounds, beforeID, limit)
-	} else if host != "" {
-		events, err = s.cfg.Accounts.FileTransfersForHostBeforeRange(host, bounds, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.FileTransfersForBeforeRange(username, bounds, beforeID, limit)
+		events, err = s.cfg.Accounts.FileTransfersForOperatorBeforeRange(
+			username, host, bounds, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account file transfer audit query", "error", err)

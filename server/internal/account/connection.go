@@ -389,12 +389,24 @@ func (s *Store) ConnectionsForBefore(username string, beforeID int64, limit int)
 // ConnectionsForBeforeRange is ConnectionsForBefore narrowed to an inclusive
 // window on started_at.
 func (s *Store) ConnectionsForBeforeRange(username string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
+	return s.ConnectionsForOperatorBeforeRange(username, "", bounds, beforeID, limit)
+}
+
+// ConnectionsForOperatorBeforeRange combines the optional cross-account
+// username and host filters used by the operator audit view. A host matches
+// either the host_id or peer_id column, just as the host-only view does.
+func (s *Store) ConnectionsForOperatorBeforeRange(username, hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	username = strings.TrimSpace(username)
-	clauses := make([]string, 0, 2)
-	args := make([]any, 0, 2)
+	hostID = strings.TrimSpace(hostID)
+	clauses := make([]string, 0, 3)
+	args := make([]any, 0, 4)
 	if username != "" {
 		clauses = append(clauses, "username = ? COLLATE NOCASE")
 		args = append(args, username)
+	}
+	if hostID != "" {
+		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
+		args = append(args, hostID, hostID)
 	}
 	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
 	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
@@ -414,15 +426,7 @@ func (s *Store) ConnectionsForHostBefore(hostID string, beforeID int64, limit in
 // ConnectionsForHostBeforeRange is ConnectionsForHostBefore narrowed to an
 // inclusive window on started_at.
 func (s *Store) ConnectionsForHostBeforeRange(hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
-	hostID = strings.TrimSpace(hostID)
-	clauses := make([]string, 0, 2)
-	args := make([]any, 0, 3)
-	if hostID != "" {
-		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
-		args = append(args, hostID, hostID)
-	}
-	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
-	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
+	return s.ConnectionsForOperatorBeforeRange("", hostID, bounds, beforeID, limit)
 }
 
 func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit int) ([]ConnectionEvent, error) {

@@ -561,6 +561,134 @@ func TestAddressBookGroupAPI(t *testing.T) {
 	}
 }
 
+func TestAddressBookBulkGroupMoveAPI(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	reply := login(t, s.URL, "alice", "correct horse")
+	for _, group := range []string{"studio", "lab"} {
+		if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/"+group,
+			`{"name":"`+group+`"}`, reply.Token); status != http.StatusOK {
+			t.Fatalf("create group %s: %d %s", group, status, body)
+		}
+	}
+	peers := make(map[string]peerReply)
+	for _, item := range []struct {
+		id, group string
+	}{
+		{"peer-a", "studio"},
+		{"peer-b", "studio"},
+		{"peer-c", "lab"},
+	} {
+		status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/"+item.id,
+			`{"name":"`+item.id+`","group_id":"`+item.group+`"}`, reply.Token)
+		if status != http.StatusOK {
+			t.Fatalf("create peer %s: %d %s", item.id, status, body)
+		}
+		var peer peerReply
+		if err := json.Unmarshal(body, &peer); err != nil {
+			t.Fatalf("decode peer %s: %v", item.id, err)
+		}
+		peers[item.id] = peer
+	}
+
+	type bulkReply struct {
+		Revision  int64       `json:"revision"`
+		Moved     []peerReply `json:"moved"`
+		Unchanged []string    `json:"unchanged"`
+	}
+	body := fmt.Sprintf(`{"group_id":"lab","peers":[{"id":"peer-a","if_revision":%d},{"id":"peer-b","if_revision":%d},{"id":"peer-c","if_revision":%d}]}`,
+		peers["peer-a"].Revision, peers["peer-b"].Revision, peers["peer-c"].Revision)
+	status, response := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move", body, reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("bulk move: %d %s", status, response)
+	}
+	var moved bulkReply
+	if err := json.Unmarshal(response, &moved); err != nil {
+		t.Fatalf("bulk move reply: %v", err)
+	}
+	if moved.Revision != 6 || len(moved.Moved) != 2 || len(moved.Unchanged) != 1 || moved.Unchanged[0] != "peer-c" {
+		t.Fatalf("bulk move reply = %+v", moved)
+	}
+	for _, peer := range moved.Moved {
+		if peer.GroupID != "lab" || peer.Revision != moved.Revision {
+			t.Fatalf("moved peer = %+v", peer)
+		}
+	}
+
+	noopBody := fmt.Sprintf(`{"group_id":"lab","peers":[{"id":"peer-a","if_revision":%d},{"id":"peer-b","if_revision":%d},{"id":"peer-c","if_revision":%d}]}`,
+		moved.Revision, moved.Revision, peers["peer-c"].Revision)
+	status, response = request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move", noopBody, reply.Token)
+	var noop bulkReply
+	if status != http.StatusOK || json.Unmarshal(response, &noop) != nil || noop.Revision != moved.Revision ||
+		len(noop.Moved) != 0 || len(noop.Unchanged) != 3 {
+		t.Fatalf("no-op bulk move: %d %s", status, response)
+	}
+
+	duplicateBody := `{"group_id":"lab","peers":[{"id":"peer-c"},{"id":"peer-c"}]}`
+	status, response = request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move", duplicateBody, reply.Token)
+	var duplicate bulkReply
+	if status != http.StatusOK || json.Unmarshal(response, &duplicate) != nil ||
+		duplicate.Revision != moved.Revision || len(duplicate.Moved) != 0 ||
+		len(duplicate.Unchanged) != 1 || duplicate.Unchanged[0] != "peer-c" {
+		t.Fatalf("duplicate bulk move: %d %s", status, response)
+	}
+
+	for _, invalid := range []string{
+		`{}`,
+		`{"peers":[{"id":"peer-a"}]}`,
+		`{"group_id":"lab","peers":[]}`,
+		`{"group_id":"bad id","peers":[{"id":"peer-a"}]}`,
+		`{"group_id":"lab","peers":[{"id":"bad id"}]}`,
+		`{"group_id":"lab","peers":[{"id":"peer-a","if_revision":0}]}`,
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move", invalid, reply.Token); status != http.StatusBadRequest {
+			t.Fatalf("invalid bulk move %s: %d %s", invalid, status, body)
+		}
+	}
+	var oversized strings.Builder
+	oversized.WriteString(`{"group_id":"lab","peers":[`)
+	for i := 0; i <= account.MaxAddressBookMoveBatch; i++ {
+		if i > 0 {
+			oversized.WriteByte(',')
+		}
+		fmt.Fprintf(&oversized, `{"id":"peer-%03d"}`, i)
+	}
+	oversized.WriteString(`]}`)
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move",
+		oversized.String(), reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("oversized bulk move: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move", body, ""); status != http.StatusUnauthorized {
+		t.Fatalf("bulk move without token: %d %s", status, body)
+	}
+
+	staleBody := fmt.Sprintf(`{"group_id":"studio","peers":[{"id":"peer-a","if_revision":%d},{"id":"peer-b","if_revision":%d}]}`,
+		moved.Revision, peers["peer-b"].Revision)
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move", staleBody, reply.Token); status != http.StatusConflict {
+		t.Fatalf("stale bulk move: %d %s", status, body)
+	}
+	status, response = request(t, http.MethodGet, s.URL+"/v1/addressbook", "", reply.Token)
+	var book addressBookReply
+	if status != http.StatusOK || json.Unmarshal(response, &book) != nil {
+		t.Fatalf("book after stale batch: %d %s", status, response)
+	}
+	for _, peer := range book.Peers {
+		if peer.ID == "peer-a" && (peer.GroupID != "lab" || peer.Revision != moved.Revision) {
+			t.Fatalf("stale batch partially moved peer-a = %+v", peer)
+		}
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move",
+		`{"group_id":"studio","peers":[{"id":"peer-a"},{"id":"peer-c"}]}`, reply.Token); status != http.StatusOK {
+		t.Fatalf("unconditional bulk move: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/peers/bulk-move",
+		`{"group_id":"lab","peers":[{"id":"peer-missing"}]}`, reply.Token); status != http.StatusNotFound {
+		t.Fatalf("unknown bulk peer: %d %s", status, body)
+	}
+}
+
 func TestAddressBookGroupOptimisticConcurrencyAPI(t *testing.T) {
 	s := testutil.Start(t)
 	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
@@ -1326,6 +1454,176 @@ func TestAddressBookTargetGrantsAPI(t *testing.T) {
 		!strings.Contains(string(body), `"books":[]`) {
 		t.Fatalf("book after everyone revoke: %d %s", status, body)
 	}
+
+	groupEvents, err := s.Accounts.AuditEventsFor(account.AuditAddressBookGroupRevoke, 20)
+	if err != nil || len(groupEvents) != 1 {
+		t.Fatalf("group revoke audit = %+v, %v", groupEvents, err)
+	}
+	if event := groupEvents[0]; event.Username != "alice" || !event.Success ||
+		event.ClientIP == "" ||
+		!strings.Contains(event.Detail, `target_id="team"`) ||
+		!strings.Contains(event.Detail, `target_name="Team"`) ||
+		!strings.Contains(event.Detail, `permission="write"`) ||
+		!strings.Contains(event.Detail, `scope="whole"`) ||
+		!strings.Contains(event.Detail, `owner="alice"`) ||
+		!strings.Contains(event.Detail, `cause="explicit_all"`) {
+		t.Fatalf("group revoke audit detail = %+v", event)
+	}
+	everyoneEvents, err := s.Accounts.AuditEventsFor(account.AuditAddressBookEveryoneRevoke, 20)
+	if err != nil || len(everyoneEvents) != 1 {
+		t.Fatalf("everyone revoke audit = %+v, %v", everyoneEvents, err)
+	}
+	if event := everyoneEvents[0]; event.Username != "alice" || !event.Success ||
+		!strings.Contains(event.Detail, `target_kind="everyone"`) ||
+		!strings.Contains(event.Detail, `permission="read"`) ||
+		!strings.Contains(event.Detail, `owner="alice"`) ||
+		!strings.Contains(event.Detail, `cause="explicit_all"`) {
+		t.Fatalf("everyone revoke audit detail = %+v", event)
+	}
+}
+
+func TestAddressBookTargetScopeRevocationIsAudited(t *testing.T) {
+	s := testutil.Start(t)
+	for _, username := range []string{"alice", "bob"} {
+		if _, err := s.Accounts.CreateUser(username, "correct horse"); err != nil {
+			t.Fatalf("create %s: %v", username, err)
+		}
+	}
+	if _, err := s.Accounts.CreateGroup("team", "Team", "", 0, 0); err != nil {
+		t.Fatalf("create account group: %v", err)
+	}
+	for _, username := range []string{"alice", "bob"} {
+		if _, err := s.Accounts.AddGroupMember("team", username, account.RoleReadonly); err != nil {
+			t.Fatalf("add %s to group: %v", username, err)
+		}
+	}
+	alice := login(t, s.URL, "alice", "correct horse")
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/lab",
+		`{"name":"Lab"}`, alice.Token); status != http.StatusOK {
+		t.Fatalf("create address book group: %d %s", status, body)
+	}
+	for _, share := range []string{
+		`{"target":"group","target_id":"team","group_id":"lab","permission":"write"}`,
+		`{"target":"everyone","group_id":"lab","permission":"read"}`,
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/grants",
+			share, alice.Token); status != http.StatusOK {
+			t.Fatalf("seed scoped target share %s: %d %s", share, status, body)
+		}
+	}
+
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/addressbook/grants/targets?kind=group&target_id=team&group_id=lab",
+		"", alice.Token); status != http.StatusNoContent {
+		t.Fatalf("revoke scoped group grant: %d %s", status, body)
+	}
+	groupEvents, err := s.Accounts.AuditEventsFor(account.AuditAddressBookGroupRevoke, 20)
+	if err != nil || len(groupEvents) != 1 {
+		t.Fatalf("scoped group revoke audit = %+v, %v", groupEvents, err)
+	}
+	event := groupEvents[0]
+	if event.Username != "alice" || !event.Success ||
+		!strings.Contains(event.Detail, `target_id="team"`) ||
+		!strings.Contains(event.Detail, `target_name="Team"`) ||
+		!strings.Contains(event.Detail, `permission="write"`) ||
+		!strings.Contains(event.Detail, `scope_id="lab"`) ||
+		!strings.Contains(event.Detail, `scope_name="Lab"`) ||
+		!strings.Contains(event.Detail, `owner="alice"`) ||
+		!strings.Contains(event.Detail, `cause="explicit_scope"`) {
+		t.Fatalf("scoped group revoke audit detail = %+v", event)
+	}
+	everyoneEvents, err := s.Accounts.AuditEventsFor(account.AuditAddressBookEveryoneRevoke, 20)
+	if err != nil || len(everyoneEvents) != 0 {
+		t.Fatalf("scoped group revoke touched everyone audit = %+v, %v", everyoneEvents, err)
+	}
+}
+
+func TestAddressBookTargetRevocationCascadesAreAudited(t *testing.T) {
+	s := testutil.Start(t)
+	for _, username := range []string{"alice", "bob", "dave"} {
+		if _, err := s.Accounts.CreateUser(username, "correct horse"); err != nil {
+			t.Fatalf("create %s: %v", username, err)
+		}
+	}
+	if _, err := s.Accounts.SetRole("alice", account.RoleAdmin); err != nil {
+		t.Fatalf("promote alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateGroup("team", "Team", "", 0, 0); err != nil {
+		t.Fatalf("create account group: %v", err)
+	}
+	for _, username := range []string{"alice", "dave"} {
+		if _, err := s.Accounts.AddGroupMember("team", username, account.RoleAdmin); err != nil {
+			t.Fatalf("add %s to group: %v", username, err)
+		}
+	}
+	alice := login(t, s.URL, "alice", "correct horse")
+	dave := login(t, s.URL, "dave", "correct horse")
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/lab",
+		`{"name":"Lab"}`, alice.Token); status != http.StatusOK {
+		t.Fatalf("create address book group: %d %s", status, body)
+	}
+
+	for _, share := range []struct {
+		token string
+		body  string
+	}{
+		{alice.Token, `{"target":"group","target_id":"team","group_id":"lab","permission":"write"}`},
+		{alice.Token, `{"target":"everyone","group_id":"lab","permission":"read"}`},
+		{alice.Token, `{"target":"group","target_id":"team","permission":"control"}`},
+		{dave.Token, `{"target":"group","target_id":"team","permission":"write"}`},
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/grants",
+			share.body, share.token); status != http.StatusOK {
+			t.Fatalf("seed target share %s: %d %s", share.body, status, body)
+		}
+	}
+
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/groups/lab", "", alice.Token); status != http.StatusNoContent {
+		t.Fatalf("delete address book group: %d %s", status, body)
+	}
+	groupEvents, err := s.Accounts.AuditEventsFor(account.AuditAddressBookGroupRevoke, 20)
+	if err != nil || len(groupEvents) != 1 {
+		t.Fatalf("address book group cascade group audit = %+v, %v", groupEvents, err)
+	}
+	if event := groupEvents[0]; event.Username != "alice" ||
+		!strings.Contains(event.Detail, `scope_id="lab"`) ||
+		!strings.Contains(event.Detail, `scope_name="Lab"`) ||
+		!strings.Contains(event.Detail, `cause="address_book_group_deleted"`) {
+		t.Fatalf("address book group cascade group detail = %+v", event)
+	}
+	everyoneEvents, err := s.Accounts.AuditEventsFor(account.AuditAddressBookEveryoneRevoke, 20)
+	if err != nil || len(everyoneEvents) != 1 {
+		t.Fatalf("address book group cascade everyone audit = %+v, %v", everyoneEvents, err)
+	}
+	if event := everyoneEvents[0]; event.Username != "alice" ||
+		!strings.Contains(event.Detail, `scope_id="lab"`) ||
+		!strings.Contains(event.Detail, `scope_name="Lab"`) {
+		t.Fatalf("address book group cascade everyone detail = %+v", event)
+	}
+
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/groups/team", "", alice.Token); status != http.StatusNoContent {
+		t.Fatalf("delete account group: %d %s", status, body)
+	}
+	groupEvents, err = s.Accounts.AuditEventsFor(account.AuditAddressBookGroupRevoke, 20)
+	if err != nil || len(groupEvents) != 3 {
+		t.Fatalf("account group cascade group audit = %+v, %v", groupEvents, err)
+	}
+	owners := map[string]bool{}
+	for _, event := range groupEvents {
+		if !strings.Contains(event.Detail, `cause="account_group_deleted"`) ||
+			!strings.Contains(event.Detail, `scope="whole"`) {
+			continue
+		}
+		if strings.Contains(event.Detail, `owner="alice"`) {
+			owners["alice"] = true
+		}
+		if strings.Contains(event.Detail, `owner="dave"`) {
+			owners["dave"] = true
+		}
+	}
+	if !owners["alice"] || !owners["dave"] {
+		t.Fatalf("account group cascade owners = %+v, events = %+v", owners, groupEvents)
+	}
 }
 
 func TestAccountRoutesNeedPersistentState(t *testing.T) {
@@ -1368,11 +1666,14 @@ type accountSessionReply struct {
 	DeviceName  string `json:"device_name"`
 	CreatedAtMS int64  `json:"created_at_ms"`
 	ExpiresAtMS int64  `json:"expires_at_ms"`
+	LastSeenMS  int64  `json:"last_seen_at_ms"`
+	Online      bool   `json:"online"`
 	Current     bool   `json:"current"`
 }
 
 type accountSessionsReply struct {
 	Sessions []accountSessionReply `json:"sessions"`
+	Total    int                   `json:"total"`
 }
 
 func TestAccountSessionsAndRevoke(t *testing.T) {

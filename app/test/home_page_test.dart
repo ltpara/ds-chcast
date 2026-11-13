@@ -111,6 +111,26 @@ class _MemoryDevices extends DeviceStore {
   }
 
   @override
+  Future<List<Device>> settleGroupMoves(
+    Set<String> keys,
+    String groupId,
+    int revision,
+  ) async {
+    final String value = groupId.trim();
+    for (int i = 0; i < devices.length; ++i) {
+      if (!keys.contains(devices[i].key)) {
+        continue;
+      }
+      devices[i] = devices[i].copyWith(
+        groupId: value,
+        groupCleared: value.isEmpty,
+        revision: revision > 0 ? revision : null,
+      );
+    }
+    return List<Device>.of(devices);
+  }
+
+  @override
   Future<List<Device>> updateMac(String key, String mac) async {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
@@ -2289,10 +2309,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('设备备注'));
     await tester.pumpAndSettle();
-    await tester.enterText(
-      find.byKey(const Key('account-note')),
-      '  机柜 A3  ',
-    );
+    await tester.enterText(find.byKey(const Key('account-note')), '  机柜 A3  ');
     await tester.tap(find.byKey(const Key('account-note-save')));
     await tester.pumpAndSettle();
 
@@ -3379,6 +3396,155 @@ void main() {
     },
   );
 
+  testWidgets('bulk move sends revisions and settles all moved devices', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final DateTime now = DateTime.now();
+    final _MemoryAccount accounts = _MemoryAccount(
+      AccountSession(
+        server: 'http://127.0.0.1:8443',
+        username: 'alice',
+        token: 'tok',
+        expiresAt: now.toUtc().add(const Duration(hours: 1)),
+        bookRevision: 6,
+      ),
+    );
+    final _MemoryDevices devices = _MemoryDevices(<Device>[
+      Device(
+        id: 'studio',
+        name: '工作室',
+        server: 'http://127.0.0.1:8443',
+        groupId: 'work',
+        revision: 3,
+        saved: true,
+        addedAt: now.subtract(const Duration(hours: 1)),
+      ),
+      Device(
+        id: 'office',
+        name: '办公室',
+        server: 'http://127.0.0.1:8443',
+        groupId: 'work',
+        revision: 4,
+        saved: true,
+        addedAt: now.subtract(const Duration(hours: 2)),
+      ),
+    ]);
+    final List<String> keys = <String>[
+      for (final Device device in devices.devices) device.key,
+    ];
+    List<AddressBookPeerMove> submitted = <AddressBookPeerMove>[];
+    String? target;
+    int calls = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: devices,
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: accounts,
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return const BatchLookupResult(hosts: <String, HostInfo>{});
+          },
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async {
+                return const AddressBookSnapshot(
+                  revision: 6,
+                  peers: <AddressBookPeer>[
+                    AddressBookPeer(
+                      id: 'studio',
+                      name: '工作室',
+                      groupId: 'work',
+                      revision: 3,
+                    ),
+                    AddressBookPeer(
+                      id: 'office',
+                      name: '办公室',
+                      groupId: 'work',
+                      revision: 4,
+                    ),
+                  ],
+                  groups: <AddressBookGroup>[
+                    AddressBookGroup(id: 'work', name: 'Work', revision: 2),
+                    AddressBookGroup(id: 'lab', name: 'Lab', revision: 3),
+                  ],
+                );
+              },
+          addressBookBulkMover:
+              (
+                ServerSettings server,
+                String token,
+                List<AddressBookPeerMove> peers,
+                String groupId,
+              ) async {
+                calls++;
+                submitted = List<AddressBookPeerMove>.of(peers);
+                target = groupId;
+                return const AddressBookBulkMoveResult(
+                  revision: 7,
+                  moved: <AddressBookPeer>[
+                    AddressBookPeer(
+                      id: 'studio',
+                      name: '工作室',
+                      groupId: 'lab',
+                      revision: 7,
+                    ),
+                    AddressBookPeer(
+                      id: 'office',
+                      name: '办公室',
+                      groupId: 'lab',
+                      revision: 7,
+                    ),
+                  ],
+                  unchanged: <String>[],
+                );
+              },
+        ),
+      ),
+    );
+    for (int i = 0; i < 6; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(find.byKey(const Key('bulk-move-devices')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('bulk-move-devices')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('批量移动到分组'), findsOneWidget);
+    expect(find.byKey(const Key('bulk-move-confirm')), findsOneWidget);
+    await tester.tap(find.byKey(Key('bulk-move-device-${keys[0]}')));
+    await tester.tap(find.byKey(Key('bulk-move-device-${keys[1]}')));
+    await tester.tap(find.byKey(const Key('bulk-move-target-lab')));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('bulk-move-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(calls, 1);
+    expect(target, 'lab');
+    expect(submitted, hasLength(2));
+    final Map<String, int> submittedRevisions = <String, int>{
+      for (final AddressBookPeerMove peer in submitted)
+        peer.id: peer.ifRevision,
+    };
+    expect(submittedRevisions, <String, int>{'studio': 3, 'office': 4});
+    for (final Device device in devices.devices) {
+      expect(device.groupId, 'lab');
+      expect(device.revision, 7);
+      expect(device.groupCleared, isFalse);
+    }
+    expect(find.text('已批量移动到分组'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('dragging a device onto a group header moves it', (
     WidgetTester tester,
   ) async {
@@ -3733,88 +3899,89 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
-  testWidgets('the trash button opens the recycle bin and resyncs after a change', (
-    WidgetTester tester,
-  ) async {
-    tester.view.physicalSize = const Size(1600, 1000);
-    tester.view.devicePixelRatio = 1.0;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
+  testWidgets(
+    'the trash button opens the recycle bin and resyncs after a change',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1600, 1000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
 
-    int fetches = 0;
-    final _MemoryAccount accounts = _MemoryAccount(
-      AccountSession(
-        server: 'http://127.0.0.1:8443',
-        username: 'alice',
-        token: 'tok',
-        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
-        bookRevision: 2,
-      ),
-    );
-    await tester.pumpWidget(
-      MaterialApp(
-        home: HomePage(
-          deviceStore: _MemoryDevices(<Device>[
-            Device(
-              id: 'studio',
-              name: '工作室',
-              server: 'http://127.0.0.1:8443',
-              saved: true,
-              addedAt: DateTime.now(),
-            ),
-          ]),
-          serverStore: _MemoryServers(
-            const ServerSettings(url: 'http://127.0.0.1:8443'),
-          ),
-          identityStore: _MemoryIdentity(),
-          trustStore: _MemoryTrust(<String, String>{}),
-          accountStore: accounts,
-          lookupBatch: (ServerSettings server, List<String> hostIds) async {
-            return const BatchLookupResult(hosts: <String, HostInfo>{});
-          },
-          addressBookFetcher:
-              (ServerSettings server, String token, int since) async {
-                fetches++;
-                return const AddressBookSnapshot(
-                  revision: 2,
-                  peers: <AddressBookPeer>[
-                    AddressBookPeer(id: 'studio', name: '工作室'),
-                  ],
-                );
-              },
-          addressBookPeerWriter:
-              (
-                ServerSettings server,
-                String token,
-                String peerId, {
-                String? name,
-                List<String>? tags,
-                String? note,
-                String? groupId,
-                int? ifRevision,
-              }) async => AddressBookPeer(id: peerId),
-          trashDialogBuilder: (ServerSettings server, String token) =>
-              _FakeTrashDialog(),
+      int fetches = 0;
+      final _MemoryAccount accounts = _MemoryAccount(
+        AccountSession(
+          server: 'http://127.0.0.1:8443',
+          username: 'alice',
+          token: 'tok',
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          bookRevision: 2,
         ),
-      ),
-    );
-    for (int i = 0; i < 6; ++i) {
-      await tester.pump(const Duration(milliseconds: 20));
-    }
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: HomePage(
+            deviceStore: _MemoryDevices(<Device>[
+              Device(
+                id: 'studio',
+                name: '工作室',
+                server: 'http://127.0.0.1:8443',
+                saved: true,
+                addedAt: DateTime.now(),
+              ),
+            ]),
+            serverStore: _MemoryServers(
+              const ServerSettings(url: 'http://127.0.0.1:8443'),
+            ),
+            identityStore: _MemoryIdentity(),
+            trustStore: _MemoryTrust(<String, String>{}),
+            accountStore: accounts,
+            lookupBatch: (ServerSettings server, List<String> hostIds) async {
+              return const BatchLookupResult(hosts: <String, HostInfo>{});
+            },
+            addressBookFetcher:
+                (ServerSettings server, String token, int since) async {
+                  fetches++;
+                  return const AddressBookSnapshot(
+                    revision: 2,
+                    peers: <AddressBookPeer>[
+                      AddressBookPeer(id: 'studio', name: '工作室'),
+                    ],
+                  );
+                },
+            addressBookPeerWriter:
+                (
+                  ServerSettings server,
+                  String token,
+                  String peerId, {
+                  String? name,
+                  List<String>? tags,
+                  String? note,
+                  String? groupId,
+                  int? ifRevision,
+                }) async => AddressBookPeer(id: peerId),
+            trashDialogBuilder: (ServerSettings server, String token) =>
+                _FakeTrashDialog(),
+          ),
+        ),
+      );
+      for (int i = 0; i < 6; ++i) {
+        await tester.pump(const Duration(milliseconds: 20));
+      }
 
-    expect(find.byKey(const Key('address-book-trash')), findsOneWidget);
-    final int before = fetches;
-    await tester.tap(find.byKey(const Key('address-book-trash')));
-    await tester.pumpAndSettle();
-    expect(find.text('fake-trash'), findsOneWidget);
+      expect(find.byKey(const Key('address-book-trash')), findsOneWidget);
+      final int before = fetches;
+      await tester.tap(find.byKey(const Key('address-book-trash')));
+      await tester.pumpAndSettle();
+      expect(find.text('fake-trash'), findsOneWidget);
 
-    await tester.tap(find.byKey(const Key('fake-trash-close')));
-    await tester.pumpAndSettle();
-    expect(find.text('fake-trash'), findsNothing);
-    expect(fetches, greaterThan(before));
+      await tester.tap(find.byKey(const Key('fake-trash-close')));
+      await tester.pumpAndSettle();
+      expect(find.text('fake-trash'), findsNothing);
+      expect(fetches, greaterThan(before));
 
-    await tester.pumpWidget(const SizedBox());
-  });
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 
   testWidgets('the address book filters by name, id and tags', (
     WidgetTester tester,
@@ -4842,19 +5009,13 @@ void main() {
     expect(tester.widget<TextField>(portField).controller?.text, '3389');
     await tester.enterText(portField, '70000');
     await tester.tap(
-      find.descendant(
-        of: find.byType(AlertDialog),
-        matching: find.text('连接'),
-      ),
+      find.descendant(of: find.byType(AlertDialog), matching: find.text('连接')),
     );
     await tester.pumpAndSettle();
     expect(find.text('端口须为 1–65535'), findsOneWidget);
 
     await tester.tap(
-      find.descendant(
-        of: find.byType(AlertDialog),
-        matching: find.text('取消'),
-      ),
+      find.descendant(of: find.byType(AlertDialog), matching: find.text('取消')),
     );
     await tester.pumpAndSettle();
     expect(find.text('RDP 设置'), findsNothing);

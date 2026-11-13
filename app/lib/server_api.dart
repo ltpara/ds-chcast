@@ -654,6 +654,30 @@ class AddressBookPeer {
   }
 }
 
+/// One peer and the revision a bulk group move is based on.
+class AddressBookPeerMove {
+  const AddressBookPeerMove({required this.id, this.ifRevision = 0});
+
+  final String id;
+  final int ifRevision;
+}
+
+/// Result of one atomic address-book group move.
+///
+/// [revision] is shared by every entry in [moved]. It remains the current book
+/// revision when all selected peers were already in the target group.
+class AddressBookBulkMoveResult {
+  const AddressBookBulkMoveResult({
+    required this.revision,
+    required this.moved,
+    required this.unchanged,
+  });
+
+  final int revision;
+  final List<AddressBookPeer> moved;
+  final List<String> unchanged;
+}
+
 /// One named group inside the signed-in user's address book.
 class AddressBookGroup {
   const AddressBookGroup({
@@ -711,6 +735,198 @@ class AddressBookGroup {
       updatedAtMs: rawUpdated is num ? rawUpdated.toInt() : 0,
       revision: rawRevision is num ? rawRevision.toInt() : 0,
       deleted: value['deleted'] == true,
+    );
+  }
+}
+
+const String addressBookGroupTransferFormat = 'chast-addressbook-groups';
+const int addressBookGroupTransferVersion = 1;
+const List<String> addressBookGroupImportConflictModes = <String>[
+  'reject',
+  'skip',
+  'update',
+];
+
+/// One portable address-book group. It intentionally carries no devices,
+/// membership, revisions, timestamps or tombstones.
+class AddressBookGroupTransfer {
+  const AddressBookGroupTransfer({
+    required this.id,
+    required this.name,
+    this.parentId = '',
+    this.position = 0,
+  });
+
+  final String id;
+  final String name;
+  final String parentId;
+  final int position;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'id': id,
+    'name': name,
+    'parent_id': parentId,
+    'position': position,
+  };
+
+  static AddressBookGroupTransfer _fromJson(Object? value) {
+    if (value is! Map) {
+      throw ServerApiException(tr('分组导入文档中的分组无效'));
+    }
+    const Set<String> allowed = <String>{'id', 'name', 'parent_id', 'position'};
+    if (!value.keys.every(
+      (Object? key) => key is String && allowed.contains(key),
+    )) {
+      throw ServerApiException(tr('分组导入文档包含未知字段'));
+    }
+    final Object? rawID = value['id'];
+    final Object? rawName = value['name'];
+    final Object? rawParentID = value['parent_id'];
+    final Object? rawPosition = value['position'];
+    if (rawID is! String ||
+        rawName is! String ||
+        rawParentID is! String ||
+        rawPosition is! num) {
+      throw ServerApiException(tr('分组导入文档中的分组字段类型无效'));
+    }
+    final String id = rawID.trim();
+    final String name = rawName.trim();
+    final String parentID = rawParentID.trim();
+    final int position = rawPosition.toInt();
+    if (id.isEmpty || name.isEmpty) {
+      throw ServerApiException(tr('分组导入文档包含空 ID 或名称'));
+    }
+    if (position < 0 || position != rawPosition) {
+      throw ServerApiException(tr('分组导入文档中的排序位置无效'));
+    }
+    return AddressBookGroupTransfer(
+      id: id,
+      name: name,
+      parentId: parentID,
+      position: position,
+    );
+  }
+}
+
+/// Portable group structure exchanged as strict JSON. Devices and their
+/// membership are deliberately absent from this document.
+class AddressBookGroupTransferDocument {
+  const AddressBookGroupTransferDocument({
+    required this.groups,
+    this.conflict = 'reject',
+  });
+
+  final List<AddressBookGroupTransfer> groups;
+
+  /// Conflict mode read from the document. The import dialog can override it
+  /// explicitly before submitting.
+  final String conflict;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'format': addressBookGroupTransferFormat,
+    'version': addressBookGroupTransferVersion,
+    'conflict': conflict,
+    'groups': <Object?>[
+      for (final AddressBookGroupTransfer group in groups) group.toJson(),
+    ],
+  };
+
+  String toJsonText() => const JsonEncoder.withIndent('  ').convert(toJson());
+
+  static AddressBookGroupTransferDocument parse(String source) {
+    Object? decoded;
+    try {
+      decoded = jsonDecode(source);
+    } on FormatException {
+      throw ServerApiException(tr('分组导入内容不是有效 JSON'));
+    }
+    return fromJson(decoded);
+  }
+
+  static AddressBookGroupTransferDocument fromJson(Object? value) {
+    if (value is! Map) {
+      throw ServerApiException(tr('分组导入文档必须是 JSON 对象'));
+    }
+    const Set<String> allowed = <String>{
+      'format',
+      'version',
+      'conflict',
+      'groups',
+    };
+    if (!value.keys.every(
+      (Object? key) => key is String && allowed.contains(key),
+    )) {
+      throw ServerApiException(tr('分组导入文档包含未知字段'));
+    }
+    if (value['format'] != addressBookGroupTransferFormat) {
+      throw ServerApiException(tr('分组导入文档格式不受支持'));
+    }
+    final Object? version = value['version'];
+    if (version is! num || version != addressBookGroupTransferVersion) {
+      throw ServerApiException(tr('分组导入文档版本不受支持'));
+    }
+    final Object? rawConflict = value['conflict'];
+    final String conflict = rawConflict == null
+        ? 'reject'
+        : rawConflict is String
+        ? rawConflict.trim()
+        : '';
+    if (!addressBookGroupImportConflictModes.contains(conflict)) {
+      throw ServerApiException(tr('分组导入冲突模式无效'));
+    }
+    final Object? rawGroups = value['groups'];
+    if (rawGroups is! List) {
+      throw ServerApiException(tr('分组导入文档缺少 groups 数组'));
+    }
+    if (rawGroups.length > 256) {
+      throw ServerApiException(tr('一次最多导入 256 个分组'));
+    }
+    final List<AddressBookGroupTransfer> groups = <AddressBookGroupTransfer>[
+      for (final Object? item in rawGroups)
+        AddressBookGroupTransfer._fromJson(item),
+    ];
+    return AddressBookGroupTransferDocument(conflict: conflict, groups: groups);
+  }
+}
+
+/// Server classification of one atomic address-book group import.
+class AddressBookGroupImportResult {
+  const AddressBookGroupImportResult({
+    required this.revision,
+    this.created = const <AddressBookGroup>[],
+    this.updated = const <AddressBookGroup>[],
+    this.skipped = const <String>[],
+    this.unchanged = const <AddressBookGroup>[],
+  });
+
+  final int revision;
+  final List<AddressBookGroup> created;
+  final List<AddressBookGroup> updated;
+  final List<String> skipped;
+  final List<AddressBookGroup> unchanged;
+
+  bool get hasChanges => created.isNotEmpty || updated.isNotEmpty;
+
+  static AddressBookGroupImportResult fromJson(Object? value) {
+    if (value is! Map) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    final Object? rawRevision = value['revision'];
+    if (rawRevision is! num) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    return AddressBookGroupImportResult(
+      revision: rawRevision.toInt(),
+      created: ServerApi._parseGroups(value['created']),
+      updated: ServerApi._parseGroups(value['updated']),
+      skipped: <String>[
+        for (final Object? id
+            in value['skipped'] is List
+                ? value['skipped'] as List
+                : const <Object?>[])
+          if (id is String && id.trim().isNotEmpty) id.trim(),
+      ],
+      unchanged: ServerApi._parseGroups(value['unchanged']),
     );
   }
 }
@@ -977,8 +1193,12 @@ class SharedAddressBook {
 }
 
 class ServerApiException implements Exception {
-  const ServerApiException(this.message,
-      {this.statusCode, this.code = '', this.transient = false});
+  const ServerApiException(
+    this.message, {
+    this.statusCode,
+    this.code = '',
+    this.transient = false,
+  });
 
   final String message;
   final int? statusCode;
@@ -995,6 +1215,38 @@ class ServerApiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+class _RecordingUploadSession {
+  const _RecordingUploadSession({
+    required this.id,
+    required this.offset,
+    required this.size,
+  });
+
+  final String id;
+  final int offset;
+  final int size;
+
+  static _RecordingUploadSession? fromJson(Object? value) {
+    if (value is! Map) {
+      return null;
+    }
+    final Object? rawUpload = value['upload'];
+    final Map upload = rawUpload is Map ? rawUpload : value;
+    final String id = upload['id']?.toString().trim() ?? '';
+    final Object? rawOffset = upload['offset'];
+    final Object? rawSize = upload['size'];
+    if (id.isEmpty || rawOffset is! num || rawSize is! num) {
+      return null;
+    }
+    final int offset = rawOffset.toInt();
+    final int size = rawSize.toInt();
+    if (offset < 0 || size <= 0 || offset > size) {
+      return null;
+    }
+    return _RecordingUploadSession(id: id, offset: offset, size: size);
+  }
 }
 
 enum HostPresence { unknown, checking, online, offline, unreachable }
@@ -1089,9 +1341,7 @@ class ServerApi {
     final Map<String, String> query = <String, String>{
       if (clientPublicKey.isNotEmpty) 'client_public_key': clientPublicKey,
     };
-    final Uri uri = query.isEmpty
-        ? base
-        : base.replace(queryParameters: query);
+    final Uri uri = query.isEmpty ? base : base.replace(queryParameters: query);
     final Object? decoded = await _getJson(
       uri,
       timeout,
@@ -1156,8 +1406,11 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded =
-        await _getJson(uri, timeout, key: settings.connectionKey);
+    final Object? decoded = await _getJson(
+      uri,
+      timeout,
+      key: settings.connectionKey,
+    );
     final Object? rawHosts = decoded is Map ? decoded['hosts'] : null;
     if (rawHosts is! List) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
@@ -2337,17 +2590,19 @@ class ServerApi {
         if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
         if (route.isNotEmpty) 'route': route,
         'items': items
-            .map((FileTransferReport item) => <String, Object?>{
-                  'direction': item.direction,
-                  'name': item.name.trim(),
-                  if (item.size > 0) 'size': item.size,
-                  'success': item.success,
-                  if (item.detail.trim().isNotEmpty)
-                    'detail': item.detail.trim(),
-                  if (item.occurredAt != null)
-                    'occurred_at_ms':
-                        item.occurredAt!.toUtc().millisecondsSinceEpoch,
-                })
+            .map(
+              (FileTransferReport item) => <String, Object?>{
+                'direction': item.direction,
+                'name': item.name.trim(),
+                if (item.size > 0) 'size': item.size,
+                'success': item.success,
+                if (item.detail.trim().isNotEmpty) 'detail': item.detail.trim(),
+                if (item.occurredAt != null)
+                  'occurred_at_ms': item.occurredAt!
+                      .toUtc()
+                      .millisecondsSinceEpoch,
+              },
+            )
             .toList(),
       },
       success: const <int>{HttpStatus.created},
@@ -2988,6 +3243,64 @@ class ServerApi {
     );
   }
 
+  /// Exports only the signed-in account's live group structure. Device ids,
+  /// membership, notes, revisions and timestamps never enter the document.
+  static Future<AddressBookGroupTransferDocument> exportAddressBookGroups(
+    ServerSettings settings,
+    String token, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/addressbook/groups/export');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'GET',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      unauthorized: tr('账号登录已失效，请重新登录'),
+    );
+    return AddressBookGroupTransferDocument.fromJson(decoded);
+  }
+
+  /// Imports group structure atomically. [conflict] is one of `reject`, `skip`
+  /// or `update`; no device or membership information is sent.
+  static Future<AddressBookGroupImportResult> importAddressBookGroups(
+    ServerSettings settings,
+    String token,
+    AddressBookGroupTransferDocument document, {
+    String conflict = 'reject',
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final String mode = conflict.trim();
+    if (!addressBookGroupImportConflictModes.contains(mode)) {
+      throw ServerApiException(tr('分组导入冲突模式无效'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/addressbook/groups/import');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Map<String, Object?> body = document.toJson()..['conflict'] = mode;
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: body,
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      badRequest: tr('分组导入内容无效'),
+      conflict: tr('分组 ID 已存在，已取消本次导入'),
+    );
+    return AddressBookGroupImportResult.fromJson(decoded);
+  }
+
   /// Creates or partially updates an address-book entry.
   ///
   /// Omitted fields keep the server value; an empty [name] or [tags] clears
@@ -3019,6 +3332,82 @@ class ServerApi {
       ifRevision: ifRevision,
       timeout: timeout,
       notFound: tr('地址簿条目不存在'),
+    );
+  }
+
+  /// Atomically moves 1 to [maxBatchIds] peers into one group.
+  ///
+  /// An empty [groupId] targets the ungrouped list. A positive per-peer
+  /// revision rejects the whole batch with a 409 if any row changed since it
+  /// was read. Unknown peers or groups likewise leave every row untouched.
+  static Future<AddressBookBulkMoveResult> moveAddressBookPeers(
+    ServerSettings settings,
+    String token,
+    List<AddressBookPeerMove> peers,
+    String groupId, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    if (peers.isEmpty || peers.length > maxBatchIds) {
+      throw ServerApiException(tr('一次只能移动 1 到 200 台设备'));
+    }
+    final Set<String> seen = <String>{};
+    final List<Map<String, Object?>> bodyPeers = <Map<String, Object?>>[];
+    for (final AddressBookPeerMove peer in peers) {
+      final String id = peer.id.trim();
+      if (id.isEmpty) {
+        throw ServerApiException(tr('设备 ID 为空'));
+      }
+      if (peer.ifRevision < 0) {
+        throw ServerApiException(tr('地址簿版本无效'));
+      }
+      if (!seen.add(id)) {
+        continue;
+      }
+      bodyPeers.add(<String, Object?>{
+        'id': id,
+        if (peer.ifRevision > 0) 'if_revision': peer.ifRevision,
+      });
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/addressbook/peers/bulk-move');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'group_id': groupId.trim(), 'peers': bodyPeers},
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      notFound: tr('地址簿条目不存在'),
+    );
+    if (decoded is! Map) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    final Object? rawRevision = decoded['revision'];
+    final Object? rawMoved = decoded['moved'];
+    final Object? rawUnchanged = decoded['unchanged'];
+    if (rawRevision is! num || rawMoved is! List || rawUnchanged is! List) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    final List<AddressBookPeer> moved = <AddressBookPeer>[];
+    for (final Object? value in rawMoved) {
+      final AddressBookPeer? peer = AddressBookPeer.fromJson(value);
+      if (peer == null) {
+        throw ServerApiException(tr('连接服务返回了无效数据'));
+      }
+      moved.add(peer);
+    }
+    return AddressBookBulkMoveResult(
+      revision: rawRevision.toInt(),
+      moved: moved,
+      unchanged: <String>[
+        for (final Object? value in rawUnchanged)
+          if (value is String && value.trim().isNotEmpty) value.trim(),
+      ],
     );
   }
 
@@ -3882,9 +4271,9 @@ class ServerApi {
     return archive;
   }
 
-  /// Streams one local MP4 into the account archive. Metadata travels in the
-  /// query string so a UTF-8 name survives; the body stays raw bytes, which
-  /// keeps the server from buffering a multi-gigabyte recording.
+  /// Uploads one local MP4 into the account archive. Current servers accept a
+  /// resumable session in bounded chunks; an older server that does not expose
+  /// the session routes falls back to the original single streaming request.
   static Future<RemoteRecording> uploadRecording(
     ServerSettings settings,
     String token, {
@@ -3895,6 +4284,8 @@ class ServerApi {
     int durationMs = 0,
     void Function(int sent, int total)? onProgress,
     Duration timeout = const Duration(minutes: 10),
+    int chunkSize = 8 << 20,
+    bool resumable = true,
   }) async {
     final String accountToken = _accountToken(settings, token);
     final int total = await file.length();
@@ -3904,6 +4295,440 @@ class ServerApi {
     final String fileName = name.trim().isEmpty
         ? _fileName(file.path)
         : name.trim();
+    if (!resumable) {
+      return _uploadRecordingLegacy(
+        settings,
+        accountToken,
+        file: file,
+        fileName: fileName,
+        peerId: peerId,
+        startedAtMs: startedAtMs,
+        durationMs: durationMs,
+        total: total,
+        onProgress: onProgress,
+        timeout: timeout,
+      );
+    }
+    final int effectiveChunk = chunkSize <= 0
+        ? 8 << 20
+        : chunkSize.clamp(1, 32 << 20).toInt();
+    final DateTime uploadStartedAt = DateTime.now().toUtc();
+    _RecordingUploadSession? upload;
+    try {
+      try {
+        upload = await _beginRecordingUpload(
+          settings,
+          accountToken,
+          fileName: fileName,
+          peerId: peerId,
+          startedAtMs: startedAtMs,
+          durationMs: durationMs,
+          size: total,
+          timeout: timeout,
+        );
+      } on ServerApiException catch (error) {
+        if (error.statusCode == HttpStatus.notFound ||
+            error.statusCode == HttpStatus.methodNotAllowed) {
+          return _uploadRecordingLegacy(
+            settings,
+            accountToken,
+            file: file,
+            fileName: fileName,
+            peerId: peerId,
+            startedAtMs: startedAtMs,
+            durationMs: durationMs,
+            total: total,
+            onProgress: onProgress,
+            timeout: timeout,
+          );
+        }
+        rethrow;
+      }
+      if (upload.size != total) {
+        throw ServerApiException(tr('连接服务返回了无效数据'));
+      }
+      _RecordingUploadSession session = upload;
+      onProgress?.call(session.offset, total);
+      int recoveryAttempts = 0;
+      while (session.offset < total) {
+        final int offset = session.offset;
+        final int end = (offset + effectiveChunk)
+            .clamp(offset + 1, total)
+            .toInt();
+        try {
+          session = await _appendRecordingUpload(
+            settings,
+            accountToken,
+            session.id,
+            offset: offset,
+            end: end,
+            file: file,
+            timeout: timeout,
+          );
+          recoveryAttempts = 0;
+          onProgress?.call(session.offset, total);
+        } on ServerApiException catch (error) {
+          if (!error.retryable && error.statusCode != HttpStatus.conflict) {
+            rethrow;
+          }
+          if (error.statusCode != HttpStatus.conflict) {
+            recoveryAttempts++;
+            if (recoveryAttempts > 4) {
+              throw ServerApiException(
+                tr('录制上传多次中断，请稍后重试'),
+                statusCode: error.statusCode,
+                transient: error.transient,
+              );
+            }
+            await Future<void>.delayed(
+              Duration(milliseconds: 200 * recoveryAttempts),
+            );
+          }
+          final _RecordingUploadSession recovered =
+              await _retryRecordingOperation(
+                () => _recordingUploadStatus(
+                  settings,
+                  accountToken,
+                  session.id,
+                  timeout: timeout,
+                ),
+              );
+          if (recovered.size != total) {
+            throw ServerApiException(tr('连接服务返回了无效数据'));
+          }
+          session = recovered;
+          onProgress?.call(session.offset, total);
+        }
+      }
+      final RemoteRecording recording = await _completeRecordingUpload(
+        settings,
+        accountToken,
+        session.id,
+        fileName: fileName,
+        peerId: peerId,
+        startedAtMs: startedAtMs,
+        durationMs: durationMs,
+        size: total,
+        uploadStartedAt: uploadStartedAt,
+        timeout: timeout,
+      );
+      onProgress?.call(total, total);
+      return recording;
+    } on ServerApiException {
+      rethrow;
+    } on FileSystemException catch (error) {
+      throw ServerApiException(
+        tr('读取录制文件失败：{error}', <String, Object?>{'error': error.message}),
+      );
+    } catch (error) {
+      throw ServerApiException(
+        tr('连接服务请求失败：{error}', <String, Object?>{'error': error}),
+      );
+    } finally {
+      if (upload != null) {
+        // A terminal local or protocol failure must not leave a session holding
+        // the account's upload quota. Completion already removed the session,
+        // so this best-effort delete is then a harmless 404.
+        await _cancelRecordingUpload(settings, accountToken, upload.id);
+      }
+    }
+  }
+
+  static Future<_RecordingUploadSession> _beginRecordingUpload(
+    ServerSettings settings,
+    String accountToken, {
+    required String fileName,
+    required String peerId,
+    required int startedAtMs,
+    required int durationMs,
+    required int size,
+    required Duration timeout,
+  }) async {
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/recordings/uploads');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      success: const <int>{HttpStatus.created},
+      body: <String, Object?>{
+        'name': fileName,
+        'peer_id': peerId.trim(),
+        'size': size,
+        'started_at_ms': startedAtMs > 0 ? startedAtMs : 0,
+        'duration_ms': durationMs > 0 ? durationMs : 0,
+      },
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      unavailable: tr('连接服务未启用录制归档'),
+      recordingErrors: true,
+    );
+    final _RecordingUploadSession? upload = _RecordingUploadSession.fromJson(
+      decoded,
+    );
+    if (upload == null) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    return upload;
+  }
+
+  static Future<_RecordingUploadSession> _appendRecordingUpload(
+    ServerSettings settings,
+    String accountToken,
+    String uploadId, {
+    required int offset,
+    required int end,
+    required File file,
+    required Duration timeout,
+  }) async {
+    final Uri uri;
+    try {
+      uri = Uri.parse(
+        '${settings.url}/v1/account/recordings/uploads/${Uri.encodeComponent(uploadId)}',
+      );
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final HttpClient client = await _newClient(timeout);
+    try {
+      final HttpClientRequest request = await client
+          .openUrl('PATCH', uri)
+          .timeout(timeout);
+      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      request.headers.set(
+        HttpHeaders.authorizationHeader,
+        'Bearer $accountToken',
+      );
+      request.headers.set('X-Upload-Offset', '$offset');
+      request.headers.contentType = ContentType.binary;
+      request.contentLength = end - offset;
+      await request.addStream(file.openRead(offset, end));
+      final HttpClientResponse response = await request.close().timeout(
+        timeout,
+      );
+      final String text = await response
+          .transform(utf8.decoder)
+          .join()
+          .timeout(timeout);
+      if (response.statusCode != HttpStatus.accepted) {
+        throw _recordingFailure(response.statusCode, text);
+      }
+      final Object? decoded = text.trim().isEmpty ? null : jsonDecode(text);
+      final _RecordingUploadSession? upload = _RecordingUploadSession.fromJson(
+        decoded,
+      );
+      if (upload == null) {
+        throw ServerApiException(tr('连接服务返回了无效数据'));
+      }
+      return upload;
+    } on ServerApiException {
+      rethrow;
+    } on TimeoutException {
+      throw ServerApiException(tr('连接服务超时'), transient: true);
+    } on SocketException catch (error) {
+      final String detail = error.message.trim();
+      throw ServerApiException(
+        detail.isEmpty
+            ? tr('无法连接连接服务')
+            : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
+        transient: true,
+      );
+    } on HttpException catch (error) {
+      throw ServerApiException(
+        tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}),
+        transient: true,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  static Future<_RecordingUploadSession> _recordingUploadStatus(
+    ServerSettings settings,
+    String accountToken,
+    String uploadId, {
+    required Duration timeout,
+  }) async {
+    final Uri uri = Uri.parse(
+      '${settings.url}/v1/account/recordings/uploads/${Uri.encodeComponent(uploadId)}',
+    );
+    final Object? decoded = await _requestJson(
+      'GET',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      notFound: tr('录制上传已失效，请重新开始'),
+      unavailable: tr('连接服务未启用录制归档'),
+      recordingErrors: true,
+    );
+    final _RecordingUploadSession? upload = _RecordingUploadSession.fromJson(
+      decoded,
+    );
+    if (upload == null) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    return upload;
+  }
+
+  static Future<RemoteRecording> _completeRecordingUpload(
+    ServerSettings settings,
+    String accountToken,
+    String uploadId, {
+    required String fileName,
+    required String peerId,
+    required int startedAtMs,
+    required int durationMs,
+    required int size,
+    required DateTime uploadStartedAt,
+    required Duration timeout,
+  }) async {
+    final Uri uri = Uri.parse(
+      '${settings.url}/v1/account/recordings/uploads/${Uri.encodeComponent(uploadId)}/complete',
+    );
+    ServerApiException? lastError;
+    for (int attempt = 0; attempt < 4; attempt++) {
+      try {
+        final Object? decoded = await _requestJson(
+          'POST',
+          uri,
+          timeout,
+          accountToken: accountToken,
+          success: const <int>{HttpStatus.created},
+          unauthorized: tr('账号登录已失效，请重新登录'),
+          unavailable: tr('连接服务未启用录制归档'),
+          recordingErrors: true,
+        );
+        final RemoteRecording? recording = decoded is Map
+            ? RemoteRecording.fromJson(decoded['recording'])
+            : null;
+        if (recording == null) {
+          throw ServerApiException(tr('连接服务返回了无效数据'));
+        }
+        return recording;
+      } on ServerApiException catch (error) {
+        lastError = error;
+        final RemoteRecording? completed = await _findCompletedRecordingUpload(
+          settings,
+          accountToken,
+          fileName: fileName,
+          peerId: peerId,
+          startedAtMs: startedAtMs,
+          durationMs: durationMs,
+          size: size,
+          uploadStartedAt: uploadStartedAt,
+          timeout: timeout,
+        );
+        if (completed != null) {
+          return completed;
+        }
+        if (!error.retryable) {
+          rethrow;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 250 * (attempt + 1)));
+      }
+    }
+    throw lastError ?? ServerApiException(tr('连接服务超时'));
+  }
+
+  static Future<RemoteRecording?> _findCompletedRecordingUpload(
+    ServerSettings settings,
+    String accountToken, {
+    required String fileName,
+    required String peerId,
+    required int startedAtMs,
+    required int durationMs,
+    required int size,
+    required DateTime uploadStartedAt,
+    required Duration timeout,
+  }) async {
+    try {
+      final RecordingArchive archive = await listRecordings(
+        settings,
+        accountToken,
+        timeout: timeout,
+      );
+      final String storedName = _safeRecordingName(fileName);
+      final String normalizedPeer = peerId.trim();
+      final int notBefore = uploadStartedAt.millisecondsSinceEpoch - 60000;
+      for (final RemoteRecording recording in archive.recordings) {
+        final int? created = recording.createdAt?.millisecondsSinceEpoch;
+        if (recording.size != size ||
+            (recording.name != fileName && recording.name != storedName) ||
+            recording.peerId != normalizedPeer ||
+            (startedAtMs > 0 && recording.startedAtMs != startedAtMs) ||
+            (durationMs > 0 && recording.durationMs != durationMs) ||
+            (created != null && created < notBefore)) {
+          continue;
+        }
+        return recording;
+      }
+    } on ServerApiException {
+      // The completion retry remains authoritative when the archive list is
+      // temporarily unavailable.
+    }
+    return null;
+  }
+
+  static Future<void> _cancelRecordingUpload(
+    ServerSettings settings,
+    String accountToken,
+    String uploadId,
+  ) async {
+    try {
+      final Uri uri = Uri.parse(
+        '${settings.url}/v1/account/recordings/uploads/${Uri.encodeComponent(uploadId)}',
+      );
+      await _requestJson(
+        'DELETE',
+        uri,
+        const Duration(seconds: 3),
+        accountToken: accountToken,
+        success: const <int>{HttpStatus.noContent},
+        unauthorized: tr('账号登录已失效，请重新登录'),
+        notFound: '',
+        unavailable: tr('连接服务未启用录制归档'),
+        recordingErrors: true,
+      );
+    } catch (_) {
+      // The original terminal error remains the actionable failure.
+    }
+  }
+
+  static Future<T> _retryRecordingOperation<T>(
+    Future<T> Function() operation,
+  ) async {
+    ServerApiException? lastError;
+    for (int attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await operation();
+      } on ServerApiException catch (error) {
+        lastError = error;
+        if (!error.retryable || attempt == 2) {
+          rethrow;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 150 * (attempt + 1)));
+      }
+    }
+    throw lastError ?? ServerApiException(tr('连接服务超时'));
+  }
+
+  static Future<RemoteRecording> _uploadRecordingLegacy(
+    ServerSettings settings,
+    String accountToken, {
+    required File file,
+    required String fileName,
+    required String peerId,
+    required int startedAtMs,
+    required int durationMs,
+    required int total,
+    required void Function(int sent, int total)? onProgress,
+    required Duration timeout,
+  }) async {
     final Uri uri;
     try {
       uri = Uri.parse('${settings.url}/v1/account/recordings').replace(
@@ -3958,25 +4783,23 @@ class ServerApi {
     } on ServerApiException {
       rethrow;
     } on TimeoutException {
-      throw ServerApiException(tr('连接服务超时'));
+      throw ServerApiException(tr('连接服务超时'), transient: true);
     } on SocketException catch (error) {
       final String detail = error.message.trim();
       throw ServerApiException(
         detail.isEmpty
             ? tr('无法连接连接服务')
             : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
+        transient: true,
       );
     } on HttpException catch (error) {
       throw ServerApiException(
         tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}),
+        transient: true,
       );
     } on FileSystemException catch (error) {
       throw ServerApiException(
         tr('读取录制文件失败：{error}', <String, Object?>{'error': error.message}),
-      );
-    } catch (error) {
-      throw ServerApiException(
-        tr('连接服务请求失败：{error}', <String, Object?>{'error': error}),
       );
     } finally {
       client.close(force: true);
@@ -4157,6 +4980,10 @@ class ServerApi {
         return ServerApiException(tr('账号登录已失效，请重新登录'), statusCode: status);
       case HttpStatus.notFound:
         return ServerApiException(tr('录制不存在或已被删除'), statusCode: status);
+      case HttpStatus.conflict:
+        return ServerApiException(tr('录制上传进度已变化'), statusCode: status);
+      case HttpStatus.tooManyRequests:
+        return ServerApiException(tr('同时进行的录制上传过多'), statusCode: status);
       case HttpStatus.requestEntityTooLarge:
         if (detail.contains('quota')) {
           return ServerApiException(tr('录制存储配额已用尽'), statusCode: status);
@@ -4311,8 +5138,13 @@ class ServerApi {
     String key = '',
     String accountToken = '',
   }) {
-    return _requestJson('GET', uri, timeout, key: key,
-        accountToken: accountToken);
+    return _requestJson(
+      'GET',
+      uri,
+      timeout,
+      key: key,
+      accountToken: accountToken,
+    );
   }
 
   static Future<Object?> _requestJson(
@@ -4329,6 +5161,7 @@ class ServerApi {
     String badRequest = '',
     String conflict = '',
     String? unavailable,
+    bool recordingErrors = false,
   }) async {
     unauthorized ??= tr('连接服务密钥无效');
     notFound ??= tr('设备未注册或已下线');
@@ -4356,6 +5189,9 @@ class ServerApi {
           .join()
           .timeout(timeout);
       if (!success.contains(response.statusCode)) {
+        if (recordingErrors) {
+          throw _recordingFailure(response.statusCode, text);
+        }
         final String? secondFactor = response.headers.value('x-chast-2fa');
         String code = secondFactor == 'required'
             ? 'totp_required'

@@ -103,6 +103,24 @@ func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	role := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("role")))
+	email := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("email")))
+	phone := strings.TrimSpace(r.URL.Query().Get("phone"))
+	sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort")))
+	if sortBy == "" {
+		sortBy = account.UserSortUsername
+	}
+	if !account.ValidUserSort(sortBy) {
+		writeError(w, http.StatusBadRequest, account.ErrInvalidUserSort.Error())
+		return
+	}
+	order := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("order")))
+	if order == "" {
+		order = "asc"
+	}
+	if order != "asc" && order != "desc" {
+		writeError(w, http.StatusBadRequest, "order must be asc or desc")
+		return
+	}
 	csv, ok := exportRequest(w, r)
 	if !ok {
 		return
@@ -118,9 +136,12 @@ func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	users, total, err := s.cfg.Accounts.ListUsersPage(query, role, limit, offset)
+	users, total, err := s.cfg.Accounts.ListUsersPage(account.UserListOptions{
+		Query: query, Email: email, Phone: phone, Role: role,
+		Sort: sortBy, Desc: order == "desc", Limit: limit, Offset: offset,
+	})
 	if err != nil {
-		if errors.Is(err, account.ErrInvalidRole) {
+		if errors.Is(err, account.ErrInvalidRole) || errors.Is(err, account.ErrInvalidUserSort) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -346,19 +367,26 @@ func (s *server) adminAccountSessions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	limit, offset, ok := sessionPageParams(w, r)
+	if !ok {
+		return
+	}
 	user, err := s.cfg.Accounts.FindUser(r.PathValue("username"))
 	if err != nil {
 		writeAccountError(w, err)
 		return
 	}
 	token, _ := bearerToken(r)
-	sessions, err := s.cfg.Accounts.Sessions(user.ID, token)
+	sessions, total, err := s.cfg.Accounts.SessionsPage(user.ID, token, limit, offset)
 	if err != nil {
 		s.cfg.Logger.Error("list account sessions", "user", user.Username, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not list the account sessions")
 		return
 	}
-	resp := accountSessionsResponse{Sessions: make([]accountSessionView, 0, len(sessions))}
+	resp := accountSessionsResponse{
+		Sessions: make([]accountSessionView, 0, len(sessions)),
+		Total:    total,
+	}
 	for _, session := range sessions {
 		resp.Sessions = append(resp.Sessions, viewAccountSession(session))
 	}

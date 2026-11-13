@@ -26,6 +26,12 @@ func seedAuditEventTables(t *testing.T, db *sql.DB) {
 			password_hash TEXT NOT NULL DEFAULT '',
 			created_at    INTEGER NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE user_tokens (
+			token_hash TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL
+		)`,
 		`CREATE TABLE audit_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			created_at INTEGER NOT NULL,
@@ -73,6 +79,59 @@ func seedAuditEventTables(t *testing.T, db *sql.DB) {
 			db.Close()
 			t.Fatalf("seed audit event tables: %v", err)
 		}
+	}
+}
+
+func TestSchemaMigrationBackfillsSessionActivity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE schema_migrations (
+			version    INTEGER PRIMARY KEY,
+			name       TEXT NOT NULL DEFAULT '',
+			applied_at INTEGER NOT NULL
+		)`,
+		`INSERT INTO schema_migrations (version, name, applied_at) VALUES (17, 'ldap identities', 0)`,
+		`CREATE TABLE users (
+			id            TEXT PRIMARY KEY,
+			username      TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE user_tokens (
+			token_hash TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL
+		)`,
+		`INSERT INTO user_tokens (token_hash, user_id, created_at, expires_at)
+		 VALUES ('legacy-hash', 'user-1', 123456, 999999999999)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatalf("seed pre-v18 database: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	var loginAt, lastSeenAt int64
+	if err := store.db.QueryRow(
+		`SELECT login_at, last_seen_at FROM user_tokens WHERE token_hash = 'legacy-hash'`,
+	).Scan(&loginAt, &lastSeenAt); err != nil {
+		t.Fatalf("read migrated activity: %v", err)
+	}
+	if loginAt != 123456 || lastSeenAt != 123456 {
+		t.Fatalf("migrated activity = %d/%d, want 123456", loginAt, lastSeenAt)
 	}
 }
 

@@ -42,6 +42,21 @@ const Map<String, String> kEnglishHome = <String, String>{
   '分组内顺序已更新': 'Group order updated',
   '分组已保存在本机，将在下次同步上传':
       'The group is saved locally and will upload on the next sync',
+  '批量移动': 'Bulk move',
+  '批量移动到分组': 'Move multiple devices to a group',
+  '批量移动未完成，服务器未修改任何设备':
+      'Bulk move was not completed; no devices were changed on the server',
+  '一次只能移动 1 到 200 台设备': 'Move between 1 and 200 devices at a time',
+  '地址簿版本无效': 'The address-book revision is invalid',
+  '已批量移到未分组': 'Moved the selected devices to Ungrouped',
+  '已批量移动到分组': 'Moved the selected devices to the group',
+  '所选设备已在目标分组': 'The selected devices are already in that group',
+  '选择设备和目标分组。一次最多移动 200 台设备。':
+      'Select devices and a destination group. You can move up to 200 devices at a time.',
+  '已选择 {count} 台': '{count} selected',
+  '没有可移动的设备': 'No devices can be moved',
+  '目标分组': 'Destination group',
+  '移动': 'Move',
   '删除': 'Delete',
   '删除设备': 'Delete device',
   '别名': 'Alias',
@@ -283,6 +298,12 @@ const Map<String, String> kEnglishHome = <String, String>{
   '已用 {used}': 'Used {used}',
   '已用 {used}，配额 {quota}': 'Used {used} of {quota}',
   '录制上传失败：{error}': 'Recording upload failed: {error}',
+  '录制上传多次中断，请稍后重试':
+      'The recording upload was interrupted repeatedly; please try again later',
+  '录制上传已失效，请重新开始':
+      'The recording upload expired; please start it again',
+  '录制上传进度已变化': 'The recording upload progress changed',
+  '同时进行的录制上传过多': 'Too many recording uploads are active',
   '录制不存在或已被删除': 'The recording does not exist or was deleted',
   '录制存储配额已用尽': 'The recording storage quota is used up',
   '录制已上传：{name}': 'Recording uploaded: {name}',
@@ -333,8 +354,8 @@ const Map<String, String> kEnglishHome = <String, String>{
   '端口须为 1–65535': 'The port must be 1–65535',
   '通过已登录的会话把本机的一个随机端口转发到主机的 127.0.0.1 端口，再用系统远程桌面连接。凭据由远程桌面自行询问，不会保存。':
       'Forwards a random local port through the signed-in session to the host\'s '
-          '127.0.0.1 port, then opens the system RDP client. Credentials are '
-          'prompted by RDP and never stored.',
+      '127.0.0.1 port, then opens the system RDP client. Credentials are '
+      'prompted by RDP and never stored.',
   '仅看收藏': 'Favorites only',
   '收藏': 'Add to Favorites',
   '取消收藏': 'Remove from Favorites',

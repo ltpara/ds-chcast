@@ -65,16 +65,12 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 	}
 	var (
 		events []account.AuditEvent
-		err    error
 	)
 	user := strings.TrimSpace(r.URL.Query().Get("user"))
-	if groupID != "" {
-		events, err = s.cfg.Accounts.AuditEventsForGroupBeforeRange(
-			groupID, r.URL.Query().Get("action"), user, bounds, beforeID, limit)
-	} else {
-		events, err = s.cfg.Accounts.AuditEventsForBeforeRange(
-			r.URL.Query().Get("action"), user, bounds, beforeID, limit)
-	}
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	events, err := s.cfg.Accounts.AuditEventsForFilterBefore(groupID, account.AuditFilter{
+		Action: r.URL.Query().Get("action"), Username: user, HostID: host, Bounds: bounds,
+	}, beforeID, limit)
 	if err != nil {
 		s.cfg.Logger.Error("account audit query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the audit log")

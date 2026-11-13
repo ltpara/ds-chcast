@@ -305,22 +305,36 @@ func (s *Store) UpdateAccountGroup(groupID string, name, description *string, me
 // DeleteGroup removes the group and its membership and device links. It is
 // allowed to remove the last group admin because the whole scope disappears.
 func (s *Store) DeleteAccountGroup(groupID string) error {
+	_, err := s.DeleteAccountGroupWithRevocations(groupID)
+	return err
+}
+
+// DeleteAccountGroupWithRevocations performs DeleteAccountGroup and returns
+// the address-book target grants removed with the group. The grants are read
+// in the same transaction that deletes them so callers can audit every owner
+// and scope without a query/deletion race.
+func (s *Store) DeleteAccountGroupWithRevocations(groupID string) ([]RevokedTargetGrant, error) {
 	groupID = strings.TrimSpace(groupID)
 	if !registry.ValidID(groupID) {
-		return ErrInvalidAccountGroupID
+		return nil, ErrInvalidAccountGroupID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("account store %s: begin group delete: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: begin group delete: %w", s.path, err)
 	}
 	defer tx.Rollback()
+	revoked, err := s.revokedTargetGrantsLocked(tx,
+		`t.target_kind = ? AND t.target_id = ?`, ShareTargetGroup, groupID)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec(`DELETE FROM account_group_members WHERE group_id = ?`, groupID); err != nil {
-		return fmt.Errorf("account store %s: delete group members: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: delete group members: %w", s.path, err)
 	}
 	if _, err := tx.Exec(`DELETE FROM account_group_devices WHERE group_id = ?`, groupID); err != nil {
-		return fmt.Errorf("account store %s: delete group devices: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: delete group devices: %w", s.path, err)
 	}
 	// Address-book shares addressed to the group expire with it; a grant whose
 	// target no longer exists must not linger in the owner's grant list.
@@ -328,7 +342,7 @@ func (s *Store) DeleteAccountGroup(groupID string) error {
 		`DELETE FROM address_book_target_grants WHERE target_kind = 'group' AND target_id = ?`,
 		groupID,
 	); err != nil {
-		return fmt.Errorf("account store %s: delete group address book grants: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: delete group address book grants: %w", s.path, err)
 	}
 	// A group-scoped policy assignment dies with its group; devices that were
 	// covered by it are reconciled back to open/manual by the caller.
@@ -336,24 +350,24 @@ func (s *Store) DeleteAccountGroup(groupID string) error {
 		`DELETE FROM policy_assignments WHERE scope_kind = ? AND scope_value = ?`,
 		PolicyScopeGroup, groupID,
 	); err != nil {
-		return fmt.Errorf("account store %s: delete group policy assignments: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: delete group policy assignments: %w", s.path, err)
 	}
 	res, err := tx.Exec(`DELETE FROM account_groups WHERE id = ?`, groupID)
 	if err != nil {
-		return fmt.Errorf("account store %s: delete group: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: delete group: %w", s.path, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if affected == 0 {
-		return ErrUnknownAccountGroup
+		return nil, ErrUnknownAccountGroup
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("account store %s: commit group delete: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: commit group delete: %w", s.path, err)
 	}
 	s.invalidatePolicyReconcileLocked()
-	return nil
+	return revoked, nil
 }
 
 // GroupRole resolves one account's membership in one group.

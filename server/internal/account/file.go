@@ -288,12 +288,24 @@ func (s *Store) FileTransfersForBefore(username string, beforeID int64, limit in
 // FileTransfersForBeforeRange is FileTransfersForBefore narrowed to an
 // inclusive window on occurred_at.
 func (s *Store) FileTransfersForBeforeRange(username string, bounds TimeBounds, beforeID int64, limit int) ([]FileEvent, error) {
+	return s.FileTransfersForOperatorBeforeRange(username, "", bounds, beforeID, limit)
+}
+
+// FileTransfersForOperatorBeforeRange combines the optional cross-account
+// username and host filters used by the operator audit view. A host matches
+// either the host_id or peer_id column, just as the host-only view does.
+func (s *Store) FileTransfersForOperatorBeforeRange(username, hostID string, bounds TimeBounds, beforeID int64, limit int) ([]FileEvent, error) {
 	username = strings.TrimSpace(username)
-	clauses := make([]string, 0, 2)
-	args := make([]any, 0, 2)
+	hostID = strings.TrimSpace(hostID)
+	clauses := make([]string, 0, 3)
+	args := make([]any, 0, 4)
 	if username != "" {
 		clauses = append(clauses, "username = ? COLLATE NOCASE")
 		args = append(args, username)
+	}
+	if hostID != "" {
+		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
+		args = append(args, hostID, hostID)
 	}
 	clauses, args = addTimeBounds(clauses, args, "occurred_at", bounds)
 	return s.fileEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
@@ -313,15 +325,7 @@ func (s *Store) FileTransfersForHostBefore(hostID string, beforeID int64, limit 
 // FileTransfersForHostBeforeRange is FileTransfersForHostBefore narrowed to an
 // inclusive window on occurred_at.
 func (s *Store) FileTransfersForHostBeforeRange(hostID string, bounds TimeBounds, beforeID int64, limit int) ([]FileEvent, error) {
-	hostID = strings.TrimSpace(hostID)
-	clauses := make([]string, 0, 2)
-	args := make([]any, 0, 3)
-	if hostID != "" {
-		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
-		args = append(args, hostID, hostID)
-	}
-	clauses, args = addTimeBounds(clauses, args, "occurred_at", bounds)
-	return s.fileEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
+	return s.FileTransfersForOperatorBeforeRange("", hostID, bounds, beforeID, limit)
 }
 
 func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) ([]FileEvent, error) {

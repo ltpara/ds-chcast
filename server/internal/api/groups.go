@@ -428,11 +428,13 @@ func (s *server) deleteAccountGroup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.cfg.Accounts.DeleteAccountGroup(groupID); err != nil {
+	revoked, err := s.cfg.Accounts.DeleteAccountGroupWithRevocations(groupID)
+	if err != nil {
 		writeGroupError(w, err)
 		return
 	}
 	s.recordAudit(r, actor, account.AuditGroupDelete, "deleted group "+groupID, true)
+	s.recordAddressBookTargetRevocations(r, actor, "account_group_deleted", revoked)
 	// Deleting a group drops its device links and group-scoped assignments, so
 	// devices can fall back to another assignment or become unmanaged.
 	s.reconcileAllPolicies()

@@ -302,16 +302,18 @@ func TestAdminAccountBanAndUnban(t *testing.T) {
 func TestAdminAccountDirectoryPagingAndCSV(t *testing.T) {
 	s := testutil.Start(t)
 	seed := []struct {
-		name string
-		role string
+		name  string
+		role  string
+		email string
+		phone string
 	}{
-		{"alice", account.RoleAdmin},
-		{"bob", account.RoleUser},
-		{"carol", account.RoleReadonly},
-		{"dave", account.RoleOperator},
+		{"alice", account.RoleAdmin, "zed@example.com", "13900000005"},
+		{"bob", account.RoleUser, "bob@example.com", "13800000001"},
+		{"carol", account.RoleReadonly, "", ""},
+		{"dave", account.RoleOperator, "other@example.com", ""},
 	}
 	for _, user := range seed {
-		if _, err := s.Accounts.CreateUserWithRole(user.name, "correct horse", "", "", user.role); err != nil {
+		if _, err := s.Accounts.CreateUserWithRole(user.name, "correct horse", user.email, user.phone, user.role); err != nil {
 			t.Fatalf("create %s: %v", user.name, err)
 		}
 	}
@@ -353,10 +355,28 @@ func TestAdminAccountDirectoryPagingAndCSV(t *testing.T) {
 	if reply := list("q=CAR"); reply.Total != 1 || names(reply) != "carol" {
 		t.Fatalf("query page = %+v", reply)
 	}
+	if reply := list("q=bob%40example.com"); reply.Total != 1 || names(reply) != "bob" {
+		t.Fatalf("contact query page = %+v", reply)
+	}
+	if reply := list("q=138-0000"); reply.Total != 1 || names(reply) != "bob" {
+		t.Fatalf("formatted phone query page = %+v", reply)
+	}
+	if reply := list("email=example.com"); reply.Total != 3 || names(reply) != "alice,bob,dave" {
+		t.Fatalf("email filter page = %+v", reply)
+	}
+	if reply := list("phone=1380000"); reply.Total != 1 || names(reply) != "bob" {
+		t.Fatalf("phone filter page = %+v", reply)
+	}
 	if reply := list("role=operator"); reply.Total != 1 || names(reply) != "dave" || reply.Users[0].Role != account.RoleOperator {
 		t.Fatalf("role page = %+v", reply)
 	}
-	for _, query := range []string{"role=owner", "limit=1001", "offset=-1", "limit=x"} {
+	if reply := list("sort=email&order=desc"); reply.Total != 4 || names(reply) != "alice,dave,bob,carol" {
+		t.Fatalf("email descending page = %+v", reply)
+	}
+	if reply := list("sort=phone&limit=2&offset=1"); reply.Total != 4 || names(reply) != "alice,carol" {
+		t.Fatalf("phone sorted page = %+v", reply)
+	}
+	for _, query := range []string{"role=owner", "sort=banned", "order=up", "limit=1001", "offset=-1", "limit=x"} {
 		if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts?"+query, "", admin.Token); status != http.StatusBadRequest {
 			t.Fatalf("bad query %q: %d %s", query, status, body)
 		}
@@ -378,12 +398,17 @@ func TestAdminAccountDirectoryPagingAndCSV(t *testing.T) {
 	if len(all) != 5 || all[0] != "id,username,role,email,phone,permission_ceiling,banned,created_at" {
 		t.Fatalf("csv = %v", all)
 	}
-	if !strings.Contains(all[2], ",bob,user,,,4,false,") {
+	if !strings.Contains(all[2], ",bob,user,bob@example.com,13800000001,4,false,") {
 		t.Fatalf("bob csv row = %q", all[2])
 	}
-	filtered := csvLines("format=csv&role=user&q=bob", admin.Token)
+	filtered := csvLines("format=csv&role=user&q=bob%40example.com", admin.Token)
 	if len(filtered) != 2 || !strings.Contains(filtered[1], ",bob,user,") {
 		t.Fatalf("filtered csv = %v", filtered)
+	}
+	sorted := csvLines("format=csv&sort=email&order=desc&limit=1", admin.Token)
+	if len(sorted) != 5 || !strings.Contains(sorted[1], ",alice,admin,zed@example.com,") ||
+		!strings.Contains(sorted[4], ",carol,readonly,,,") {
+		t.Fatalf("sorted csv = %v", sorted)
 	}
 	if status, body := request(t, http.MethodGet, s.URL+"/v1/accounts?format=csv", "", plain.Token); status != http.StatusForbidden {
 		t.Fatalf("csv as ordinary user: %d %s", status, body)
@@ -553,6 +578,90 @@ func TestAdminAccountSessions(t *testing.T) {
 	}
 	if !toldBob || !toldAlice {
 		t.Fatalf("admin session audit missing: %+v", events)
+	}
+}
+
+func TestAccountSessionPaginationAndOnline(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse")
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	s.Accounts.SetClock(func() time.Time { return now })
+	loginDevice := func(device string) loginReply {
+		t.Helper()
+		status, data := request(t, http.MethodPost, s.URL+"/v1/account/login",
+			`{"username":"bob","password":"battery staple","device_id":"`+device+`"}`, "")
+		if status != http.StatusOK {
+			t.Fatalf("login %s: %d %s", device, status, data)
+		}
+		var reply loginReply
+		if err := json.Unmarshal(data, &reply); err != nil {
+			t.Fatalf("login reply: %v", err)
+		}
+		return reply
+	}
+	first := loginDevice("bob-a")
+	now = now.Add(time.Minute)
+	second := loginDevice("bob-b")
+
+	// No parameters keep the legacy all-sessions response and expose the new
+	// activity fields additively.
+	status, data := request(t, http.MethodGet, s.URL+"/v1/accounts/bob/sessions", "", admin.Token)
+	if status != http.StatusOK {
+		t.Fatalf("legacy session list: %d %s", status, data)
+	}
+	var all accountSessionsReply
+	if err := json.Unmarshal(data, &all); err != nil || all.Total != 2 || len(all.Sessions) != 2 {
+		t.Fatalf("legacy session list = %+v (%v)", all, err)
+	}
+	for _, session := range all.Sessions {
+		if !session.Online || session.LastSeenMS == 0 {
+			t.Fatalf("new login not online: %+v", session)
+		}
+	}
+
+	// After the activity window, the calling session is refreshed by this
+	// request while the quiet newer login becomes offline conceptually. Login
+	// order remains stable, so page one still contains bob-b.
+	now = now.Add(account.SessionOnlineWindow + time.Minute)
+	status, data = request(t, http.MethodGet, s.URL+"/v1/account/sessions?limit=1&offset=0", "", first.Token)
+	if status != http.StatusOK {
+		t.Fatalf("self first page: %d %s", status, data)
+	}
+	var page accountSessionsReply
+	if err := json.Unmarshal(data, &page); err != nil || page.Total != 2 || len(page.Sessions) != 1 {
+		t.Fatalf("self first page = %+v (%v)", page, err)
+	}
+	if page.Sessions[0].DeviceID != "bob-b" || page.Sessions[0].Online || page.Sessions[0].Current {
+		t.Fatalf("quiet session state = %+v", page.Sessions[0])
+	}
+
+	status, data = request(t, http.MethodGet,
+		s.URL+"/v1/accounts/bob/sessions?limit=1&offset=1", "", admin.Token)
+	if status != http.StatusOK {
+		t.Fatalf("admin second page: %d %s", status, data)
+	}
+	if err := json.Unmarshal(data, &page); err != nil || page.Total != 2 || len(page.Sessions) != 1 {
+		t.Fatalf("admin second page = %+v (%v)", page, err)
+	}
+	if page.Sessions[0].DeviceID != "bob-a" || !page.Sessions[0].Online || page.Sessions[0].Current {
+		t.Fatalf("active admin-view session = %+v", page.Sessions[0])
+	}
+
+	for _, query := range []string{"limit=-1", "limit=1001", "limit=nope", "offset=-1"} {
+		if status, body := request(t, http.MethodGet,
+			s.URL+"/v1/account/sessions?"+query, "", second.Token); status != http.StatusBadRequest {
+			t.Fatalf("invalid %s: %d %s", query, status, body)
+		}
+		if status, body := request(t, http.MethodGet,
+			s.URL+"/v1/accounts/bob/sessions?"+query, "", admin.Token); status != http.StatusBadRequest {
+			t.Fatalf("admin invalid %s: %d %s", query, status, body)
+		}
 	}
 }
 
