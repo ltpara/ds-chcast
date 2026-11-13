@@ -612,6 +612,16 @@ public:
     // beyond a completed handshake; the host may ignore hints at its own
     // policy. Returns InvalidCall before the handshake completes.
     Error request_show_cursor(const ShowCursorHint& hint);
+    // Pops the oldest temporary annotation message. Unlike pointer hints,
+    // stroke points form an ordered stream and are never coalesced: dropping a
+    // middle message would leave a visible gap. The host drains the queue in
+    // its session loop. No input permission is required.
+    bool take_annotation(AnnotationMessage& annotation);
+    // Number of annotation messages accepted by the transport.
+    uint64_t annotations_received() const;
+    // Sends a temporary session annotation. Draw-only and available after the
+    // handshake; the host may ignore it at its own policy.
+    Error request_annotation(const AnnotationMessage& annotation);
     // Pops the newest DisplayFollowState. The host sends it as the answer and
     // unsolicited when it turns a mode off itself.
     bool take_display_follow_state(DisplayFollowState& state);
