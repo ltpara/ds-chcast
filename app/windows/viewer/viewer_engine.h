@@ -807,6 +807,12 @@ public:
     // (the pointer-down moment), which the host overlay draws as a ripple; it
     // is not a held-button state.
     bool ShowCursor(int32_t x, int32_t y, bool visible, bool pressed = false);
+    // Queues one temporary freehand annotation message. Messages preserve
+    // stroke order and are never coalesced; the drawer batches points before
+    // calling this. Draw-only, so remote input permission is not required.
+    // Returns false when no session is streaming, the message is malformed, or
+    // the bounded pending queue is full.
+    bool SendAnnotation(chast::AnnotationMessage annotation);
     // Queues stream preferences: encoder choice, frame-rate cap and quality
     // preset. Returns false when no session is running or a value is outside
     // its wire range. Accepted as soon as the session starts, before the first
@@ -845,6 +851,11 @@ public:
     // automated run never touches the operator's clipboard.
     void SetClipboardFileSource(
         std::function<bool(std::vector<std::string>&)> source);
+    // Test hook: selects the local root for ordinary downloads and clipboard
+    // file staging. Empty restores the normal Downloads\chast location. The
+    // path must be absolute and may only change while no session is running;
+    // the current session keeps the value it captured at Start().
+    bool SetFileReceiveDirectoryForTesting(std::string directory);
     // Queues local paths for upload (viewer -> host). Folders are expanded
     // into their regular files, preserving the folder as the first relative
     // directory component. `relative_prefix` names the directory below the
@@ -1178,9 +1189,9 @@ private:
     };
     void ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoch);
     bool EnqueueUpload(const std::string& path, std::string relative_path, uint64_t epoch,
-                       bool clipboard = false);
+                       bool clipboard = false, bool directory = false);
     void EnqueueUploadFailure(std::string name, std::string relative_path, std::string error,
-                              uint64_t epoch);
+                              uint64_t epoch, bool directory = false);
     bool HasHashableUploadLocked() const;
     // Shared validation and queueing for RequestBatchDownload and
     // RequestDirectoryDownload. `batch` tells the page which wording to use.
@@ -1419,6 +1430,9 @@ private:
         // The upload belongs to the local clipboard (protocol v34): the host
         // stages it for CF_HDROP and the clipboard permission gates it.
         bool clipboard = false;
+        // Protocol v74 metadata-only folder entry. It has no local file stream
+        // and reaches kReady without hashing.
+        bool directory = false;
         // The operator kept the destination's existing file; a completed
         // entry with this flag counts as skipped, not as sent or failed.
         bool skipped = false;
@@ -1563,6 +1577,8 @@ private:
 
     mutable std::mutex file_mutex_;
     std::condition_variable file_work_cv_;
+    mutable std::mutex receive_directory_mutex_;
+    std::string file_receive_directory_;
     std::deque<FileUpload> uploads_;
     std::deque<PendingUploadRoot> pending_upload_roots_;
     FileUpload last_upload_;
@@ -1632,6 +1648,11 @@ private:
     // matters to the host overlay.
     mutable std::mutex cursor_hint_mutex_;
     std::optional<chast::ShowCursorHint> pending_show_cursor_;
+
+    // Annotation order is part of the drawing semantics, so this is a bounded
+    // FIFO rather than the newest-value slots used for pointer hints.
+    mutable std::mutex annotation_mutex_;
+    std::deque<chast::AnnotationMessage> pending_annotations_;
 
     // Stream preferences are a snapshot, not a queue: the operator wants the
     // menu's last choice applied, not every intermediate one.

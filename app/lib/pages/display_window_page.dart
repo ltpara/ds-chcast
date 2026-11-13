@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../display_stream_controller.dart';
 import '../l10n.dart';
 import '../remote_pointer.dart';
+import '../annotation_stroke_controller.dart';
 import '../session_window.dart';
 import '../viewer_bridge.dart';
 import '../view_prefs.dart';
@@ -54,6 +55,15 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   bool _cursorHintOnHost = false;
   int _cursorHintSentMs = 0;
   static const int _cursorHintIntervalMs = 33;
+  bool _annotationMode = false;
+  final AnnotationStrokeController _annotation = AnnotationStrokeController(
+    sender: (int action, int strokeId, List<ViewerAnnotationPoint> points) =>
+        ViewerBridge.sendAnnotation(
+          action: action,
+          strokeId: strokeId,
+          points: <Map<String, int>>[for (final point in points) point.toMap()],
+        ),
+  );
   final Map<int, int> _remoteButtons = <int, int>{};
   String _error = '';
   double _wheelX = 0, _wheelY = 0;
@@ -65,6 +75,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   bool get _input =>
       !_closing &&
       !_keyboardChanging &&
+      !_annotationMode &&
       _control &&
       _status.acceptsInput &&
       _texture?.stream.ready == true;
@@ -254,6 +265,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     // The main session keeps running after this window closes, so clear the
     // host-side viewer pointer instead of leaving a stale hint behind.
     _hideCursorHint();
+    await _annotation.clear();
     // Native Shutdown also detaches synchronously if the window X destroys
     // this engine before Dart cleanup can finish.
     try {
@@ -266,6 +278,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   @override
   void dispose() {
     _closing = true;
+    unawaited(_annotation.clear());
     _timer?.cancel();
     ViewerBridge.setKeyboardTextRejectedHandler(null);
     WidgetsBinding.instance.removeObserver(this);
@@ -355,6 +368,55 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     if (!_cursorHintOnHost) return;
     _cursorHintOnHost = false;
     unawaited(ViewerBridge.showCursor(x: 0, y: 0, visible: false));
+  }
+
+  void _toggleAnnotationMode() {
+    final bool enabled = !_annotationMode;
+    setState(() => _annotationMode = enabled);
+    if (enabled) {
+      // _input excludes annotation mode. Release what this window already sent
+      // and make _syncCapture disable native capture for the draw-only path.
+      _release();
+      _syncCapture();
+    } else {
+      unawaited(_annotation.flush());
+      _syncCapture();
+    }
+  }
+
+  void _startAnnotation(Offset frame) {
+    if (!_annotationMode || _texture == null) return;
+    final (int x, int y) = _point(frame);
+    unawaited(_annotation.begin(ViewerAnnotationPoint(x, y)));
+    setState(() {});
+  }
+
+  void _moveAnnotation(Offset frame) {
+    if (!_annotationMode || _texture == null || !_annotation.isDrawing) return;
+    final (int x, int y) = _point(frame);
+    unawaited(_annotation.move(ViewerAnnotationPoint(x, y)));
+  }
+
+  void _endAnnotation(Offset frame) {
+    if (!_annotationMode || _texture == null) return;
+    final (int x, int y) = _point(frame);
+    unawaited(_annotation.end(point: ViewerAnnotationPoint(x, y)));
+    setState(() {});
+  }
+
+  void _cancelAnnotation() {
+    unawaited(_annotation.flush());
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _undoAnnotation() async {
+    await _annotation.undo();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _clearAnnotation() async {
+    await _annotation.clear();
+    if (mounted) setState(() {});
   }
 
   void _move(Offset p, int buttons) {
@@ -508,6 +570,26 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                 : null,
           ),
           IconButton(
+            tooltip: _annotationMode ? tr('退出标注模式') : tr('在主机上标注'),
+            isSelected: _annotationMode,
+            icon: Icon(_annotationMode ? Icons.draw_rounded : Icons.draw_outlined),
+            onPressed: !_closing ? _toggleAnnotationMode : null,
+          ),
+          IconButton(
+            tooltip: tr('撤销上一笔标注'),
+            icon: const Icon(Icons.undo_rounded),
+            onPressed: !_closing && _annotation.canUndo
+                ? () => unawaited(_undoAnnotation())
+                : null,
+          ),
+          IconButton(
+            tooltip: tr('清除全部标注'),
+            icon: const Icon(Icons.delete_sweep_outlined),
+            onPressed: !_closing && _annotation.canUndo
+                ? () => unawaited(_clearAnnotation())
+                : null,
+          ),
+          IconButton(
             tooltip: tr('缩放'),
             icon: const Icon(Icons.fit_screen),
             onPressed: () {
@@ -564,8 +646,10 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           sourceWidth: s.sourceWidth,
                           sourceHeight: s.sourceHeight,
                           fit: _fit,
-                          captureInput: _input,
+                          drawEnabled: _annotationMode,
+                          captureInput: _input && !_annotationMode,
                           hideCursor:
+                              !_annotationMode &&
                               texture.pointer?.visible == true &&
                               texture.cursor != null &&
                               texture.cursorShape == texture.pointer?.shapeId,
@@ -582,6 +666,10 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           onGesture: _gesture,
                           onDevicePointer: _device,
                           onDeviceCancel: _device,
+                          onDrawStart: _startAnnotation,
+                          onDrawMove: _moveAnnotation,
+                          onDrawEnd: _endAnnotation,
+                          onDrawCancel: _cancelAnnotation,
                           onCursorHint: _onCursorHint,
                           onCursorHintPress: _onCursorHintPress,
                           onCursorHintExit: _hideCursorHint,

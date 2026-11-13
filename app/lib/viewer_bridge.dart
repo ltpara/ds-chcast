@@ -3133,6 +3133,23 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// Sends one temporary freehand annotation message (protocol v76). Points
+  /// are virtual-desktop pixels. Clear and undo use action 0/4 with stroke 0
+  /// and no points; begin/move/end use action 1/2/3 with a non-zero stroke id
+  /// and 1..64 points. This path is draw-only and needs no input permission.
+  static Future<bool> sendAnnotation({
+    required int action,
+    required int strokeId,
+    required List<Map<String, int>> points,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendAnnotation', {
+      'action': action,
+      'strokeId': strokeId,
+      'points': points,
+    });
+    return queued ?? false;
+  }
+
   /// Sends one display-management request (protocol v47). [action] is a
   /// [ViewerDisplayControlAction] value, [value] the count, toggle state or
   /// privacy implementation, and [target] the host-issued output id for a

@@ -1544,6 +1544,56 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "sendAnnotation") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t action = 0;
+        int64_t stroke_id = 0;
+        if (args == nullptr || !map_int(*args, "action", &action) ||
+            !map_int(*args, "strokeId", &stroke_id) || action < 0 || action > 4 ||
+            stroke_id < 0 || stroke_id > UINT32_MAX) {
+            result->Error("bad_args", "sendAnnotation wants action and strokeId");
+            return;
+        }
+        const auto points_it = args->find(key("points"));
+        const auto* points = points_it == args->end()
+                                 ? nullptr
+                                 : std::get_if<flutter::EncodableList>(&points_it->second);
+        if (points == nullptr || points->size() > chast::kMaxAnnotationPoints) {
+            result->Error("bad_args", "sendAnnotation wants at most 64 points");
+            return;
+        }
+        chast::AnnotationMessage annotation;
+        annotation.action = static_cast<chast::AnnotationAction>(action);
+        annotation.stroke_id = static_cast<uint32_t>(stroke_id);
+        annotation.points.reserve(points->size());
+        for (const flutter::EncodableValue& item : *points) {
+            const auto* point = std::get_if<flutter::EncodableMap>(&item);
+            int64_t x = 0;
+            int64_t y = 0;
+            if (point == nullptr || !map_int(*point, "x", &x) ||
+                !map_int(*point, "y", &y) || x < -chast::kMaxAnnotationCoordinate ||
+                x > chast::kMaxAnnotationCoordinate ||
+                y < -chast::kMaxAnnotationCoordinate ||
+                y > chast::kMaxAnnotationCoordinate) {
+                result->Error("bad_args", "sendAnnotation carries an invalid point");
+                return;
+            }
+            annotation.points.push_back(
+                chast::AnnotationPoint{static_cast<int32_t>(x), static_cast<int32_t>(y)});
+        }
+        const bool empty_command = annotation.action == chast::AnnotationAction::Clear ||
+                                   annotation.action == chast::AnnotationAction::Undo;
+        if ((empty_command && (annotation.stroke_id != 0 || !annotation.points.empty())) ||
+            (!empty_command && (annotation.stroke_id == 0 || annotation.points.empty()))) {
+            result->Error("bad_args", "sendAnnotation action and points disagree");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr && viewer_->SendAnnotation(std::move(annotation));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
     if (method == "requestDisplayModes") {
         const auto* display = std::get_if<int32_t>(call.arguments());
         if (display == nullptr || *display < 0 || *display >= chast::kMaxDisplayCount) {

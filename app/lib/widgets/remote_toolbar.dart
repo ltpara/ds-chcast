@@ -30,6 +30,11 @@ class RemoteToolbar extends StatelessWidget {
     required this.inputAvailable,
     this.showMyCursor = false,
     this.onToggleShowCursor,
+    this.annotationMode = false,
+    this.annotationCanUndo = false,
+    this.onToggleAnnotation,
+    this.onUndoAnnotation,
+    this.onClearAnnotation,
     required this.clipboardEnabled,
     required this.clipboardAvailable,
     this.clipboardDirection = 3,
@@ -163,6 +168,13 @@ class RemoteToolbar extends StatelessWidget {
   /// with remote control off too.
   final bool showMyCursor;
   final VoidCallback? onToggleShowCursor;
+  /// Freehand drawing is draw-only and remains available while remote control
+  /// is off. Pointer input is suppressed while this mode is active.
+  final bool annotationMode;
+  final bool annotationCanUndo;
+  final VoidCallback? onToggleAnnotation;
+  final VoidCallback? onUndoAnnotation;
+  final VoidCallback? onClearAnnotation;
   final bool clipboardEnabled;
   final bool clipboardAvailable;
   final int clipboardDirection;
@@ -722,6 +734,24 @@ class RemoteToolbar extends StatelessWidget {
                     : tr('在主机上显示我的光标'),
                 active: showMyCursor,
                 onTap: () => onToggleShowCursor?.call(),
+              ),
+              _BarButton(
+                icon: annotationMode ? Icons.draw_rounded : Icons.draw_outlined,
+                tooltip: annotationMode ? tr('退出标注模式') : tr('在主机上标注'),
+                active: annotationMode,
+                onTap: () => onToggleAnnotation?.call(),
+              ),
+              _BarButton(
+                icon: Icons.undo_rounded,
+                tooltip: tr('撤销上一笔标注'),
+                disabled: !annotationCanUndo,
+                onTap: () => onUndoAnnotation?.call(),
+              ),
+              _BarButton(
+                icon: Icons.delete_sweep_outlined,
+                tooltip: tr('清除全部标注'),
+                disabled: !annotationCanUndo,
+                onTap: () => onClearAnnotation?.call(),
               ),
               _SpecialKeysButton(
                 available: specialKeysAvailable,

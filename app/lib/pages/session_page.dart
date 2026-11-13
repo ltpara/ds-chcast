@@ -25,6 +25,7 @@ import '../rdp.dart';
 import '../recording_retention.dart';
 import '../remote_key_sequence.dart';
 import '../remote_pointer.dart';
+import '../annotation_stroke_controller.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
 import '../view_prefs.dart';
@@ -387,6 +388,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   bool get _inputActive =>
       !_keyboardChanging &&
+      !_annotationMode &&
       _controlEnabled &&
       _status.acceptsInput &&
       _startError == null;
@@ -400,6 +402,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // still be where the pointer is. ~30 updates per second is smooth enough
   // and keeps a fast mouse from flooding the control stream.
   static const int _cursorHintIntervalMs = 33;
+
+  bool _annotationMode = false;
+  final AnnotationStrokeController _annotation = AnnotationStrokeController(
+    sender: (int action, int strokeId, List<ViewerAnnotationPoint> points) =>
+        ViewerBridge.sendAnnotation(
+          action: action,
+          strokeId: strokeId,
+          points: <Map<String, int>>[for (final point in points) point.toMap()],
+        ),
+  );
 
   String get _prefsPeerId => widget.target.preferencesKey;
 
@@ -473,6 +485,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(ViewerBridge.setWindowCloseHandler(null));
     }
     _stopPolling();
+    unawaited(_annotation.clear());
     _ticketTimer?.cancel();
     _ticketTimer = null;
     _hideTimer?.cancel();
@@ -1280,6 +1293,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _teardownSession() async {
     _stopPolling();
+    await _annotation.clear();
     _ticketTimer?.cancel();
     _ticketTimer = null;
     final displays = _displayStreams;
@@ -1600,6 +1614,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         _isCredentialChallenge(status.denial);
     final bool nowOver = status.isOver && !challenge;
     final bool justOver = nowOver && !_over;
+    if (!nowOver) {
+      // Emit once for each new asynchronous failure while the session is
+      // still live. The JSON includes the host codec/transport and local
+      // decoder/playback state needed to correlate both sides of a report.
+      emitViewerFailureDiagnostics(previous, status);
+    }
     if (status.hasFrame && _auditStartedAt == null) {
       _auditStartedAt = DateTime.now();
     }
@@ -2572,6 +2592,57 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!enabled) {
       _hideCursorHint();
     }
+  }
+
+  void _toggleAnnotationMode() {
+    final bool enabled = !_annotationMode;
+    setState(() => _annotationMode = enabled);
+    if (enabled) {
+      // The toolbar click may arrive while a remote button or key is held.
+      // Annotation mode hides the input path, so lift everything first and
+      // release native key capture before accepting draw events.
+      _releaseRemoteInput();
+      _setKeyCapture(false);
+    } else {
+      unawaited(_annotation.flush());
+      _focus.requestFocus();
+      _setKeyCapture(_inputActive);
+    }
+  }
+
+  void _startAnnotation(Offset frame, {DisplayVideoStream? display}) {
+    if (!_annotationMode) return;
+    final (int x, int y) = _desktopPoint(frame, display);
+    unawaited(_annotation.begin(ViewerAnnotationPoint(x, y)));
+    setState(() {});
+  }
+
+  void _moveAnnotation(Offset frame, {DisplayVideoStream? display}) {
+    if (!_annotationMode || !_annotation.isDrawing) return;
+    final (int x, int y) = _desktopPoint(frame, display);
+    unawaited(_annotation.move(ViewerAnnotationPoint(x, y)));
+  }
+
+  void _endAnnotation(Offset frame, {DisplayVideoStream? display}) {
+    if (!_annotationMode) return;
+    final (int x, int y) = _desktopPoint(frame, display);
+    unawaited(_annotation.end(point: ViewerAnnotationPoint(x, y)));
+    setState(() {});
+  }
+
+  void _cancelAnnotation() {
+    unawaited(_annotation.flush());
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _undoAnnotation() async {
+    await _annotation.undo();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _clearAnnotation() async {
+    await _annotation.clear();
+    if (mounted) setState(() {});
   }
 
   void _onCursorHint(Offset frame, {DisplayVideoStream? display}) {
@@ -3904,7 +3975,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         sourceWidth: stream.sourceWidth,
         sourceHeight: stream.sourceHeight,
         fit: fit ?? _fit,
-        captureInput: _inputActive,
+        drawEnabled: _annotationMode,
+        captureInput: _inputActive && !_annotationMode,
         hideCursor:
             texture.pointer?.visible == true &&
             texture.cursor != null &&
@@ -3919,6 +3991,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             _onGesture(p, zoom, x, y, display: stream),
         onDevicePointer: (e, p) => _onDevicePointer(e, p, display: stream),
         onDeviceCancel: (e, p) => _onDeviceCancel(e, p, display: stream),
+        onDrawStart: (p) => _startAnnotation(p, display: stream),
+        onDrawMove: (p) => _moveAnnotation(p, display: stream),
+        onDrawEnd: (p) => _endAnnotation(p, display: stream),
+        onDrawCancel: _cancelAnnotation,
         onCursorHint: (p) => _onCursorHint(p, display: stream),
         onCursorHintPress: (p) => _onCursorHintPress(p, display: stream),
         onCursorHintExit: _hideCursorHint,
@@ -6073,9 +6149,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       sourceWidth: _status.sourceWidth,
                       sourceHeight: _status.sourceHeight,
                       fit: _fit,
-                      captureInput: _inputActive,
+                      drawEnabled: _annotationMode,
+                      captureInput: _inputActive && !_annotationMode,
                       hideCursor:
-                          _inputActive && (_cursorInstalled || _relativeMouse),
+                          !_annotationMode &&
+                          _inputActive &&
+                          (_cursorInstalled || _relativeMouse),
                       onScaleChanged: _onViewScale,
                       onHover: _inputActive ? _onPointerHover : null,
                       onMove: _inputActive ? _onPointerMove : null,
@@ -6084,6 +6163,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onGesture: _inputActive ? _onGesture : null,
                       onDevicePointer: _inputActive ? _onDevicePointer : null,
                       onDeviceCancel: _inputActive ? _onDeviceCancel : null,
+                      onDrawStart: _startAnnotation,
+                      onDrawMove: _moveAnnotation,
+                      onDrawEnd: _endAnnotation,
+                      onDrawCancel: _cancelAnnotation,
                       onCursorHint: _onCursorHint,
                       onCursorHintPress: _onCursorHintPress,
                       onCursorHintExit: _hideCursorHint,
@@ -6117,6 +6200,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         inputAvailable: _status.acceptsInput,
                         showMyCursor: _showMyCursor,
                         onToggleShowCursor: _toggleShowMyCursor,
+                        annotationMode: _annotationMode,
+                        annotationCanUndo: _annotation.canUndo,
+                        onToggleAnnotation: _toggleAnnotationMode,
+                        onUndoAnnotation: () => unawaited(_undoAnnotation()),
+                        onClearAnnotation: () => unawaited(_clearAnnotation()),
                         clipboardEnabled: _clipboardSync,
                         clipboardAvailable: _status.acceptsClipboard,
                         clipboardDirection: _status.clipboardDirection,

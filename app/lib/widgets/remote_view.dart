@@ -67,6 +67,7 @@ class RemoteView extends StatefulWidget {
     this.sourceHeight = 0,
     required this.fit,
     this.captureInput = false,
+    this.drawEnabled = false,
     this.hideCursor = false,
     this.onScaleChanged,
     this.onHover,
@@ -76,6 +77,10 @@ class RemoteView extends StatefulWidget {
     this.onGesture,
     this.onDevicePointer,
     this.onDeviceCancel,
+    this.onDrawStart,
+    this.onDrawMove,
+    this.onDrawEnd,
+    this.onDrawCancel,
     this.onCursorHint,
     this.onCursorHintPress,
     this.onCursorHintExit,
@@ -103,6 +108,11 @@ class RemoteView extends StatefulWidget {
   /// enables this while remote control is on.
   final bool captureInput;
 
+  /// While true, primary drags draw temporary host annotations instead of
+  /// forwarding input. This branch deliberately bypasses every input callback
+  /// so a gesture can never also reach the remote mouse injector.
+  final bool drawEnabled;
+
   /// True while the native side has installed the host's own pointer. The
   /// local one is hidden only then, so a host that sends no sprite (a machine
   /// with no pointing device) still leaves the user an arrow to aim with.
@@ -122,6 +132,10 @@ class RemoteView extends StatefulWidget {
   /// has no contact to inject.
   final FrameDeviceHandler? onDevicePointer;
   final FrameDeviceHandler? onDeviceCancel;
+  final ValueChanged<Offset>? onDrawStart;
+  final ValueChanged<Offset>? onDrawMove;
+  final ValueChanged<Offset>? onDrawEnd;
+  final VoidCallback? onDrawCancel;
 
   /// Reports the pointer position in captured-desktop pixels for the host's
   /// "show my cursor" hint. Unlike the input callbacks it also runs while
@@ -156,10 +170,16 @@ class _RemoteViewState extends State<RemoteView> {
   double _gestureY = 0;
   double _gestureZoom = 0;
   bool _zooming = false;
+  int? _drawPointer;
+  Offset _lastDrawFrame = Offset.zero;
 
   @override
   void dispose() {
     _releaseButtons();
+    if (_drawPointer != null) {
+      widget.onDrawEnd?.call(_lastDrawFrame);
+      _drawPointer = null;
+    }
     _vertical.dispose();
     _horizontal.dispose();
     super.dispose();
@@ -193,6 +213,10 @@ class _RemoteViewState extends State<RemoteView> {
       _releaseButtons();
       _panZoomPointer = null;
       _resetGesture();
+    }
+    if (oldWidget.drawEnabled && !widget.drawEnabled && _drawPointer != null) {
+      widget.onDrawEnd?.call(_lastDrawFrame);
+      _drawPointer = null;
     }
   }
 
@@ -298,6 +322,48 @@ class _RemoteViewState extends State<RemoteView> {
         texture,
         IgnorePointer(child: widget.overlayBuilder!(box)),
       ]));
+    }
+    if (widget.drawEnabled) {
+      return MouseRegion(
+        cursor: SystemMouseCursors.precise,
+        onExit: (_) => widget.onCursorHintExit?.call(),
+        child: Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: (PointerDownEvent event) {
+            widget.onFocusRequested?.call();
+            if (_drawPointer != null ||
+                (!_isDevicePointer(event) &&
+                    event.buttons & kPrimaryMouseButton == 0)) {
+              return;
+            }
+            _drawPointer = event.pointer;
+            _lastDrawFrame = _toFrame(event.localPosition, box);
+            widget.onDrawStart?.call(_lastDrawFrame);
+          },
+          onPointerMove: (PointerMoveEvent event) {
+            if (_drawPointer != event.pointer) return;
+            _lastDrawFrame = _toFrame(event.localPosition, box);
+            widget.onDrawMove?.call(_lastDrawFrame);
+            widget.onCursorHint?.call(_lastDrawFrame);
+          },
+          onPointerUp: (PointerUpEvent event) {
+            if (_drawPointer != event.pointer) return;
+            _lastDrawFrame = _toFrame(event.localPosition, box);
+            widget.onDrawMove?.call(_lastDrawFrame);
+            widget.onDrawEnd?.call(_lastDrawFrame);
+            _drawPointer = null;
+          },
+          onPointerCancel: (PointerCancelEvent event) {
+            if (_drawPointer != event.pointer) return;
+            _drawPointer = null;
+            widget.onDrawCancel?.call();
+          },
+          onPointerHover: (PointerHoverEvent event) {
+            widget.onCursorHint?.call(_toFrame(event.localPosition, box));
+          },
+          child: texture,
+        ),
+      );
     }
     if (!widget.captureInput) {
       if (widget.onCursorHint == null) {
@@ -452,7 +518,7 @@ class _RemoteViewState extends State<RemoteView> {
       );
     }
 
-    if (widget.captureInput) {
+    if (widget.captureInput || widget.drawEnabled) {
       // Remote control owns the wheel, so the canvas must not also scroll
       // itself. A window smaller than the frame clips instead.
       return ClipRect(

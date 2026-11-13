@@ -39,6 +39,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr auto kReceiveTimeout = std::chrono::milliseconds(250);
+constexpr size_t kMaxPendingAnnotations = 512;
 // Input and audio are drained once per receive poll, so an idle desktop (where
 // the receive timeout is the only thing pacing the loop) still carries pointer
 // motion and audio frames within this bound.
@@ -87,6 +88,30 @@ std::filesystem::path path_from_utf8(const std::string& path) {
 std::string utf8_from_path(const std::filesystem::path& path) {
     const std::u8string text = path.u8string();
     return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+
+std::wstring file_api_path(const std::filesystem::path& path) {
+    std::wstring text = path.wstring();
+    if (text.rfind(L"\\\\?\\", 0) == 0 || text.size() < 248) {
+        return text;
+    }
+    if (text.rfind(L"\\\\", 0) == 0) {
+        return L"\\\\?\\UNC\\" + text.substr(2);
+    }
+    return L"\\\\?\\" + text;
+}
+
+bool file_attributes(const std::filesystem::path& path, DWORD& attributes,
+                     std::string* error) {
+    attributes = GetFileAttributesW(file_api_path(path).c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return true;
+    }
+    if (error != nullptr) {
+        *error = "the path cannot be read (error " +
+                 std::to_string(static_cast<unsigned long>(GetLastError())) + ")";
+    }
+    return false;
 }
 
 std::string record_file_path(const std::string& directory) {
@@ -157,6 +182,24 @@ constexpr size_t kMaxPendingInput = 256;
 // Safety valve for a folder that expands into a huge tree; the UI would
 // otherwise build an unbounded queue on the session thread.
 constexpr size_t kMaxQueuedUploads = 10000;
+
+bool upload_offer_path_fits(const std::string& parent, const std::string& name,
+                            std::string* error) {
+    const std::string full = chast::make_offer_relative_path(parent, name);
+    if (full.size() > chast::kMaxFileRelativePathBytes) {
+        if (error) *error = "the folder path is too long for a transfer";
+        return false;
+    }
+    size_t components = 1;
+    for (char ch : parent) {
+        if (ch == '/') ++components;
+    }
+    if (components > chast::kMaxFileRelativeComponents) {
+        if (error) *error = "the folder path is nested too deeply for a transfer";
+        return false;
+    }
+    return true;
+}
 
 const char* session_mode_name(chast::SessionMode mode) {
     switch (mode) {
@@ -556,6 +599,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_show_cursor_.reset();
     }
     {
+        std::lock_guard<std::mutex> lock(annotation_mutex_);
+        pending_annotations_.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(stream_option_mutex_);
         pending_stream_options_.reset();
     }
@@ -690,6 +737,10 @@ void ViewerEngine::Stop() {
     file_work_cv_.notify_all();
     if (file_worker_.joinable()) {
         file_worker_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(annotation_mutex_);
+        pending_annotations_.clear();
     }
     running_.store(false, std::memory_order_release);
 }
@@ -870,6 +921,27 @@ bool ViewerEngine::ShowCursor(int32_t x, int32_t y, bool visible, bool pressed) 
     return true;
 }
 
+bool ViewerEngine::SendAnnotation(chast::AnnotationMessage annotation) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming) {
+            return false;
+        }
+    }
+    if (chast::make_annotation(annotation).empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(annotation_mutex_);
+    if (pending_annotations_.size() >= kMaxPendingAnnotations) {
+        return false;
+    }
+    pending_annotations_.push_back(std::move(annotation));
+    return true;
+}
+
 bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
                                     chast::StreamQuality quality, chast::VideoChroma chroma,
                                     uint8_t quality_percent) {
@@ -940,6 +1012,21 @@ void ViewerEngine::SetClipboardFileSource(
     std::function<bool(std::vector<std::string>&)> source) {
     std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
     clipboard_file_source_ = std::move(source);
+}
+
+bool ViewerEngine::SetFileReceiveDirectoryForTesting(std::string directory) {
+    if (running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!directory.empty() && !path_from_utf8(directory).is_absolute()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(receive_directory_mutex_);
+    if (running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    file_receive_directory_ = std::move(directory);
+    return true;
 }
 
 void ViewerEngine::SetClipboardVirtualSink(
@@ -1319,6 +1406,21 @@ void ViewerEngine::ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoc
         EnqueueUploadFailure(display_name, root.prefix, "the path no longer exists", epoch);
         return;
     }
+    DWORD source_attributes = INVALID_FILE_ATTRIBUTES;
+    std::string attribute_error;
+    if (!file_attributes(source, source_attributes, &attribute_error)) {
+        EnqueueUploadFailure(display_name, root.prefix, attribute_error, epoch);
+        return;
+    }
+    // std::filesystem's treatment of Windows junctions varies by runtime. A
+    // reparse point is never a plain file or directory to send, regardless of
+    // whether it looks like a symlink or a directory to the C++ library.
+    if ((source_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        EnqueueUploadFailure(display_name, root.prefix,
+                             "reparse points cannot be sent", epoch,
+                             (source_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        return;
+    }
     if (std::filesystem::is_regular_file(status)) {
         EnqueueUpload(root.path, root.prefix, epoch);
         return;
@@ -1333,7 +1435,15 @@ void ViewerEngine::ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoc
     // that directory, so the host creates prefix/top/... instead of prefix/...
     const std::string base =
         root.prefix.empty() ? top : root.prefix + "/" + top;
-    bool added = false;
+    std::string path_error;
+    if (!upload_offer_path_fits(root.prefix, top, &path_error)) {
+        EnqueueUploadFailure(top, root.prefix, path_error, epoch, true);
+        return;
+    }
+    // Preserve the selected folder itself, including when it is empty.
+    if (!EnqueueUpload(root.path, root.prefix, epoch, false, true)) {
+        return;
+    }
     size_t seen = 0;
     std::filesystem::recursive_directory_iterator iterator(
         source, std::filesystem::directory_options::skip_permission_denied, ec);
@@ -1354,18 +1464,36 @@ void ViewerEngine::ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoc
             entry.symlink_status(status_error);
         // Links are skipped on purpose: following them can leave the dropped
         // tree, loop back and send the same bytes twice.
-        if (!status_error && std::filesystem::is_regular_file(entry_status)) {
+        DWORD entry_attributes = INVALID_FILE_ATTRIBUTES;
+        const bool attributes_ok =
+            !status_error && file_attributes(entry.path(), entry_attributes, nullptr);
+        const bool reparse =
+            attributes_ok && (entry_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        if (reparse && std::filesystem::is_directory(entry_status)) {
+            // recursive_directory_iterator does not request symlink following,
+            // but Windows junctions can still be classified as directories.
+            iterator.disable_recursion_pending();
+        }
+        if (!status_error && !reparse &&
+            (std::filesystem::is_regular_file(entry_status) ||
+             std::filesystem::is_directory(entry_status))) {
             const std::filesystem::path relative_dir =
                 entry.path().parent_path().lexically_relative(source);
             // lexically_relative uses native separators; the wire wants '/'.
             const std::string relative = chast::make_offer_relative_path(
                 base, utf8_from_path(relative_dir));
-            if (relative.size() <= chast::kMaxFileRelativePathBytes) {
-                if (!EnqueueUpload(utf8_from_path(entry.path()), std::move(relative),
-                                   epoch)) {
-                    break;
+            std::string entry_error;
+            if (!upload_offer_path_fits(relative, utf8_from_path(entry.path().filename()),
+                                        &entry_error)) {
+                EnqueueUploadFailure(utf8_from_path(entry.path().filename()), relative,
+                                     entry_error, epoch,
+                                     std::filesystem::is_directory(entry_status));
+                if (std::filesystem::is_directory(entry_status)) {
+                    iterator.disable_recursion_pending();
                 }
-                added = true;
+            } else if (!EnqueueUpload(utf8_from_path(entry.path()), std::move(relative), epoch,
+                                      false, std::filesystem::is_directory(entry_status))) {
+                break;
             }
         }
         iterator.increment(ec);
@@ -1375,21 +1503,22 @@ void ViewerEngine::ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoc
             ec.clear();
         }
     }
-    if (!added) {
-        EnqueueUploadFailure(top, base,
-                             ec ? "the folder cannot be read"
-                                : "the folder contains no sendable files",
-                             epoch);
-    }
 }
 
 bool ViewerEngine::EnqueueUpload(const std::string& path, std::string relative_path,
-                                 uint64_t epoch, bool clipboard) {
+                                 uint64_t epoch, bool clipboard, bool directory) {
     const std::filesystem::path source = path_from_utf8(path);
     const std::string name = utf8_from_path(source.filename());
     if (name.empty() || name.size() > chast::kMaxFileNameBytes) {
         EnqueueUploadFailure(name.empty() ? "file" : name, std::move(relative_path),
-                             "the file name cannot be carried by an offer", epoch);
+                             "the file name cannot be carried by an offer", epoch,
+                             directory);
+        return true;
+    }
+    std::string path_error;
+    if (!upload_offer_path_fits(relative_path, name, &path_error)) {
+        EnqueueUploadFailure(name, std::move(relative_path), path_error, epoch,
+                             directory);
         return true;
     }
     std::lock_guard<std::mutex> lock(file_mutex_);
@@ -1402,18 +1531,20 @@ bool ViewerEngine::EnqueueUpload(const std::string& path, std::string relative_p
         return false;
     }
     FileUpload upload;
-    upload.stage = FileUpload::Stage::kQueued;
+    upload.stage = directory ? FileUpload::Stage::kReady : FileUpload::Stage::kQueued;
     upload.path = path;
     upload.name = name;
     upload.relative_path = std::move(relative_path);
     upload.transfer_id = next_file_id_++;
     upload.clipboard = clipboard;
+    upload.directory = directory;
     uploads_.push_back(std::move(upload));
     return true;
 }
 
 void ViewerEngine::EnqueueUploadFailure(std::string name, std::string relative_path,
-                                        std::string error, uint64_t epoch) {
+                                        std::string error, uint64_t epoch,
+                                        bool directory) {
     std::lock_guard<std::mutex> lock(file_mutex_);
     if (upload_epoch_ != epoch || uploads_.size() >= kMaxQueuedUploads) {
         return;
@@ -1423,6 +1554,7 @@ void ViewerEngine::EnqueueUploadFailure(std::string name, std::string relative_p
     upload.name = name.empty() ? "file" : std::move(name);
     upload.relative_path = std::move(relative_path);
     upload.error = std::move(error);
+    upload.directory = directory;
     upload.transfer_id = next_file_id_++;
     uploads_.push_back(std::move(upload));
 }
@@ -4135,11 +4267,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             // entries the purge actually aborts are failures.
                             const bool terminal = it->stage == FileUpload::Stage::kDone ||
                                                   it->stage == FileUpload::Stage::kFailed;
-                            if (terminal) {
+                            if (!it->directory && terminal) {
                                 record_completed_file(true, it->name, it->size,
                                                       it->stage == FileUpload::Stage::kDone,
                                                       it->error);
-                            } else {
+                            } else if (!it->directory) {
                                 record_completed_file(true, it->name, it->size, false,
                                                       message);
                             }
@@ -4394,14 +4526,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             }
                             const bool success = stage == FileUpload::Stage::kDone;
                             const bool skipped = success && uploads_.front().skipped;
+                            const bool directory = uploads_.front().directory;
                             if (skipped) {
                                 ++files_skipped;
                             } else if (!success) {
                                 ++file_failures;
-                            } else {
+                            } else if (!directory) {
                                 ++files_sent;
                             }
-                            if (!uploads_.front().clipboard && !skipped) {
+                            if (!uploads_.front().clipboard && !directory && !skipped) {
                                 // The host writes no audit record for a kept
                                 // file either, so the two sets stay aligned.
                                 record_completed_file(true, uploads_.front().name,
@@ -4494,10 +4627,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     if (snapshot.stage == FileUpload::Stage::kReady) {
                         chast::FileOffer offer;
                         offer.transfer_id = snapshot.transfer_id;
-                        offer.size = snapshot.size;
-                        offer.modified_time = snapshot.modified_time;
-                        offer.resume = true;
-                        offer.sha256 = snapshot.digest;
+                        offer.directory = snapshot.directory;
+                        offer.size = snapshot.directory ? 0 : snapshot.size;
+                        offer.modified_time =
+                            snapshot.directory ? 0 : snapshot.modified_time;
+                        offer.resume = !snapshot.directory;
+                        if (!snapshot.directory) offer.sha256 = snapshot.digest;
                         offer.name = snapshot.name;
                         offer.relative_path = snapshot.relative_path;
                         offer.clipboard = snapshot.clipboard;
@@ -4514,7 +4649,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 uploads_.front().stage = FileUpload::Stage::kOffered;
                             }
                         }
-                        std::fprintf(stderr, "viewer: file %s offered (%llu bytes)\n",
+                        std::fprintf(stderr, "viewer: %s %s offered (%llu bytes)\n",
+                                     snapshot.directory ? "folder" : "file",
                                      snapshot.name.c_str(),
                                      static_cast<unsigned long long>(snapshot.size));
                         return;
@@ -4611,8 +4747,24 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                                 : answer.reason);
                                 return;
                             }
-                            if (answer.resume_offset > snapshot.size) {
+                            if (answer.resume_offset > snapshot.size ||
+                                (snapshot.directory && answer.resume_offset != 0)) {
                                 file_fail("the host asked to resume past the end of the file");
+                                return;
+                            }
+                            if (snapshot.directory) {
+                                {
+                                    std::lock_guard<std::mutex> lock(file_mutex_);
+                                    if (uploads_.empty() ||
+                                        uploads_.front().transfer_id !=
+                                            snapshot.transfer_id ||
+                                        uploads_.front().stage != FileUpload::Stage::kOffered) {
+                                        return;
+                                    }
+                                    uploads_.front().stage = FileUpload::Stage::kFinishing;
+                                }
+                                std::fprintf(stderr, "viewer: folder %s accepted\n",
+                                             snapshot.name.c_str());
                                 return;
                             }
                             file_stream.open(path_from_utf8(snapshot.path), std::ios::binary);
@@ -4721,7 +4873,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // The host's download. Offered files are accepted into the
                 // local receive directory while file transfer is granted; the
                 // .part file is renamed only after the digest checks out.
-                const std::string download_directory = chast::default_receive_directory();
+                const std::string configured_receive_directory = [&] {
+                    std::lock_guard<std::mutex> lock(receive_directory_mutex_);
+                    return file_receive_directory_;
+                }();
+                const std::string download_directory =
+                    configured_receive_directory.empty()
+                        ? chast::default_receive_directory()
+                        : configured_receive_directory;
                 auto download_fail = [&](const std::string& message, bool report) {
                     uint32_t transfer_id = 0;
                     std::string name;
@@ -8511,6 +8670,23 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                auto drain_annotations = [&] {
+                    std::deque<chast::AnnotationMessage> pending;
+                    {
+                        std::lock_guard<std::mutex> lock(annotation_mutex_);
+                        pending.swap(pending_annotations_);
+                    }
+                    while (!pending.empty()) {
+                        chast::Error sent = session->request_annotation(pending.front());
+                        pending.pop_front();
+                        if (!sent.ok()) {
+                            std::fprintf(stderr, "viewer: annotation: %s\n",
+                                         sent.to_string().c_str());
+                            break;
+                        }
+                    }
+                };
+
                 // Adopts every follow state. The host reports the modes in
                 // effect, not the modes requested, so a refusal or a
                 // host-initiated disable returns the menu to reality.
@@ -8769,6 +8945,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_display_modes();
                     drain_display_follow();
                     drain_show_cursor();
+                    drain_annotations();
                     drain_stream_options();
                     {
                         const auto probe_now = Clock::now();
@@ -8869,6 +9046,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_os_login();
                     drain_elevation();
                     drain_session_requests();
+                    drain_annotations();
                     receive_session_answers();
                     receive_chat();
                     drain_chat();
@@ -9124,10 +9302,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             const bool success = stage == FileUpload::Stage::kDone;
             if (!success) {
                 ++file_failures;
-            } else {
+            } else if (!uploads_.front().directory) {
                 ++files_sent;
             }
-            if (!uploads_.front().clipboard) {
+            if (!uploads_.front().clipboard && !uploads_.front().directory) {
                 record_completed_file(true, uploads_.front().name, uploads_.front().size,
                                       success, uploads_.front().error);
             }
@@ -9146,7 +9324,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             // Every entry that cannot continue is one failed file in the
             // audit, not a single aggregate failure.
             for (const FileUpload& upload : uploads_) {
-                if (!upload.clipboard) {
+                if (!upload.clipboard && !upload.directory) {
                     record_completed_file(true, upload.name, upload.size, false,
                                           "the session ended before the file finished");
                 }
