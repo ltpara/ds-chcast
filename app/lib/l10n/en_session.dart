@@ -248,8 +248,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '帧率（FPS）': 'Frame rate (FPS)',
   '自定义…': 'Custom…',
   '自定义：最高 {cap} 帧/秒': 'Custom: up to {cap} fps',
-  '输入 {min}–{max} 之间的帧率上限':
-      'Enter a frame rate cap between {min} and {max}',
+  '输入 {min}–{max} 之间的帧率上限': 'Enter a frame rate cap between {min} and {max}',
   '{min}–{max} fps，越高越流畅，也越占带宽':
       '{min}–{max} fps. Higher is smoother and uses more bandwidth.',
   '请输入 {min}–{max} 之间的整数': 'Enter a whole number between {min} and {max}',
@@ -716,4 +715,16 @@ const Map<String, String> kEnglishSession = <String, String>{
   '使用 VP9；所有观看端支持时生效': 'Uses VP9 when all viewers support full color',
   '无法获取访问票据：{p1}': 'Could not obtain an access ticket: {p1}',
   '访问票据已过期': 'The access ticket has expired',
+  '终端': 'Terminal',
+  '阻止输入': 'Block input',
+  '系统登录': 'OS login',
+  '会话切换': 'Session switching',
+  '远程配置': 'Remote configuration',
+  '其他远程权限': 'Other remote permissions',
+  '系统音频已停止': 'System audio stopped',
+  '系统音频出现问题': 'System audio problem',
+  '语音通话已结束': 'Voice call ended',
+  '语音通话出现问题': 'Voice call problem',
+  '语音通话未能开启': 'Voice call could not start',
+  '{prefix}：{reason}': '{prefix}: {reason}',
 };

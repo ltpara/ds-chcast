@@ -16,7 +16,11 @@
 
 #include <windows.h>
 
+#include <d3d11.h>
 #include <dxgi.h>
+
+#include <cstdint>
+#include <vector>
 
 namespace chast::detail {
 
@@ -44,5 +48,18 @@ POINT surface_to_output(const POINT& point, UINT width, UINT height, DXGI_MODE_R
 // boundary because the transform is an axis-aligned flip/transpose, so the
 // result is exact and needs no padding.
 RECT surface_to_output(const RECT& rect, UINT width, UINT height, DXGI_MODE_ROTATION rotation);
+
+// Destination box for uploading a tightly packed rectangle into a larger
+// D3D11 texture. UpdateSubresource uses resource coordinates, so a merged
+// child at a non-zero layout offset must upload there rather than at (0, 0).
+D3D11_BOX destination_box(UINT x, UINT y, UINT width, UINT height);
+
+// Copies a tightly packed BGRA image into screen orientation. This is the
+// system-memory fallback used when the video processor cannot rotate a
+// duplication surface. `source_pitch` is measured in bytes; the returned image
+// is tightly packed at output_width * 4 bytes per row.
+bool rotate_bgra(const uint8_t* source, UINT source_pitch, UINT width, UINT height,
+                 DXGI_MODE_ROTATION rotation, std::vector<uint8_t>* output,
+                 UINT* output_width, UINT* output_height);
 
 }  // namespace chast::detail

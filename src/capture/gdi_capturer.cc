@@ -58,7 +58,7 @@ public:
         display_.height = height_;
         display_.rotation_degrees = 0;
 
-        if (!device_ && config_.backend != CaptureBackend::GdiCpu) {
+        if (!cpu_only() && !device_) {
             detail::CaptureDevice created;
             Error err = detail::create_capture_device(display_.adapter_luid, created);
             if (!err.ok() && external_device_) return err;
@@ -86,7 +86,7 @@ public:
             return check_win32(FALSE, "SelectObject(capture DIB)");
         }
 
-        if (device_) {
+        if (device_ && !cpu_only()) {
             const auto upload = [&]() -> Error {
                 D3D11_TEXTURE2D_DESC texture{};
                 texture.Width = width_;
@@ -113,8 +113,8 @@ public:
             }
         }
 
-        frame_.device = device_.get();
-        frame_.context = context_.get();
+        frame_.device = cpu_only() ? nullptr : device_.get();
+        frame_.context = cpu_only() ? nullptr : context_.get();
         frame_.texture = texture_.get();
         frame_.shared_handle = shared_handle_;
         frame_.width = width_;
@@ -147,7 +147,7 @@ public:
         }
         cursor_ = {};
         if (config_.capture_cursor) sample_desktop_cursor(display_, cursor_);
-        if (!device_) {
+        if (cpu_only() || !device_) {
             const auto* begin = static_cast<const uint8_t*>(pixels_);
             frame_.cpu_bgra = std::make_shared<const std::vector<uint8_t>>(
                 begin, begin + size_t(width_) * height_ * 4);
@@ -192,9 +192,10 @@ public:
     const CursorInfo& cursor() const override { return cursor_; }
     const DisplayInfo& display() const override { return display_; }
     AdapterDevice adapter_device() const override {
+        if (cpu_only()) return {};
         return AdapterDevice{device_.get(), vendor_id_, display_.adapter_luid};
     }
-    const char* implementation() const noexcept override { return device_ ? "gdi" : "gdi-cpu"; }
+    const char* implementation() const noexcept override { return cpu_only() ? "gdi-cpu" : "gdi"; }
 
     Error reinitialize() override {
         DisplayInfo refreshed = display_;
@@ -246,8 +247,10 @@ public:
     const Error& last_error() const override { return last_error_; }
 
 private:
+    bool cpu_only() const { return config_.backend == CaptureBackend::GdiCpu; }
+
     Error create_nv12_pass() {
-        if (!device_ || !config_.nv12.enabled) return Error::success();
+        if (cpu_only() || !device_ || !config_.nv12.enabled) return Error::success();
         auto next = std::make_unique<detail::Nv12Pass>();
         Error err = next->initialize(device_.get(), context_.get(), width_, height_,
                                      scaled_even(width_, nv12_percent_),

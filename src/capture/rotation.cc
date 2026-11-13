@@ -1,6 +1,8 @@
 #include "capture/rotation.h"
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 
 #ifdef min
 #undef min
@@ -49,6 +51,73 @@ RECT surface_to_output(const RECT& r, UINT width, UINT height, DXGI_MODE_ROTATIO
     out.right = std::max(a.x, b.x) + 1;
     out.bottom = std::max(a.y, b.y) + 1;
     return out;
+}
+
+D3D11_BOX destination_box(UINT x, UINT y, UINT width, UINT height) {
+    return D3D11_BOX{x, y, 0, x + width, y + height, 1};
+}
+
+bool rotate_bgra(const uint8_t* source, UINT source_pitch, UINT width, UINT height,
+                 DXGI_MODE_ROTATION rotation, std::vector<uint8_t>* output,
+                 UINT* output_width, UINT* output_height) {
+    if (!source || !output || !output_width || !output_height || width == 0 || height == 0 ||
+        static_cast<uint64_t>(source_pitch) < static_cast<uint64_t>(width) * 4) {
+        return false;
+    }
+    if (rotation != DXGI_MODE_ROTATION_IDENTITY &&
+        rotation != DXGI_MODE_ROTATION_UNSPECIFIED &&
+        rotation != DXGI_MODE_ROTATION_ROTATE90 &&
+        rotation != DXGI_MODE_ROTATION_ROTATE180 &&
+        rotation != DXGI_MODE_ROTATION_ROTATE270) {
+        return false;
+    }
+
+    const UINT out_width = swaps_axes(rotation) ? height : width;
+    const UINT out_height = swaps_axes(rotation) ? width : height;
+    const uint64_t out_pitch = static_cast<uint64_t>(out_width) * 4;
+    const uint64_t out_size = out_pitch * out_height;
+    if (out_size > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+    output->resize(static_cast<size_t>(out_size));
+
+    for (UINT y = 0; y < out_height; ++y) {
+        uint8_t* dst = output->data() + static_cast<size_t>(y) * static_cast<size_t>(out_pitch);
+        if (rotation == DXGI_MODE_ROTATION_IDENTITY ||
+            rotation == DXGI_MODE_ROTATION_UNSPECIFIED) {
+            std::memcpy(dst, source + static_cast<size_t>(y) * source_pitch,
+                        static_cast<size_t>(out_pitch));
+            continue;
+        }
+        for (UINT x = 0; x < out_width; ++x) {
+            UINT source_x = 0;
+            UINT source_y = 0;
+            switch (rotation) {
+                case DXGI_MODE_ROTATION_ROTATE90:
+                    source_x = y;
+                    source_y = height - 1 - x;
+                    break;
+                case DXGI_MODE_ROTATION_ROTATE180:
+                    source_x = width - 1 - x;
+                    source_y = height - 1 - y;
+                    break;
+                case DXGI_MODE_ROTATION_ROTATE270:
+                    source_x = width - 1 - y;
+                    source_y = x;
+                    break;
+                default:
+                    break;
+            }
+            std::memcpy(dst + static_cast<size_t>(x) * 4,
+                        source + static_cast<size_t>(source_y) * source_pitch +
+                            static_cast<size_t>(source_x) * 4,
+                        4);
+        }
+    }
+
+    *output_width = out_width;
+    *output_height = out_height;
+    return true;
 }
 
 }  // namespace chast::detail

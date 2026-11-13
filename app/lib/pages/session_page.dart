@@ -19,6 +19,7 @@ import '../session_window.dart';
 import '../stream_prefs.dart';
 import '../target.dart';
 import '../theme.dart';
+import '../receiver_status_events.dart';
 import '../reconnect_policy.dart';
 import '../rdp.dart';
 import '../recording_retention.dart';
@@ -385,7 +386,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _fileReportBusy = false;
 
   bool get _inputActive =>
-      !_keyboardChanging && _controlEnabled && _status.acceptsInput && _startError == null;
+      !_keyboardChanging &&
+      _controlEnabled &&
+      _status.acceptsInput &&
+      _startError == null;
 
   // "Show my cursor": the viewer pointer drawn on the host desktop. It is a
   // draw-only hint, so it keeps working while remote control is off.
@@ -431,7 +435,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _streamMaxFps = prefs.maxFps;
     ViewerBridge.setKeyboardTextRejectedHandler(() {
       if (mounted && !_closing) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(tr('文字未发送，请检查控制权限或连接状态'))));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(tr('文字未发送，请检查控制权限或连接状态'))));
       }
     });
     final ViewPreferences viewPrefs = ViewPreferences.load(
@@ -670,7 +676,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(tr('录制失败：{error}', <String, Object?>{'error': error})),
+            content: Text(
+              tr('录制失败：{error}', <String, Object?>{'error': error}),
+            ),
             duration: const Duration(seconds: 5),
           ),
         );
@@ -1014,9 +1022,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!_emergencyActive) {
       return;
     }
-    _emergencyTickets = agent.accessTickets.listen((
-      TunnelAccessTicket ticket,
-    ) {
+    _emergencyTickets = agent.accessTickets.listen((TunnelAccessTicket ticket) {
       if (!mounted || _closing || _reconnecting || _tunnel != agent) {
         return;
       }
@@ -1229,7 +1235,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       // do not briefly show the host's defaults.
       if (_streamCodec != ViewerStreamCodec.auto ||
           _streamQuality != ViewerStreamQuality.high ||
-          _streamMaxFps != 0 || _streamFullColor) {
+          _streamMaxFps != 0 ||
+          _streamFullColor) {
         ++_streamPending;
         try {
           if (!await ViewerBridge.setStreamOptions(
@@ -1674,7 +1681,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             // A preference re-applied after a reconnect was refused; show the
             // values the host actually runs.
             _streamFullColor = status.chroma == 1;
-            _streamCodec = status.codec == 'vp9' ? ViewerStreamCodec.vp9 : status.codec == 'hevc'
+            _streamCodec = status.codec == 'vp9'
+                ? ViewerStreamCodec.vp9
+                : status.codec == 'hevc'
                 ? ViewerStreamCodec.hevc
                 : (status.codec == 'av1'
                       ? ViewerStreamCodec.av1
@@ -1904,6 +1913,52 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             reason.isEmpty
                 ? tr('麦克风已停止')
                 : tr('麦克风已停止：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    }
+    // System audio failures happen asynchronously after video is already up.
+    // Surface them once per new counter/reason/state change instead of making
+    // the operator open the statistics overlay to discover silence.
+    if (!nowOver && viewerAudioFailureRaised(previous, status)) {
+      final String reason = status.audioError;
+      final String prefix = status.audioAnnounced && !status.audioEnabled
+          ? tr('系统音频已停止')
+          : tr('系统音频出现问题');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? prefix
+                : tr('{prefix}：{reason}', <String, Object?>{
+                    'prefix': prefix,
+                    'reason': reason,
+                  }),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    }
+    // Voice call setup is asynchronous. A host refusal, decoder/player setup
+    // failure and a host-initiated close all arrive through voiceError after
+    // the toggle call has already returned successfully.
+    if (!nowOver && viewerVoiceFailureRaised(previous, status)) {
+      final String reason = status.voiceError;
+      final String prefix = previous.voiceEnabled && !status.voiceEnabled
+          ? tr('语音通话已结束')
+          : status.voiceEnabled
+          ? tr('语音通话出现问题')
+          : tr('语音通话未能开启');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? prefix
+                : tr('{prefix}：{reason}', <String, Object?>{
+                    'prefix': prefix,
+                    'reason': reason,
+                  }),
           ),
           duration: const Duration(seconds: 5),
         ),
@@ -2257,11 +2312,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         if (cursor == null || !cursor.visible || image == null) {
           return const SizedBox.shrink();
         }
-        final int width =
-            _status.sourceWidth > 0 ? _status.sourceWidth : _status.width;
-        final int height =
-            _status.sourceHeight > 0 ? _status.sourceHeight : _status.height;
-        if (width <= 0 || height <= 0 || drawn.width <= 0 || drawn.height <= 0) {
+        final int width = _status.sourceWidth > 0
+            ? _status.sourceWidth
+            : _status.width;
+        final int height = _status.sourceHeight > 0
+            ? _status.sourceHeight
+            : _status.height;
+        if (width <= 0 ||
+            height <= 0 ||
+            drawn.width <= 0 ||
+            drawn.height <= 0) {
           return const SizedBox.shrink();
         }
         final double sx = drawn.width / width;
@@ -2468,7 +2528,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   void _setFit(ViewFit fit) {
     setState(() => _fit = fit);
-    ViewPreferences.update(peerId: _prefsPeerId, fit: fit == ViewFit.original ? 1 : 0);
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      fit: fit == ViewFit.original ? 1 : 0,
+    );
   }
 
   void _toggleReverseWheel() {
@@ -2478,7 +2541,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         swapButtons: _mouse.swapButtons,
       ),
     );
-    ViewPreferences.update(peerId: _prefsPeerId, reverseWheel: _mouse.reverseWheel);
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      reverseWheel: _mouse.reverseWheel,
+    );
   }
 
   void _toggleSwapButtons() {
@@ -2488,7 +2554,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         swapButtons: !_mouse.swapButtons,
       ),
     );
-    ViewPreferences.update(peerId: _prefsPeerId, swapButtons: _mouse.swapButtons);
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      swapButtons: _mouse.swapButtons,
+    );
   }
 
   void _toggleStats() {
@@ -2545,7 +2614,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _rememberFileSort(FileBrowserSort sort, bool ascending) {
     _fileBrowserSort = sort;
     _fileBrowserSortAscending = ascending;
-    ViewPreferences.update(peerId: _prefsPeerId, fileSort: sort.index, fileSortAscending: ascending);
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      fileSort: sort.index,
+      fileSortAscending: ascending,
+    );
   }
 
   void _rememberFileBrowserDirectory(String directory) {
@@ -3968,25 +4041,47 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// Adds the display to this connection and opens a view of its existing
   /// decoder. The runner shares the native session without connection secrets.
   Future<void> _openDisplayWindow(int display) async {
-    if (_openingDisplayWindow || !_status.isLive || _closing || _reconnecting) return;
+    if (_openingDisplayWindow || !_status.isLive || _closing || _reconnecting) {
+      return;
+    }
     _openingDisplayWindow = true;
     try {
-      final selected = _displayStreams?.state.streams.map((s) => s.displayIndex).toSet() ?? <int>{};
+      final selected =
+          _displayStreams?.state.streams.map((s) => s.displayIndex).toSet() ??
+          <int>{};
       if (selected.isEmpty) {
         final primary = _status.streamedDisplayIndex ?? _defaultDisplayIndex();
         if (primary >= 0) selected.add(primary);
       }
       selected.add(display);
-      await _selectDisplayStreams(selected.toList(),
-          layout: _displayStreamLayout ?? _DisplayStreamLayout.single);
+      await _selectDisplayStreams(
+        selected.toList(),
+        layout: _displayStreamLayout ?? _DisplayStreamLayout.single,
+      );
       final controller = _displayStreams;
       if (controller == null) return;
       final deadline = DateTime.now().add(const Duration(seconds: 10));
-      while (mounted && !_closing && !_reconnecting && controller == _displayStreams) {
+      while (mounted &&
+          !_closing &&
+          !_reconnecting &&
+          controller == _displayStreams) {
         await controller.refresh();
-        if (!mounted || _closing || _reconnecting || controller != _displayStreams) return;
-        final stream = controller.state.streams.where((s) => s.displayIndex == display).firstOrNull;
-        if (stream != null && await DisplayStreamBridge.openWindow(stream.streamId, peerId: _prefsPeerId)) return;
+        if (!mounted ||
+            _closing ||
+            _reconnecting ||
+            controller != _displayStreams) {
+          return;
+        }
+        final stream = controller.state.streams
+            .where((s) => s.displayIndex == display)
+            .firstOrNull;
+        if (stream != null &&
+            await DisplayStreamBridge.openWindow(
+              stream.streamId,
+              peerId: _prefsPeerId,
+            )) {
+          return;
+        }
         if (!controller.busy || DateTime.now().isAfter(deadline)) break;
         await Future<void>.delayed(const Duration(milliseconds: 100));
       }
@@ -3998,8 +4093,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _openingDisplayWindow = false;
     }
     if (!mounted || _closing || _reconnecting) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(tr('无法打开会话窗口'))));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(tr('无法打开会话窗口'))));
   }
 
   /// Fetches the mode list for the streamed output once the session is live.
@@ -4089,8 +4185,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     int? maxFps,
     bool? fullColor,
   }) async {
-    final bool nextFullColor = fullColor ?? (codec != null && codec != ViewerStreamCodec.vp9 ? false : _streamFullColor);
-    final ViewerStreamCodec nextCodec = fullColor == true ? ViewerStreamCodec.vp9 : codec ?? _streamCodec;
+    final bool nextFullColor =
+        fullColor ??
+        (codec != null && codec != ViewerStreamCodec.vp9
+            ? false
+            : _streamFullColor);
+    final ViewerStreamCodec nextCodec = fullColor == true
+        ? ViewerStreamCodec.vp9
+        : codec ?? _streamCodec;
     final ViewerStreamQuality nextQuality = quality ?? _streamQuality;
     final int nextQualityPercent = qualityPercent ?? _streamQualityPercent;
     final int nextFps = maxFps ?? _streamMaxFps;
@@ -4099,7 +4201,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         nextQualityPercent != _streamQualityPercent;
     if (nextCodec == _streamCodec &&
         nextQuality == _streamQuality &&
-        nextFps == _streamMaxFps && nextFullColor == _streamFullColor &&
+        nextFps == _streamMaxFps &&
+        nextFullColor == _streamFullColor &&
         !customPercentChanged) {
       return;
     }
@@ -4127,8 +4230,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         codec: nextCodec.code,
         maxFps: nextFps,
         quality: nextQuality.code,
-        qualityPercent:
-            nextQuality == ViewerStreamQuality.custom ? nextQualityPercent : 0,
+        qualityPercent: nextQuality == ViewerStreamQuality.custom
+            ? nextQualityPercent
+            : 0,
         chroma: nextFullColor ? 1 : 0,
       );
     } on PlatformException {
@@ -4260,28 +4364,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _notifyPermissionChange(int before, ViewerStatus status) {
     final int lost = before & ~status.permissions;
     final int gained = status.permissions & ~before;
-    String names(int mask) {
-      final List<String> parts = <String>[];
-      if ((mask & ViewerPermission.input) != 0) {
-        parts.add(tr('输入控制'));
-      }
-      if ((mask & ViewerPermission.clipboard) != 0) {
-        parts.add(tr('剪贴板'));
-      }
-      if ((mask & ViewerPermission.audio) != 0) {
-        parts.add(tr('音频'));
-      }
-      if ((mask & ViewerPermission.microphone) != 0) {
-        parts.add(tr('麦克风'));
-      }
-      if ((mask & ViewerPermission.privacyMode) != 0) {
-        parts.add(tr('隐私模式'));
-      }
-      if ((mask & ViewerPermission.record) != 0) {
-        parts.add(tr('录制'));
-      }
-      return parts.join('、');
-    }
+    String names(int mask) => viewerPermissionNames(
+      mask,
+      translate: (String source) => tr(source),
+    ).join(AppLanguage.isEnglish ? ', ' : '、');
 
     final String lostNames = names(lost);
     final String gainedNames = names(gained);
@@ -5243,7 +5329,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _changeKeyboardMode(ViewerKeyboardMode mode, {bool persist = true}) async {
+  Future<void> _changeKeyboardMode(
+    ViewerKeyboardMode mode, {
+    bool persist = true,
+  }) async {
     if (_keyboardChanging || mode == _keyboardMode) return;
     _keyboardChanging = true;
     _releaseRemoteInput();
@@ -5252,11 +5341,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       await ViewerBridge.setKeyboardMode(mode);
       if (!mounted || _closing) return;
       setState(() => _keyboardMode = mode);
-      if (persist) ViewPreferences.update(peerId: _prefsPeerId, keyboardMode: mode.name);
+      if (persist) {
+        ViewPreferences.update(peerId: _prefsPeerId, keyboardMode: mode.name);
+      }
     } on PlatformException catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.message ?? tr('无法切换键盘模式'))));
+          SnackBar(content: Text(error.message ?? tr('无法切换键盘模式'))),
+        );
       }
     } finally {
       _keyboardChanging = false;
@@ -5299,9 +5391,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (enable && _keyboardMode == ViewerKeyboardMode.local && !captured) {
         if (!_localKeyboardUnavailable) {
           _localKeyboardUnavailable = true;
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(tr('本地输入法未启用，请重新聚焦画面或切换物理按键')),
-          ));
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(tr('本地输入法未启用，请重新聚焦画面或切换物理按键'))),
+          );
         }
       } else if (captured || _keyboardMode != ViewerKeyboardMode.local) {
         _localKeyboardUnavailable = false;
@@ -5315,10 +5407,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       setState(() {
         _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
         _statsVisible = prefs.stats;
-        _mouse = MouseMapping(reverseWheel: prefs.reverseWheel, swapButtons: prefs.swapButtons);
+        _mouse = MouseMapping(
+          reverseWheel: prefs.reverseWheel,
+          swapButtons: prefs.swapButtons,
+        );
       });
       final mode = viewerKeyboardModeFromName(prefs.keyboardMode);
-      if (mode != _keyboardMode) unawaited(_changeKeyboardMode(mode, persist: false));
+      if (mode != _keyboardMode) {
+        unawaited(_changeKeyboardMode(mode, persist: false));
+      }
     }
     if (!_focus.hasPrimaryFocus && _inputActive) _releaseRemoteInput();
     _setKeyCapture(_inputActive && _focus.hasPrimaryFocus);
@@ -5991,8 +6088,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onCursorHintPress: _onCursorHintPress,
                       onCursorHintExit: _hideCursorHint,
                       onFocusRequested: _focus.requestFocus,
-                      overlayBuilder:
-                          _inputActive ? null : _buildRemoteCursorOverlay,
+                      overlayBuilder: _inputActive
+                          ? null
+                          : _buildRemoteCursorOverlay,
                     ),
                   )
                 else
@@ -6105,8 +6203,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         streamOptionsAvailable: _status.isLive,
                         streamCodec: _streamCodec,
                         streamFullColor: _streamFullColor,
-                        streamActualFormat: "${_status.codec.toUpperCase()} · ${_status.chroma == 1 ? '4:4:4' : '4:2:0'}",
-                        onSelectStreamFullColor: (value) => unawaited(_changeStreamOptions(fullColor: value)),
+                        streamActualFormat:
+                            "${_status.codec.toUpperCase()} · ${_status.chroma == 1 ? '4:4:4' : '4:2:0'}",
+                        onSelectStreamFullColor: (value) =>
+                            unawaited(_changeStreamOptions(fullColor: value)),
                         streamQuality: _streamQuality,
                         streamQualityPercent: _streamQualityPercent,
                         streamMaxFps: _streamMaxFps,
@@ -6114,15 +6214,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_changeStreamOptions(codec: codec)),
                         onSelectStreamQuality: (ViewerStreamQuality quality) =>
                             unawaited(_changeStreamOptions(quality: quality)),
-                        onSelectStreamQualityPercent: (int percent) => unawaited(
-                            _changeStreamOptions(
+                        onSelectStreamQualityPercent: (int percent) =>
+                            unawaited(
+                              _changeStreamOptions(
                                 quality: ViewerStreamQuality.custom,
-                                qualityPercent: percent)),
+                                qualityPercent: percent,
+                              ),
+                            ),
                         onSelectStreamFps: (int fps) =>
                             unawaited(_changeStreamOptions(maxFps: fps)),
                         onToggleControl: _toggleControl,
                         keyboardMode: _keyboardMode,
-                        onKeyboardMode: (mode) => unawaited(_changeKeyboardMode(mode)),
+                        onKeyboardMode: (mode) =>
+                            unawaited(_changeKeyboardMode(mode)),
                         reverseWheel: _mouse.reverseWheel,
                         swapButtons: _mouse.swapButtons,
                         onToggleReverseWheel: _toggleReverseWheel,
@@ -6608,8 +6712,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                                       _fileBrowserSortAscending,
                                   initialShowHidden: _fileBrowserShowHidden,
                                   onSortChanged: _rememberFileSort,
-                                  onShowHiddenChanged:
-                                      _rememberFileShowHidden,
+                                  onShowHiddenChanged: _rememberFileShowHidden,
                                   onClose: _leave,
                                 );
                               },
@@ -7635,9 +7738,9 @@ class _EmergencyAccessDialogState extends State<_EmergencyAccessDialog> {
       if (!mounted) {
         return;
       }
-      Navigator.of(context).pop(
-        _EmergencyAccessResult(token: login.token, reason: reason),
-      );
+      Navigator.of(
+        context,
+      ).pop(_EmergencyAccessResult(token: login.token, reason: reason));
     } on ServerApiException catch (error) {
       if (!mounted) {
         return;
@@ -7661,7 +7764,9 @@ class _EmergencyAccessDialogState extends State<_EmergencyAccessDialog> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
               Text(
-                tr('受限设备拒绝普通账号时，管理员可为本次连接签发 60 秒应急票据。操作会记录管理员身份和填写的原因，且仍受设备权限上限与主机本地认证约束。'),
+                tr(
+                  '受限设备拒绝普通账号时，管理员可为本次连接签发 60 秒应急票据。操作会记录管理员身份和填写的原因，且仍受设备权限上限与主机本地认证约束。',
+                ),
                 style: const TextStyle(
                   color: Colors.white54,
                   fontSize: 12,

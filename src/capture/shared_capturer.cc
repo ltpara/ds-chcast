@@ -96,11 +96,11 @@ public:
             }
             if (result == CaptureResult::NoNewFrame) return result;
             const auto& incoming = source_->capture->frame();
-            if (incoming.cpu_bgra && !external_) {
+            if (incoming.cpu_bgra) {
                 source_->frame = incoming;
                 source_->cursor = source_->capture->cursor();
                 ++source_->sequence;
-                ++source_->desktop_sequence;
+                if (incoming.desktop_updated) ++source_->desktop_sequence;
             } else {
                 if (!incoming.texture) return CaptureResult::NoNewFrame;
                 // A pointer-only wake leaves the desktop image untouched. Keeping
@@ -119,7 +119,7 @@ public:
                 ++source_->sequence;
             }
         }
-        if (source_->frame.cpu_bgra && !external_) {
+        if (source_->frame.cpu_bgra) {
             frame_ = source_->frame;
             frame_.nv12_width = (std::max)(2u, (frame_.width * percent_ + 50) / 100) & ~1u;
             frame_.nv12_height = (std::max)(2u, (frame_.height * percent_ + 50) / 100) & ~1u;

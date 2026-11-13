@@ -2359,16 +2359,14 @@ class ViewerBridge {
     int qualityPercent = 0,
     int chroma = 0,
   }) async {
-    final bool? queued = await _channel.invokeMethod<bool>(
-      'setStreamOptions',
-      <String, Object>{
-        'codec': codec,
-        'maxFps': maxFps,
-        'quality': quality,
-        'qualityPercent': qualityPercent,
-        'chroma': chroma,
-      },
-    );
+    final bool? queued = await _channel
+        .invokeMethod<bool>('setStreamOptions', <String, Object>{
+          'codec': codec,
+          'maxFps': maxFps,
+          'quality': quality,
+          'qualityPercent': qualityPercent,
+          'chroma': chroma,
+        });
     return queued ?? false;
   }
 
@@ -2880,8 +2878,10 @@ class ViewerBridge {
   /// [decision] is 0 skip, 1 overwrite, 2 cancel; [remember] keeps skip or
   /// overwrite for the rest of the queue. Returns false when there is no
   /// conflict to answer.
-  static Future<bool> answerFileConflict(int decision,
-      {bool remember = false}) async {
+  static Future<bool> answerFileConflict(
+    int decision, {
+    bool remember = false,
+  }) async {
     final answered = await _channel.invokeMethod<bool>('answerFileConflict', {
       'decision': decision,
       'remember': remember,
@@ -3356,6 +3356,7 @@ abstract final class ViewerPermission {
   // The host's consent to a local recording of the received stream; advisory,
   // because the host cannot see or stop the recording itself.
   static const int record = 0x0200;
+  static const int camera = 0x0400;
   static const int restart = 0x0800;
   static const int blockInput = 0x1000;
   // The host lets the viewer type its OS password at a logon or lock screen.

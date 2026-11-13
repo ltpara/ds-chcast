@@ -726,6 +726,81 @@ void subscriber_queue_age() {
     check(state->wrong_thread == 0, "age recovery keeps GPU operations on the source thread");
 }
 
+void staggered_keyframes_merge() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto viewer = pool.subscribe(L"idr-merge", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe the keyframe merge viewer");
+    frame(*viewer);
+    EncoderConfig config;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "start the keyframe merge encoder");
+    auto drain = [&](std::chrono::milliseconds span) {
+        const auto deadline = std::chrono::steady_clock::now() + span;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (viewer->capture(5ms) != CaptureResult::Frame) continue;
+            std::vector<EncodedPacket> packets;
+            check(encoder->encode(nullptr, 0, false, packets).ok(),
+                  "the merge viewer drains normally");
+        }
+    };
+    // Let the initial IDR age out so the first explicit request is immediate.
+    drain(200ms);
+    const unsigned before = state->idrs.load();
+    // Independent recoveries can ask on nearby ticks. One shared IDR should
+    // serve all of them instead of an IDR for every request.
+    for (int i = 0; i < 4; ++i) {
+        DesktopStreamPool::request_keyframe(*viewer);
+        drain(45ms);
+    }
+    drain(250ms);
+    const unsigned added = state->idrs.load() - before;
+    check(added >= 1 && added < 4,
+          "staggered keyframe requests share one merged IDR");
+    std::vector<EncodedPacket> packets;
+    frame(*viewer);
+    check(encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty(),
+          "the merge viewer receives the merged IDR");
+    encoder.reset(); viewer.reset();
+}
+
+void deferred_keyframe_on_static_desktop() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    std::string error;
+    auto viewer = pool.subscribe(L"deferred-static", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe the deferred static viewer");
+    frame(*viewer);
+    EncoderConfig config;
+    config.codec = VideoCodec::Av1;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr && encoder->codec() == VideoCodec::Av1,
+          "start the deferred static encoder");
+    std::vector<EncodedPacket> packets;
+    check(encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty() &&
+              packets.front().idr,
+          "consume the initial static IDR");
+    DesktopStreamPool::request_keyframe(*viewer);
+    frame(*viewer);
+    packets.clear();
+    check(encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty() &&
+              packets.front().idr,
+          "a deferred static keyframe is promoted without a desktop change");
+    encoder.reset(); viewer.reset();
+}
+
 void slow_encode_is_not_queue_wait() {
     DesktopStreamPool pool;
     auto state = std::make_shared<host_test::MediaState>();
@@ -970,6 +1045,8 @@ int main() {
         global_codec_voting();
         static_refresh_budget();
         subscriber_queue_age();
+        staggered_keyframes_merge();
+        deferred_keyframe_on_static_desktop();
         slow_encode_is_not_queue_wait();
         slow_viewer_backpressure();
         {

@@ -84,7 +84,13 @@ private:
     // earlier one (a degraded rotation and a missing NV12 pass can both happen).
     void note(const Error& err);
     Error run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out, HANDLE* shared_out,
-                     bool* rotation_failed, bool* hdr_failed, bool* fp16_without_hdr);
+                     bool* rotation_failed, bool* hdr_failed, bool* fp16_without_hdr,
+                     bool* cpu_rotated);
+    // Reads the post-HDR BGRA texture back and rotates it into screen
+    // orientation. The result is an immutable cpu_bgra image, so the
+    // duplication surface can be released before the frame is published.
+    Error rotate_cpu(ID3D11Texture2D* source);
+    bool needs_cpu_rotation() const;
     Error run_nv12(ID3D11Texture2D* source);
     void release_nv12();
     // Builds the rotation pass for the current rotation and sizes. Rebuilding
@@ -95,9 +101,8 @@ private:
     // the stages currently publish, scaled by nv12_percent_. A no-op when NV12
     // is not configured; returns the failure that left the pass not-ready.
     Error create_nv12_pass();
-    // Size of the texture the stages publish: screen-space when the video
-    // processor rotates, panel-native when the encoder has to carry the
-    // rotation itself.
+    // Size of the image the stages publish. Both GPU and CPU rotation produce
+    // screen-space pixels, so this is the display's reported mode size.
     void published_size(UINT& width, UINT& height) const;
     void pump_cursor(const DXGI_OUTDUPL_FRAME_INFO& info);
     void publish_common(ID3D11Texture2D* texture, bool desktop_updated,
@@ -336,9 +341,8 @@ Error DxgiCapturer::initialize() {
     frame_.height = screen_height_;
     frame_.format = DXGI_FORMAT_B8G8R8A8_UNORM;
     frame_.adapter_luid = display_.adapter_luid;
-    // Non-zero only when the GPU could not rotate; the encoder then carries
-    // it while consuming the unrotated texture.
-    frame_.rotation_degrees = rotation_pass_.ready() ? 0 : detail::rotation_degrees(rotation_);
+    // Both the GPU pass and the CPU fallback publish screen-oriented pixels.
+    frame_.rotation_degrees = 0;
     // A fresh duplication's first acquired frame holds the whole desktop, but
     // DXGI reports it with LastPresentTime zero; force it through the stages so
     // the first Frame is never a null texture.
@@ -347,16 +351,15 @@ Error DxgiCapturer::initialize() {
 }
 
 void DxgiCapturer::published_size(UINT& width, UINT& height) const {
-    // With a rotation pass the stages publish the rotated (screen-space)
-    // image; without one they pass the panel-native surface through and the
-    // encoder rotates, so NV12 must match that surface instead.
-    if (rotation_pass_.ready()) {
-        width = screen_width_;
-        height = screen_height_;
-    } else {
-        width = surface_width_;
-        height = surface_height_;
-    }
+    // The GPU rotation pass and the CPU readback fallback both publish the
+    // display in screen orientation.
+    width = screen_width_;
+    height = screen_height_;
+}
+
+bool DxgiCapturer::needs_cpu_rotation() const {
+    return rotation_ != DXGI_MODE_ROTATION_IDENTITY &&
+           rotation_ != DXGI_MODE_ROTATION_UNSPECIFIED && !rotation_pass_.ready();
 }
 
 void DxgiCapturer::create_rotation_pass() {
@@ -377,6 +380,13 @@ void DxgiCapturer::create_rotation_pass() {
 Error DxgiCapturer::create_nv12_pass() {
     nv12_pass_.reset();
     if (!config_.nv12.enabled) {
+        return Error::success();
+    }
+    if (needs_cpu_rotation()) {
+        // A CPU-rotated frame has no GPU texture for the video processor to
+        // consume. Keep the BGRA image available to the software VP9 path
+        // instead of advertising an NV12 image that cannot match it.
+        release_nv12();
         return Error::success();
     }
     UINT width = 0;
@@ -585,8 +595,7 @@ Error DxgiCapturer::re_duplicate_without_hdr() {
     // for it instead of letting the old rotation output and the new NV12 target
     // disagree.
     create_rotation_pass();
-    frame_.rotation_degrees =
-        rotation_pass_.ready() ? 0 : detail::rotation_degrees(rotation_);
+    frame_.rotation_degrees = 0;
     const Error nv12 = create_nv12_pass();
     if (!nv12.ok()) {
         note(nv12);
@@ -603,6 +612,8 @@ Error DxgiCapturer::re_duplicate_without_hdr() {
     // the old desktop) is stale too.
     frame_.texture = nullptr;
     frame_.shared_handle = nullptr;
+    frame_.cpu_bgra.reset();
+    frame_.cpu_image = false;
     release_nv12();
     frame_dirty_ = true;
     return Error::success();
@@ -630,6 +641,15 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
 
     const bool desktop_changed = info.AccumulatedFrames > 0 && info.LastPresentTime.QuadPart != 0;
     if (!desktop_changed && !frame_dirty_) {
+        if (frame_.cpu_bgra) {
+            // The CPU image is immutable. A pointer-only wake can release the
+            // duplication surface immediately and republish that retained
+            // image without replacing it with the unrotated desktop texture.
+            release_frame();
+            publish_common(nullptr, /*desktop_updated=*/false, nullptr);
+            frame_.nv12_updated = false;
+            return CaptureResult::Frame;
+        }
         // The pointer moved over an otherwise static desktop. A texture this
         // capturer owns (a stage output) still holds the newest image, so it
         // is republished; a pass-through frame was the previous duplication
@@ -659,8 +679,9 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
     bool rotation_failed = false;
     bool hdr_failed = false;
     bool fp16_without_hdr = false;
+    bool cpu_rotated = false;
     Error err = run_stages(desktop.get(), &staged, &staged_handle, &rotation_failed, &hdr_failed,
-                           &fp16_without_hdr);
+                           &fp16_without_hdr, &cpu_rotated);
     if (!err.ok()) {
         last_error_ = err;
         const bool permanent = detail::stage_failure_is_permanent(err.status());
@@ -682,39 +703,48 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
         }
         if (permanent && rotation_failed) {
             // The video processor can no longer rotate this surface (the mode
-            // or format changed under it). Fall back to publishing the
-            // unrotated image with rotation_degrees set, the same contract the
-            // capturer uses when the device has no rotation caps, instead of
-            // failing every frame.
+            // or format changed under it). Retry the same acquired frame
+            // through the CPU fallback so this wake produces a usable picture
+            // instead of being lost.
             rotation_pass_ = detail::RotationPass{};
-            frame_.rotation_degrees = detail::rotation_degrees(rotation_);
+            frame_.rotation_degrees = 0;
+            nv12_pass_.reset();
+            release_nv12();
+            frame_dirty_ = true;
+            staged = nullptr;
+            staged_handle = nullptr;
+            rotation_failed = false;
+            hdr_failed = false;
+            fp16_without_hdr = false;
+            cpu_rotated = false;
+            err = run_stages(desktop.get(), &staged, &staged_handle, &rotation_failed,
+                             &hdr_failed, &fp16_without_hdr, &cpu_rotated);
+            if (!err.ok()) {
+                last_error_ = err;
+                release_frame();
+                frame_.texture = nullptr;
+                frame_.shared_handle = nullptr;
+                frame_.cpu_bgra.reset();
+                frame_.cpu_image = false;
+                release_nv12();
+                frame_dirty_ = true;
+                return needs_reinit(err.status()) ? CaptureResult::ReinitNeeded
+                                                  : CaptureResult::FatalError;
+            }
+        } else {
             release_frame();
+            // The publishable texture may have been the duplication surface,
+            // which ReleaseFrame just invalidated; the NV12 copy was made from
+            // it in an earlier frame and is equally stale.
             frame_.texture = nullptr;
             frame_.shared_handle = nullptr;
+            frame_.cpu_bgra.reset();
+            frame_.cpu_image = false;
             release_nv12();
-            const Error nv12 = create_nv12_pass();
-            if (!nv12.ok()) {
-                note(nv12);
-            }
             frame_dirty_ = true;
-            return CaptureResult::NoNewFrame;
+            return needs_reinit(err.status()) ? CaptureResult::ReinitNeeded
+                                              : CaptureResult::FatalError;
         }
-        release_frame();
-        // The publishable texture may have been the duplication surface, which
-        // ReleaseFrame just invalidated; the NV12 copy was made from it in an
-        // earlier frame and is equally stale.
-        frame_.texture = nullptr;
-        frame_.shared_handle = nullptr;
-        frame_.nv12_texture = nullptr;
-        frame_.nv12_shared_handle = nullptr;
-        frame_.nv12_width = 0;
-        frame_.nv12_height = 0;
-        frame_.nv12_surface_width = 0;
-        frame_.nv12_surface_height = 0;
-        frame_.nv12_updated = false;
-        frame_dirty_ = true;
-        return needs_reinit(err.status()) ? CaptureResult::ReinitNeeded
-                                                   : CaptureResult::FatalError;
     }
 
     // A stage output is a texture we own and survives the release; a direct
@@ -727,7 +757,7 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
     // duplication surface. It writes its own texture, so it does not affect
     // whether the frame can be released.
     frame_.nv12_updated = false;
-    if (nv12_pass_) {
+    if (nv12_pass_ && !cpu_rotated) {
         const Error nv12 = run_nv12(staged);
         if (!nv12.ok()) {
             note(nv12);
@@ -843,12 +873,13 @@ void DxgiCapturer::release_frame() {
 
 Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
                                HANDLE* shared_out, bool* rotation_failed, bool* hdr_failed,
-                               bool* fp16_without_hdr) {
+                               bool* fp16_without_hdr, bool* cpu_rotated) {
     *out = nullptr;
     *shared_out = nullptr;
     *rotation_failed = false;
     *hdr_failed = false;
     *fp16_without_hdr = false;
+    *cpu_rotated = false;
     D3D11_TEXTURE2D_DESC desc{};
     desktop->GetDesc(&desc);
     ID3D11Texture2D* current = desktop;
@@ -887,7 +918,17 @@ Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
         }
         *shared_out = hdr_pass_->shared_handle();
     }
-    *out = current;
+
+    if (needs_cpu_rotation()) {
+        const Error err = rotate_cpu(current);
+        if (!err.ok()) {
+            return err;
+        }
+        *shared_out = nullptr;
+        *cpu_rotated = true;
+    } else {
+        *out = current;
+    }
 
     // Advanced Color can be toggled without losing the duplication. Re-read
     // the state (rate-limited) so a desktop that turned HDR on or off is
@@ -899,6 +940,58 @@ Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
             color_ = fresh;
         }
     }
+    return Error::success();
+}
+
+Error DxgiCapturer::rotate_cpu(ID3D11Texture2D* source) {
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        return Error(Status::Unsupported, "CPU rotation needs a BGRA8 frame");
+    }
+
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    Error err = check(device_->CreateTexture2D(&staging_desc, nullptr, staging.put()),
+                      "CreateTexture2D(rotation readback)");
+    if (!err.ok()) {
+        return err;
+    }
+    context_->CopyResource(staging.get(), source);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT hr = context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        return check(hr, "Map(rotation readback)");
+    }
+
+    std::vector<uint8_t> rotated;
+    UINT rotated_width = 0;
+    UINT rotated_height = 0;
+    const bool rotated_ok =
+        detail::rotate_bgra(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
+                            desc.Width, desc.Height, rotation_, &rotated, &rotated_width,
+                            &rotated_height);
+    context_->Unmap(staging.get(), 0);
+    if (!rotated_ok) {
+        return Error(Status::Unsupported, "CPU rotation failed for the captured BGRA frame");
+    }
+
+    frame_.cpu_bgra =
+        std::make_shared<const std::vector<uint8_t>>(std::move(rotated));
+    frame_.cpu_image = false;
+    frame_.texture = nullptr;
+    frame_.shared_handle = nullptr;
+    frame_.width = rotated_width;
+    frame_.height = rotated_height;
+    frame_.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    frame_.rotation_degrees = 0;
+    frame_.nv12_width = scaled_even(rotated_width, nv12_percent_);
+    frame_.nv12_height = scaled_even(rotated_height, nv12_percent_);
     return Error::success();
 }
 
@@ -923,6 +1016,9 @@ void DxgiCapturer::publish_common(ID3D11Texture2D* texture, bool desktop_updated
     frame_.texture = texture;
     frame_.shared_handle = shared_handle;
     if (texture) {
+        frame_.cpu_bgra.reset();
+        frame_.cpu_image = false;
+        frame_.rotation_degrees = 0;
         D3D11_TEXTURE2D_DESC desc{};
         texture->GetDesc(&desc);
         frame_.width = desc.Width;
@@ -948,7 +1044,8 @@ void DxgiCapturer::publish_cursor() {
     // rotated panel is the unrotated one; the published texture has the
     // rotation applied, so the position follows it.
     cursor_.position = decoded.position();
-    if (rotation_pass_.ready()) {
+    if (rotation_ != DXGI_MODE_ROTATION_IDENTITY &&
+        rotation_ != DXGI_MODE_ROTATION_UNSPECIFIED) {
         cursor_.position = detail::surface_to_output(decoded.position(), surface_width_,
                                                      surface_height_, rotation_);
     }
@@ -983,6 +1080,12 @@ void DxgiCapturer::publish_cursor() {
 void DxgiCapturer::clear_public_state() {
     frame_.texture = nullptr;
     frame_.shared_handle = nullptr;
+    frame_.cpu_bgra.reset();
+    frame_.cpu_image = false;
+    frame_.width = 0;
+    frame_.height = 0;
+    frame_.format = DXGI_FORMAT_UNKNOWN;
+    frame_.rotation_degrees = 0;
     frame_.desktop_updated = true;
     frame_.nv12_texture = nullptr;
     frame_.nv12_shared_handle = nullptr;

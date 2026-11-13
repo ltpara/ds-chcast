@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "capture/detail.h"
+#include "capture/rotation.h"
 #include "capture/shader.h"
 
 using chast::ComPtr;
@@ -214,6 +215,70 @@ void test_hdr(ID3D11Device* device, ID3D11DeviceContext* context) {
     check_near(pixel(image, 2, 0)[2], 187, 2, "1.0 at white level 2000 becomes 187");
 }
 
+void test_cpu_rotation() {
+    constexpr UINT kWidth = 4;
+    constexpr UINT kHeight = 2;
+    constexpr UINT kPitch = kWidth * 4 + 8;
+    std::vector<uint8_t> source(static_cast<size_t>(kPitch) * kHeight, 0xcc);
+    for (UINT y = 0; y < kHeight; ++y) {
+        for (UINT x = 0; x < kWidth; ++x) {
+            uint8_t* p = source.data() + static_cast<size_t>(y) * kPitch + x * 4;
+            p[0] = static_cast<uint8_t>(16 + x * 32 + y);
+            p[1] = static_cast<uint8_t>(64 + x * 16 + y * 8);
+            p[2] = static_cast<uint8_t>(128 + x * 8 + y * 32);
+            p[3] = static_cast<uint8_t>(200 + x + y);
+        }
+    }
+
+    const struct {
+        DXGI_MODE_ROTATION rotation;
+        UINT width;
+        UINT height;
+        const char* dimensions;
+    } cases[] = {
+        {DXGI_MODE_ROTATION_ROTATE90, kHeight, kWidth,
+         "CPU rotation 90 swaps the frame dimensions"},
+        {DXGI_MODE_ROTATION_ROTATE180, kWidth, kHeight,
+         "CPU rotation 180 keeps the frame dimensions"},
+        {DXGI_MODE_ROTATION_ROTATE270, kHeight, kWidth,
+         "CPU rotation 270 swaps the frame dimensions"},
+    };
+    for (const auto& c : cases) {
+        std::vector<uint8_t> rotated;
+        UINT width = 0;
+        UINT height = 0;
+        const bool ok = chast::detail::rotate_bgra(source.data(), kPitch, kWidth, kHeight,
+                                                   c.rotation, &rotated, &width, &height);
+        check(ok && width == c.width && height == c.height, c.dimensions);
+        if (!ok || width != c.width || height != c.height) {
+            continue;
+        }
+
+        bool pixels_match = true;
+        for (UINT y = 0; y < kHeight && pixels_match; ++y) {
+            for (UINT x = 0; x < kWidth; ++x) {
+                const POINT dst =
+                    chast::detail::surface_to_output(POINT{static_cast<LONG>(x),
+                                                          static_cast<LONG>(y)},
+                                                     kWidth, kHeight, c.rotation);
+                const uint8_t* expected =
+                    source.data() + static_cast<size_t>(y) * kPitch + x * 4;
+                const uint8_t* actual =
+                    rotated.data() + (static_cast<size_t>(dst.y) * width + dst.x) * 4;
+                if (std::memcmp(expected, actual, 4) != 0) {
+                    pixels_match = false;
+                    break;
+                }
+            }
+        }
+        check(pixels_match, "CPU rotation maps every source pixel to screen space");
+    }
+
+    const D3D11_BOX dst = chast::detail::destination_box(5, 7, kWidth, kHeight);
+    check(dst.left == 5 && dst.top == 7 && dst.right == 9 && dst.bottom == 9,
+          "CPU upload keeps a child's non-zero merged-canvas offset");
+}
+
 void test_rotation(ID3D11Device* device, ID3D11DeviceContext* context) {
     // Four quadrants so a rotation is distinguishable from a flip or a copy:
     // top-left red, top-right green, bottom-left blue, bottom-right white.
@@ -368,6 +433,7 @@ void test_nv12_scale(ID3D11Device* device, ID3D11DeviceContext* context) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    test_cpu_rotation();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     if (!create_device(&device, &context)) {

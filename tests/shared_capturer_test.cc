@@ -118,11 +118,38 @@ void cpu_readers() {
           "a CPU-only reader scales without changing another reader's image");
 }
 
+// Merged capture runs child readers on the compositor's GPU device. A CPU-only
+// child must still cross the shared-reader boundary as immutable BGRA so the
+// compositor can upload it at that child's layout offset.
+void merged_cpu_reader() {
+    const std::vector<chast::DisplayInfo> displays = chast::enumerate_displays();
+    if (displays.empty()) {
+        skip("merged CPU capture needs an attached output");
+        return;
+    }
+    chast::CaptureConfig config;
+    config.backend = chast::CaptureBackend::GdiCpu;
+    config.nv12.enabled = true;
+    config.capture_cursor = false;
+    std::string error;
+    std::unique_ptr<chast::IDxgiCapturer> merged =
+        chast::create_merged_capturer({displays[0]}, config, &error);
+    if (!merged) {
+        const std::string reason = "merged CPU capture unavailable: " + error;
+        skip(reason.c_str());
+        return;
+    }
+    check(frame(*merged), "merged capture consumes an external CPU child frame");
+    check(merged->frame().texture && merged->frame().nv12_texture &&
+              !merged->frame().cpu_bgra,
+          "the merged canvas uploads CPU child pixels before NV12 conversion");
+}
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     run();
     cpu_readers();
+    merged_cpu_reader();
     return failures ? 1 : 0;
 }

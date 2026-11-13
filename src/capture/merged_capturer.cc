@@ -20,6 +20,7 @@
 #endif
 
 #include "capture/detail.h"
+#include "capture/rotation.h"
 #include "chast/capture.h"
 
 #include <algorithm>
@@ -404,9 +405,23 @@ bool MergedCapturer::composite(Child& child, const FrameInfo& frame) {
         static_cast<uint64_t>(child.offset_y) + frame.height > canvas_height_) {
         return false;
     }
-    const D3D11_BOX box{0, 0, 0, frame.width, frame.height, 1};
+    if (frame.cpu_bgra) {
+        // A child whose GPU rotation failed publishes screen-oriented BGRA in
+        // system memory. Upload only that child's rectangle into the otherwise
+        // GPU-resident merged canvas so the final NV12 path is unchanged.
+        const D3D11_BOX dest_box =
+            detail::destination_box(static_cast<UINT>(child.offset_x),
+                                   static_cast<UINT>(child.offset_y), frame.width, frame.height);
+        context_->UpdateSubresource(canvas_.get(), 0, &dest_box, frame.cpu_bgra->data(),
+                                    frame.width * 4, 0);
+        return true;
+    }
+    // CopySubresourceRegion takes the destination offset separately. Its source
+    // box must stay relative to the child texture, not the merged canvas.
+    const D3D11_BOX source_box{0, 0, 0, frame.width, frame.height, 1};
     context_->CopySubresourceRegion(canvas_.get(), 0, static_cast<UINT>(child.offset_x),
-                                    static_cast<UINT>(child.offset_y), 0, frame.texture, 0, &box);
+                                    static_cast<UINT>(child.offset_y), 0, frame.texture, 0,
+                                    &source_box);
     return true;
 }
 
@@ -423,7 +438,8 @@ CaptureResult MergedCapturer::handle_child(size_t index, CaptureResult result, b
                                     name + " needs a CPU rotation, which a merged view cannot do");
                 return CaptureResult::FatalError;
             }
-            if (!captured.texture || captured.format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+            if (!captured.cpu_bgra &&
+                (!captured.texture || captured.format != DXGI_FORMAT_B8G8R8A8_UNORM)) {
                 last_error_ =
                     Error(Status::CaptureFailed, name + " produced no BGRA8 frame");
                 return CaptureResult::FatalError;
