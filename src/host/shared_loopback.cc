@@ -1,10 +1,35 @@
 #include "host/shared_loopback.h"
+#include <chrono>
 #include <deque>
 
 namespace chast {
 namespace {
+
+// A stalled reader must not replay half a second of old sound when it
+// resumes. The packet cap bounds bytes; this bounds age, which is what the
+// far side actually experiences as latency.
+constexpr uint64_t kMaxQueuedAudioAgeMs = 500;
+
+uint64_t steady_now_ms() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+
+uint64_t drop_stale(std::deque<EncodedAudio>& packets, uint64_t now) {
+    uint64_t dropped = 0;
+    while (!packets.empty() && now > packets.front().capture_ms &&
+           now - packets.front().capture_ms > kMaxQueuedAudioAgeMs) {
+        packets.pop_front();
+        ++dropped;
+    }
+    return dropped;
+}
+
 struct AudioSubscription {
     std::deque<EncodedAudio> packets;
+    uint64_t dropped = 0;
+    uint64_t stale_dropped = 0;
     bool active = false;
 };
 }
@@ -41,16 +66,23 @@ public:
         if (sub_->packets.empty()) {
             EncodedAudio next;
             if (source_->capture->take_packet(next)) {
+                const uint64_t now = steady_now_ms();
                 for (auto it = source_->subscribers.begin(); it != source_->subscribers.end();) {
                     auto sub = it->lock();
                     if (!sub) { it = source_->subscribers.erase(it); continue; }
                     ++it;
                     if (!sub->active) continue;
-                    if (sub->packets.size() >= 25) sub->packets.pop_front();
+                    sub->stale_dropped += drop_stale(sub->packets, now);
+                    if (sub->packets.size() >= 25) {
+                        sub->packets.pop_front();
+                        ++sub->dropped;
+                    }
                     sub->packets.push_back(next);
                 }
             }
         }
+        if (sub_->packets.empty()) return false;
+        sub_->stale_dropped += drop_stale(sub_->packets, steady_now_ms());
         if (sub_->packets.empty()) return false;
         packet = std::move(sub_->packets.front());
         sub_->packets.pop_front();
@@ -70,7 +102,10 @@ public:
     }
     AudioCaptureStats stats() const override {
         std::lock_guard<std::mutex> lock(source_->mutex);
-        return source_->capture->stats();
+        AudioCaptureStats stats = source_->capture->stats();
+        stats.dropped += sub_->dropped;
+        stats.stale_dropped += sub_->stale_dropped;
+        return stats;
     }
 private:
     std::shared_ptr<Source> source_;

@@ -4,12 +4,14 @@
 // processed in endpoint-sized blocks. No device, no network, deterministic.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "chast/audio.h"
@@ -203,6 +205,107 @@ void test_echo_cancellation() {
     }
 }
 
+void test_reference_producers() {
+    auto reference = std::make_shared<chast::AudioReference>();
+    reference->acquire();
+    check(reference->active(), "a producer acquisition activates the reference");
+    reference->acquire();
+    reference->release();
+    check(reference->active(), "one producer leaving keeps a shared reference alive");
+    reference->release();
+    check(!reference->active(), "the last producer release deactivates the reference");
+
+    // Two players on one reference must mix at the same playhead instead of
+    // appending one behind the other.
+    reference->acquire();
+    const int64_t now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    std::vector<int16_t> first(kRate / 10, 1000);   // 100 ms
+    std::vector<int16_t> second(first.size(), 2000);
+    reference->push_rendered(first.data(), first.size(), 1, now);
+    reference->push_rendered(second.data(), second.size(), 1, now);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::vector<int16_t> mixed(960 * 2);
+    const bool read = reference->read_delayed_frames(960, 0, mixed.data());
+    bool sum_ok = read;
+    for (size_t frame = 0; frame < 960; ++frame) {
+        sum_ok = sum_ok && mixed[frame * 2] == 3000 && mixed[frame * 2 + 1] == 3000;
+    }
+    check(sum_ok, "concurrent producers are mixed on one timed reference");
+
+    reference->release();
+
+    // The ring wraps every two seconds. A producer arriving with a timestamp
+    // that maps onto an old lap must replace that slot, not mix stale audio
+    // into the new playhead.
+    auto wrapped_reference = std::make_shared<chast::AudioReference>();
+    wrapped_reference->acquire();
+    std::vector<int16_t> stale(kRate / 5, 4000);
+    std::vector<int16_t> current(kRate / 5, 2000);
+    wrapped_reference->push_rendered(stale.data(), stale.size(), 1, now);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2050));
+    const int64_t later = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    wrapped_reference->push_rendered(current.data(), current.size(), 1, later);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool wrap_read =
+        wrapped_reference->read_delayed_frames(960, 0, mixed.data());
+    bool wrap_ok = wrap_read;
+    for (size_t frame = 0; wrap_ok && frame < 960; ++frame) {
+        wrap_ok = mixed[frame * 2] == 2000 && mixed[frame * 2 + 1] == 2000;
+    }
+    check(wrap_ok, "a later lap overwrites stale samples instead of remixing them");
+    wrapped_reference->release();
+}
+
+void test_clipped_reference_stays_time_aligned() {
+    auto reference = std::make_shared<chast::AudioReference>();
+    const int64_t before =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    reference->acquire();
+    // Start before the timed reference's origin, so only the block head is
+    // clipped. The remaining samples must keep their original playhead.
+    const int64_t audible_start_ms = before - 50;
+    constexpr size_t kBlockFrames = kRate * 3 / 10;
+    std::vector<int16_t> samples(kBlockFrames);
+    for (size_t frame = 0; frame < samples.size(); ++frame) {
+        samples[frame] = static_cast<int16_t>(frame);
+    }
+    reference->push_rendered(samples.data(), samples.size(), 1, audible_start_ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::vector<int16_t> output(480 * 2);
+    const int64_t read_start =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    const bool read = reference->read_delayed_frames(480, 0, output.data());
+    const int64_t read_end =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+
+    // The first read frame's source index equals elapsed time since `before`
+    // plus 40 ms (50 ms clipped head minus the 10 ms output block), regardless
+    // of when acquire() chose the exact origin.
+    const int64_t expected_low =
+        (read_start - before) * static_cast<int64_t>(kRate) / 1000 + kRate * 40 / 1000 - 96;
+    const int64_t expected_high =
+        (read_end - before) * static_cast<int64_t>(kRate) / 1000 + kRate * 40 / 1000 + 96;
+    bool aligned = read && output[0] >= expected_low && output[0] <= expected_high;
+    for (size_t frame = 0; aligned && frame < 480; ++frame) {
+        aligned = output[frame * 2] == output[0] + static_cast<int16_t>(frame) &&
+                  output[frame * 2 + 1] == output[0] + static_cast<int16_t>(frame);
+    }
+    check(aligned, "a block that began before the reference origin keeps its tail aligned");
+    reference->release();
+}
+
 void test_inactive_reference() {
     auto reference = std::make_shared<chast::AudioReference>();
     chast::AudioDspConfig config;
@@ -375,6 +478,8 @@ void test_stereo_and_partial_blocks() {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     test_echo_cancellation();
+    test_reference_producers();
+    test_clipped_reference_stays_time_aligned();
     test_inactive_reference();
     test_noise_suppression();
     test_stereo_and_partial_blocks();

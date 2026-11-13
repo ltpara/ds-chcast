@@ -63,6 +63,7 @@ class IAudioPlayer;
 class ILoopbackCapture;
 class IMicrophoneCapture;
 class WallpaperRemoval;
+struct AudioPlayerConfig;
 struct MicrophoneCaptureConfig;
 struct ViewerRegistry;
 
@@ -164,6 +165,7 @@ struct HostServerStats {
     uint64_t audio_packets = 0;
     uint64_t audio_bytes = 0;
     uint64_t audio_dropped = 0;
+    uint64_t audio_stale_dropped = 0;  // discarded by the shared queue age budget
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
@@ -197,6 +199,10 @@ struct HostServerStats {
     // its adaptive filter restarted (playback start/stop or endpoint reopen).
     uint64_t audio_dsp_frames = 0;
     uint64_t audio_dsp_resets = 0;
+    uint64_t audio_reference_underruns = 0;
+    bool audio_dsp_requested = false;
+    bool audio_dsp_active = false;
+    std::string audio_dsp_error;
     bool audio_recovering = false;
     // Privacy mode: whether the local screen is masked right now, and how many
     // viewer requests changed it (refusals included).
@@ -237,7 +243,14 @@ struct HostServerStats {
     uint64_t voice_call_packets = 0;
     uint64_t voice_call_bytes = 0;
     uint64_t voice_call_dropped = 0;
+    uint64_t voice_call_stale_dropped = 0;
     uint64_t voice_call_errors = 0;
+    uint64_t voice_dsp_frames = 0;
+    uint64_t voice_dsp_resets = 0;
+    uint64_t voice_reference_underruns = 0;
+    bool voice_dsp_requested = false;
+    bool voice_dsp_active = false;
+    std::string voice_dsp_error;
     // Pointer traffic. cursor_sent counts the CursorUpdates handed to the
     // transport; cursor_shapes is how many of them carried a sprite and
     // cursor_bytes their total sprite size. cursor_dropped counts updates the
@@ -469,8 +482,11 @@ struct HostServerConfig {
     std::function<std::unique_ptr<ILoopbackCapture>(std::string*)> audio_capture;
     // Creates the microphone player. Empty opens the default render endpoint;
     // the loopback check substitutes a sink that only counts frames so it does
-    // not make noise. Created lazily, the first time a viewer opens CMIC.
-    std::function<std::unique_ptr<IAudioPlayer>(std::string*)> microphone_player;
+    // not make noise. The config carries the render sink that feeds the host
+    // AEC references; a substitute must call it for accepted playback. Created
+    // lazily, the first time a viewer opens CMIC.
+    std::function<std::unique_ptr<IAudioPlayer>(const AudioPlayerConfig&, std::string*)>
+        microphone_player;
     // Creates the host microphone a viewer's voice call sends (protocol v37).
     // The config carries settings.voice_microphone as device_id; empty follows
     // the default communications capture device. The loopback check
@@ -1098,11 +1114,13 @@ private:
     bool microphone_broken_ = false;
     // All viewers feed the reference used by the shared loopback echo canceller.
     std::shared_ptr<AudioReference> audio_reference_;
-    // This worker's incoming playback also feeds host voice AEC, including
-    // calls with system sound disabled. Its lifetime follows playback, not
-    // voice capture, so changing microphones retains a live reference.
+    // Incoming playback from every viewer feeds one host-wide voice reference,
+    // including calls with system sound disabled. Its lifetime follows
+    // playback, not voice capture, so changing microphones retains a live
+    // reference. A worker without a registry keeps a private one.
     std::shared_ptr<AudioReference> voice_reference_ = std::make_shared<AudioReference>();
-    std::chrono::steady_clock::time_point voice_reference_last_push_{};
+    // True between acquire() at player start and release() at player stop.
+    bool microphone_reference_acquired_ = false;
 
     // Voice call of this worker's viewer. The capture is created when the
     // viewer asks and stopped on close, permission loss or capture failure.
@@ -1111,6 +1129,8 @@ private:
     uint64_t voice_next_seq_ = 0;
     uint64_t voice_request_id_ = 0;
     uint64_t voice_send_drops_ = 0;
+    bool voice_dsp_failure_logged_ = false;
+    std::string voice_dsp_error_logged_;
     // Microphone chosen from the tray. The UI thread queues it here; the
     // session thread swaps the capture and clears the pending flag.
     std::mutex voice_microphone_mutex_;

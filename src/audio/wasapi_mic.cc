@@ -62,8 +62,9 @@ class WasapiMicrophoneCapture final : public IMicrophoneCapture {
 public:
     explicit WasapiMicrophoneCapture(MicrophoneCaptureConfig config)
         : config_(std::move(config)) {
-        if ((config_.echo_cancellation && config_.reference) ||
-            config_.noise_suppression) {
+        dsp_requested_ = (config_.echo_cancellation && config_.reference) ||
+                         config_.noise_suppression;
+        if (dsp_requested_) {
             AudioDspConfig dsp_config;
             dsp_config.near_channels = kMicChannels;
             dsp_config.echo_cancellation = config_.echo_cancellation;
@@ -73,6 +74,14 @@ public:
             // A DSP that cannot open must not take the microphone down: the
             // capture falls back to sending the raw signal.
             dsp_ = AudioPreprocessor::create(dsp_config, &dsp_error);
+            dsp_active_ = dsp_ != nullptr;
+            if (!dsp_) {
+                // Keep the raw path alive, but let stats() and the host log
+                // explain why cancellation is not running.
+                dsp_error_ = dsp_error.empty()
+                                 ? std::string("audio DSP creation failed")
+                                 : dsp_error;
+            }
         }
     }
     ~WasapiMicrophoneCapture() override { close(); }
@@ -103,6 +112,9 @@ public:
             stats.reference_underruns = dsp.reference_underruns;
             stats.dsp_resets = dsp.resets;
         }
+        stats.dsp_requested = dsp_requested_;
+        stats.dsp_active = dsp_active_;
+        stats.dsp_error = dsp_error_;
         return stats;
     }
 
@@ -149,6 +161,9 @@ private:
     wasapi::MixFormat format_;
     std::unique_ptr<IAudioEncoder> encoder_;
     std::unique_ptr<AudioPreprocessor> dsp_;
+    bool dsp_requested_ = false;
+    bool dsp_active_ = false;
+    std::string dsp_error_;
     SwrContext* swr_ = nullptr;
     std::vector<int16_t> pcm_;
     std::vector<uint8_t> zero_input_;

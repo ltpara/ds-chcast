@@ -1147,6 +1147,28 @@ void refresh_ui() {
                     stream += tr(L"（重置 ") +
                               std::to_wstring(status.stats.audio_dsp_resets) + tr(L"）");
                 }
+            } else if (status.stats.audio_dsp_requested && !status.stats.audio_dsp_active) {
+                stream += tr(L" · DSP 不可用");
+            }
+            if (status.stats.audio_reference_underruns > 0) {
+                stream += tr(L" · 参考欠载 ") +
+                          std::to_wstring(status.stats.audio_reference_underruns);
+            }
+            if (status.stats.audio_stale_dropped > 0) {
+                stream += tr(L" · 过期丢弃 ") +
+                          std::to_wstring(status.stats.audio_stale_dropped);
+            }
+        }
+        if (status.stats.voice_call_active) {
+            stream += tr(L" · 语音上行");
+            if (status.stats.voice_dsp_active) {
+                stream += L" · AEC";
+            } else if (status.stats.voice_dsp_requested) {
+                stream += tr(L" · DSP 不可用");
+            }
+            if (status.stats.voice_reference_underruns > 0) {
+                stream += tr(L" · 语音参考欠载 ") +
+                          std::to_wstring(status.stats.voice_reference_underruns);
             }
         }
         if (status.download_active) {
@@ -1876,6 +1898,8 @@ enum SecurityDialogId {
     kSecAudioRefresh,
     kSecAudioAec,
     kSecAudioGate,
+    kSecVoiceAec,
+    kSecVoiceNoise,
     kSecVoiceMicrophone,
     kSecVoiceMicRefresh,
     kSecVirtualDisplayPolicy,
@@ -1939,6 +1963,8 @@ struct SecurityDialogState {
     HWND voice_microphone = nullptr;
     HWND audio_aec = nullptr;
     HWND audio_gate = nullptr;
+    HWND voice_aec = nullptr;
+    HWND voice_noise = nullptr;
     HWND virtual_display_policy = nullptr;
     HWND virtual_display_count = nullptr;
     HWND virtual_display_resolution = nullptr;
@@ -2337,6 +2363,9 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
                 : dialog.selected_voice_microphone;
     }
     updated.audio_aec = is_checked(dialog.audio_aec);
+    if (dialog.voice_aec != nullptr) updated.voice_aec = is_checked(dialog.voice_aec);
+    if (dialog.voice_noise != nullptr)
+        updated.voice_noise_suppression = is_checked(dialog.voice_noise);
     if (dialog.audio_gate != nullptr) {
         // Keep a custom threshold (host.ini) when the box stays checked; the
         // checkbox only distinguishes "off" from the default 2 s.
@@ -2608,7 +2637,7 @@ bool edit_security_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = (chast::host::english_ui() ? 700 : 620) + (g_app->machine_settings_editor ? 80 : 0);
     const int page_text_width = dialog_width - 80;
-    RECT frame{0, 0, px(dialog_width), px(784)};
+    RECT frame{0, 0, px(dialog_width), px(812)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -2642,7 +2671,7 @@ bool edit_security_settings(HostSettings& result) {
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12),
-                                 px(dialog_width - 32), px(692), window,
+                                 px(dialog_width - 32), px(730), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
@@ -2920,81 +2949,90 @@ bool edit_security_settings(HostSettings& result) {
         add(L"BUTTON", audio_aec_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 358,
             std::max(400, check_px(audio_aec_text)), 24, kSecAudioAec, nullptr,
             &dialog.advanced_page);
+    const wchar_t* voice_aec_text = tr(L"语音回声消除");
+    dialog.voice_aec =
+        add(L"BUTTON", voice_aec_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 386,
+            check_px(voice_aec_text), 24, kSecVoiceAec, nullptr, &dialog.advanced_page);
+    const wchar_t* voice_noise_text = tr(L"语音降噪");
+    dialog.voice_noise =
+        add(L"BUTTON", voice_noise_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0,
+            32 + check_px(voice_aec_text) + 20, 386, check_px(voice_noise_text), 24,
+            kSecVoiceNoise, nullptr, &dialog.advanced_page);
     const wchar_t* audio_gate_text = tr(L"静音 2 秒后暂停发送系统声音");
     dialog.audio_gate =
-        add(L"BUTTON", audio_gate_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 386,
+        add(L"BUTTON", audio_gate_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 414,
             std::max(400, check_px(audio_gate_text)), 24, kSecAudioGate, nullptr,
             &dialog.advanced_page);
     const wchar_t* voice_mic_label = tr(L"语音麦克风（上行）");
     const int voice_mic_left = 32 + text_px(voice_mic_label) + 12;
-    add(L"STATIC", voice_mic_label, SS_LEFT, 0, 32, 414, text_px(voice_mic_label) + 8, 20,
+    add(L"STATIC", voice_mic_label, SS_LEFT, 0, 32, 442, text_px(voice_mic_label) + 8, 20,
         0, nullptr, &dialog.advanced_page);
     dialog.voice_microphone =
         add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
-            WS_EX_CLIENTEDGE, voice_mic_left, 410, 500 - voice_mic_left, 200,
+            WS_EX_CLIENTEDGE, voice_mic_left, 438, 500 - voice_mic_left, 200,
             kSecVoiceMicrophone, nullptr, &dialog.advanced_page);
-    add(L"BUTTON", tr(L"刷新"), BS_PUSHBUTTON | WS_TABSTOP, 0, 500, 409, 76, 28,
+    add(L"BUTTON", tr(L"刷新"), BS_PUSHBUTTON | WS_TABSTOP, 0, 500, 437, 76, 28,
         kSecVoiceMicRefresh, nullptr, &dialog.advanced_page);
 
     const wchar_t* allow_session_select_text = tr(L"允许切换 Windows 会话（仅服务模式）");
     dialog.allow_session_select =
-        add(L"BUTTON", allow_session_select_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 450,
+        add(L"BUTTON", allow_session_select_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 480,
             std::max(360, check_px(allow_session_select_text)), 24, kSecAllowSessionSelect,
             nullptr, &dialog.advanced_page);
     add(L"STATIC",
         tr(L"查看器可列出并切换到本机其他已登录的 Windows 会话；手工运行主机时该项不会生效。"),
-        SS_LEFT, 0, 32, 478, page_text_width, 36, 0, nullptr, &dialog.advanced_page);
+        SS_LEFT, 0, 32, 508, page_text_width, 36, 0, nullptr, &dialog.advanced_page);
 
     const wchar_t* allow_remote_config_text = tr(L"允许查看者修改本页的开关（远程配置）");
     dialog.allow_remote_config =
-        add(L"BUTTON", allow_remote_config_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 520,
+        add(L"BUTTON", allow_remote_config_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 550,
             std::max(400, check_px(allow_remote_config_text)), 24, kSecAllowRemoteConfig,
             nullptr, &dialog.advanced_page);
     const wchar_t* lock_after_end_text = tr(L"最后一个查看者离开后锁定本机");
     dialog.lock_after_end =
-        add(L"BUTTON", lock_after_end_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 548,
+        add(L"BUTTON", lock_after_end_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 578,
             std::max(400, check_px(lock_after_end_text)), 24, kSecLockAfterEnd, nullptr,
             &dialog.advanced_page);
     add(L"STATIC",
         tr(L"远程配置需要单独授予权限；关闭某个开关会在本会话立即撤销对应权限，开启则从下次连接生效。"),
-        SS_LEFT, 0, 32, 576, page_text_width, 24, 0, nullptr, &dialog.advanced_page);
+        SS_LEFT, 0, 32, 606, page_text_width, 24, 0, nullptr, &dialog.advanced_page);
     const wchar_t* virtual_display_label = tr(L"虚拟显示器");
-    add(L"STATIC", virtual_display_label, SS_LEFT, 0, 32, 610, text_px(virtual_display_label) + 8,
+    add(L"STATIC", virtual_display_label, SS_LEFT, 0, 32, 640, text_px(virtual_display_label) + 8,
         20, 0, nullptr, &dialog.advanced_page);
     const int virtual_display_left = 32 + text_px(virtual_display_label) + 12;
     dialog.virtual_display_policy =
         add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
-            WS_EX_CLIENTEDGE, virtual_display_left, 606, 260, 200, kSecVirtualDisplayPolicy,
+            WS_EX_CLIENTEDGE, virtual_display_left, 636, 260, 200, kSecVirtualDisplayPolicy,
             nullptr, &dialog.advanced_page);
     const wchar_t* privacy_impl_label = tr(L"隐私方式");
     const int privacy_impl_left = virtual_display_left + 260 + 16;
-    add(L"STATIC", privacy_impl_label, SS_LEFT, 0, privacy_impl_left, 610,
+    add(L"STATIC", privacy_impl_label, SS_LEFT, 0, privacy_impl_left, 640,
         text_px(privacy_impl_label) + 8, 20, 0, nullptr, &dialog.advanced_page);
     dialog.privacy_mode_impl =
         add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
-            WS_EX_CLIENTEDGE, privacy_impl_left + text_px(privacy_impl_label) + 8, 606, 120,
+            WS_EX_CLIENTEDGE, privacy_impl_left + text_px(privacy_impl_label) + 8, 636, 120,
             200, kSecPrivacyModeImpl, nullptr, &dialog.advanced_page);
     const wchar_t* virtual_count_label = tr(L"数量（1–4）");
     const int virtual_count_label_width = text_px(virtual_count_label);
-    add(L"STATIC", virtual_count_label, SS_LEFT, 0, 32, 640, virtual_count_label_width + 8, 20, 0,
+    add(L"STATIC", virtual_count_label, SS_LEFT, 0, 32, 670, virtual_count_label_width + 8, 20, 0,
         nullptr, &dialog.advanced_page);
     dialog.virtual_display_count =
         add(L"EDIT", L"1", ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-            32 + virtual_count_label_width + 12, 636, 60, 26, kSecVirtualDisplayCount, nullptr,
+            32 + virtual_count_label_width + 12, 666, 60, 26, kSecVirtualDisplayCount, nullptr,
             &dialog.advanced_page);
     const wchar_t* virtual_resolution_label = tr(L"分辨率");
     const int virtual_resolution_left =
         std::max(32 + virtual_count_label_width + 12 + 60 + 20, 208);
-    add(L"STATIC", virtual_resolution_label, SS_LEFT, 0, virtual_resolution_left, 640,
+    add(L"STATIC", virtual_resolution_label, SS_LEFT, 0, virtual_resolution_left, 670,
         text_px(virtual_resolution_label) + 8, 20, 0, nullptr, &dialog.advanced_page);
     dialog.virtual_display_resolution =
         add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
             WS_EX_CLIENTEDGE,
-            virtual_resolution_left + text_px(virtual_resolution_label) + 12, 636, 180, 200,
+            virtual_resolution_left + text_px(virtual_resolution_label) + 12, 666, 180, 200,
             kSecVirtualDisplayResolution, nullptr, &dialog.advanced_page);
     const std::wstring virtual_display_line =
         virtual_display_text(probe_virtual_display());
-    add(L"STATIC", virtual_display_line.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, 32, 674,
+    add(L"STATIC", virtual_display_line.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, 32, 704,
         page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
     // ----- local recording page -----
@@ -3017,7 +3055,7 @@ bool edit_security_settings(HostSettings& result) {
         SS_LEFT, 0, 32, 398, page_text_width, 64, 0, nullptr, &dialog.recording_page);
 
     const int sec_cancel_left = dialog_width - 20 - 90;
-    const int save_y = 720;
+    const int save_y = 752;
     const int save_width = g_app->machine_settings_editor ? 220 : 90;
     add(L"BUTTON", tr(g_app->machine_settings_editor ? L"保存并重启服务" : L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0,
         sec_cancel_left - 10 - save_width, save_y, save_width, 32, kSecSave, nullptr, nullptr);
@@ -3082,6 +3120,8 @@ bool edit_security_settings(HostSettings& result) {
     dialog.selected_audio_device = settings.audio_device;
     dialog.selected_voice_microphone = settings.voice_microphone;
     set_check(dialog.audio_aec, settings.audio_aec);
+    set_check(dialog.voice_aec, settings.voice_aec);
+    set_check(dialog.voice_noise, settings.voice_noise_suppression);
     set_check(dialog.audio_gate, settings.audio_silence_gate_ms != 0);
     for (const wchar_t* item :
          {tr(L"关闭"), tr(L"无显示器时自动启用"), tr(L"总是启用")}) {

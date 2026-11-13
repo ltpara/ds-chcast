@@ -110,13 +110,26 @@ struct MicState {
 
 class FakeMicPlayer : public chast::IAudioPlayer {
 public:
-    explicit FakeMicPlayer(std::shared_ptr<MicState> state) : state_(std::move(state)) {}
+    FakeMicPlayer(std::shared_ptr<MicState> state, chast::AudioPlayerConfig config)
+        : state_(std::move(state)), config_(std::move(config)) {}
     chast::Error start() override { return chast::Error::success(); }
     void stop() override {}
     chast::Error push(const chast::DecodedAudio& block) override {
         if (state_->fail_playback)
             return chast::Error(chast::Status::Unavailable, "synthetic playback failure");
         state_->playback_frames += block.samples.size() / block.channels;
+        // Model immediate playback: the real WASAPI player reports accepted
+        // PCM from its render thread, and the host AEC expects one sample per
+        // pushed frame.
+        if (config_.render_sink && block.sample_rate == 48000 && block.channels >= 1 &&
+            block.channels <= 2) {
+            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+            config_.render_sink(block.samples.data(),
+                                block.samples.size() / block.channels, block.channels,
+                                now);
+        }
         return chast::Error::success();
     }
     void set_clock_offset(int64_t) override {}
@@ -127,6 +140,7 @@ public:
     std::string error() const override { return {}; }
 private:
     std::shared_ptr<MicState> state_;
+    chast::AudioPlayerConfig config_;
 };
 
 struct WallpaperState {
@@ -183,7 +197,12 @@ chast::AudioInfo voice_info() {
 // always-ready source.
 class FakeMicCapture : public chast::IMicrophoneCapture {
 public:
-    explicit FakeMicCapture(std::shared_ptr<MicState> state) : state_(std::move(state)) {}
+    FakeMicCapture(std::shared_ptr<MicState> state,
+                   chast::MicrophoneCaptureConfig config)
+        : state_(std::move(state)),
+          dsp_requested_((config.echo_cancellation && config.reference) ||
+                         config.noise_suppression),
+          dsp_active_(dsp_requested_) {}
 
     ~FakeMicCapture() override { stop(); }
 
@@ -227,10 +246,17 @@ public:
     bool failed() const override { return false; }
     std::string error() const override { return {}; }
     chast::AudioInfo info() const override { return voice_info(); }
-    chast::AudioCaptureStats stats() const override { return {}; }
+    chast::AudioCaptureStats stats() const override {
+        chast::AudioCaptureStats stats;
+        stats.dsp_requested = dsp_requested_;
+        stats.dsp_active = dsp_active_;
+        return stats;
+    }
 
 private:
     std::shared_ptr<MicState> state_;
+    bool dsp_requested_ = false;
+    bool dsp_active_ = false;
     bool active_ = false;
     long long last_ms_ = 0;
     uint64_t seq_ = 0;
@@ -278,10 +304,11 @@ std::unique_ptr<chast::HostServer> start_host(uint16_t port, const std::filesyst
         if (!microphone.device_id.empty() && microphone.device_id != "second-mic-id") {
             return nullptr;
         }
-        return std::make_unique<FakeMicCapture>(mic);
+        return std::make_unique<FakeMicCapture>(mic, microphone);
     };
-    config.microphone_player = [mic](std::string*) {
-        return std::make_unique<FakeMicPlayer>(mic);
+    config.microphone_player = [mic](const chast::AudioPlayerConfig& player,
+                                    std::string*) {
+        return std::make_unique<FakeMicPlayer>(mic, player);
     };
     config.wallpaper_remover =
         [wallpaper](std::string*) -> std::unique_ptr<chast::WallpaperRemoval> {
@@ -393,6 +420,13 @@ int main() {
                                std::chrono::seconds(5)),
                       "the host reports the call as active");
                 check(mic->started.load(), "the host started the capture device");
+                check(wait_for(
+                          [&host] {
+                              const auto stats = host->status().stats;
+                              return stats.voice_dsp_requested && stats.voice_dsp_active;
+                          },
+                          std::chrono::seconds(5)),
+                      "the host reports that voice DSP was requested and is active");
                 const auto dsp_config = mic->last_config();
                 const auto reference = dsp_config.reference;
                 check(dsp_config.echo_cancellation && dsp_config.noise_suppression && reference,
@@ -606,6 +640,14 @@ int main() {
             const auto raw_config = raw_mic->last_config();
             check(!raw_config.echo_cancellation && !raw_config.noise_suppression,
                   "both explicit voice DSP opt-outs reach the capture factory");
+            check(wait_for(
+                      [&raw_host] {
+                          const auto stats = raw_host->status().stats;
+                          return stats.voice_call_active && !stats.voice_dsp_requested &&
+                                 !stats.voice_dsp_active;
+                      },
+                      std::chrono::seconds(5)),
+                  "the host reports that raw voice capture has no active DSP");
             chast::ClientStats stats;
             viewer->finish_client(stats, std::chrono::seconds(5));
         }

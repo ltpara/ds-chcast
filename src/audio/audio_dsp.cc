@@ -24,6 +24,7 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -45,19 +46,131 @@ struct AudioReference::Impl {
     mutable std::mutex mutex;
     std::vector<int16_t> ring =
         std::vector<int16_t>(kReferenceCapacity * kReferenceChannels, 0);
+    // Untimed mode advances this exactly like the old append-only ring.
     uint64_t written = 0;
-    bool active = false;
+    // A reference may be owned by several players. The last release clears
+    // the history, not every individual stop.
+    uint32_t producers = 0;
+    bool legacy_active = false;
+    // Timed mode places each pushed block on the steady-clock playhead and
+    // mixes overlapping producers.
+    bool timed = false;
+    int64_t origin_ms = 0;
+    bool have_frames = false;
+    int64_t first_frame = 0;
+    int64_t last_frame = 0;
+    int64_t last_push_steady_ms = 0;
+    // The ring wraps after two seconds. A position that maps to the same slot
+    // as a previous lap must start from zero before concurrent producers mix
+    // into it; otherwise old playback leaks into the current reference.
+    std::vector<int64_t> stamp = std::vector<int64_t>(kReferenceCapacity, -1);
+
+    bool active_locked() const { return producers > 0 || legacy_active; }
+
+    void reset_locked() {
+        std::fill(ring.begin(), ring.end(), 0);
+        written = 0;
+        timed = false;
+        origin_ms = 0;
+        have_frames = false;
+        first_frame = 0;
+        last_frame = 0;
+        last_push_steady_ms = 0;
+        std::fill(stamp.begin(), stamp.end(), int64_t{-1});
+    }
+
+    void push_timed(const int16_t* samples, size_t frames, uint16_t channels,
+                    int64_t audible_start_ms);
 };
+
+namespace {
+
+int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t frames_from_ms(int64_t ms) {
+    return ms * static_cast<int64_t>(kDspRate) / 1000;
+}
+
+void mix_frame(int16_t* ring, size_t index, int16_t left, int16_t right) {
+    const int mixed_left = static_cast<int>(ring[index]) + left;
+    const int mixed_right = static_cast<int>(ring[index + 1]) + right;
+    ring[index] = static_cast<int16_t>(std::clamp(mixed_left, -32768, 32767));
+    ring[index + 1] = static_cast<int16_t>(std::clamp(mixed_right, -32768, 32767));
+}
+
+}  // namespace
+
+void AudioReference::Impl::push_timed(const int16_t* samples, size_t frames,
+                                      uint16_t channels, int64_t audible_start_ms) {
+    const int64_t raw_start = frames_from_ms(audible_start_ms - origin_ms);
+    const int64_t start = (std::max)(int64_t{0}, raw_start);
+    // A block that began before origin loses only its head; clamping the
+    // whole block would shift every later sample earlier.
+    const size_t first = raw_start < 0
+        ? static_cast<size_t>((std::min)(static_cast<int64_t>(frames), -raw_start))
+        : 0;
+    if (first >= frames) {
+        last_push_steady_ms = steady_ms();
+        return;
+    }
+    if (!have_frames) {
+        first_frame = start;
+        have_frames = true;
+    } else {
+        first_frame = (std::min)(first_frame, start);
+    }
+    last_frame = (std::max)(last_frame, start + static_cast<int64_t>(frames - first));
+    last_push_steady_ms = steady_ms();
+    for (size_t frame = first; frame < frames; ++frame) {
+        const int64_t position = raw_start + static_cast<int64_t>(frame);
+        const int64_t slot = position % static_cast<int64_t>(kReferenceCapacity);
+        const size_t index = static_cast<size_t>(slot) * kReferenceChannels;
+        if (stamp[static_cast<size_t>(slot)] != position) {
+            stamp[static_cast<size_t>(slot)] = position;
+            ring[index] = 0;
+            ring[index + 1] = 0;
+        }
+        const int16_t left = samples[frame * channels];
+        const int16_t right = channels > 1 ? samples[frame * channels + 1] : left;
+        mix_frame(ring.data(), index, left, right);
+    }
+}
 
 AudioReference::AudioReference() : impl_(std::make_unique<Impl>()) {}
 AudioReference::~AudioReference() = default;
+
+void AudioReference::acquire() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->producers++ == 0 && !impl_->legacy_active) {
+        impl_->reset_locked();
+        impl_->origin_ms = steady_ms();
+    }
+}
+
+void AudioReference::release() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->producers == 0) {
+        return;
+    }
+    if (--impl_->producers == 0 && !impl_->legacy_active) {
+        impl_->reset_locked();
+    }
+}
 
 void AudioReference::push(const int16_t* samples, size_t frames, uint16_t channels) {
     if (!samples || frames == 0 || channels == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (!impl_->active) {
+    if (!impl_->active_locked()) {
+        return;
+    }
+    if (impl_->timed) {
+        impl_->push_timed(samples, frames, channels, steady_ms());
         return;
     }
     for (size_t frame = 0; frame < frames; ++frame) {
@@ -69,6 +182,25 @@ void AudioReference::push(const int16_t* samples, size_t frames, uint16_t channe
         impl_->ring[index + 1] = right;
         ++impl_->written;
     }
+}
+
+void AudioReference::push_rendered(const int16_t* samples, size_t frames, uint16_t channels,
+                                   int64_t audible_start_ms) {
+    if (!samples || frames == 0 || channels == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->active_locked()) {
+        return;
+    }
+    if (!impl_->timed) {
+        // Mixing needs one timeline. A reference must not mix legacy appends
+        // and timestamped renders, so switching modes starts a fresh window.
+        impl_->reset_locked();
+        impl_->origin_ms = steady_ms();
+        impl_->timed = true;
+    }
+    impl_->push_timed(samples, frames, channels, audible_start_ms);
 }
 
 bool AudioReference::read_delayed(size_t frames, uint32_t delay_ms, int16_t* out) const {
@@ -83,44 +215,85 @@ bool AudioReference::read_delayed_frames(size_t frames, size_t delay_frames,
     }
     std::fill(out, out + frames * kReferenceChannels, 0);
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (!impl_->active) {
+    if (!impl_->active_locked()) {
         return false;
     }
-    const uint64_t delay = delay_frames;
-    const uint64_t total = impl_->written;
-    const uint64_t end = total > delay ? total - delay : 0;
-    if (end == 0) {
+    if (!impl_->timed) {
+        const uint64_t delay = delay_frames;
+        const uint64_t total = impl_->written;
+        const uint64_t end = total > delay ? total - delay : 0;
+        if (end == 0) {
+            return false;
+        }
+        const uint64_t wanted_start = end > frames ? end - frames : 0;
+        const uint64_t oldest = total > kReferenceCapacity ? total - kReferenceCapacity : 0;
+        const uint64_t start = (std::max)(wanted_start, oldest);
+        // The block always ends at `end`, so missing history leaves zeros at its
+        // front. This keeps the newest samples next to the capture block.
+        for (uint64_t frame = start; frame < end; ++frame) {
+            const size_t source =
+                static_cast<size_t>(frame % kReferenceCapacity) * kReferenceChannels;
+            const size_t target =
+                static_cast<size_t>(frame + frames - end) * kReferenceChannels;
+            out[target] = impl_->ring[source];
+            out[target + 1] = impl_->ring[source + 1];
+        }
+        return start == wanted_start && end >= frames;
+    }
+    if (!impl_->have_frames || impl_->last_push_steady_ms == 0 ||
+        steady_ms() - impl_->last_push_steady_ms > 500) {
+        // A stalled stream must not keep feeding old samples to the canceller.
         return false;
     }
-    const uint64_t wanted_start = end > frames ? end - frames : 0;
-    const uint64_t oldest = total > kReferenceCapacity ? total - kReferenceCapacity : 0;
-    const uint64_t start = (std::max)(wanted_start, oldest);
-    // The block always ends at `end`, so missing history leaves zeros at its
-    // front. This keeps the newest samples next to the capture block.
-    for (uint64_t frame = start; frame < end; ++frame) {
-        const size_t source =
-            static_cast<size_t>(frame % kReferenceCapacity) * kReferenceChannels;
+    const int64_t head =
+        (std::max)(int64_t{0}, frames_from_ms(steady_ms() - impl_->origin_ms));
+    const int64_t end = head - static_cast<int64_t>(delay_frames);
+    if (end <= 0 || end > impl_->last_frame) {
+        return false;
+    }
+    const int64_t wanted_start = end - static_cast<int64_t>(frames);
+    const int64_t oldest =
+        (std::max)(impl_->first_frame, end - static_cast<int64_t>(kReferenceCapacity));
+    const int64_t start = (std::max)(wanted_start, oldest);
+    for (int64_t frame = start; frame < end; ++frame) {
+        const int64_t slot = frame % static_cast<int64_t>(kReferenceCapacity);
+        if (impl_->stamp[static_cast<size_t>(slot)] != frame) {
+            continue;
+        }
+        const size_t source = static_cast<size_t>(slot) * kReferenceChannels;
         const size_t target =
-            static_cast<size_t>(frame + frames - end) * kReferenceChannels;
+            static_cast<size_t>(frame + static_cast<int64_t>(frames) - end) *
+            kReferenceChannels;
         out[target] = impl_->ring[source];
         out[target + 1] = impl_->ring[source + 1];
     }
-    return start == wanted_start && end >= frames;
+    return start == wanted_start && end - start == static_cast<int64_t>(frames);
 }
 
 void AudioReference::set_active(bool active) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->active == active) {
+    if (impl_->legacy_active == active) {
         return;
     }
-    impl_->active = active;
-    impl_->written = 0;
-    std::fill(impl_->ring.begin(), impl_->ring.end(), 0);
+    impl_->legacy_active = active;
+    if (impl_->producers == 0) {
+        impl_->reset_locked();
+        if (active) {
+            impl_->origin_ms = steady_ms();
+        }
+    }
 }
 
 bool AudioReference::active() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->active;
+    if (!impl_->active_locked()) {
+        return false;
+    }
+    if (impl_->timed && (impl_->last_push_steady_ms == 0 ||
+                         steady_ms() - impl_->last_push_steady_ms > 500)) {
+        return false;
+    }
+    return true;
 }
 
 struct AudioPreprocessor::Impl {

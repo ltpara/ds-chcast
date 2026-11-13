@@ -35,6 +35,11 @@ struct Picture {
 };
 constexpr size_t kMaxSubscriberQueueFrames = 60;
 constexpr size_t kMaxSubscriberQueueBytes = 8u * 1024u * 1024u;
+// Several slow viewers expire on different ticks. One shared IDR can serve
+// all of them, so requests inside this window wait instead of forcing an IDR
+// on every tick. The delay is bounded to one frame or this window, whichever
+// is longer, and only affects viewers that are already waiting.
+constexpr uint64_t kIdrMergeWindowMs = 120;
 struct Subscription {
     // Only the owning connection reads/replaces current. The service changes
     // queues on its thread, not metadata a connection might be inspecting.
@@ -94,6 +99,10 @@ struct DesktopStreamPool::Source {
     bool lost = false;
     bool fatal = false;
     bool keyframe = true;
+    // Set when a keyframe was requested inside the merge window. encode()
+    // promotes it once the window from the last delivered IDR has elapsed.
+    bool keyframe_deferred = false;
+    uint64_t last_idr_ms = 0;
     bool have_input = false;
     // A desktop change was captured while every subscriber queue was full and
     // has not been encoded yet. The next free tick must send a real frame
@@ -347,13 +356,41 @@ struct DesktopStreamPool::Source {
         return !follow_desktop || follow_desktop(failure, nullptr);
     }
 
+    // A source reset or generation change invalidates every queued IDR, so
+    // these transitions bypass the merge window.
+    void force_keyframe() {
+        keyframe = true;
+        keyframe_deferred = false;
+        last_idr_ms = 0;
+    }
+    // Merge staggered requests from independent slow subscribers. A request
+    // that arrives while a recent IDR is still within the window is deferred
+    // instead of triggering another full keyframe on the next tick.
+    void request_shared_keyframe(uint64_t now) {
+        if (keyframe) {
+            return;
+        }
+        if (last_idr_ms != 0 && now - last_idr_ms < kIdrMergeWindowMs) {
+            keyframe_deferred = true;
+            return;
+        }
+        keyframe = true;
+        keyframe_deferred = false;
+    }
+    void service_deferred_keyframe(uint64_t now) {
+        if (!keyframe && keyframe_deferred &&
+            (last_idr_ms == 0 || now - last_idr_ms >= kIdrMergeWindowMs)) {
+            keyframe = true;
+            keyframe_deferred = false;
+        }
+    }
     void clear_queues() {
         for (auto& weak : subscribers) if (auto sub = weak.lock()) {
             sub->queue.clear();
             sub->queued_bytes = 0;
             sub->waiting_idr = true;
         }
-        keyframe = true;
+        force_keyframe();
     }
     void notify_cursor() {
         if (cursor_sampler) return;
@@ -379,7 +416,7 @@ struct DesktopStreamPool::Source {
                 return picture->generation == generation && picture->idr;
             }))
             return;
-        keyframe = true;
+        request_shared_keyframe(now_ms());
     }
     void invalidate() {
         ++generation;
@@ -693,10 +730,10 @@ struct DesktopStreamPool::Source {
                 sub->queue.clear();
                 sub->queued_bytes = 0;
                 sub->waiting_idr = true;
-                keyframe = true;
+                request_shared_keyframe(picture->published_ms);
             }
             if (sub->waiting_idr && !picture->idr) {
-                keyframe = true;
+                request_shared_keyframe(picture->published_ms);
                 continue;
             }
             // An IDR decodes on its own and makes every queued reference
@@ -714,6 +751,9 @@ struct DesktopStreamPool::Source {
     }
     bool encode(bool repeat, bool force_update = false) {
         if (!image || (!image->nv12 && !image->frame.cpu_bgra)) return true;
+        // A request deferred by the merge window becomes active here, on the
+        // first tick after the window closes, even if no new subscriber asks.
+        service_deferred_keyframe(now_ms());
         if (!encoder || encoder->width() != image->frame.nv12_width ||
             encoder->height() != image->frame.nv12_height) {
             std::string failure;
@@ -745,7 +785,7 @@ struct DesktopStreamPool::Source {
             if (!result.ok() && result.status() != Status::DeviceRemoved &&
                 result.status() != Status::DeviceReset) {
                 next->packets.clear();
-                keyframe = true;
+                request_shared_keyframe(now_ms());
                 result = encode_picture(*encoder, *next, pts, true, next->packets);
             }
         } else {
@@ -806,7 +846,11 @@ struct DesktopStreamPool::Source {
             next->frame.cpu_image = true;
             next->frame.cpu_bgra.reset();
         }
-        if (next->idr) keyframe = false;
+        if (next->idr) {
+            keyframe = false;
+            keyframe_deferred = false;
+            last_idr_ms = now_ms();
+        }
         if (repeat) {
             if (delivered) {
                 ++repeat_outputs;
@@ -854,7 +898,7 @@ struct DesktopStreamPool::Source {
             sub.queued_bytes = 0;
             sub.consumed = true;
             sub.waiting_idr = true;
-            keyframe = true;
+            request_shared_keyframe(now);
             return true;
         }
         return false;
@@ -890,7 +934,10 @@ struct DesktopStreamPool::Source {
         if (Clock::now() < due) return;
         if (recorder && recorder->needs_keyframe(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count())))
-            keyframe = true;
+            request_shared_keyframe(now_ms());
+        // A merge-window request has no new desktop frame to drive encode(),
+        // so promote it from the service tick once its window has elapsed.
+        service_deferred_keyframe(now_ms());
         const auto common = common_codecs();
         if (!global_codec && configured && encoder && common != previous_common) {
             previous_common = common;
@@ -1029,7 +1076,7 @@ public:
         sub->generation = source->generation;
         source->subscribers.push_back(sub);
         { std::lock_guard lock(source->pointer_mutex); source->pointer_subscribers.push_back(sub); }
-        source->keyframe = true;
+        source->request_shared_keyframe(now_ms());
     }
     ~Capture() override;
     CaptureResult capture(std::chrono::milliseconds timeout) override {
@@ -1559,7 +1606,7 @@ void DesktopStreamPool::discard_backlog(IDxgiCapturer& capturer) {
         sub.queued_bytes = 0;
         sub.consumed = true;
         sub.waiting_idr = true;
-        capture.source->keyframe = true;
+        capture.source->request_shared_keyframe(now_ms());
     });
 }
 

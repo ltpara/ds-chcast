@@ -97,6 +97,10 @@ struct ViewerRegistry {
     // Pipelines outlive individual connections while their display is subscribed.
     DesktopStreamPool desktop_streams;
     SharedLoopback system_audio;
+    // Every viewer's microphone playback reaches the same speakers, so one
+    // reference feeds all host voice captures. Producer acquire/release keeps
+    // it alive until the last player stops.
+    std::shared_ptr<AudioReference> voice_reference = std::make_shared<AudioReference>();
 
     bool claim_audit_ref(const std::string& ref) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1110,6 +1114,13 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
 
 HostServer::~HostServer() {
     stop();
+    if (microphone_reference_acquired_) {
+        voice_reference_->release();
+        if (audio_reference_) {
+            audio_reference_->release();
+        }
+        microphone_reference_acquired_ = false;
+    }
     carrier_.reset();
     if (registry_ && !adopted_) {
         std::lock_guard<std::mutex> lock(registry_->mutex);
@@ -2466,6 +2477,9 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
     viewer->permission_policy_ = permission_policy_;
     viewer->denial_audit_ = denial_audit_;
     viewer->registry_ = registry_;
+    // All workers play into the same speakers; share one AEC reference so a
+    // viewer's host-microphone capture cancels every viewer, not only itself.
+    viewer->voice_reference_ = registry_->voice_reference;
     viewer->adopted_ = true;
     viewer->self_ = viewer;
     // The listener owns serve_once and token rotation; it passes only what
@@ -3098,12 +3112,17 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     bool audio_policy_enabled = settings_.allow_audio;
     SharedLoopback standalone_audio;
     auto& shared_audio = registry_ ? registry_->system_audio : standalone_audio;
+    // Every worker's microphone playback reaches the same speakers. Feed the
+    // shared loopback reference even when this viewer does not capture system
+    // audio itself, otherwise one viewer's playback is missing from another
+    // viewer's echo canceller.
+    if (registry_ || settings_.audio_aec) {
+        audio_reference_ = shared_audio.reference;
+    }
+    bool audio_dsp_failure_logged = false;
     auto open_system_audio = [&] {
         if (!settings_.allow_audio || audio_capture) return;
         const bool audio_aec = settings_.audio_aec;
-        if (audio_aec) {
-            audio_reference_ = shared_audio.reference;
-        }
         std::string audio_error;
         audio_capture = shared_audio.subscribe([&](std::string* failure) {
             if (config_.audio_capture) return config_.audio_capture(failure);
@@ -3116,10 +3135,18 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }, &audio_error);
         if (audio_capture) {
             audio_info = audio_capture->info();
+            const AudioCaptureStats capture_stats = audio_capture->stats();
             log("audio: Opus " + std::to_string(audio_info.sample_rate / 1000u) + " kHz, " +
                 std::to_string(audio_info.channels) + " ch, " +
                 std::to_string(audio_info.bitrate / 1000u) + " kbps" +
                 (audio_aec ? ", echo cancellation on" : ", echo cancellation off"));
+            if (capture_stats.dsp_requested && !capture_stats.dsp_active) {
+                audio_dsp_failure_logged = true;
+                log("audio: the DSP is unavailable; sending the raw mix: " +
+                    (capture_stats.dsp_error.empty()
+                         ? std::string("audio DSP creation failed")
+                         : capture_stats.dsp_error));
+            }
         } else {
             ++stats.audio_errors;
             log("audio unavailable: " + audio_error);
@@ -3399,10 +3426,23 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         const AudioCaptureStats captured = audio_capture->stats();
         stats.audio_dropped = audio_send_drops + captured.dropped;
+        stats.audio_stale_dropped = captured.stale_dropped;
         stats.audio_capture_recoveries = captured.recoveries;
         stats.audio_gate_transitions = captured.gate_transitions;
         stats.audio_dsp_frames = captured.processed_frames;
         stats.audio_dsp_resets = captured.dsp_resets;
+        stats.audio_reference_underruns = captured.reference_underruns;
+        stats.audio_dsp_requested = captured.dsp_requested;
+        stats.audio_dsp_active = captured.dsp_active;
+        stats.audio_dsp_error = captured.dsp_error;
+        if (captured.dsp_requested && !captured.dsp_active &&
+            !audio_dsp_failure_logged) {
+            audio_dsp_failure_logged = true;
+            log("audio: the DSP is unavailable; sending the raw mix: " +
+                (captured.dsp_error.empty()
+                     ? std::string("audio DSP creation failed")
+                     : captured.dsp_error));
+        }
         stats.audio_recovering = captured.recovering;
         if (captured.recoveries != audio_recoveries_logged) {
             audio_recoveries_logged = captured.recoveries;
@@ -8769,9 +8809,14 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
 }
 
 void HostServer::stop_microphone(HostServerStats& stats, const std::string& reason) {
-    voice_reference_->set_active(false);
-    if (audio_reference_) {
-        audio_reference_->set_active(false);
+    if (microphone_reference_acquired_) {
+        // release(), not set_active(false): another viewer may still be
+        // playing into the same host-wide reference.
+        voice_reference_->release();
+        if (audio_reference_) {
+            audio_reference_->release();
+        }
+        microphone_reference_acquired_ = false;
     }
     if (microphone_player_) {
         stats.microphone_underruns = microphone_player_->stats().underruns;
@@ -8789,12 +8834,9 @@ void HostServer::stop_microphone(HostServerStats& stats, const std::string& reas
 }
 
 void HostServer::drain_microphone(HostServerStats& stats) {
-    // An open but stalled stream must not repeatedly train voice AEC with
-    // the same old PCM. Leave room for the render lead and acoustic tail;
-    // the first block after the gap reactivates an empty reference.
-    if (voice_reference_->active() &&
-        std::chrono::steady_clock::now() - voice_reference_last_push_ > std::chrono::milliseconds(500))
-        voice_reference_->set_active(false);
+    // A stalled stream is handled by the reference's timed playhead: after
+    // 500 ms without a rendered block it reports inactive and the canceller
+    // resets, without clearing another viewer's live reference.
     stats.microphone_streams = session_->microphone_streams();
     if (!settings_.allow_microphone || stats.microphone_streams == 0) {
         return;
@@ -8852,8 +8894,22 @@ void HostServer::drain_microphone(HostServerStats& stats) {
                 // The same output as the system-sound capture: what the
                 // reference models has to be what the speakers play.
                 player_config.device_id = settings_.audio_device;
+                const auto voice_reference = voice_reference_;
+                const auto loop_reference = audio_reference_;
+                player_config.render_sink =
+                    [voice_reference, loop_reference](const int16_t* pcm, size_t frames,
+                                                      uint16_t channels,
+                                                      int64_t audible_start_ms) {
+                        voice_reference->push_rendered(pcm, frames, channels,
+                                                       audible_start_ms);
+                        if (loop_reference) {
+                            loop_reference->push_rendered(pcm, frames, channels,
+                                                          audible_start_ms);
+                        }
+                    };
                 if (config_.microphone_player) {
-                    microphone_player_ = config_.microphone_player(&setup_error);
+                    microphone_player_ =
+                        config_.microphone_player(player_config, &setup_error);
                 } else {
                     microphone_player_ = create_audio_player(player_config, &setup_error);
                 }
@@ -8869,19 +8925,20 @@ void HostServer::drain_microphone(HostServerStats& stats) {
                     microphone_decoder_.reset();
                     log("microphone playback failed: " + started.to_string());
                 } else {
-                    voice_reference_last_push_ = std::chrono::steady_clock::now();
-                    voice_reference_->set_active(true);
+                    // The render sink feeds the reference only after the
+                    // endpoint accepts a block. Acquire here so a shared
+                    // reference stays active while this player runs.
+                    voice_reference_->acquire();
                     if (audio_reference_) {
-                        // Only live playback may train the canceller; the
-                        // pushed blocks are the reference for loopback.
-                        audio_reference_->set_active(true);
+                        audio_reference_->acquire();
                     }
+                    microphone_reference_acquired_ = true;
                     stats.microphone_active = true;
                     log("microphone: Opus " +
                         std::to_string(info.sample_rate / 1000u) + " kHz, " +
                         std::to_string(info.channels) + " ch, " +
                         std::to_string(info.frame_samples) + " samples/frame" +
-                        (audio_reference_ ? ", feeding loopback AEC" : ""));
+                        (audio_reference_ ? ", feeding host AEC references" : ""));
                 }
             }
         }
@@ -8912,16 +8969,6 @@ void HostServer::drain_microphone(HostServerStats& stats) {
                 push_failed = true;
                 break;
             }
-            // Only accepted playback belongs in the echo reference. Both
-            // decoders deliver 48 kHz PCM, the reference's fixed sample rate.
-            if (block.sample_rate == 48000 && block.channels >= 1 && block.channels <= 2) {
-                const auto frames = block.samples.size() / block.channels;
-                voice_reference_last_push_ = std::chrono::steady_clock::now();
-                voice_reference_->set_active(true);
-                voice_reference_->push(block.samples.data(), frames, block.channels);
-                if (audio_reference_)
-                    audio_reference_->push(block.samples.data(), frames, block.channels);
-            }
         }
         if (push_failed) {
             break;
@@ -8946,6 +8993,8 @@ void HostServer::stop_voice_call(HostServerStats& stats, const std::string& reas
     voice_info_ = AudioInfo{};
     voice_next_seq_ = 0;
     voice_request_id_ = 0;
+    voice_dsp_failure_logged_ = false;
+    voice_dsp_error_logged_.clear();
     const bool was_active = stats.voice_call_active;
     stats.voice_call_active = false;
     if (was_active) {
@@ -8996,6 +9045,18 @@ std::unique_ptr<IMicrophoneCapture> HostServer::create_voice_capture(
             }
             capture->stop();
             capture.reset();
+        } else {
+            voice_dsp_failure_logged_ = false;
+            voice_dsp_error_logged_.clear();
+            const AudioCaptureStats capture_stats = capture->stats();
+            if (capture_stats.dsp_requested && !capture_stats.dsp_active) {
+                voice_dsp_failure_logged_ = true;
+                voice_dsp_error_logged_ = capture_stats.dsp_error;
+                log("voice call: the DSP is unavailable; sending raw microphone audio: " +
+                    (capture_stats.dsp_error.empty()
+                         ? std::string("audio DSP creation failed")
+                         : capture_stats.dsp_error));
+            }
         }
     }
     device_id = microphone_config.device_id;
@@ -9192,6 +9253,22 @@ void HostServer::drain_voice_call(HostServerStats& stats) {
     }
     const AudioCaptureStats captured = voice_capture_->stats();
     stats.voice_call_dropped = voice_send_drops_ + captured.dropped;
+    stats.voice_call_stale_dropped = captured.stale_dropped;
+    stats.voice_dsp_frames = captured.processed_frames;
+    stats.voice_dsp_resets = captured.dsp_resets;
+    stats.voice_reference_underruns = captured.reference_underruns;
+    stats.voice_dsp_requested = captured.dsp_requested;
+    stats.voice_dsp_active = captured.dsp_active;
+    stats.voice_dsp_error = captured.dsp_error;
+    if (captured.dsp_requested && !captured.dsp_active &&
+        (!voice_dsp_failure_logged_ || captured.dsp_error != voice_dsp_error_logged_)) {
+        voice_dsp_failure_logged_ = true;
+        voice_dsp_error_logged_ = captured.dsp_error;
+        log("voice call: the DSP is unavailable; sending raw microphone audio: " +
+            (captured.dsp_error.empty()
+                 ? std::string("audio DSP creation failed")
+                 : captured.dsp_error));
+    }
 }
 
 bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,

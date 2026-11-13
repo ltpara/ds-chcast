@@ -111,6 +111,11 @@ private:
         // partial block would hold half of its samples back and the endpoint
         // could run dry between halves.
         int64_t play_lead_ms = 0;
+        // Canonical 48 kHz reference PCM for AEC. Kept only when the decoded
+        // block already has the fixed reference format; the render sink gets
+        // it after ReleaseBuffer succeeds, never at push time.
+        std::vector<int16_t> reference;
+        uint16_t reference_channels = 0;
     };
 
     void thread_main();
@@ -169,6 +174,7 @@ private:
     int swr_input_rate_ = 0;
     uint16_t swr_input_channels_ = 0;
     std::vector<uint8_t> scratch_;
+    std::vector<int16_t> reference_silence_;
 
     // Serialises push()'s conversion against an endpoint rebuild. The packet
     // thread must never touch swr_ while the render thread replaces the mix
@@ -773,7 +779,7 @@ bool WasapiPlayer::render() {
                 return false;
             }
             const size_t source_offset = head.written * frame_bytes;
-            if (muted_.load()) {
+            if (mute) {
                 // Zeroing the block is authoritative even if the endpoint's
                 // volume service is missing or refuses the mute call.
                 std::memset(data, 0, write_frames * frame_bytes);
@@ -787,10 +793,36 @@ bool WasapiPlayer::render() {
                 return false;
             }
 
+            const size_t reference_frames =
+                head.reference.empty() ? 0 : head.reference.size() / head.reference_channels;
+            const size_t reference_offset = reference_frames == 0
+                ? 0
+                : head.written * reference_frames / head.frames;
             head.written += write_frames;
             played_frames_.fetch_add(write_frames);
             queued_frames_ -= write_frames;
             padding += static_cast<UINT32>(write_frames);
+            if (config_.render_sink && head.reference_channels != 0 &&
+                reference_frames != 0) {
+                const size_t reference_end = (std::min)(
+                    reference_frames, head.written * reference_frames / head.frames);
+                const int64_t audible_start =
+                    play_local +
+                    static_cast<int64_t>(head.written - write_frames) * 1000 /
+                        device_rate;
+                if (mute) {
+                    reference_silence_.assign(
+                        (reference_end - reference_offset) * head.reference_channels, 0);
+                    config_.render_sink(reference_silence_.data(),
+                                        reference_end - reference_offset,
+                                        head.reference_channels, audible_start);
+                } else {
+                    config_.render_sink(
+                        head.reference.data() + reference_offset,
+                        reference_end - reference_offset, head.reference_channels,
+                        audible_start);
+                }
+            }
             const int64_t end_local =
                 play_local + static_cast<int64_t>(head.written) * 1000 / device_rate;
             // Anything between the last written audio and this block's slot
@@ -1048,6 +1080,11 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
         block.frames = frames;
         block.host_capture_ms = audio.capture_ms;
         block.play_lead_ms = playout_lead_ms();
+        if (config_.render_sink && audio.sample_rate == 48000 && audio.channels >= 1 &&
+            audio.channels <= 2 && !audio.samples.empty()) {
+            block.reference = audio.samples;
+            block.reference_channels = audio.channels;
+        }
         queue_.push_back(std::move(block));
         queued_frames_ += frames;
         have_pushed_ = true;

@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -147,11 +148,19 @@ std::unique_ptr<IAudioDecoder> create_audio_decoder(const AudioInfo& info, std::
 // ----- audio DSP (echo cancellation and noise suppression) -----
 
 // Playback reference shared by the side that renders audio and the side that
-// cancels its echo. Both directions need the same thing: the PCM that is (or
-// is about to be) audible, kept long enough that a fixed read delay can line
-// it up with the microphone. The format is fixed at 48 kHz stereo s16 because
-// both capture paths already run at 48 kHz. All methods are thread-safe; push
-// and read are called from different threads in practice.
+// cancels its echo. Both directions need the same thing: the PCM that is
+// audible, kept long enough that a fixed read delay can line it up with the
+// microphone. The format is fixed at 48 kHz stereo s16 because both capture
+// paths already run at 48 kHz. All methods are thread-safe; push and read are
+// called from different threads in practice.
+//
+// A reference can be shared by several players (the host plays every viewer's
+// microphone through the same speakers). Producers call acquire() before the
+// first push and release() when their player stops; the last release clears
+// the history, so one viewer closing its microphone no longer blinds the AEC
+// of another. Timed pushes are mixed on a common steady-clock timeline, which
+// is what makes two concurrent players cancel correctly instead of appending
+// one stream behind the other.
 class AudioReference {
 public:
     AudioReference();
@@ -159,22 +168,42 @@ public:
     AudioReference(const AudioReference&) = delete;
     AudioReference& operator=(const AudioReference&) = delete;
 
-    // Appends playback PCM. `channels` is 1 or 2; mono is duplicated to both
-    // sides. Ignored while inactive, so a paused player cannot seed stale
-    // history for the next one.
+    // Producer lifetime for a shared reference. acquire() activates and keeps
+    // the history while at least one producer is attached. release() clears it
+    // only when the last producer leaves. Balanced calls are required.
+    void acquire();
+    void release();
+
+    // Appends playback PCM to the untimed stream. `channels` is 1 or 2; mono
+    // is duplicated to both sides. Ignored while inactive, so a paused player
+    // cannot seed stale history for the next one. Callers that know when the
+    // PCM becomes audible should use push_rendered() instead.
     void push(const int16_t* samples, size_t frames, uint16_t channels);
 
-    // Writes `frames` stereo samples ending `delay_ms` before the newest push.
-    // Returns false (and zero-fills the missing part) while the reference is
-    // inactive or shorter than the requested span; callers use that as an
+    // Appends PCM that becomes audible at `audible_start_ms` on the steady
+    // clock. Concurrent producers are mixed sample-by-sample (saturating) at
+    // that position. A player calls this from its render thread after the
+    // endpoint accepted a block, so blocks discarded during a rebuild, the
+    // startup gather or queue overflow never enter the reference.
+    void push_rendered(const int16_t* samples, size_t frames, uint16_t channels,
+                       int64_t audible_start_ms);
+
+    // Writes `frames` stereo samples ending `delay_ms` before the current
+    // playhead (timed mode) or the newest push (untimed mode). Returns false
+    // (and zero-fills the missing part) while the reference is inactive,
+    // stalled or shorter than the requested span; callers use that as an
     // underrun signal, not an error. The sample-accurate variant exists
     // because the DSP adds a partial-frame delay of its own.
     bool read_delayed(size_t frames, uint32_t delay_ms, int16_t* out) const;
     bool read_delayed_frames(size_t frames, size_t delay_frames, int16_t* out) const;
 
-    // Opening/clearing the reference. Any transition drops the history: after
-    // a pause the old samples no longer describe what is audible. The echo
-    // canceller resets itself when this flips to false.
+    // Single-owner activation, kept for the DSP tests and simple callers.
+    // Acquire/release is the lifetime mechanism for shared players; a legacy
+    // deactivation does not clear history while producers remain attached.
+    // Any transition drops the history: after a pause the old samples no
+    // longer describe what is audible. The echo canceller resets itself when
+    // this flips to false. Timed history also reports inactive after 500 ms
+    // without a push, so a stalled stream cannot keep training the filter.
     void set_active(bool active);
     bool active() const;
 
@@ -261,7 +290,9 @@ struct LoopbackCaptureConfig {
 
 struct AudioCaptureStats {
     uint64_t packets = 0;          // packets queued for the session
-    uint64_t dropped = 0;          // packets dropped because the queue was full
+    uint64_t dropped = 0;          // packets dropped because a queue was full
+    uint64_t stale_dropped = 0;    // packets discarded after waiting past the
+                                   // shared queue's age budget
     uint64_t silence_frames = 0;   // device frames detected as silence
     uint64_t capture_errors = 0;   // terminal read/encode failures
     uint64_t gate_transitions = 0; // silence gate opened or closed
@@ -271,6 +302,12 @@ struct AudioCaptureStats {
     uint64_t reference_underruns = 0;
     uint64_t dsp_resets = 0;
     bool recovering = false;       // endpoint lost, waiting for a new default
+    // Echo cancellation / noise suppression requested by the settings and
+    // whether the DSP object could actually be created. A missing SpeexDSP
+    // build must be visible here instead of silently sending raw PCM.
+    bool dsp_requested = false;
+    bool dsp_active = false;
+    std::string dsp_error;
 };
 
 // Captures the default render endpoint's loopback mix on its own thread,
@@ -328,8 +365,10 @@ struct MicrophoneCaptureConfig {
     std::string device_id;
     uint32_t bitrate = 32000;
     size_t queue_packets = 16;
-    // Viewer-side echo cancellation and noise suppression. The reference is
-    // the system audio this viewer is playing; both switches are independent.
+    // Host-side echo cancellation and noise suppression for the uplink. The
+    // host plays every viewer's microphone through its speakers, so the
+    // reference is host-wide and may have several producers; both switches
+    // are independent.
     std::shared_ptr<AudioReference> reference;
     bool echo_cancellation = false;
     bool noise_suppression = false;
@@ -656,6 +695,13 @@ struct AudioPlayerConfig {
     // instead of carrying the startup handshake delay for the whole session.
     // 0 anchors on the first block. Only used with `arrival_anchored`.
     uint32_t anchor_gather_blocks = 0;
+    // Reports PCM that the endpoint accepted, after ReleaseBuffer succeeds and
+    // only for actual playback. `audible_start_ms` is the steady-clock time
+    // the first frame is scheduled to become audible. Blocks dropped by the
+    // startup gather, queue overflow, an expired slot or an endpoint rebuild
+    // never reach this callback, so echo cancellation cannot train on audio
+    // that was never played. Empty when no reference is needed.
+    std::function<void(const int16_t*, size_t, uint16_t, int64_t)> render_sink;
     // Grow the playout lead past `lead_ms` when arrivals miss their slots,
     // and return it after the link settles. Works on both timelines: with
     // `arrival_anchored` it starts from zero, and with a host capture offset
