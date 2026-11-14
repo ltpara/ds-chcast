@@ -102,8 +102,10 @@ chast-quic.exe verify --port 45633 --seconds 2 --quiet --annotation-overlay
 客户端建立会话，枚举当前进程的 `chast_annotation_overlay` 窗口并使每个显示器
 恰好对应一个覆盖层；逐项核验窗口样式、`WM_NCHITTEST == HTTRANSPARENT`、
 `GetWindowDisplayAffinity == WDA_EXCLUDEFROMCAPTURE`、窗口矩形与显示器矩形
-一致、没有输入权限时仍可显示，以及 `Clear` 后隐藏。会话结束后确认覆盖层窗口
-已销毁。捕获排除是 Windows 10 2004+ 的能力；探针校验窗口亲和性，但真实
+一致、没有输入权限时仍可显示，以及 `Clear` 后隐藏。排除捕获的窗口不能再用桌面
+截图检查笔迹，探针因此通过 `WM_PRINTCLIENT` 回读覆盖层自身的合成表面，断言笔迹
+像素确实存在，`Clear` 后再回读要求表面归零，最后比对桌面截图要求标注不得泄漏。
+会话结束后确认覆盖层窗口已销毁。捕获排除是 Windows 10 2004+ 的能力；探针校验窗口亲和性，但真实
 Desktop Duplication 截图/录像以及旧版 Windows 的回退行为仍待人工环境验收。
 
 Flutter：
@@ -121,7 +123,7 @@ controller 唯一 ID、发送异常恢复、绘制路径完全不调用远程输
 
 ## 6. 未完成验收
 
-自动化已经创建真实可见的 `HostServer` 会话并通过上述窗口、像素与销毁检查；
+自动化已经创建真实可见的 `HostServer` 会话并通过上述窗口、笔迹回读、捕获排除与销毁检查；
 以下项目仍须真实 GUI 操作或双机环境验收：
 
 1. 在真实查看器窗口中用鼠标、触摸和笔划分别绘制，并目视确认延迟、笔宽与主机

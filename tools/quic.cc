@@ -8496,6 +8496,82 @@ bool annotation_overlay_works(uint16_t port, std::string* detail) {
         }
     }
 
+    // The plane is excluded from capture, so a desktop screenshot can only
+    // prove the ink is absent. Read the composed surface back through
+    // WM_PRINTCLIENT to prove the stroke was actually rendered.
+    HWND ink_plane = nullptr;
+    RECT ink_plane_rect{};
+    const int probe_x = (patch.left + patch.right) / 2;
+    const int probe_y = (patch.top + patch.bottom) / 2;
+    for (HWND window : planes) {
+        RECT candidate{};
+        if (GetWindowRect(window, &candidate) == FALSE) {
+            return fail("GetWindowRect failed for an annotation plane");
+        }
+        if (probe_x >= candidate.left && probe_x < candidate.right && probe_y >= candidate.top &&
+            probe_y < candidate.bottom) {
+            ink_plane = window;
+            ink_plane_rect = candidate;
+            break;
+        }
+    }
+    if (ink_plane == nullptr) {
+        return fail("no annotation plane covers the probe patch");
+    }
+    auto surface_ink = [&](size_t* ink, std::string* why) {
+        HDC dc = CreateCompatibleDC(nullptr);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = patch_width;
+        info.bmiHeader.biHeight = -patch_height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (dc == nullptr || bitmap == nullptr || bits == nullptr) {
+            if (bitmap != nullptr) {
+                DeleteObject(bitmap);
+            }
+            if (dc != nullptr) {
+                DeleteDC(dc);
+            }
+            *why = "allocation failed";
+            return false;
+        }
+        const HGDIOBJ previous = SelectObject(dc, bitmap);
+        // WM_PRINTCLIENT copies the plane at its own origin; shift the
+        // destination viewport so the patch lands at pixel (0, 0).
+        SetViewportOrgEx(dc, ink_plane_rect.left - patch.left, ink_plane_rect.top - patch.top,
+                         nullptr);
+        SendMessageW(ink_plane, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+        GdiFlush();
+        const auto* pixels = static_cast<const uint8_t*>(bits);
+        size_t count = 0;
+        const size_t total = static_cast<size_t>(patch_width) * patch_height;
+        for (size_t i = 0; i < total; ++i) {
+            const uint8_t* pixel = pixels + i * 4;
+            if (static_cast<int>(pixel[0]) + static_cast<int>(pixel[1]) +
+                    static_cast<int>(pixel[2]) >= 24) {
+                ++count;
+            }
+        }
+        SelectObject(dc, previous);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+        *ink = count;
+        return true;
+    };
+    size_t ink_pixels = 0;
+    std::string readback_error;
+    if (!surface_ink(&ink_pixels, &readback_error)) {
+        return fail("annotation surface readback: " + readback_error);
+    }
+    if (ink_pixels < 1000) {
+        return fail("the annotation plane rendered only " + std::to_string(ink_pixels) +
+                    " ink pixels");
+    }
+
     std::vector<uint8_t> after;
     if (!capture_screen_patch(patch, &after, &error)) {
         return fail("annotation screenshot: " + error);
@@ -8515,6 +8591,14 @@ bool annotation_overlay_works(uint16_t port, std::string* detail) {
     }
     if (!wait_for_annotation_windows(false, &planes, std::chrono::seconds(5))) {
         return fail("the annotation plane stayed visible after Clear");
+    }
+    size_t cleared_pixels = 0;
+    if (!surface_ink(&cleared_pixels, &readback_error)) {
+        return fail("annotation surface readback after Clear: " + readback_error);
+    }
+    if (cleared_pixels != 0) {
+        return fail("Clear left " + std::to_string(cleared_pixels) +
+                    " ink pixels on the plane surface");
     }
 
     client.reset();

@@ -524,6 +524,17 @@ LRESULT CALLBACK AnnotationOverlay::Impl::window_proc(HWND window, UINT message,
             }
             return 0;
         }
+        case WM_PRINTCLIENT: {
+            // A plane excluded from capture cannot be checked with a desktop
+            // screenshot. The probe uses this hook to read the composed
+            // surface back and prove the ink was actually rendered.
+            if (plane != nullptr && plane->surface_dc != nullptr) {
+                BitBlt(reinterpret_cast<HDC>(wparam), 0, 0, plane->width, plane->height,
+                       plane->surface_dc, 0, 0, SRCCOPY);
+                return 0;
+            }
+            break;
+        }
         case WM_NCHITTEST:
             return HTTRANSPARENT;
         case WM_MOUSEACTIVATE:

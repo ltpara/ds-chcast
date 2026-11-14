@@ -2,7 +2,7 @@
 
 本文件记录服务端/管理台在 2026-11-12 的检查点，以及 2026-11-13/14 的续办结果。历史提交基线保留为协议 v72；当前 GitHub 基线为 `5590d75`（协议 v73），工作区源码为 v76。
 
-2026-11-14 G21 原生增量：工作区协议 v76 新增临时自由手写标注，含查看端绘制队列、Windows 逐显示器点击穿透覆盖层、按 stroke ID 支持多窗口交错笔画和 2048 笔/65536 点上限。协议/光栅/历史测试、12/12 Flutter 定向测试、Windows Release 构建、单机真实 QUIC 回环 104 项及启用覆盖层探针后的 105 项通过，其中真实 `HostServer` 单机可见覆盖层完成窗口、像素与销毁自动化；真实双机、多屏/混合 DPI、锁屏/UAC 和生产发布仍是未完成验收，见 [临时自由标注](annotation-2026-11-14.md)。协议与原生代码的实时状态仍以 `docs/status-and-plan-2026-11-09.md` 和代码为准。
+2026-11-14 G21 原生增量：工作区协议 v76 新增临时自由手写标注，含查看端绘制队列、Windows 逐显示器点击穿透覆盖层、按 stroke ID 支持多窗口交错笔画和 2048 笔/65536 点上限。协议/光栅/历史测试、12/12 Flutter 定向测试、Windows Release 构建、单机真实 QUIC 回环 104 项及启用覆盖层探针后的 105 项通过，其中真实 `HostServer` 单机可见覆盖层完成窗口、笔迹回读、捕获排除与销毁自动化；真实双机、多屏/混合 DPI、锁屏/UAC 和生产发布仍是未完成验收，见 [临时自由标注](annotation-2026-11-14.md)。协议与原生代码的实时状态仍以 `docs/status-and-plan-2026-11-09.md` 和代码为准。
 
 2026-11-14 P2 指针续验：Windows 主机现在同时读取 `CursorBaseSize` 与辅助功能 `CursorSize`，按有效 DPI 派生目标物理尺寸；GDI 与 DXGI 共用等比缩放、预乘 BGRA、反色掩码、热点映射和描边逻辑，发布精灵上限 512 px。真实 GDI 在辅助功能 1/13/15 档分别采集到 32/224/256 px 的有效可见形状，内容 ID 各不相同，测试后已恢复用户设置。`cursor`、`protocol`、`protocol_fuzz`、`capture_transform`、`shared_capture`、`shared_capturer`、`desktop`、`desktop_stream` 共 8/8 CTest 通过。当前会话中的 DXGI 连续 30 次没有 pointer shape，且没有致命采集错误，因此真实 DXGI 大光标、查看端叠层缩放和 hotspot 对齐仍待交互式桌面验收，见 [指针四项复核](pointer-acceptance-2026-11-11.md)。
 
