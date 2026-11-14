@@ -40,6 +40,18 @@ constexpr size_t kMaxSubscriberQueueBytes = 8u * 1024u * 1024u;
 // on every tick. The delay is bounded to one frame or this window, whichever
 // is longer, and only affects viewers that are already waiting.
 constexpr uint64_t kIdrMergeWindowMs = 120;
+// A subscriber that keeps losing its reference chain must not force a keyframe
+// at the merge-window rate: an IDR is the largest picture the encoder produces,
+// so asking for one because the path is full adds more bytes to the same path.
+// Each resync therefore sets the earliest time the next one may be requested,
+// doubling from the merge window up to this cap. A window without another
+// resync means the path held, which restores the fast step.
+constexpr uint64_t kResyncBackoffMaxMs = 2000;
+constexpr uint64_t kResyncResetWindowMs = 1500;
+// A reading session waits this long for the display service to publish before
+// it returns to the session loop, which still has to service control messages,
+// audio and the clipboard on the same thread.
+constexpr std::chrono::milliseconds kFrameWaitSlice{5};
 struct Subscription {
     // Only the owning connection reads/replaces current. The service changes
     // queues on its thread, not metadata a connection might be inspecting.
@@ -54,6 +66,16 @@ struct Subscription {
     // charge time spent waiting for the service to process capture() twice.
     uint64_t current_available_ms = 0;
     std::atomic<uint64_t> delivered_wait_ms{0}, expired_frames{0}, age_resyncs{0};
+    std::atomic<uint64_t> resync_backoffs{0};
+    // Service-thread only: the exponential backoff that keeps a subscriber
+    // stuck on a slow path from forcing a keyframe every merge window. The
+    // reset tracks request activity, not admitted resyncs, so a sustained
+    // stall cannot pass for a recovered path just because its own backoff
+    // interval grew past the reset window.
+    unsigned resync_attempts = 0;
+    uint64_t resync_due_ms = 0;
+    uint64_t last_resync_request_ms = 0;
+    bool resync_pending = false;
     VideoCodecMask decoding_codecs = kVideoCodecAll;
     // Desktop sources invoke this from their independent pointer worker;
     // sources without a sampler publish captured cursor metadata before encode.
@@ -70,6 +92,12 @@ struct DesktopStreamPool::Source {
     std::condition_variable wake;
     std::deque<std::function<void()>> commands;
     bool stopping = false;
+    // Wakes reading sessions when a picture is published instead of leaving
+    // them to poll a fixed slice. The serial changes on every publish, so a
+    // reader that missed the notification still sees the newer value.
+    std::mutex frame_mutex;
+    std::condition_variable frame_wake;
+    uint64_t frame_serial = 0;
     std::thread worker;
     std::thread cursor_worker;
     std::mutex pointer_mutex;
@@ -384,11 +412,54 @@ struct DesktopStreamPool::Source {
             keyframe_deferred = false;
         }
     }
+    static uint64_t resync_delay(unsigned attempts) {
+        uint64_t delay = kIdrMergeWindowMs;
+        for (unsigned i = 1; i < attempts && delay < kResyncBackoffMaxMs; ++i) delay *= 2;
+        return std::min(delay, kResyncBackoffMaxMs);
+    }
+    // Requests a shared IDR on behalf of a subscriber that lost its reference
+    // chain, subject to that subscriber's backoff. The service tick retries a
+    // refused request even when the desktop stops publishing pictures.
+    bool request_resync(Subscription& sub, uint64_t now) {
+        // A window without a resync request means the subscriber stopped
+        // falling behind: decay to the base step so the next stall is
+        // answered at once instead of inheriting an older burst's delay.
+        if (!sub.resync_pending && sub.last_resync_request_ms != 0 && now >= sub.last_resync_request_ms &&
+            now - sub.last_resync_request_ms >= kResyncResetWindowMs) {
+            sub.resync_attempts = 0;
+            sub.resync_due_ms = 0;
+        }
+        if (now > sub.last_resync_request_ms) sub.last_resync_request_ms = now;
+        if (now < sub.resync_due_ms) {
+            sub.resync_pending = true;
+            sub.resync_backoffs.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        sub.resync_pending = false;
+        sub.resync_attempts = std::min(sub.resync_attempts + 1, 16u);
+        sub.resync_due_ms = now + resync_delay(sub.resync_attempts);
+        request_shared_keyframe(now);
+        return true;
+    }
+    void service_pending_resyncs(uint64_t now) {
+        for (const auto& weak : subscribers) if (auto sub = weak.lock()) {
+            if (sub->resync_pending && sub->waiting_idr && now >= sub->resync_due_ms)
+                request_resync(*sub, now);
+        }
+    }
+    void notify_published() {
+        {
+            std::lock_guard lock(frame_mutex);
+            ++frame_serial;
+        }
+        frame_wake.notify_all();
+    }
     void clear_queues() {
         for (auto& weak : subscribers) if (auto sub = weak.lock()) {
             sub->queue.clear();
             sub->queued_bytes = 0;
             sub->waiting_idr = true;
+            sub->resync_pending = false;
         }
         force_keyframe();
     }
@@ -406,7 +477,7 @@ struct DesktopStreamPool::Source {
             if (sink) sink(*image->cursor);
         }
     }
-    void request_keyframe(const Subscription& sub) {
+    void request_keyframe(Subscription& sub) {
         // The connection may ask again while its first IDR is waiting to be
         // consumed. Coalesce that request instead of encoding another IDR on
         // the next tick after the first one has already been delivered.
@@ -416,6 +487,12 @@ struct DesktopStreamPool::Source {
                 return picture->generation == generation && picture->idr;
             }))
             return;
+        // A forced encode or viewer request must not bypass an outstanding
+        // backlog recovery's rate limit. Source resets use force_keyframe().
+        if (sub.waiting_idr && sub.resync_attempts != 0) {
+            request_resync(sub, now_ms());
+            return;
+        }
         request_shared_keyframe(now_ms());
     }
     void invalidate() {
@@ -724,16 +801,21 @@ struct DesktopStreamPool::Source {
             if (!sub) { it = subscribers.erase(it); continue; }
             ++it;
             // Bound each slow connection independently. Never resume at a P
-            // frame after dropping references: request a fresh IDR instead.
-            if (sub->queue.size() >= kMaxSubscriberQueueFrames ||
-                sub->queued_bytes + picture->bytes > kMaxSubscriberQueueBytes) {
+            // frame after dropping references: request a fresh IDR instead,
+            // subject to this subscriber's resync backoff so a path that stays
+            // full does not turn into a keyframe stream.
+            const bool overflow = sub->queue.size() >= kMaxSubscriberQueueFrames ||
+                sub->queued_bytes + picture->bytes > kMaxSubscriberQueueBytes;
+            if (overflow) {
                 sub->queue.clear();
                 sub->queued_bytes = 0;
                 sub->waiting_idr = true;
-                request_shared_keyframe(picture->published_ms);
+                request_resync(*sub, picture->published_ms);
             }
             if (sub->waiting_idr && !picture->idr) {
-                request_shared_keyframe(picture->published_ms);
+                // The overflow branch above already asked for this frame; a
+                // second call would only inflate the suppressed count.
+                if (!overflow) request_resync(*sub, picture->published_ms);
                 continue;
             }
             // An IDR decodes on its own and makes every queued reference
@@ -745,9 +827,13 @@ struct DesktopStreamPool::Source {
                 sub->queued_bytes = 0;
             }
             sub->waiting_idr = false;
+            sub->resync_pending = false;
             sub->queue.push_back(picture);
             sub->queued_bytes += picture->bytes;
         }
+        // Reading sessions block on this instead of polling a fixed slice, so
+        // a send follows its publish instead of trailing it by up to 5 ms.
+        notify_published();
     }
     bool encode(bool repeat, bool force_update = false) {
         if (!image || (!image->nv12 && !image->frame.cpu_bgra)) return true;
@@ -898,7 +984,7 @@ struct DesktopStreamPool::Source {
             sub.queued_bytes = 0;
             sub.consumed = true;
             sub.waiting_idr = true;
-            request_shared_keyframe(now);
+            request_resync(sub, now);
             return true;
         }
         return false;
@@ -932,6 +1018,7 @@ struct DesktopStreamPool::Source {
         if (!capture || fatal || lost || (!configured && image)) return;
         apply_qos();
         if (Clock::now() < due) return;
+        service_pending_resyncs(now_ms());
         if (recorder && recorder->needs_keyframe(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count())))
             request_shared_keyframe(now_ms());
@@ -1079,17 +1166,42 @@ public:
         source->request_shared_keyframe(now_ms());
     }
     ~Capture() override;
-    CaptureResult capture(std::chrono::milliseconds timeout) override {
+    CaptureResult read_once() {
         const auto requested_ms = now_ms();
-        const auto result = source->call([&] {
+        return source->call([&] {
             const auto result = source->read(*sub, requested_ms);
             error = source->error;
             return result;
         });
-        // Readers wait without occupying the GPU thread.
-        if (result == CaptureResult::NoNewFrame)
-            std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds(5)));
-        return result;
+    }
+    CaptureResult capture(std::chrono::milliseconds timeout) override {
+        // Sample the publish serial before reading: a publish that lands
+        // between the read and the wait must still wake this call, or the
+        // picture waits for the next session loop iteration.
+        uint64_t seen = 0;
+        {
+            std::lock_guard lock(source->frame_mutex);
+            seen = source->frame_serial;
+        }
+        auto result = read_once();
+        if (result != CaptureResult::NoNewFrame) return result;
+        // Wait for the display service to publish instead of sleeping a fixed
+        // slice: the sleep put up to its whole length between a publish and the
+        // send. The slice stays short because this thread still services
+        // control, audio and clipboard work on the same loop.
+        const auto slice = std::min(timeout, kFrameWaitSlice);
+        if (slice.count() <= 0) return result;
+        bool published = false;
+        {
+            std::unique_lock lock(source->frame_mutex);
+            published = source->frame_wake.wait_for(lock, slice,
+                [&] { return source->frame_serial != seen; });
+        }
+        // Only a publish makes the second dispatch worth it: a timing-out wait
+        // leaves nothing to read and the next call finds the picture, exactly
+        // as the previous fixed sleep behaved.
+        if (!published) return result;
+        return read_once();
     }
     const FrameInfo& frame() const override { return sub->current ? sub->current->frame : empty_frame; }
     const CursorInfo& cursor() const override { return sub->current ? *sub->current->cursor : empty_cursor; }
@@ -1606,7 +1718,9 @@ void DesktopStreamPool::discard_backlog(IDxgiCapturer& capturer) {
         sub.queued_bytes = 0;
         sub.consumed = true;
         sub.waiting_idr = true;
-        capture.source->request_shared_keyframe(now_ms());
+        // A path that reports backpressure repeatedly must not be answered
+        // with a keyframe each time; the backoff admits one per window.
+        capture.source->request_resync(sub, now_ms());
     });
 }
 
@@ -1616,7 +1730,8 @@ uint64_t DesktopStreamPool::capture_time(const IDxgiCapturer& capturer) {
 
 DesktopStreamPool::QueueStats DesktopStreamPool::queue_stats(const IDxgiCapturer& capturer) {
     const auto& sub = *dynamic_cast<const Capture&>(capturer).sub;
-    return {sub.delivered_wait_ms.load(), sub.expired_frames.load(), sub.age_resyncs.load()};
+    return {sub.delivered_wait_ms.load(), sub.expired_frames.load(), sub.age_resyncs.load(),
+            sub.resync_backoffs.load()};
 }
 
 std::future<DesktopStreamPool::Screenshot> DesktopStreamPool::screenshot_async(IDxgiCapturer& capturer) {

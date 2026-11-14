@@ -8,7 +8,16 @@
 namespace chast {
 namespace {
 constexpr uint32_t kInitFps = 15;
+// Soft floor for a path that is merely slow. Bitrate-targeted encoders do not
+// send fewer bytes at fewer frames, so cutting frames below this while the
+// bitrate can still come down would only add stutter.
 constexpr uint32_t kMinAutoFps = 5;
+// A delay of this order means the path is not draining at the current rate at
+// all. Holding the soft floor there keeps the queue full, so the floor steps
+// down with the measured delay, as the reference policy does (MIN_FPS = 1).
+constexpr uint32_t kHardFloorDelayMs = 600;
+constexpr uint32_t kMinDelayFps = 3;
+constexpr uint32_t kStallFloorDelayMs = 1200;
 constexpr uint32_t kDelayThresholdMs = 150;
 constexpr uint8_t kRestoreGuardSamples = 5;
 constexpr uint8_t kStartupEnded = 255;
@@ -16,6 +25,16 @@ constexpr uint8_t kStartupEnded = 255;
 float clamp_ratio(float value, float low, float high) {
     if (low > high) std::swap(low, high);
     return std::clamp(value, low, high);
+}
+// The frame-rate floor a measured delay justifies. Until the bitrate has
+// bottomed out, cutting frames does not cut bytes, so the floor stays soft and
+// only bitrate is reduced; once there is no bitrate left to give, a queue that
+// keeps growing has to be drained by sending less often.
+constexpr uint32_t auto_fps_floor(bool bitrate_first, uint32_t delay_ms) {
+    if (bitrate_first) return kMinAutoFps;
+    if (delay_ms >= kStallFloorDelayMs) return 1;
+    if (delay_ms >= kHardFloorDelayMs) return kMinDelayFps;
+    return kMinAutoFps;
 }
 } // namespace
 
@@ -345,7 +364,7 @@ void VideoQos::delay(uint64_t id, uint32_t value, uint64_t now) {
     // While the bitrate can still come down, the frame rate keeps its floor:
     // bitrate-targeted encoders do not send fewer bytes at fewer frames.
     if (bitrate_first) fps = std::max(fps, min_fps);
-    fps = std::max(fps, std::min(kMinAutoFps, cap));
+    fps = std::max(fps, std::min(auto_fps_floor(bitrate_first, average), cap));
     fps = delay.limit_fps_change(current, fps, sample, bitrate_first, braked);
     fps = delay.accelerate_startup(current, fps, cap, sample, braked);
     const bool reduce_bitrate = bitrate_first && delay.needs_bitrate_reduction() &&
@@ -390,8 +409,12 @@ void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
     // halve, three quarter, and so on down to the floor.
     const uint32_t divisor = 1u << std::min<uint32_t>(second > 0 ? second - 1 : 0, 5);
     const uint32_t current = delay.fps.value_or(reference);
-    const uint32_t floor = std::min(kMinAutoFps, cap);
-    // The floor is a floor, not a lift: a target already below it stays.
+    // The floor is a floor, not a lift: a target already below it stays. A
+    // stalled probe means nothing is arriving, so the soft floor gives way and
+    // only a trickle of frames is kept to keep receipts flowing. This path
+    // only runs past two seconds, so the delay tiers above always resolve to 1
+    // here; they belong to measured delay, not to a stall.
+    const uint32_t floor = std::min(auto_fps_floor(false, second * 1000), cap);
     uint32_t fps = std::clamp(reference / divisor, floor, cap);
     fps = std::min(fps, current);
     delay.fps = fps;

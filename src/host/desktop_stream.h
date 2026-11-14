@@ -99,13 +99,18 @@ public:
     // session alive while votes/decoder capabilities can still change.
     static bool encoder_recovery_pending(const IDxgiCapturer& capture);
     static void request_keyframe(IDxgiCapturer& capture);
-    // Resume this subscriber at a fresh IDR after network backpressure.
+    // Resume this subscriber at a fresh IDR after network backpressure. The
+    // keyframe request itself is subject to the per-subscriber backoff below.
     static void discard_backlog(IDxgiCapturer& capture);
     static uint64_t capture_time(const IDxgiCapturer& capture);
     struct QueueStats {
         uint64_t delivered_wait_ms = 0;
         uint64_t expired_frames = 0;
         uint64_t age_resyncs = 0;
+        // Resync-driven IDR requests this subscriber suppressed because it was
+        // still inside its backoff window. High values mean a viewer that keeps
+        // forcing keyframes instead of draining.
+        uint64_t resync_backoffs = 0;
     };
     // Local post-encode waiting only; excludes source dispatch, transport,
     // decode and presentation. Sampling never waits on capture or encoding.

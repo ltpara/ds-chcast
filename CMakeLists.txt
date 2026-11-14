@@ -770,7 +770,7 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(display_video PROPERTIES TIMEOUT 30)
     set_tests_properties(display_subscriptions PROPERTIES TIMEOUT 30)
     add_test(NAME video_qos COMMAND chast-video-qos-test)
-    set_tests_properties(desktop_stream PROPERTIES TIMEOUT 30)
+    set_tests_properties(desktop_stream PROPERTIES TIMEOUT 45)
     set_tests_properties(host_parity PROPERTIES TIMEOUT 240)
     add_test(NAME host_voice COMMAND chast-host-voice-test)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)
@@ -814,6 +814,9 @@ if(CHAST_BUILD_TESTS)
                 -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/tools/annexb.h
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/decode_rejects_vp9.cmake)
     add_test(NAME mp4_recorder COMMAND chast-mp4-recorder-test)
+
+    add_test(NAME quic_microphone_reference COMMAND chast-quic --test-microphone-reference)
+    set_tests_properties(quic_microphone_reference PROPERTIES TIMEOUT 10)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.

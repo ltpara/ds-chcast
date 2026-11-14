@@ -681,13 +681,24 @@ private:
 
 class RecordingMicrophonePlayer final : public chast::IAudioPlayer {
 public:
-    explicit RecordingMicrophonePlayer(std::shared_ptr<MicrophoneRecorder> recorder)
-        : recorder_(std::move(recorder)) {}
+    using RenderSink = std::function<void(const int16_t*, size_t, uint16_t, int64_t)>;
+    RecordingMicrophonePlayer(std::shared_ptr<MicrophoneRecorder> recorder, RenderSink sink)
+        : recorder_(std::move(recorder)), render_sink_(std::move(sink)) {}
 
     chast::Error start() override { return chast::Error::success(); }
     void stop() override {}
     chast::Error push(const chast::DecodedAudio& audio) override {
         recorder_->record(audio);
+        // The host trains its echo canceller on PCM the endpoint accepted, so
+        // the loopback substitute reports the same accepted playback.
+        if (render_sink_ && !muted_ && !audio.samples.empty() &&
+            audio.sample_rate == 48000 && audio.channels >= 1 && audio.channels <= 2 &&
+            audio.samples.size() % audio.channels == 0) {
+            const auto audible_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            render_sink_(audio.samples.data(), audio.samples.size() / audio.channels,
+                         audio.channels, audible_start_ms);
+        }
         return chast::Error::success();
     }
     void set_clock_offset(int64_t) override {}
@@ -704,8 +715,62 @@ public:
 
 private:
     std::shared_ptr<MicrophoneRecorder> recorder_;
+    RenderSink render_sink_;
     bool muted_ = false;
 };
+
+int test_microphone_render_reference() {
+    bool passed = true;
+    for (const uint16_t channels : {uint16_t{1}, uint16_t{2}}) {
+        chast::AudioReference reference;
+        reference.acquire();
+        auto recorder = std::make_shared<MicrophoneRecorder>();
+        chast::DecodedAudio block;
+        block.sample_rate = 48000;
+        block.channels = channels;
+        block.samples.assign(4800 * channels, 1200); // 100 ms of audible PCM.
+        if (channels == 2)
+            for (size_t i = 1; i < block.samples.size(); i += 2) block.samples[i] = -600;
+        const auto started = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        unsigned callbacks = 0;
+        RecordingMicrophonePlayer player(recorder,
+            [&](const int16_t* pcm, size_t frames, uint16_t rendered_channels, int64_t audible_ms) {
+                ++callbacks;
+                const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const bool valid = pcm == block.samples.data() && frames == 4800 &&
+                    rendered_channels == channels && audible_ms >= started && audible_ms <= now;
+                passed = passed && valid;
+                if (valid) reference.push_rendered(pcm, frames, rendered_channels, audible_ms);
+            });
+        passed = player.push(block).ok() && passed;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        int16_t rendered[2]{};
+        passed = reference.read_delayed(1, 0, rendered) && passed;
+        passed = passed && rendered[0] == 1200 && rendered[1] == (channels == 1 ? 1200 : -600);
+        player.set_mute(true);
+        player.push(block);
+        player.set_mute(false);
+        block.sample_rate = 44100;
+        player.push(block);
+        block.sample_rate = 48000;
+        block.channels = 0;
+        player.push(block);
+        block.channels = 3;
+        player.push(block);
+        block.channels = 2;
+        block.samples.resize(3);
+        player.push(block);
+        block.samples.clear();
+        player.push(block);
+        passed = passed && callbacks == 1;
+        reference.release();
+    }
+    std::printf("%s microphone render reference: mono/stereo PCM, timestamps, mute and format guards\n",
+                passed ? "ok  " : "FAIL");
+    return passed ? 0 : 1;
+}
 
 // True when the last socket call failed only because a non-blocking socket
 // would have waited; every other error is a real failure.
@@ -2492,9 +2557,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     if (options.microphone && options.microphone_recorder) {
         std::shared_ptr<MicrophoneRecorder> recorder = options.microphone_recorder;
         config.microphone_player =
-            [recorder](const chast::AudioPlayerConfig&, std::string*)
+            [recorder](const chast::AudioPlayerConfig& player, std::string*)
             -> std::unique_ptr<chast::IAudioPlayer> {
-            return std::make_unique<RecordingMicrophonePlayer>(recorder);
+            return std::make_unique<RecordingMicrophonePlayer>(recorder, player.render_sink);
         };
     }
     config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
@@ -11527,6 +11592,8 @@ int run_weak_network(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--test-microphone-reference")
+        return test_microphone_render_reference();
     chast::enable_physical_desktop_coordinates();
     chast_tools::install_crash_handler();
     std::setvbuf(stdout, nullptr, _IONBF, 0);

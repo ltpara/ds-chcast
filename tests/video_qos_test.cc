@@ -230,6 +230,44 @@ int main() {
         check(near(abr_off.state(1700).ratio, 1.5f),
               "ABR off holds the quality ratio at the viewer target");
 
+        // A path that can no longer shed bitrate has to shed frames: holding
+        // the soft floor left the queue full and the delay growing. The delay
+        // keeps growing, so the policy cannot mistake it for a high-RTT path.
+        VideoQos congested(30, 1.5f, false);
+        congested.open(1, 0);
+        warm(congested, 1, 1100, 12);
+        uint32_t settled = 30;
+        for (unsigned n = 0; n < 48; ++n) {
+            congested.delay(1, 700 + n * 40, 2300 + n * 100);
+            settled = congested.state(2300 + n * 100).fps;
+        }
+        check(settled == 1,
+              "a saturated path that cannot shed bitrate sheds frames instead");
+        congested.delay(1, 10, 7500);
+        congested.delay(1, 10, 7600);
+        check(congested.state(7600).fps == 30,
+              "clean replies still restore the rate the floor gave up");
+
+        // While the bitrate can still come down, fewer frames do not send fewer
+        // bytes: the frame rate keeps its soft floor there.
+        VideoQos soft_floor(30, 1.5f, true);
+        soft_floor.open(1, 0);
+        soft_floor.display(10, 1, 5000, true, 0);
+        warm(soft_floor, 1, 1100, 12);
+        for (unsigned n = 0; n < 10; ++n) soft_floor.delay(1, 800, 2300 + n * 100);
+        check(soft_floor.state(3300).fps >= 5,
+              "a frame-rate floor holds while the bitrate can still be cut");
+        check(near(soft_floor.state(3300).ratio, 1.5f) == false,
+              "the same congestion is answered with bitrate, not only frames");
+
+        // A probe that is still unanswered means nothing is arriving at all.
+        VideoQos stalled(30, 1.5f, false);
+        stalled.open(1, 0);
+        warm(stalled, 1, 1100, 12);
+        stalled.pending(1, 5000, 5000);
+        check(stalled.state(5000).fps == 1,
+              "an unanswered probe for five seconds drops to the trickle rate");
+
         VideoQos fixed_rates(60, 1.5f, false, false);
         fixed_rates.open(1, 0);
         fixed_rates.delay(1, 400, 1100);

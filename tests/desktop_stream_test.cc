@@ -771,6 +771,198 @@ void staggered_keyframes_merge() {
     encoder.reset(); viewer.reset();
 }
 
+// An uplink that stays full reports backpressure on frame after frame. Each
+// report breaks that subscriber's reference chain, but answering every report
+// with an IDR puts the largest picture the encoder produces back onto the same
+// full path. The resync must therefore back off instead of running at the
+// merge-window rate.
+void resync_backoff_bounds_keyframes() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto viewer = pool.subscribe(L"resync-backoff", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe the backpressure viewer");
+    frame(*viewer);
+    EncoderConfig config;
+    config.framerate = 30;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "start the backpressure encoder");
+    std::vector<EncodedPacket> packets;
+    auto drain = [&] {
+        if (viewer->capture(5ms) != CaptureResult::Frame) return false;
+        packets.clear();
+        return encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty();
+    };
+    drain();
+    drain();
+    const unsigned baseline = state->idrs.load();
+    // The session does exactly this when a send returns WaitTimeout: the frame
+    // was delivered, so the compressed chain now has a hole.
+    const auto stalled_until = std::chrono::steady_clock::now() + 1600ms;
+    unsigned reports = 0;
+    while (std::chrono::steady_clock::now() < stalled_until) {
+        DesktopStreamPool::discard_backlog(*viewer);
+        // The session used to follow discard_backlog with a forced IDR. A
+        // second request must not bypass the subscription's recovery window.
+        DesktopStreamPool::request_keyframe(*viewer);
+        ++reports;
+        drain();
+        std::this_thread::sleep_for(5ms);
+    }
+    const auto forced = state->idrs.load() - baseline;
+    const auto stats = DesktopStreamPool::queue_stats(*viewer);
+    check(reports > 40, "backpressure is reported on frame after frame");
+    check(stats.resync_backoffs > 0, "suppressed resyncs are observable in queue telemetry");
+    check(forced <= 6 && forced >= 2,
+          "a path that stays full cannot pull one keyframe per merge window");
+    // Stop discarding: the capped backoff eventually admits the resync that
+    // ends the stall, and from then on the chain holds without asking again.
+    const auto settled_before = state->idrs.load();
+    const auto settle_until = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < settle_until && state->idrs.load() == settled_before) {
+        drain();
+        std::this_thread::sleep_for(10ms);
+    }
+    check(state->idrs.load() > settled_before, "a stalled subscriber still receives the capped resync");
+    // Only a window without any resync request counts as recovery, so keep the
+    // chain alive for longer than the reset window before stalling again.
+    const auto quiet_until = std::chrono::steady_clock::now() + 1600ms;
+    while (std::chrono::steady_clock::now() < quiet_until) {
+        drain();
+        std::this_thread::sleep_for(10ms);
+    }
+    const unsigned recovered_at = state->idrs.load();
+    DesktopStreamPool::discard_backlog(*viewer);
+    bool resumed = false;
+    const auto resume_until = std::chrono::steady_clock::now() + 500ms;
+    while (std::chrono::steady_clock::now() < resume_until) {
+        if (drain()) {
+            resumed = !packets.empty() && packets.front().idr;
+            break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    check(resumed && state->idrs.load() > recovered_at,
+          "a stall after a settled window resumes immediately with an IDR");
+    encoder.reset();
+    viewer.reset();
+    check(state->wrong_thread == 0, "resync backoff stays on the display service thread");
+}
+
+void static_resync_retries_without_publication() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    std::string error;
+    auto viewer = pool.subscribe(L"static-resync", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe the static resync viewer");
+    frame(*viewer);
+    EncoderConfig config;
+    config.codec = VideoCodec::Av1; // No static refinements to drive a retry.
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "start the static resync encoder");
+    auto consume_idr = [&] {
+        frame(*viewer);
+        std::vector<EncodedPacket> packets;
+        check(encoder->encode(nullptr, 0, false, packets).ok() &&
+                  !packets.empty() && packets.front().idr,
+              "static recovery supplies an independently decodable picture");
+    };
+    consume_idr();
+    // Grow the window past the queue-age limit. No desktop changes or viewer
+    // keyframe requests occur during any of these recoveries.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DesktopStreamPool::discard_backlog(*viewer);
+        consume_idr();
+    }
+    const auto before = DesktopStreamPool::queue_stats(*viewer).resync_backoffs;
+    DesktopStreamPool::discard_backlog(*viewer);
+    check(DesktopStreamPool::queue_stats(*viewer).resync_backoffs > before,
+          "static recovery really enters the backoff window");
+    consume_idr();
+
+    // Leave the next recovery IDR unread until it expires. The age-recovery
+    // path must also retry after clearing the last picture of a static source.
+    DesktopStreamPool::discard_backlog(*viewer);
+    frame(*viewer);
+    const auto age_before = DesktopStreamPool::queue_stats(*viewer);
+    std::this_thread::sleep_for(300ms);
+    check(viewer->capture(0ms) == CaptureResult::NoNewFrame,
+          "the unread static IDR expires before delivery");
+    const auto expired = DesktopStreamPool::queue_stats(*viewer);
+    check(expired.age_resyncs > age_before.age_resyncs &&
+              expired.resync_backoffs > age_before.resync_backoffs,
+          "queue-age recovery is deferred after discarding the static IDR");
+    consume_idr();
+    const auto settled = state->idrs.load();
+    std::this_thread::sleep_for(250ms);
+    check(state->idrs == settled, "delivering the IDR cancels the pending retry");
+    encoder.reset(); viewer.reset();
+    check(state->wrong_thread == 0, "static resync timers run on the service thread");
+}
+
+// A reader with no picture waits for the display service to publish instead of
+// sleeping a fixed slice, and a publish that lands while it waits must be
+// delivered by that same call.
+void publish_wakes_waiting_reader() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    state->moving = true;
+    std::string error;
+    auto viewer = pool.subscribe(L"frame-wake", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe the wake viewer");
+    frame(*viewer);
+    EncoderConfig config;
+    config.framerate = 60;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr, "start the wake encoder");
+    auto drain = [&] {
+        std::vector<EncodedPacket> packets;
+        if (viewer->capture(5ms) != CaptureResult::Frame) return false;
+        return encoder->encode(nullptr, 0, false, packets).ok() && !packets.empty();
+    };
+    for (int round = 0; round < 5; ++round) {
+        // Freeze the source, then let it publish only while the reader waits.
+        state->hold_frames = true;
+        std::this_thread::sleep_for(40ms);
+        while (drain()) {}
+        std::thread release([&] {
+            std::this_thread::sleep_for(40ms);
+            state->hold_frames = false;
+        });
+        // The session loops on capture(); each call waits one slice. A publish
+        // that lands while a call is waiting must not be missed, or the stream
+        // stalls for that frame.
+        const auto started = std::chrono::steady_clock::now();
+        CaptureResult result = CaptureResult::NoNewFrame;
+        const auto deadline = started + 1s;
+        while (result != CaptureResult::Frame && std::chrono::steady_clock::now() < deadline)
+            result = viewer->capture(5ms);
+        const auto waited = std::chrono::steady_clock::now() - started;
+        release.join();
+        check(result == CaptureResult::Frame,
+              "a picture published during the wait is delivered without another send");
+        check(waited < 300ms, "the publish wakes the reader instead of stalling it");
+        check(drain(), "the woken picture can be encoded");
+    }
+    encoder.reset();
+    viewer.reset();
+    check(state->wrong_thread == 0, "publish wakeups stay on the display service thread");
+}
+
 void deferred_keyframe_on_static_desktop() {
     DesktopStreamPool pool;
     auto state = std::make_shared<host_test::MediaState>();
@@ -1046,6 +1238,9 @@ int main() {
         static_refresh_budget();
         subscriber_queue_age();
         staggered_keyframes_merge();
+        resync_backoff_bounds_keyframes();
+        static_resync_retries_without_publication();
+        publish_wakes_waiting_reader();
         deferred_keyframe_on_static_desktop();
         slow_encode_is_not_queue_wait();
         slow_viewer_backpressure();

@@ -321,6 +321,11 @@ private:
 constexpr auto kDownloadSendBudget = std::chrono::milliseconds(8);
 constexpr double kDownloadBytesPerSecond = 32.0 * 1024.0 * 1024.0;
 constexpr double kDownloadBurst = 256.0 * 1024.0;
+// A viewer asking for a keyframe is asking for the largest picture the encoder
+// produces. Serving every request turns a saturated uplink into a keyframe
+// stream, so each connection is answered at most once per window and requests
+// inside the window merge into one deferred request.
+constexpr auto kViewerKeyframeInterval = std::chrono::seconds(1);
 
 std::filesystem::path path_from_utf8(const std::string& utf8) {
     return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
@@ -2830,10 +2835,33 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         ServerInfo info;
         Clock::time_point last_keyframe = Clock::now();
         Clock::time_point recovery_at{};
+        // A viewer request is served at most once per window; requests inside
+        // the window merge into one deferred request instead of being dropped.
+        // An IDR is the largest picture the encoder produces, so answering
+        // every request on a path that is already full only refills it.
+        Clock::time_point keyframe_request_due{};
+        bool keyframe_request_pending = false;
+        void request_viewer_keyframe(Clock::time_point now) {
+            if (now - last_keyframe >= kViewerKeyframeInterval) {
+                force_keyframe = true;
+                keyframe_request_pending = false;
+                keyframe_request_due = {};
+                return;
+            }
+            keyframe_request_pending = true;
+            keyframe_request_due = last_keyframe + kViewerKeyframeInterval;
+        }
+        void promote_viewer_keyframe(Clock::time_point now) {
+            if (!keyframe_request_pending || now < keyframe_request_due) return;
+            keyframe_request_pending = false;
+            keyframe_request_due = {};
+            force_keyframe = true;
+        }
         bool encoder_recovery_only = false;
         bool force_keyframe = true, have_input = false, resolution_fixed = false;
         bool probe_pending = false, needs_resync = false;
         uint64_t observed_expired_frames = 0, observed_age_resyncs = 0;
+        uint64_t observed_resync_backoffs = 0;
         uint32_t extra_idrs = 0, frames_without_nv12 = 0, framerate = 30;
         uint16_t resolution_request = 100, resolution_percent = 100;
         uint32_t target_bitrate = 0;
@@ -4023,8 +4051,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             ? queue.expired_frames - video.observed_expired_frames : queue.expired_frames;
         stats.video_age_resyncs += queue.age_resyncs >= video.observed_age_resyncs
             ? queue.age_resyncs - video.observed_age_resyncs : queue.age_resyncs;
+        stats.video_resync_backoffs += queue.resync_backoffs >= video.observed_resync_backoffs
+            ? queue.resync_backoffs - video.observed_resync_backoffs : queue.resync_backoffs;
         video.observed_expired_frames = queue.expired_frames;
         video.observed_age_resyncs = queue.age_resyncs;
+        video.observed_resync_backoffs = queue.resync_backoffs;
     };
     auto process_frame = [&](uint64_t pts_ms, bool idle = false) -> bool {
         const FrameInfo& frame = idle ? cached_frame : capturer->frame();
@@ -5472,7 +5503,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         if (video_needs_resync) {
             DesktopStreamPool::discard_backlog(*capturer);
-            force_keyframe = true;
+            // The subscription now owns the IDR request and its retry timer.
+            // A forced encode here would ask again outside that backoff.
+            force_keyframe = false;
             video_needs_resync = false;
         }
 
@@ -6247,15 +6280,19 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
         }
         if (session_->take_keyframe_request()) {
-            force_keyframe = true;
-            for (auto& [id, entry] : other_videos) entry.force_keyframe = true;
+            video.request_viewer_keyframe(now);
+            for (auto& [id, entry] : other_videos) entry.request_viewer_keyframe(now);
         }
         uint32_t requested_stream = 0;
         while (session_->take_display_keyframe_request(requested_stream)) {
-            if (requested_stream == video.id && capturer) force_keyframe = true;
+            if (requested_stream == video.id && capturer) video.request_viewer_keyframe(now);
             const auto found = other_videos.find(requested_stream);
-            if (found != other_videos.end()) found->second.force_keyframe = true;
+            if (found != other_videos.end()) found->second.request_viewer_keyframe(now);
         }
+        // Deferred viewer requests become due here, even if the viewer stopped
+        // asking: the request it already made is still owed an IDR.
+        video.promote_viewer_keyframe(now);
+        for (auto& [id, entry] : other_videos) entry.promote_viewer_keyframe(now);
         if (config_.keyframe_interval_ms > 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keyframe).count() >=
                 static_cast<long long>(config_.keyframe_interval_ms)) {

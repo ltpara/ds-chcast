@@ -940,6 +940,34 @@ void desktop_switch_during_admission() {
     finish(viewer);
 }
 
+// An IDR is the largest picture the encoder produces, so a viewer that keeps
+// asking for one must not be answered on every request: requests inside the
+// one-second window merge into a single deferred keyframe.
+void viewer_keyframe_requests_are_bounded() {
+    Fixture f;
+    f.start();
+    auto viewer = f.connect();
+    require(keyframe(*viewer), "viewer receives its first keyframe");
+    unsigned requests = 0, idrs = 0;
+    auto next_request = std::chrono::steady_clock::now();
+    const auto end = std::chrono::steady_clock::now() + 2300ms;
+    while (std::chrono::steady_clock::now() < end) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_request) {
+            require(viewer->request_keyframe().ok(), "viewer repeats its keyframe request");
+            ++requests;
+            next_request = now + 100ms;
+        }
+        FrameHeader header;
+        std::vector<uint8_t> data;
+        if (viewer->receive_frame(header, data, 10ms).ok() && header.idr) ++idrs;
+    }
+    require(requests >= 20, "the viewer really asked frame after frame");
+    require(idrs >= 1 && idrs <= 3,
+            "a request flood is answered at most once per keyframe window");
+    finish(viewer);
+}
+
 struct TwoDisplays {
     Fixture fixture;
     std::shared_ptr<host_test::MediaState> left = fixture.media;
@@ -2526,6 +2554,17 @@ int main(int argc, char** argv) {
         WSACleanup();
         return failures ? 1 : 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--keyframe-rate") {
+        run("viewer keyframe request rate limiting", viewer_keyframe_requests_are_bounded);
+        WSACleanup();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--backpressure") {
+        run("video application backpressure and recovery", video_backpressure);
+        run("sender queue age and observable recovery", sender_queue_freshness);
+        WSACleanup();
+        return failures ? 1 : 0;
+    }
     run("elevation permission and cancellation", elevation_permissions);
     run("authenticated local elevation handoff", elevation_handoff);
     run("clipboard directions and independent file permissions", clipboard_directions);
@@ -2539,6 +2578,7 @@ int main(int argc, char** argv) {
     run("publisher-only audio", publisher_only_audio);
     run("audio enabled after admission", late_audio_source);
     run("desktop changed during admission", desktop_switch_during_admission);
+    run("viewer keyframe request rate limiting", viewer_keyframe_requests_are_bounded);
     run("independent display subscriptions and resource lifetime", independent_displays);
     run("multiple display streams in one connection", multiple_displays_one_connection);
     run("multiple display rollback and one vote per connection", multiple_display_failures_and_votes);

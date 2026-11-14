@@ -122,6 +122,10 @@ struct HostServerStats {
     uint64_t video_max_queue_wait_ms = 0;
     uint64_t video_expired_frames = 0;
     uint64_t video_age_resyncs = 0;
+    // Resyncs this subscriber suppressed because it was still inside its
+    // keyframe backoff. A high count means a viewer that keeps asking for
+    // keyframes instead of draining what it already has.
+    uint64_t video_resync_backoffs = 0;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
     bool client_connected = false;  // at least one viewer got through
     bool peer_left = false;         // the last session ended with the peer gone
