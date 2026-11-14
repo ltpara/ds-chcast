@@ -92,11 +92,11 @@
 
 ## 1. 基线
 
-- 仓库：`ltpara/ds-chcast`；分支：`main`。
-- GitHub 当前提交基线：`5590d75`（`chast: close receiver status and capture gaps`，协议 v73）。
-- 当前工作区在 GitHub 基线之上累计 v74–v76：目录上传、PNG/大图像剪贴板与临时自由手写标注；源码协议为 **v76**，尚未提交。当前不承诺与 v74 及更早版本或 RustDesk 线协议互通。
+- 仓库：`ltpara/ds-chcast`；工作分支：`codex/backup-pending-features-2026-11-14`（已推送），`main` 仍停在 `a609e44`。
+- GitHub 当前提交基线：`24d9343`（`fix: unblock low-FPS sessions and echo local annotation ink`，协议 v76）。
+- 该基线包含 v74–v76（目录上传、PNG/大图像剪贴板、临时自由手写标注）、2026-11-15 的 5 项审核修复（1 FPS 会话阻塞、QoS 1 FPS 层级与 IDR、查看端本地标注墨迹、标注作用域、传输兜底边界文档）与 RustDesk 再次比对记录。当前不承诺与 v74 及更早版本或 RustDesk 线协议互通。
 - RustDesk 行为对照固定于本地参考提交 `7423dced37845c48093b6f71bd82e4a16cc8c79d`；只参考行为与字段语义，不引入其代码或依赖。
-- 本次提交范围：工作区累计的 v71–v73 变更（协作光标姓名/波纹、v70 原始帧截图与 v72 CSHT 流、v73 光标形状重取）、发射端媒体对齐（软件回退改 VP9、移除 OpenH264、Opus 10 ms 低延迟应用）、服务端控制面（中继池耗尽降级注册、策略物化缓存、重放表摊销清理与效果实测）、传输栈原理差异文档，以及对应原生测试、Go 测试和文档。`build/` 下的本机证据与构建产物、`server/*.test.exe` 不提交。
+- 检查点提交范围：v74–v76 与审核修复的源码、原生/Flutter 测试和文档。`build/` 下的本机证据与构建产物、`server/*.test.exe` 不提交。
 
 ## 2. 已完成并进入生产路径
 
