@@ -20,6 +20,10 @@
 #include "win/annotation_paint.h"
 #include "win/cursor_hint_paint.h"
 
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
 namespace chast {
 
 namespace {
@@ -407,6 +411,16 @@ bool AnnotationOverlay::Impl::create_planes(std::string* error) {
             plane.height, nullptr, nullptr, wc.hInstance, &plane);
         if (plane.window == nullptr) {
             *error = "CreateWindowExW: " + win32_error(GetLastError());
+            planes.push_back(std::move(plane));
+            release_planes();
+            return false;
+        }
+        // Keep temporary ink out of screenshots and recordings. A layered
+        // window that cannot be excluded would silently leak annotations into
+        // the remote picture, so refuse the overlay instead.
+        if (!SetWindowDisplayAffinity(plane.window, WDA_EXCLUDEFROMCAPTURE)) {
+            *error = "SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE): " +
+                     win32_error(GetLastError());
             planes.push_back(std::move(plane));
             release_planes();
             return false;

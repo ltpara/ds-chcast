@@ -8472,6 +8472,11 @@ bool annotation_overlay_works(uint16_t port, std::string* detail) {
         if ((style & WS_POPUP) == 0 || (ex_style & required) != required) {
             return fail("annotation plane lacks popup/no-activate/click-through/layered style");
         }
+        DWORD affinity = WDA_NONE;
+        if (!GetWindowDisplayAffinity(window, &affinity) ||
+            affinity != WDA_EXCLUDEFROMCAPTURE) {
+            return fail("annotation plane is not excluded from screen capture");
+        }
         RECT rect{};
         if (GetWindowRect(window, &rect) == FALSE) {
             return fail("GetWindowRect failed for an annotation plane");
@@ -8495,10 +8500,12 @@ bool annotation_overlay_works(uint16_t port, std::string* detail) {
     if (!capture_screen_patch(patch, &after, &error)) {
         return fail("annotation screenshot: " + error);
     }
+    // WDA_EXCLUDEFROMCAPTURE must keep the ink out of capture. The ordinary
+    // desktop under the overlay should therefore remain unchanged.
     const size_t changed = changed_screen_pixels(before, after);
-    if (changed < 1000) {
-        return fail("the visible annotation changed only " + std::to_string(changed) +
-                    " screen pixels");
+    if (changed > 64) {
+        return fail("capture exclusion leaked the annotation into " +
+                    std::to_string(changed) + " screen pixels");
     }
 
     chast::AnnotationMessage clear;

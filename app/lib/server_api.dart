@@ -4329,7 +4329,7 @@ class ServerApi {
       } on ServerApiException catch (error) {
         if (error.statusCode == HttpStatus.notFound ||
             error.statusCode == HttpStatus.methodNotAllowed) {
-          return _uploadRecordingLegacy(
+          return await _uploadRecordingLegacy(
             settings,
             accountToken,
             file: file,

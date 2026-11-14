@@ -3,10 +3,12 @@
 // Temporary freehand annotations drawn on the host desktop for one viewer.
 //
 // Each monitor gets a layered, click-through, never-activated tool window, so
-// the overlay cannot take focus or intercept input. A stroke is kept only in
-// memory and dies with this object, which the host owns for the lifetime of
-// the viewer session. Points use virtual-desktop pixels; monitor planes clip
-// them locally, including negative coordinates and lines that cross outputs.
+// the overlay cannot take focus or intercept input. The window is also excluded
+// from screen capture, keeping temporary ink out of screenshots and recordings.
+// A stroke is kept only in memory and dies with this object, which the host owns
+// for the lifetime of the viewer session. Points use virtual-desktop pixels;
+// monitor planes clip them locally, including negative coordinates and lines
+// that cross outputs.
 
 #include <cstdint>
 #include <memory>

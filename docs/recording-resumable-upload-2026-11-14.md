@@ -159,7 +159,7 @@ Flutter 定向测试覆盖丢失 PATCH 响应后按持久偏移恢复、完成�
 
 全量回归以最终工作树结果为准：Go `go test ./... -count=1`、`go vet ./...`、
 `go build ./...` 通过；Flutter `analyze --no-pub` 无问题，`test --no-pub`
-751/751 通过。首次 Flutter 全量回归曾发现 4 条新增错误文案缺少英文翻译，
+763/763 通过。首次 Flutter 全量回归曾发现 4 条新增错误文案缺少英文翻译，
 补齐后本地化与续传定向测试、Flutter 全量测试均通过。
 
 ## 未覆盖环境
