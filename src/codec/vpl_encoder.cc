@@ -1083,14 +1083,15 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
         return Error::success();
     }
 
-    // A bitrate change can be applied inside the running sequence: the runtime
-    // confirms through Query that StartNewSequence=OFF is honoured, and only
-    // bitrate-like parameters may change that way. The encoder then keeps its
-    // reference frames and the viewer decodes on without an IDR. Frame rate is
-    // not one of those parameters, and before the first real frame the only
-    // reference is the probe image the peer never received, so both take the
-    // ordinary reset below.
-    if (codec_ == VideoCodec::H264 && has_input_ && fps == framerate_) {
+    // A rate or cadence change can be applied inside the running sequence:
+    // the runtime confirms through Query that StartNewSequence=OFF is honoured.
+    // The encoder then keeps its reference frames and the viewer decodes on
+    // without an IDR. That matters most exactly when the path is congested: a
+    // frame-rate-only QoS step must not put the largest picture the encoder
+    // produces back onto that path. If the runtime insists on a new sequence
+    // (or the session has no real frame yet), the ordinary reset below
+    // restarts it, which needs an IDR.
+    if (codec_ == VideoCodec::H264 && has_input_) {
         mfxVideoParam candidate = params_;
         // Query may rewrite extension fields; never let a rejected query
         // mutate the configuration the live session is using.
@@ -1103,12 +1104,15 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
         mfxExtBuffer* buffers[3] = {&signal.Header, &sequence.Header, &option.Header};
         candidate.ExtParam = buffers;
         candidate.NumExtParam = 3;
-        // Only the target rate may move in a continuous sequence. mfx-gen
-        // treats a changed CPB size, initial delay or MaxKbps as a configuration
-        // change that needs StartNewSequence=ON, and the viewer would then wait
-        // for an IDR on a bitrate-only vote. The buffer keeps the size it was
-        // opened with; its duration simply follows the new rate.
+        // Only the target rate and the declared cadence may move in a
+        // continuous sequence. mfx-gen treats a changed CPB size, initial delay
+        // or MaxKbps as a configuration change that needs StartNewSequence=ON,
+        // and the viewer would then wait for an IDR on a bitrate-only vote. The
+        // buffer keeps the size it was opened with; its duration simply follows
+        // the new rate.
         candidate.mfx.TargetKbps = static_cast<mfxU16>(kbps);
+        candidate.mfx.FrameInfo.FrameRateExtN = static_cast<mfxU16>(fps);
+        candidate.mfx.FrameInfo.FrameRateExtD = 1;
         mfxStatus sts = MFXVideoENCODE_Query(session_, &candidate, &candidate);
         if (sts >= MFX_ERR_NONE && option.StartNewSequence == MFX_CODINGOPTION_OFF) {
             sts = MFXVideoENCODE_Reset(session_, &candidate);

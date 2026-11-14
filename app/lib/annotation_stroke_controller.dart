@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 /// Wire values for protocol v76 freehand annotations.
 abstract final class AnnotationWireAction {
@@ -62,11 +63,13 @@ class AnnotationStrokeController {
   final int throttleMs;
   final List<ViewerAnnotationPoint> _pending = <ViewerAnnotationPoint>[];
 
-  // Every session engine draws on the same host desktop. A counter per
-  // controller would let the main session and an independent display window
-  // allocate the same active stroke id, so moves from one window could be
-  // appended to the other window's stroke.
-  static int _nextGlobalStrokeId = 1;
+  // Every session engine draws on the same host desktop. Display windows run
+  // in their own Flutter engine, and each engine is its own Dart isolate, so
+  // a static counter starts over and would hand two windows the same active
+  // stroke id; the host would then append one window's moves to the other's
+  // stroke. A random per-isolate start space makes that collision negligible.
+  static final math.Random _strokeRandom = math.Random.secure();
+  static int _nextGlobalStrokeId = 1 + _strokeRandom.nextInt(0xfffffffe);
   int? _activeStrokeId;
   ViewerAnnotationPoint? _lastPoint;
   int _lastFlushMs = 0;

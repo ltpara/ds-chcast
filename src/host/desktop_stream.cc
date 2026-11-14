@@ -52,6 +52,11 @@ constexpr uint64_t kResyncResetWindowMs = 1500;
 // it returns to the session loop, which still has to service control messages,
 // audio and the clipboard on the same thread.
 constexpr std::chrono::milliseconds kFrameWaitSlice{5};
+// The display service waits for a desktop change in slices of at most this
+// length. Sessions post frame reads and control work to that same thread
+// synchronously, so a single raw wait for a whole low-FPS interval would hold
+// input and audio behind it.
+constexpr std::chrono::milliseconds kCaptureSlice{8};
 struct Subscription {
     // Only the owning connection reads/replaces current. The service changes
     // queues on its thread, not metadata a connection might be inspecting.
@@ -340,6 +345,20 @@ struct DesktopStreamPool::Source {
         }
         wake.notify_one();
         return result.get();
+    }
+    // Runs queued commands on the service thread. pump() calls this between
+    // capture slices so a synchronous reader never waits out a whole slice.
+    // Returns true once the source is stopping.
+    bool service_commands() {
+        std::deque<std::function<void()>> pending;
+        bool halt = false;
+        {
+            std::lock_guard<std::mutex> lock(command_mutex);
+            pending.swap(commands);
+            halt = stopping;
+        }
+        for (auto& command : pending) command();
+        return halt;
     }
     void run() {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1057,11 +1076,29 @@ struct DesktopStreamPool::Source {
         // samples the present stream with a low duty cycle: when its cadence
         // and the tick cadence share a phase, whole intervals report no new
         // frame while others carry two. The target framerate is the cap.
-        const auto capture_timeout = full
-            ? std::chrono::milliseconds(0)
-            : std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::clamp<Clock::duration>(due - Clock::now(), std::chrono::milliseconds(1), interval));
-        const auto result = capture->capture(capture_timeout);
+        // The wait runs in bounded slices and queued commands are serviced in
+        // between. A reading session calls capture() and encode() on this
+        // thread synchronously; one raw wait for a whole low-FPS interval
+        // would otherwise stop control, audio and input for that long.
+        CaptureResult result = CaptureResult::NoNewFrame;
+        if (full) {
+            result = capture->capture(std::chrono::milliseconds(0));
+        } else {
+            bool sampled = false;
+            for (;;) {
+                auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    due - Clock::now());
+                // A command may have rescheduled the tick (display recovery
+                // sets due to now); leave the old window to the next pump.
+                if (left.count() <= 0 && sampled) break;
+                left = left.count() > 0 ? std::min(left, kCaptureSlice)
+                                        : std::chrono::milliseconds(0);
+                result = capture->capture(left);
+                sampled = true;
+                if (result != CaptureResult::NoNewFrame || Clock::now() >= due) break;
+                if (service_commands() || lost || fatal) return;
+            }
+        }
         if (result == CaptureResult::ReinitNeeded || result == CaptureResult::FatalError) {
             error = capture->last_error();
             invalidate();

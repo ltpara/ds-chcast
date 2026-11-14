@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
+import '../annotation_ink.dart';
 import '../viewer_bridge.dart';
 
 enum ViewFit { adaptive, original }
@@ -86,6 +87,8 @@ class RemoteView extends StatefulWidget {
     this.onCursorHintExit,
     this.onFocusRequested,
     this.overlayBuilder,
+    this.ink,
+    this.inkSurface = 0,
   });
 
   final int textureId;
@@ -149,6 +152,13 @@ class RemoteView extends StatefulWidget {
   final VoidCallback? onCursorHintExit;
   final VoidCallback? onFocusRequested;
   final Widget Function(Size drawn)? overlayBuilder;
+
+  /// Local echo of this engine's annotation strokes. The host paints them on a
+  /// capture-excluded overlay, so the video never shows them; while draw mode
+  /// is on this layer gives the operator immediate feedback. Only strokes for
+  /// [inkSurface] are painted.
+  final ViewerAnnotationInk? ink;
+  final int inkSurface;
 
   @override
   State<RemoteView> createState() => _RemoteViewState();
@@ -322,6 +332,30 @@ class _RemoteViewState extends State<RemoteView> {
         texture,
         IgnorePointer(child: widget.overlayBuilder!(box)),
       ]));
+    }
+    final ViewerAnnotationInk? ink = widget.ink;
+    if (widget.drawEnabled && ink != null) {
+      texture = ClipRect(
+        child: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            texture,
+            IgnorePointer(
+              child: ListenableBuilder(
+                listenable: ink,
+                builder: (BuildContext context, Widget? _) => CustomPaint(
+                  painter: ViewerInkPainter(
+                    ink: ink,
+                    surface: widget.inkSurface,
+                    sourceWidth: widget._pointerWidth.toDouble(),
+                    sourceHeight: widget._pointerHeight.toDouble(),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
     }
     if (widget.drawEnabled) {
       return MouseRegion(

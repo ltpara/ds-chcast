@@ -32,6 +32,7 @@ class RemoteToolbar extends StatelessWidget {
     this.onToggleShowCursor,
     this.annotationMode = false,
     this.annotationCanUndo = false,
+    this.annotationCanClear = false,
     this.onToggleAnnotation,
     this.onUndoAnnotation,
     this.onClearAnnotation,
@@ -172,6 +173,11 @@ class RemoteToolbar extends StatelessWidget {
   /// is off. Pointer input is suppressed while this mode is active.
   final bool annotationMode;
   final bool annotationCanUndo;
+
+  /// Clearing acts on the whole host session, which includes strokes drawn
+  /// from other viewer windows, so it does not depend on this window's undo
+  /// history.
+  final bool annotationCanClear;
   final VoidCallback? onToggleAnnotation;
   final VoidCallback? onUndoAnnotation;
   final VoidCallback? onClearAnnotation;
@@ -750,7 +756,7 @@ class RemoteToolbar extends StatelessWidget {
               _BarButton(
                 icon: Icons.delete_sweep_outlined,
                 tooltip: tr('清除全部标注'),
-                disabled: !annotationCanUndo,
+                disabled: !annotationCanClear,
                 onTap: () => onClearAnnotation?.call(),
               ),
               _SpecialKeysButton(

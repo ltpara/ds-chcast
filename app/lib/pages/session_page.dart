@@ -25,6 +25,7 @@ import '../rdp.dart';
 import '../recording_retention.dart';
 import '../remote_key_sequence.dart';
 import '../remote_pointer.dart';
+import '../annotation_ink.dart';
 import '../annotation_stroke_controller.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
@@ -412,6 +413,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           points: <Map<String, int>>[for (final point in points) point.toMap()],
         ),
   );
+  final ViewerAnnotationInk _annotationInk = ViewerAnnotationInk();
 
   String get _prefsPeerId => widget.target.preferencesKey;
 
@@ -486,6 +488,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     _stopPolling();
     unawaited(_annotation.clear());
+    _annotationInk.dispose();
     _ticketTimer?.cancel();
     _ticketTimer = null;
     _hideTimer?.cancel();
@@ -2604,6 +2607,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _releaseRemoteInput();
       _setKeyCapture(false);
     } else {
+      _annotationInk.end();
       unawaited(_annotation.flush());
       _focus.requestFocus();
       _setKeyCapture(_inputActive);
@@ -2612,6 +2616,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   void _startAnnotation(Offset frame, {DisplayVideoStream? display}) {
     if (!_annotationMode) return;
+    _annotationInk.begin(display?.streamId ?? 0, frame);
     final (int x, int y) = _desktopPoint(frame, display);
     unawaited(_annotation.begin(ViewerAnnotationPoint(x, y)));
     setState(() {});
@@ -2619,28 +2624,34 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   void _moveAnnotation(Offset frame, {DisplayVideoStream? display}) {
     if (!_annotationMode || !_annotation.isDrawing) return;
+    _annotationInk.move(frame);
     final (int x, int y) = _desktopPoint(frame, display);
     unawaited(_annotation.move(ViewerAnnotationPoint(x, y)));
   }
 
   void _endAnnotation(Offset frame, {DisplayVideoStream? display}) {
     if (!_annotationMode) return;
+    _annotationInk.end();
     final (int x, int y) = _desktopPoint(frame, display);
     unawaited(_annotation.end(point: ViewerAnnotationPoint(x, y)));
     setState(() {});
   }
 
   void _cancelAnnotation() {
+    _annotationInk.end();
     unawaited(_annotation.flush());
     if (mounted) setState(() {});
   }
 
   Future<void> _undoAnnotation() async {
+    final bool hadStroke = _annotation.canUndo;
     await _annotation.undo();
+    if (hadStroke) _annotationInk.undo();
     if (mounted) setState(() {});
   }
 
   Future<void> _clearAnnotation() async {
+    _annotationInk.clear();
     await _annotation.clear();
     if (mounted) setState(() {});
   }
@@ -3998,6 +4009,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         onCursorHint: (p) => _onCursorHint(p, display: stream),
         onCursorHintPress: (p) => _onCursorHintPress(p, display: stream),
         onCursorHintExit: _hideCursorHint,
+        ink: _annotationInk,
+        inkSurface: stream.streamId,
       ),
     );
   }
@@ -6174,6 +6187,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       overlayBuilder: _inputActive
                           ? null
                           : _buildRemoteCursorOverlay,
+                      ink: _annotationInk,
                     ),
                   )
                 else
@@ -6202,6 +6216,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onToggleShowCursor: _toggleShowMyCursor,
                         annotationMode: _annotationMode,
                         annotationCanUndo: _annotation.canUndo,
+                        annotationCanClear: _annotationMode,
                         onToggleAnnotation: _toggleAnnotationMode,
                         onUndoAnnotation: () => unawaited(_undoAnnotation()),
                         onClearAnnotation: () => unawaited(_clearAnnotation()),

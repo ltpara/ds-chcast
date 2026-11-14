@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../display_stream_controller.dart';
 import '../l10n.dart';
 import '../remote_pointer.dart';
+import '../annotation_ink.dart';
 import '../annotation_stroke_controller.dart';
 import '../session_window.dart';
 import '../viewer_bridge.dart';
@@ -64,6 +65,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
           points: <Map<String, int>>[for (final point in points) point.toMap()],
         ),
   );
+  final ViewerAnnotationInk _annotationInk = ViewerAnnotationInk();
   final Map<int, int> _remoteButtons = <int, int>{};
   String _error = '';
   double _wheelX = 0, _wheelY = 0;
@@ -265,7 +267,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     // The main session keeps running after this window closes, so clear the
     // host-side viewer pointer instead of leaving a stale hint behind.
     _hideCursorHint();
-    await _annotation.clear();
+    // Closing this window only finishes its own stroke: the host ink is
+    // session-scoped and other windows may still be drawing on it.
+    unawaited(_annotation.flush());
     // Native Shutdown also detaches synchronously if the window X destroys
     // this engine before Dart cleanup can finish.
     try {
@@ -278,7 +282,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   @override
   void dispose() {
     _closing = true;
-    unawaited(_annotation.clear());
+    _annotationInk.dispose();
     _timer?.cancel();
     ViewerBridge.setKeyboardTextRejectedHandler(null);
     WidgetsBinding.instance.removeObserver(this);
@@ -379,6 +383,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
       _release();
       _syncCapture();
     } else {
+      _annotationInk.end();
       unawaited(_annotation.flush());
       _syncCapture();
     }
@@ -386,6 +391,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
 
   void _startAnnotation(Offset frame) {
     if (!_annotationMode || _texture == null) return;
+    _annotationInk.begin(0, frame);
     final (int x, int y) = _point(frame);
     unawaited(_annotation.begin(ViewerAnnotationPoint(x, y)));
     setState(() {});
@@ -393,28 +399,34 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
 
   void _moveAnnotation(Offset frame) {
     if (!_annotationMode || _texture == null || !_annotation.isDrawing) return;
+    _annotationInk.move(frame);
     final (int x, int y) = _point(frame);
     unawaited(_annotation.move(ViewerAnnotationPoint(x, y)));
   }
 
   void _endAnnotation(Offset frame) {
     if (!_annotationMode || _texture == null) return;
+    _annotationInk.end();
     final (int x, int y) = _point(frame);
     unawaited(_annotation.end(point: ViewerAnnotationPoint(x, y)));
     setState(() {});
   }
 
   void _cancelAnnotation() {
+    _annotationInk.end();
     unawaited(_annotation.flush());
     if (mounted) setState(() {});
   }
 
   Future<void> _undoAnnotation() async {
+    final bool hadStroke = _annotation.canUndo;
     await _annotation.undo();
+    if (hadStroke) _annotationInk.undo();
     if (mounted) setState(() {});
   }
 
   Future<void> _clearAnnotation() async {
+    _annotationInk.clear();
     await _annotation.clear();
     if (mounted) setState(() {});
   }
@@ -585,7 +597,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
           IconButton(
             tooltip: tr('清除全部标注'),
             icon: const Icon(Icons.delete_sweep_outlined),
-            onPressed: !_closing && _annotation.canUndo
+            // Clear is session-wide, so it is available whenever draw mode is
+            // on even if this window has not drawn a stroke itself.
+            onPressed: !_closing && _annotationMode
                 ? () => unawaited(_clearAnnotation())
                 : null,
           ),
@@ -673,6 +687,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           onCursorHint: _onCursorHint,
                           onCursorHintPress: _onCursorHintPress,
                           onCursorHintExit: _hideCursorHint,
+                          ink: _annotationInk,
                         );
                       },
                     ),

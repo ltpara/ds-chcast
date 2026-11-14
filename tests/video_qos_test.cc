@@ -268,6 +268,29 @@ int main() {
         check(stalled.state(5000).fps == 1,
               "an unanswered probe for five seconds drops to the trickle rate");
 
+        // The 1 FPS tier is a last resort, not a parallel bandwidth knob. In
+        // CBR the byte target follows the ratio, not the frame rate, so the
+        // tier may only open once the ratio is at its floor; before that,
+        // frames keep the soft floor and the congestion is paid in bitrate.
+        VideoQos last_resort(30, 1.5f, true);
+        last_resort.open(1, 0);
+        last_resort.display(10, 1, 5000, true, 0);
+        warm(last_resort, 1, 1100, 12);
+        bool floor_held = true;
+        now = 2300;
+        for (unsigned n = 0; n < 80; ++n) {
+            last_resort.delay(1, 1200 + n * 40, now);
+            last_resort.display(10, 6, 5000, true, now);
+            const auto state = last_resort.state(now);
+            if (state.ratio > 0.2001f && state.fps < 5) floor_held = false;
+            if (state.fps == 1) break;
+            now += 100;
+        }
+        check(floor_held, "the last-resort tier stays closed while bitrate can fall");
+        const auto floor_state = last_resort.state(now);
+        check(floor_state.fps == 1 && near(floor_state.ratio, 0.2f),
+              "a saturated queue reaches 1 FPS only at the bitrate floor");
+
         VideoQos fixed_rates(60, 1.5f, false, false);
         fixed_rates.open(1, 0);
         fixed_rates.delay(1, 400, 1100);

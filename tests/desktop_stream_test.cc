@@ -963,6 +963,52 @@ void publish_wakes_waiting_reader() {
     check(state->wrong_thread == 0, "publish wakeups stay on the display service thread");
 }
 
+// A static desktop at a low frame rate makes the display service wait a whole
+// frame interval for a change. Sessions post their frame reads and control
+// work synchronously on that same thread, so one unsliced raw wait would hold
+// input and audio for about a second per tick.
+void low_fps_wait_does_not_block_session() {
+    DesktopStreamPool pool;
+    auto state = std::make_shared<host_test::MediaState>();
+    std::string error;
+    auto viewer = pool.subscribe(L"low-fps", [state](std::string*) {
+        return std::make_unique<host_test::Capture>(state);
+    }, [state](ID3D11Device*, const EncoderConfig& config, std::string*) {
+        return std::make_unique<host_test::Encoder>(state, config);
+    }, &error);
+    check(viewer != nullptr, "subscribe a viewer at one frame per second");
+    frame(*viewer);
+    EncoderConfig config;
+    config.framerate = 1;
+    auto encoder = DesktopStreamPool::encoder(*viewer, config, &error);
+    check(encoder != nullptr && encoder->framerate() == 1, "start the 1 FPS encoder");
+    std::vector<EncodedPacket> packets;
+    check(encoder->encode(nullptr, 0, false, packets).ok(), "consume the first picture");
+    // The desktop is static now. Wait until the service is inside its long
+    // capture wait, then time a session-side command that has to run on the
+    // same thread.
+    const auto entered = state->captures.load();
+    const auto pump_deadline = std::chrono::steady_clock::now() + 2s;
+    while (state->captures == entered && std::chrono::steady_clock::now() < pump_deadline)
+        std::this_thread::sleep_for(1ms);
+    check(state->captures != entered, "the service entered its 1 FPS capture wait");
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = viewer->capture(5ms);
+    const auto blocked = std::chrono::steady_clock::now() - started;
+    check(result == CaptureResult::NoNewFrame, "a static 1 FPS desktop reports no new frame");
+    check(blocked < 200ms,
+          "a queued session command runs inside the 1 FPS capture wait instead of after it");
+    // The sliced wait still delivers a change as soon as it happens.
+    state->moving = true;
+    CaptureResult next = CaptureResult::NoNewFrame;
+    const auto frame_deadline = std::chrono::steady_clock::now() + 2s;
+    while (next != CaptureResult::Frame && std::chrono::steady_clock::now() < frame_deadline)
+        next = viewer->capture(5ms);
+    check(next == CaptureResult::Frame, "the sliced wait still delivers a desktop change");
+    encoder.reset(); viewer.reset();
+    check(state->wrong_thread == 0, "the sliced wait stays on the display service thread");
+}
+
 void deferred_keyframe_on_static_desktop() {
     DesktopStreamPool pool;
     auto state = std::make_shared<host_test::MediaState>();
@@ -1241,6 +1287,7 @@ int main() {
         resync_backoff_bounds_keyframes();
         static_resync_retries_without_publication();
         publish_wakes_waiting_reader();
+        low_fps_wait_does_not_block_session();
         deferred_keyframe_on_static_desktop();
         slow_encode_is_not_queue_wait();
         slow_viewer_backpressure();
