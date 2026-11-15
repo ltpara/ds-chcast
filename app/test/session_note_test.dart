@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
 import 'package:chast_viewer/pages/session_page.dart';
+import 'package:chast_viewer/server_settings.dart';
 import 'package:chast_viewer/stream_prefs.dart';
 import 'package:chast_viewer/target.dart';
 import 'package:chast_viewer/trust_store.dart';
@@ -74,20 +76,157 @@ void main() {
     await harness.pumpCloseFinished();
     expect(find.byType(SessionPage), findsNothing);
   });
+
+  testWidgets('native window waits for the audit response before closing', (
+    WidgetTester tester,
+  ) async {
+    final Completer<void> requestSeen = Completer<void>();
+    final Completer<void> releaseResponse = Completer<void>();
+    final _SessionHarness harness = await _SessionHarness.create(
+      tester,
+      askNote: true,
+      windowSession: true,
+      connectionReporter:
+          ({
+            required ServerSettings settings,
+            required String token,
+            required String peerId,
+            required DateTime startedAt,
+            required DateTime endedAt,
+            required String detail,
+            required String note,
+            required String auditRef,
+            required String route,
+          }) async {
+            requestSeen.complete();
+            await releaseResponse.future;
+          },
+    );
+    addTearDown(harness.dispose);
+    await harness.openSession();
+    await tester.pump(const Duration(seconds: 1));
+
+    final Future<void> closing = harness.requestNativeClose();
+    await harness.pumpCloseDialog();
+    expect(find.byType(AlertDialog), findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.byType(FilledButton),
+      ),
+    );
+    await tester.pump();
+    await tester.runAsync(
+      () => requestSeen.future.timeout(const Duration(seconds: 3)),
+    );
+    expect(harness.closeWindowCalls, 0);
+    releaseResponse.complete();
+    await tester.runAsync(() => closing.timeout(const Duration(seconds: 3)));
+    expect(harness.closeWindowCalls, 1);
+  });
+
+  testWidgets('main window waits for the audit response before popping', (
+    WidgetTester tester,
+  ) async {
+    final Completer<void> requestSeen = Completer<void>();
+    final Completer<void> releaseResponse = Completer<void>();
+    final _SessionHarness harness = await _SessionHarness.create(
+      tester,
+      askNote: false,
+      connectionReporter:
+          ({
+            required ServerSettings settings,
+            required String token,
+            required String peerId,
+            required DateTime startedAt,
+            required DateTime endedAt,
+            required String detail,
+            required String note,
+            required String auditRef,
+            required String route,
+          }) async {
+            requestSeen.complete();
+            await releaseResponse.future;
+          },
+    );
+    addTearDown(harness.dispose);
+    await harness.openSession();
+    await tester.pump(const Duration(seconds: 1));
+
+    harness.closeSession();
+    await tester.runAsync(
+      () => requestSeen.future.timeout(const Duration(seconds: 3)),
+    );
+    expect(find.byType(SessionPage), findsOneWidget);
+    releaseResponse.complete();
+    await harness.pumpCloseFinished();
+    expect(find.byType(SessionPage), findsNothing);
+  });
+
+  testWidgets('system back waits for the audit response before popping', (
+    WidgetTester tester,
+  ) async {
+    final Completer<void> requestSeen = Completer<void>();
+    final Completer<void> releaseResponse = Completer<void>();
+    final _SessionHarness harness = await _SessionHarness.create(
+      tester,
+      askNote: false,
+      connectionReporter:
+          ({
+            required ServerSettings settings,
+            required String token,
+            required String peerId,
+            required DateTime startedAt,
+            required DateTime endedAt,
+            required String detail,
+            required String note,
+            required String auditRef,
+            required String route,
+          }) async {
+            requestSeen.complete();
+            await releaseResponse.future;
+          },
+    );
+    addTearDown(harness.dispose);
+    await harness.openSession();
+    await tester.pump(const Duration(seconds: 1));
+
+    await harness.systemBack();
+    await tester.runAsync(
+      () => requestSeen.future.timeout(const Duration(seconds: 3)),
+    );
+    expect(find.byType(SessionPage), findsOneWidget);
+    releaseResponse.complete();
+    await harness.pumpCloseFinished();
+    expect(find.byType(SessionPage), findsNothing);
+  });
 }
 
 class _SessionHarness {
-  _SessionHarness(this.tester, this.dir, this.account, this.trustStore);
+  _SessionHarness(
+    this.tester,
+    this.dir,
+    this.account,
+    this.trustStore,
+    this.windowSession,
+    this.connectionReporter,
+  );
 
   final WidgetTester tester;
   final Directory dir;
   final AccountSession account;
   final TrustStore trustStore;
+  final bool windowSession;
+  final SessionConnectionReporter? connectionReporter;
   final List<Map<Object?, Object?>> starts = <Map<Object?, Object?>>[];
+  int closeWindowCalls = 0;
 
   static Future<_SessionHarness> create(
     WidgetTester tester, {
     required bool askNote,
+    String serverUrl = 'http://127.0.0.1:1',
+    bool windowSession = false,
+    SessionConnectionReporter? connectionReporter,
   }) async {
     const MethodChannel native = MethodChannel('chast/viewer');
     const MethodChannel gpu = MethodChannel('flutter_gpu_texture_renderer');
@@ -105,12 +244,14 @@ class _SessionHarness {
       tester,
       dir,
       AccountSession(
-        server: 'http://127.0.0.1:1',
+        server: serverUrl,
         username: 'alice',
         token: 'account-token',
         expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
       ),
       TrustStore(file: trustFile),
+      windowSession,
+      connectionReporter,
     );
     final messenger = tester.binding.defaultBinaryMessenger;
     messenger.setMockMethodCallHandler(gpu, (MethodCall call) async => 1);
@@ -136,6 +277,9 @@ class _SessionHarness {
           return <Object?>[];
         case 'refreshRemoteCursor':
           return false;
+        case 'closeSessionWindow':
+          harness.closeWindowCalls++;
+          return null;
         default:
           return null;
       }
@@ -161,6 +305,8 @@ class _SessionHarness {
                     target: const ConnectTarget('127.0.0.1', 1),
                     account: account,
                     trustStore: trustStore,
+                    windowSession: windowSession,
+                    connectionReporter: connectionReporter,
                   ),
                 ),
               ),
@@ -185,6 +331,24 @@ class _SessionHarness {
 
   void closeSession() {
     tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).onClose();
+  }
+
+  Future<void> systemBack() async {
+    expect(await tester.binding.handlePopRoute(), isTrue);
+    await tester.pump();
+  }
+
+  Future<void> requestNativeClose() async {
+    final ByteData data = const StandardMethodCodec().encodeMethodCall(
+      const MethodCall('windowCloseRequested'),
+    );
+    final Completer<void> completed = Completer<void>();
+    tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+      'chast/viewer',
+      data,
+      (_) => completed.complete(),
+    );
+    await completed.future;
   }
 
   /// Shutdown runs before the prompt, so the dialog needs a few frames.

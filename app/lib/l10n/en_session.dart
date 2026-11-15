@@ -731,4 +731,12 @@ const Map<String, String> kEnglishSession = <String, String>{
   '语音通话出现问题': 'Voice call problem',
   '语音通话未能开启': 'Voice call could not start',
   '{prefix}：{reason}': '{prefix}: {reason}',
+  '连接时同步本机剪贴板': 'Sync the local clipboard on connect',
+  '下次连接把本机当前剪贴板推送到主机':
+      'Push the local clipboard to the host on the next connection',
+  '长按选择连接时是否推送本机剪贴板':
+      'Long-press to choose whether to push the local clipboard on connect',
+  '会随本次连接记录写入服务器审计，可跳过。':
+      'Stored with this connection record in the server audit; you can skip it.',
+  '提交': 'Submit',
 };

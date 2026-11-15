@@ -996,6 +996,10 @@ type connectionLine struct {
 	Route      string `json:"route"`
 	Success    bool   `json:"success"`
 	Detail     string `json:"detail"`
+	// Note is the viewer's end-of-session remark. It is archived with the row
+	// so the append-only copy does not lose a field the live query and CSV
+	// export already expose.
+	Note string `json:"note,omitempty"`
 }
 
 type transferLine struct {
@@ -1069,6 +1073,7 @@ func (a *Archiver) readConnections(afterID int64, limit int) ([]record, error) {
 			Route:      event.Route,
 			Success:    event.Success,
 			Detail:     event.Detail,
+			Note:       event.Note,
 		})
 		if err != nil {
 			return nil, err

@@ -719,6 +719,36 @@ private:
     bool muted_ = false;
 };
 
+// A zero rate disables shaping. Keep that branch finite so diagnostics and
+// custom weak-link runs cannot turn their acceptance budget into infinity.
+double weak_link_frame_age_budget_ms(uint64_t keyframe_bytes, uint32_t rate_kbps,
+                                     double delay_ms, double queue_ms) {
+    const double transit_ms =
+        rate_kbps == 0 ? 0.0
+                       : static_cast<double>(keyframe_bytes) * 8.0 /
+                             static_cast<double>(rate_kbps);
+    return (std::min)(3000.0, transit_ms + delay_ms * 2.0 + queue_ms);
+}
+
+int test_weak_link_frame_age_budget() {
+    bool passed = true;
+    auto expect = [&](double actual, double low, double high, const char* what) {
+        const bool ok = actual > low && actual <= high;
+        passed = passed && ok;
+        std::printf("%s %s (%.0f ms)\n", ok ? "ok  " : "FAIL", what, actual);
+    };
+    expect(weak_link_frame_age_budget_ms(262144, 1000, 80.0, 500.0), 2750.0, 3000.0,
+           "a large key frame stays inside the fixed three-second ceiling");
+    expect(weak_link_frame_age_budget_ms(120000, 1000, 80.0, 500.0), 1600.0, 1650.0,
+           "a smaller key frame tightens the diagnostic budget");
+    const double fast = weak_link_frame_age_budget_ms(262144, 2000, 80.0, 500.0);
+    const double slow = weak_link_frame_age_budget_ms(262144, 1000, 80.0, 500.0);
+    expect(slow - fast, 1000.0, 1100.0, "the diagnostic budget tracks the link rate");
+    const double unlimited = weak_link_frame_age_budget_ms(262144, 0, 80.0, 500.0);
+    expect(unlimited, 650.0, 670.0, "zero rate has a finite unlimited-bandwidth budget");
+    std::printf("%s weak-link frame-age budget\n", passed ? "ok  " : "FAIL");
+    return passed ? 0 : 1;
+}
 int test_microphone_render_reference() {
     bool passed = true;
     for (const uint16_t channels : {uint16_t{1}, uint16_t{2}}) {
@@ -2329,6 +2359,11 @@ struct ReceiverStats {
     uint64_t frames_without_capture = 0;
     double last_frame_age_ms = -1.0;
     double max_frame_age_ms = -1.0;
+    // The largest key-frame access unit, in bytes, counted as frames arrive.
+    // One IDR at the streamed geometry cannot cross a bottleneck faster than
+    // its bits allow, so this size explains the observed peak beside the fixed
+    // acceptance ceiling.
+    uint64_t max_keyframe_bytes = 0;
     // Bitrate and frame rate the last StreamInfo announced (the encoder's
     // target and ladder pick after ABR).
     uint32_t target_bitrate = 0;
@@ -6536,6 +6571,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
 
         ++stats.received;
         last_frame = std::chrono::steady_clock::now();
+        // Tracked for every key frame, not only the clock-synced ones, so the
+        // diagnostic beside the worst frame age cannot understate the IDR.
+        if (header.keyframe && payload.size() > stats.max_keyframe_bytes)
+            stats.max_keyframe_bytes = payload.size();
 
         if (header.capture_ms == 0) {
             ++stats.frames_without_capture;
@@ -8174,7 +8213,7 @@ bool annotation_roundtrip_works(uint16_t port, std::string* detail) {
         {chast::AnnotationAction::Begin, 41, {{-320, -180}}},
         {chast::AnnotationAction::Move, 41, {{-300, -160}, {-280, -140}}},
         {chast::AnnotationAction::End, 41, {{-280, -140}}},
-        {chast::AnnotationAction::Undo, 0, {}},
+        {chast::AnnotationAction::Undo, 41, {}},
         {chast::AnnotationAction::Clear, 0, {}},
     };
     for (size_t i = 0; i < messages.size(); ++i) {
@@ -11451,8 +11490,20 @@ int run_weak_network(const Options& options) {
           "the last announcement matched the running target");
     check(received.latency.valid && received.latency.replies > 0,
           "the latency probe survived the relay");
-    check(received.max_frame_age_ms >= 0.0 && received.max_frame_age_ms < 3000.0,
-          "the worst frame age stayed within the weak-link budget");
+    const double idr_transit_ms =
+        rate_kbps == 0 ? 0.0
+                       : static_cast<double>(received.max_keyframe_bytes) * 8.0 /
+                             static_cast<double>(rate_kbps);
+    constexpr double age_budget_ms = 3000.0;
+    check(received.max_keyframe_bytes > 0,
+          "the viewer saw a key frame through the lossy link");
+    check(received.max_frame_age_ms >= 0.0 && received.max_frame_age_ms <= age_budget_ms,
+          "the worst frame age stayed inside the three-second weak-link ceiling");
+    // The link is clean for the last part of the run, so the age the session
+    // ends on is the recovery evidence; the worst sample alone cannot tell a
+    // drained queue from a permanently backed-up one.
+    check(received.last_frame_age_ms >= 0.0 && received.last_frame_age_ms <= 300.0,
+          "the frame age settled once the link came back");
 
     check(to_viewer.received > 0 && to_viewer.forwarded > 0,
           "video datagrams crossed the relay");
@@ -11558,6 +11609,13 @@ int run_weak_network(const Options& options) {
                 received.max_frame_age_ms,
                 static_cast<unsigned long long>(sent.stream_updates_sent),
                 static_cast<unsigned long long>(received.stream_updates));
+    std::printf("     frame age: worst %.0f ms of a %.0f ms budget ("
+                "%.0f ms key-frame transit of %llu bytes over %u kbps, %.0f ms relay queue = "
+                "%.0f kB), settled at %.0f ms\n",
+                received.max_frame_age_ms, age_budget_ms, idr_transit_ms,
+                static_cast<unsigned long long>(received.max_keyframe_bytes), rate_kbps,
+                kQueueMs, static_cast<double>(rate_kbps) * kQueueMs / 8000.0,
+                received.last_frame_age_ms);
     std::printf("     video receipts: %llu, last delivery %.0f ms, pending %.0f ms\n",
                 static_cast<unsigned long long>(sent.video_receipts), sent.video_delivery_ms,
                 sent.video_pending_ms);
@@ -11594,6 +11652,8 @@ int run_weak_network(const Options& options) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--test-microphone-reference")
         return test_microphone_render_reference();
+    if (argc == 2 && std::string(argv[1]) == "--test-weak-link-budget")
+        return test_weak_link_frame_age_budget();
     chast::enable_physical_desktop_coordinates();
     chast_tools::install_crash_handler();
     std::setvbuf(stdout, nullptr, _IONBF, 0);

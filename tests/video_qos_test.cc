@@ -80,13 +80,14 @@ int main() {
         timeout.open(1, 0);
         warm(timeout, 1, 1100, 12);
         timeout.pending(1, 3000, 3000);
-        check(timeout.state(3000).fps == 7, "a probe three seconds out quarters the rate");
+        check(timeout.state(3000).fps == 1,
+              "six missed delivery windows reach the receipt-keeping rate");
         timeout.delay(1, 3200, 3100);
-        check(timeout.state(3100).fps == 7, "the late reply belongs to the braked stall");
+        check(timeout.state(3100).fps == 1, "the late reply belongs to the braked stall");
         timeout.pending(1, 0, 3200);
-        check(timeout.state(3200).fps == 7, "clearing the probe does not lift the brake");
+        check(timeout.state(3200).fps == 1, "clearing the probe does not lift the brake");
         timeout.delay(1, 10, 3300);
-        check(timeout.state(3300).fps == 8, "one good reply does not restore the full rate");
+        check(timeout.state(3300).fps == 2, "one good reply does not restore the full rate");
         timeout.delay(1, 10, 3400);
         check(timeout.state(3400).fps == 30, "two good replies restore the held level");
         timeout.delay(1, 10, 3500);
@@ -140,25 +141,34 @@ int main() {
         delivery_stall.open(1, 0);
         delivery_stall.display(10, 1, 5000, true, 0);
         delivery_stall.delay(1, 10, 1100);
-        delivery_stall.pending(1, 1900, 2000);
-        check(near(delivery_stall.state(2000).ratio, 1.5f),
-              "a sub-two-second outstanding receipt is treated as jitter");
-        delivery_stall.pending(1, 2100, 2500);
-        check(near(delivery_stall.state(2500).ratio, 0.45f),
-              "the first receipt beyond two seconds cuts bitrate to the quality floor");
+        const auto delivery_fps = delivery_stall.state(1100).fps;
+        delivery_stall.pending(1, 499, 1500);
+        check(near(delivery_stall.state(1500).ratio, 1.5f),
+              "an outstanding receipt inside one delivery window is tolerated");
+        delivery_stall.pending(1, 500, 1600);
+        check(near(delivery_stall.state(1600).ratio, 0.24f),
+              "the first missed delivery window leaves twenty percent link headroom");
+        check(delivery_stall.state(1600).fps == delivery_fps,
+              "the first missed window spends bitrate before frame rate");
+        delivery_stall.pending(1, 999, 1900);
+        check(delivery_stall.state(1900).fps == delivery_fps,
+              "samples in the same half-second bucket do not cut twice");
+        delivery_stall.pending(1, 1000, 2100);
+        check(delivery_stall.state(2100).fps == delivery_fps / 2,
+              "a second missed delivery window halves the held frame rate");
+        delivery_stall.delay(1, 10, 2200);
+        delivery_stall.delay(1, 10, 2300);
+        delivery_stall.delay(1, 10, 2400);
+        check(delivery_stall.state(2400).fps > delivery_fps / 2,
+              "completing a delivery stall starts frame-rate recovery");
+        delivery_stall.delay(1, 10, 2500);
         delivery_stall.delay(1, 10, 2600);
         delivery_stall.delay(1, 10, 2700);
-        delivery_stall.delay(1, 10, 2800);
-        check(delivery_stall.state(2800).fps > 15,
-              "completing a delivery stall starts frame-rate recovery");
-        delivery_stall.delay(1, 10, 2900);
-        delivery_stall.delay(1, 10, 3000);
-        delivery_stall.delay(1, 10, 3100);
-        check(delivery_stall.state(3100).fps == 30,
+        check(delivery_stall.state(2700).fps == 30,
               "a clean delivery path still restores the previous frame rate");
-        delivery_stall.display(10, 6, 5000, true, 5500);
-        const auto delivery_ratio = delivery_stall.state(5500).ratio;
-        check(near(delivery_ratio, 0.5175f),
+        delivery_stall.display(10, 6, 5000, true, 5100);
+        const auto delivery_ratio = delivery_stall.state(5100).ratio;
+        check(near(delivery_ratio, 0.276f),
               "normal bounded bitrate recovery follows the urgent cut");
 
         // RustDesk feeds its periodic adjustment once a second. An elevated

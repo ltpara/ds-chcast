@@ -113,7 +113,7 @@ void main() {
   });
 
   test(
-    'undo ends an active stroke and uses the action-only wire shape',
+    'undo ends an active stroke and names that stroke on the wire',
     () async {
       await controller.begin(const ViewerAnnotationPoint(1, 1), nowMs: 0);
 
@@ -124,7 +124,7 @@ void main() {
         AnnotationWireAction.end,
         AnnotationWireAction.undo,
       ]);
-      expect(sender.sent.last.strokeId, 0);
+      expect(sender.sent.last.strokeId, sender.sent.first.strokeId);
       expect(sender.sent.last.points, isEmpty);
       expect(controller.canUndo, isFalse);
       expect(await controller.undo(), isFalse);
@@ -132,17 +132,40 @@ void main() {
     },
   );
 
+  test('failed undo keeps the stroke available for a retry', () async {
+    await controller.begin(const ViewerAnnotationPoint(1, 1), nowMs: 0);
+    await controller.end(nowMs: 1);
+    sender.throwNext = true;
+
+    expect(await controller.undo(), isFalse);
+    expect(controller.canUndo, isTrue);
+    expect(await controller.undo(), isTrue);
+    expect(sender.sent.last.strokeId, sender.sent.first.strokeId);
+    expect(controller.canUndo, isFalse);
+  });
+
   test('clear sends the action-only shape and resets undo history', () async {
     await controller.begin(const ViewerAnnotationPoint(1, 2), nowMs: 0);
     await controller.end(nowMs: 1);
 
-    await controller.clear();
+    expect(await controller.clear(), isTrue);
 
     expect(sender.sent.last.action, AnnotationWireAction.clear);
     expect(sender.sent.last.strokeId, 0);
     expect(sender.sent.last.points, isEmpty);
     expect(controller.canUndo, isFalse);
     expect(controller.isDrawing, isFalse);
+  });
+
+  test('failed clear keeps the history available for a retry', () async {
+    await controller.begin(const ViewerAnnotationPoint(1, 2), nowMs: 0);
+    await controller.end(nowMs: 1);
+    sender.throwNext = true;
+
+    expect(await controller.clear(), isFalse);
+    expect(controller.canUndo, isTrue);
+    expect(await controller.clear(), isTrue);
+    expect(controller.canUndo, isFalse);
   });
 
   test('separate controllers never allocate the same stroke id', () async {

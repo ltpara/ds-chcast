@@ -263,8 +263,19 @@ func (s *Store) policyObjectsByIDsLocked(ids []string) ([]PolicyObject, error) {
 func policyImportMatches(policy PolicyObject, entry *preparedPolicyImport) bool {
 	return policy.Mode == entry.mode &&
 		policy.PermissionCeiling == entry.input.PermissionCeiling &&
-		sameStringSet(policy.AllowedUsers, normalizedStringSet(entry.input.AllowedUsers)) &&
+		sameFoldedStringSet(policy.AllowedUsers, entry.input.AllowedUsers) &&
 		sameStringSet(policy.AllowedGroups, normalizedStringSet(entry.input.AllowedGroups))
+}
+
+func sameFoldedStringSet(left, right []string) bool {
+	fold := func(values []string) []string {
+		out := normalizedStringSet(values)
+		for i := range out {
+			out[i] = strings.ToLower(out[i])
+		}
+		return normalizedStringSet(out)
+	}
+	return sameStringSet(fold(left), fold(right))
 }
 
 func normalizedStringSet(values []string) []string {

@@ -300,8 +300,7 @@ const Map<String, String> kEnglishHome = <String, String>{
   '录制上传失败：{error}': 'Recording upload failed: {error}',
   '录制上传多次中断，请稍后重试':
       'The recording upload was interrupted repeatedly; please try again later',
-  '录制上传已失效，请重新开始':
-      'The recording upload expired; please start it again',
+  '录制上传已失效，请重新开始': 'The recording upload expired; please start it again',
   '录制上传进度已变化': 'The recording upload progress changed',
   '同时进行的录制上传过多': 'Too many recording uploads are active',
   '录制不存在或已被删除': 'The recording does not exist or was deleted',
@@ -362,4 +361,8 @@ const Map<String, String> kEnglishHome = <String, String>{
   '已收藏': 'Added to favorites',
   '已取消收藏': 'Removed from favorites',
   '还没有收藏的设备': 'No favorite devices yet',
+  '会话备注': 'Session note',
+  '结束会话时填写备注': 'Ask for a note when the session ends',
+  '已开启': 'On',
+  '未开启': 'Off',
 };

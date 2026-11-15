@@ -1583,10 +1583,11 @@ void ViewerBridge::HandleMethodCall(
             annotation.points.push_back(
                 chast::AnnotationPoint{static_cast<int32_t>(x), static_cast<int32_t>(y)});
         }
-        const bool empty_command = annotation.action == chast::AnnotationAction::Clear ||
-                                   annotation.action == chast::AnnotationAction::Undo;
-        if ((empty_command && (annotation.stroke_id != 0 || !annotation.points.empty())) ||
-            (!empty_command && (annotation.stroke_id == 0 || annotation.points.empty()))) {
+        const bool clear = annotation.action == chast::AnnotationAction::Clear;
+        const bool undo = annotation.action == chast::AnnotationAction::Undo;
+        if ((clear && (annotation.stroke_id != 0 || !annotation.points.empty())) ||
+            (undo && (annotation.stroke_id == 0 || !annotation.points.empty())) ||
+            (!clear && !undo && (annotation.stroke_id == 0 || annotation.points.empty()))) {
             result->Error("bad_args", "sendAnnotation action and points disagree");
             return;
         }

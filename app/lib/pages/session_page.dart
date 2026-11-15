@@ -44,6 +44,19 @@ import 'package:chast_viewer/l10n.dart';
 
 enum _DisplayStreamLayout { single, grid, desktop }
 
+typedef SessionConnectionReporter =
+    Future<void> Function({
+      required ServerSettings settings,
+      required String token,
+      required String peerId,
+      required DateTime startedAt,
+      required DateTime endedAt,
+      required String detail,
+      required String note,
+      required String auditRef,
+      required String route,
+    });
+
 class SessionPage extends StatefulWidget {
   const SessionPage({
     super.key,
@@ -57,6 +70,7 @@ class SessionPage extends StatefulWidget {
     this.rdpPort = 0,
     this.windowSession = false,
     this.initialDisplay = 65535,
+    this.connectionReporter,
   });
 
   final ConnectTarget target;
@@ -87,6 +101,10 @@ class SessionPage extends StatefulWidget {
   /// The output this window should show from the start; [kViewerDisplayAuto]
   /// follows the host's choice.
   final int initialDisplay;
+
+  /// Test seam for the final account audit request. Production uses
+  /// [ServerApi.reportConnection].
+  final SessionConnectionReporter? connectionReporter;
 
   /// The signed-in account, if any. It is used to report a finished remote
   /// session and, when enabled, to upload finished recordings.
@@ -255,6 +273,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _fullscreen = false;
   bool _reconnecting = false;
   bool _closing = false;
+  bool _allowPop = false;
   bool _controlEnabled = false;
   bool _nativeKeyCapture = false;
   bool _localKeyboardUnavailable = false;
@@ -497,7 +516,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(ViewerBridge.setWindowCloseHandler(null));
     }
     _stopPolling();
-    unawaited(_annotation.clear());
+    unawaited(_annotation.clear().then((_) {}));
     _annotationInk.dispose();
     _ticketTimer?.cancel();
     _ticketTimer = null;
@@ -551,9 +570,32 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         ? widget.target.hostId
         : widget.target.label;
     try {
-      await ServerApi.reportConnection(
-        ServerSettings(url: account.server),
-        account.token,
+      final SessionConnectionReporter reporter =
+          widget.connectionReporter ??
+          ({
+            required ServerSettings settings,
+            required String token,
+            required String peerId,
+            required DateTime startedAt,
+            required DateTime endedAt,
+            required String detail,
+            required String note,
+            required String auditRef,
+            required String route,
+          }) => ServerApi.reportConnection(
+            settings,
+            token,
+            peerId: peerId,
+            startedAt: startedAt,
+            endedAt: endedAt,
+            detail: detail,
+            note: note,
+            auditRef: auditRef,
+            route: route,
+          );
+      await reporter(
+        settings: ServerSettings(url: account.server),
+        token: account.token,
         peerId: peer,
         startedAt: startedAt,
         endedAt: DateTime.now(),
@@ -567,11 +609,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _finishSessionAudit(String detail) async {
+    final DateTime? auditStartedAt = _auditStartedAt;
+    _auditStartedAt = null;
+    if (auditStartedAt != null) {
+      await _reportFinishedSession(auditStartedAt, detail);
+    }
+  }
+
   /// Asks for the remark that goes out with this session's audit row. The
   /// prompt only appears for a connected, account-audited session and only
   /// when the operator enabled it; every other close path stays silent.
   Future<void> _promptSessionNote() async {
-    if (!_askSessionNote || _auditStartedAt == null || _sessionNote.isNotEmpty) {
+    if (!_askSessionNote ||
+        _auditStartedAt == null ||
+        _sessionNote.isNotEmpty) {
       return;
     }
     final AccountSession? account = await _activeAccount();
@@ -2623,10 +2675,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _toggleSyncInitClipboard() {
     final bool enabled = !_syncInitClipboard;
     setState(() => _syncInitClipboard = enabled);
-    ViewPreferences.update(
-      peerId: _prefsPeerId,
-      syncInitClipboard: enabled,
-    );
+    ViewPreferences.update(peerId: _prefsPeerId, syncInitClipboard: enabled);
   }
 
   void _toggleShowMyCursor() {
@@ -2685,15 +2734,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _undoAnnotation() async {
-    final bool hadStroke = _annotation.canUndo;
-    await _annotation.undo();
-    if (hadStroke) _annotationInk.undo();
+    final bool undone = await _annotation.undo();
+    if (undone) _annotationInk.undo();
     if (mounted) setState(() {});
   }
 
   Future<void> _clearAnnotation() async {
-    _annotationInk.clear();
-    await _annotation.clear();
+    final bool cleared = await _annotation.clear();
+    if (cleared) _annotationInk.clear();
     if (mounted) setState(() {});
   }
 
@@ -4784,6 +4832,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     try {
       await _shutdown();
       await _promptSessionNote();
+      await _finishSessionAudit('closed');
     } finally {
       await SessionWindowRequest.close();
     }
@@ -4805,14 +4854,26 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _clearCursor();
     await _shutdown();
     await _promptSessionNote();
+    await _finishSessionAudit('closed');
     if (!mounted) {
       return;
     }
     if (widget.windowSession) {
       await SessionWindowRequest.close();
     } else {
+      setState(() => _allowPop = true);
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
       Navigator.of(context).pop();
     }
+  }
+
+  void _onPopInvoked(bool didPop, Object? result) {
+    if (didPop) {
+      _cleanupAfterPop();
+      return;
+    }
+    if (!_closing) unawaited(_leave());
   }
 
   void _cleanupAfterPop() {
@@ -6170,12 +6231,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final bool showOverlay = _startError != null || _status.isOver;
 
     return PopScope(
-      canPop: true,
-      onPopInvokedWithResult: (bool didPop, Object? result) {
-        if (didPop) {
-          _cleanupAfterPop();
-        }
-      },
+      canPop: _allowPop,
+      onPopInvokedWithResult: _onPopInvoked,
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Focus(
@@ -6731,12 +6788,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final bool showOverlay = _startError != null || _status.isOver;
     final bool live = _status.isLive;
     return PopScope(
-      canPop: true,
-      onPopInvokedWithResult: (bool didPop, Object? result) {
-        if (didPop) {
-          _cleanupAfterPop();
-        }
-      },
+      canPop: _allowPop,
+      onPopInvokedWithResult: _onPopInvoked,
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Column(
@@ -6896,12 +6949,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _ => (Icons.cable_rounded, tr('远程会话')),
     };
     return PopScope(
-      canPop: true,
-      onPopInvokedWithResult: (bool didPop, Object? result) {
-        if (didPop) {
-          _cleanupAfterPop();
-        }
-      },
+      canPop: _allowPop,
+      onPopInvokedWithResult: _onPopInvoked,
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Column(
@@ -8903,9 +8952,7 @@ class _SessionNoteDialogState extends State<_SessionNoteDialog> {
         controller: _controller,
         autofocus: true,
         maxLength: 240,
-        decoration: InputDecoration(
-          hintText: tr('会随本次连接记录写入服务器审计，可跳过。'),
-        ),
+        decoration: InputDecoration(hintText: tr('会随本次连接记录写入服务器审计，可跳过。')),
         onSubmitted: (_) => _submit(),
       ),
       actions: <Widget>[

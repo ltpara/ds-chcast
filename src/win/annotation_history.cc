@@ -46,13 +46,15 @@ void AnnotationHistory::clear() {
     point_count_ = 0;
 }
 
-bool AnnotationHistory::undo() {
-    if (strokes_.empty()) {
+bool AnnotationHistory::undo(uint32_t id) {
+    const auto found = std::find_if(strokes_.begin(), strokes_.end(),
+                                    [id](const Stroke& stroke) { return stroke.id == id; });
+    if (found == strokes_.end()) {
         return false;
     }
-    deactivate(strokes_.back().id);
-    point_count_ -= strokes_.back().points.size();
-    strokes_.pop_back();
+    deactivate(found->id);
+    point_count_ -= found->points.size();
+    strokes_.erase(found);
     return true;
 }
 

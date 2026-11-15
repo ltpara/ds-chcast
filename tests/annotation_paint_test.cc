@@ -89,7 +89,7 @@ void test_interleaved_strokes() {
     EXPECT(!history.is_active(1) && !history.is_active(2));
 }
 
-void test_undo_removes_newest() {
+void test_undo_removes_named_stroke() {
     chast::detail::AnnotationHistory history;
     EXPECT(history.begin(7, chast::AnnotationPoint{1, 2}));
     EXPECT(history.end(7));
@@ -97,11 +97,12 @@ void test_undo_removes_newest() {
     EXPECT(history.append(8, chast::AnnotationPoint{5, 6}));
     EXPECT(history.end(8));
     EXPECT(history.strokes().size() == 2);
-    EXPECT(history.undo());
-    EXPECT(history.strokes().size() == 1 && history.strokes().front().id == 7);
-    EXPECT(history.point_count() == 1);
-    EXPECT(!history.is_active(8));
-    EXPECT(!history.append(8, chast::AnnotationPoint{9, 10}));
+    EXPECT(history.undo(7));
+    EXPECT(history.strokes().size() == 1 && history.strokes().front().id == 8);
+    EXPECT(history.point_count() == 2);
+    EXPECT(!history.is_active(7));
+    EXPECT(!history.append(7, chast::AnnotationPoint{9, 10}));
+    EXPECT(!history.undo(99));
 }
 
 void test_history_bounds() {
@@ -133,7 +134,7 @@ int main() {
     test_dot_and_color();
     test_overlay_blend();
     test_interleaved_strokes();
-    test_undo_removes_newest();
+    test_undo_removes_named_stroke();
     test_history_bounds();
     if (failures != 0) {
         std::fprintf(stderr, "%d annotation paint expectation(s) failed\n", failures);

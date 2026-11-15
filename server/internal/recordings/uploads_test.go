@@ -41,6 +41,44 @@ func TestResumableUploadReclaimsAbandonedSession(t *testing.T) {
 	}
 }
 
+func TestResumableUploadReclaimWaitsForWriterAndRechecksIdle(t *testing.T) {
+	archive, _, user := openArchive(t, 0, 0)
+	upload, err := archive.BeginUpload(user.ID, "clip.mp4", "", 0, 0, 4)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	part := archive.uploadPartPath(user.ID, upload.ID)
+	stale := time.Now().Add(-uploadIdleTTL - time.Minute)
+	if err := os.Chtimes(part, stale, stale); err != nil {
+		t.Fatalf("age part: %v", err)
+	}
+
+	lock := archive.uploadLock(upload.ID)
+	lock.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, beginErr := archive.BeginUpload(user.ID, "next.mp4", "", 0, 0, 4)
+		done <- beginErr
+	}()
+	select {
+	case beginErr := <-done:
+		lock.Unlock()
+		t.Fatalf("reclaim did not wait for active upload lock: %v", beginErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := os.Chtimes(part, time.Now(), time.Now()); err != nil {
+		lock.Unlock()
+		t.Fatalf("refresh part: %v", err)
+	}
+	lock.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("begin after writer: %v", err)
+	}
+	if _, err := archive.UploadStatus(user.ID, upload.ID); err != nil {
+		t.Fatalf("active upload was reclaimed: %v", err)
+	}
+}
+
 func TestResumableUploadRecoversMissingPartFile(t *testing.T) {
 	archive, _, user := openArchive(t, 0, 0)
 	upload, err := archive.BeginUpload(user.ID, "clip.mp4", "", 0, 0, 4)

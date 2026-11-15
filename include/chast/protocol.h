@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 76.
+// The chast wire protocol, version 77.
 //
 // One QUIC connection carries:
 //
@@ -56,7 +56,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 76;
+inline constexpr uint16_t kProtocolVersion = 77;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -507,13 +507,15 @@ enum class ControlType : uint16_t {
     // that stream; a request naming a shape the host no longer holds is
     // ignored, because the next pointer sample will bring the current shape.
     CursorShapeRequest = 88,
-    // Viewer -> host (v76): a temporary session annotation stroke. Draw-only:
-    // no point reaches the input injector and no input permission is required.
+    // Viewer -> host (v76, targeted undo in v77): a temporary session
+    // annotation stroke. Draw-only: no point reaches the input injector and no
+    // input permission is required.
     // Payload: action (u8, see AnnotationAction), three reserved zero bytes,
     // stroke id (u32), point count (u16), two reserved zero bytes, then one or
-    // more points as x (i32), y (i32) in virtual-desktop pixels. Clear and
-    // undo carry zero points and stroke id 0; begin, move and end carry 1..64
-    // points and a non-zero stroke id. A client throttles moves and batches
+    // more points as x (i32), y (i32) in virtual-desktop pixels. Clear carries
+    // zero points and stroke id 0; undo carries zero points and the id of the
+    // stroke to remove; begin, move and end carry 1..64 points and a non-zero
+    // stroke id. A client throttles moves and batches
     // nearby samples so the host never sees an unbounded control stream.
     Annotation = 89,
 };

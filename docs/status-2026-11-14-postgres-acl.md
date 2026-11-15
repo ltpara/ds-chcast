@@ -17,7 +17,7 @@
 | --- | --- |
 | 分支 | `main` |
 | 本轮提交前 GitHub 基线 | `5590d75`（协议 v73） |
-| 当前工作区协议 | v76 |
+| 当前工作区协议 | v77 |
 | 账号 schema | v18 |
 | 本轮 ACL 数据库 | PostgreSQL 14.25，`chast_acl_20261114` |
 | 最终票据 | `kid=acl-e2e-v2`，`policy_version=7` |

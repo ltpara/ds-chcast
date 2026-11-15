@@ -419,15 +419,14 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   }
 
   Future<void> _undoAnnotation() async {
-    final bool hadStroke = _annotation.canUndo;
-    await _annotation.undo();
-    if (hadStroke) _annotationInk.undo();
+    final bool undone = await _annotation.undo();
+    if (undone) _annotationInk.undo();
     if (mounted) setState(() {});
   }
 
   Future<void> _clearAnnotation() async {
-    _annotationInk.clear();
-    await _annotation.clear();
+    final bool cleared = await _annotation.clear();
+    if (cleared) _annotationInk.clear();
     if (mounted) setState(() {});
   }
 
@@ -584,7 +583,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
           IconButton(
             tooltip: _annotationMode ? tr('退出标注模式') : tr('在主机上标注'),
             isSelected: _annotationMode,
-            icon: Icon(_annotationMode ? Icons.draw_rounded : Icons.draw_outlined),
+            icon: Icon(
+              _annotationMode ? Icons.draw_rounded : Icons.draw_outlined,
+            ),
             onPressed: !_closing ? _toggleAnnotationMode : null,
           ),
           IconButton(

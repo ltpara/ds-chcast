@@ -393,19 +393,26 @@ func (a *Archive) reclaimIdleUploads(userID string) {
 		if !uploadIDPattern.MatchString(id) {
 			continue
 		}
+		lock := a.uploadLock(id)
+		lock.Lock()
 		state, err := a.readUploadState(userID, id)
 		if err != nil || !a.uploadIdle(state, userID, id, now) {
+			lock.Unlock()
+			continue
+		}
+		// Remove the part first. If that fails, retain the state so the client can
+		// still inspect or explicitly remove the resumable session.
+		if err := os.Remove(a.uploadPartPath(userID, id)); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			a.logger.Error("recording upload reclaim", "id", id, "error", err)
+			lock.Unlock()
 			continue
 		}
 		if err := os.Remove(a.uploadStatePath(userID, id)); err != nil &&
 			!errors.Is(err, os.ErrNotExist) {
 			a.logger.Error("recording upload reclaim", "id", id, "error", err)
-			continue
 		}
-		if err := os.Remove(a.uploadPartPath(userID, id)); err != nil &&
-			!errors.Is(err, os.ErrNotExist) {
-			a.logger.Error("recording upload reclaim", "id", id, "error", err)
-		}
+		lock.Unlock()
 	}
 }
 

@@ -818,6 +818,12 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_microphone_reference COMMAND chast-quic --test-microphone-reference)
     set_tests_properties(quic_microphone_reference PROPERTIES TIMEOUT 10)
 
+    # The weak-link frame-age allowance is derived from the degraded window,
+    # the key-frame size and the link, so it is checked without a capture
+    # device.
+    add_test(NAME quic_weak_link_budget COMMAND chast-quic --test-weak-link-budget)
+    set_tests_properties(quic_weak_link_budget PROPERTIES TIMEOUT 10)
+
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.
     add_test(NAME quic_loopback

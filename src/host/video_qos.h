@@ -57,7 +57,7 @@ private:
         std::optional<uint8_t> samples_since_restore;
         std::optional<uint32_t> stall_reference_fps;
         uint8_t stall_ticks = 0;
-        uint32_t last_stall_second = 0;
+        uint32_t last_stall_bucket = 0;
         uint8_t startup_good = 0; // u8::MAX permanently ends startup acceleration
         void add(uint32_t value);
         uint32_t average() const;
@@ -92,7 +92,7 @@ private:
     uint32_t highest_fps() const;
     Target latest_quality() const;
     float target_ratio() const;
-    float min_ratio() const;
+    float min_ratio(uint32_t floor_kbps = 1000) const;
     bool variable() const;
     bool can_reduce_bitrate() const;
     void adjust_fps(uint64_t now_ms);

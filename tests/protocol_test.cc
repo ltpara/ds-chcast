@@ -516,6 +516,15 @@ void test_annotation() {
               got.points.empty(),
           "Annotation round-trips clear");
 
+    sent.action = chast::AnnotationAction::Undo;
+    sent.stroke_id = 7;
+    check(chast::parse_annotation(payload_of(chast::make_annotation(sent)), got, &error) &&
+              got.action == chast::AnnotationAction::Undo && got.stroke_id == 7 &&
+              got.points.empty(),
+          "Annotation round-trips a targeted undo");
+    sent.stroke_id = 0;
+    check(chast::make_annotation(sent).empty(), "Annotation undo requires a stroke id");
+
     const std::vector<uint8_t> payload = payload_of(message);
     check(!chast::parse_annotation(
               std::vector<uint8_t>(payload.begin(), payload.end() - 3), got, &error),

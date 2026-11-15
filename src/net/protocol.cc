@@ -1985,8 +1985,11 @@ bool valid_annotation_point(const AnnotationPoint& point) {
 
 bool annotation_shape_valid(AnnotationAction action, uint32_t stroke_id,
                             size_t point_count) {
-    if (action == AnnotationAction::Clear || action == AnnotationAction::Undo) {
+    if (action == AnnotationAction::Clear) {
         return stroke_id == 0 && point_count == 0;
+    }
+    if (action == AnnotationAction::Undo) {
+        return stroke_id != 0 && point_count == 0;
     }
     return stroke_id != 0 && point_count >= 1 && point_count <= kMaxAnnotationPoints;
 }

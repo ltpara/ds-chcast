@@ -75,7 +75,7 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 	}
 	if _, err := store.RecordConnection(alice.ID, "alice", "devbox", "viewer",
 		"198.51.100.4", "Testland", "punch", "",
-		start, start.Add(90*time.Second), true, "viewer side", ""); err != nil {
+		start, start.Add(90*time.Second), true, "viewer side", "closed the VPN first"); err != nil {
 		t.Fatalf("record connection: %v", err)
 	}
 	if _, err := store.RecordFileTransfer(alice.ID, "alice", "devbox", "upload",
@@ -117,7 +117,8 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 	connectionLines := readLines(t, connectionPath)
 	if len(connectionLines) != 1 || connectionLines[0]["detail"] != "viewer side" ||
 		connectionLines[0]["duration_ms"] != float64(90000) ||
-		connectionLines[0]["stream"] != "connections" {
+		connectionLines[0]["stream"] != "connections" ||
+		connectionLines[0]["note"] != "closed the VPN first" {
 		t.Fatalf("connection lines = %v", connectionLines)
 	}
 	transferLines := readLines(t, transferPath)

@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
-/// Wire values for protocol v76 freehand annotations.
+/// Wire values for protocol v77 freehand annotations.
 abstract final class AnnotationWireAction {
   static const int clear = 0;
   static const int begin = 1;
@@ -37,8 +37,8 @@ typedef AnnotationSender =
 ///
 /// Begin is sent immediately. Moves are batched at about 30 Hz and at 64
 /// points, and End is always flushed on pointer-up or cancellation. The host
-/// only needs the visual result, so there is no acknowledgement protocol; a
-/// rejected send is ignored until the next stroke or clear.
+/// only needs the visual result, so there is no host acknowledgement protocol.
+/// A failed undo or clear keeps its local history so the operator can retry.
 class AnnotationStrokeController {
   factory AnnotationStrokeController({
     required AnnotationSender sender,
@@ -73,10 +73,10 @@ class AnnotationStrokeController {
   int? _activeStrokeId;
   ViewerAnnotationPoint? _lastPoint;
   int _lastFlushMs = 0;
-  int _strokeCount = 0;
+  final List<int> _strokeIds = <int>[];
 
   bool get isDrawing => _activeStrokeId != null;
-  bool get canUndo => _strokeCount > 0;
+  bool get canUndo => _strokeIds.isNotEmpty;
 
   static int _allocateStrokeId() {
     final int id = _nextGlobalStrokeId;
@@ -94,7 +94,7 @@ class AnnotationStrokeController {
     _lastPoint = point;
     _lastFlushMs = now;
     _pending.clear();
-    _strokeCount++;
+    _strokeIds.add(strokeId);
     await _send(AnnotationWireAction.begin, strokeId, <ViewerAnnotationPoint>[
       point,
     ]);
@@ -150,19 +150,34 @@ class AnnotationStrokeController {
     if (_activeStrokeId != null) {
       await end();
     }
-    if (_strokeCount == 0) {
+    if (_strokeIds.isEmpty) {
       return false;
     }
-    _strokeCount--;
-    return _send(AnnotationWireAction.undo, 0, const <ViewerAnnotationPoint>[]);
+    final int strokeId = _strokeIds.last;
+    final bool sent = await _send(
+      AnnotationWireAction.undo,
+      strokeId,
+      const <ViewerAnnotationPoint>[],
+    );
+    if (sent) {
+      _strokeIds.removeLast();
+    }
+    return sent;
   }
 
-  Future<void> clear() async {
+  Future<bool> clear() async {
     if (_activeStrokeId != null) {
       await end();
     }
-    _strokeCount = 0;
-    await _send(AnnotationWireAction.clear, 0, const <ViewerAnnotationPoint>[]);
+    final bool sent = await _send(
+      AnnotationWireAction.clear,
+      0,
+      const <ViewerAnnotationPoint>[],
+    );
+    if (sent) {
+      _strokeIds.clear();
+    }
+    return sent;
   }
 
   Future<void> _flushMoves(int now) async {

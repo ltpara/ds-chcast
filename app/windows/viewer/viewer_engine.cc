@@ -8678,19 +8678,27 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
 
                 auto drain_annotations = [&] {
-                    std::deque<chast::AnnotationMessage> pending;
-                    {
-                        std::lock_guard<std::mutex> lock(annotation_mutex_);
-                        pending.swap(pending_annotations_);
-                    }
-                    while (!pending.empty()) {
-                        chast::Error sent = session->request_annotation(pending.front());
-                        pending.pop_front();
-                        if (!sent.ok()) {
-                            std::fprintf(stderr, "viewer: annotation: %s\n",
-                                         sent.to_string().c_str());
-                            break;
+                    while (true) {
+                        chast::AnnotationMessage annotation;
+                        {
+                            std::lock_guard<std::mutex> lock(annotation_mutex_);
+                            if (pending_annotations_.empty()) {
+                                return;
+                            }
+                            annotation = std::move(pending_annotations_.front());
+                            pending_annotations_.pop_front();
                         }
+                        chast::Error sent = session->request_annotation(annotation);
+                        if (sent.ok()) {
+                            continue;
+                        }
+                        if (sent.status() == chast::Status::WaitTimeout) {
+                            std::lock_guard<std::mutex> lock(annotation_mutex_);
+                            pending_annotations_.push_front(std::move(annotation));
+                        }
+                        std::fprintf(stderr, "viewer: annotation: %s\n",
+                                     sent.to_string().c_str());
+                        return;
                     }
                 };
 

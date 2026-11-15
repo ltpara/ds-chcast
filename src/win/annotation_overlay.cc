@@ -304,7 +304,7 @@ bool AnnotationOverlay::Impl::apply(const AnnotationMessage& annotation,
             history.clear();
             return render_all(error);
         case AnnotationAction::Undo:
-            history.undo();
+            history.undo(annotation.stroke_id);
             return render_all(error);
         case AnnotationAction::Begin:
         case AnnotationAction::Move:

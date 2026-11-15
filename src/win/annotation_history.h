@@ -22,7 +22,7 @@ public:
     bool append(uint32_t id, const AnnotationPoint& point);
     bool end(uint32_t id);
     void clear();
-    bool undo();
+    bool undo(uint32_t id);
     bool trim(size_t max_strokes, size_t max_points);
 
     const std::vector<Stroke>& strokes() const { return strokes_; }

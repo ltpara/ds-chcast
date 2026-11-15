@@ -19,6 +19,8 @@ constexpr uint32_t kHardFloorDelayMs = 600;
 constexpr uint32_t kMinDelayFps = 3;
 constexpr uint32_t kStallFloorDelayMs = 1200;
 constexpr uint32_t kDelayThresholdMs = 150;
+constexpr uint32_t kDeliveryStallBucketMs = 500;
+constexpr uint32_t kEmergencyBitrateFloorKbps = 800;
 constexpr uint8_t kRestoreGuardSamples = 5;
 constexpr uint8_t kStartupEnded = 255;
 
@@ -171,20 +173,15 @@ void VideoQos::Delay::on_reduction(uint32_t current) {
 
 bool VideoQos::Delay::needs_bitrate_reduction() const {
     // An outstanding video receipt is not probe jitter: it is application
-    // delay already visible to the viewer. Waiting for a second tick past two
-    // seconds lets the delivery window grow beyond the three-second latency
-    // budget before the first rate cut. A single sub-two-second probe remains
-    // jitter and never reaches this path.
+    // delay already visible to the viewer. One missed 500 ms delivery window
+    // is enough to protect the queue; shorter outstanding receipts stay jitter.
     return consecutive_bad >= 2 || stall_ticks >= 1;
 }
 
 std::optional<float> VideoQos::Delay::ratio_reduction() const {
     if (!needs_bitrate_reduction()) return std::nullopt;
-    // A delivery stall beyond two seconds is direct evidence that the current
-    // target cannot drain the transport queue. An ordinary "unconfirmed"
-    // 0.8 step leaves a 3 Mbps stream above a 1 Mbps bottleneck and produces
-    // another multi-second backlog. Cut hard enough for the confirmed stall
-    // while retaining the configured quality floor.
+    // A delivery stall is direct evidence that the current target cannot drain
+    // the transport queue. adjust_ratio moves it to the emergency floor.
     if (stall_ticks) return 0.3f;
     const auto excess = average();
     const bool confirmed = consecutive_bad >= 3;
@@ -219,7 +216,7 @@ float VideoQos::target_ratio() const {
     if (target.custom_ratio) return *target.custom_ratio;
     return target.quality ? quality_ratio(*target.quality) : default_ratio_;
 }
-float VideoQos::min_ratio() const {
+float VideoQos::min_ratio(uint32_t floor_kbps) const {
     const Target target = latest_quality();
     const auto ratio = target_ratio();
     float minimum = 0.1f;
@@ -237,8 +234,9 @@ float VideoQos::min_ratio() const {
         minimum = 0.335f;
     }
     if (bitrate_kbps_) {
-        const auto one_mbps = std::max(ratio_ * 1000.0f / bitrate_kbps_, 0.1f);
-        minimum = std::min(minimum, one_mbps);
+        const auto bitrate_floor =
+            std::max(ratio_ * static_cast<float>(floor_kbps) / bitrate_kbps_, 0.1f);
+        minimum = std::min(minimum, bitrate_floor);
     }
     return std::max(minimum, floor);
 }
@@ -332,7 +330,7 @@ void VideoQos::delay(uint64_t id, uint32_t value, uint64_t now) {
     const uint32_t sample = std::max(value, 10u);
     // The reply closes the outstanding probe, braked or not.
     delay.stall_ticks = 0;
-    delay.last_stall_second = 0;
+    delay.last_stall_bucket = 0;
     const bool braked = delay.stall_reference_fps.has_value();
     delay.stall_reference_fps.reset();
     const auto old_average = delay.average();
@@ -385,15 +383,17 @@ void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
     if (found == users_.end() || !adaptive_fps_) return;
     auto& user = found->second;
     auto& delay = user.delay;
-    if (elapsed <= 2000) {
-        delay.last_stall_second = 0;
+    if (elapsed < kDeliveryStallBucketMs) {
+        delay.last_stall_bucket = 0;
         return;
     }
-    // The caller samples every 500 ms; the reference ticks once per second.
-    const auto second = static_cast<uint32_t>(
-        std::min<uint64_t>(elapsed / 1000, std::numeric_limits<uint32_t>::max()));
-    if (second <= delay.last_stall_second) return;
-    delay.last_stall_second = second;
+    // Application delivery is already outside the reliable video stream's
+    // 500 ms window. Act on the first missed window, then once per additional
+    // window so a queue cannot grow for whole seconds between decisions.
+    const auto bucket = static_cast<uint32_t>(std::min<uint64_t>(
+        elapsed / kDeliveryStallBucketMs, std::numeric_limits<uint32_t>::max()));
+    if (bucket <= delay.last_stall_bucket) return;
+    delay.last_stall_bucket = bucket;
     delay.stall_ticks = static_cast<uint8_t>(std::min<unsigned>(delay.stall_ticks + 1, 255));
     delay.add(static_cast<uint32_t>(std::min<uint64_t>(elapsed, UINT32_MAX)));
     const uint32_t cap = fps_cap(user);
@@ -405,24 +405,26 @@ void VideoQos::pending(uint64_t id, uint64_t elapsed, uint64_t now) {
         delay.stall_reference_fps = reference;
         delay.on_reduction(reference);
     }
-    // Halve for every second the probe stays out beyond the first: two seconds
-    // halve, three quarter, and so on down to the floor.
-    const uint32_t divisor = 1u << std::min<uint32_t>(second > 0 ? second - 1 : 0, 5);
+    // The first bucket spends bitrate headroom. Each additional 500 ms halves
+    // the held frame rate until only the receipt-keeping trickle remains.
+    const uint32_t divisor = 1u << std::min<uint32_t>(bucket > 0 ? bucket - 1 : 0, 5);
     const uint32_t current = delay.fps.value_or(reference);
     // The floor is a floor, not a lift: a target already below it stays. A
     // stalled probe means nothing is arriving, so the soft floor gives way and
     // only a trickle of frames is kept to keep receipts flowing. This path
-    // only runs past two seconds, so the delay tiers above always resolve to 1
-    // here; they belong to measured delay, not to a stall.
-    const uint32_t floor = std::min(auto_fps_floor(false, second * 1000), cap);
+    // it belongs to a delivery stall rather than an ordinary delay sample.
+    const uint32_t floor =
+        std::min(auto_fps_floor(false, static_cast<uint32_t>(
+            std::min<uint64_t>(elapsed, std::numeric_limits<uint32_t>::max()))), cap);
     uint32_t fps = std::clamp(reference / divisor, floor, cap);
     fps = std::min(fps, current);
     delay.fps = fps;
     adjust_fps(now);
     // The periodic ratio tick has a three-second cooldown. An active delivery
-    // stall cannot spend that budget before its first congestion action: apply
-    // one bounded reduction as soon as the receipt is beyond two seconds.
-    if (now - last_ratio_ >= 1000) adjust_ratio(false, now);
+    // stall cannot spend that budget before its first congestion action.
+    if (!delay.replies_after_bitrate_reduction &&
+        now - last_ratio_ >= kDeliveryStallBucketMs)
+        adjust_ratio(false, now);
 }
 void VideoQos::adjust_ratio(bool dynamic, uint64_t now) {
     if (!variable() || users_.empty()) return;
@@ -446,11 +448,17 @@ void VideoQos::adjust_ratio(bool dynamic, uint64_t now) {
     std::optional<float> add_150kbps;
     if (bitrate_kbps_)
         add_150kbps = (bitrate_kbps_ + 150.0f) * current / bitrate_kbps_;
-    const auto minimum = min_ratio();
+    const bool emergency = std::any_of(users_.begin(), users_.end(), [](const auto& entry) {
+        return entry.second.delay.stall_ticks > 0;
+    });
+    const auto minimum = min_ratio(emergency ? kEmergencyBitrateFloorKbps : 1000);
     const auto maximum = target;
     float next = current;
     if (reduction) {
-        next = current * *reduction;
+        // A missed application-delivery window is direct queue evidence. Move
+        // to the emergency floor immediately so the bottleneck retains room
+        // for key frames, retransmissions and control traffic.
+        next = emergency ? minimum : current * *reduction;
     } else if (maximum_delay < 50) {
         if (dynamic) next = current * 1.15f;
     } else if (maximum_delay < 100) {

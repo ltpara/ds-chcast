@@ -3139,10 +3139,11 @@ class ViewerBridge {
     return queued ?? false;
   }
 
-  /// Sends one temporary freehand annotation message (protocol v76). Points
-  /// are virtual-desktop pixels. Clear and undo use action 0/4 with stroke 0
-  /// and no points; begin/move/end use action 1/2/3 with a non-zero stroke id
-  /// and 1..64 points. This path is draw-only and needs no input permission.
+  /// Sends one temporary freehand annotation message (protocol v77). Points
+  /// are virtual-desktop pixels. Clear uses action 0 with stroke 0; undo uses
+  /// action 4 with the target stroke id. Both carry no points. Begin/move/end
+  /// use action 1/2/3 with a non-zero stroke id and 1..64 points. This path is
+  /// draw-only and needs no input permission.
   static Future<bool> sendAnnotation({
     required int action,
     required int strokeId,

@@ -1,7 +1,7 @@
 # chast 与 RustDesk 功能对照（2026-11-15）
 
 本文件是 2026-11-15 的功能差异入口，用本机 RustDesk 1.5.1 源码重新核对
-发射端、查看端、服务端和产品面。协议基线为工作区 **v76**。历史矩阵中与本文
+发射端、查看端、服务端和产品面。协议基线为工作区 **v77**。历史矩阵中与本文
 冲突的行以本文为准：[全产品对照](rustdesk-full-parity-2026-11-07.md) 保留
 C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md)
 保留宿主逐模块记录。
@@ -10,7 +10,7 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
 
 | 项目 | 本轮口径 |
 | --- | --- |
-| 我方 | `D:/ds-chcast`，分支 `codex/pending-features-2026-11-14` 的工作区，协议 **v76** |
+| 我方 | `D:/ds-chcast`，分支 `codex/pending-features-2026-11-14` 的工作区，协议 **v77** |
 | RustDesk | 本机 `D:/rustdesk`，HEAD `55786aa`（2026-11-03），`Cargo.toml` 版本 **1.5.1**；浅克隆只有 1 个提交，不能用提交区间推断引入时间 |
 | 旧参照 | 多份旧文档固定 `7423dce`；`55786aa` 已补 Windows HDR 归一化、`static_refresh.rs`、QoS 重写和音频管道，旧文档中“参照没有 HDR/静止刷新”等判断已过期 |
 | 方法 | 两侧源码阅读；RustDesk 侧只取行为与字段语义，不引入其代码或依赖；我方证据来自既有构建/测试记录，本轮未重跑完整原生 ctest |
@@ -30,6 +30,8 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
    光标、姓名和点击波纹画到主机屏幕的**光标覆盖层**，不是自由笔画；我方的
    `Annotation`（89）才是真正的临时自由手写，RustDesk 1.5.1 没有对应能力。
    因此这一项应从“缺口”改为“我方超出基线”，但真实双机等边界仍待验收。
+   v77 进一步把 `Undo` 收紧为携带目标 `stroke_id`，多个查看窗口交错绘制时各自
+   只撤销自己的笔画，不再误删其他窗口的最新笔迹。
 4. 查看端仍有若干 RustDesk 有、我方没有的**体验型 P3**：会话期间保持本机
    唤醒、多连接标签页、用本机全部显示器铺满画面、视图缩放百分比、光标缩放、
    “把剪贴板作为按键发送”、虚拟屏自定义分辨率（依赖 PLAT-01）、触控板速度/边缘滚动、
@@ -77,7 +79,7 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
 | X04 | 自定义视图缩放百分比 | 工具栏 `Scale custom`（`remote_toolbar.dart:828`） | 仅适配/原始比例两种（`ViewFit`） | 缺失，P3 |
 | X05 | 光标缩放倍率 | 工具栏 `Zoom cursor`（`remote_toolbar.dart:1040`） | 光标按主机 DPI/辅助功能档位派生，无用户倍率 | 缺失，P3 |
 | X06 | 把剪贴板作为按键发送 | 工具栏 `Send clipboard keystrokes`（`remote_toolbar.dart:506`） | 只有“发送文本”输入框，无逐字符按键注入 | 缺失，P3 |
-| X07 | 每显示器自定义分辨率列表 | `PeerConfig::custom_resolutions`（`config.rs:383`）与重连重放 `try_change_init_resolution`（`ui_session_interface.rs:1589`），但条目只由虚拟屏切换路径写入（`handle_peer_switch_display`→`set_custom_resolution`，`ui_session_interface.rs:1546`），桌面端自由宽高输入也只对 RustDesk 虚拟屏出现（`isVirtualDisplayResolution`，`remote_toolbar.dart:2277`） | 物理输出两侧都只列主机枚举模式（我方 v76 `ListDisplayModes`/`SetDisplayMode`）；我方虚拟屏已接受 WxH 输入但会吸附到 `usbmmidd_default_modes()` 的 15 个固定尺寸（`virtual_display.cc:1456`），任意宽高随 PLAT-01 驱动解阻 | 部分；自定义尺寸依赖 PLAT-01（P3） |
+| X07 | 每显示器自定义分辨率列表 | `PeerConfig::custom_resolutions`（`config.rs:383`）与重连重放 `try_change_init_resolution`（`ui_session_interface.rs:1589`），但条目只由虚拟屏切换路径写入（`handle_peer_switch_display`→`set_custom_resolution`，`ui_session_interface.rs:1546`），桌面端自由宽高输入也只对 RustDesk 虚拟屏出现（`isVirtualDisplayResolution`，`remote_toolbar.dart:2277`） | 物理输出两侧都只列主机枚举模式（我方 v77 `ListDisplayModes`/`SetDisplayMode`）；我方虚拟屏已接受 WxH 输入但会吸附到 `usbmmidd_default_modes()` 的 15 个固定尺寸（`virtual_display.cc:1456`），任意宽高随 PLAT-01 驱动解阻 | 部分；自定义尺寸依赖 PLAT-01（P3） |
 | X08 | 触控板速度、边缘滚动、滚动样式 | `trackpad-speed`（`flutter/lib/models/input_model.dart:446`）、`kOptionScrollStyle`/`kOptionEdgeScrollEdgeThickness`（`consts.dart:86-87`） | 有触控板 pan/zoom 手势、反向滚轮、左右键互换；无速度倍率/边缘滚动/样式 | 缺失，P3 |
 | X09 | 查看端本地“仅查看” | `view_only`（`src/client.rs:3289`、`io_loop.rs:518`） | 有主机权限和工具栏输入开关；无查看端本地仅查看偏好 | 缺失，P3 |
 | X10 | SVG 剪贴板格式 | `ImageSvg = 23`（`libs/base/protos/message.proto:344`） | CCLB v4 无 SVG 格式（文本/HTML/RTF/DIB/PNG/文件列表） | 缺失，P3 |

@@ -8839,34 +8839,31 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         clipboard_baseline_pending_ = false;
         initial_send = clipboard_initial_send_;
         clipboard_initial_send_ = false;
-        last_clipboard_hash_ = has_content
-                                   ? clipboard_content_hash(snapshot.content) : 0;
-        // Copied, not moved: an initial send still needs this snapshot.
-        last_clipboard_ = snapshot.content;
-        last_file_identity_ = snapshot.has_files
-                                  ? clipboard_file_identity_hash(snapshot.entries) : 0;
-        last_file_source_version_ = snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
-        last_file_entries_ = snapshot.entries;
-        last_file_paths_ = snapshot.paths;
-        if (!initial_send || (!has_content && !snapshot.has_files)) return;
+        if (!initial_send || (!has_content && !snapshot.has_files)) {
+            last_clipboard_hash_ = has_content
+                                       ? clipboard_content_hash(snapshot.content) : 0;
+            last_clipboard_ = snapshot.content;
+            last_file_identity_ = snapshot.has_files
+                                      ? clipboard_file_identity_hash(snapshot.entries) : 0;
+            last_file_source_version_ =
+                snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
+            last_file_entries_ = snapshot.entries;
+            last_file_paths_ = snapshot.paths;
+            return;
+        }
     }
     auto& current_files = snapshot.entries;
     auto& current_paths = snapshot.paths;
     if (snapshot.has_files) {
         const uint64_t identity = clipboard_file_identity_hash(current_files);
-        last_clipboard_ = ClipboardContent{};
-        last_clipboard_hash_ = 0;
         const auto source_version = snapshot.local_files ? snapshot.local_files->SourceVersion() : 0;
         if (identity == 0 || (!initial_send && identity == last_file_identity_ &&
             (!last_file_source_version_ || last_file_source_version_ == source_version))) {
             return;
         }
-        last_file_entries_ = std::move(current_files);
-        last_file_paths_ = std::move(current_paths);
-        last_file_identity_ = identity;
         ClipboardFormatData entry;
         entry.format = ClipboardFormat::FileList;
-        entry.data = encode_clipboard_file_list(last_file_entries_);
+        entry.data = encode_clipboard_file_list(current_files);
         if (entry.data.empty()) {
             log("clipboard: the local file list is not sendable");
             return;
@@ -8880,6 +8877,11 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
             log("clipboard files send failed: " + sent.to_string());
             return;
         }
+        last_clipboard_ = ClipboardContent{};
+        last_clipboard_hash_ = 0;
+        last_file_entries_ = std::move(current_files);
+        last_file_paths_ = std::move(current_paths);
+        last_file_identity_ = identity;
         // Only a list this viewer actually received may be downloaded by
         // index; publishing after the send keeps a failed announce from
         // leaving paths the viewer never saw. The source travels with the
@@ -8912,12 +8914,12 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
     if (hash == last_clipboard_hash_ && !initial_send) {
         return;
     }
-    // Remember content we cannot put on the wire (oversized or malformed) so
-    // every later tick does not retry the same value.
-    last_clipboard_ = current;
-    last_clipboard_hash_ = hash;
     std::string content_error;
     if (!valid_clipboard_content(current, &content_error)) {
+        // Remember content we cannot put on the wire so every later tick does
+        // not retry the same malformed or oversized value.
+        last_clipboard_ = current;
+        last_clipboard_hash_ = hash;
         log("clipboard: the local item is not sendable: " + content_error);
         return;
     }
@@ -8928,6 +8930,8 @@ void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
         log("clipboard send failed: " + sent.to_string());
         return;
     }
+    last_clipboard_ = ClipboardContent{};
+    last_clipboard_hash_ = hash;
     ++clipboard_seq_;
     ++stats.clipboard_sent;
 }

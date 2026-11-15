@@ -57,6 +57,29 @@ func TestImportPolicyObjectsCreateUpdateUnchanged(t *testing.T) {
 	}
 }
 
+func TestImportPolicyObjectsUsernamesAreCaseInsensitiveForUnchanged(t *testing.T) {
+	store := openGroupStore(t)
+	if _, err := store.CreateUser("Alice", "correct horse"); err != nil {
+		t.Fatalf("create Alice: %v", err)
+	}
+	existing := mustCreatePolicy(t, store, "case", DevicePolicyRestricted, 3,
+		[]string{"Alice"}, nil)
+
+	result, err := store.ImportPolicyObjects([]PolicyObjectImport{{
+		Name:              "case",
+		Mode:              DevicePolicyRestricted,
+		PermissionCeiling: 3,
+		AllowedUsers:      []string{"alice"},
+	}}, PolicyImportConflictUpdate, "importer")
+	if err != nil {
+		t.Fatalf("import lowercase username: %v", err)
+	}
+	if len(result.Unchanged) != 1 || len(result.Updated) != 0 ||
+		result.Unchanged[0].PolicyVersion != existing.PolicyVersion {
+		t.Fatalf("case-only import changed policy: %+v", result)
+	}
+}
+
 func TestImportPolicyObjectsRejectConflictIsAtomic(t *testing.T) {
 	store := openGroupStore(t)
 	existing := mustCreatePolicy(t, store, "kept", DevicePolicyOpen, 1, nil, nil)

@@ -6,6 +6,8 @@
 
 > **2026-11-15 复核**：按本机 RustDesk `55786aa`（1.5.1）重新核对，最新功能差异与新增查看端 P3 以 [RustDesk 功能对照](rustdesk-comparison-2026-11-15.md) 为准。本文件 C30 已更新为“设备级开关、默认关闭”。S22 同日补记会话结束备注：`connection_events.note`（schema v19）、管理台连接页签过滤与 CSV `note` 列。C49 需澄清概念：RustDesk `src/whiteboard` 只有 `Cursor/Clear/Exit`，是光标/姓名/点击波纹覆盖层；v76 的自由手写标注是我方独有能力，不是未关闭的旧缺口。
 
+> **2026-11-15 v77**：当前工作区协议为 v77。v77 只收紧临时自由手写标注的 `Undo` 语义（必须携带非零 `stroke_id` 与零个点，主机按 ID 删除该笔），`Clear` 仍为 stroke 0 加零个点，编解码与其余控制消息不变；与 v76 及更早版本不承诺线协议互通。标注状态以[G21 标注专题](annotation-2026-11-14.md)为准，实时协议状态仍以[当前状态与计划](status-and-plan-2026-11-09.md)为准。
+
 > **2026-11-14 P2 指针续验**：工作区补齐 Windows 辅助功能指针倍率和 DPI 派生，GDI/DXGI 共用 512 px 上限内的缩放、反色掩码、热点映射与描边逻辑。真实 GDI 1/13/15 档采集到 32/224/256 px，相关 8 项 CTest 通过；当前会话 DXGI 连续 30 次没有 pointer shape。真实 DXGI 大光标、查看端叠层与 hotspot 目视仍需交互式桌面环境，详见[指针四项复核](pointer-acceptance-2026-11-11.md)。
 
 ## 结论与范围
