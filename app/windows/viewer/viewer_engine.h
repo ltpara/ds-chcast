@@ -750,7 +750,8 @@ public:
                bool file_transfer_only = false,
                chast::SessionMode session_mode = chast::SessionMode::Desktop,
                std::vector<uint8_t> access_ticket = {},
-               std::vector<uint8_t> access_ticket_seed = {});
+               std::vector<uint8_t> access_ticket_seed = {},
+               bool sync_init_clipboard = false);
     // Queues a freshly issued access ticket for the running managed session.
     // The session thread sends it as TicketRenew and moves the host's lease to
     // the new expiry; the caller keeps fetching tickets on its own timer. The
@@ -1178,7 +1179,7 @@ private:
              std::string carrier_host_id, std::string carrier_token,
              std::string audit_ref, bool file_transfer_only,
              chast::SessionMode session_mode, std::vector<uint8_t> access_ticket,
-             std::vector<uint8_t> access_ticket_seed);
+             std::vector<uint8_t> access_ticket_seed, bool sync_init_clipboard);
     void SetState(ViewerState state, std::string error = {});
     // Expands dropped folders and hashes queued uploads on its own thread, so
     // a multi-gigabyte read never stalls the session's receive loop.

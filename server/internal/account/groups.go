@@ -802,12 +802,12 @@ const groupEventFilter = `(user_id IN (SELECT user_id FROM account_group_members
 // ConnectionsForGroupBefore pages a group's session history. Optional
 // username and host filters narrow the group window further.
 func (s *Store) ConnectionsForGroupBefore(groupID, username, hostID string, beforeID int64, limit int) ([]ConnectionEvent, error) {
-	return s.ConnectionsForGroupBeforeRange(groupID, username, hostID, TimeBounds{}, beforeID, limit)
+	return s.ConnectionsForGroupBeforeRange(groupID, username, hostID, "", TimeBounds{}, beforeID, limit)
 }
 
 // ConnectionsForGroupBeforeRange is ConnectionsForGroupBefore narrowed to an
 // inclusive window on started_at.
-func (s *Store) ConnectionsForGroupBeforeRange(groupID, username, hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
+func (s *Store) ConnectionsForGroupBeforeRange(groupID, username, hostID, note string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	groupID = strings.TrimSpace(groupID)
 	if !registry.ValidID(groupID) {
 		return nil, ErrInvalidAccountGroupID
@@ -822,6 +822,7 @@ func (s *Store) ConnectionsForGroupBeforeRange(groupID, username, hostID string,
 		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
 		args = append(args, hostID, hostID)
 	}
+	clauses, args = addNoteFilter(clauses, args, note)
 	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
 	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
 }

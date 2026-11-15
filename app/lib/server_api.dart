@@ -2513,8 +2513,10 @@ class ServerApi {
   /// derives the username and client address from the token and request, so
   /// callers only describe the peer and timing. [route] is one of `direct`,
   /// `punch`, `relay` or `carrier` (empty when the path never settled).
-  /// Audit delivery is best-effort; callers should ignore failures rather
-  /// than disturb the viewer.
+  /// [note] is the optional remark the operator typed at the end of the
+  /// session; the server stores it on this connection row and never replaces
+  /// it afterwards. Audit delivery is best-effort; callers should ignore
+  /// failures rather than disturb the viewer.
   static Future<void> reportConnection(
     ServerSettings settings,
     String token, {
@@ -2523,6 +2525,7 @@ class ServerApi {
     required DateTime endedAt,
     bool success = true,
     String detail = '',
+    String note = '',
     String auditRef = '',
     String route = '',
     Duration timeout = const Duration(seconds: 6),
@@ -2549,6 +2552,7 @@ class ServerApi {
         'ended_at_ms': endedAt.toUtc().millisecondsSinceEpoch,
         'success': success,
         if (detail.trim().isNotEmpty) 'detail': detail.trim(),
+        if (note.trim().isNotEmpty) 'note': note.trim(),
         if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
         if (route.isNotEmpty) 'route': route,
       },
@@ -4371,15 +4375,18 @@ class ServerApi {
           if (!error.retryable && error.statusCode != HttpStatus.conflict) {
             rethrow;
           }
+          // Every failure counts against the retry budget, including a
+          // truncated chunk: a server that keeps cutting a chunk must fail the
+          // upload instead of looping forever on status reads.
+          recoveryAttempts++;
+          if (recoveryAttempts > 4) {
+            throw ServerApiException(
+              tr('录制上传多次中断，请稍后重试'),
+              statusCode: error.statusCode,
+              transient: error.transient,
+            );
+          }
           if (error.statusCode != HttpStatus.conflict) {
-            recoveryAttempts++;
-            if (recoveryAttempts > 4) {
-              throw ServerApiException(
-                tr('录制上传多次中断，请稍后重试'),
-                statusCode: error.statusCode,
-                transient: error.transient,
-              );
-            }
             await Future<void>.delayed(
               Duration(milliseconds: 200 * recoveryAttempts),
             );

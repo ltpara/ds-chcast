@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -161,6 +162,14 @@ func (s *server) recordingUploadError(w http.ResponseWriter, user account.User, 
 	case errors.As(err, &offsetErr):
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error": "recording upload offset is stale", "offset": offsetErr.Actual,
+		})
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		// The body was cut short so the chunk was rolled back. Reporting the
+		// same resumable condition as a stale offset lets the client re-read
+		// the durable offset and send the chunk again, instead of treating a
+		// dropped connection as a broken server.
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "recording upload chunk was truncated",
 		})
 	case errors.Is(err, recordings.ErrEmpty), errors.Is(err, recordings.ErrUploadIncomplete),
 		errors.Is(err, recordings.ErrUploadSize):

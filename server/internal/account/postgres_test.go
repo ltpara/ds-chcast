@@ -67,7 +67,7 @@ func TestPostgresStore(t *testing.T) {
 	start := time.Now().UTC().Add(-time.Minute)
 	connection, err := store.RecordConnection(user.ID, username, "123456789", "viewer",
 		"192.0.2.10", "Testland", RoutePunch, "abcdef0123456789",
-		start, time.Now().UTC(), true, "test")
+		start, time.Now().UTC(), true, "test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,11 +494,11 @@ func TestPostgresAccountGroups(t *testing.T) {
 
 	now := time.Now().UTC()
 	if _, err := store.RecordConnection(bob.ID, bob.Username, "peer-bob",
-		"viewer", "127.0.0.1", "", "", "", now.Add(-time.Minute), now, true, ""); err != nil {
+		"viewer", "127.0.0.1", "", "", "", now.Add(-time.Minute), now, true, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.RecordConnection(alice.ID, alice.Username, "peer-alice",
-		"viewer", "127.0.0.1", "", "", "", now.Add(-time.Minute), now, true, ""); err != nil {
+		"viewer", "127.0.0.1", "", "", "", now.Add(-time.Minute), now, true, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AppendAudit(AuditEvent{Username: bob.Username, Action: "pg_group_probe"}); err != nil {

@@ -16,6 +16,7 @@ const (
 	connectionRetention   = 10000
 	maxConnectionPeer     = 128
 	maxConnectionDetail   = 256
+	maxConnectionNote     = 240
 	maxConnectionIP       = 64
 	maxConnectionLocation = 64
 	maxConnectionRoute    = 32
@@ -71,6 +72,9 @@ type ConnectionEvent struct {
 	EndedAt   time.Time
 	Success   bool
 	Detail    string
+	// Note is the viewer's end-of-session remark. It is written by the report
+	// that closes the session and is never overwritten afterwards.
+	Note string
 }
 
 func (e ConnectionEvent) Duration() time.Duration {
@@ -112,7 +116,7 @@ func (s *Store) RecordConnection(
 	userID, username, peerID, direction, clientIP, location, route, auditRef string,
 	startedAt, endedAt time.Time,
 	success bool,
-	detail string,
+	detail, note string,
 ) (ConnectionEvent, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
@@ -137,6 +141,7 @@ func (s *Store) RecordConnection(
 	location = normalizeText(location, maxConnectionLocation)
 	route = normalizeRoute(route)
 	detail = normalizeText(detail, maxConnectionDetail)
+	note = normalizeText(note, maxConnectionNote)
 	ref, err := normalizeAuditRef(auditRef)
 	if err != nil {
 		return ConnectionEvent{}, err
@@ -171,6 +176,7 @@ func (s *Store) RecordConnection(
 			merged.EndedAt = latest(existing.EndedAt, endedAt)
 			merged.Success = existing.Success && success
 			merged.Detail = mergeConnectionDetail(existing.Detail, detail)
+			merged.Note = mergeConnectionNote(existing.Note, note)
 			merged.Source = mergeSource(existing.Source, connectionViewer)
 			if err := s.updateConnectionLocked(merged, userID); err != nil {
 				return ConnectionEvent{}, err
@@ -191,6 +197,7 @@ func (s *Store) RecordConnection(
 		EndedAt:   endedAt,
 		Success:   success,
 		Detail:    detail,
+		Note:      note,
 	}
 	return s.insertConnectionLocked(event, userID)
 }
@@ -298,18 +305,28 @@ func mergeConnectionDetail(existing, incoming string) string {
 	return normalizeText(existing+" | "+incoming, maxConnectionDetail)
 }
 
+// mergeConnectionNote keeps the first remark a session receives. The host
+// report never carries a note, so this only decides between two viewer
+// reports of the same audit reference.
+func mergeConnectionNote(existing, incoming string) string {
+	if existing != "" {
+		return existing
+	}
+	return incoming
+}
+
 func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (ConnectionEvent, error) {
 	var id int64
 	err := s.db.QueryRow(
 		`INSERT INTO connection_events
 			(user_id, username, peer_id, direction, client_ip, location, route,
-			 started_at, ended_at, success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 started_at, ended_at, success, detail, host_id, audit_ref, source, note)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
 		userID, event.Username, event.PeerID, event.Direction, event.ClientIP,
 		event.Location, event.Route,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
-		event.Detail, event.HostID, event.AuditRef, event.Source,
+		event.Detail, event.HostID, event.AuditRef, event.Source, event.Note,
 	).Scan(&id)
 	if err != nil {
 		return ConnectionEvent{}, fmt.Errorf("account store %s: record connection: %w", s.path, err)
@@ -330,17 +347,17 @@ func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (Co
 func (s *Store) updateConnectionLocked(event ConnectionEvent, userID string) error {
 	query := `UPDATE connection_events SET username=?, peer_id=?, direction=?,
 			client_ip=?, location=?, route=?, started_at=?, ended_at=?, success=?, detail=?,
-			host_id=?, audit_ref=?, source=? WHERE id=?`
+			host_id=?, audit_ref=?, source=?, note=? WHERE id=?`
 	args := []any{
 		event.Username, event.PeerID, event.Direction, event.ClientIP,
 		event.Location, event.Route,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
-		event.Detail, event.HostID, event.AuditRef, event.Source, event.ID,
+		event.Detail, event.HostID, event.AuditRef, event.Source, event.Note, event.ID,
 	}
 	if userID != "" {
 		query = `UPDATE connection_events SET user_id=?, username=?, peer_id=?,
 			direction=?, client_ip=?, location=?, route=?, started_at=?, ended_at=?,
-			success=?, detail=?, host_id=?, audit_ref=?, source=? WHERE id=?`
+			success=?, detail=?, host_id=?, audit_ref=?, source=?, note=? WHERE id=?`
 		args = append([]any{userID}, args...)
 	}
 	if _, err := s.db.Exec(query, args...); err != nil {
@@ -352,7 +369,7 @@ func (s *Store) updateConnectionLocked(event ConnectionEvent, userID string) err
 func (s *Store) connectionByRefLocked(ref string) (ConnectionEvent, bool, error) {
 	row := s.db.QueryRow(
 		`SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source, location, route
+			success, detail, host_id, audit_ref, source, location, route, note
 		 FROM connection_events WHERE audit_ref = ? ORDER BY id LIMIT 1`, ref)
 	event, err := scanConnection(row)
 	if err == errNoRows {
@@ -389,17 +406,18 @@ func (s *Store) ConnectionsForBefore(username string, beforeID int64, limit int)
 // ConnectionsForBeforeRange is ConnectionsForBefore narrowed to an inclusive
 // window on started_at.
 func (s *Store) ConnectionsForBeforeRange(username string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
-	return s.ConnectionsForOperatorBeforeRange(username, "", bounds, beforeID, limit)
+	return s.ConnectionsForOperatorBeforeRange(username, "", "", bounds, beforeID, limit)
 }
 
 // ConnectionsForOperatorBeforeRange combines the optional cross-account
-// username and host filters used by the operator audit view. A host matches
-// either the host_id or peer_id column, just as the host-only view does.
-func (s *Store) ConnectionsForOperatorBeforeRange(username, hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
+// username, host and note filters used by the operator audit view. A host
+// matches either the host_id or peer_id column, just as the host-only view
+// does. The note filter matches a case-insensitive substring.
+func (s *Store) ConnectionsForOperatorBeforeRange(username, hostID, note string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	username = strings.TrimSpace(username)
 	hostID = strings.TrimSpace(hostID)
-	clauses := make([]string, 0, 3)
-	args := make([]any, 0, 4)
+	clauses := make([]string, 0, 4)
+	args := make([]any, 0, 5)
 	if username != "" {
 		clauses = append(clauses, "username = ? COLLATE NOCASE")
 		args = append(args, username)
@@ -408,8 +426,22 @@ func (s *Store) ConnectionsForOperatorBeforeRange(username, hostID string, bound
 		clauses = append(clauses, "(host_id = ? OR peer_id = ? COLLATE NOCASE)")
 		args = append(args, hostID, hostID)
 	}
+	clauses, args = addNoteFilter(clauses, args, note)
 	clauses, args = addTimeBounds(clauses, args, "started_at", bounds)
 	return s.connectionEvents(strings.Join(clauses, " AND "), args, beforeID, limit)
+}
+
+// addNoteFilter narrows a list to rows whose note contains needle. LIKE is
+// used instead of instr() so the clause also runs on PostgreSQL; the caller's
+// wildcards are escaped so a note search is always a literal substring.
+func addNoteFilter(clauses []string, args []any, note string) ([]string, []any) {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return clauses, args
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).
+		Replace(strings.ToLower(note))
+	return append(clauses, `LOWER(note) LIKE ? ESCAPE '\'`), append(args, "%"+escaped+"%")
 }
 
 // ConnectionsForHost lists sessions that involve one host, including inbound
@@ -426,7 +458,7 @@ func (s *Store) ConnectionsForHostBefore(hostID string, beforeID int64, limit in
 // ConnectionsForHostBeforeRange is ConnectionsForHostBefore narrowed to an
 // inclusive window on started_at.
 func (s *Store) ConnectionsForHostBeforeRange(hostID string, bounds TimeBounds, beforeID int64, limit int) ([]ConnectionEvent, error) {
-	return s.ConnectionsForOperatorBeforeRange("", hostID, bounds, beforeID, limit)
+	return s.ConnectionsForOperatorBeforeRange("", hostID, "", bounds, beforeID, limit)
 }
 
 func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit int) ([]ConnectionEvent, error) {
@@ -444,7 +476,7 @@ func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit
 		args = append(args, beforeID)
 	}
 	query := `SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source, location, route
+			success, detail, host_id, audit_ref, source, location, route, note
 		 FROM connection_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
@@ -483,7 +515,7 @@ func scanConnection(row rowScanner) (ConnectionEvent, error) {
 	if err := row.Scan(&event.ID, &event.Username, &event.PeerID,
 		&event.Direction, &event.ClientIP, &started, &ended,
 		&event.Success, &event.Detail, &event.HostID, &event.AuditRef,
-		&event.Source, &event.Location, &event.Route); err != nil {
+		&event.Source, &event.Location, &event.Route, &event.Note); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConnectionEvent{}, errNoRows
 		}

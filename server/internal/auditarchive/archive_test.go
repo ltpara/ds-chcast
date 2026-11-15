@@ -75,7 +75,7 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 	}
 	if _, err := store.RecordConnection(alice.ID, "alice", "devbox", "viewer",
 		"198.51.100.4", "Testland", "punch", "",
-		start, start.Add(90*time.Second), true, "viewer side"); err != nil {
+		start, start.Add(90*time.Second), true, "viewer side", ""); err != nil {
 		t.Fatalf("record connection: %v", err)
 	}
 	if _, err := store.RecordFileTransfer(alice.ID, "alice", "devbox", "upload",
@@ -202,7 +202,7 @@ func TestRunMergesLateHostAuditIntoItsOwnDay(t *testing.T) {
 	day28 := time.Date(2026, 10, 28, 9, 30, 0, 0, time.UTC)
 	if _, err := store.RecordConnection(alice.ID, "alice", "devbox", "viewer",
 		"198.51.100.4", "Testland", "punch", "abcd1234",
-		day28, day28.Add(time.Minute), true, "viewer side"); err != nil {
+		day28, day28.Add(time.Minute), true, "viewer side", ""); err != nil {
 		t.Fatalf("record viewer connection: %v", err)
 	}
 

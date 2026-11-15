@@ -174,22 +174,14 @@ func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID stri
 // a group it belongs to; the unfiltered endpoint keeps its stricter rule.
 func (s *server) auditGroupFilter(w http.ResponseWriter, r *http.Request) (string, bool) {
 	groupID := strings.TrimSpace(r.URL.Query().Get("group"))
-	if groupID == "" {
-		return "", true
-	}
-	if s.cfg.Accounts == nil {
-		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
-		return "", false
-	}
-	if s.serverKeyAuthorized(r) {
-		return groupID, true
-	}
-	token, ok := bearerToken(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "server key or operator account token required")
-		return "", false
-	}
-	if account.HasAPITokenPrefix(token) {
+	// A machine token is bounded by the group it was minted for even when the
+	// request omits ?group=. Checking only the explicit parameter let a
+	// group-scoped token fall through to the unfiltered trail.
+	if token, ok := bearerToken(r); ok && account.HasAPITokenPrefix(token) {
+		if s.cfg.Accounts == nil {
+			writeError(w, http.StatusServiceUnavailable, accountUnavailable)
+			return "", false
+		}
 		principal, err := s.cfg.Accounts.AuthenticateAPIToken(token)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "server key or operator account token required")
@@ -204,10 +196,24 @@ func (s *server) auditGroupFilter(w http.ResponseWriter, r *http.Request) (strin
 				writeError(w, http.StatusForbidden, "API token is limited to another group")
 				return "", false
 			}
-			// A group-scoped token never reads the unfiltered trail.
 			return principal.Token.GroupID, true
 		}
 		return groupID, true
+	}
+	if groupID == "" {
+		return "", true
+	}
+	if s.cfg.Accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
+		return "", false
+	}
+	if s.serverKeyAuthorized(r) {
+		return groupID, true
+	}
+	token, ok := bearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "server key or operator account token required")
+		return "", false
 	}
 	user, err := s.cfg.Accounts.Authenticate(token)
 	if err != nil {

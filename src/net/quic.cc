@@ -72,8 +72,18 @@ constexpr size_t kMaxAudioDatagramQueue = 256;
 // larger than one legitimate item so a slow consumer is not punished, but
 // small enough that a peer cannot turn the session into an allocator.
 constexpr size_t kMaxClipboardStreams = 8;
-constexpr size_t kMaxPendingClipboardBytes = 96u * 1024u * 1024u;
+// The largest stream a compliant sender can produce: kMaxClipboardTotalBytes
+// of raw payload plus the CCLB header and one entry header per format.
 constexpr size_t kMaxClipboardStreamBytes = kMaxClipboardTotalBytes + 64u * 1024u;
+// The aggregate bound must admit one maximum-size item, which is what a
+// sender of a 64 MiB PNG plus a 32 MiB DIB legitimately produces. A smaller
+// value rejected that item on arrival and its stream was aborted. A second
+// equal-size item is refused while the first is still queued.
+constexpr size_t kMaxPendingClipboardBytes = kMaxClipboardStreamBytes;
+static_assert(kMaxClipboardStreamBytes >=
+                  kMaxClipboardTotalBytes + kClipboardStreamHeaderSize +
+                      kMaxClipboardFormats * kClipboardEntryHeaderSize,
+              "the stream bound must admit a maximum-size clipboard item");
 constexpr size_t kMaxIncomingUploads = 8;
 constexpr size_t kMaxBufferedFileBytes = 64u * 1024u * 1024u;
 // The host stops consuming CFIL bytes above the high-water mark (leaving the

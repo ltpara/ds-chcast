@@ -397,6 +397,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // "Show my cursor": the viewer pointer drawn on the host desktop. It is a
   // draw-only hint, so it keeps working while remote control is off.
   bool _showMyCursor = false;
+  // Push this machine's clipboard on connect. Read once when the session
+  // starts, so editing it applies to the next connection.
+  bool _syncInitClipboard = false;
+  // Ask for an end-of-session remark (RustDesk's allow-ask-for-note). The
+  // remark rides on the connection report, so it only appears when this
+  // session is audited by an account server.
+  bool _askSessionNote = false;
+  String _sessionNote = '';
   bool _cursorHintOnHost = false;
   int _cursorHintSentMs = 0;
   // The hint is throttled rather than queued: only the latest position can
@@ -464,6 +472,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _statsVisible = viewPrefs.stats;
     _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
     _showMyCursor = viewPrefs.showMyCursor;
+    _syncInitClipboard = viewPrefs.syncInitClipboard;
+    _askSessionNote = viewPrefs.askSessionNote;
     _fileBrowserSortAscending = viewPrefs.fileSortAscending;
     _fileBrowserDirectory = viewPrefs.browserDirectory;
     _fileBrowserShowHidden = viewPrefs.browserShowHidden;
@@ -548,11 +558,32 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         startedAt: startedAt,
         endedAt: DateTime.now(),
         detail: detail,
+        note: _sessionNote,
         auditRef: _status.auditRef,
         route: _connectionRoute,
       );
     } catch (_) {
       // Audit delivery must not disturb the session or the returned page.
+    }
+  }
+
+  /// Asks for the remark that goes out with this session's audit row. The
+  /// prompt only appears for a connected, account-audited session and only
+  /// when the operator enabled it; every other close path stays silent.
+  Future<void> _promptSessionNote() async {
+    if (!_askSessionNote || _auditStartedAt == null || _sessionNote.isNotEmpty) {
+      return;
+    }
+    final AccountSession? account = await _activeAccount();
+    if (account == null || !account.isActiveAt(DateTime.now()) || !mounted) {
+      return;
+    }
+    final String? note = await showDialog<String>(
+      context: context,
+      builder: (BuildContext dialogContext) => const _SessionNoteDialog(),
+    );
+    if (note != null && mounted) {
+      _sessionNote = note.trim();
     }
   }
 
@@ -1235,6 +1266,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         fileTransferOnly: widget.fileTransferOnly,
         sessionMode: widget.sessionMode,
         accessTicket: accessTicket,
+        syncInitClipboard: _syncInitClipboard,
       );
       _startTicketRenewal(accessTicket);
       // The native session starts with clipboard sync on; reapply this page's
@@ -2586,6 +2618,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _toggleStats() {
     setState(() => _statsVisible = !_statsVisible);
     ViewPreferences.update(peerId: _prefsPeerId, stats: _statsVisible);
+  }
+
+  void _toggleSyncInitClipboard() {
+    final bool enabled = !_syncInitClipboard;
+    setState(() => _syncInitClipboard = enabled);
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      syncInitClipboard: enabled,
+    );
   }
 
   void _toggleShowMyCursor() {
@@ -4742,6 +4783,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _clearCursor();
     try {
       await _shutdown();
+      await _promptSessionNote();
     } finally {
       await SessionWindowRequest.close();
     }
@@ -4762,6 +4804,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _setKeyCapture(false);
     _clearCursor();
     await _shutdown();
+    await _promptSessionNote();
     if (!mounted) {
       return;
     }
@@ -6223,6 +6266,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         clipboardEnabled: _clipboardSync,
                         clipboardAvailable: _status.acceptsClipboard,
                         clipboardDirection: _status.clipboardDirection,
+                        syncInitClipboard: _syncInitClipboard,
+                        onToggleSyncInitClipboard: _toggleSyncInitClipboard,
                         fileAvailable: _status.acceptsFiles,
                         fileActive: _status.fileActive,
                         audioAvailable: _status.acceptsAudio,
@@ -8823,6 +8868,52 @@ class _SessionPickerDialogState extends State<_SessionPickerDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: Text(tr('取消')),
         ),
+      ],
+    );
+  }
+}
+
+/// Owns the remark controller so the dialog's exit animation can still read
+/// it; disposing it as soon as `showDialog` returns races that last frame.
+class _SessionNoteDialog extends StatefulWidget {
+  const _SessionNoteDialog();
+
+  @override
+  State<_SessionNoteDialog> createState() => _SessionNoteDialogState();
+}
+
+class _SessionNoteDialogState extends State<_SessionNoteDialog> {
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.of(context).pop(_controller.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(tr('会话备注')),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        maxLength: 240,
+        decoration: InputDecoration(
+          hintText: tr('会随本次连接记录写入服务器审计，可跳过。'),
+        ),
+        onSubmitted: (_) => _submit(),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('跳过')),
+        ),
+        FilledButton(onPressed: _submit, child: Text(tr('提交'))),
       ],
     );
   }

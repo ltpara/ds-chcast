@@ -37,7 +37,9 @@ public:
 private:
     AnnotationOverlay();
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    // Shared so a thread that does not finish within the stop timeout keeps
+    // its state alive after the overlay object is gone.
+    std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace chast

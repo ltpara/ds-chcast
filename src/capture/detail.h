@@ -397,6 +397,23 @@ UINT cursor_diameter_from_settings(UINT cursor_base_size, UINT accessibility_siz
 // usable; callers then keep the shape as reported instead of failing capture.
 UINT cursor_target_size(const DisplayInfo& display);
 
+// cursor_target_size() opens two registry keys and queries the monitor DPI, and
+// the capture loop would repeat that on every frame. The inputs change only
+// when the user moves the accessibility slider or the display topology changes,
+// so this cache re-reads them at most once a second and otherwise reuses both.
+class CursorTargetSizeCache final {
+public:
+    UINT target_size(const DisplayInfo& display);
+
+private:
+    static constexpr std::chrono::seconds kRefreshInterval{1};
+    bool ready_ = false;
+    std::chrono::steady_clock::time_point refreshed_{};
+    UINT base_diameter_ = 0;
+    HMONITOR monitor_ = nullptr;
+    UINT dpi_ = 96;
+};
+
 // Physical pixels for one monitor. Windows scales CursorBaseSize by the
 // monitor's DPI; this is the size at which the OS draws the pointer. Invalid
 // input keeps the protocol-safe fallback rather than producing a zero sprite.

@@ -100,6 +100,12 @@ void main() {
       await settleStart(1);
       RemoteToolbar toolbar() =>
           tester.widget<RemoteToolbar>(find.byType(RemoteToolbar));
+      // The initial clipboard push is opt-in; flipping it before the
+      // reconnect must reach the next start.
+      expect(starts.single['syncInitClipboard'], isFalse);
+      toolbar().onToggleSyncInitClipboard!();
+      await tester.pump();
+      expect(toolbar().syncInitClipboard, isTrue);
       expect(toolbar().elevationAvailable, isTrue);
       toolbar().onElevation!();
       await tester.pump();
@@ -122,6 +128,7 @@ void main() {
       await settleStart(2);
       expect(starts.last['fingerprint'], pin);
       expect(starts.last['allowUnverified'], isFalse);
+      expect(starts.last['syncInitClipboard'], isTrue);
       expect(toolbar().elevated, isTrue);
       expect(toolbar().elevationAvailable, isFalse);
       await tester.pumpWidget(const SizedBox.shrink());

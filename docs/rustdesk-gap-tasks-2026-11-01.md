@@ -1380,9 +1380,10 @@ chast 的两端是分离产品：查看器只有 QUIC 客户端、解码/渲染�
 - 白板（`src/whiteboard`）**更正（2026-11-11）**：在固定提交 `7423dce` 上已进入
   Flutter 产品面（`show_my_cursor` 工具栏/快捷键、主机透明覆盖层），旧判断
   “只在 CLI/内部工具中出现”已过期；本轮登记为 G21（P3）并已实现光标部分
-  （协议 v68），RustDesk 式白板绘制仍未实现，见
-  [发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md) 与本文同日
-  小节。
+  （协议 v68）；RustDesk 式白板绘制在 1.5.1 中实际只有 `Cursor/Clear/Exit`
+  光标覆盖层，不等于自由笔画；我方的临时自由手写已由 v76 `Annotation`（89）
+  关闭，见 [发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md)、
+  [最新功能对照](rustdesk-comparison-2026-11-15.md) 与本文同日小节。
   `PluginRequest` 仍属插件机制，不是产品功能缺口。
 - 虚拟显示器、远程打印、非 Windows/Web/移动客户端仍由 PLAT-01～03 跟踪，
   本表不重复登记。
@@ -1499,7 +1500,8 @@ u16 权限掩码在 `kPermissionRemoteConfig = 0x8000` 之后已经没有空闲�
   关闭或偏好切到关闭时发送隐藏。自动化：`chast-protocol-test` 的往返/负坐标/
   隐藏/截断/尾随/未知标志/保留位用例；`display_window_preferences_test` 断言
   独立显示器窗口的精确桌面坐标、离开隐藏和偏好关闭后停发；`flutter analyze`
-  无问题；`display_menu` 与 `view_prefs` 定向 57/57。边界：自由标注绘制未实现；覆盖层在真实
+  无问题；`display_menu` 与 `view_prefs` 定向 57/57。边界：自由手写标注在 v76 已补齐
+  （`Annotation` 89，源码/自动化/单机 QUIC 回环通过，真实双机未验）；覆盖层在真实
   多屏、混合 DPI 和负坐标下的目视位置，以及 Windows 10 实机，待人工验证。
 - **G21 协作光标补强（v71）**：`ShowCursor` 增加按下边沿标志（flags bit1，
   仅可见时合法，未知位拒绝），它不是按住状态；查看端在按下瞬间绕过节流

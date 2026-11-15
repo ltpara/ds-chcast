@@ -498,7 +498,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                          std::string carrier_host_id, std::string carrier_token,
                          bool file_transfer_only, chast::SessionMode session_mode,
                          std::vector<uint8_t> access_ticket,
-                         std::vector<uint8_t> access_ticket_seed) {
+                         std::vector<uint8_t> access_ticket_seed,
+                         bool sync_init_clipboard) {
     if (running_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -700,7 +701,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                           std::move(carrier_host), carrier_port,
                           std::move(carrier_host_id), std::move(carrier_token),
                           std::move(audit_ref), file_transfer_only, session_mode,
-                          std::move(access_ticket), std::move(access_ticket_seed));
+                          std::move(access_ticket), std::move(access_ticket_seed),
+                          sync_init_clipboard);
     return true;
 }
 
@@ -2411,7 +2413,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string audit_ref, bool file_transfer_only,
                        chast::SessionMode session_mode,
                        std::vector<uint8_t> access_ticket,
-                       std::vector<uint8_t> access_ticket_seed) {
+                       std::vector<uint8_t> access_ticket_seed,
+                       bool sync_init_clipboard) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -4361,9 +4364,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     clipboard_out_identity = clipboard_has_files
                                         ? chast::clipboard_file_identity_hash(result.snapshot.entries) : 0;
                                     clipboard_source_version = result.snapshot.local_files ? result.snapshot.local_files->SourceVersion() : 0;
-                                    clipboard_initial_files = !clipboard_baseline_failed &&
+                                    // The baseline is recorded either way; only the
+                                    // push is opt-in, so a later change still syncs.
+                                    clipboard_initial_files = sync_init_clipboard &&
+                                        !clipboard_baseline_failed &&
                                         clipboard_has_files && !result.snapshot.entries.empty();
-                                    clipboard_initial_send = !clipboard_baseline_failed &&
+                                    clipboard_initial_send = sync_init_clipboard &&
+                                        !clipboard_baseline_failed &&
                                         !clipboard_has_files && !result.snapshot.content.empty();
                                     clipboard_baseline_failed = false;
                                 }

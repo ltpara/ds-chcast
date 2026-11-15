@@ -2910,8 +2910,9 @@
       filterKey: 'username',
       filterPlaceholder: '用户名（可选）',
       hasHost: true,
+      hasNote: true,
       columns: ['开始', '用户', '对端', '方向', '来源', '客户端 IP', '地点', '路由',
-        '关联', '时长', '结果', '详情'],
+        '关联', '时长', '结果', '备注', '详情'],
       row(event) {
         return [
           fmtTime(event.started_at_ms),
@@ -2925,6 +2926,7 @@
           refCell(event.audit_ref),
           fmtDurationMS(event.duration_ms),
           pillBool(event.success),
+          event.note || '—',
           event.detail || '—',
         ];
       },
@@ -2993,9 +2995,11 @@
     $('audit-filter').placeholder = spec.filterPlaceholder;
     $('audit-host').classList.toggle('hidden', !spec.hasHost);
     $('audit-user').classList.toggle('hidden', !spec.hasUser);
+    $('audit-note').classList.toggle('hidden', !spec.hasNote);
     $('audit-filter').value = '';
     $('audit-host').value = '';
     $('audit-user').value = '';
+    $('audit-note').value = '';
     loadAudit(true).catch(reportError);
   }
 
@@ -3012,6 +3016,10 @@
     if (spec.hasHost) {
       const host = $('audit-host').value.trim();
       if (host) params.set('host', host);
+    }
+    if (spec.hasNote) {
+      const note = $('audit-note').value.trim();
+      if (note) params.set('note', note);
     }
     // datetime-local is wall-clock time in the operator's zone; the report API
     // takes unix milliseconds, so convert here and let the server stay zone-free.

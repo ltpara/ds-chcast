@@ -126,6 +126,8 @@ void main() {
     expect(prefs.keyboardMode, 'physical');
     expect(prefs.autoRecord, isFalse);
     expect(prefs.recordKeep, 0);
+    expect(prefs.syncInitClipboard, isFalse);
+    expect(prefs.askSessionNote, isFalse);
   });
 
   test('saves and loads the choices', () {
@@ -144,6 +146,8 @@ void main() {
         autoRecord: true,
         recordKeep: 10,
         showMyCursor: true,
+        syncInitClipboard: true,
+        askSessionNote: true,
       ),
     );
     final ViewPreferences prefs = ViewPreferences.load();
@@ -160,6 +164,8 @@ void main() {
     expect(prefs.autoRecord, isTrue);
     expect(prefs.recordKeep, 10);
     expect(prefs.showMyCursor, isTrue);
+    expect(prefs.syncInitClipboard, isTrue);
+    expect(prefs.askSessionNote, isTrue);
     expect(readFile(), <String, Object?>{
       'view_fit': 1,
       'view_stats': true,
@@ -174,7 +180,39 @@ void main() {
       'view_auto_record': true,
       'view_record_keep': 10,
       'view_show_my_cursor': true,
+      'view_sync_init_clipboard': true,
+      'view_ask_session_note': true,
     });
+  });
+
+  test('the session note prompt is shared and defaults to off', () {
+    expect(ViewPreferences.load().askSessionNote, isFalse);
+    ViewPreferences.update(peerId: 'desk', askSessionNote: true);
+    expect(ViewPreferences.load().askSessionNote, isTrue);
+    expect(ViewPreferences.load(peerId: 'desk').askSessionNote, isTrue);
+    final Map<Object?, Object?> peers =
+        readFile()['peers'] as Map<Object?, Object?>;
+    expect(
+      (peers['desk'] as Map<Object?, Object?>).containsKey(
+        'view_ask_session_note',
+      ),
+      isFalse,
+    );
+  });
+
+  test('connect-time clipboard sync follows the device and defaults to off', () {
+    expect(ViewPreferences.load().syncInitClipboard, isFalse);
+    ViewPreferences.update(peerId: 'desk', syncInitClipboard: true);
+    expect(ViewPreferences.load(peerId: 'desk').syncInitClipboard, isTrue);
+    expect(ViewPreferences.load(peerId: 'other').syncInitClipboard, isFalse);
+    expect(readFile().containsKey('view_sync_init_clipboard'), isFalse);
+    final Map<Object?, Object?> peers =
+        readFile()['peers'] as Map<Object?, Object?>;
+    expect(
+      (peers['desk'] as Map<Object?, Object?>)[
+          'view_sync_init_clipboard'],
+      isTrue,
+    );
   });
 
   test('show my cursor follows the device and defaults to off', () {
@@ -273,6 +311,8 @@ void main() {
       'view_auto_record': false,
       'view_record_keep': 0,
       'view_show_my_cursor': false,
+      'view_sync_init_clipboard': false,
+      'view_ask_session_note': false,
     });
   });
 

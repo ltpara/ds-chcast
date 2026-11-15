@@ -2714,6 +2714,7 @@ type connectionReply struct {
 	DurationMS  int64  `json:"duration_ms"`
 	Success     bool   `json:"success"`
 	Detail      string `json:"detail"`
+	Note        string `json:"note"`
 }
 
 type connectionsReply struct {
@@ -2755,7 +2756,7 @@ func TestConnectionAudit(t *testing.T) {
 
 	status, body = request(t, http.MethodPost, s.URL+"/v1/account/connections",
 		`{"peer_id":" devbox ","started_at_ms":`+strconv.FormatInt(start, 10)+
-			`,"ended_at_ms":`+strconv.FormatInt(now, 10)+`,"detail":"ended normally"}`,
+			`,"ended_at_ms":`+strconv.FormatInt(now, 10)+`,"detail":"ended normally","note":"  after the VPN  "}`,
 		alice.Token)
 	if status != http.StatusCreated {
 		t.Fatalf("report connection: %d %s", status, body)
@@ -2766,7 +2767,8 @@ func TestConnectionAudit(t *testing.T) {
 	}
 	if created.ID == 0 || created.Username != "alice" || created.PeerID != "devbox" ||
 		created.Direction != "viewer" || !created.Success ||
-		created.DurationMS != 60000 || created.ClientIP != "127.0.0.1" {
+		created.DurationMS != 60000 || created.ClientIP != "127.0.0.1" ||
+		created.Note != "after the VPN" {
 		t.Fatalf("created connection = %+v", created)
 	}
 	if created.StartedAtMS != start || created.EndedAtMS != now {
@@ -2791,7 +2793,8 @@ func TestConnectionAudit(t *testing.T) {
 		t.Fatalf("own connections reply: %v", err)
 	}
 	if len(own.Connections) != 1 || own.Connections[0].PeerID != "devbox" ||
-		own.Connections[0].Detail != "ended normally" {
+		own.Connections[0].Detail != "ended normally" ||
+		own.Connections[0].Note != "after the VPN" {
 		t.Fatalf("own connections = %+v", own.Connections)
 	}
 
@@ -2833,6 +2836,18 @@ func TestConnectionAudit(t *testing.T) {
 	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/connections?username=nobody", "", testutil.ServerKey)
 	if status != http.StatusOK || !strings.Contains(string(body), `"connections":[]`) {
 		t.Fatalf("unknown user connections: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/connections?note=VPN", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("note filter: %d %s", status, body)
+	}
+	if err := json.Unmarshal(body, &all); err != nil || len(all.Connections) != 1 ||
+		all.Connections[0].Username != "alice" {
+		t.Fatalf("note filter = %+v, %v", all.Connections, err)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/connections?note=nobody-mentions-this", "", testutil.ServerKey)
+	if status != http.StatusOK || !strings.Contains(string(body), `"connections":[]`) {
+		t.Fatalf("unmatched note filter: %d %s", status, body)
 	}
 	for _, query := range []string{"?limit=0", "?limit=201", "?limit=nope"} {
 		if status, body := request(t, http.MethodGet, s.URL+"/v1/audit/connections"+query, "", testutil.ServerKey); status != http.StatusBadRequest {

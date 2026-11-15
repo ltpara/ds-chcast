@@ -75,7 +75,7 @@ func TestHistoryAscendingPages(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		if _, err := store.RecordConnection(alice.ID, alice.Username, "devbox", "viewer",
-			"127.0.0.1", "", "", "", now, now.Add(time.Minute), true, fmt.Sprintf("c%d", i)); err != nil {
+			"127.0.0.1", "", "", "", now, now.Add(time.Minute), true, fmt.Sprintf("c%d", i), ""); err != nil {
 			t.Fatalf("record connection: %v", err)
 		}
 		if _, err := store.RecordFileTransfer(alice.ID, alice.Username, "devbox", "upload",

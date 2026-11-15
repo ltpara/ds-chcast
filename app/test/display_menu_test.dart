@@ -108,6 +108,8 @@ void main() {
     int recordKeep = 0,
     ValueChanged<bool>? onAutoRecordChanged,
     ValueChanged<int>? onRecordKeepChanged,
+    bool syncInitClipboard = false,
+    VoidCallback? onToggleSyncInitClipboard,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -121,6 +123,8 @@ void main() {
           inputAvailable: true,
           clipboardEnabled: true,
           clipboardAvailable: true,
+          syncInitClipboard: syncInitClipboard,
+          onToggleSyncInitClipboard: onToggleSyncInitClipboard,
           fileAvailable: fileAvailable,
           fileActive: fileActive,
           audioAvailable: audioAvailable,
@@ -250,6 +254,25 @@ void main() {
     await tester.tap(find.text('DISPLAY2'));
     await tester.pumpAndSettle();
     expect(picked, 1);
+  });
+
+  testWidgets('clipboard long press toggles the connect-time push switch', (
+    WidgetTester tester,
+  ) async {
+    var toggles = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (_) {},
+      onToggleSyncInitClipboard: () => toggles++,
+    ));
+
+    await tester.longPress(find.byIcon(Icons.content_paste_go_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('连接时同步本机剪贴板'), findsOneWidget);
+    await tester.tap(find.text('连接时同步本机剪贴板'));
+    await tester.pumpAndSettle();
+    expect(toggles, 1);
   });
 
   testWidgets('the default entry asks the server to choose', (WidgetTester tester) async {

@@ -3462,6 +3462,7 @@ void main() {
       startedAt: started,
       endedAt: ended,
       detail: 'closed',
+      note: '  VPN off  ',
       auditRef: ' ref-1 ',
       route: 'punch',
     );
@@ -3474,6 +3475,7 @@ void main() {
     expect(body?['ended_at_ms'], ended.millisecondsSinceEpoch);
     expect(body?['success'], isTrue);
     expect(body?['detail'], 'closed');
+    expect(body?['note'], 'VPN off');
     expect(body?['audit_ref'], 'ref-1');
     expect(body?['route'], 'punch');
   });
@@ -3859,6 +3861,106 @@ void main() {
       expect(progress, <int>[0, 4, 8, 10, 10]);
       expect(recorded.id, 'd' * 32);
       expect(recorded.name, 'resume.mp4');
+      expect(deleteCount, 1);
+    },
+  );
+
+  test(
+    'uploadRecording gives up when the server keeps truncating a chunk',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-conflict-upload-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
+      final List<int> bytes = List<int>.generate(10, (int index) => index + 1);
+      await file.writeAsBytes(bytes);
+
+      const String uploadId = 'dddddddddddddddddddddddddddddddd';
+      int patchCount = 0;
+      int statusCount = 0;
+      int deleteCount = 0;
+      server.listen((HttpRequest request) async {
+        final String path = request.uri.path;
+        request.response.headers.contentType = ContentType.json;
+        if (request.method == 'POST' &&
+            path == '/v1/account/recordings/uploads') {
+          await request.drain<void>();
+          request.response.statusCode = HttpStatus.created;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'upload': <String, Object?>{
+                'id': uploadId,
+                'offset': 0,
+                'size': bytes.length,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'PATCH' &&
+            path == '/v1/account/recordings/uploads/$uploadId') {
+          patchCount++;
+          await request.drain<void>();
+          // Every chunk arrives short; the durable offset never advances, so
+          // an unbounded conflict recovery would retry the same chunk forever.
+          request.response.statusCode = HttpStatus.conflict;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'error': 'recording upload chunk was truncated',
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'GET' &&
+            path == '/v1/account/recordings/uploads/$uploadId') {
+          statusCount++;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'upload': <String, Object?>{
+                'id': uploadId,
+                'offset': 0,
+                'size': bytes.length,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'DELETE' &&
+            path == '/v1/account/recordings/uploads/$uploadId') {
+          deleteCount++;
+          request.response.statusCode = HttpStatus.noContent;
+          await request.response.close();
+          return;
+        }
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+      });
+
+      await expectLater(
+        ServerApi.uploadRecording(
+          settings,
+          'account-token',
+          file: file,
+          name: 'stuck.mp4',
+          peerId: 'devbox',
+          startedAtMs: 1761400000000,
+          durationMs: 5000,
+          chunkSize: 4,
+        ),
+        throwsA(
+          isA<ServerApiException>().having(
+            (ServerApiException error) => error.statusCode,
+            'statusCode',
+            HttpStatus.conflict,
+          ),
+        ),
+      );
+      expect(patchCount, 5);
+      expect(statusCount, 4);
       expect(deleteCount, 1);
     },
   );

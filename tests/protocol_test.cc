@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -36,6 +37,25 @@ void check(bool condition, const char* what) {
 // The parsers take the payload; the makers return the whole control message.
 std::vector<uint8_t> payload_of(const std::vector<uint8_t>& message) {
     return std::vector<uint8_t>(message.begin() + chast::kControlHeaderSize, message.end());
+}
+
+uint32_t clipboard_test_crc(const uint8_t* data, size_t size) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> values{};
+        for (uint32_t n = 0; n < values.size(); ++n) {
+            uint32_t value = n;
+            for (int bit = 0; bit < 8; ++bit) {
+                value = (value & 1) != 0 ? 0xEDB88320u ^ (value >> 1) : value >> 1;
+            }
+            values[n] = value;
+        }
+        return values;
+    }();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < size; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
 }
 
 void test_elevation() {
@@ -512,6 +532,10 @@ void test_annotation() {
     reserved[1] = 1;
     check(!chast::parse_annotation(reserved, got, &error),
           "Annotation with a non-zero reserved byte is rejected");
+    std::vector<uint8_t> count_reserved = payload;
+    count_reserved[10] = 1;
+    check(!chast::parse_annotation(count_reserved, got, &error),
+          "Annotation with a non-zero reserved byte after the point count is rejected");
     std::vector<uint8_t> zero_stroke = payload;
     zero_stroke[4] = 0;
     zero_stroke[5] = 0;
@@ -536,18 +560,16 @@ void test_annotation() {
     sent.stroke_id = 0;
     sent.points.clear();
     std::vector<uint8_t> clear_with_points = payload_of(chast::make_annotation(sent));
-    clear_with_points[10] = 1;
-    clear_with_points[11] = 0;
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
-    clear_with_points.push_back(0);
+    clear_with_points[8] = 1;  // point count
+    clear_with_points[9] = 0;
+    for (int i = 0; i < 8; ++i) {
+        clear_with_points.push_back(0);
+    }
     check(!chast::parse_annotation(clear_with_points, got, &error),
           "clear cannot carry a point");
+    clear_with_points.resize(clear_with_points.size() - 8);
+    check(!chast::parse_annotation(clear_with_points, got, &error),
+          "clear cannot declare a point count");
 }
 
 void test_hello_ack() {
@@ -5348,6 +5370,102 @@ void test_clipboard_container() {
     large.formats.front().data.push_back('L');
     check(!chast::valid_clipboard_content(large, &error),
           "clipboard text past the stream limit is rejected");
+
+    // The transport admits one CCLB stream of kMaxClipboardTotalBytes of raw
+    // payload plus its framing. A copy that carries both images at their
+    // format limits is the largest item a sender can produce; a 96 MiB receive
+    // budget aborted it mid-stream even though the content was valid.
+    {
+        const auto append_be32 = [](std::vector<uint8_t>& out, uint32_t value) {
+            out.push_back(static_cast<uint8_t>(value >> 24));
+            out.push_back(static_cast<uint8_t>(value >> 16));
+            out.push_back(static_cast<uint8_t>(value >> 8));
+            out.push_back(static_cast<uint8_t>(value));
+        };
+        const auto append_chunk = [&append_be32](std::vector<uint8_t>& out, const char (&type)[5],
+                                                 const std::vector<uint8_t>& payload) {
+            append_be32(out, static_cast<uint32_t>(payload.size()));
+            const size_t start = out.size();
+            out.insert(out.end(), type, type + 4);
+            out.insert(out.end(), payload.begin(), payload.end());
+            append_be32(out, clipboard_test_crc(out.data() + start, payload.size() + 4));
+        };
+        // Framing only: IHDR 4096x4096, one IDAT of incompressible filler and
+        // IEND. The receive bound protects the framing validator, which never
+        // decodes these pixels.
+        const auto build_png = [&](size_t total_bytes) {
+            std::vector<uint8_t> ihdr;
+            append_be32(ihdr, 4096);
+            append_be32(ihdr, 4096);
+            for (const uint8_t byte : {uint8_t{8}, uint8_t{6}, uint8_t{0}, uint8_t{0}, uint8_t{0}}) {
+                ihdr.push_back(byte);
+            }
+            // Signature (8) + IHDR (25) + IDAT header (12) + IEND (12).
+            std::vector<uint8_t> idat(total_bytes - 57);
+            uint32_t value = 0x9E3779B9u;
+            for (uint8_t& byte : idat) {
+                value = value * 1664525u + 1013904223u;
+                byte = static_cast<uint8_t>(value >> 24);
+            }
+            std::vector<uint8_t> data;
+            data.reserve(total_bytes);
+            static constexpr uint8_t kSignature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+            data.insert(data.end(), kSignature, kSignature + sizeof(kSignature));
+            append_chunk(data, "IHDR", ihdr);
+            append_chunk(data, "IDAT", idat);
+            append_chunk(data, "IEND", {});
+            return data;
+        };
+        const auto write_u32 = [](std::vector<uint8_t>& out, size_t at, uint32_t value) {
+            for (int i = 0; i < 4; ++i) {
+                out[at + i] = static_cast<uint8_t>(value >> (8 * i));
+            }
+        };
+
+        chast::ClipboardContent packed;
+        chast::ClipboardFormatData packed_text;
+        packed_text.format = chast::ClipboardFormat::Text;
+        packed_text.data.resize(chast::kMaxClipboardTextBytes);
+        uint32_t text_value = 0x2545F491u;
+        for (uint8_t& byte : packed_text.data) {
+            text_value = text_value * 1664525u + 1013904223u;
+            // Printable ASCII stays valid UTF-8 yet resists compression.
+            byte = static_cast<uint8_t>('!' + (text_value >> 24) % 90);
+        }
+        packed.formats.push_back(std::move(packed_text));
+
+        constexpr uint32_t kDibWidth = 4096;
+        constexpr uint32_t kDibHeight = 2046;
+        const uint32_t dib_pixels = kDibWidth * kDibHeight * 4;
+        chast::ClipboardFormatData packed_dib;
+        packed_dib.format = chast::ClipboardFormat::Dib;
+        packed_dib.data.assign(40u + dib_pixels, 0);
+        write_u32(packed_dib.data, 0, 40);  // BITMAPINFOHEADER
+        write_u32(packed_dib.data, 4, kDibWidth);
+        write_u32(packed_dib.data, 8, kDibHeight);
+        packed_dib.data[12] = 1;   // planes
+        packed_dib.data[14] = 32;  // bit count
+        uint32_t dib_value = 0x6D2B79F5u;
+        for (size_t i = 40; i < packed_dib.data.size(); ++i) {
+            dib_value = dib_value * 1664525u + 1013904223u;
+            packed_dib.data[i] = static_cast<uint8_t>(dib_value >> 24);
+        }
+        packed.formats.push_back(std::move(packed_dib));
+
+        chast::ClipboardFormatData packed_png;
+        packed_png.format = chast::ClipboardFormat::Png;
+        packed_png.data = build_png(chast::kMaxClipboardPngBytes);
+        packed.formats.push_back(std::move(packed_png));
+
+        check(chast::valid_clipboard_content(packed, &error),
+              "a two-image clipboard at the format limits validates");
+        const std::vector<uint8_t> packed_stream = chast::encode_clipboard_stream(packed);
+        check(!packed_stream.empty() &&
+                  packed_stream.size() <= chast::kMaxClipboardTotalBytes + 64u * 1024u,
+              "a two-image clipboard fits the transport stream bound");
+        check(packed_stream.size() > 96u * 1024u * 1024u,
+              "the two-image item outgrows the 96 MiB receive budget it once hit");
+    }
 }
 
 }  // namespace

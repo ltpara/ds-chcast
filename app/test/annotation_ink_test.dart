@@ -98,18 +98,39 @@ void main() {
       reason: 'the oldest stroke is evicted first',
     );
 
+    // The point bound is shared by every stroke, as on the host, so one very
+    // long stroke is trimmed at its head.
+    ink.clear();
     ink.begin(0, Offset.zero);
-    for (int i = 0; i <= ViewerAnnotationInk.maxPointsPerStroke; ++i) {
+    for (int i = 1; i < ViewerAnnotationInk.maxPoints; ++i) {
       ink.move(Offset(i.toDouble(), 1));
     }
+    expect(ink.strokes.single.points, hasLength(ViewerAnnotationInk.maxPoints));
+    ink.move(Offset(ViewerAnnotationInk.maxPoints.toDouble(), 1));
+    expect(ink.strokes.single.points, hasLength(ViewerAnnotationInk.maxPoints));
     expect(
-      ink.strokes.last.points,
-      hasLength(ViewerAnnotationInk.maxPointsPerStroke),
+      ink.strokes.single.points.first,
+      const Offset(1, 1),
+      reason: 'an overlong stroke loses its oldest point',
     );
     expect(
-      ink.strokes.last.points.last,
-      Offset(ViewerAnnotationInk.maxPointsPerStroke.toDouble(), 1),
-      reason: 'an overlong stroke keeps its newest tail',
+      ink.strokes.single.points.last,
+      Offset(ViewerAnnotationInk.maxPoints.toDouble(), 1),
     );
+  });
+
+  test('a second stroke evicts the first once the point budget is spent', () {
+    final ViewerAnnotationInk ink = ViewerAnnotationInk();
+    addTearDown(ink.dispose);
+
+    ink.begin(0, Offset.zero);
+    for (int i = 1; i < ViewerAnnotationInk.maxPoints; ++i) {
+      ink.move(Offset(i.toDouble(), 1));
+    }
+    ink.begin(7, const Offset(5, 5));
+
+    expect(ink.strokes, hasLength(1));
+    expect(ink.strokes.single.surface, 7);
+    expect(ink.strokes.single.points, const <Offset>[Offset(5, 5)]);
   });
 }

@@ -103,7 +103,7 @@ func (s *Store) AuditEventsAfter(afterID int64, limit int) ([]AuditEvent, error)
 func (s *Store) ConnectionsAfter(afterID int64, limit int) ([]ConnectionEvent, error) {
 	limit = archivePage(limit)
 	query := `SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source, location, route
+			success, detail, host_id, audit_ref, source, location, route, note
 		 FROM connection_events WHERE id > ? ORDER BY id ASC LIMIT ?`
 	s.mu.Lock()
 	defer s.mu.Unlock()

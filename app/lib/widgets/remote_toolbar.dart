@@ -39,6 +39,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.clipboardEnabled,
     required this.clipboardAvailable,
     this.clipboardDirection = 3,
+    this.syncInitClipboard = false,
+    this.onToggleSyncInitClipboard,
     required this.fileAvailable,
     required this.fileActive,
     required this.audioAvailable,
@@ -184,6 +186,12 @@ class RemoteToolbar extends StatelessWidget {
   final bool clipboardEnabled;
   final bool clipboardAvailable;
   final int clipboardDirection;
+
+  /// Push this machine's clipboard to the host when the session connects.
+  /// Edited by a long press on the clipboard button and read at the next
+  /// connection, like RustDesk's `sync-init-clipboard`.
+  final bool syncInitClipboard;
+  final VoidCallback? onToggleSyncInitClipboard;
   final bool fileAvailable;
   final bool fileActive;
   final bool audioAvailable;
@@ -594,6 +602,97 @@ class RemoteToolbar extends StatelessWidget {
     );
   }
 
+  String _clipboardTooltip() {
+    if (!clipboardAvailable) {
+      return tr('服务端未开放剪贴板');
+    }
+    final String action = clipboardEnabled
+        ? tr('暂停剪贴板同步')
+        : tr('恢复剪贴板同步');
+    final String direction = clipboardDirection == 1
+        ? '\n${tr('仅主机 → 查看端（含文件剪贴板）')}'
+        : clipboardDirection == 2
+        ? '\n${tr('仅查看端 → 主机（含文件剪贴板）')}'
+        : '';
+    return '$action$direction\n${tr('长按选择连接时是否推送本机剪贴板')}';
+  }
+
+  /// The clipboard button's long press edits the connect-time push switch.
+  /// It applies to the next connection, while the tap keeps controlling the
+  /// running session's host-side sync.
+  Future<void> _openClipboardMenu(BuildContext context) async {
+    if (onToggleSyncInitClipboard == null) {
+      return;
+    }
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) {
+      return;
+    }
+    final Offset origin = box.localToGlobal(Offset.zero);
+    final Object? selected = await showMenu<Object>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        origin.dx,
+        origin.dy + box.size.height,
+        origin.dx + 300,
+        origin.dy + box.size.height,
+      ),
+      color: const Color(0xFF24252B),
+      elevation: 8,
+      items: <PopupMenuEntry<Object>>[
+        _clipboardToggleItem(
+          tr('连接时同步本机剪贴板'),
+          tr('下次连接把本机当前剪贴板推送到主机'),
+        ),
+      ],
+    );
+    if (selected == 'initial-sync') {
+      onToggleSyncInitClipboard?.call();
+    }
+  }
+
+  PopupMenuItem<Object> _clipboardToggleItem(String title, String detail) {
+    return PopupMenuItem<Object>(
+      value: 'initial-sync',
+      height: 44,
+      child: Row(
+        children: <Widget>[
+          Icon(
+            syncInitClipboard
+                ? Icons.check_box_rounded
+                : Icons.check_box_outline_blank_rounded,
+            size: 16,
+            color: syncInitClipboard ? kAccentBright : Colors.white54,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: syncInitClipboard ? kAccentBright : Colors.white70,
+                  ),
+                ),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// Recording options behind a long press: RustDesk keeps auto-record in its
   /// general settings, which this viewer does not have, so the record button
   /// owns both the auto-record switch and the retention limit.
@@ -783,17 +882,12 @@ class RemoteToolbar extends StatelessWidget {
                 icon: clipboardEnabled
                     ? Icons.content_paste_go_rounded
                     : Icons.content_paste_off_rounded,
-                tooltip: !clipboardAvailable
-                    ? tr('服务端未开放剪贴板')
-                    : (clipboardEnabled ? tr('暂停剪贴板同步') : tr('恢复剪贴板同步')) +
-                          (clipboardDirection == 1
-                              ? '\n${tr('仅主机 → 查看端（含文件剪贴板）')}'
-                              : clipboardDirection == 2
-                              ? '\n${tr('仅查看端 → 主机（含文件剪贴板）')}'
-                              : ''),
+                tooltip: _clipboardTooltip(),
                 disabled: !clipboardAvailable,
                 active: clipboardAvailable && clipboardEnabled,
                 onTap: onToggleClipboard,
+                onLongPress: (BuildContext context) =>
+                    unawaited(_openClipboardMenu(context)),
               ),
               _BarButton(
                 icon: Icons.upload_file_rounded,

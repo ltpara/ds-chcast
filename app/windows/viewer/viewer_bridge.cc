@@ -545,8 +545,10 @@ void ViewerBridge::HandleMethodCall(
         bool allow_unverified = false;
         bool trust_device = false;
         bool file_transfer_only = false;
+        bool sync_init_clipboard = false;
         if (args != nullptr) {
             map_bool(*args, "fileTransferOnly", &file_transfer_only);
+            map_bool(*args, "syncInitClipboard", &sync_init_clipboard);
         }
         chast::SessionMode session_mode = chast::SessionMode::Desktop;
         if (args != nullptr) {
@@ -673,7 +675,7 @@ void ViewerBridge::HandleMethodCall(
                             std::move(carrier_host_id), std::move(carrier_token),
                             file_transfer_only, session_mode,
                             std::move(access_ticket),
-                            std::move(access_ticket_seed))) {
+                            std::move(access_ticket_seed), sync_init_clipboard)) {
             result->Error("busy", "a session is already running");
             return;
         }

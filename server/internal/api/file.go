@@ -234,7 +234,7 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 	if asCSV, ok := exportRequest(w, r); !ok {
 		return
 	} else if asCSV {
-		s.fileTransfersCSV(w, r)
+		s.fileTransfersCSV(w, r, groupID)
 		return
 	}
 	limit, ok := s.connectionLimit(w, r)

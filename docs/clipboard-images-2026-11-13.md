@@ -47,6 +47,16 @@ Text、HTML、RTF、DIB 和 PNG；接收端在一次剪贴板所有权变化中�
 网络 DIB 上限仍为 32 MiB；不能通过提高 DIB 上限替代 PNG 路径。160 MiB 仅覆盖
 发送端把本地大 DIB 转成 PNG 的临时输入，该 DIB 本身不会进入 CCLB。
 
+CCLB 字节在进入内容模型前还要经过两层 QUIC 预算：单条流的组包上限和接收端
+待处理聚合上限。两层都必须容纳一个合法的最大项（4 MiB 文本 + 各 4 MiB 的
+HTML/RTF + 32 MiB DIB + 64 MiB PNG），因此均为 112 MiB 总流加 64 KiB 的
+CCLB 头与每格式条目头余量。旧值 96 MiB 小于该合法组合，会在容器校验通过后
+仍被传输层拒绝。聚合上限与单流上限相同，同时最多 8 条在途流，超出即拒绝该
+流而不是继续缓冲。
+
+`protocol` 测试构造上述最大合法项，断言它通过容器校验、不超过流上限，并明确
+越过旧的 96 MiB 接收预算。
+
 PNG 在进入内容模型前检查签名、完整 chunk 边界、CRC、IHDR 的合法位深/颜色类型、
 压缩/过滤字段、`IDAT` 与 `IEND` 顺序、尾随字节以及尺寸/像素预算。WIC 负责
 PNG 编解码，`chast.png` 是独立静态库，剪贴板测试不依赖 D3D11 采集栈。无压缩
@@ -83,6 +93,11 @@ ctest --test-dir build/root -C Release -R '^(png_writer|protocol|clipboard_async
 - `protocol_fuzz`：协议解析变异回归；
 - `clipboard_async`：真实 ViewerEngine、HostServer 和 QUIC 回环双向传输完整
   PNG 字节，host→viewer 与 viewer→host 均有独立断言。
+
+2026-11-15 追加的 `protocol` 断言用 4 MiB 文本、约 32 MiB DIB 和 64 MiB PNG
+组成最大合法项，确认其通过容器校验并落在新的流上限内，且总字节数明确超过旧的
+96 MiB 接收预算；定向构建后 `protocol`、`annotation_paint`、`cursor` 三个
+可执行文件均直接运行通过。
 
 同一构建随后执行宽范围剪贴板回归：
 

@@ -109,6 +109,21 @@ func TestSchemaMigrationBackfillsSessionActivity(t *testing.T) {
 		)`,
 		`INSERT INTO user_tokens (token_hash, user_id, created_at, expires_at)
 		 VALUES ('legacy-hash', 'user-1', 123456, 999999999999)`,
+		`CREATE TABLE connection_events (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id    TEXT NOT NULL,
+			username   TEXT NOT NULL,
+			peer_id    TEXT NOT NULL,
+			direction  TEXT NOT NULL DEFAULT 'viewer',
+			client_ip  TEXT NOT NULL DEFAULT '',
+			started_at INTEGER NOT NULL,
+			ended_at   INTEGER NOT NULL,
+			success    INTEGER NOT NULL DEFAULT 1,
+			detail     TEXT NOT NULL DEFAULT '',
+			host_id    TEXT NOT NULL DEFAULT '',
+			audit_ref  TEXT NOT NULL DEFAULT '',
+			source     TEXT NOT NULL DEFAULT 'viewer'
+		)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()

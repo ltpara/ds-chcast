@@ -103,7 +103,7 @@ func TestOperatorEventFiltersCombineUsernameAndHost(t *testing.T) {
 	} {
 		if _, err := store.RecordConnection(item.user.ID, item.user.Username,
 			item.peer, "viewer", "127.0.0.1", "", "", "",
-			now.Add(-time.Minute), now, true, item.user.Username+"-"+item.peer); err != nil {
+			now.Add(-time.Minute), now, true, item.user.Username+"-"+item.peer, ""); err != nil {
 			t.Fatalf("record connection: %v", err)
 		}
 		if _, err := store.RecordFileTransfer(item.user.ID, item.user.Username,
@@ -113,11 +113,11 @@ func TestOperatorEventFiltersCombineUsernameAndHost(t *testing.T) {
 		}
 	}
 
-	connections, err := store.ConnectionsForOperatorBeforeRange("ALICE", "ALPHA", TimeBounds{}, 0, 50)
+	connections, err := store.ConnectionsForOperatorBeforeRange("ALICE", "ALPHA", "", TimeBounds{}, 0, 50)
 	if err != nil || len(connections) != 1 || connections[0].Detail != "alice-alpha" {
 		t.Fatalf("combined connection filter = %+v, %v", connections, err)
 	}
-	connections, err = store.ConnectionsForOperatorBeforeRange("", "alpha", TimeBounds{}, 0, 50)
+	connections, err = store.ConnectionsForOperatorBeforeRange("", "alpha", "", TimeBounds{}, 0, 50)
 	if err != nil || len(connections) != 3 {
 		t.Fatalf("host connection filter = %+v, %v", connections, err)
 	}

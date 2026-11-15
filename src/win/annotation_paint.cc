@@ -22,8 +22,8 @@ void blend_pixel(uint32_t* pixel, uint32_t alpha, uint32_t red, uint32_t green,
     *pixel = (out_alpha << 24) | (out_red << 16) | (out_green << 8) | out_blue;
 }
 
-double distance_to_segment(double x, double y, double x0, double y0, double x1,
-                           double y1) {
+double squared_distance_to_segment(double x, double y, double x0, double y0,
+                                   double x1, double y1) {
     const double dx = x1 - x0;
     const double dy = y1 - y0;
     const double length_sq = dx * dx + dy * dy;
@@ -31,7 +31,7 @@ double distance_to_segment(double x, double y, double x0, double y0, double x1,
     t = std::clamp(t, 0.0, 1.0);
     const double offset_x = x0 + t * dx - x;
     const double offset_y = y0 + t * dy - y;
-    return std::sqrt(offset_x * offset_x + offset_y * offset_y);
+    return offset_x * offset_x + offset_y * offset_y;
 }
 
 }  // namespace
@@ -53,14 +53,18 @@ void annotation_draw_segment(uint32_t* pixels, int width, int height, int x0, in
     const uint32_t red = (color >> 16) & 0xFFu;
     const uint32_t green = (color >> 8) & 0xFFu;
     const uint32_t blue = color & 0xFFu;
+    // Most pixels of a long stroke's bounding box sit outside the pen band, so
+    // compare squared distances and take the root only for the ones that blend.
+    const double outer = radius + 0.75;
+    const double outer_sq = outer * outer;
     for (int y = top; y < bottom; ++y) {
         for (int x = left; x < right; ++x) {
-            const double distance =
-                distance_to_segment(x + 0.5, y + 0.5, x0, y0, x1, y1);
-            const double coverage = std::clamp(radius + 0.75 - distance, 0.0, 1.0);
-            if (coverage <= 0.0) {
+            const double offset_sq =
+                squared_distance_to_segment(x + 0.5, y + 0.5, x0, y0, x1, y1);
+            if (offset_sq >= outer_sq) {
                 continue;
             }
+            const double coverage = std::clamp(outer - std::sqrt(offset_sq), 0.0, 1.0);
             const uint32_t pixel_alpha =
                 static_cast<uint32_t>(static_cast<double>(alpha) * coverage + 0.5);
             const uint32_t premultiplied_red = red * pixel_alpha / 255u;

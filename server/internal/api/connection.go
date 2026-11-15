@@ -17,6 +17,7 @@ type connectionReportRequest struct {
 	EndedAtMS   int64  `json:"ended_at_ms"`
 	Success     *bool  `json:"success"`
 	Detail      string `json:"detail"`
+	Note        string `json:"note,omitempty"`
 	AuditRef    string `json:"audit_ref,omitempty"`
 	Route       string `json:"route,omitempty"`
 }
@@ -37,6 +38,7 @@ type connectionView struct {
 	DurationMS  int64  `json:"duration_ms"`
 	Success     bool   `json:"success"`
 	Detail      string `json:"detail"`
+	Note        string `json:"note,omitempty"`
 }
 
 type connectionsResponse struct {
@@ -61,6 +63,7 @@ func connectionToView(event account.ConnectionEvent) connectionView {
 		DurationMS:  event.Duration().Milliseconds(),
 		Success:     event.Success,
 		Detail:      event.Detail,
+		Note:        event.Note,
 	}
 }
 
@@ -127,7 +130,7 @@ func (s *server) recordAccountConnection(w http.ResponseWriter, r *http.Request)
 	ip := s.clientIP(r)
 	event, err := s.cfg.Accounts.RecordConnection(
 		user.ID, user.Username, req.PeerID, req.Direction, ip, s.clientLocation(ip),
-		req.Route, req.AuditRef, startedAt, endedAt, success, req.Detail,
+		req.Route, req.AuditRef, startedAt, endedAt, success, req.Detail, req.Note,
 	)
 	if err != nil {
 		if errors.Is(err, account.ErrInvalidConnection) {
@@ -191,7 +194,7 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	if asCSV, ok := exportRequest(w, r); !ok {
 		return
 	} else if asCSV {
-		s.connectionsCSV(w, r)
+		s.connectionsCSV(w, r, groupID)
 		return
 	}
 	limit, ok := s.connectionLimit(w, r)
@@ -212,12 +215,13 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	)
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	note := strings.TrimSpace(r.URL.Query().Get("note"))
 	if groupID != "" {
 		events, err = s.cfg.Accounts.ConnectionsForGroupBeforeRange(
-			groupID, username, host, bounds, beforeID, limit)
+			groupID, username, host, note, bounds, beforeID, limit)
 	} else {
 		events, err = s.cfg.Accounts.ConnectionsForOperatorBeforeRange(
-			username, host, bounds, beforeID, limit)
+			username, host, note, bounds, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account connection audit query", "error", err)

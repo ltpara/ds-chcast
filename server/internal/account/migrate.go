@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 18
+const accountSchemaVersion = 19
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -32,6 +32,18 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 16, Name: "account session permission caps", Apply: applySessionPermissionCaps},
 	{Version: 17, Name: "ldap identities", Apply: applyLDAPIdentities},
 	{Version: 18, Name: "account session activity", Apply: applyAccountSessionActivity},
+	{Version: 19, Name: "connection note", Apply: applyConnectionNote},
+}
+
+// applyConnectionNote stores the viewer's end-of-session remark on the
+// connection row it describes. The note is written once, by the same report
+// that carries the session timing, so a later host merge cannot overwrite it.
+func applyConnectionNote(db *sql.DB) error {
+	if err := ensureColumn(db, "connection_events", "note",
+		"note TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate connection_events.note: %w", err)
+	}
+	return nil
 }
 
 // applyAccountSessionActivity separates a login's stable start time from its

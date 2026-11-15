@@ -53,7 +53,7 @@
 | TCP 端口转发 | [port_forward_relay.cc](D:/ds-chcast/src/host/port_forward_relay.cc) | [port_forward_mux.rs](D:/rustdesk/src/server/port_forward_mux.rs) | 已有；本轮不展开服务器中继实现 |
 | 虚拟显示、无头及隐私恢复 | [virtual_display.cc](D:/ds-chcast/src/host/virtual_display.cc)、[display_privacy.cc](D:/ds-chcast/src/host/display_privacy.cc) | [virtual_display_manager.rs](D:/rustdesk/src/virtual_display_manager.rs)、[win_virtual_display.rs](D:/rustdesk/src/privacy_mode/win_virtual_display.rs) | 已有；驱动供应与多 GPU 实测尚需补齐，见 G09 |
 | 防休眠、壁纸移除及恢复 | [power_request.cc](D:/ds-chcast/src/win/power_request.cc)、[wallpaper.cc](D:/ds-chcast/src/win/wallpaper.cc) | [connection.rs](D:/rustdesk/src/server/connection.rs)、[windows.rs](D:/rustdesk/src/platform/windows.rs) | 已有；异常退出恢复仍应纳入验收 |
-| 协作光标提示 | [show_cursor.cc](D:/ds-chcast/src/win/show_cursor.cc)、[cursor_hint_paint.cc](D:/ds-chcast/src/win/cursor_hint_paint.cc)、[protocol.h](D:/ds-chcast/include/chast/protocol.h) | [whiteboard/mod.rs](D:/rustdesk/src/whiteboard/mod.rs:27)、[whiteboard/windows.rs](D:/rustdesk/src/whiteboard/windows.rs) | v71 起有颜色、姓名和点击波纹；自由标注仍缺，见 G10 |
+| 协作光标提示 | [show_cursor.cc](D:/ds-chcast/src/win/show_cursor.cc)、[cursor_hint_paint.cc](D:/ds-chcast/src/win/cursor_hint_paint.cc)、[protocol.h](D:/ds-chcast/include/chast/protocol.h) | [whiteboard/mod.rs](D:/rustdesk/src/whiteboard/mod.rs:27)、[whiteboard/windows.rs](D:/rustdesk/src/whiteboard/windows.rs) | v71 起有颜色、姓名和点击波纹；v76 已补自由手写标注（G21） |
 | 远程打印、控制方向切换 | [protocol.h](D:/ds-chcast/include/chast/protocol.h) | [printer_service.rs](D:/rustdesk/src/server/printer_service.rs)、[connection.rs](D:/rustdesk/src/server/connection.rs:3982) | 未找到我方对应协议和执行路径；属于产品扩展，见 G10 |
 
 ## 具体缺口与可提升点
@@ -150,7 +150,7 @@
 
 ### G10 · C：协作提示与额外产品功能
 
-- **协作光标：** 我方 [ShowCursorHint](D:/ds-chcast/include/chast/protocol.h) 在 v71 已有位置、可见性和按下边沿；覆盖层按设备名取色、绘制姓名并在点击处播放 420 ms 波纹（`cursor_hint_paint.cc`）。RustDesk [CustomEvent](D:/rustdesk/src/whiteboard/mod.rs:27) 为 Cursor/Clear/Exit，另有 Clear/绘制标注。剩余差异是自由标注；不能据此写成“缺少自由绘画白板”。
+- **协作光标：** 我方 [ShowCursorHint](D:/ds-chcast/include/chast/protocol.h) 在 v71 已有位置、可见性和按下边沿；覆盖层按设备名取色、绘制姓名并在点击处播放 420 ms 波纹（`cursor_hint_paint.cc`）。RustDesk [CustomEvent](D:/rustdesk/src/whiteboard/mod.rs:27) 为 Cursor/Clear/Exit，没有自由笔画；自由标注已由 v76 `Annotation`（89）补齐，不能据此写成“缺少自由绘画白板”。
 - **远程打印：** RustDesk [printer_service.rs](D:/rustdesk/src/server/printer_service.rs) 包含动态打印驱动适配器与作业处理；我方未找到对应端到端路径。它依赖驱动/运行时条件，不能声称当前本地 RustDesk 已开箱可用。只有明确打印需求时再立项。
 - **切换控制方向：** RustDesk [SwitchSidesRequest:3982](D:/rustdesk/src/server/connection.rs:3982) 拉起反向连接并关闭原会话；我方没有对应协调协议。实现需同时涉及两端、授权与连接恢复，不是给发射端加一个按钮即可。
 

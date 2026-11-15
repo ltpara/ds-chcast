@@ -4,6 +4,8 @@
 
 > 2026-11-12 复核：本机 RustDesk 参照已变为 `D:/rustdesk` 的 `55786aa`（2026-11-03），本文的 `7423dce` 仍可检出但不代表当前参照，旧路径 `D:/rustdesk-ref` 已不存在。`55786aa` 已加入 Windows HDR 归一化和 `static_refresh.rs`，所以本文“参考版本没有 Windows HDR tone-map”和“参考只有 WouldBlock 重复 10 次”的描述只适用于旧基线。另：查看端出站录制已有云端上传，缺的是主机入站录制的集中归档。当前结论见 [发射端审计](sender-audit-2026-11-12.md)。
 
+> 2026-11-15 复核：文中“缺标注绘制/白板自由标注”的判断已过期。v76 新增 `Annotation`（89），支持查看端自由手写、撤销、清除和本地墨迹回显，协议/光栅/历史、Flutter 与单机 QUIC 回环通过；RustDesk 1.5.1 的 `src/whiteboard` 只有 `Cursor/Clear/Exit` 覆盖层，不是自由笔画。最新差异见 [RustDesk 功能对照](rustdesk-comparison-2026-11-15.md)。
+
 ## 1. 结论
 
 我方已经具备较完整的 Windows 远控主机能力。本次审核发现的光标采样耦合（A01）、截图控制流阻塞与流 ID 0 歧义（A03）、无设备 CPU 回退缺口（A04）、认证前连接占用正式名额（A05）已进入修复；弱网峰值帧龄门槛已收紧到 3 秒。最终实现和回归结果以 [2026-11-12 修复记录](D:/ds-chcast/docs/sender-fixes-2026-11-12.md) 为准。**A02 撤销缺陷认定：无限 P 帧、按需 IDR 是产品设计约束，录制也不引入周期 IDR。** RustDesk 的录制 GOP 策略属于设计差异，不能作为改变我方约束的理由。

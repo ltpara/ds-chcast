@@ -729,3 +729,31 @@ func TestAssetsStayCSPCompatible(t *testing.T) {
 		}
 	}
 }
+
+// TestConsoleExposesConnectionNotes keeps the connection audit tab's remark
+// column and substring filter wired to the note the viewer submits at the end
+// of a session.
+func TestConsoleExposesConnectionNotes(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page := string(index); !strings.Contains(page, `id="audit-note"`) {
+		t.Error("index.html is missing the note filter input")
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(script)
+	for _, want := range []string{
+		"hasNote: true",
+		"$('audit-note').classList.toggle",
+		"params.set('note'",
+		"event.note ||",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing %q", want)
+		}
+	}
+}

@@ -30,6 +30,11 @@ libvpx VP9；无硬件时 Auto 把共享流协商为 VP9。Opus 改为 10 ms 帧
 的表述应按此限定理解。最新结论见
 [发射端审计](sender-audit-2026-11-12.md)。
 
+2026-11-15 复核：自由手写标注已由 v76 `Annotation`（89）实现（协议/光栅/历史、
+Flutter 与单机 QUIC 回环通过，真实双机未验）；RustDesk 1.5.1 的
+`src/whiteboard` 只有光标/姓名/点击波纹，不是自由笔画。本文其余内容保留
+2026-11-11/12 快照，最新差异见 [RustDesk 功能对照](rustdesk-comparison-2026-11-15.md)。
+
 口径说明：
 
 - 本文只比较**发射端（主机）**：采集 → 预处理 → 编码 → 节奏/背压 → 发送 →
@@ -61,12 +66,12 @@ libvpx VP9；无硬件时 Auto 把共享流协商为 VP9。Opus 改为 10 ms 帧
 | 新观看者接入 | 组内 prepare → 证明 IDR → 原子 commit；不重启现有流 | 检测到新订阅即 `SWITCH`，重建编码器 | chast 占优 |
 | 帧节奏/背压 | 每订阅 60 帧/8 MiB 有界窗口，溢出等 IDR；全部满则暂停采集 | 每连接无界通道；每帧最多等 3 s 让所有连接取走 | chast 隔离性更好；RustDesk 更简单 |
 | 控制面与视频面 | QUIC 控制流/视频流分离，视频积压不挡控制 | 同一连接消息流，视频发送阻塞时控制消息排队 | chast 占优 |
-| 光标 | 采集线程逐帧采样、去重合并、按显示投递；覆盖层按查看端取色/姓名/波纹 | 成熟光标服务 + 白板 | 产品化接近；自由标注仍缺 |
+| 光标 | 采集线程逐帧采样、去重合并、按显示投递；覆盖层按查看端取色/姓名/波纹 | 成熟光标服务 + 白板 | 产品化接近；v76 已补自由手写标注（快照时缺） |
 | 音频 | 共享 loopback 扇出；SpeexDSP AEC/AGC/NS；DATAGRAM + Opus PLC；主机语音通话 | 共享 audio service；LowDelay Opus；8 s 静音门；语音通话；无 AEC/DATAGRAM | chast 传输与 DSP 更强；设备切换未对比 |
 | 主机侧截图 | 查看端请求原始帧，主机在显示服务线程旁路拷贝 BGRA、编码 PNG 分片发送；失败/超时回退到解码帧 | 采集循环内取原始帧转 RGBA 发送 | 持平（chast 不打断视频流） |
 | 录制 | 编码包直写 MP4，多源、10 分钟分段、32 MiB 队列 | 编码包写入 Recorder，录制时关键帧间隔 240；可选录制后上传 | chast 分段/多源更明确，RustDesk 多上传 |
 | 多显示器 | 每屏独立 Source，全局编码/QoS，可合并 | 每屏独立 VideoService，全局编码/QoS | 持平 |
-| 主机增值功能 | 有主机侧截图、协作光标颜色/姓名/点击波纹；无自由标注、远程打印、主机入站录制上传 | 四者都有 | RustDesk 仍多三项（查看端出站录制上传双方都有） |
+| 主机增值功能 | v76 已有自由手写标注；无远程打印、主机入站录制上传 | 远程打印、主机入站录制上传 | RustDesk 仍多两项（查看端出站录制上传双方都有） |
 
 ### 1.1 功能缺口清单
 
@@ -77,7 +82,7 @@ libvpx VP9；无硬件时 Auto 把共享流协商为 VP9。Opus 改为 10 ms 帧
 
 | 功能 | RustDesk 7423dce | chast | 影响 |
 | --- | --- | --- | --- |
-| 白板/协作光标 | [src/whiteboard/mod.rs](../../rustdesk-ref/src/whiteboard/mod.rs) 的 `Cursor/Clear/Exit` 事件，光标带颜色、按键、文字 | v71 起覆盖层有颜色、姓名和点击波纹；无自由标注 | 自由标注缺失 |
+| 白板/协作光标 | [src/whiteboard/mod.rs](../../rustdesk-ref/src/whiteboard/mod.rs) 的 `Cursor/Clear/Exit` 事件，光标带颜色、按键、文字 | v71 起覆盖层有颜色、姓名和点击波纹；v76 补自由手写标注 | 快照时自由标注缺失，已由 v76 关闭 |
 | 远程打印 | `OPTION_ENABLE_REMOTE_PRINTER`、`PrinterData`、`JobType::Printer`（[connection.rs:1010](../../rustdesk-ref/src/server/connection.rs#L1010)） | 无 | 打印重定向缺失 |
 | 切换控制方向 | `SwitchSidesRequest` 拉起反向连接并关闭原会话（[connection.rs:3646](../../rustdesk-ref/src/server/connection.rs#L3646)） | 无对应协议 | 角色互换缺失 |
 | 录制后上传 | [record_upload.rs:23](../../rustdesk-ref/src/hbbs_http/record_upload.rs#L23)，录制时把 `RecordState` 交给 hbbs_http | 主机入站录制只写本地 MP4；查看端出站录制已可上传 | 主机侧集中归档缺失 |
@@ -362,7 +367,8 @@ RustDesk 有独立的光标服务、`capture_cursor_embedded` 选项和更成熟
 
 效果判断：光标正确性和“指针更新不被视频背压阻塞”chast 已经达标，
 32×32 缺陷有像素级证据；协作光标的产品化在 v71 后已与 RustDesk
-的白板光标对齐到颜色/姓名/点击反馈，自由绘制标注仍未实现。512 px
+的白板光标对齐到颜色/姓名/点击反馈，自由手写标注已由 v76 `Annotation`（89）
+实现（自动化/单机回环通过，真实双机未验）。512 px
 与隐藏指针的 OS 级场景仍需双机/真实前台窗口验收。
 
 ## 9. 音频
@@ -477,7 +483,7 @@ chast 的每连接队列更保守，RustDesk 与摄像头相关的移动端缩�
   本机没有真实锁屏/UAC/驱动安装场景，未验收。
 - UAC/安全桌面：两端都会在桌面切换时重建采集；本机无法制造真实
   UAC/SAS 场景，未验收。
-- 协作光标/白板：v71 起 chast 已有颜色、姓名和点击波纹；自由标注、
+- 协作光标/白板：v71 起 chast 已有颜色、姓名和点击波纹，v76 已补自由手写标注；
   远程打印、主机入站录制上传、切换控制方向 RustDesk 有，chast 没有（见 1.1）。
 - 主机语音通话与音频设备选择：两端都有（RustDesk 的 `audio-input`/
   voice-call，chast 的 `voice_microphone` + `send_voice_audio`）；
@@ -504,9 +510,9 @@ chast 的每连接队列更保守，RustDesk 与摄像头相关的移动端缩�
    硬件的机器和特殊解码端更友好；chast 的硬件优先策略是有意取舍，
    但需要产品层明确“没有共同格式”时的降级话术。
 2. **主机侧增值功能**：远程打印、主机入站录制上传、切换控制方向；chast 已有
-   主机原始帧截图、本地录制和协作光标（颜色/姓名/波纹），自由标注仍缺。
-3. **白板自由绘制**：RustDesk 的标注工具可留下绘制内容；chast 的覆盖层
-   只跟随指针，不保留笔迹。
+   主机原始帧截图、本地录制、协作光标（颜色/姓名/波纹）和 v76 自由手写标注。
+3. **白板自由绘制（已关闭）**：chast 的 v76 `Annotation` 可留下笔迹、撤销和清除；
+   RustDesk 1.5.1 的 whiteboard 只跟随指针和点击波纹，不保留笔迹。
 4. **音频设备与移动端覆盖**：RustDesk 的 `audio-input`、voice-call
    设备切换和平台覆盖更成熟；chast 已有主机语音通话与设备恢复路径，
    但只到代码审查，未做同场景设备热切换对比。

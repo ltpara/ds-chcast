@@ -31,6 +31,10 @@ const (
 	uploadPartSuffix  = ".part"
 	maxActiveUploads  = 8
 	uploadLockStripes = 64
+	// A session that has received no bytes for this long is abandoned. Without
+	// it a crashed uploader holds a quota reservation and one of the eight
+	// active slots until the daily orphan sweep.
+	uploadIdleTTL = time.Hour
 )
 
 // Upload is the resumable state exposed to a recording client. Offset is the
@@ -84,6 +88,9 @@ func (a *Archive) BeginUpload(userID, name, peerID string, startedAtMS, duration
 
 	a.uploadBeginMu.Lock()
 	defer a.uploadBeginMu.Unlock()
+	// Reclaim abandoned sessions first so a client that retried after a crash
+	// is not refused by its own leftovers.
+	a.reclaimIdleUploads(userID)
 	used, _, err := a.accounts.RecordingUsage(userID)
 	if err != nil {
 		return Upload{}, err
@@ -144,6 +151,11 @@ func (a *Archive) UploadStatus(userID, id string) (Upload, error) {
 	if err != nil {
 		return Upload{}, err
 	}
+	// An expired session is gone even if its files survive a failed reclaim:
+	// resuming it would resurrect a reservation the account already lost.
+	if a.uploadIdle(state, userID, id, time.Now()) {
+		return Upload{}, ErrUnknownUpload
+	}
 	info, err := os.Stat(a.uploadPartPath(userID, id))
 	if errors.Is(err, os.ErrNotExist) {
 		return uploadView(state, 0), nil
@@ -179,7 +191,11 @@ func (a *Archive) AppendUpload(userID, id string, offset, size int64, body io.Re
 		return Upload{}, ErrUploadSize
 	}
 	partPath := a.uploadPartPath(userID, id)
-	file, err := os.OpenFile(partPath, os.O_WRONLY, 0o600)
+	// O_CREATE restores a part file that vanished under a session whose state
+	// file survived. Status reports offset 0 in that case, so recreating the
+	// file lets the client resume from the start instead of failing every
+	// append until it deletes the session.
+	file, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return Upload{}, fmt.Errorf("recording upload append: %w", err)
 	}
@@ -345,6 +361,52 @@ func (a *Archive) activeUploadBytes(userID string) (int64, int, error) {
 		count++
 	}
 	return total, count, nil
+}
+
+// uploadIdle reports whether a session has seen no bytes for uploadIdleTTL.
+// The part file's mtime is the last accepted chunk; a missing part file falls
+// back to the creation time.
+func (a *Archive) uploadIdle(state uploadState, userID, id string, now time.Time) bool {
+	if info, err := os.Stat(a.uploadPartPath(userID, id)); err == nil {
+		return now.Sub(info.ModTime()) >= uploadIdleTTL
+	}
+	return now.UnixMilli()-state.CreatedAtMS >= uploadIdleTTL.Milliseconds()
+}
+
+// reclaimIdleUploads removes abandoned sessions for one account. Callers hold
+// uploadBeginMu, so the sweep cannot race a concurrent BeginUpload for the
+// same account.
+func (a *Archive) reclaimIdleUploads(userID string) {
+	dir := filepath.Join(a.dir, userID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	const statePrefix = tempPrefix + "session-"
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, statePrefix) || !strings.HasSuffix(name, uploadStateSuffix) {
+			continue
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(name, statePrefix), uploadStateSuffix)
+		if !uploadIDPattern.MatchString(id) {
+			continue
+		}
+		state, err := a.readUploadState(userID, id)
+		if err != nil || !a.uploadIdle(state, userID, id, now) {
+			continue
+		}
+		if err := os.Remove(a.uploadStatePath(userID, id)); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			a.logger.Error("recording upload reclaim", "id", id, "error", err)
+			continue
+		}
+		if err := os.Remove(a.uploadPartPath(userID, id)); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			a.logger.Error("recording upload reclaim", "id", id, "error", err)
+		}
+	}
 }
 
 func (a *Archive) readUploadState(userID, id string) (uploadState, error) {

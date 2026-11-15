@@ -183,7 +183,7 @@ func TestAccountGroupEventFilters(t *testing.T) {
 	for _, tc := range []struct{ user User }{{alice}, {bob}, {carol}} {
 		if _, err := store.RecordConnection(tc.user.ID, tc.user.Username,
 			"peer-"+tc.user.Username, "viewer", "127.0.0.1", "", "", "",
-			now.Add(-time.Minute), now, true, "report"); err != nil {
+			now.Add(-time.Minute), now, true, "report", ""); err != nil {
 			t.Fatalf("record connection for %s: %v", tc.user.Username, err)
 		}
 	}

@@ -114,17 +114,29 @@ bool sample_desktop_cursor(const DisplayInfo& display, CursorInfo& cursor) {
 namespace chast::detail {
 
 UINT cursor_target_size(const DisplayInfo& display) {
-    DWORD base_size = 0;
-    DWORD accessibility_size = 0;
-    const bool have_base = read_cursor_registry_dword(
-        HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"CursorBaseSize", base_size);
-    const bool have_accessibility = read_cursor_registry_dword(
-        HKEY_CURRENT_USER, L"Software\\Microsoft\\Accessibility", L"CursorSize",
-        accessibility_size);
-    const UINT base = cursor_diameter_from_settings(
-        have_base ? base_size : 0, have_accessibility ? accessibility_size : 0);
-    if (base == 0) {
-        return 0;
+    // A fresh cache resolves both inputs on its first call, so the uncached
+    // entry point shares the one resolution path.
+    return CursorTargetSizeCache{}.target_size(display);
+}
+
+UINT CursorTargetSizeCache::target_size(const DisplayInfo& display) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!ready_ || now - refreshed_ >= kRefreshInterval) {
+        DWORD base_size = 0;
+        DWORD accessibility_size = 0;
+        const bool have_base = read_cursor_registry_dword(
+            HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"CursorBaseSize", base_size);
+        const bool have_accessibility = read_cursor_registry_dword(
+            HKEY_CURRENT_USER, L"Software\\Microsoft\\Accessibility", L"CursorSize",
+            accessibility_size);
+        base_diameter_ = cursor_diameter_from_settings(
+            have_base ? base_size : 0, have_accessibility ? accessibility_size : 0);
+        // Re-query the monitor DPI as well: a display-scaling change keeps the
+        // same monitor handle, and the refresh is what notices it.
+        monitor_ = nullptr;
+        dpi_ = 96;
+        ready_ = true;
+        refreshed_ = now;
     }
 
     HMONITOR monitor = display.monitor;
@@ -133,14 +145,18 @@ UINT cursor_target_size(const DisplayInfo& display) {
                   display.rect.bottom};
         monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
     }
-    UINT dpi_x = 96;
-    UINT dpi_y = 96;
-    if (monitor == nullptr ||
-        FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y)) ||
-        dpi_x == 0) {
-        dpi_x = 96;
+    if (monitor != monitor_) {
+        UINT dpi_x = 96;
+        UINT dpi_y = 96;
+        dpi_ = 96;
+        if (monitor != nullptr &&
+            SUCCEEDED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y)) &&
+            dpi_x != 0) {
+            dpi_ = dpi_x;
+        }
+        monitor_ = monitor;
     }
-    return cursor_size_at_dpi(base, dpi_x);
+    return cursor_size_at_dpi(base_diameter_, dpi_);
 }
 
 // Pointer decoding. DXGI reports pointer shapes in three formats whose alpha

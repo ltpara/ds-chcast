@@ -55,7 +55,7 @@ func TestAuditReportsCombineGroupUserHostAndCSV(t *testing.T) {
 	} {
 		if _, err := s.Accounts.RecordConnection(item.user.ID, item.user.Username,
 			item.peer, "viewer", "127.0.0.1", "", "", "",
-			now.Add(-time.Minute), now, true, item.user.Username+"-"+item.peer); err != nil {
+			now.Add(-time.Minute), now, true, item.user.Username+"-"+item.peer, ""); err != nil {
 			t.Fatalf("record connection: %v", err)
 		}
 		if _, err := s.Accounts.RecordFileTransfer(item.user.ID, item.user.Username,

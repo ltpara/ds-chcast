@@ -30,8 +30,19 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[15].Apply = applySessionPermissionCapsPostgres
 	list[16].Apply = applyLDAPIdentitiesPostgres
 	list[17].Apply = applyAccountSessionActivityPostgres
+	list[18].Apply = applyConnectionNotePostgres
 	return list
 }()
+
+// applyConnectionNotePostgres mirrors the SQLite connection note column.
+func applyConnectionNotePostgres(db *sql.DB) error {
+	if _, err := db.Exec(
+		`ALTER TABLE connection_events ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''`,
+	); err != nil {
+		return fmt.Errorf("migrate connection note: %w", err)
+	}
+	return nil
+}
 
 // applyAccountSessionActivityPostgres mirrors the stable login and recent-use
 // timestamps used by the paginated session directory.

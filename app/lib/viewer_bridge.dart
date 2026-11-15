@@ -2003,6 +2003,10 @@ class ViewerBridge {
   /// [accessTicket] is the base64url signed ticket a managed host requires
   /// (v62). It must have been minted for the public key returned by
   /// [ticketIdentity]; leave it empty for hosts that authenticate locally.
+  ///
+  /// [syncInitClipboard] pushes this machine's clipboard to the host as the
+  /// session's first change. Off by default: the host's clipboard permission
+  /// still gates it, but the local clipboard is the operator's own data.
   static Future<void> start({
     required String host,
     required int port,
@@ -2022,6 +2026,7 @@ class ViewerBridge {
     bool fileTransferOnly = false,
     String sessionMode = 'desktop',
     String accessTicket = '',
+    bool syncInitClipboard = false,
   }) async {
     await _channel.invokeMethod<void>('start', <String, Object>{
       'host': host,
@@ -2041,6 +2046,7 @@ class ViewerBridge {
       'carrierToken': carrierToken,
       'fileTransferOnly': fileTransferOnly,
       'sessionMode': sessionMode,
+      'syncInitClipboard': syncInitClipboard,
       if (accessTicket.isNotEmpty) 'accessTicket': accessTicket,
     });
   }

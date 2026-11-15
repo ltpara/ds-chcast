@@ -2934,7 +2934,7 @@ func TestConnectionReportsMergeByAuditRef(t *testing.T) {
 
 	report := func() (ConnectionEvent, error) {
 		return store.RecordConnection(alice.ID, "alice", "viewerbox", connectionViewer,
-			"127.0.0.1", "Testland", RoutePunch, ref, at, at.Add(2*time.Minute), true, "")
+			"127.0.0.1", "Testland", RoutePunch, ref, at, at.Add(2*time.Minute), true, "", "")
 	}
 	merged, err := report()
 	if err != nil {

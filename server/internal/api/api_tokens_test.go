@@ -157,6 +157,72 @@ func TestAPITokenScopesAndLifecycle(t *testing.T) {
 	}
 }
 
+// TestGroupScopedTokenCSVStaysScoped pins the export paths. The JSON handlers
+// already narrow a group-scoped token to its own group, but the CSV helpers
+// used to re-read ?group= from the request, so omitting the parameter exported
+// the whole trail.
+func TestGroupScopedTokenCSVStaysScoped(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	for _, group := range []string{"east", "west"} {
+		if _, err := s.Accounts.CreateGroup(group, group, "", 0, 0); err != nil {
+			t.Fatalf("create %s: %v", group, err)
+		}
+	}
+	if _, err := s.Accounts.AddGroupMember("east", "alice", account.RoleReadonly); err != nil {
+		t.Fatalf("add alice: %v", err)
+	}
+	if _, err := s.Accounts.AddGroupMember("west", "bob", account.RoleReadonly); err != nil {
+		t.Fatalf("add bob: %v", err)
+	}
+	adminToken := login(t, s.URL, "alice", "correct horse").Token
+	grouped := createToken(t, s.URL, adminToken,
+		`{"name":"east ops","role":"operator","resources":["groups","audit"],"group_id":"east","expires_in_seconds":3600}`)
+	now := time.Now().UTC()
+	for _, username := range []string{"alice", "bob"} {
+		if err := s.Accounts.AppendAudit(account.AuditEvent{
+			Username: username, Action: "csv_scope_probe", Detail: username + "-detail",
+		}); err != nil {
+			t.Fatalf("append audit %s: %v", username, err)
+		}
+		user, err := s.Accounts.FindUser(username)
+		if err != nil {
+			t.Fatalf("find %s: %v", username, err)
+		}
+		if _, err := s.Accounts.RecordConnection(user.ID, username, "devbox", "viewer",
+			"127.0.0.1", "", "", "", now.Add(-time.Minute), now, true,
+			username+"-connection", ""); err != nil {
+			t.Fatalf("record connection %s: %v", username, err)
+		}
+		if _, err := s.Accounts.RecordFileTransfer(user.ID, username, "devbox", "upload",
+			username+".txt", "127.0.0.1", "", "", "", 16, 1, now, true,
+			username+"-transfer"); err != nil {
+			t.Fatalf("record transfer %s: %v", username, err)
+		}
+	}
+
+	for _, path := range []string{"/v1/audit", "/v1/audit/connections", "/v1/audit/file-transfers"} {
+		for _, format := range []string{"", "?format=csv"} {
+			status, body := request(t, http.MethodGet, s.URL+path+format, "", grouped.Secret)
+			if status != http.StatusOK {
+				t.Fatalf("%s%s with group token: %d %s", path, format, status, body)
+			}
+			text := string(body)
+			if !strings.Contains(text, "alice") {
+				t.Fatalf("%s%s dropped the token's own group: %s", path, format, text)
+			}
+			if strings.Contains(text, "bob") {
+				t.Fatalf("%s%s leaked another group: %s", path, format, text)
+			}
+		}
+	}
+}
+
 // TestAPITokenDeviceGroupScope pins the device token range: listing, policy
 // management and per-device operations only reach devices in the token group,
 // while global policy objects and issuer revocation stay whole-deployment.

@@ -43,7 +43,7 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 	if asCSV, ok := exportRequest(w, r); !ok {
 		return
 	} else if asCSV {
-		s.auditCSV(w, r)
+		s.auditCSV(w, r, groupID)
 		return
 	}
 	limit := 50

@@ -20,14 +20,16 @@ class ViewerInkStroke {
 /// video never contains them and a viewer would otherwise draw blind. This
 /// model mirrors only this engine's own strokes; the wire protocol has no
 /// host-to-viewer annotation echo, so strokes drawn from another window are
-/// not shown here. Bounds follow the host history so a long session cannot
-/// grow the local copy without limit.
+/// not shown here. The bounds match the host history (2048 strokes and 65536
+/// points across all of them, oldest evicted first), so the local copy cannot
+/// outlive or outgrow what the host still keeps.
 class ViewerAnnotationInk extends ChangeNotifier {
   static const int maxStrokes = 2048;
-  static const int maxPointsPerStroke = 16384;
+  static const int maxPoints = 65536;
 
   final List<ViewerInkStroke> _strokes = <ViewerInkStroke>[];
   ViewerInkStroke? _active;
+  int _pointCount = 0;
   int _revision = 0;
 
   List<ViewerInkStroke> get strokes => List<ViewerInkStroke>.unmodifiable(
@@ -48,10 +50,9 @@ class ViewerAnnotationInk extends ChangeNotifier {
     end();
     final ViewerInkStroke stroke = ViewerInkStroke(surface, point);
     _strokes.add(stroke);
-    if (_strokes.length > maxStrokes) {
-      _strokes.removeAt(0);
-    }
+    _pointCount++;
     _active = stroke;
+    _trim();
     _changed();
   }
 
@@ -61,11 +62,8 @@ class ViewerAnnotationInk extends ChangeNotifier {
       return;
     }
     stroke.points.add(point);
-    if (stroke.points.length > maxPointsPerStroke) {
-      // Keep the tail, matching the host's overlong-stroke behaviour; the
-      // length is trimmed in one go so a bounded stroke costs amortised O(1).
-      stroke.points.removeRange(0, stroke.points.length - maxPointsPerStroke);
-    }
+    _pointCount++;
+    _trim();
     _changed();
   }
 
@@ -84,14 +82,43 @@ class ViewerAnnotationInk extends ChangeNotifier {
     if (_strokes.isEmpty) {
       return;
     }
-    _strokes.removeLast();
+    _pointCount -= _strokes.removeLast().points.length;
     _changed();
   }
 
   void clear() {
     _active = null;
     _strokes.clear();
+    _pointCount = 0;
     _changed();
+  }
+
+  /// Mirrors detail::AnnotationHistory::trim: drop whole strokes oldest first,
+  /// then trim the oldest stroke's head points when it alone is over budget.
+  void _trim() {
+    while (_strokes.length > maxStrokes) {
+      _removeOldest();
+    }
+    while (_pointCount > maxPoints && _strokes.length > 1) {
+      _removeOldest();
+    }
+    if (_pointCount > maxPoints) {
+      final List<Offset> points = _strokes.first.points;
+      final int excess = math.min(_pointCount - maxPoints, points.length - 1);
+      if (excess > 0) {
+        points.removeRange(0, excess);
+        _pointCount -= excess;
+      }
+    }
+  }
+
+  void _removeOldest() {
+    final ViewerInkStroke oldest = _strokes.removeAt(0);
+    _pointCount -= oldest.points.length;
+    if (identical(_active, oldest)) {
+      // The host deactivates an evicted stroke, so later moves are dropped.
+      _active = null;
+    }
   }
 }
 

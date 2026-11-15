@@ -158,6 +158,7 @@ func TestAddressBookGroupImportUpdateSkipAndStrictJSON(t *testing.T) {
 		"format":"chast-addressbook-groups","version":1,"conflict":"skip",
 		"groups":[{"id":"changed","name":"Ignored","parent_id":"","position":9}]
 	}`
+	priorRevision := result.Revision
 	status, body = request(t, http.MethodPost, s.URL+"/v1/addressbook/groups/import", skipBody, reply.Token)
 	if status != http.StatusOK {
 		t.Fatalf("skip import: %d %s", status, body)
@@ -165,7 +166,7 @@ func TestAddressBookGroupImportUpdateSkipAndStrictJSON(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("skip reply: %v", err)
 	}
-	if len(result.Skipped) != 1 || result.Skipped[0] != "changed" || result.Revision != 0 {
+	if len(result.Skipped) != 1 || result.Skipped[0] != "changed" || result.Revision != priorRevision {
 		t.Fatalf("skip result = %+v", result)
 	}
 

@@ -105,7 +105,7 @@ func TestAddressBookGroupImportSkipAndReject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("skip import: %v", err)
 	}
-	if len(result.Skipped) != 1 || result.Skipped[0] != "existing" || result.Revision != 0 {
+	if len(result.Skipped) != 1 || result.Skipped[0] != "existing" || result.Revision != before.Revision {
 		t.Fatalf("skip result = %+v", result)
 	}
 	afterSkip, err := store.Snapshot(alice.ID, 0)
@@ -118,6 +118,53 @@ func TestAddressBookGroupImportSkipAndReject(t *testing.T) {
 		afterSkip.Groups[0].UpdatedAt.UnixMilli() != existing.UpdatedAt.UnixMilli() ||
 		afterSkip.Revision != before.Revision {
 		t.Fatalf("skip changed the book: %+v", afterSkip)
+	}
+}
+
+func TestAddressBookGroupImportNoWriteKeepsRevision(t *testing.T) {
+	store := openGroupStore(t)
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "root", "Root"); err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	before, err := store.Snapshot(alice.ID, 0)
+	if err != nil {
+		t.Fatalf("snapshot before: %v", err)
+	}
+	if before.Revision == 0 {
+		t.Fatalf("stored revision did not advance: %+v", before)
+	}
+
+	cases := []struct {
+		name   string
+		groups []AddressBookGroupImport
+	}{
+		{name: "empty package"},
+		{name: "unchanged only", groups: []AddressBookGroupImport{
+			{ID: "root", Name: "Root"},
+		}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := store.ImportAddressBookGroups(alice.ID, tt.groups, AddressBookGroupImportConflictUpdate)
+			if err != nil {
+				t.Fatalf("import: %v", err)
+			}
+			if result.Revision != before.Revision {
+				t.Fatalf("no-op import revision = %d, want current %d", result.Revision, before.Revision)
+			}
+		})
+	}
+
+	after, err := store.Snapshot(alice.ID, 0)
+	if err != nil {
+		t.Fatalf("snapshot after: %v", err)
+	}
+	if after.Revision != before.Revision {
+		t.Fatalf("no-op import advanced the revision: before=%d after=%d", before.Revision, after.Revision)
 	}
 }
 

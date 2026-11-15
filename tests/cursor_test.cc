@@ -107,6 +107,19 @@ void test_accessibility_size() {
     EXPECT(width == 32 && height == 16);
 }
 
+void test_target_size_cache() {
+    // The cache exists for the per-frame path; it must agree with a direct
+    // read and stay consistent across calls inside one refresh window.
+    chast::DisplayInfo display;
+    display.rect.right = 1;
+    display.rect.bottom = 1;
+    chast::detail::CursorTargetSizeCache cache;
+    const UINT direct = chast::detail::cursor_target_size(display);
+    EXPECT(cache.target_size(display) == direct);
+    EXPECT(cache.target_size(display) == direct);
+    EXPECT(chast::detail::cursor_target_size(display) == direct);
+}
+
 void test_scaled_hotspot() {
     POINT point = chast::detail::scale_cursor_hotspot(POINT{3, 7}, 16, 16, 64, 64);
     EXPECT(point.x == 12 && point.y == 28);
@@ -429,6 +442,7 @@ int main(int argc, char** argv) {
     }
     test_content_id();
     test_accessibility_size();
+    test_target_size_cache();
     test_scaled_hotspot();
     test_scaled_bitmap();
     test_derive_sprite();

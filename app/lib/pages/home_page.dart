@@ -22,6 +22,7 @@ import '../theme.dart';
 import '../tunnel_agent.dart';
 import '../trust_store.dart';
 import '../view_filter.dart';
+import '../view_prefs.dart';
 import '../viewer_bridge.dart';
 import '../wake_on_lan.dart';
 import 'session_page.dart';
@@ -221,6 +222,7 @@ class _HomePageState extends State<HomePage> {
   String _deviceQuery = '';
   final Set<String> _selectedTags = <String>{};
   bool _favoritesOnly = false;
+  bool _askSessionNote = false;
   late final DeviceStore _deviceStore;
   late final ServerSettingsStore _serverStore;
   late final TrustStore _trustStore;
@@ -274,6 +276,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _askSessionNote = ViewPreferences.load().askSessionNote;
     _deviceStore = widget.deviceStore ?? DeviceStore();
     _serverStore =
         widget.serverStore ??
@@ -2034,6 +2037,11 @@ class _HomePageState extends State<HomePage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
+  void _setAskSessionNote(bool enabled) {
+    setState(() => _askSessionNote = enabled);
+    ViewPreferences.update(askSessionNote: enabled);
+  }
+
   Future<void> _showServerSettings() async {
     final ServerSettings? settings = await showDialog<ServerSettings>(
       context: context,
@@ -2359,6 +2367,8 @@ class _HomePageState extends State<HomePage> {
             onlineCount: _onlineCount,
             account: _account,
             syncing: _syncing,
+            askSessionNote: _askSessionNote,
+            onAskSessionNoteChanged: _setAskSessionNote,
             onConfigureServer: _showServerSettings,
             onAccount: _showAccount,
           ),
@@ -3499,6 +3509,8 @@ class _Sidebar extends StatelessWidget {
     required this.onlineCount,
     required this.account,
     required this.syncing,
+    required this.askSessionNote,
+    required this.onAskSessionNoteChanged,
     required this.onConfigureServer,
     required this.onAccount,
   });
@@ -3509,6 +3521,8 @@ class _Sidebar extends StatelessWidget {
   final int onlineCount;
   final AccountSession? account;
   final bool syncing;
+  final bool askSessionNote;
+  final ValueChanged<bool> onAskSessionNoteChanged;
   final VoidCallback onConfigureServer;
   final VoidCallback onAccount;
 
@@ -3895,6 +3909,48 @@ class _Sidebar extends StatelessWidget {
                     ),
                     Text(
                       AppLanguage.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: mutedStyle(context, size: 10),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 2),
+            PopupMenuButton<bool>(
+              key: const Key('session-note-menu'),
+              tooltip: tr('会话备注'),
+              onSelected: onAskSessionNoteChanged,
+              itemBuilder: (BuildContext context) => <PopupMenuEntry<bool>>[
+                CheckedPopupMenuItem<bool>(
+                  value: !askSessionNote,
+                  checked: askSessionNote,
+                  child: Text(tr('结束会话时填写备注')),
+                ),
+              ],
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.edit_note_rounded,
+                      size: 14,
+                      color: askSessionNote
+                          ? kAccent
+                          : (dark ? Colors.white38 : const Color(0xFF8A919C)),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        tr('会话备注'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: mutedStyle(context, size: 10),
+                      ),
+                    ),
+                    Text(
+                      askSessionNote ? tr('已开启') : tr('未开启'),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: mutedStyle(context, size: 10),

@@ -10,7 +10,60 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestResumableUploadReclaimsAbandonedSession(t *testing.T) {
+	archive, _, user := openArchive(t, 0, 0)
+	upload, err := archive.BeginUpload(user.ID, "clip.mp4", "", 0, 0, 4)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := archive.AppendUpload(user.ID, upload.ID, 0, 4, strings.NewReader("abcd")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// Age the part file past the idle window, as an uploader that crashed
+	// mid-transfer would leave it.
+	stale := time.Now().Add(-uploadIdleTTL - time.Minute)
+	part := filepath.Join(archive.Dir(), user.ID, tempPrefix+"session-"+upload.ID+".part")
+	if err := os.Chtimes(part, stale, stale); err != nil {
+		t.Fatalf("age part: %v", err)
+	}
+	if _, err := archive.UploadStatus(user.ID, upload.ID); !errors.Is(err, ErrUnknownUpload) {
+		t.Fatalf("idle status = %v", err)
+	}
+	// The next BeginUpload reclaims the files so the slot and quota return.
+	if _, err := archive.BeginUpload(user.ID, "clip2.mp4", "", 0, 0, 4); err != nil {
+		t.Fatalf("begin after idle: %v", err)
+	}
+	if _, err := os.Stat(part); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("idle part survived reclaim: %v", err)
+	}
+}
+
+func TestResumableUploadRecoversMissingPartFile(t *testing.T) {
+	archive, _, user := openArchive(t, 0, 0)
+	upload, err := archive.BeginUpload(user.ID, "clip.mp4", "", 0, 0, 4)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	part := filepath.Join(archive.Dir(), user.ID, tempPrefix+"session-"+upload.ID+".part")
+	if err := os.Remove(part); err != nil {
+		t.Fatalf("remove part: %v", err)
+	}
+	// Status must report the durable offset the client can resume from, and the
+	// append that follows must recreate the file instead of failing forever.
+	status, err := archive.UploadStatus(user.ID, upload.ID)
+	if err != nil || status.Offset != 0 {
+		t.Fatalf("status without part = %+v %v", status, err)
+	}
+	if _, err := archive.AppendUpload(user.ID, upload.ID, 0, 4, strings.NewReader("abcd")); err != nil {
+		t.Fatalf("append after part loss: %v", err)
+	}
+	if _, err := archive.CompleteUpload(user.ID, upload.ID); err != nil {
+		t.Fatalf("complete after part loss: %v", err)
+	}
+}
 
 func TestResumableUploadSurvivesArchiveRestart(t *testing.T) {
 	archive, store, user := openArchive(t, 0, 0)

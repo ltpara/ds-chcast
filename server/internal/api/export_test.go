@@ -179,7 +179,7 @@ func TestCSVExportPagesPastStorePageCaps(t *testing.T) {
 	for i := 0; i < connectionRows; i++ {
 		at := start.Add(time.Duration(i) * time.Minute)
 		if _, err := s.Accounts.RecordConnection(user.ID, "alice", "peer1", "viewer", "",
-			"", "", "", at, at.Add(time.Second), true, fmt.Sprintf("c%d", i)); err != nil {
+			"", "", "", at, at.Add(time.Second), true, fmt.Sprintf("c%d", i), ""); err != nil {
 			t.Fatalf("record connection %d: %v", i, err)
 		}
 	}
@@ -303,7 +303,7 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	}
 	if _, err := s.Accounts.RecordConnection(
 		user.ID, "alice", "peer1", "viewer", "198.51.100.7", "Testland", "punch", "",
-		created, ended, true, "viewer side"); err != nil {
+		created, ended, true, "viewer side", "closed the VPN first"); err != nil {
 		t.Fatalf("record connection: %v", err)
 	}
 	if _, err := s.Accounts.RecordHostFileTransfer(
@@ -340,7 +340,7 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	rows = exportCSV(t, s.URL+"/v1/audit/connections?format=csv")
 	if want := []string{"id", "started_at", "ended_at", "duration_ms", "username",
 		"peer_id", "host_id", "audit_ref", "source", "direction",
-		"client_ip", "location", "route", "success", "detail"}; !slices.Equal(rows[0], want) {
+		"client_ip", "location", "route", "success", "detail", "note"}; !slices.Equal(rows[0], want) {
 		t.Fatalf("connection header = %v, want %v", rows[0], want)
 	}
 	if len(rows) != 3 {
@@ -355,7 +355,8 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	viewerRow := exportRow(t, rows, 14, "viewer side")
 	if viewerRow[4] != "alice" || viewerRow[5] != "peer1" ||
 		viewerRow[8] != "viewer" || viewerRow[10] != "198.51.100.7" ||
-		viewerRow[11] != "Testland" || viewerRow[12] != "punch" {
+		viewerRow[11] != "Testland" || viewerRow[12] != "punch" ||
+		viewerRow[15] != "closed the VPN first" {
 		t.Fatalf("viewer connection row = %v", viewerRow)
 	}
 

@@ -26,6 +26,8 @@ class ViewPreferences {
     this.autoRecord = false,
     this.recordKeep = 0,
     this.showMyCursor = false,
+    this.syncInitClipboard = false,
+    this.askSessionNote = false,
   });
 
   /// 0 = adaptive (fit the window), 1 = original pixels.
@@ -64,6 +66,20 @@ class ViewPreferences {
   /// Follows the device, like the input remapping.
   final bool showMyCursor;
 
+  /// Push this machine's clipboard to the host when a session connects
+  /// (RustDesk's `sync-init-clipboard`). Off by default so a connection never
+  /// uploads local clipboard data without the operator asking. Follows the
+  /// device; it is read when the session starts, so a change applies to the
+  /// next connection.
+  final bool syncInitClipboard;
+
+  /// Ask for a short remark when a session the server audits ends
+  /// (RustDesk's `allow-ask-for-note`). The remark goes out with the same
+  /// connection report, so it only appears when an account is signed in.
+  /// Shared, because it describes how this viewer closes sessions, not a
+  /// property of one device.
+  final bool askSessionNote;
+
   static const String _fitKey = 'view_fit';
   static const String _statsKey = 'view_stats';
   static const String _fileSortKey = 'file_sort';
@@ -77,6 +93,8 @@ class ViewPreferences {
   static const String _autoRecordKey = 'view_auto_record';
   static const String _recordKeepKey = 'view_record_keep';
   static const String _showMyCursorKey = 'view_show_my_cursor';
+  static const String _syncInitClipboardKey = 'view_sync_init_clipboard';
+  static const String _askSessionNoteKey = 'view_ask_session_note';
 
   /// Kept here so existing tests can redirect the shared settings file.
   @visibleForTesting
@@ -101,6 +119,8 @@ class ViewPreferences {
     final Object? rawRecordKeep = map[_recordKeepKey];
     final Object? rawShowHidden = map[_browserShowHiddenKey];
     final Object? rawShowMyCursor = map[_showMyCursorKey];
+    final Object? rawSyncInitClipboard = map[_syncInitClipboardKey];
+    final Object? rawAskSessionNote = map[_askSessionNoteKey];
     return ViewPreferences(
       fit: rawFit is int && (rawFit == 0 || rawFit == 1) ? rawFit : 0,
       stats: rawStats is bool ? rawStats : false,
@@ -118,6 +138,10 @@ class ViewPreferences {
       autoRecord: rawAutoRecord is bool ? rawAutoRecord : false,
       recordKeep: _normalizeRecordKeep(rawRecordKeep),
       showMyCursor: rawShowMyCursor is bool ? rawShowMyCursor : false,
+      syncInitClipboard: rawSyncInitClipboard is bool
+          ? rawSyncInitClipboard
+          : false,
+      askSessionNote: rawAskSessionNote is bool ? rawAskSessionNote : false,
     );
   }
 
@@ -164,6 +188,8 @@ class ViewPreferences {
       autoRecord: prefs.autoRecord,
       recordKeep: prefs.recordKeep,
       showMyCursor: prefs.showMyCursor,
+      syncInitClipboard: prefs.syncInitClipboard,
+      askSessionNote: prefs.askSessionNote,
     );
   }
 
@@ -184,6 +210,8 @@ class ViewPreferences {
     bool? autoRecord,
     int? recordKeep,
     bool? showMyCursor,
+    bool? syncInitClipboard,
+    bool? askSessionNote,
   }) {
     final Map<String, Object?> shared = <String, Object?>{
       if (fileSort != null)
@@ -197,6 +225,7 @@ class ViewPreferences {
             : 13,
       _autoRecordKey: ?autoRecord,
       if (recordKeep != null) _recordKeepKey: _normalizeRecordKeep(recordKeep),
+      _askSessionNoteKey: ?askSessionNote,
     };
     final Map<String, Object?> scoped = <String, Object?>{
       if (fit != null) _fitKey: fit == 1 ? 1 : 0,
@@ -205,6 +234,7 @@ class ViewPreferences {
       _swapButtonsKey: ?swapButtons,
       _browserShowHiddenKey: ?browserShowHidden,
       _showMyCursorKey: ?showMyCursor,
+      _syncInitClipboardKey: ?syncInitClipboard,
       if (keyboardMode != null)
         _keyboardModeKey: _normalizeKeyboardMode(keyboardMode),
     };

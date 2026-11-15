@@ -1816,13 +1816,14 @@ func (s *Store) Authenticate(token string) (User, error) {
 	now := s.now().UTC()
 	// Authenticated traffic is the only evidence that a login is active. Touch
 	// at most once a minute so normal API reads do not turn into hot writes.
-	if _, err := s.db.Exec(
+	// This is bookkeeping for the online indicator: a failed touch must not
+	// reject an otherwise valid token, because every caller maps an
+	// Authenticate error to 401 and the client then discards its session.
+	_, _ = s.db.Exec(
 		`UPDATE user_tokens SET last_seen_at = ?
 		 WHERE token_hash = ? AND last_seen_at < ?`,
 		unixMillis(now), tokenHash(token), unixMillis(now.Add(-sessionTouchInterval)),
-	); err != nil {
-		return User{}, fmt.Errorf("account store %s: record session activity: %w", s.path, err)
-	}
+	)
 	user.CreatedAt = timeFromMillis(created)
 	return user, nil
 }
@@ -2439,6 +2440,16 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 		Groups:       groups,
 		GroupChanges: groupChanges,
 	}, nil
+}
+
+// currentRevision reads the per-user counter inside the caller's transaction.
+func currentRevision(tx *sql.Tx, userID string) (int64, error) {
+	var revision int64
+	err := tx.QueryRow(`SELECT book_revision FROM users WHERE id = ?`, userID).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrUnknownUser
+	}
+	return revision, err
 }
 
 // nextRevision advances the per-user counter inside the caller's transaction.

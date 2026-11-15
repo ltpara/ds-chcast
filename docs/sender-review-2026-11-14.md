@@ -131,7 +131,7 @@
 | --- | --- | --- | --- | --- |
 | G1 | 远程打印 | `src/`、`include/` 全量检索 `printer` 无主机会话路径 | `src/server/printer_service.rs` | 需要驱动部署，按客户需求立项 |
 | G2 | 切换控制方向 | 协议枚举无对应控制类型（`include/chast/protocol.h` `ControlType`） | `SwitchSidesRequest` | 跨双端 + 授权 + 重连设计 |
-| G3 | 白板自由标注 | 只有 `src/win/cursor_hint_paint.cc`（姓名/颜色/点击波纹） | `src/whiteboard`（1.4.9 仅光标与波纹，无持久笔迹） | 参照能力也有限，按产品需要单独立项 |
+| G3 | 白板自由标注 | 只有 `src/win/cursor_hint_paint.cc`（姓名/颜色/点击波纹） | `src/whiteboard`（1.5.1 仅光标与波纹，无持久笔迹） | v76 已实现 `Annotation`（89）自由手写，关闭该项；真实双机仍待验收 |
 | G4 | 软件 AV1 / VP8 | `encoder_factory.cc` 软件后端只接受 VP9 | libaom AV1、libvpx VP8/VP9 | 无 AV1 硬件的机器只能 H.264/HEVC/VP9 |
 | G5 | AV1 4:4:4 | `valid_video_format()`：4:4:4 仅 VP9（`encoder.h:57-60`） | VP9/AV1 均可 4:4:4 | 与 G4 一起评估 |
 | G6 | 便携特权辅助服务 / 远程管理员凭据提权 | 现有链路为 UAC 交接 + 重连 | `portable_service.rs`（Direct/Logon） | 免安装场景的安全桌面连续性 |

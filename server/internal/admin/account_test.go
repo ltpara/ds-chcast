@@ -230,7 +230,7 @@ func TestAccountConsoleCommands(t *testing.T) {
 	started := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
 	if _, err := s.Accounts.RecordConnection(
 		bob.ID, bob.Username, "devbox", "viewer", "127.0.0.1", "", "", "",
-		started, started.Add(time.Minute), true, "",
+		started, started.Add(time.Minute), true, "", "",
 	); err != nil {
 		t.Fatalf("record connection: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestAuditConsolePrune(t *testing.T) {
 	for _, at := range []time.Time{old, fresh} {
 		if _, err := s.Accounts.RecordConnection(
 			alice.ID, alice.Username, "devbox", "viewer", "127.0.0.1", "", "", "",
-			at, at.Add(time.Minute), true, "",
+			at, at.Add(time.Minute), true, "", "",
 		); err != nil {
 			t.Fatalf("record connection: %v", err)
 		}

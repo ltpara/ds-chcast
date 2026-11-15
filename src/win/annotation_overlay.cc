@@ -92,15 +92,28 @@ struct AnnotationOverlay::Impl {
         int height = 0;
     };
     HANDLE ready = nullptr;
+    // Set when run() returns, so the owner can stop waiting for a thread that
+    // never reaches its message loop instead of joining it forever.
+    HANDLE done = nullptr;
     std::thread thread;
     std::string create_error;
     std::atomic<bool> visible{false};
+    // The owner gave up on startup. A thread that was still inside a Win32
+    // call when that happened must not leave annotation windows behind.
+    std::atomic<bool> abandoned{false};
+    // Set once create_planes() has returned, after which `planes` is only
+    // mutated by the thread that later releases them on exit.
+    std::atomic<bool> startup_done{false};
     std::vector<Plane> planes;
     detail::AnnotationHistory history;
     uint32_t color = 0xFFFFFF;
     double ink_radius = 4.5;
 
+    ~Impl();
     void run(std::string label);
+    // Posts WM_CLOSE and waits for the thread to finish, detaching it instead
+    // of joining when it does not. See the definition for why.
+    void stop();
     bool create_planes(std::string* error);
     void release_planes();
     bool update_plane(Plane& plane, std::string* error);
@@ -471,6 +484,9 @@ bool AnnotationOverlay::Impl::create_planes(std::string* error) {
 }
 
 void AnnotationOverlay::Impl::run(std::string label) {
+    if (abandoned) {
+        return;
+    }
     HDESK desktop = OpenDesktopW(L"Default", 0, FALSE, kDefaultDesktopAccess);
     if (desktop == nullptr) {
         create_error = "OpenDesktopW(Default): " + win32_error(GetLastError());
@@ -485,6 +501,9 @@ void AnnotationOverlay::Impl::run(std::string label) {
         SetEvent(ready);
         return;
     }
+    if (abandoned) {
+        return;
+    }
     color = cursor_hint_color(label);
     const HDC screen = GetDC(nullptr);
     const int dpi = screen != nullptr ? GetDeviceCaps(screen, LOGPIXELSX) : 96;
@@ -496,7 +515,14 @@ void AnnotationOverlay::Impl::run(std::string label) {
         SetEvent(ready);
         return;
     }
+    startup_done = true;
     SetEvent(ready);
+    if (abandoned) {
+        // Startup timed out while the planes were being created; the owner has
+        // already detached this thread and nothing will ever close these.
+        release_planes();
+        return;
+    }
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -555,17 +581,39 @@ LRESULT CALLBACK AnnotationOverlay::Impl::window_proc(HWND window, UINT message,
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
-AnnotationOverlay::AnnotationOverlay() : impl_(std::make_unique<Impl>()) {}
+AnnotationOverlay::AnnotationOverlay() : impl_(std::make_shared<Impl>()) {}
 
 AnnotationOverlay::~AnnotationOverlay() {
-    if (!impl_->planes.empty() && impl_->planes.front().window != nullptr) {
-        PostMessageW(impl_->planes.front().window, WM_CLOSE, 0, 0);
+    impl_->stop();
+}
+
+AnnotationOverlay::Impl::~Impl() {
+    if (ready != nullptr) {
+        CloseHandle(ready);
     }
-    if (impl_->thread.joinable()) {
-        impl_->thread.join();
+    if (done != nullptr) {
+        CloseHandle(done);
     }
-    if (impl_->ready != nullptr) {
-        CloseHandle(impl_->ready);
+}
+
+void AnnotationOverlay::Impl::stop() {
+    abandoned = true;
+    // Before startup finishes the thread may still be appending planes, so
+    // there is no window to close yet: it releases them itself on the
+    // abandoned check that follows create_planes().
+    if (startup_done && !planes.empty() && planes.front().window != nullptr) {
+        PostMessageW(planes.front().window, WM_CLOSE, 0, 0);
+    }
+    if (!thread.joinable()) {
+        return;
+    }
+    // A thread stuck inside a Win32 call would never see WM_CLOSE, and joining
+    // it would hang the host on shutdown. The thread holds its own reference
+    // to this Impl, so it may finish after the overlay is gone.
+    if (done != nullptr && WaitForSingleObject(done, 2000) == WAIT_OBJECT_0) {
+        thread.join();
+    } else {
+        thread.detach();
     }
 }
 
@@ -574,23 +622,28 @@ std::unique_ptr<AnnotationOverlay> AnnotationOverlay::create(std::string* error,
     std::unique_ptr<AnnotationOverlay> overlay(new AnnotationOverlay());
     Impl& impl = *overlay->impl_;
     impl.ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (impl.ready == nullptr) {
+    impl.done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (impl.ready == nullptr || impl.done == nullptr) {
         *error = "CreateEvent: " + win32_error(GetLastError());
         return nullptr;
     }
     try {
-        impl.thread = std::thread([&impl, label] { impl.run(label); });
+        std::shared_ptr<Impl> state = overlay->impl_;
+        impl.thread = std::thread([state, label] {
+            state->run(label);
+            SetEvent(state->done);
+        });
     } catch (const std::exception& exception) {
         *error = std::string("annotation overlay thread: ") + exception.what();
         return nullptr;
     }
     const DWORD waited = WaitForSingleObject(impl.ready, 5000);
-    CloseHandle(impl.ready);
-    impl.ready = nullptr;
+    // Short-circuit keeps `planes` untouched unless the thread finished its
+    // startup: on a timeout it may still be appending planes.
     if (waited != WAIT_OBJECT_0 || impl.planes.empty()) {
         *error = !impl.create_error.empty() ? impl.create_error
                                             : "the annotation overlay did not start";
-        impl.thread.join();
+        // The destructor stops the thread without joining it unboundedly.
         return nullptr;
     }
     for (Impl::Plane& plane : impl.planes) {

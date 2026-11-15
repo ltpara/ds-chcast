@@ -134,11 +134,13 @@ func (e *csvExport) done() {
 	}
 }
 
-func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
+// The *CSV helpers take the group range the caller already resolved through
+// auditGroupFilter(). Re-reading ?group= here would let a group-scoped token
+// omit the parameter and export the unscoped trail.
+func (s *server) auditCSV(w http.ResponseWriter, r *http.Request, group string) {
 	action := r.URL.Query().Get("action")
 	user := strings.TrimSpace(r.URL.Query().Get("user"))
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
-	group := strings.TrimSpace(r.URL.Query().Get("group"))
 	bounds, ok := reportTimeBounds(w, r)
 	if !ok {
 		return
@@ -181,10 +183,10 @@ func (s *server) auditCSV(w http.ResponseWriter, r *http.Request) {
 	export.done()
 }
 
-func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
+func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request, group string) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
-	group := strings.TrimSpace(r.URL.Query().Get("group"))
+	note := strings.TrimSpace(r.URL.Query().Get("note"))
 	bounds, ok := reportTimeBounds(w, r)
 	if !ok {
 		return
@@ -192,7 +194,7 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 	export := s.newCSVExport(w, "chast-connections", "connection", []string{
 		"id", "started_at", "ended_at", "duration_ms", "username", "peer_id",
 		"host_id", "audit_ref", "source", "direction", "client_ip", "location",
-		"route", "success", "detail",
+		"route", "success", "detail", "note",
 	})
 	var before int64
 	for {
@@ -202,10 +204,10 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 		)
 		if group != "" {
 			events, err = s.cfg.Accounts.ConnectionsForGroupBeforeRange(
-				group, username, host, bounds, before, exportEventBatch)
+				group, username, host, note, bounds, before, exportEventBatch)
 		} else {
 			events, err = s.cfg.Accounts.ConnectionsForOperatorBeforeRange(
-				username, host, bounds, before, exportEventBatch)
+				username, host, note, bounds, before, exportEventBatch)
 		}
 		if err != nil {
 			export.fail(err, "could not read the connection log")
@@ -229,6 +231,7 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 				event.Route,
 				strconv.FormatBool(event.Success),
 				event.Detail,
+				event.Note,
 			})
 		}
 		if !export.write(rows) {
@@ -242,10 +245,9 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 	export.done()
 }
 
-func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request) {
+func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request, group string) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
-	group := strings.TrimSpace(r.URL.Query().Get("group"))
 	bounds, ok := reportTimeBounds(w, r)
 	if !ok {
 		return

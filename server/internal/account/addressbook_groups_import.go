@@ -247,6 +247,13 @@ func (s *Store) ImportAddressBookGroups(
 				return AddressBookGroupImportResult{}, fmt.Errorf("account store %s: import address book group: %w", s.path, err)
 			}
 		}
+	} else {
+		// A no-op import reports the current cursor, not a fresh revision: a
+		// zero would make the client treat the book as reset.
+		revision, err = currentRevision(tx, userID)
+		if err != nil {
+			return AddressBookGroupImportResult{}, fmt.Errorf("account store %s: read imported address book revision: %w", s.path, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return AddressBookGroupImportResult{}, fmt.Errorf("account store %s: commit address book group import: %w", s.path, err)
