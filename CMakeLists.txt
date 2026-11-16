@@ -707,6 +707,15 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-audio-playout-test tests/audio_playout_test.cc)
     target_link_libraries(chast-audio-playout-test PRIVATE chast.audio)
 
+    # Host-wide loopback fan-out: short stalls keep their packets, queue
+    # overflow and the 500 ms stale-age budget are counted separately.
+    add_executable(chast-shared-loopback-test tests/shared_loopback_test.cc
+        src/host/shared_loopback.cc)
+    target_include_directories(chast-shared-loopback-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-shared-loopback-test PRIVATE chast.audio)
+
     # Receive-side file handling: name sanitizing, resumable .part files and
     # digest verification, all inside a temporary directory.
     add_executable(chast-file-transfer-test tests/file_transfer_test.cc)
@@ -826,6 +835,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME audio COMMAND chast-audio-codec-test)
     add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
     add_test(NAME audio_playout COMMAND chast-audio-playout-test)
+    add_test(NAME shared_loopback COMMAND chast-shared-loopback-test)
+    set_tests_properties(shared_loopback PROPERTIES TIMEOUT 10)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
     add_test(NAME carrier COMMAND chast-carrier-test)
     add_test(NAME decoder_padding COMMAND chast-decoder-padding-test)
@@ -991,7 +1002,7 @@ if(CHAST_BUILD_TESTS)
     # rollover into a second segment. Both files are removed afterwards unless
     # --save is also given.
     add_test(NAME quic_recording
-        COMMAND chast-quic verify --port 45508 --seconds 4
+        COMMAND chast-quic verify --port 45514 --seconds 4
                 --record .chast-quic-record-test.mp4 --quiet)
     set_tests_properties(quic_recording PROPERTIES TIMEOUT 120)
     # The same recording probe with HEVC requested. Where the host cannot

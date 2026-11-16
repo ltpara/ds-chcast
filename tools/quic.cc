@@ -1948,6 +1948,7 @@ struct SenderStats {
     uint64_t audio_packets = 0;
     uint64_t audio_bytes = 0;
     uint64_t audio_dropped = 0;
+    uint64_t audio_stale_dropped = 0;
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
@@ -2829,6 +2830,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.audio_packets = status.stats.audio_packets;
     stats.audio_bytes = status.stats.audio_bytes;
     stats.audio_dropped = status.stats.audio_dropped;
+    stats.audio_stale_dropped = status.stats.audio_stale_dropped;
     stats.audio_errors = status.stats.audio_errors;
     stats.audio_capture_recoveries = status.stats.audio_capture_recoveries;
     stats.audio_gate_transitions = status.stats.audio_gate_transitions;
@@ -2933,7 +2935,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         }
         if (options.audio) {
             std::printf("sender: audio announced=%d active=%d %s %u Hz %u ch %u kbps "
-                        "packets=%llu bytes=%llu dropped=%llu errors=%llu "
+                        "packets=%llu bytes=%llu dropped=%llu stale=%llu errors=%llu "
                         "recoveries=%llu gates=%llu recovering=%d\n",
                         stats.audio_announced ? 1 : 0, stats.audio_active ? 1 : 0,
                         audio_codec_name(stats.audio_info.codec),
@@ -2942,6 +2944,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         static_cast<unsigned long long>(stats.audio_packets),
                         static_cast<unsigned long long>(stats.audio_bytes),
                         static_cast<unsigned long long>(stats.audio_dropped),
+                        static_cast<unsigned long long>(stats.audio_stale_dropped),
                         static_cast<unsigned long long>(stats.audio_errors),
                         static_cast<unsigned long long>(stats.audio_capture_recoveries),
                         static_cast<unsigned long long>(stats.audio_gate_transitions),
@@ -11139,6 +11142,13 @@ int run_verify(const Options& options) {
             check(sent.audio_errors == 0 && sent.audio_dropped == 0,
                   "the host's audio path reported no errors or drops");
         }
+        if (sent.audio_dropped > 0 || sent.audio_stale_dropped > 0) {
+            std::printf("     audio counters: queue drops %llu, stale drops %llu, "
+                        "errors %llu\n",
+                        static_cast<unsigned long long>(sent.audio_dropped),
+                        static_cast<unsigned long long>(sent.audio_stale_dropped),
+                        static_cast<unsigned long long>(sent.audio_errors));
+        }
         if (local.audio_stream) {
             check(!received.audio_datagram,
                   "the viewer's opt-out kept system audio on the reliable stream");
@@ -11562,7 +11572,7 @@ int run_weak_network(const Options& options) {
                       static_cast<double>(sent.audio_packets);
         std::printf("     audio: transport=%s sent %llu, received %llu (%.2f%% loss), "
                     "gaps %llu, reordered %llu, missing %llu, concealed %llu, "
-                    "host drops %llu, decoded %.2f s\n",
+                    "host drops %llu, stale %llu, decoded %.2f s\n",
                     received.audio_datagram ? "datagram" : "stream",
                     static_cast<unsigned long long>(sent.audio_packets),
                     static_cast<unsigned long long>(received.audio_received), lost_share,
@@ -11571,6 +11581,7 @@ int run_weak_network(const Options& options) {
                     static_cast<unsigned long long>(received.audio_missing),
                     static_cast<unsigned long long>(received.audio_concealed),
                     static_cast<unsigned long long>(sent.audio_dropped),
+                    static_cast<unsigned long long>(sent.audio_stale_dropped),
                     received.audio_seconds);
         if (local.play) {
             check(received.audio_player_error.empty() && received.audio_played > 0,
