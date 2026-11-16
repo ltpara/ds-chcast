@@ -28,6 +28,8 @@ class ViewPreferences {
     this.showMyCursor = false,
     this.syncInitClipboard = false,
     this.askSessionNote = false,
+    this.fitConfigured = false,
+    this.syncInitClipboardConfigured = false,
   });
 
   /// 0 = adaptive (fit the window), 1 = original pixels.
@@ -79,6 +81,12 @@ class ViewPreferences {
   /// Shared, because it describes how this viewer closes sessions, not a
   /// property of one device.
   final bool askSessionNote;
+
+  /// Distinguishes a saved local choice from the built-in default. Managed
+  /// Viewer settings in `default` mode use their recommendation only when no
+  /// local choice exists yet.
+  final bool fitConfigured;
+  final bool syncInitClipboardConfigured;
 
   static const String _fitKey = 'view_fit';
   static const String _statsKey = 'view_stats';
@@ -142,6 +150,8 @@ class ViewPreferences {
           ? rawSyncInitClipboard
           : false,
       askSessionNote: rawAskSessionNote is bool ? rawAskSessionNote : false,
+      fitConfigured: rawFit is int && (rawFit == 0 || rawFit == 1),
+      syncInitClipboardConfigured: rawSyncInitClipboard is bool,
     );
   }
 

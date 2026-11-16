@@ -147,6 +147,70 @@ void main() {
     expect(ticket.subject, 'alice');
   });
 
+  test('lookup parses an account-bound viewer strategy delivery', () async {
+    const String clientKey = 'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg';
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'online': true,
+          'viewer_strategy': <String, Object?>{
+            'context': 'viewer-context',
+            'expires_at_ms': DateTime.utc(2099).millisecondsSinceEpoch,
+            'snapshot': <String, Object?>{
+              'peer_id': 'devbox',
+              'target': 'viewer',
+              'revision': 4,
+              'digest':
+                  '0123456789abcdef0123456789abcdef'
+                  '0123456789abcdef0123456789abcdef',
+              'settings': <String, Object?>{
+                'viewer.view_fit': <String, Object?>{
+                  'mode': 'locked',
+                  'value': 1,
+                },
+              },
+            },
+          },
+        }),
+      );
+      await request.response.close();
+    });
+
+    final HostInfo host = await ServerApi.lookup(
+      settings,
+      'devbox',
+      accountToken: 'account-token',
+      clientPublicKey: clientKey,
+    );
+    expect(host.viewerStrategy, isNotNull);
+    expect(host.viewerStrategy!.context, 'viewer-context');
+    expect(host.viewerStrategy!.clientPublicKey, clientKey);
+    expect(host.viewerStrategy!.snapshot.revision, 4);
+    expect(host.viewerStrategy!.snapshot.settings.keys, <String>[
+      'viewer.view_fit',
+    ]);
+  });
+
+  test(
+    'lookup ignores viewer strategy without the client public key',
+    () async {
+      server.listen((HttpRequest request) async {
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'online': true,
+            'viewer_strategy': <String, Object?>{'context': 'unbound-context'},
+          }),
+        );
+        await request.response.close();
+      });
+
+      final HostInfo host = await ServerApi.lookup(settings, 'devbox');
+      expect(host.viewerStrategy, isNull);
+    },
+  );
+
   test('an empty access_ticket field is ignored', () async {
     server.listen((HttpRequest request) async {
       request.response.headers.contentType = ContentType.json;
@@ -681,6 +745,54 @@ void main() {
     expect(result.refreshToken, 'new-refresh');
     expect(result.username, 'alice');
   });
+
+  test(
+    'viewer strategy receipt uses the bound account and opaque context',
+    () async {
+      String? method;
+      Uri? requested;
+      String? authorization;
+      Object? body;
+      server.listen((HttpRequest request) async {
+        method = request.method;
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        body = jsonDecode(await utf8.decoder.bind(request).join());
+        request.response.headers.contentType = ContentType.json;
+        request.response.write('{}');
+        await request.response.close();
+      });
+      final Map<String, Object?> receipt = <String, Object?>{
+        'revision': 4,
+        'digest':
+            '0123456789abcdef0123456789abcdef'
+            '0123456789abcdef0123456789abcdef',
+        'sequence': 1,
+        'status': 'applied',
+        'results': <String, Object?>{
+          'viewer.view_fit': <String, Object?>{'status': 'applied'},
+        },
+      };
+
+      await ServerApi.reportViewerStrategyReceipt(
+        settings,
+        ' account-token ',
+        peerId: 'devbox',
+        context: 'viewer-context',
+        clientPublicKey: 'client-key',
+        receipt: receipt,
+      );
+
+      expect(method, 'POST');
+      expect(requested?.path, '/v1/account/device-strategies/devbox/receipt');
+      expect(authorization, 'Bearer account-token');
+      expect(body, <String, Object?>{
+        'context': 'viewer-context',
+        'client_public_key': 'client-key',
+        'receipt': receipt,
+      });
+    },
+  );
 
   test('refresh maps a rejected token to a signed-out error', () async {
     server.listen((HttpRequest request) async {

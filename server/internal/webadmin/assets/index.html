@@ -750,6 +750,34 @@
     </div>
   </dialog>
 
+  <dialog id="client-strategy-dialog" class="wide">
+    <form id="client-strategy-form" class="dialog-stack" autocomplete="off">
+      <h2 id="client-strategy-title">客户端设置</h2>
+      <p id="client-strategy-note" class="muted"></p>
+      <div id="client-strategy-fields" class="dialog-stack"></div>
+      <p id="client-strategy-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" id="client-strategy-reload">重新加载</button>
+        <span class="spacer"></span>
+        <button type="button" id="client-strategy-close">关闭</button>
+        <button type="submit" id="client-strategy-save">保存设置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="client-strategy-status-dialog" class="wide">
+    <div class="dialog-stack">
+      <h2 id="client-strategy-status-title">客户端设置状态</h2>
+      <p id="client-strategy-status-note" class="muted"></p>
+      <div id="client-strategy-status-results" class="dialog-stack"></div>
+      <div class="dialog-actions">
+        <button type="button" id="client-strategy-status-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button type="button" id="client-strategy-status-close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
   <script src="app.js"></script>
 </body>
 </html>

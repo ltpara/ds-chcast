@@ -11,6 +11,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
+	"github.com/ltpara/ds-chcast/server/internal/strategy"
 )
 
 type policyObjectView struct {
@@ -36,11 +37,17 @@ type policyObjectRequest struct {
 const maxPolicyImportBody = 1 << 20
 
 type policyObjectExport struct {
-	Name              string   `json:"name"`
-	Mode              string   `json:"mode"`
-	PermissionCeiling uint32   `json:"permission_ceiling"`
-	AllowedUsers      []string `json:"allowed_users"`
-	AllowedGroups     []string `json:"allowed_groups"`
+	Name              string             `json:"name"`
+	Mode              string             `json:"mode"`
+	PermissionCeiling uint32             `json:"permission_ceiling"`
+	AllowedUsers      []string           `json:"allowed_users"`
+	AllowedGroups     []string           `json:"allowed_groups"`
+	ClientSettings    *strategy.Settings `json:"client_settings,omitempty"`
+}
+
+type policyObjectImportRequest struct {
+	policyObjectRequest
+	ClientSettings *strategy.Settings `json:"client_settings,omitempty"`
 }
 
 type policyExportDocument struct {
@@ -50,10 +57,10 @@ type policyExportDocument struct {
 }
 
 type policyImportRequest struct {
-	Format   string                `json:"format"`
-	Version  int                   `json:"version"`
-	Conflict string                `json:"conflict,omitempty"`
-	Policies []policyObjectRequest `json:"policies"`
+	Format   string                      `json:"format"`
+	Version  int                         `json:"version"`
+	Conflict string                      `json:"conflict,omitempty"`
+	Policies []policyObjectImportRequest `json:"policies"`
 }
 
 type policyImportView struct {
@@ -160,7 +167,16 @@ func (s *server) exportPolicyObjects(w http.ResponseWriter, r *http.Request) {
 		Policies: make([]policyObjectExport, 0, len(policies)),
 	}
 	for _, policy := range policies {
+		config, err := s.cfg.Accounts.ClientStrategy(policy.ID)
+		if err != nil {
+			s.writeClientStrategyError(w, err)
+			return
+		}
+		if config.Revision > 0 {
+			doc.Version = 2
+		}
 		item := policyObjectExport{
+			ClientSettings:    &config.Settings,
 			Name:              policy.Name,
 			Mode:              policy.Mode,
 			PermissionCeiling: policy.PermissionCeiling,
@@ -174,6 +190,11 @@ func (s *server) exportPolicyObjects(w http.ResponseWriter, r *http.Request) {
 			item.AllowedGroups = []string{}
 		}
 		doc.Policies = append(doc.Policies, item)
+	}
+	if doc.Version == 1 {
+		for i := range doc.Policies {
+			doc.Policies[i].ClientSettings = nil
+		}
 	}
 	writeJSON(w, http.StatusOK, doc)
 }
@@ -192,8 +213,8 @@ func (s *server) importPolicyObjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "format must be chast-policy-objects")
 		return
 	}
-	if req.Version != 1 {
-		writeError(w, http.StatusBadRequest, "version must be 1")
+	if req.Version != 1 && req.Version != 2 {
+		writeError(w, http.StatusBadRequest, "version must be 1 or 2")
 		return
 	}
 	if req.Policies == nil {
@@ -202,7 +223,16 @@ func (s *server) importPolicyObjects(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]account.PolicyObjectImport, 0, len(req.Policies))
 	for _, policy := range req.Policies {
+		if req.Version == 1 && policy.ClientSettings != nil {
+			writeError(w, http.StatusBadRequest, "client_settings requires version 2")
+			return
+		}
+		if req.Version == 2 && policy.ClientSettings == nil {
+			writeError(w, http.StatusBadRequest, "version 2 requires client_settings on every policy")
+			return
+		}
 		items = append(items, account.PolicyObjectImport{
+			ClientSettings:    policy.ClientSettings,
 			Name:              policy.Name,
 			Mode:              policy.Mode,
 			PermissionCeiling: policy.PermissionCeiling,
@@ -212,6 +242,10 @@ func (s *server) importPolicyObjects(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.cfg.Accounts.ImportPolicyObjects(items, req.Conflict, principal.Actor)
 	if err != nil {
+		if errors.Is(err, strategy.ErrInvalid) || errors.Is(err, account.ErrStrategyConflict) {
+			s.writeClientStrategyError(w, err)
+			return
+		}
 		writePolicyObjectError(w, err)
 		return
 	}

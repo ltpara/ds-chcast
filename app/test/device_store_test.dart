@@ -329,7 +329,7 @@ void main() {
       };
       for (final String id in <String>['alpha', 'beta']) {
         expect(after[id]!.groupId, isEmpty);
-        expect(after[id]!.groupCleared, isTrue);
+        expect(after[id]!.groupCleared, isFalse);
         expect(after[id]!.revision, 12);
       }
       expect(after['gamma']!.groupId, 'lab');
@@ -610,4 +610,77 @@ void main() {
     await file.writeAsString('[{"id": ');
     expect(await store.load(), isEmpty);
   });
+  test(
+    'dirty fields survive persistence and unrelated local operations',
+    () async {
+      final cached = Device(
+        id: 'pc',
+        server: 'http://localhost:8443',
+        name: 'Old',
+        tags: const ['tag'],
+        note: 'note',
+        groupId: 'group',
+        saved: true,
+        revision: 5,
+        addedAt: DateTime(2026),
+      );
+      await store.replaceAll([cached]);
+      await store.rename(cached.key, 'New');
+      await store.updateTags(cached.key, []);
+      await store.updateNote(cached.key, 'updated');
+      await store.updateGroup(cached.key, '');
+      await store.touch(
+        Device(id: cached.id, server: cached.server, addedAt: DateTime(2026)),
+      );
+      await store.setFavorite(cached.key, true);
+      final reloaded = DeviceStore(file: file);
+      expect((await reloaded.load()).single.dirtyFields, 15);
+      expect((await reloaded.load()).single.revision, 5);
+      await reloaded.markPushSettled(cached.key, name: true, tags: true);
+      final partlySettled = (await reloaded.load()).single;
+      expect(partlySettled.dirtyFields, Device.noteField | Device.groupField);
+      expect(partlySettled.tagsCleared, isFalse);
+      expect(partlySettled.groupCleared, isTrue);
+    },
+  );
+  test('a late acknowledgement keeps an edit made while uploading', () async {
+    final cached = Device(
+      id: 'pc',
+      server: 'http://localhost:8443',
+      name: 'Old',
+      saved: true,
+      revision: 5,
+      addedAt: DateTime(2026),
+    );
+    await store.replaceAll([cached]);
+    final sent = (await store.rename(cached.key, 'First')).single;
+    await store.rename(cached.key, 'Second');
+    await store.setPeerRevision(cached.key, 6);
+    await store.markPushSettled(cached.key, name: true, expected: sent);
+    final pending = (await store.load()).single;
+    expect(pending.name, 'Second');
+    expect(pending.dirtyFields, Device.nameField);
+    expect(pending.revision, 6);
+    await store.markPushSettled(cached.key, name: true, expected: pending);
+    expect((await store.load()).single.dirtyFields, 0);
+  });
+
+  test(
+    'saving an unchanged empty group does not create a clear intent',
+    () async {
+      final cached = Device(
+        id: 'pc',
+        server: 'http://localhost:8443',
+        name: 'Old',
+        saved: true,
+        revision: 5,
+        addedAt: DateTime(2026),
+      );
+      await store.replaceAll([cached]);
+      await store.save(cached);
+      final unchanged = (await store.load()).single;
+      expect(unchanged.groupCleared, isFalse);
+      expect(unchanged.dirtyFields, 0);
+    },
+  );
 }

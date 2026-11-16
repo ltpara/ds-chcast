@@ -104,7 +104,7 @@ bool same_access_keys(const std::vector<chast::HostSettings::AccessKeyPin>& a,
 
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
-           a.max_viewers == b.max_viewers &&
+           a.max_viewers == b.max_viewers && a.lan_discovery == b.lan_discovery &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.clipboard_direction == b.clipboard_direction &&
            a.allow_file_transfer == b.allow_file_transfer &&
@@ -157,6 +157,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.bind_address = "192.168.1.5";
     settings.port = 6100;
     settings.carrier = false;
+    settings.lan_discovery = false;
     settings.max_viewers = 3;
     settings.allow_input = false;
     settings.allow_clipboard = false;
@@ -1259,6 +1260,64 @@ void test_memory_snapshot(const std::filesystem::path& dir) {
     check(!std::filesystem::exists(path), "memory snapshot does not write secrets to disk");
 }
 
+void test_managed_default_preferences() {
+    using chast::HostPreference;
+    std::string text, error;
+    chast::HostSettings fresh;
+    fresh.access_token = "rotated-token";
+    check(chast::serialize_host_settings("host.ini", fresh, text, &error),
+          "a routine identity save serializes fresh settings");
+    auto loaded = chast::parse_host_settings(text, "host.ini");
+    check(loaded.warning.empty() && loaded.settings.explicit_preferences == 0,
+          "routine saves do not turn built-in defaults into local choices");
+    check(text.find("keep_awake=") == std::string::npos &&
+          text.find("max_viewers=") == std::string::npos,
+          "inherited managed preferences stay absent from the file");
+
+    const auto legacy = chast::parse_host_settings(
+        "keep_awake=1\ncarrier=1\nmax_viewers=2\nauto_disconnect_minutes=0\n"
+        "lock_after_session_end=0\nlan_discovery=1\n", "host.ini");
+    check(legacy.warning.empty() && legacy.settings.explicit_preferences == 63,
+          "legacy values conservatively keep their local intent, even at defaults");
+    check(chast::serialize_host_settings("host.ini", legacy.settings, text, &error) &&
+          chast::parse_host_settings(text, "host.ini").settings.explicit_preferences == 63,
+          "explicit built-in values survive serialization and process handoff");
+
+    fresh.keep_awake = false;
+    check(chast::host_preference_is_explicit(fresh, HostPreference::KeepAwake),
+          "a programmatically configured non-default is a local choice");
+    chast::mark_host_preference(fresh, HostPreference::KeepAwake);
+    fresh.keep_awake = true;
+    check(chast::serialize_host_settings("host.ini", fresh, text, &error),
+          "a deliberate reset to the built-in value serializes");
+    loaded = chast::parse_host_settings(text, "host.ini");
+    check(loaded.settings.keep_awake &&
+          chast::host_preference_is_explicit(loaded.settings, HostPreference::KeepAwake) &&
+          !chast::host_preference_is_explicit(loaded.settings, HostPreference::Carrier),
+          "a reset remains explicit without marking unrelated settings");
+
+    const auto invalid = chast::parse_host_settings(
+        "keep_awake=invalid\nmax_viewers=99\nlan_discovery=invalid\n", "host.ini");
+    check(!invalid.warning.empty() && invalid.settings.explicit_preferences == 0 &&
+          invalid.settings.lan_discovery,
+          "invalid preferences warn without creating explicit choices");
+    const auto discovery = chast::parse_host_settings("lan_discovery=0\n", "host.ini");
+    check(discovery.warning.empty() && !discovery.settings.lan_discovery &&
+          chast::host_preference_is_explicit(discovery.settings, HostPreference::LanDiscovery),
+          "the responding host can persistently disable LAN discovery");
+
+    auto original = chast::parse_host_settings("keep_awake=0\n", "host.ini").settings;
+    auto edited = original;
+    edited.keep_awake = true;
+    chast::HostSettings merged;
+    check(chast::host::merge_service_settings(original, edited, original,
+              chast::host::ServiceSettingsPage::Security, merged, &error) &&
+          chast::serialize_host_settings("host.ini", merged, text, &error) &&
+          chast::host_preference_is_explicit(
+              chast::parse_host_settings(text, "host.ini").settings, HostPreference::KeepAwake),
+          "the service editor retains an explicit reset to the built-in value");
+}
+
 }  // namespace
 
 int main() {
@@ -1286,6 +1345,7 @@ int main() {
     test_managed_policy_ack(dir);
     test_unicode_path(dir);
     test_memory_snapshot(dir);
+    test_managed_default_preferences();
     test_service_settings_merge();
     test_windows_session_selection();
     std::error_code ec;

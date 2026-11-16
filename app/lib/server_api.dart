@@ -7,6 +7,7 @@ import 'package:crypto/crypto.dart';
 import 'server_identity.dart';
 import 'server_settings.dart';
 import 'tunnel_proxy.dart';
+import 'viewer_strategy.dart';
 import 'package:chast_viewer/l10n.dart';
 
 /// The short-lived credential a managed host requires at Hello (v62).
@@ -76,6 +77,7 @@ class HostInfo {
     this.lastSeenMs = 0,
     this.expiresInMs = 0,
     this.accessTicket,
+    this.viewerStrategy,
   });
 
   final String id;
@@ -102,15 +104,24 @@ class HostInfo {
   /// the account is allowed to reach this managed device.
   final HostAccessTicket? accessTicket;
 
+  /// A per-lookup, account-bound viewer strategy delivery. It is absent for
+  /// unauthenticated lookups, emergency access and malformed deliveries.
+  final ViewerStrategyDelivery? viewerStrategy;
+
   bool get hasRelay => relay.isNotEmpty;
   bool get hasDirectCandidate => candidate.isNotEmpty;
 
-  static HostInfo fromJson(Map<Object?, Object?> map, String fallbackId) {
+  static HostInfo fromJson(
+    Map<Object?, Object?> map,
+    String fallbackId, {
+    String clientPublicKey = '',
+  }) {
     String text(Object? value) => value?.toString() ?? '';
     int number(Object? value) => (value as num?)?.toInt() ?? 0;
     final Object? rawTags = map['tags'];
+    final String id = text(map['id']).isEmpty ? fallbackId : text(map['id']);
     return HostInfo(
-      id: text(map['id']).isEmpty ? fallbackId : text(map['id']),
+      id: id,
       online: map['online'] == true,
       candidate: text(map['candidate']),
       relay: text(map['relay']),
@@ -126,6 +137,13 @@ class HostInfo {
       lastSeenMs: number(map['last_seen_ms']),
       expiresInMs: number(map['expires_in_ms']),
       accessTicket: HostAccessTicket.fromJson(map['access_ticket']),
+      viewerStrategy: clientPublicKey.trim().isEmpty
+          ? null
+          : ViewerStrategyDelivery.fromJson(
+              map['viewer_strategy'],
+              expectedPeer: id,
+              clientPublicKey: clientPublicKey,
+            ),
     );
   }
 }
@@ -1351,7 +1369,7 @@ class ServerApi {
     if (decoded is! Map) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
-    return HostInfo.fromJson(decoded, id);
+    return HostInfo.fromJson(decoded, id, clientPublicKey: clientPublicKey);
   }
 
   /// One address-book presence refresh for [hostIds] in a single round trip.
@@ -2507,6 +2525,53 @@ class ServerApi {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
     return result;
+  }
+
+  /// Reports how this viewer applied the strategy delivered by one exact
+  /// lookup. The opaque context binds the receipt to the account, device,
+  /// snapshot and client key; callers must keep all of them together.
+  static Future<void> reportViewerStrategyReceipt(
+    ServerSettings settings,
+    String token, {
+    required String peerId,
+    required String context,
+    required String clientPublicKey,
+    required Map<String, Object?> receipt,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final String peer = peerId.trim();
+    final String deliveryContext = context.trim();
+    final String clientKey = clientPublicKey.trim();
+    if (!RegExp(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$').hasMatch(peer) ||
+        deliveryContext.isEmpty ||
+        deliveryContext.length > 128 ||
+        clientKey.isEmpty ||
+        clientKey.length > 4096) {
+      throw ServerApiException(tr('查看端策略回执上下文无效'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse(
+        '${settings.url}/v1/account/device-strategies/'
+        '${Uri.encodeComponent(peer)}/receipt',
+      );
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{
+        'context': deliveryContext,
+        'client_public_key': clientKey,
+        'receipt': receipt,
+      },
+      conflict: tr('查看端策略已更新，请重新连接'),
+      badRequest: tr('查看端策略回执无效'),
+    );
   }
 
   /// Reports one finished remote session to the account's server. The server

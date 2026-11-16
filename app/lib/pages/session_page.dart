@@ -31,6 +31,7 @@ import '../trust_store.dart';
 import '../tunnel_agent.dart';
 import '../view_prefs.dart';
 import '../viewer_bridge.dart';
+import '../viewer_strategy.dart';
 import '../widgets/camera_panel.dart';
 import '../widgets/display_stream_view.dart';
 import '../widgets/chat_panel.dart';
@@ -57,6 +58,36 @@ typedef SessionConnectionReporter =
       required String route,
     });
 
+typedef SessionHostLookup =
+    Future<HostInfo> Function({
+      required ServerSettings settings,
+      required String hostId,
+      required String accountToken,
+      required String clientPublicKey,
+    });
+
+typedef SessionViewerStrategyReceiptReporter =
+    Future<void> Function({
+      required ServerSettings settings,
+      required String accountToken,
+      required String peerId,
+      required String context,
+      required String clientPublicKey,
+      required Map<String, Object?> receipt,
+    });
+
+typedef SessionTunnelStarter =
+    Future<TunnelConnection> Function({
+      required ServerSettings server,
+      required String hostId,
+      required String accountToken,
+      required String serverPublicKey,
+      required EmergencyAccessRequest? emergency,
+    });
+
+typedef SessionServerIdentityLoader =
+    Future<ServerIdentity> Function(ServerSettings settings);
+
 class SessionPage extends StatefulWidget {
   const SessionPage({
     super.key,
@@ -71,6 +102,12 @@ class SessionPage extends StatefulWidget {
     this.windowSession = false,
     this.initialDisplay = 65535,
     this.connectionReporter,
+    this.accountResolver,
+    this.recordingUploader,
+    this.hostLookup,
+    this.serverIdentityLoader,
+    this.viewerStrategyReceiptReporter,
+    this.tunnelStarter,
   });
 
   final ConnectTarget target;
@@ -105,6 +142,20 @@ class SessionPage extends StatefulWidget {
   /// Test seam for the final account audit request. Production uses
   /// [ServerApi.reportConnection].
   final SessionConnectionReporter? connectionReporter;
+
+  /// Injectable boundaries for account renewal and recording archive tests.
+  final Future<AccountSession?> Function()? accountResolver;
+  final Future<void> Function(
+    AccountSession account,
+    File file,
+    DateTime startedAt,
+    DateTime endedAt,
+  )?
+  recordingUploader;
+  final SessionHostLookup? hostLookup;
+  final SessionServerIdentityLoader? serverIdentityLoader;
+  final SessionViewerStrategyReceiptReporter? viewerStrategyReceiptReporter;
+  final SessionTunnelStarter? tunnelStarter;
 
   /// The signed-in account, if any. It is used to report a finished remote
   /// session and, when enabled, to upload finished recordings.
@@ -145,6 +196,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Timer? _ticketTimer;
   bool _ticketRenewBusy = false;
   String _ticketPublicKey = '';
+  late ViewerLocalSettings _viewerLocalSettings;
+  ViewerStrategyDelivery? _viewerStrategyDelivery;
+  AccountSession? _viewerStrategyAccount;
+  String _viewerStrategyIdentity = '';
+  bool _viewerStrategyResolved = false;
+  bool _viewerStrategyReceiptSucceeded = false;
+  int _viewerGeneration = 0;
+  int _widgetRestartGeneration = 0;
+  TunnelMode _sessionTunnelMode = TunnelMode.auto;
+  bool _sessionUseWebSocket = false;
+  bool _sessionUploadRecordings = false;
+  bool _sessionSyncInitClipboard = false;
   // The account this page sees. A token refreshed here is written back to the
   // shared store so ticket renewal and audit reports survive the 30-minute
   // access-token lifetime.
@@ -167,6 +230,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   final Map<String, DateTime> _recordStartedAt = <String, DateTime>{};
   final List<_FinishedRecording> _recordingUploads = <_FinishedRecording>[];
   bool _uploadingRecordings = false;
+  Timer? _recordingRetryTimer;
+  String _recordingUploadError = '';
   // An upload holds its file open, so retention must not delete it.
   String _activeUploadPath = '';
   // Recording policy. Auto-record starts once per live session when the host
@@ -380,8 +445,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   int _challengeDenial = 0;
   // One tunnel per connection attempt. Reconnects must look up the host again:
   // a running helper can still hold a dead NAT mapping or an expired token.
-  TunnelAgent? _tunnel;
-  Future<TunnelAgent>? _tunnelStarting;
+  TunnelConnection? _tunnel;
+  Future<TunnelConnection>? _tunnelStarting;
   // Explicit management override for a restricted device. The administrator
   // token is collected on demand and kept only in memory; the tunnel agent
   // re-signs the override on transport refresh, so this mode never does an
@@ -501,14 +566,61 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       reverseWheel: viewPrefs.reverseWheel,
       swapButtons: viewPrefs.swapButtons,
     );
+    _viewerLocalSettings = ViewerLocalSettings(
+      tunnelMode: widget.target.mode,
+      useWebSocket: widget.settings.useWebSocket,
+      uploadRecordings: widget.settings.uploadRecordings,
+      syncInitialClipboard: viewPrefs.syncInitClipboard,
+      viewFit: viewPrefs.fit,
+      tunnelModeSet: widget.settings.modeConfigured,
+      useWebSocketSet: widget.settings.useWebSocketConfigured,
+      uploadRecordingsSet: widget.settings.uploadRecordingsConfigured,
+      syncInitialClipboardSet: viewPrefs.syncInitClipboardConfigured,
+      viewFitSet: viewPrefs.fitConfigured,
+    );
+    _applyLocalViewerSettings();
     _starting = _start();
     unawaited(_starting);
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_sameSessionIdentity(oldWidget, widget)) {
+      return;
+    }
+    _account = widget.account;
+    _resetViewerStrategyForIdentity();
+    unawaited(_restartForWidgetIdentity());
+  }
+
+  bool _sameSessionIdentity(SessionPage oldWidget, SessionPage nextWidget) {
+    bool sameAccount(AccountSession? left, AccountSession? right) {
+      if (left == null || right == null) {
+        return left == null && right == null;
+      }
+      return normalizeServerUrl(left.server) ==
+              normalizeServerUrl(right.server) &&
+          left.username.trim() == right.username.trim();
+    }
+
+    return oldWidget.target.trustKey == nextWidget.target.trustKey &&
+        oldWidget.target.mode == nextWidget.target.mode &&
+        oldWidget.target.serverKey == nextWidget.target.serverKey &&
+        oldWidget.target.linkKey == nextWidget.target.linkKey &&
+        oldWidget.settings.url == nextWidget.settings.url &&
+        oldWidget.settings.mode == nextWidget.settings.mode &&
+        oldWidget.settings.useWebSocket == nextWidget.settings.useWebSocket &&
+        oldWidget.settings.uploadRecordings ==
+            nextWidget.settings.uploadRecordings &&
+        sameAccount(oldWidget.account, nextWidget.account);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
+    _recordingRetryTimer?.cancel();
     ViewerBridge.setDropHandler(null);
     ViewerBridge.setKeyboardEscapeHandler(null);
     ViewerBridge.setKeyboardTextRejectedHandler(null);
@@ -863,93 +975,108 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   void _queueRecordingUpload(String path, DateTime? startedAt) {
     final AccountSession? account = _account;
-    if (account == null ||
-        !account.isActiveAt(DateTime.now()) ||
-        !widget.settings.uploadRecordings) {
+    if (account == null || !_sessionUploadRecordings) {
       return;
     }
-    _recordingUploads.add(_FinishedRecording(path: path, startedAt: startedAt));
+    _recordingUploads.add(
+      _FinishedRecording(
+        path: path,
+        startedAt: startedAt,
+        endedAt: DateTime.now(),
+      ),
+    );
     unawaited(_processRecordingUploads());
   }
 
+  void _retryRecordingUpload() {
+    if (!mounted || _closing) return;
+    _recordingRetryTimer ??= Timer(const Duration(seconds: 10), () {
+      _recordingRetryTimer = null;
+      unawaited(_processRecordingUploads());
+    });
+  }
+
   Future<void> _processRecordingUploads() async {
-    if (_uploadingRecordings) {
-      return;
-    }
+    if (_uploadingRecordings || _recordingRetryTimer != null) return;
     _uploadingRecordings = true;
     try {
       while (_recordingUploads.isNotEmpty) {
-        final _FinishedRecording job = _recordingUploads.removeAt(0);
-        final AccountSession? account = await _activeAccount();
-        if (account == null ||
-            !account.isActiveAt(DateTime.now()) ||
-            !widget.settings.uploadRecordings) {
-          continue;
-        }
-        final File file = File(job.path);
+        // Keep the job protected from retention throughout renewal and retry.
+        final _FinishedRecording job = _recordingUploads.first;
+        _activeUploadPath = job.path;
         try {
+          final AccountSession? account = await _activeAccount();
+          if (account == null || !account.isActiveAt(DateTime.now())) {
+            throw ServerApiException(tr('账号登录已过期，请重新登录'), statusCode: 401);
+          }
+          final File file = File(job.path);
           if (!await file.exists() || await file.length() <= 0) {
+            _recordingUploads.removeAt(0);
             continue;
           }
           final String name = _recordingFileName(job.path);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(
-                  tr('正在上传录制：{name}', <String, Object?>{'name': name}),
-                ),
+                content: Text(tr('正在上传录制：{name}', {'name': name})),
                 duration: const Duration(seconds: 2),
               ),
             );
           }
-          final DateTime endedAt = DateTime.now();
-          final DateTime startedAt = job.startedAt ?? endedAt;
-          _activeUploadPath = job.path;
-          await ServerApi.uploadRecording(
-            ServerSettings(url: account.server),
-            account.token,
-            file: file,
-            name: name,
-            peerId: widget.target.hostId.isNotEmpty
-                ? widget.target.hostId
-                : widget.target.label,
-            startedAtMs: startedAt.toUtc().millisecondsSinceEpoch,
-            durationMs: endedAt.difference(startedAt).inMilliseconds,
-          );
+          final DateTime startedAt = job.startedAt ?? job.endedAt;
+          final uploader = widget.recordingUploader;
+          if (uploader != null) {
+            await uploader(account, file, startedAt, job.endedAt);
+          } else {
+            await ServerApi.uploadRecording(
+              ServerSettings(url: account.server),
+              account.token,
+              file: file,
+              name: name,
+              peerId: widget.target.hostId.isNotEmpty
+                  ? widget.target.hostId
+                  : widget.target.label,
+              startedAtMs: startedAt.toUtc().millisecondsSinceEpoch,
+              durationMs: job.endedAt.difference(startedAt).inMilliseconds,
+            );
+          }
+          _recordingUploads.removeAt(0);
+          _recordingUploadError = '';
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(
-                  tr('录制已上传：{name}', <String, Object?>{'name': name}),
-                ),
+                content: Text(tr('录制已上传：{name}', {'name': name})),
                 duration: const Duration(seconds: 3),
               ),
             );
           }
-        } on ServerApiException catch (error) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  tr('录制上传失败：{error}', <String, Object?>{
-                    'error': error.message,
-                  }),
-                ),
-                duration: const Duration(seconds: 4),
-              ),
-            );
-          }
         } catch (error) {
-          if (mounted) {
+          final String message = error is ServerApiException
+              ? error.message
+              : '$error';
+          if (mounted && message != _recordingUploadError) {
+            _recordingUploadError = message;
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(
-                  tr('录制上传失败：{error}', <String, Object?>{'error': error}),
-                ),
+                content: Text(tr('录制上传失败：{error}', {'error': message})),
                 duration: const Duration(seconds: 4),
               ),
             );
           }
+          final bool retry =
+              error is! FileSystemException &&
+              (error is! ServerApiException ||
+                  error.statusCode == null ||
+                  error.statusCode == 0 ||
+                  error.statusCode == 401 ||
+                  error.statusCode == 408 ||
+                  error.statusCode == 429 ||
+                  (error.statusCode ?? 0) >= 500);
+          if (retry) {
+            _retryRecordingUpload();
+            return;
+          }
+          _recordingUploads.removeAt(0);
         } finally {
           _activeUploadPath = '';
         }
@@ -1044,13 +1171,193 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     return account.token;
   }
 
+  bool _accountMatchesTarget(AccountSession account, String targetServer) {
+    final String accountServer = normalizeServerUrl(account.server);
+    final String nextServer = normalizeServerUrl(targetServer);
+    return accountServer.isNotEmpty && accountServer == nextServer;
+  }
+
+  void _applyLocalViewerSettings() {
+    final ViewerLocalSettings local = _viewerLocalSettings;
+    _sessionTunnelMode = local.tunnelMode;
+    _sessionUseWebSocket = local.useWebSocket;
+    _sessionUploadRecordings = local.uploadRecordings;
+    _sessionSyncInitClipboard = local.syncInitialClipboard;
+    _fit = local.viewFit == 1 ? ViewFit.original : ViewFit.adaptive;
+  }
+
+  String _viewerStrategyBinding(AccountSession account) {
+    return '${normalizeServerUrl(account.server)}\x00'
+        '${account.username.trim()}\x00${widget.target.hostId.trim()}';
+  }
+
+  void _bindViewerStrategyIdentity(String binding) {
+    if (_viewerStrategyIdentity == binding) {
+      return;
+    }
+    _viewerStrategyIdentity = binding;
+    _viewerStrategyDelivery = null;
+    _viewerStrategyAccount = null;
+    _viewerStrategyResolved = false;
+    _viewerStrategyReceiptSucceeded = false;
+    _applyLocalViewerSettings();
+  }
+
+  void _resetViewerStrategyForIdentity() {
+    ++_viewerGeneration;
+    _viewerStrategyDelivery = null;
+    _viewerStrategyAccount = null;
+    _viewerStrategyIdentity = '';
+    _viewerStrategyResolved = false;
+    _viewerStrategyReceiptSucceeded = false;
+    _ticketPublicKey = '';
+    _ticketRenewBusy = false;
+    final ViewPreferences viewPrefs = ViewPreferences.load(
+      peerId: widget.target.preferencesKey,
+    );
+    _viewerLocalSettings = ViewerLocalSettings(
+      tunnelMode: widget.target.mode,
+      useWebSocket: widget.settings.useWebSocket,
+      uploadRecordings: widget.settings.uploadRecordings,
+      syncInitialClipboard: viewPrefs.syncInitClipboard,
+      viewFit: viewPrefs.fit,
+      tunnelModeSet: widget.settings.modeConfigured,
+      useWebSocketSet: widget.settings.useWebSocketConfigured,
+      uploadRecordingsSet: widget.settings.uploadRecordingsConfigured,
+      syncInitialClipboardSet: viewPrefs.syncInitClipboardConfigured,
+      viewFitSet: viewPrefs.fitConfigured,
+    );
+    _syncInitClipboard = viewPrefs.syncInitClipboard;
+    _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+    _applyLocalViewerSettings();
+  }
+
+  Future<void> _restartForWidgetIdentity() async {
+    final int restart = ++_widgetRestartGeneration;
+    _cancelAutoReconnect();
+    _stopPolling();
+    _ticketTimer?.cancel();
+    _ticketTimer = null;
+    await _starting;
+    if (_closing || restart != _widgetRestartGeneration) {
+      return;
+    }
+    _teardown = null;
+    await _stopSession();
+    await _stopTunnel();
+    if (_closing || restart != _widgetRestartGeneration) {
+      return;
+    }
+    _status = const ViewerStatus();
+    _sawFrame = false;
+    _over = false;
+    _controlEnabled = false;
+    _startError = null;
+    _starting = _start();
+    await _starting;
+  }
+
+  Future<HostInfo> _lookupHost(
+    ServerSettings settings,
+    AccountSession account,
+    String clientPublicKey,
+  ) {
+    final SessionHostLookup? injected = widget.hostLookup;
+    if (injected != null) {
+      return injected(
+        settings: settings,
+        hostId: widget.target.hostId,
+        accountToken: account.token,
+        clientPublicKey: clientPublicKey,
+      );
+    }
+    return ServerApi.lookup(
+      settings,
+      widget.target.hostId,
+      accountToken: account.token,
+      clientPublicKey: clientPublicKey,
+    );
+  }
+
+  void _captureViewerStrategy(AccountSession account, HostInfo info) {
+    if (_viewerStrategyResolved) {
+      if (_viewerStrategyDelivery != null) {
+        _viewerStrategyAccount = account;
+      }
+      return;
+    }
+    _bindViewerStrategyIdentity(_viewerStrategyBinding(account));
+    _viewerStrategyResolved = true;
+    _viewerStrategyReceiptSucceeded = false;
+    final ViewerStrategyDelivery? delivery = info.viewerStrategy;
+    _viewerStrategyDelivery = delivery;
+    _viewerStrategyAccount = account;
+    final ViewerEffectiveSettings effective = ViewerEffectiveSettings.resolve(
+      _viewerLocalSettings,
+      delivery: delivery,
+    );
+    _sessionTunnelMode = effective.tunnelMode;
+    _sessionUseWebSocket = effective.useWebSocket;
+    _sessionUploadRecordings = effective.uploadRecordings;
+    _sessionSyncInitClipboard = effective.syncInitialClipboard;
+    _fit = effective.viewFit == 1 ? ViewFit.original : ViewFit.adaptive;
+  }
+
+  void _reportViewerStrategyReceipt(AccountSession account) {
+    final ViewerStrategyDelivery? delivery = _viewerStrategyDelivery;
+    if (delivery == null ||
+        _viewerStrategyReceiptSucceeded ||
+        !delivery.isActiveAt(DateTime.now()) ||
+        _viewerStrategyIdentity != _viewerStrategyBinding(account)) {
+      return;
+    }
+    final SessionViewerStrategyReceiptReporter? injected =
+        widget.viewerStrategyReceiptReporter;
+    Future<void> report() async {
+      final Map<String, Object?> receipt = viewerStrategyReceipt(
+        snapshot: delivery.snapshot,
+        sequence: 1,
+      );
+      if (injected != null) {
+        await injected(
+          settings: ServerSettings(url: account.server),
+          accountToken: account.token,
+          peerId: widget.target.hostId,
+          context: delivery.context,
+          clientPublicKey: delivery.clientPublicKey,
+          receipt: receipt,
+        );
+      } else {
+        await ServerApi.reportViewerStrategyReceipt(
+          ServerSettings(url: account.server),
+          account.token,
+          peerId: widget.target.hostId,
+          context: delivery.context,
+          clientPublicKey: delivery.clientPublicKey,
+          receipt: receipt,
+        );
+      }
+      if (!_closing &&
+          _viewerStrategyIdentity == _viewerStrategyBinding(account)) {
+        _viewerStrategyReceiptSucceeded = true;
+      }
+    }
+
+    unawaited(report().catchError((Object _) {}));
+  }
+
   /// Reuses the agent within an attempt. _reconnect retires it before starting
   /// the next attempt so addresses, tokens and path selection are refreshed.
-  Future<TunnelAgent?> _ensureTunnel() async {
+  Future<TunnelConnection?> _ensureTunnel() async {
     if (!widget.target.viaServer) {
       return null;
     }
-    final TunnelAgent? existing = _tunnel;
+    final AccountSession? account = await _activeAccount();
+    if (account != null &&
+        !_accountMatchesTarget(account, widget.target.server)) {
+      return null;
+    }
+    final TunnelConnection? existing = _tunnel;
     if (existing != null) {
       if (existing.running) {
         return existing;
@@ -1063,7 +1370,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     final ServerSettings settings = ServerSettings(
       url: widget.target.server,
-      mode: widget.target.mode,
+      mode: _sessionTunnelMode,
       key: widget.target.serverKey,
       linkKey: widget.target.linkKey,
       proxy: widget.settings.proxy,
@@ -1091,6 +1398,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           clientPublicKey: clientKey,
         );
       }
+      final SessionTunnelStarter? injected = widget.tunnelStarter;
+      if (injected != null) {
+        return injected(
+          server: settings,
+          hostId: widget.target.hostId,
+          accountToken: accountToken,
+          serverPublicKey: serverKey,
+          emergency: emergency,
+        );
+      }
       return TunnelAgent.start(
         server: settings,
         hostId: widget.target.hostId,
@@ -1100,7 +1417,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       );
     }();
     try {
-      final TunnelAgent agent = await _tunnelStarting!;
+      final TunnelConnection agent = await _tunnelStarting!;
       _tunnel = agent;
       _tunnelStarting = null;
       _watchEmergencyTickets(agent);
@@ -1115,7 +1432,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// ordinary 20-second lookup renewal does not apply here: only the agent
   /// holds the transport key the override was minted against, so it is the
   /// only party that can request the next ticket.
-  void _watchEmergencyTickets(TunnelAgent agent) {
+  void _watchEmergencyTickets(TunnelConnection agent) {
     unawaited(_emergencyTickets?.cancel());
     _emergencyTickets = null;
     if (!_emergencyActive) {
@@ -1154,7 +1471,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Future<String> _confirmedServerKey(ServerSettings settings) async {
     final ServerIdentity live;
     try {
-      live = await ServerApi.serverIdentity(settings);
+      final SessionServerIdentityLoader? injected = widget.serverIdentityLoader;
+      live = injected == null
+          ? await ServerApi.serverIdentity(settings)
+          : await injected(settings);
     } on ServerApiException catch (error) {
       throw TunnelException(
         tr('无法读取服务器身份：{p2}', <String, Object?>{'p2': error.message}),
@@ -1187,7 +1507,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _startOnce() async {
-    final TunnelAgent? tunnel = await _ensureTunnel();
+    // An ordinary account lookup must settle the viewer snapshot before the
+    // tunnel starts, because tunnel mode and WebSocket preferences choose how
+    // that same start is routed. Emergency access intentionally uses local
+    // preferences and the override ticket carried by the tunnel agent.
+    final String accessTicket;
+    final TunnelConnection? tunnel;
+    if (_emergencyActive) {
+      tunnel = await _ensureTunnel();
+      accessTicket = _emergencyAccessTicket(tunnel);
+    } else {
+      accessTicket = await _fetchAccessTicket();
+      tunnel = await _ensureTunnel();
+    }
     if (!mounted) {
       await _stopSession();
       return;
@@ -1253,10 +1585,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     try {
-      // A managed host refuses a Hello without a ticket, so the lookup is
-      // part of starting the session rather than an optional add-on. An
-      // unmanaged host answers without one and keeps local authentication.
-      final String accessTicket = await _fetchAccessTicket();
       // Direct connections fall back to the host's adjacent TCP port; a
       // tunnelled session prefers the server's shared carrier, which
       // multiplexes every host on one port and needs this host's token.
@@ -1310,7 +1638,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         // With an outbound proxy the agent already forces the carrier, and the
         // engine's only carrier endpoint is the agent's loopback, so the
         // WebSocket preference cannot apply there.
-        transport: widget.settings.useWebSocket && !proxied ? 'ws' : 'auto',
+        transport: _sessionUseWebSocket && !proxied ? 'ws' : 'auto',
         carrierHost: carrierHost,
         carrierPort: carrierPort,
         carrierHostId: carrierHostId,
@@ -1318,7 +1646,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         fileTransferOnly: widget.fileTransferOnly,
         sessionMode: widget.sessionMode,
         accessTicket: accessTicket,
-        syncInitClipboard: _syncInitClipboard,
+        syncInitClipboard: _sessionSyncInitClipboard,
       );
       _startTicketRenewal(accessTicket);
       // The native session starts with clipboard sync on; reapply this page's
@@ -1362,6 +1690,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       await _stopSession();
       _teardown = null;
       rethrow;
+    }
+    final AccountSession? receiptAccount = _viewerStrategyAccount;
+    if (receiptAccount != null) {
+      _reportViewerStrategyReceipt(receiptAccount);
     }
     if (!mounted || _closing) {
       await _stopSession();
@@ -1431,6 +1763,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// window persisted (its proactive refresh rotates the token) and only then
   /// renews with the refresh token itself, writing the result back.
   Future<AccountSession?> _activeAccount() async {
+    if (widget.accountResolver != null) return widget.accountResolver!();
     final AccountSession? current = _account;
     if (current == null) {
       return null;
@@ -1495,15 +1828,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// no account, no server-side host id, or the host is not managed; a
   /// refusal from the server is surfaced instead of silently downgrading to
   /// local authentication, which a managed host would reject anyway.
+  String _emergencyAccessTicket(TunnelConnection? tunnel) {
+    final String ticket = tunnel?.accessTicket ?? '';
+    if (ticket.isEmpty) {
+      throw TunnelException(tr('隧道代理没有返回应急访问票据'));
+    }
+    return ticket;
+  }
+
   Future<String> _fetchAccessTicket() async {
     if (_emergencyActive) {
-      // The agent obtained the override immediately before the tunnel became
-      // ready, so its first ticket is the one this session starts with.
-      final String ticket = _tunnel?.accessTicket ?? '';
-      if (ticket.isEmpty) {
-        throw TunnelException(tr('隧道代理没有返回应急访问票据'));
-      }
-      return ticket;
+      return '';
     }
     final AccountSession? account = await _activeAccount();
     if (account == null ||
@@ -1516,13 +1851,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (publicKey.isEmpty) {
       return '';
     }
-    _ticketPublicKey = publicKey;
-    final HostInfo info = await ServerApi.lookup(
+    final String binding = _viewerStrategyBinding(account);
+    final int generation = _viewerGeneration;
+    _bindViewerStrategyIdentity(binding);
+    final HostInfo info = await _lookupHost(
       ServerSettings(url: account.server),
-      widget.target.hostId,
-      accountToken: account.token,
-      clientPublicKey: publicKey,
+      account,
+      publicKey,
     );
+    final AccountSession? current = await _activeAccount();
+    if (current == null ||
+        generation != _viewerGeneration ||
+        _viewerStrategyBinding(current) != binding ||
+        _viewerStrategyIdentity != binding) {
+      throw ServerApiException(tr('账号或连接目标已切换，已取消本次连接'));
+    }
+    _ticketPublicKey = publicKey;
+    _captureViewerStrategy(account, info);
     final HostAccessTicket? ticket = info.accessTicket;
     if (ticket == null) {
       return '';
@@ -1554,23 +1899,38 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// session stops at once rather than waiting for the deadline; a transient
   /// failure leaves the existing deadline in force.
   Future<void> _renewAccessTicket() async {
-    if (_emergencyActive || _ticketRenewBusy || !mounted || _closing) {
+    if (_emergencyActive ||
+        _ticketRenewBusy ||
+        !mounted ||
+        _closing ||
+        _reconnecting) {
       return;
     }
+    final int generation = _viewerGeneration;
     final AccountSession? account = await _activeAccount();
     if (account == null ||
         !account.isActiveAt(DateTime.now()) ||
+        generation != _viewerGeneration ||
+        _reconnecting ||
         _ticketPublicKey.isEmpty) {
       return;
     }
+    final String binding = _viewerStrategyBinding(account);
+    _bindViewerStrategyIdentity(binding);
     _ticketRenewBusy = true;
     try {
-      final HostInfo info = await ServerApi.lookup(
+      final HostInfo info = await _lookupHost(
         ServerSettings(url: account.server),
-        widget.target.hostId,
-        accountToken: account.token,
-        clientPublicKey: _ticketPublicKey,
+        account,
+        _ticketPublicKey,
       );
+      final AccountSession? current = await _activeAccount();
+      if (current == null ||
+          generation != _viewerGeneration ||
+          _reconnecting ||
+          _viewerStrategyBinding(current) != binding) {
+        return;
+      }
       final HostAccessTicket? ticket = info.accessTicket;
       if (ticket == null) {
         return;
@@ -2675,6 +3035,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _toggleSyncInitClipboard() {
     final bool enabled = !_syncInitClipboard;
     setState(() => _syncInitClipboard = enabled);
+    final bool locked =
+        _viewerStrategyDelivery
+            ?.snapshot
+            .settings[viewerSyncInitialClipboardKey]
+            ?.locked ??
+        false;
+    if (!locked) {
+      _sessionSyncInitClipboard = enabled;
+    }
     ViewPreferences.update(peerId: _prefsPeerId, syncInitClipboard: enabled);
   }
 
@@ -4803,6 +5172,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _shutdownOnce() async {
     _closing = true;
+    _recordingRetryTimer?.cancel();
+    _recordingRetryTimer = null;
     await _starting;
     _teardown = null;
     await _stopSession();
@@ -4811,7 +5182,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _stopTunnel() async {
-    final TunnelAgent? previous = _tunnel;
+    final TunnelConnection? previous = _tunnel;
     final StreamSubscription<TunnelAccessTicket>? tickets = _emergencyTickets;
     _tunnel = null;
     _tunnelStarting = null;
@@ -8449,10 +8820,15 @@ class _HostFingerprintDialog extends StatelessWidget {
 }
 
 class _FinishedRecording {
-  const _FinishedRecording({required this.path, this.startedAt});
+  const _FinishedRecording({
+    required this.path,
+    this.startedAt,
+    required this.endedAt,
+  });
 
   final String path;
   final DateTime? startedAt;
+  final DateTime endedAt;
 }
 
 String _sessionListCodeText(int code) {

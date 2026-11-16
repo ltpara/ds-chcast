@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "scope": "7bd9e8a6de93933e9e9e7603ab2d0c776886ecba73ab0e92db8da543e45797ef",
+  "server_url": "https://strategy.example.test",
+  "server_public_key": "",
+  "host_public_key": "4JSzoX_WDHQ1JWW3o9EGKIwlRSYibmI4igvMmpbtP-U",
+  "snapshot": {
+    "peer_id": "native-host",
+    "target": "host",
+    "revision": 7,
+    "policy_id": "policy-测试\u003c\u003e\u0026😀",
+    "settings": {
+      "host.auto_disconnect_minutes": {
+        "mode": "locked",
+        "value": 15
+      },
+      "host.carrier": {
+        "mode": "locked",
+        "value": false
+      },
+      "host.keep_awake": {
+        "mode": "default",
+        "value": false
+      },
+      "host.lan_discovery": {
+        "mode": "locked",
+        "value": false
+      },
+      "host.lock_after_session_end": {
+        "mode": "locked",
+        "value": true
+      },
+      "host.max_viewers": {
+        "mode": "default",
+        "value": 4
+      }
+    },
+    "digest": "64680b83a130fcda08e02f79c909fc74ac42eae201dcb62b133d89752ea48965",
+    "updated_at_ms": 1794787200000
+  }
+}

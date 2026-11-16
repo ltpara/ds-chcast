@@ -1,0 +1,1 @@
+{"receipt":{"digest":"59f40c4fb0dbe95c17c53a8abc332127ad9fdd79421dd84ba6c6d7faf025b348","results":{"host.future_option":{"status":"unsupported"}},"revision":8,"status":"unsupported","sequence":1},"scope":"7bd9e8a6de93933e9e9e7603ab2d0c776886ecba73ab0e92db8da543e45797ef"}

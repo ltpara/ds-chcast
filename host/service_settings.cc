@@ -30,6 +30,12 @@ bool merge_service_settings(const HostSettings& original, const HostSettings& ed
         APPLY(record_incoming); APPLY(record_directory);
         APPLY(allow_os_login); APPLY(allow_session_select); APPLY(allow_remote_config);
         APPLY(lock_after_session_end); APPLY(keep_awake); APPLY(auto_disconnect_minutes); APPLY(trusted_device_days);
+        if (original.lock_after_session_end != edited.lock_after_session_end)
+            mark_host_preference(result, HostPreference::LockAfterSessionEnd);
+        if (original.keep_awake != edited.keep_awake)
+            mark_host_preference(result, HostPreference::KeepAwake);
+        if (original.auto_disconnect_minutes != edited.auto_disconnect_minutes)
+            mark_host_preference(result, HostPreference::AutoDisconnectMinutes);
         APPLY(allow_audio); APPLY(allow_microphone); APPLY(allow_privacy_mode); APPLY(allow_permission_change);
         APPLY(file_receive_directory); APPLY(file_share_roots); APPLY(audio_device); APPLY(audio_aec); APPLY(audio_silence_gate_ms);
         APPLY(voice_microphone); APPLY(voice_aec); APPLY(voice_noise_suppression);

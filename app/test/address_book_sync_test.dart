@@ -40,16 +40,19 @@ void main() {
     expect(plan.updated, 2);
     expect(plan.pushes, isEmpty);
     expect(plan.devices, hasLength(3));
-    final Device devbox =
-        plan.devices.firstWhere((Device item) => item.id == 'devbox');
+    final Device devbox = plan.devices.firstWhere(
+      (Device item) => item.id == 'devbox',
+    );
     expect(devbox.name, '办公室');
     expect(devbox.saved, isTrue);
-    final Device lab =
-        plan.devices.firstWhere((Device item) => item.id == 'lab');
+    final Device lab = plan.devices.firstWhere(
+      (Device item) => item.id == 'lab',
+    );
     expect(lab.saved, isTrue);
     expect(lab.lastUsed, isNotNull);
-    final Device studio =
-        plan.devices.firstWhere((Device item) => item.id == 'studio');
+    final Device studio = plan.devices.firstWhere(
+      (Device item) => item.id == 'studio',
+    );
     expect(studio.name, '工作室');
     expect(studio.server, server);
     expect(studio.saved, isTrue);
@@ -109,18 +112,24 @@ void main() {
     expect(byId('fresh').groupId, 'work');
     expect(plan.added, 1);
 
-    final AddressBookPush labPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'lab');
+    final AddressBookPush labPush = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'lab',
+    );
     expect(labPush.groupId, 'lab-group');
     expect(labPush.name, isNull);
-    final AddressBookPush newPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'new');
+    final AddressBookPush newPush = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'new',
+    );
     expect(newPush.groupId, 'work');
     expect(newPush.name, '');
-    expect(plan.pushes.any((AddressBookPush push) => push.id == 'office'),
-        isFalse);
-    expect(plan.pushes.any((AddressBookPush push) => push.id == 'devbox'),
-        isFalse);
+    expect(
+      plan.pushes.any((AddressBookPush push) => push.id == 'office'),
+      isFalse,
+    );
+    expect(
+      plan.pushes.any((AddressBookPush push) => push.id == 'devbox'),
+      isFalse,
+    );
   });
 
   test('local-only peers upload their live group and drop deleted ones', () {
@@ -149,56 +158,66 @@ void main() {
       serverUrl: server,
       now: now,
     );
-    final Device stale =
-        plan.devices.firstWhere((Device item) => item.id == 'stale');
+    final Device stale = plan.devices.firstWhere(
+      (Device item) => item.id == 'stale',
+    );
     expect(stale.groupId, '');
-    final AddressBookPush kept =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'kept');
+    final AddressBookPush kept = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'kept',
+    );
     expect(kept.groupId, 'work');
-    final AddressBookPush dropped =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'stale');
+    final AddressBookPush dropped = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'stale',
+    );
     expect(dropped.groupId, isNull);
   });
 
-  test('group merges replace on a full read and apply changes incrementally',
-      () {
-    const List<AddressBookGroup> current = <AddressBookGroup>[
-      AddressBookGroup(id: 'work', name: 'Work'),
-      AddressBookGroup(id: 'lab', name: 'Lab'),
-      AddressBookGroup(id: 'old', name: 'Old'),
-    ];
-    const AddressBookSnapshot full = AddressBookSnapshot(
-      revision: 9,
-      peers: <AddressBookPeer>[],
-      groups: <AddressBookGroup>[AddressBookGroup(id: 'work', name: 'Work')],
-    );
-    expect(mergeAddressBookGroups(current: current, snapshot: full, since: 0),
-        <AddressBookGroup>[const AddressBookGroup(id: 'work', name: 'Work')]);
-    expect(
-      mergeAddressBookGroups(current: current, snapshot: full, since: 12),
-      full.groups,
-    );
+  test(
+    'group merges replace on a full read and apply changes incrementally',
+    () {
+      const List<AddressBookGroup> current = <AddressBookGroup>[
+        AddressBookGroup(id: 'work', name: 'Work'),
+        AddressBookGroup(id: 'lab', name: 'Lab'),
+        AddressBookGroup(id: 'old', name: 'Old'),
+      ];
+      const AddressBookSnapshot full = AddressBookSnapshot(
+        revision: 9,
+        peers: <AddressBookPeer>[],
+        groups: <AddressBookGroup>[AddressBookGroup(id: 'work', name: 'Work')],
+      );
+      expect(
+        mergeAddressBookGroups(current: current, snapshot: full, since: 0),
+        <AddressBookGroup>[const AddressBookGroup(id: 'work', name: 'Work')],
+      );
+      expect(
+        mergeAddressBookGroups(current: current, snapshot: full, since: 12),
+        full.groups,
+      );
 
-    const AddressBookSnapshot incremental = AddressBookSnapshot(
-      revision: 10,
-      peers: <AddressBookPeer>[],
-      groupChanges: <AddressBookGroup>[
-        AddressBookGroup(id: 'lab', name: 'Labor', revision: 10),
-        AddressBookGroup(id: 'old', deleted: true, revision: 10),
-        AddressBookGroup(id: 'new', name: 'New', revision: 10),
-      ],
-    );
-    final List<AddressBookGroup> merged = mergeAddressBookGroups(
-      current: current,
-      snapshot: incremental,
-      since: 9,
-    );
-    expect(
-      merged.map((AddressBookGroup group) => '${group.id}/${group.name}'),
-      <String>['lab/Labor', 'new/New', 'work/Work'],
-    );
-    expect(merged.any((AddressBookGroup group) => group.id == 'old'), isFalse);
-  });
+      const AddressBookSnapshot incremental = AddressBookSnapshot(
+        revision: 10,
+        peers: <AddressBookPeer>[],
+        groupChanges: <AddressBookGroup>[
+          AddressBookGroup(id: 'lab', name: 'Labor', revision: 10),
+          AddressBookGroup(id: 'old', deleted: true, revision: 10),
+          AddressBookGroup(id: 'new', name: 'New', revision: 10),
+        ],
+      );
+      final List<AddressBookGroup> merged = mergeAddressBookGroups(
+        current: current,
+        snapshot: incremental,
+        since: 9,
+      );
+      expect(
+        merged.map((AddressBookGroup group) => '${group.id}/${group.name}'),
+        <String>['lab/Labor', 'new/New', 'work/Work'],
+      );
+      expect(
+        merged.any((AddressBookGroup group) => group.id == 'old'),
+        isFalse,
+      );
+    },
+  );
 
   test('group merge orders siblings by position, then name, then id', () {
     const AddressBookSnapshot snapshot = AddressBookSnapshot(
@@ -217,10 +236,11 @@ void main() {
       snapshot: snapshot,
       since: 3,
     );
-    expect(
-      merged.map((AddressBookGroup group) => group.id),
-      <String>['a', 'b', 'c'],
-    );
+    expect(merged.map((AddressBookGroup group) => group.id), <String>[
+      'a',
+      'b',
+      'c',
+    ]);
   });
 
   test('group tree order nests children and tolerates damaged links', () {
@@ -236,7 +256,9 @@ void main() {
     ];
     final List<AddressBookGroupNode> nodes = addressBookGroupTreeOrder(groups);
     expect(
-      nodes.map((AddressBookGroupNode node) => '${node.depth}/${node.group.id}'),
+      nodes.map(
+        (AddressBookGroupNode node) => '${node.depth}/${node.group.id}',
+      ),
       <String>[
         '0/lost',
         '0/team',
@@ -270,7 +292,12 @@ void main() {
       devices: devices,
       peers: const <AddressBookPeer>[
         AddressBookPeer(id: 'first', groupId: 'work', position: 1, revision: 3),
-        AddressBookPeer(id: 'second', groupId: 'work', position: 2, revision: 3),
+        AddressBookPeer(
+          id: 'second',
+          groupId: 'work',
+          position: 2,
+          revision: 3,
+        ),
       ],
       groups: const <AddressBookGroup>[
         AddressBookGroup(id: 'work', name: 'Work'),
@@ -287,12 +314,7 @@ void main() {
 
   test('tags adopt from the server, and local tags win and are uploaded', () {
     final List<Device> devices = <Device>[
-      Device(
-        id: 'devbox',
-        server: server,
-        saved: true,
-        addedAt: now,
-      ),
+      Device(id: 'devbox', server: server, saved: true, addedAt: now),
       Device(
         id: 'lab',
         server: server,
@@ -328,22 +350,26 @@ void main() {
       now: now,
     );
 
-    final Device devbox =
-        plan.devices.firstWhere((Device item) => item.id == 'devbox');
+    final Device devbox = plan.devices.firstWhere(
+      (Device item) => item.id == 'devbox',
+    );
     expect(devbox.tags, <String>['office']);
-    final Device lab =
-        plan.devices.firstWhere((Device item) => item.id == 'lab');
+    final Device lab = plan.devices.firstWhere(
+      (Device item) => item.id == 'lab',
+    );
     expect(lab.tags, <String>['vip']);
 
     expect(plan.updated, 1);
     expect(plan.added, 0);
     expect(plan.pushes, hasLength(2));
-    final AddressBookPush labPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'lab');
+    final AddressBookPush labPush = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'lab',
+    );
     expect(labPush.name, isNull);
     expect(labPush.tags, <String>['vip']);
-    final AddressBookPush newPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'new');
+    final AddressBookPush newPush = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'new',
+    );
     expect(newPush.name, '');
     expect(newPush.tags, <String>['fresh']);
   });
@@ -371,12 +397,7 @@ void main() {
         saved: true,
         addedAt: now,
       ),
-      Device(
-        id: 'studio',
-        server: server,
-        addedAt: now,
-        lastUsed: now,
-      ),
+      Device(id: 'studio', server: server, addedAt: now, lastUsed: now),
     ];
     final List<AddressBookPeer> peers = <AddressBookPeer>[
       const AddressBookPeer(id: 'office', name: '服务器名'),
@@ -395,18 +416,22 @@ void main() {
     };
     expect(pushed, <String>{'office', 'lab'});
     expect(
-      plan.pushes.firstWhere((AddressBookPush push) => push.id == 'office').name,
+      plan.pushes
+          .firstWhere((AddressBookPush push) => push.id == 'office')
+          .name,
       '本机名',
     );
     expect(
       plan.pushes.firstWhere((AddressBookPush push) => push.id == 'lab').name,
       '本地实验室',
     );
-    final Device office =
-        plan.devices.firstWhere((Device item) => item.id == 'office');
+    final Device office = plan.devices.firstWhere(
+      (Device item) => item.id == 'office',
+    );
     expect(office.name, '本机名');
-    final Device studio =
-        plan.devices.firstWhere((Device item) => item.id == 'studio');
+    final Device studio = plan.devices.firstWhere(
+      (Device item) => item.id == 'studio',
+    );
     expect(studio.name, '服务器工作室');
     expect(studio.saved, isTrue);
     expect(plan.updated, 1);
@@ -451,18 +476,8 @@ void main() {
         saved: true,
         addedAt: now,
       ),
-      Device(
-        id: 'studio',
-        server: server,
-        saved: true,
-        addedAt: now,
-      ),
-      Device(
-        id: 'recent',
-        server: server,
-        addedAt: now,
-        lastUsed: now,
-      ),
+      Device(id: 'studio', server: server, saved: true, addedAt: now),
+      Device(id: 'recent', server: server, addedAt: now, lastUsed: now),
       Device(
         id: 'remote',
         server: 'http://127.0.0.1:9443',
@@ -473,9 +488,7 @@ void main() {
 
     final AddressBookPlan plan = planAddressBookSync(
       devices: devices,
-      peers: const <AddressBookPeer>[
-        AddressBookPeer(id: 'lab', name: '实验室'),
-      ],
+      peers: const <AddressBookPeer>[AddressBookPeer(id: 'lab', name: '实验室')],
       tombstones: const <AddressBookPeer>[
         AddressBookPeer(id: 'devbox', deleted: true, revision: 4),
         AddressBookPeer(id: 'recent', deleted: true, revision: 5),
@@ -487,25 +500,20 @@ void main() {
 
     expect(plan.removed, 1);
     expect(plan.added, 1);
-    expect(
-      plan.pushes.map((AddressBookPush push) => push.id),
-      <String>['studio'],
-    );
-    expect(
-      plan.devices.map((Device device) => device.id).toSet(),
-      <String>{'studio', 'recent', 'remote', 'lab'},
-    );
+    expect(plan.pushes.map((AddressBookPush push) => push.id), <String>[
+      'studio',
+    ]);
+    expect(plan.devices.map((Device device) => device.id).toSet(), <String>{
+      'studio',
+      'recent',
+      'remote',
+      'lab',
+    });
   });
 
   test('a pending local deletion suppresses an alive server peer', () {
     final List<Device> devices = <Device>[
-      Device(
-        id: 'lab',
-        name: '实验室',
-        server: server,
-        saved: true,
-        addedAt: now,
-      ),
+      Device(id: 'lab', name: '实验室', server: server, saved: true, addedAt: now),
     ];
     final AddressBookPlan plan = planAddressBookSync(
       devices: devices,
@@ -624,96 +632,108 @@ void main() {
       now: now,
     );
 
-    final Device devbox =
-        plan.devices.firstWhere((Device item) => item.id == 'devbox');
+    final Device devbox = plan.devices.firstWhere(
+      (Device item) => item.id == 'devbox',
+    );
     expect(devbox.tagsCleared, isFalse);
     expect(devbox.groupCleared, isFalse);
-    final Device lab =
-        plan.devices.firstWhere((Device item) => item.id == 'lab');
+    final Device lab = plan.devices.firstWhere(
+      (Device item) => item.id == 'lab',
+    );
     expect(lab.tagsCleared, isFalse);
     expect(lab.groupCleared, isFalse);
     expect(plan.pushes, isEmpty);
   });
 
-  test('notes adopt from the server, local notes win and clears are pushed', () {
-    final List<Device> devices = <Device>[
-      Device(id: 'devbox', server: server, saved: true, addedAt: now),
-      Device(
-        id: 'lab',
-        server: server,
-        note: '  本地备注 ',
-        saved: true,
-        addedAt: now,
-      ),
-      Device(
-        id: 'office',
-        server: server,
-        noteCleared: true,
-        saved: true,
-        addedAt: now,
-      ),
-      Device(
-        id: 'new',
-        server: server,
-        note: '机柜 A3',
-        saved: true,
-        addedAt: now,
-      ),
-    ];
-    final AddressBookPlan plan = planAddressBookSync(
-      devices: devices,
-      peers: const <AddressBookPeer>[
-        AddressBookPeer(id: 'devbox', note: '服务器备注', revision: 2),
-        AddressBookPeer(id: 'lab', note: '旧的服务器备注', revision: 3),
-        AddressBookPeer(id: 'office', note: '需要清除', revision: 4),
-      ],
-      serverUrl: server,
-      now: now,
-    );
+  test(
+    'notes adopt from the server, local notes win and clears are pushed',
+    () {
+      final List<Device> devices = <Device>[
+        Device(id: 'devbox', server: server, saved: true, addedAt: now),
+        Device(
+          id: 'lab',
+          server: server,
+          note: '  本地备注 ',
+          saved: true,
+          addedAt: now,
+        ),
+        Device(
+          id: 'office',
+          server: server,
+          noteCleared: true,
+          saved: true,
+          addedAt: now,
+        ),
+        Device(
+          id: 'new',
+          server: server,
+          note: '机柜 A3',
+          saved: true,
+          addedAt: now,
+        ),
+      ];
+      final AddressBookPlan plan = planAddressBookSync(
+        devices: devices,
+        peers: const <AddressBookPeer>[
+          AddressBookPeer(id: 'devbox', note: '服务器备注', revision: 2),
+          AddressBookPeer(id: 'lab', note: '旧的服务器备注', revision: 3),
+          AddressBookPeer(id: 'office', note: '需要清除', revision: 4),
+        ],
+        serverUrl: server,
+        now: now,
+      );
 
-    final Device devbox =
-        plan.devices.firstWhere((Device item) => item.id == 'devbox');
-    expect(devbox.note, '服务器备注');
-    final Device lab =
-        plan.devices.firstWhere((Device item) => item.id == 'lab');
-    expect(lab.note, '  本地备注 ');
-    final Device office =
-        plan.devices.firstWhere((Device item) => item.id == 'office');
-    expect(office.note, isEmpty);
-    expect(office.noteCleared, isTrue);
-    expect(plan.updated, 1);
-    expect(plan.pushes, hasLength(3));
-    final AddressBookPush labPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'lab');
-    expect(labPush.note, '本地备注');
-    expect(labPush.name, isNull);
-    expect(labPush.tags, isNull);
-    expect(labPush.revision, 3);
-    final AddressBookPush officePush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'office');
-    expect(officePush.note, '');
-    final AddressBookPush newPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'new');
-    expect(newPush.note, '机柜 A3');
+      final Device devbox = plan.devices.firstWhere(
+        (Device item) => item.id == 'devbox',
+      );
+      expect(devbox.note, '服务器备注');
+      final Device lab = plan.devices.firstWhere(
+        (Device item) => item.id == 'lab',
+      );
+      expect(lab.note, '  本地备注 ');
+      final Device office = plan.devices.firstWhere(
+        (Device item) => item.id == 'office',
+      );
+      expect(office.note, isEmpty);
+      expect(office.noteCleared, isTrue);
+      expect(plan.updated, 1);
+      expect(plan.pushes, hasLength(3));
+      final AddressBookPush labPush = plan.pushes.firstWhere(
+        (AddressBookPush push) => push.id == 'lab',
+      );
+      expect(labPush.note, '本地备注');
+      expect(labPush.name, isNull);
+      expect(labPush.tags, isNull);
+      expect(labPush.revision, 3);
+      final AddressBookPush officePush = plan.pushes.firstWhere(
+        (AddressBookPush push) => push.id == 'office',
+      );
+      expect(officePush.note, '');
+      final AddressBookPush newPush = plan.pushes.firstWhere(
+        (AddressBookPush push) => push.id == 'new',
+      );
+      expect(newPush.note, '机柜 A3');
 
-    final AddressBookPlan again = planAddressBookSync(
-      devices: devices,
-      peers: const <AddressBookPeer>[
-        AddressBookPeer(id: 'devbox', note: '服务器备注', revision: 2),
-        AddressBookPeer(id: 'lab', note: '本地备注', revision: 3),
-        AddressBookPeer(id: 'office', revision: 5),
-      ],
-      serverUrl: server,
-      now: now,
-    );
-    final Device settledOffice =
-        again.devices.firstWhere((Device item) => item.id == 'office');
-    expect(settledOffice.noteCleared, isFalse);
-    expect(
-      again.pushes.where((AddressBookPush push) => push.id == 'office'),
-      isEmpty,
-    );
-  });
+      final AddressBookPlan again = planAddressBookSync(
+        devices: devices,
+        peers: const <AddressBookPeer>[
+          AddressBookPeer(id: 'devbox', note: '服务器备注', revision: 2),
+          AddressBookPeer(id: 'lab', note: '本地备注', revision: 3),
+          AddressBookPeer(id: 'office', revision: 5),
+        ],
+        serverUrl: server,
+        now: now,
+      );
+      final Device settledOffice = again.devices.firstWhere(
+        (Device item) => item.id == 'office',
+      );
+      expect(settledOffice.noteCleared, isFalse);
+      expect(
+        again.pushes.where((AddressBookPush push) => push.id == 'office'),
+        isEmpty,
+      );
+    },
+  );
 
   test('peer revisions refresh on pull and travel with uploads', () {
     final List<Device> devices = <Device>[
@@ -732,6 +752,7 @@ void main() {
         tags: const <String>['vip'],
         saved: true,
         revision: 1,
+        dirtyFields: Device.tagsField,
         addedAt: now,
       ),
       Device(id: 'local', server: server, saved: true, addedAt: now),
@@ -739,22 +760,153 @@ void main() {
     final AddressBookPlan plan = planAddressBookSync(
       devices: devices,
       peers: const <AddressBookPeer>[
-        AddressBookPeer(id: 'sync', name: 'Sync', tags: <String>['vip'], revision: 5),
-        AddressBookPeer(id: 'lab', name: '实验室', tags: <String>['old'], revision: 9),
+        AddressBookPeer(
+          id: 'sync',
+          name: 'Sync',
+          tags: <String>['vip'],
+          revision: 5,
+        ),
+        AddressBookPeer(
+          id: 'lab',
+          name: '实验室',
+          tags: <String>['old'],
+          revision: 9,
+        ),
       ],
       serverUrl: server,
       now: now,
     );
 
-    final Device sync =
-        plan.devices.firstWhere((Device item) => item.id == 'sync');
+    final Device sync = plan.devices.firstWhere(
+      (Device item) => item.id == 'sync',
+    );
     expect(sync.revision, 5);
-    final AddressBookPush labPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'lab');
+    final AddressBookPush labPush = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'lab',
+    );
     expect(labPush.tags, <String>['vip']);
-    expect(labPush.revision, 9);
-    final AddressBookPush localPush =
-        plan.pushes.firstWhere((AddressBookPush push) => push.id == 'local');
+    expect(labPush.revision, 1);
+    final AddressBookPush localPush = plan.pushes.firstWhere(
+      (AddressBookPush push) => push.id == 'local',
+    );
     expect(localPush.revision, 0);
+  });
+  test('new remote values and clears replace an unedited cache', () {
+    final cached = Device(
+      id: 'pc',
+      server: server,
+      name: 'Old',
+      tags: const ['old'],
+      note: 'old note',
+      groupId: 'old-group',
+      saved: true,
+      revision: 1,
+      addedAt: now,
+    );
+    final plan = planAddressBookSync(
+      devices: [cached],
+      peers: const [
+        AddressBookPeer(
+          id: 'pc',
+          name: 'New',
+          tags: ['new'],
+          note: 'new note',
+          groupId: 'new-group',
+          revision: 2,
+        ),
+      ],
+      groups: const [
+        AddressBookGroup(id: 'old-group'),
+        AddressBookGroup(id: 'new-group'),
+      ],
+      serverUrl: server,
+      now: now,
+    );
+    expect(plan.pushes, isEmpty);
+    expect(plan.devices.single.name, 'New');
+    expect(plan.devices.single.tags, ['new']);
+    expect(plan.devices.single.note, 'new note');
+    expect(plan.devices.single.groupId, 'new-group');
+    final cleared = planAddressBookSync(
+      devices: plan.devices,
+      peers: const [AddressBookPeer(id: 'pc', revision: 3)],
+      serverUrl: server,
+      now: now,
+    );
+    expect(cleared.pushes, isEmpty);
+    expect(cleared.devices.single.name, '');
+    expect(cleared.devices.single.tags, isEmpty);
+    expect(cleared.devices.single.note, '');
+    expect(cleared.devices.single.groupId, '');
+    expect(cleared.devices.single.revision, 3);
+  });
+
+  test('failed offline edits keep their original baseline across reloads', () {
+    final cached = Device(
+      id: 'pc',
+      server: server,
+      name: 'Old',
+      tags: const ['old'],
+      saved: true,
+      revision: 1,
+      addedAt: now,
+    );
+    final edited = cached.edit(name: 'Local');
+    const peers = [
+      AddressBookPeer(id: 'pc', name: 'Remote', tags: ['new'], revision: 2),
+    ];
+    final plan = planAddressBookSync(
+      devices: [edited],
+      peers: peers,
+      serverUrl: server,
+      now: now,
+    );
+    expect(plan.devices.single.name, 'Local');
+    expect(plan.devices.single.tags, ['new']);
+    expect(plan.devices.single.revision, 1);
+    expect(plan.pushes.single.revision, 1);
+    expect(plan.pushes.single.tags, isNull);
+    final retried = planAddressBookSync(
+      devices: [Device.fromJson(plan.devices.single.toJson())!],
+      peers: peers,
+      serverUrl: server,
+      now: now,
+    );
+    expect(retried.pushes.single.name, 'Local');
+    expect(retried.pushes.single.revision, 1);
+    final acknowledged = planAddressBookSync(
+      devices: retried.devices,
+      peers: const [
+        AddressBookPeer(id: 'pc', name: 'Local', tags: ['new'], revision: 3),
+      ],
+      serverUrl: server,
+      now: now,
+    );
+    expect(acknowledged.pushes, isEmpty);
+    expect(acknowledged.devices.single.dirtyFields, 0);
+    expect(acknowledged.devices.single.revision, 3);
+  });
+
+  test('an offline name clear is sent without resending cached fields', () {
+    final edited = Device(
+      id: 'pc',
+      server: server,
+      name: 'Old',
+      tags: const ['tag'],
+      revision: 4,
+      saved: true,
+      addedAt: now,
+    ).edit(name: '');
+    final plan = planAddressBookSync(
+      devices: [edited],
+      peers: const [
+        AddressBookPeer(id: 'pc', name: 'Old', tags: ['tag'], revision: 4),
+      ],
+      serverUrl: server,
+      now: now,
+    );
+    expect(plan.pushes.single.name, '');
+    expect(plan.pushes.single.tags, isNull);
+    expect(plan.pushes.single.revision, 4);
   });
 }

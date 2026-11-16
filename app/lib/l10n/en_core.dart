@@ -1,12 +1,14 @@
 /// English for server API errors, connection status and security-key flows.
 const Map<String, String> kEnglishCore = <String, String>{
-  '两步验证已启用，请先关闭后再重新设置': 'Two-factor authentication is already enabled; disable it before setting it up again',
+  '两步验证已启用，请先关闭后再重新设置':
+      'Two-factor authentication is already enabled; disable it before setting it up again',
   '两步验证码不正确': 'The two-factor code is incorrect',
   '会话 ID 为空': 'The session ID is empty',
   '会话不存在或已退出': 'The session does not exist or has already ended',
   '共享地址簿权限不足': 'Insufficient permission for the shared address book',
   '分组 ID 为空': 'The group ID is empty',
-  '分组名称、上级分组或排序位置至少需要一项': 'Provide at least a group name, parent group or sort position',
+  '分组名称、上级分组或排序位置至少需要一项':
+      'Provide at least a group name, parent group or sort position',
   '分组名称不能为空': 'The group name cannot be empty',
   '地址簿分组不存在': 'The address book group does not exist',
   '地址簿未共享给当前账号': 'The address book is not shared with this account',
@@ -32,7 +34,8 @@ const Map<String, String> kEnglishCore = <String, String>{
   '用户名无效': 'Invalid username',
   '用户或分组不存在': 'The user or group does not exist',
   '登录已过期，请重新登录': 'The login has expired; please sign in again',
-  '短信验证码无效、已过期或密码不符合要求': 'The SMS code is invalid, expired, or the password does not meet the requirements',
+  '短信验证码无效、已过期或密码不符合要求':
+      'The SMS code is invalid, expired, or the password does not meet the requirements',
   '设备 ID 为空': 'The device ID is empty',
   '设备未注册或已下线': 'The device is not registered or is offline',
   '该安全密钥已经注册': 'This security key is already registered',
@@ -45,51 +48,68 @@ const Map<String, String> kEnglishCore = <String, String>{
   '账号已被封禁': 'The account has been suspended',
   '账号未登录': 'Not signed in',
   '账号未登录或已过期': 'Not signed in, or the session has expired',
-  '目标设备不在当前账号的地址簿中':
-      'The target is not in this account\'s address book',
+  '目标设备不在当前账号的地址簿中': 'The target is not in this account\'s address book',
   '账号登录已失效，请重新登录': 'The account login is no longer valid; please sign in again',
   '连接服务地址无效': 'Invalid connection service address',
   '连接服务密钥无效': 'Invalid connection service key',
   '连接服务未启用安全密钥': 'The connection service does not enable security keys',
   '连接服务未启用账号存储': 'The connection service does not enable account storage',
-  '连接服务未提供有效的服务器身份': 'The connection service did not provide a valid server identity',
-  '连接服务未配置账号或短信找回': 'The connection service is not configured for account or SMS recovery',
-  '连接服务未配置账号或短信登录': 'The connection service is not configured for account or SMS sign-in',
-  '连接服务未配置账号或邮件找回': 'The connection service is not configured for account or email recovery',
-  '连接服务未配置账号或邮件登录': 'The connection service is not configured for account or email sign-in',
+  '连接服务未提供有效的服务器身份':
+      'The connection service did not provide a valid server identity',
+  '连接服务未配置账号或短信找回':
+      'The connection service is not configured for account or SMS recovery',
+  '连接服务未配置账号或短信登录':
+      'The connection service is not configured for account or SMS sign-in',
+  '连接服务未配置账号或邮件找回':
+      'The connection service is not configured for account or email recovery',
+  '连接服务未配置账号或邮件登录':
+      'The connection service is not configured for account or email sign-in',
   '连接服务请求失败：{error}': 'Connection service request failed: {error}',
   '连接服务请求失败：{p62}': 'Connection service request failed: {p62}',
   '连接服务超时': 'The connection service timed out',
   '连接服务返回 HTTP {p61}': 'The connection service returned HTTP {p61}',
   '连接服务返回了无效 JSON': 'The connection service returned invalid JSON',
   '连接服务返回了无效数据': 'The connection service returned invalid data',
+  '查看端策略回执上下文无效': 'Invalid viewer strategy receipt context',
+  '查看端策略回执无效': 'Invalid viewer strategy receipt',
+  '查看端策略已更新，请重新连接': 'The viewer strategy has changed; reconnect to apply it',
+  '账号或连接目标已切换，已取消本次连接':
+      'The account or connection target changed; this connection was cancelled',
   '邮件验证码需为 8 位数字': 'The email code must be 8 digits',
   '邮箱格式无效': 'Invalid email format',
-  '重置令牌无效、已过期或密码不符合要求': 'The reset token is invalid, expired, or the password does not meet the requirements',
+  '重置令牌无效、已过期或密码不符合要求':
+      'The reset token is invalid, expired, or the password does not meet the requirements',
   '验证码或恢复码不正确': 'Incorrect verification or recovery code',
   'TCP 回退': 'TCP fallback',
   'WebSocket 回退': 'WebSocket fallback',
-  '两步验证码不正确或已过期，请重新输入。': 'The two-factor code is incorrect or expired; please enter it again.',
-  '主机拒绝了本次连接请求，请让主机确认后重试。': 'The host declined this connection; ask the host to approve it and try again.',
-  '主机未在限定时间内完成验证，请重试。': 'The host did not finish verification in time; please try again.',
+  '两步验证码不正确或已过期，请重新输入。':
+      'The two-factor code is incorrect or expired; please enter it again.',
+  '主机拒绝了本次连接请求，请让主机确认后重试。':
+      'The host declined this connection; ask the host to approve it and try again.',
+  '主机未在限定时间内完成验证，请重试。':
+      'The host did not finish verification in time; please try again.',
   '主机要求两步验证码。': 'The host requires a two-factor code.',
   '主机要求输入连接密码。': 'The host requires a connection password.',
   '单声道': 'Mono',
   '图片': 'Images',
   '密码不正确，请重试。': 'Incorrect password; please try again.',
-  '尝试次数过多，主机已暂时拒绝此地址。请稍后再试。': 'Too many attempts; the host is temporarily refusing this address. Try again later.',
+  '尝试次数过多，主机已暂时拒绝此地址。请稍后再试。':
+      'Too many attempts; the host is temporarily refusing this address. Try again later.',
   '摄像头': 'Camera',
   '文本': 'Text',
   '本机地址不在主机的允许列表中。': 'This machine is not on the host\'s allow list.',
   '立体声': 'Stereo',
-  '访问令牌不正确。请向主机确认当前令牌后重试。': 'The access token is incorrect. Confirm the current token with the host and try again.',
-  '该一次性令牌已被使用，请让主机重新生成一个。': 'This one-time token has been used; ask the host to generate a new one.',
+  '访问令牌不正确。请向主机确认当前令牌后重试。':
+      'The access token is incorrect. Confirm the current token with the host and try again.',
+  '该一次性令牌已被使用，请让主机重新生成一个。':
+      'This one-time token has been used; ask the host to generate a new one.',
   '音频输出': 'Audio output',
   '局域网扫描失败（{p3}）': 'LAN scan failed ({p3})',
   '局域网扫描失败：{error}': 'LAN scan failed: {error}',
   '局域网扫描没有在预期时间内返回': 'The LAN scan did not return in time',
   '局域网扫描返回了无效数据': 'The LAN scan returned invalid data',
-  '无法启动局域网扫描（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。': 'Cannot start the LAN scan ({exe}): {p2}\nMake sure chast-tunnel.exe is in the same folder as the session app.',
+  '无法启动局域网扫描（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。':
+      'Cannot start the LAN scan ({exe}): {p2}\nMake sure chast-tunnel.exe is in the same folder as the session app.',
   'Windows Hello 操作失败': 'Windows Hello failed',
   'Windows Hello 操作失败：{text}': 'Windows Hello failed: {text}',
   'Windows Hello 未返回完整的凭据': 'Windows Hello did not return complete credentials',
@@ -108,28 +128,46 @@ const Map<String, String> kEnglishCore = <String, String>{
   '仅直连': 'Direct only',
   '直连': 'Direct',
   '自动直连 · 失败回退中继': 'Auto direct · fall back to relay',
-  '无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。': 'Cannot start the tunnel agent ({exe}): {p2}\nMake sure chast-tunnel.exe is in the same folder as the session app.',
-  '隧道代理启动失败（退出码 {code}）{p7}': 'The tunnel agent failed to start (exit code {code}) {p7}',
-  '隧道代理在 {p3} 秒内没有就绪{p4}': 'The tunnel agent was not ready within {p3} seconds{p4}',
-  '隧道代理返回了无效监听地址：{p5}': 'The tunnel agent returned an invalid listen address: {p5}',
+  '无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。':
+      'Cannot start the tunnel agent ({exe}): {p2}\nMake sure chast-tunnel.exe is in the same folder as the session app.',
+  '隧道代理启动失败（退出码 {code}）{p7}':
+      'The tunnel agent failed to start (exit code {code}) {p7}',
+  '隧道代理在 {p3} 秒内没有就绪{p4}':
+      'The tunnel agent was not ready within {p3} seconds{p4}',
+  '隧道代理返回了无效监听地址：{p5}':
+      'The tunnel agent returned an invalid listen address: {p5}',
   '当前密码或两步验证码不正确': 'The current password or two-step code is incorrect',
-  '地址无效：示例 https://chast.example:8443（本机可用 http://127.0.0.1:8443）': 'Invalid address; for example https://chast.example:8443 (http://127.0.0.1:8443 works on this machine)',
+  '地址无效：示例 https://chast.example:8443（本机可用 http://127.0.0.1:8443）':
+      'Invalid address; for example https://chast.example:8443 (http://127.0.0.1:8443 works on this machine)',
   '确认主机证书': 'Confirm host certificate',
-  '首次连接到 {host}。请与主机管理员核对证书指纹：': 'First connection to {host}. Compare the certificate fingerprint with your host administrator:',
-  '确认后会记住该指纹；以后证书变化会被拒绝，直到你再次确认。': 'The fingerprint is remembered after you confirm; later certificate changes are refused until you confirm again.',
-  '未确认主机证书指纹，已终止连接': 'The host certificate fingerprint was not confirmed; the connection was closed',
-  '无法保存主机指纹，本次连接不会固定证书；下次连接需要重新确认。': 'The host fingerprint could not be saved, so this connection is not pinned; the next connection will ask again.',
-  '主机指纹未能保存，本次连接未固定证书': 'The host fingerprint could not be saved; this connection is not pinned',
-  '这次连接没有固定主机证书：指纹无法保存到本地，下次连接会重新确认。': 'This connection did not pin the host certificate: the fingerprint could not be saved locally, and the next connection will ask again.',
-  '服务器要求的安全密钥域名与连接服务不一致：{rpId}': 'The security-key domain requested by the server does not match the connection service: {rpId}',
-  '录制大小与服务器记录不一致：应有 {expected} 字节，响应为 {actual} 字节': 'Recording size does not match the server record: expected {expected} bytes, response has {actual}',
+  '首次连接到 {host}。请与主机管理员核对证书指纹：':
+      'First connection to {host}. Compare the certificate fingerprint with your host administrator:',
+  '确认后会记住该指纹；以后证书变化会被拒绝，直到你再次确认。':
+      'The fingerprint is remembered after you confirm; later certificate changes are refused until you confirm again.',
+  '未确认主机证书指纹，已终止连接':
+      'The host certificate fingerprint was not confirmed; the connection was closed',
+  '无法保存主机指纹，本次连接不会固定证书；下次连接需要重新确认。':
+      'The host fingerprint could not be saved, so this connection is not pinned; the next connection will ask again.',
+  '主机指纹未能保存，本次连接未固定证书':
+      'The host fingerprint could not be saved; this connection is not pinned',
+  '这次连接没有固定主机证书：指纹无法保存到本地，下次连接会重新确认。':
+      'This connection did not pin the host certificate: the fingerprint could not be saved locally, and the next connection will ask again.',
+  '服务器要求的安全密钥域名与连接服务不一致：{rpId}':
+      'The security-key domain requested by the server does not match the connection service: {rpId}',
+  '录制大小与服务器记录不一致：应有 {expected} 字节，响应为 {actual} 字节':
+      'Recording size does not match the server record: expected {expected} bytes, response has {actual}',
   '录制下载数据超过记录的大小': 'Recording download exceeds the recorded size',
-  '录制下载不完整：应有 {expected} 字节，实际收到 {actual} 字节': 'Recording download is incomplete: expected {expected} bytes, received {actual}',
+  '录制下载不完整：应有 {expected} 字节，实际收到 {actual} 字节':
+      'Recording download is incomplete: expected {expected} bytes, received {actual}',
   '录制内容校验失败，文件已删除': 'Recording verification failed; the file was deleted',
-  '出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口': 'Invalid outbound proxy; use http://, https://, socks5:// or socks5h:// with an explicit port',
+  '出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口':
+      'Invalid outbound proxy; use http://, https://, socks5:// or socks5h:// with an explicit port',
   '出站代理地址为空': 'The outbound proxy address is empty',
   '无法启动代理桥接（{exe}）：{p2}': 'Cannot start the proxy bridge ({exe}): {p2}',
-  '代理桥接启动失败（退出码 {code}）{p7}': 'The proxy bridge failed to start (exit code {code}) {p7}',
-  '代理桥接在 {p3} 秒内没有就绪{p4}': 'The proxy bridge was not ready within {p3} seconds{p4}',
-  '代理桥接返回了无效监听地址：{p5}': 'The proxy bridge returned an invalid listen address: {p5}',
+  '代理桥接启动失败（退出码 {code}）{p7}':
+      'The proxy bridge failed to start (exit code {code}) {p7}',
+  '代理桥接在 {p3} 秒内没有就绪{p4}':
+      'The proxy bridge was not ready within {p3} seconds{p4}',
+  '代理桥接返回了无效监听地址：{p5}':
+      'The proxy bridge returned an invalid listen address: {p5}',
 };

@@ -45,6 +45,10 @@
     policyObjects: [],
     policyAssignments: [],
     policyObjectEditing: null,
+	clientStrategy: null,
+	clientStrategyGen: 0,
+	clientStrategyPeer: '',
+	clientStrategyStatusGen: 0,
     accountCapUser: null,
     accountRecoveryUser: null,
     accountSessionsUser: null,
@@ -362,9 +366,21 @@
 
   // refreshSession rotates the account pair. It runs on every expired access
   // token, so a console stays usable for the refresh token's lifetime.
-  async function refreshSession() {
-    const auth = state.auth;
-    if (!auth || auth.mode !== 'account' || !auth.refresh) return false;
+  const sessionRefreshes = new WeakMap();
+
+  async function refreshSession(auth = state.auth) {
+    if (!auth || auth !== state.auth || auth.mode !== 'account' || !auth.refresh) return false;
+    if (sessionRefreshes.has(auth)) return sessionRefreshes.get(auth);
+    const pending = refreshSessionOnce(auth);
+    sessionRefreshes.set(auth, pending);
+    try {
+      return await pending;
+    } finally {
+      if (sessionRefreshes.get(auth) === pending) sessionRefreshes.delete(auth);
+    }
+  }
+
+  async function refreshSessionOnce(auth) {
     try {
       const resp = await fetch('/v1/account/refresh', {
         method: 'POST',
@@ -374,6 +390,7 @@
       });
       if (!resp.ok) return false;
       const data = readJSON(await resp.text());
+      if (state.auth !== auth) return false;
       if (!data || !data.token || !data.refresh_token) return false;
       auth.token = data.token;
       auth.refresh = data.refresh_token;
@@ -390,7 +407,11 @@
     }
   }
 
-  async function api(path, options, retried) {
+  async function api(path, options, retried, auth = state.auth) {
+    const requireCurrentSession = () => {
+      if (state.auth !== auth) throw new ApiError('登录身份已变化，已取消旧请求，请重新操作。', 409);
+    };
+    requireCurrentSession();
     const opts = options || {};
     const headers = authHeaders();
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
@@ -401,11 +422,13 @@
       cache: 'no-store',
     });
     const text = await resp.text();
+    requireCurrentSession();
     const data = readJSON(text);
     if (resp.status === 401) {
-      if (!retried && await refreshSession()) {
-        return api(path, options, true);
+      if (!retried && await refreshSession(auth)) {
+        return api(path, options, true, auth);
       }
+      requireCurrentSession();
       lock('登录已失效或凭据被拒绝，请重新登录。');
       throw new ApiError('unauthorized', 401);
     }
@@ -863,6 +886,15 @@
     state.policyObjects = [];
     state.policyAssignments = [];
     state.policyObjectEditing = null;
+    state.clientStrategyGen++;
+    state.clientStrategyStatusGen++;
+    state.clientStrategy = null;
+    state.clientStrategyPeer = '';
+    for (const id of ['client-strategy-dialog', 'client-strategy-status-dialog']) {
+      if ($(id).open) $(id).close();
+    }
+    clear($('client-strategy-fields'));
+    clear($('client-strategy-status-results'));
     state.tokens = [];
     state.tokenSecret = '';
     resetMine();
@@ -1541,6 +1573,9 @@
     const edit = button('编辑', 'small');
     edit.addEventListener('click', () => openPolicyObjectDialog(policy));
     actions.appendChild(edit);
+    const config = button('客户端设置', 'small');
+    config.addEventListener('click', () => openClientStrategy(policy).catch(reportError));
+    actions.appendChild(config);
     tr.appendChild(cell(actions));
     return tr;
   }
@@ -1610,6 +1645,9 @@
     const edit = button('编辑', 'small');
     edit.addEventListener('click', () => openPolicyDialog(policy));
     actions.appendChild(edit);
+    const configStatus = button('设置状态', 'small');
+    configStatus.addEventListener('click', () => openClientStrategyStatus(policy.peer_id).catch(reportError));
+    actions.appendChild(configStatus);
     tr.appendChild(cell(actions));
     return tr;
   }
@@ -1726,6 +1764,176 @@
   }
 
   // ---------- policy objects and assignments ----------
+
+  const strategyLabels = {
+    'host.lock_after_session_end': '主机：会话结束后锁定',
+    'host.keep_awake': '主机：会话期间保持唤醒',
+    'host.auto_disconnect_minutes': '主机：无操作断开时间（分钟，0 为关闭）',
+    'host.max_viewers': '主机：最大同时连接数',
+    'host.carrier': '主机：启用 TCP / WebSocket 回退',
+    'host.lan_discovery': '主机：允许局域网发现',
+    'viewer.tunnel_mode': '查看端：连接方式',
+    'viewer.use_websocket': '查看端：使用 WebSocket',
+    'viewer.upload_recordings': '查看端：自动上传录制',
+    'viewer.sync_initial_clipboard': '查看端：连接时同步剪贴板',
+    'viewer.view_fit': '查看端：画面大小',
+  };
+  const strategyStatusLabels = {
+    applied: '已应用', pending_restart: '待重启', pending_session: '下次会话生效',
+    unsupported: '客户端不支持', failed: '应用失败',
+  };
+
+  function strategySelect(choices) {
+    const select = el('select');
+    choices.forEach(([value, label]) => {
+      const option = el('option', '', label);
+      option.value = value;
+      select.appendChild(option);
+    });
+    return select;
+  }
+
+  async function openClientStrategy(policy) {
+    const generation = ++state.clientStrategyGen;
+    const auth = state.auth;
+    state.clientStrategy = null;
+    const dialog = $('client-strategy-dialog');
+    $('client-strategy-title').textContent = '客户端设置 · ' + policy.name;
+    $('client-strategy-note').textContent = '正在加载…';
+    $('client-strategy-error').textContent = '';
+    $('client-strategy-save').disabled = true;
+    $('client-strategy-reload').disabled = true;
+    clear($('client-strategy-fields'));
+    if (!dialog.open) dialog.showModal();
+    try {
+      const [catalog, config] = await Promise.all([
+        api('/v1/client-strategies/catalog'),
+        api('/v1/policies/' + encodeURIComponent(policy.id) + '/client-strategy'),
+      ]);
+      if (generation !== state.clientStrategyGen || auth !== state.auth || !dialog.open) return;
+      if (catalog.version !== 1 || !Array.isArray(catalog.settings) || !config.settings ||
+          !Number.isSafeInteger(config.revision)) throw new Error('服务器返回的设置格式不受支持');
+      const known = new Set(catalog.settings.map((def) => def.key));
+      if (Object.keys(config.settings).some((key) => !known.has(key))) {
+        throw new Error('配置含有当前目录无法解释的设置，请刷新管理台后再编辑');
+      }
+      const fields = [];
+      catalog.settings.forEach((def) => {
+        const box = el('fieldset', 'dialog-stack');
+        box.appendChild(el('legend', '', strategyLabels[def.key] || def.key));
+        const modeLabel = el('label', '', '管理方式');
+        const mode = strategySelect([['inherit', '使用本地设置'], ['default', '本地未设置时使用'], ['locked', '由管理员指定']]);
+        modeLabel.appendChild(mode);
+        box.appendChild(modeLabel);
+        const valueLabel = el('label', '', '值');
+        let value;
+        if (def.type === 'boolean') value = strategySelect([['false', '关闭'], ['true', '开启']]);
+        else if (def.type === 'string' && Array.isArray(def.choices)) {
+          const labels = {auto: '自动直连与回退', direct: '仅直连', relay: '仅中继'};
+          value = strategySelect(def.choices.map((choice) => [choice, labels[choice] || choice]));
+        } else if (def.key === 'viewer.view_fit') value = strategySelect([['0', '适应窗口'], ['1', '原始大小']]);
+        else if (def.type === 'integer') {
+          value = el('input'); value.type = 'number'; value.step = '1';
+          value.min = String(def.min || 0); value.max = String(def.max); value.value = value.min;
+        } else throw new Error('管理台不支持设置类型：' + def.type);
+        const setting = config.settings[def.key];
+        mode.value = setting ? setting.mode : 'inherit';
+        if (setting) value.value = String(setting.value);
+        value.disabled = mode.value === 'inherit';
+        mode.addEventListener('change', () => { value.disabled = mode.value === 'inherit'; });
+        valueLabel.appendChild(value);
+        box.appendChild(valueLabel);
+        box.appendChild(el('span', 'muted', def.apply === 'restart' ? '应用需要主机重启；请查看设备回报的状态。' : '在下一次会话开始时应用。'));
+        $('client-strategy-fields').appendChild(box);
+        fields.push({def, mode, value});
+      });
+      state.clientStrategy = {policy, revision: config.revision, fields, auth, generation};
+      $('client-strategy-note').textContent = '配置版本 ' + config.revision + '。保存后等待客户端应用回报；“使用本地设置”会撤销该项覆盖。';
+      $('client-strategy-save').disabled = !can('admin');
+      $('client-strategy-reload').disabled = false;
+    } catch (err) {
+      if (generation === state.clientStrategyGen && auth === state.auth && dialog.open) {
+        $('client-strategy-error').textContent = err.message;
+        $('client-strategy-note').textContent = '加载失败，尚未修改配置。请关闭后重新打开。';
+      }
+    }
+  }
+
+  async function saveClientStrategy() {
+    const editing = state.clientStrategy;
+    if (!editing || editing.auth !== state.auth) return;
+    const settings = {};
+    for (const {def, mode, value} of editing.fields) {
+      if (mode.value === 'inherit') continue;
+      let typed = value.value;
+      if (def.type === 'boolean') typed = typed === 'true';
+      if (def.type === 'integer') {
+        typed = Number(typed);
+        if (value.value === '' || !Number.isSafeInteger(typed) || typed < (def.min || 0) || typed > def.max) {
+          $('client-strategy-error').textContent = (strategyLabels[def.key] || def.key) + '：请输入允许范围内的整数';
+          return;
+        }
+      }
+      settings[def.key] = {mode: mode.value, value: typed};
+    }
+    $('client-strategy-error').textContent = '';
+    await withButton($('client-strategy-save'), async () => {
+      $('client-strategy-reload').disabled = true;
+      $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = true; });
+      try {
+        const saved = await api('/v1/policies/' + encodeURIComponent(editing.policy.id) + '/client-strategy', {
+          method: 'PUT', body: {if_revision: editing.revision, settings},
+        });
+        if (editing !== state.clientStrategy || editing.auth !== state.auth) return;
+        editing.revision = saved.revision;
+        $('client-strategy-note').textContent = '配置版本 ' + saved.revision + ' 已保存，等待客户端应用回报。';
+        toast('客户端设置已保存，尚需确认设备应用状态');
+      } catch (err) {
+        if (editing !== state.clientStrategy || editing.auth !== state.auth) return;
+        $('client-strategy-error').textContent = err.status === 409
+          ? '配置已被其他管理员修改。当前输入已保留；重新加载后核对并再次编辑。' : err.message;
+      } finally {
+        if (editing === state.clientStrategy) {
+          $('client-strategy-reload').disabled = false;
+          $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = false; });
+        }
+      }
+    });
+  }
+
+  async function openClientStrategyStatus(peer) {
+    const generation = ++state.clientStrategyStatusGen;
+    const auth = state.auth;
+    state.clientStrategyPeer = peer;
+    const dialog = $('client-strategy-status-dialog');
+    $('client-strategy-status-title').textContent = '客户端设置状态 · ' + peer;
+    $('client-strategy-status-note').textContent = '正在查询…';
+    clear($('client-strategy-status-results'));
+    if (!dialog.open) dialog.showModal();
+    try {
+      const snapshots = await Promise.all(['host', 'viewer'].map((target) =>
+        api('/v1/device-strategies/' + encodeURIComponent(peer) + '?target=' + target)));
+      if (generation !== state.clientStrategyStatusGen || auth !== state.auth || !dialog.open) return;
+      snapshots.forEach((snapshot) => {
+        const section = el('section', 'dialog-stack');
+        section.appendChild(el('h3', '', (snapshot.target === 'host' ? '主机' : '查看端') + ' · 版本 ' + snapshot.revision));
+        section.appendChild(el('p', 'muted', snapshot.policy_id ? '来源策略：' + snapshot.policy_id : '无分配，使用本地设置'));
+        const receipt = snapshot.receipt;
+        section.appendChild(el('p', '', receipt ? (strategyStatusLabels[receipt.status] || '未知状态') + ' · ' + fmtTime(receipt.reported_at_ms) : '尚无当前版本的应用回报，不能确认已生效。'));
+        Object.entries(snapshot.settings || {}).forEach(([key, setting]) => {
+          const result = receipt && receipt.results && receipt.results[key];
+          section.appendChild(el('p', '', (strategyLabels[key] || key) + '：' + String(setting.value) +
+            ' · ' + (setting.mode === 'locked' ? '管理员指定' : '本地未设置时使用') +
+            ' · ' + (result ? (strategyStatusLabels[result.status] || '未知状态') : '待回报')));
+          if (result && result.detail) section.appendChild(el('span', 'muted', result.detail));
+        });
+        $('client-strategy-status-results').appendChild(section);
+      });
+      $('client-strategy-status-note').textContent = '只显示当前配置版本的回报；旧版本结果不作为当前生效证据。查看端配置按连接目标应用。';
+    } catch (err) {
+      if (generation === state.clientStrategyStatusGen && auth === state.auth && dialog.open) $('client-strategy-status-note').textContent = err.message;
+    }
+  }
 
   function openPolicyObjectDialog(policy) {
     state.policyObjectEditing = policy || null;
@@ -3299,6 +3507,17 @@
     }));
     $('policy-export-json').addEventListener('click', (event) =>
       withButton(event.currentTarget, exportPolicyObjects));
+    $('client-strategy-form').addEventListener('submit', (event) => { event.preventDefault(); saveClientStrategy().catch(reportError); });
+    $('client-strategy-close').addEventListener('click', () => $('client-strategy-dialog').close());
+    $('client-strategy-dialog').addEventListener('close', () => { state.clientStrategyGen++; state.clientStrategy = null; });
+    $('client-strategy-reload').addEventListener('click', () => {
+      if (state.clientStrategy && window.confirm('重新加载将放弃当前未保存的输入，继续？')) openClientStrategy(state.clientStrategy.policy).catch(reportError);
+    });
+    $('client-strategy-status-close').addEventListener('click', () => $('client-strategy-status-dialog').close());
+    $('client-strategy-status-dialog').addEventListener('close', () => { state.clientStrategyStatusGen++; state.clientStrategyPeer = ''; });
+    $('client-strategy-status-refresh').addEventListener('click', () => {
+      if (state.clientStrategyPeer) openClientStrategyStatus(state.clientStrategyPeer).catch(reportError);
+    });
     $('policy-import-json').addEventListener('click', () => $('policy-import-file').click());
     $('policy-import-file').addEventListener('change', (event) => {
       const file = event.currentTarget.files && event.currentTarget.files[0];

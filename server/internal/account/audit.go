@@ -82,6 +82,8 @@ const (
 	// the device policy actions above.
 	AuditPolicyObjectCreate     = "policy_object_create"
 	AuditPolicyObjectUpdate     = "policy_object_update"
+	AuditClientStrategyUpdate   = "client_strategy_update"
+	AuditClientStrategyReceipt  = "client_strategy_receipt"
 	AuditPolicyObjectDelete     = "policy_object_delete"
 	AuditPolicyObjectImport     = "policy_object_import"
 	AuditPolicyAssignmentCreate = "policy_assignment_create"
@@ -93,6 +95,9 @@ const (
 
 	AuditAPITokenCreate = "api_token_create"
 	AuditAPITokenRevoke = "api_token_revoke"
+
+	AuditConnectionDisconnect        = "connection_disconnect"
+	AuditConnectionDisconnectReceipt = "connection_disconnect_receipt"
 )
 
 // auditRetention keeps the table bounded without an external maintenance job.

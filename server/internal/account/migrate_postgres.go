@@ -31,6 +31,12 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[16].Apply = applyLDAPIdentitiesPostgres
 	list[17].Apply = applyAccountSessionActivityPostgres
 	list[18].Apply = applyConnectionNotePostgres
+	// The strategy tables use portable DDL with explicit BIGINT counters and
+	// timestamps; SQLite and PostgreSQL share this additive migration.
+	list[19].Apply = applyClientStrategies
+	list[20].Apply = applyClientStrategyReceipts
+	list[21].Apply = applyViewerStrategyDeliveries
+	list[22].Apply = applyLiveConnections
 	return list
 }()
 

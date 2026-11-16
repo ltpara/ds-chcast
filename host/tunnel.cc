@@ -340,6 +340,9 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     command += L" --key-stdin";
     add(L"--local", L"127.0.0.1:" + std::to_wstring(local_port));
     add(L"--listen", widen(settings.tunnel_listen));
+    // Go bool flags require =false: a separate "false" is a positional arg
+    // and would leave discovery enabled (and stop parsing subsequent flags).
+    command += settings.lan_discovery ? L" --lan-discovery=true" : L" --lan-discovery=false";
     if (settings.carrier && local_port != 0 && local_port < 65535) {
         // The carrier binds the same address as QUIC, but the agent always
         // reaches it over loopback when QUIC listens on a wildcard.

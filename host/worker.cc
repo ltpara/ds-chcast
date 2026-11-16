@@ -14,6 +14,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,6 +23,7 @@
 
 #include "chast/capture.h"
 #include "chast/host_server.h"
+#include "chast/host_client_strategy.h"
 #include "chast/identity.h"
 #include "chast/virtual_display.h"
 #include "platform.h"
@@ -98,6 +100,9 @@ void save_password_hash(const std::string& hash) {
 void save_remote_settings(const HostSettings& update) {
     std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
     HostSettings& settings = g_worker->settings;
+    if (settings.lock_after_session_end != update.lock_after_session_end) {
+        mark_host_preference(settings, HostPreference::LockAfterSessionEnd);
+    }
     settings.lock_after_session_end = update.lock_after_session_end;
     settings.allow_clipboard = update.allow_clipboard;
     settings.allow_file_transfer = update.allow_file_transfer;
@@ -324,22 +329,94 @@ void prepare_virtual_display_on_start(const HostSettings& settings) {
                   {"monitors", std::to_string(result.status.active_monitors)}});
 }
 
+bool load_worker_strategy(const HostSettings& local, HostSettings& effective,
+                          HostClientStrategy& previous, HostStrategyIdentity& identity,
+                          bool& loaded, bool& blocked, bool& changed,
+                          std::string& error) {
+    blocked = false;
+    changed = false;
+    effective = local;
+    const std::string path = host_client_strategy_path(local);
+    if (path.empty()) {
+        loaded = false;
+        return true;
+    }
+    const int path_length =
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(),
+                            static_cast<int>(path.size()), nullptr, 0);
+    if (path_length <= 0) {
+        blocked = true;
+        error = "client strategy cache path is not valid UTF-8";
+        return false;
+    }
+    std::wstring native_path(static_cast<size_t>(path_length), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(),
+                        static_cast<int>(path.size()), native_path.data(),
+                        path_length);
+    std::error_code ec;
+    const bool present =
+        std::filesystem::exists(std::filesystem::path(native_path), ec);
+    if (ec) {
+        blocked = true;
+        error = "cannot inspect client strategy cache: " + ec.message();
+        return false;
+    }
+    if (!present) {
+        effective = loaded ? host_strategy_effective_settings(local, previous) : local;
+        return true;
+    }
+    if (!host_strategy_identity(local, "", identity, &error)) {
+        blocked = true;
+        return false;
+    }
+    HostClientStrategy next;
+    const HostClientStrategy* prior = loaded ? &previous : nullptr;
+    if (!read_host_client_strategy(path, identity, prior, next, &error)) {
+        blocked = true;
+        if (loaded) effective = host_strategy_effective_settings(local, previous);
+        return false;
+    }
+    if (loaded && next.revision == previous.revision &&
+        next.digest == previous.digest) {
+        effective = host_strategy_effective_settings(local, previous);
+        return true;
+    }
+    changed = !loaded || next.revision != previous.revision ||
+              next.digest != previous.digest;
+    previous = std::move(next);
+    loaded = true;
+    blocked = host_strategy_has_unsupported_settings(previous);
+    if (blocked)
+        error = "client strategy contains settings unsupported by this worker";
+    effective = host_strategy_effective_settings(local, previous);
+    return true;
+}
+
 bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
                   const std::string& fingerprint, HostServer& server,
-                  std::atomic<bool>& ended, std::atomic<uint32_t>& exit_code) {
+                  std::atomic<bool>& ended, std::atomic<uint32_t>& exit_code,
+                  std::atomic<bool>& ready, std::atomic<bool>& failed) {
     ended = false;
     exit_code = 0;
+    ready = false;
+    failed = false;
     std::string error;
     if (!tunnel.start(settings, settings.port, fingerprint,
-                      [&server](const TunnelEvent& event) { log_tunnel_event(server, event); },
+                      [&server, &ready](const TunnelEvent& event) {
+                          if (event.event == "ready") ready = true;
+                          log_tunnel_event(server, event);
+                      },
                       [](const std::string& line) {
                           worker_event("tunnel.output", {{"text", line}});
                       },
-                      [&ended, &exit_code](uint32_t code) {
+                      [&ended, &exit_code, &ready, &failed](uint32_t code) {
+                          ready = false;
+                          failed = code != 0;
                           exit_code = code;
                           ended = true;
                       },
                       &error)) {
+        failed = true;
         worker_event("tunnel.start_failed", {{"error", error}});
         return false;
     }
@@ -372,6 +449,25 @@ int run_worker(std::string* error) {
         worker_event("settings.warning", {{"text", settings_warning}});
     }
     context.settings = settings;
+    HostSettings effective_settings;
+    HostClientStrategy managed_strategy;
+    HostStrategyIdentity strategy_identity;
+    bool managed_strategy_loaded = false;
+    bool strategy_blocked = false;
+    bool strategy_changed = false;
+    std::string strategy_error;
+    load_worker_strategy(settings, effective_settings, managed_strategy,
+                         strategy_identity, managed_strategy_loaded,
+                         strategy_blocked, strategy_changed, strategy_error);
+    if (!strategy_error.empty()) {
+        worker_event("strategy.unavailable",
+                     {{"error", strategy_error},
+                      {"blocked", strategy_blocked ? "true" : "false"}});
+    } else if (managed_strategy_loaded) {
+        worker_event("strategy.loaded",
+                     {{"revision", std::to_string(managed_strategy.revision)},
+                      {"digest", managed_strategy.digest}});
+    }
 
     if (settings.password_hash.empty()) {
         worker_event("auth.password_missing");
@@ -397,8 +493,8 @@ int run_worker(std::string* error) {
 
     ServiceControlServer control;
     HostServerConfig config;
-    config.settings = settings;
-    config.audio_silence_gate_ms = settings.audio_silence_gate_ms;
+    config.settings = effective_settings;
+    config.audio_silence_gate_ms = effective_settings.audio_silence_gate_ms;
     config.identity_scope = IdentityScope::LocalMachine;
     // Click/Both waits for an authenticated operator in this Windows session.
     // The service never creates temporary passwords or bypasses missing approval.
@@ -433,11 +529,20 @@ int run_worker(std::string* error) {
     std::unique_ptr<HostServer> server = HostServer::create(std::move(config), &create_error);
     if (!server) {
         *error = create_error;
+        if (managed_strategy_loaded) {
+            std::string receipt_error;
+            if (!write_host_client_strategy_ack(
+                    settings, strategy_identity, managed_strategy, false, false,
+                    &receipt_error, true, false)) {
+                worker_event("strategy.receipt_failed", {{"error", receipt_error}});
+            }
+        }
         worker_event("listener.failed", {{"error", create_error}});
         CloseHandle(stop);
         g_worker = nullptr;
         return 1;
     }
+    server->set_strategy_admission_allowed(!strategy_blocked);
     std::string control_error;
     if (!control.start(*server, &control_error, [&context] {
         std::lock_guard lock(context.settings_mutex);
@@ -452,24 +557,30 @@ int run_worker(std::string* error) {
     }
 
     bool tunnel_wanted = false;
-    if (settings.tunnel) {
-        if (settings.server_url.empty()) {
+    bool tunnel_configuration_failed = false;
+    if (effective_settings.tunnel) {
+        if (effective_settings.server_url.empty()) {
             worker_event("tunnel.local_only");
-        } else if (std::string tunnel_error; validate_tunnel_settings(settings, &tunnel_error)) {
+            tunnel_configuration_failed = true;
+        } else if (std::string tunnel_error; validate_tunnel_settings(effective_settings, &tunnel_error)) {
             tunnel_wanted = true;
         } else {
             worker_event("tunnel.settings_rejected", {{"error", tunnel_error}});
+            tunnel_configuration_failed = true;
         }
     }
 
     TunnelProcess tunnel;
     std::atomic<bool> tunnel_ended{false};
     std::atomic<uint32_t> tunnel_exit_code{0};
+    std::atomic<bool> tunnel_ready{false};
+    std::atomic<bool> tunnel_failed{tunnel_configuration_failed};
     bool tunnel_needs_start = tunnel_wanted;
     auto next_tunnel = std::chrono::steady_clock::now();
+    auto next_strategy = std::chrono::steady_clock::now();
     if (tunnel_wanted &&
-        start_tunnel(tunnel, settings, status.fingerprint, *server, tunnel_ended,
-                     tunnel_exit_code)) {
+        start_tunnel(tunnel, effective_settings, status.fingerprint, *server, tunnel_ended,
+                     tunnel_exit_code, tunnel_ready, tunnel_failed)) {
         tunnel_needs_start = false;
     }
 
@@ -478,10 +589,73 @@ int run_worker(std::string* error) {
             break;
         }
         if (!server->running()) {
+            if (managed_strategy_loaded) {
+                std::string receipt_error;
+                if (!write_host_client_strategy_ack(
+                        settings, strategy_identity, managed_strategy, false, false,
+                        &receipt_error, true, tunnel_failed.load())) {
+                    worker_event("strategy.receipt_failed", {{"error", receipt_error}});
+                }
+            }
             worker_event("server.stopped");
             break;
         }
         const auto now = std::chrono::steady_clock::now();
+        const bool server_ready =
+            server->status().state == HostState::Listening ||
+            server->status().state == HostState::Streaming;
+        const bool tunnel_effectively_ready =
+            !effective_settings.tunnel || tunnel_ready.load();
+        if (managed_strategy_loaded) {
+            std::string receipt_error;
+            if (!write_host_client_strategy_ack(
+                    settings, strategy_identity, managed_strategy,
+                    server_ready, tunnel_effectively_ready, &receipt_error,
+                    false, tunnel_failed.load())) {
+                worker_event("strategy.receipt_failed", {{"error", receipt_error}});
+            }
+        }
+        if (now >= next_strategy) {
+            next_strategy = now + std::chrono::seconds(2);
+            const HostSettings old_effective = effective_settings;
+            HostSettings local;
+            {
+                std::lock_guard<std::mutex> lock(context.settings_mutex);
+                local = context.settings;
+            }
+            bool changed = false;
+            std::string read_error;
+            const bool readable = load_worker_strategy(
+                local, effective_settings, managed_strategy, strategy_identity,
+                managed_strategy_loaded, strategy_blocked, changed, read_error);
+            server->set_strategy_admission_allowed(readable && !strategy_blocked);
+            server->set_strategy_locked_preferences(
+                effective_settings.managed_locked_preferences);
+            if (!read_error.empty()) {
+                worker_event("strategy.unavailable", {{"error", read_error}});
+            }
+            if (changed &&
+                (old_effective.keep_awake != effective_settings.keep_awake ||
+                 old_effective.max_viewers != effective_settings.max_viewers ||
+                 old_effective.carrier != effective_settings.carrier ||
+                 old_effective.lan_discovery != effective_settings.lan_discovery)) {
+                if (managed_strategy_loaded) {
+                    std::string receipt_error;
+                    if (!write_host_client_strategy_ack(
+                            local, strategy_identity, managed_strategy, false, false,
+                            &receipt_error, false, false)) {
+                        worker_event("strategy.receipt_failed", {{"error", receipt_error}});
+                    }
+                }
+                worker_event("strategy.restart_required");
+                break;
+            }
+            if (changed) {
+                server->set_next_session_strategy(
+                    effective_settings.lock_after_session_end,
+                    effective_settings.auto_disconnect_minutes);
+            }
+        }
         if (tunnel_ended.exchange(false)) {
             worker_event("tunnel.exited",
                          {{"code", std::to_string(tunnel_exit_code.load())}});
@@ -491,8 +665,8 @@ int run_worker(std::string* error) {
         if (!tunnel_needs_start || now < next_tunnel) {
             continue;
         }
-        if (start_tunnel(tunnel, settings, status.fingerprint, *server, tunnel_ended,
-                         tunnel_exit_code)) {
+        if (start_tunnel(tunnel, effective_settings, status.fingerprint, *server, tunnel_ended,
+                         tunnel_exit_code, tunnel_ready, tunnel_failed)) {
             tunnel_needs_start = false;
         } else {
             next_tunnel = now + std::chrono::seconds(5);

@@ -198,6 +198,15 @@ void test_command_line() {
           "the executable is quoted and followed by host mode");
     check(contains(command, L"--old-id devbox.home"),
           "a pending old id is passed for migration");
+    check(contains(command, L"--lan-discovery=true"),
+          "LAN discovery defaults are explicit in the child launch");
+    settings.lan_discovery = false;
+    const auto discovery_off = chast::host::tunnel_command_line(
+        L"chast-tunnel.exe", settings, 4433, "AA:BB:CC");
+    check(contains(discovery_off, L"--lan-discovery=false") &&
+          !contains(discovery_off, L"--lan-discovery=true") &&
+          contains(discovery_off, L"--fingerprint AA:BB:CC"),
+          "disabling LAN discovery uses Go bool syntax and retains subsequent flags");
     check(contains(command, L"--server https://rendezvous.example.com"),
           "the service URL is passed");
     check(contains(command, L"--id devbox.office"), "the device id is passed");

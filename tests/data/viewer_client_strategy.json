@@ -1,0 +1,30 @@
+{
+  "peer_id": "native-host",
+  "target": "viewer",
+  "revision": 9,
+  "policy_id": "viewer-policy",
+  "settings": {
+    "viewer.sync_initial_clipboard": {
+      "mode": "locked",
+      "value": true
+    },
+    "viewer.tunnel_mode": {
+      "mode": "locked",
+      "value": "relay"
+    },
+    "viewer.upload_recordings": {
+      "mode": "locked",
+      "value": false
+    },
+    "viewer.use_websocket": {
+      "mode": "default",
+      "value": true
+    },
+    "viewer.view_fit": {
+      "mode": "default",
+      "value": 1
+    }
+  },
+  "digest": "3ed81cab826adde84b3aa763d78b1dc4c4850f1882aac30a7eb6a33dbe589eb1",
+  "updated_at_ms": 1794787200000
+}

@@ -27,6 +27,7 @@ class Device {
     this.favorite = false,
     this.mac = '',
     this.revision = 0,
+    this.dirtyFields = 0,
     this.lastUsed,
   });
 
@@ -76,6 +77,57 @@ class Device {
   /// Server revision of the address-book row this entry was last synced from.
   /// Zero means unknown, so the next upload omits the concurrency token.
   final int revision;
+
+  /// Locally edited fields, persisted until acknowledged by the server.
+  /// A cached value alone is never evidence of a local edit.
+  static const int nameField = 1;
+  static const int tagsField = 2;
+  static const int noteField = 4;
+  static const int groupField = 8;
+  final int dirtyFields;
+
+  Device edit({
+    String? name,
+    List<String>? tags,
+    String? note,
+    String? groupId,
+  }) {
+    final String? cleanName = name?.trim();
+    final List<String>? cleanTagList = tags == null ? null : cleanTags(tags);
+    final String? cleanNoteText = note == null ? null : cleanNote(note);
+    final String? cleanGroup = groupId?.trim();
+    return copyWith(
+      name: cleanName,
+      tags: cleanTagList,
+      note: cleanNoteText,
+      groupId: cleanGroup,
+      dirtyFields:
+          dirtyFields |
+          (cleanName != null && cleanName != this.name ? nameField : 0) |
+          (cleanTagList != null && !sameTags(cleanTagList, this.tags)
+              ? tagsField
+              : 0) |
+          (cleanNoteText != null && cleanNoteText != this.note
+              ? noteField
+              : 0) |
+          (cleanGroup != null && cleanGroup != this.groupId ? groupField : 0),
+      tagsCleared: cleanTagList == null
+          ? null
+          : cleanTagList.isEmpty &&
+                (tagsCleared || !sameTags(cleanTagList, this.tags)),
+      noteCleared: cleanNoteText == null
+          ? null
+          : cleanNoteText.isEmpty &&
+                (noteCleared || cleanNoteText != this.note),
+      groupCleared: cleanGroup == null
+          ? null
+          : cleanGroup.isEmpty && (groupCleared || cleanGroup != this.groupId),
+    );
+  }
+
+  static bool sameTags(List<String> a, List<String> b) =>
+      a.length == b.length &&
+      Iterable<int>.generate(a.length).every((int i) => a[i] == b[i]);
   final DateTime? lastUsed;
   final DateTime addedAt;
 
@@ -112,6 +164,7 @@ class Device {
     bool? favorite,
     String? mac,
     int? revision,
+    int? dirtyFields,
     DateTime? lastUsed,
     DateTime? addedAt,
   }) {
@@ -130,6 +183,7 @@ class Device {
       favorite: favorite ?? this.favorite,
       mac: mac ?? this.mac,
       revision: revision ?? this.revision,
+      dirtyFields: dirtyFields ?? this.dirtyFields,
       lastUsed: lastUsed ?? this.lastUsed,
       addedAt: addedAt ?? this.addedAt,
     );
@@ -150,6 +204,7 @@ class Device {
     'favorite': favorite,
     'mac': mac,
     'revision': revision,
+    'dirtyFields': dirtyFields,
     'lastUsed': lastUsed?.millisecondsSinceEpoch,
     'addedAt': addedAt.millisecondsSinceEpoch,
   };
@@ -232,6 +287,9 @@ class Device {
       mac: normalizeMac(value['mac']?.toString() ?? '') ?? '',
       revision: rawRevision is num && rawRevision >= 0
           ? rawRevision.toInt()
+          : 0,
+      dirtyFields: value['dirtyFields'] is num
+          ? (value['dirtyFields'] as num).toInt() & 15
           : 0,
       lastUsed: rawLastUsed is num
           ? DateTime.fromMillisecondsSinceEpoch(rawLastUsed.toInt())
@@ -372,24 +430,17 @@ class DeviceStore {
       final DateTime now = DateTime.now();
       if (index >= 0) {
         final Device old = devices[index];
-        final List<String> tags = device.tags.isEmpty ? old.tags : device.tags;
-        devices[index] = Device(
-          id: device.id,
-          name: device.name.isEmpty ? old.name : device.name,
-          server: device.server,
-          tags: tags,
-          note: device.note.isEmpty ? old.note : Device.cleanNote(device.note),
-          groupId: old.groupId,
-          tagsCleared: tags.isEmpty ? old.tagsCleared : false,
-          noteCleared: device.note.isEmpty ? old.noteCleared : false,
-          groupCleared: old.groupCleared,
-          saved: old.saved || device.saved,
-          favorite: old.favorite,
-          mac: device.mac.isNotEmpty ? device.mac : old.mac,
-          revision: old.revision,
-          lastUsed: now,
-          addedAt: old.addedAt,
-        );
+        devices[index] = old
+            .edit(
+              name: device.name.isEmpty ? null : device.name,
+              tags: device.tags.isEmpty ? null : device.tags,
+              note: device.note.isEmpty ? null : device.note,
+            )
+            .copyWith(
+              saved: old.saved || device.saved,
+              mac: device.mac.isNotEmpty ? device.mac : old.mac,
+              lastUsed: now,
+            );
       } else {
         devices.add(
           Device(
@@ -421,29 +472,17 @@ class DeviceStore {
       final DateTime now = DateTime.now();
       if (index >= 0) {
         final Device old = devices[index];
-        final List<String> tags = device.tags.isEmpty
-            ? old.tags
-            : Device.cleanTags(device.tags);
-        final String groupId = old.groupId.isEmpty
-            ? device.groupId.trim()
-            : old.groupId;
-        devices[index] = Device(
-          id: device.id,
-          name: device.name.isEmpty ? old.name : device.name,
-          server: device.server,
-          tags: tags,
-          note: device.note.isEmpty ? old.note : Device.cleanNote(device.note),
-          groupId: groupId,
-          tagsCleared: tags.isEmpty ? old.tagsCleared : false,
-          noteCleared: device.note.isEmpty ? old.noteCleared : false,
-          groupCleared: groupId.isEmpty ? old.groupCleared : false,
-          saved: true,
-          favorite: old.favorite,
-          mac: device.mac.isNotEmpty ? device.mac : old.mac,
-          revision: old.revision,
-          lastUsed: old.lastUsed,
-          addedAt: old.addedAt,
-        );
+        devices[index] = old
+            .edit(
+              name: device.name.isEmpty ? null : device.name,
+              tags: device.tags.isEmpty ? null : device.tags,
+              note: device.note.isEmpty ? null : device.note,
+              groupId: old.groupId.isEmpty ? device.groupId : null,
+            )
+            .copyWith(
+              saved: true,
+              mac: device.mac.isNotEmpty ? device.mac : old.mac,
+            );
       } else {
         devices.add(
           Device(
@@ -481,7 +520,7 @@ class DeviceStore {
       final List<Device> devices = await load();
       final int index = devices.indexWhere((Device item) => item.key == key);
       if (index >= 0) {
-        devices[index] = devices[index].copyWith(name: name.trim());
+        devices[index] = devices[index].edit(name: name);
       }
       return _save(devices);
     });
@@ -518,10 +557,7 @@ class DeviceStore {
       final int index = devices.indexWhere((Device item) => item.key == key);
       if (index >= 0) {
         final List<String> clean = Device.cleanTags(tags);
-        devices[index] = devices[index].copyWith(
-          tags: clean,
-          tagsCleared: clean.isEmpty,
-        );
+        devices[index] = devices[index].edit(tags: clean);
       }
       return _save(devices);
     });
@@ -535,10 +571,7 @@ class DeviceStore {
       final int index = devices.indexWhere((Device item) => item.key == key);
       if (index >= 0) {
         final String value = groupId.trim();
-        devices[index] = devices[index].copyWith(
-          groupId: value,
-          groupCleared: value.isEmpty,
-        );
+        devices[index] = devices[index].edit(groupId: value);
       }
       return _save(devices);
     });
@@ -565,7 +598,8 @@ class DeviceStore {
         }
         devices[i] = devices[i].copyWith(
           groupId: value,
-          groupCleared: value.isEmpty,
+          groupCleared: false,
+          dirtyFields: devices[i].dirtyFields & ~Device.groupField,
           revision: revision > 0 ? revision : null,
         );
         changed = true;
@@ -583,10 +617,7 @@ class DeviceStore {
       final int index = devices.indexWhere((Device item) => item.key == key);
       if (index >= 0) {
         final String clean = Device.cleanNote(note);
-        devices[index] = devices[index].copyWith(
-          note: clean,
-          noteCleared: clean.isEmpty,
-        );
+        devices[index] = devices[index].edit(note: clean);
       }
       return _save(devices);
     });
@@ -596,18 +627,34 @@ class DeviceStore {
   /// replay it over a newer edit from another device.
   Future<List<Device>> markPushSettled(
     String key, {
+    bool name = false,
     bool tags = false,
     bool note = false,
     bool group = false,
+    Device? expected,
   }) async {
     return withStoreLock(_file(), () async {
-      if (!tags && !note && !group) {
+      if (!name && !tags && !note && !group) {
         return load();
       }
       final List<Device> devices = await load();
       final int index = devices.indexWhere((Device item) => item.key == key);
       if (index >= 0) {
+        final Device current = devices[index];
+        name = name && (expected == null || current.name == expected.name);
+        tags =
+            tags &&
+            (expected == null || Device.sameTags(current.tags, expected.tags));
+        note = note && (expected == null || current.note == expected.note);
+        group =
+            group && (expected == null || current.groupId == expected.groupId);
         devices[index] = devices[index].copyWith(
+          dirtyFields:
+              devices[index].dirtyFields &
+              ~((name ? Device.nameField : 0) |
+                  (tags ? Device.tagsField : 0) |
+                  (note ? Device.noteField : 0) |
+                  (group ? Device.groupField : 0)),
           tagsCleared: tags ? false : null,
           noteCleared: note ? false : null,
           groupCleared: group ? false : null,

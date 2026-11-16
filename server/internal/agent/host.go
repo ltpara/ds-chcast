@@ -432,6 +432,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	go h.relayHelloLoop()
 	go h.refreshLoop()
 	go h.hostEventLoop()
+	if cfg.PolicyState != "" {
+		go h.clientStrategyLoop()
+	}
 	if h.carrier != nil {
 		go h.carrierLinkLoop()
 	}

@@ -782,6 +782,38 @@ HostSettingsLoad load_host_settings(const std::string& path) {
     return parse_host_settings(text.str(), path);
 }
 
+namespace {
+constexpr const char* preference_keys[] = {
+    "lock_after_session_end", "keep_awake", "auto_disconnect_minutes",
+    "max_viewers", "carrier", "lan_discovery"
+};
+static_assert(std::size(preference_keys) == static_cast<size_t>(HostPreference::Count));
+
+uint32_t preference_value(const HostSettings& settings, HostPreference preference) {
+    switch (preference) {
+    case HostPreference::LockAfterSessionEnd: return settings.lock_after_session_end;
+    case HostPreference::KeepAwake: return settings.keep_awake;
+    case HostPreference::AutoDisconnectMinutes: return settings.auto_disconnect_minutes;
+    case HostPreference::MaxViewers: return settings.max_viewers;
+    case HostPreference::Carrier: return settings.carrier;
+    case HostPreference::LanDiscovery: return settings.lan_discovery;
+    default: return 0;
+    }
+}
+}
+
+void mark_host_preference(HostSettings& settings, HostPreference preference) {
+    if (preference < HostPreference::Count) {
+        settings.explicit_preferences |= 1u << static_cast<unsigned>(preference);
+    }
+}
+
+bool host_preference_is_explicit(const HostSettings& settings, HostPreference preference) {
+    if (preference >= HostPreference::Count) return false;
+    return (settings.explicit_preferences & (1u << static_cast<unsigned>(preference))) != 0 ||
+           preference_value(settings, preference) != preference_value(HostSettings{}, preference);
+}
+
 HostSettingsLoad parse_host_settings(const std::string& contents, const std::string& path) {
     HostSettingsLoad result;
     result.settings.audit_spool = audit_spool_path_for(path);
@@ -807,6 +839,7 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
         }
         const std::string key = lower(trim(text.substr(0, equals)));
         const std::string value = trim(text.substr(equals + 1));
+        const size_t warning_size = result.warning.size();
         HostSettings& settings = result.settings;
         if (key == "bind") {
             if (value.empty()) {
@@ -824,6 +857,10 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
         } else if (key == "carrier") {
             if (!parse_bool(value, settings.carrier)) {
                 warn(result.warning, "carrier '" + value + "' is not a boolean");
+            }
+        } else if (key == "lan_discovery") {
+            if (!parse_bool(value, settings.lan_discovery)) {
+                warn(result.warning, "lan_discovery '" + value + "' is not a boolean");
             }
         } else if (key == "max_viewers") {
             uint32_t viewers = 0;
@@ -1317,6 +1354,14 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
         }
         // Unknown keys are kept quiet: a newer build may write settings this
         // one does not know, and that is not an error the operator can fix.
+        if (result.warning.size() == warning_size) {
+            for (size_t i = 0; i < std::size(preference_keys); ++i) {
+                if (key == preference_keys[i]) {
+                    mark_host_preference(settings, static_cast<HostPreference>(i));
+                    break;
+                }
+            }
+        }
     }
 
     HostSettings& settings = result.settings;
@@ -1357,6 +1402,10 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
 
 bool serialize_host_settings(const std::string& path, const HostSettings& settings,
                              std::string& output, std::string* error) {
+    if (settings.managed_runtime_settings) {
+        if (error) *error = "Managed runtime settings cannot replace local preferences.";
+        return false;
+    }
     if (settings.record_directory.find_first_of("\r\n") != std::string::npos ||
         settings.record_directory.find('\0') != std::string::npos ||
         (settings.record_incoming && !native_path(settings.record_directory).is_absolute())) {
@@ -1400,11 +1449,19 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
         (settings.allow_os_login ? kPermissionOsLogin : 0) |
         (settings.allow_session_select ? kPermissionSessionSelect : 0);
     std::ostringstream text;
-    text << "# chast host settings\n"
+    text << "# chast host settings\n";
+    // Omit inherited built-in defaults so routine token/identity saves do not
+    // accidentally override a future managed default. Old files that contain
+    // these keys retain their values and explicit intent on the next save.
+    for (size_t i = 0; i < std::size(preference_keys); ++i) {
+        const auto preference = static_cast<HostPreference>(i);
+        if (host_preference_is_explicit(settings, preference)) {
+            text << preference_keys[i] << '=' << preference_value(settings, preference) << '\n';
+        }
+    }
+    text
          << "bind=" << settings.bind_address << "\n"
          << "port=" << settings.port << "\n"
-         << "carrier=" << (settings.carrier ? 1 : 0) << "\n"
-         << "max_viewers=" << settings.max_viewers << "\n"
          << "# security\n"
          << "auth_mode=" << auth_mode_name(settings.auth_mode) << "\n"
          << "password_hash=" << settings.password_hash << "\n"
@@ -1445,11 +1502,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "os_login=" << (settings.allow_os_login ? 1 : 0) << "\n"
          << "session_select=" << (settings.allow_session_select ? 1 : 0) << "\n"
          << "allow_remote_config=" << (settings.allow_remote_config ? 1 : 0) << "\n"
-         << "lock_after_session_end=" << (settings.lock_after_session_end ? 1 : 0)
-         << "\n"
-         << "keep_awake=" << (settings.keep_awake ? 1 : 0) << "\n"
          << "remove_wallpaper=" << (settings.remove_wallpaper ? 1 : 0) << "\n"
-         << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
          << "trusted_device_days=" << settings.trusted_device_days << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="

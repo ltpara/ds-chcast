@@ -144,13 +144,32 @@ class TunnelAccessTicket {
   final int permissions;
 }
 
+/// The live surface a viewer needs from a tunnel helper. [TunnelAgent] is the
+/// production implementation; tests can provide a lightweight fake without
+/// starting a child process.
+abstract interface class TunnelConnection {
+  String get host;
+  int get port;
+  String get relayHost;
+  int get relayPort;
+  String get carrierHost;
+  int get carrierPort;
+  String get carrierToken;
+  String get path;
+  String get pathLabel;
+  String get accessTicket;
+  bool get running;
+  Stream<TunnelAccessTicket> get accessTickets;
+  Future<void> stop();
+}
+
 /// Owns one `chast-tunnel viewer` child process for a session.
 ///
 /// The agent listens on a loopback UDP port chosen by the OS and forwards
 /// every datagram to the direct candidate or relay. ViewerEngine therefore
 /// dials 127.0.0.1; certificate pinning still uses the logical host identity
 /// in [ConnectTarget.trustKey].
-class TunnelAgent {
+class TunnelAgent implements TunnelConnection {
   TunnelAgent._(this._process, this._executable);
 
   static const String loopback = '127.0.0.1';
@@ -200,38 +219,34 @@ class TunnelAgent {
         (Platform.environment['CHAST_PUBLISHER_KEY'] ?? '').trim();
     final bool requirePublisher =
         (Platform.environment['CHAST_REQUIRE_PUBLISHER'] ?? '') == '1';
-    await Process.start(
-      helper,
-      <String>[
-        'apply-update',
-        '--version',
-        version,
-        '--url',
-        url,
-        '--sha256',
-        sha256,
-        '--size',
-        '$size',
-        '--signature',
-        signature,
-        '--server-pubkey',
-        serverPublicKey,
-        if (publisherKey.isNotEmpty) ...<String>[
-          '--publisher-pubkey',
-          publisherKey,
-          '--publisher-sig',
-          publisherSignature,
-        ],
-        if (requirePublisher) '--require-publisher',
-        '--target',
-        Platform.resolvedExecutable,
-        '--wait-pid',
-        '$pid',
-        '--log',
-        '${Directory.systemTemp.path}\\chast-viewer-update.log',
+    await Process.start(helper, <String>[
+      'apply-update',
+      '--version',
+      version,
+      '--url',
+      url,
+      '--sha256',
+      sha256,
+      '--size',
+      '$size',
+      '--signature',
+      signature,
+      '--server-pubkey',
+      serverPublicKey,
+      if (publisherKey.isNotEmpty) ...<String>[
+        '--publisher-pubkey',
+        publisherKey,
+        '--publisher-sig',
+        publisherSignature,
       ],
-      mode: ProcessStartMode.detached,
-    );
+      if (requirePublisher) '--require-publisher',
+      '--target',
+      Platform.resolvedExecutable,
+      '--wait-pid',
+      '$pid',
+      '--log',
+      '${Directory.systemTemp.path}\\chast-viewer-update.log',
+    ], mode: ProcessStartMode.detached);
   }
 
   static String defaultExecutable() {
@@ -314,7 +329,8 @@ class TunnelAgent {
       throw TunnelException(tr('未配置连接服务'));
     }
     final String exe = executable ?? defaultExecutable();
-    final List<String> args = argumentOverride ??
+    final List<String> args =
+        argumentOverride ??
         arguments(
           server: server.url,
           hostId: hostId,
@@ -331,11 +347,15 @@ class TunnelAgent {
       process = await Process.start(exe, args, runInShell: false);
     } on ProcessException catch (error) {
       throw TunnelException(
-        tr('无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。', <String, Object?>{'exe': exe, 'p2': error.message}),
+        tr(
+          '无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。',
+          <String, Object?>{'exe': exe, 'p2': error.message},
+        ),
       );
     }
-    final String credential =
-        server.linkKey.isNotEmpty ? server.linkKey : server.key;
+    final String credential = server.linkKey.isNotEmpty
+        ? server.linkKey
+        : server.key;
     final bool emergencyReady = emergency?.ready ?? false;
     if (credential.isNotEmpty ||
         accountToken.isNotEmpty ||
@@ -370,20 +390,29 @@ class TunnelAgent {
     agent._stdout = process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .listen(agent._onLine,
-            onError: agent._onStreamError, onDone: agent._stdoutDone.complete);
+        .listen(
+          agent._onLine,
+          onError: agent._onStreamError,
+          onDone: agent._stdoutDone.complete,
+        );
     agent._stderr = process.stderr
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .listen(agent._noteLog,
-            onError: agent._onStreamError, onDone: agent._stderrDone.complete);
+        .listen(
+          agent._noteLog,
+          onError: agent._onStreamError,
+          onDone: agent._stderrDone.complete,
+        );
     unawaited(agent._watchExit());
     try {
       await agent._ready!.future.timeout(timeout);
     } on TimeoutException {
       await agent.stop();
       throw TunnelException(
-        tr('隧道代理在 {p3} 秒内没有就绪{p4}', <String, Object?>{'p3': timeout.inSeconds, 'p4': agent._logSuffix()}),
+        tr('隧道代理在 {p3} 秒内没有就绪{p4}', <String, Object?>{
+          'p3': timeout.inSeconds,
+          'p4': agent._logSuffix(),
+        }),
         retryable: true,
       );
     } catch (_) {
@@ -393,10 +422,14 @@ class TunnelAgent {
     return agent;
   }
 
+  @override
   String get host => loopback;
+  @override
   int get port => _port;
+  @override
   String get path => _path;
   String get remote => _remote;
+  @override
   bool get running => _running;
   String get executable => _executable;
 
@@ -407,6 +440,7 @@ class TunnelAgent {
   String get relay => _relay;
 
   /// Host part of [relay], without the brackets of an IPv6 literal.
+  @override
   String get relayHost {
     final String text = _relay.trim();
     if (text.startsWith('[')) {
@@ -418,6 +452,7 @@ class TunnelAgent {
   }
 
   /// Port part of [relay], or 0 when no relay arrived.
+  @override
   int get relayPort => parseListenPort(_relay) ?? 0;
 
   /// Shared TCP/WebSocket carrier the server advertised for this host,
@@ -425,6 +460,7 @@ class TunnelAgent {
   String get carrier => _carrier;
 
   /// Host part of [carrier], without the brackets of an IPv6 literal.
+  @override
   String get carrierHost {
     final String text = _carrier.trim();
     if (text.startsWith('[')) {
@@ -436,23 +472,28 @@ class TunnelAgent {
   }
 
   /// Port part of [carrier], or 0 when the server has no shared carrier.
+  @override
   int get carrierPort => parseListenPort(_carrier) ?? 0;
 
   /// Per-lease token that lets this viewer attach to its host slot on the
   /// shared carrier. Empty when the server has no shared carrier.
+  @override
   String get carrierToken => _carrierToken;
 
   /// The current emergency override ticket, or empty on an ordinary lookup.
   /// The page hands this to the native session on start.
+  @override
   String get accessTicket => _accessTicket;
   int get accessExpiresAtMs => _accessExpiresAtMs;
 
   /// Renewed emergency tickets. The agent re-signs the override whenever it
   /// refreshes a transport credential, and the live session must follow it or
   /// the host lease expires mid-session.
+  @override
   Stream<TunnelAccessTicket> get accessTickets => _ticketEvents.stream;
 
   /// "直连"/"中继"/"连接中" for the session overlay.
+  @override
   String get pathLabel {
     switch (_path) {
       case 'direct':
@@ -480,12 +521,14 @@ class TunnelAgent {
       _accessTicket = event.accessTicket;
       _accessExpiresAtMs = event.accessExpiresAtMs;
       if (!_ticketEvents.isClosed) {
-        _ticketEvents.add(TunnelAccessTicket(
-          ticket: event.accessTicket,
-          expiresAtMs: event.accessExpiresAtMs,
-          subject: event.accessSubject,
-          permissions: event.accessPermissions,
-        ));
+        _ticketEvents.add(
+          TunnelAccessTicket(
+            ticket: event.accessTicket,
+            expiresAtMs: event.accessExpiresAtMs,
+            subject: event.accessSubject,
+            permissions: event.accessPermissions,
+          ),
+        );
       }
     }
     if (event.path.isNotEmpty) {
@@ -506,7 +549,11 @@ class TunnelAgent {
     if (event.event == 'ready') {
       final int? port = parseListenPort(event.listen);
       if (port == null || port <= 0 || port > 65535) {
-        _fail(TunnelException(tr('隧道代理返回了无效监听地址：{p5}', <String, Object?>{'p5': event.listen})));
+        _fail(
+          TunnelException(
+            tr('隧道代理返回了无效监听地址：{p5}', <String, Object?>{'p5': event.listen}),
+          ),
+        );
         return;
       }
       _port = port;
@@ -541,9 +588,14 @@ class TunnelAgent {
     // Process exit can arrive before its final JSON error or diagnostics.
     await Future.wait(<Future<void>>[_stdoutDone.future, _stderrDone.future]);
     if (!_stopping && !(_ready?.isCompleted ?? true)) {
-      _fail(TunnelException(
-        tr('隧道代理启动失败（退出码 {code}）{p7}', <String, Object?>{'code': code, 'p7': _logSuffix()}),
-      ));
+      _fail(
+        TunnelException(
+          tr('隧道代理启动失败（退出码 {code}）{p7}', <String, Object?>{
+            'code': code,
+            'p7': _logSuffix(),
+          }),
+        ),
+      );
     }
   }
 
@@ -553,6 +605,7 @@ class TunnelAgent {
     }
   }
 
+  @override
   Future<void> stop() async {
     if (_stopping) {
       return;

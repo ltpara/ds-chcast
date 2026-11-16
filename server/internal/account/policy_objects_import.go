@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/ltpara/ds-chcast/server/internal/strategy"
 )
 
 const (
@@ -26,6 +28,8 @@ type PolicyObjectImport struct {
 	PermissionCeiling uint32
 	AllowedUsers      []string
 	AllowedGroups     []string
+	// Nil preserves existing settings when importing a legacy document.
+	ClientSettings *strategy.Settings
 }
 
 type PolicyImportResult struct {
@@ -35,14 +39,17 @@ type PolicyImportResult struct {
 }
 
 type preparedPolicyImport struct {
-	input     PolicyObjectImport
-	name      string
-	mode      string
-	userIDs   []string
-	groups    []string
-	existing  *PolicyObject
-	id        string
-	unchanged bool
+	input            PolicyObjectImport
+	name             string
+	mode             string
+	userIDs          []string
+	groups           []string
+	existing         *PolicyObject
+	id               string
+	unchanged        bool
+	strategyJSON     string
+	strategyRevision int64
+	strategyChanged  bool
 }
 
 // ImportPolicyObjects validates the complete document before opening a write
@@ -64,6 +71,14 @@ func (s *Store) ImportPolicyObjects(items []PolicyObjectImport, conflict, actor 
 	prepared := make([]preparedPolicyImport, 0, len(items))
 	seenNames := make(map[string]struct{}, len(items))
 	for _, item := range items {
+		strategyJSON := ""
+		if item.ClientSettings != nil {
+			var err error
+			strategyJSON, err = strategy.Encode(*item.ClientSettings)
+			if err != nil {
+				return PolicyImportResult{}, err
+			}
+		}
 		name := normalizeText(item.Name, maxName)
 		if name == "" {
 			return PolicyImportResult{}, ErrInvalidPolicyObjectName
@@ -92,6 +107,7 @@ func (s *Store) ImportPolicyObjects(items []PolicyObjectImport, conflict, actor 
 			return PolicyImportResult{}, err
 		}
 		prepared = append(prepared, preparedPolicyImport{
+			strategyJSON: strategyJSON,
 			input: PolicyObjectImport{
 				Name:              name,
 				Mode:              mode,
@@ -139,6 +155,28 @@ func (s *Store) ImportPolicyObjects(items []PolicyObjectImport, conflict, actor 
 	}
 	if len(existing)+newCount > maxPolicyObjects {
 		return PolicyImportResult{}, ErrPolicyObjectQuota
+	}
+	for i := range prepared {
+		entry := &prepared[i]
+		if entry.strategyJSON == "" {
+			continue
+		}
+		before := "{}"
+		if entry.existing != nil {
+			config, err := s.clientStrategyLocked(entry.existing.ID)
+			if err != nil {
+				return PolicyImportResult{}, err
+			}
+			entry.strategyRevision = config.Revision
+			before, err = strategy.Encode(config.Settings)
+			if err != nil {
+				return PolicyImportResult{}, err
+			}
+		}
+		entry.strategyChanged = before != entry.strategyJSON
+		if entry.strategyChanged && entry.strategyRevision >= strategy.MaxRevision {
+			return PolicyImportResult{}, fmt.Errorf("%w: revision exhausted", strategy.ErrInvalid)
+		}
 	}
 
 	tx, err := s.db.Begin()
@@ -196,6 +234,28 @@ func (s *Store) ImportPolicyObjects(items []PolicyObjectImport, conflict, actor 
 		changed = true
 	}
 
+	for i := range prepared {
+		entry := &prepared[i]
+		if !entry.strategyChanged {
+			continue
+		}
+		result, err := tx.Exec(`INSERT INTO policy_client_strategies (policy_id, revision, settings_json, updated_at, updated_by)
+			VALUES (?, ?, ?, ?, ?) ON CONFLICT(policy_id) DO UPDATE SET revision = excluded.revision,
+			settings_json = excluded.settings_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by
+			WHERE policy_client_strategies.revision = ?`,
+			entry.id, entry.strategyRevision+1, entry.strategyJSON, unixMillis(now), actor, entry.strategyRevision)
+		if err != nil {
+			return PolicyImportResult{}, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return PolicyImportResult{}, err
+		}
+		if count != 1 {
+			return PolicyImportResult{}, ErrStrategyConflict
+		}
+		entry.unchanged = false
+	}
 	if err := tx.Commit(); err != nil {
 		return PolicyImportResult{}, fmt.Errorf("account store %s: commit policy import: %w", s.path, err)
 	}

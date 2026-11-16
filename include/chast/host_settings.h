@@ -51,7 +51,21 @@ struct TrustedDevice {
 
 inline constexpr size_t kMaxTrustedDevices = 32;
 
+// Local preferences that can also receive a managed default. Presence in the
+// INI is intentional, even when the value equals the built-in default.
+enum class HostPreference : uint8_t {
+    LockAfterSessionEnd, KeepAwake, AutoDisconnectMinutes, MaxViewers, Carrier,
+    LanDiscovery, Count
+};
+
 struct HostSettings {
+    // Local-only intent; never populate this mask from a managed overlay.
+    uint32_t explicit_preferences = 0;
+    // Runtime overlay copies cannot be serialized as local preferences.
+    bool managed_runtime_settings = false;
+    // Preferences controlled by a locked managed strategy. This is runtime
+    // metadata and is never serialized into host.ini.
+    uint32_t managed_locked_preferences = 0;
     // 0.0.0.0 serves the LAN; 127.0.0.1 keeps everything local.
     std::string bind_address = "0.0.0.0";
     uint16_t port = 4433;
@@ -59,6 +73,9 @@ struct HostSettings {
     // some client networks block; the fallback carries the same QUIC
     // datagrams over a TCP stream without changing the session protocol.
     bool carrier = true;
+    // Answer LAN discovery requests in the tunnel agent. Takes effect at the
+    // next tunnel start; independent from the viewer's active LAN scan.
+    bool lan_discovery = true;
     // Viewers served at the same time, 1..8. 1 keeps the sequential host: a
     // second connection waits until the current viewer leaves. Above 1 every
     // viewer gets its own handshake, permissions, streams and audit record;
@@ -329,6 +346,10 @@ struct HostSettingsLoad {
 };
 
 HostSettingsLoad load_host_settings(const std::string& path);
+// Call when the user deliberately chooses a value, including a built-in
+// default. Non-default programmatic values are also treated as explicit.
+void mark_host_preference(HostSettings& settings, HostPreference preference);
+bool host_preference_is_explicit(const HostSettings& settings, HostPreference preference);
 bool save_host_settings(const std::string& path, const HostSettings& settings, std::string* error);
 // Same representation as host.ini, for authenticated local process handoffs.
 // source_path preserves path-derived defaults; these functions do no file I/O.

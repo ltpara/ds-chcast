@@ -425,6 +425,19 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/policies/{id}", s.policyObjectDetail)
 	mux.HandleFunc("PUT /v1/policies/{id}", s.updatePolicyObject)
 	mux.HandleFunc("DELETE /v1/policies/{id}", s.deletePolicyObject)
+	mux.HandleFunc("GET /v1/client-strategies/catalog", s.clientStrategyCatalog)
+	mux.HandleFunc("GET /v1/policies/{id}/client-strategy", s.getClientStrategy)
+	mux.HandleFunc("PUT /v1/policies/{id}/client-strategy", s.setClientStrategy)
+	mux.HandleFunc("GET /v1/device-strategies/{peer}", s.previewClientStrategy)
+	mux.HandleFunc("GET /v1/hosts/{peer}/client-strategy", s.fetchHostClientStrategy)
+	mux.HandleFunc("POST /v1/hosts/{peer}/client-strategy/receipt", s.reportHostClientStrategyReceipt)
+	mux.HandleFunc("POST /v1/account/device-strategies/{peer}/receipt", s.reportViewerClientStrategyReceipt)
+	mux.HandleFunc("GET /v1/live-connections", s.listLiveConnections)
+	mux.HandleFunc("GET /v1/live-connections/{host}/{connection}", s.getLiveConnection)
+	mux.HandleFunc("POST /v1/live-connections/{host}/{connection}/disconnect", s.disconnectLiveConnection)
+	mux.HandleFunc("POST /v1/hosts/{peer}/live-connections", s.reportHostLiveConnections)
+	mux.HandleFunc("GET /v1/hosts/{peer}/live-connections/{runtime}/commands", s.fetchHostLiveCommands)
+	mux.HandleFunc("POST /v1/hosts/{peer}/live-connections/{runtime}/receipts", s.reportHostLiveReceipt)
 	mux.HandleFunc("GET /v1/policy-assignments", s.listPolicyAssignments)
 	mux.HandleFunc("POST /v1/policy-assignments", s.createPolicyAssignment)
 	mux.HandleFunc("POST /v1/policy-assignments/bulk", s.bulkPolicyAssignments)
@@ -574,11 +587,15 @@ type lookupResponse struct {
 	// ephemeral transport_public_key. They are separate from the access ticket:
 	// one credential per transport purpose, bound to the host, the requesting
 	// subject and the agent key, and never usable for application admission.
-	TransportPunch    *lookupTransportTicket `json:"transport_punch,omitempty"`
-	TransportRelay    *lookupTransportTicket `json:"transport_relay,omitempty"`
-	TransportCarrier  *lookupTransportTicket `json:"transport_carrier,omitempty"`
-	ConfigSerial      int64                  `json:"config_serial,omitempty"`
-	RendezvousServers []string               `json:"rendezvous_servers,omitempty"`
+	TransportPunch   *lookupTransportTicket `json:"transport_punch,omitempty"`
+	TransportRelay   *lookupTransportTicket `json:"transport_relay,omitempty"`
+	TransportCarrier *lookupTransportTicket `json:"transport_carrier,omitempty"`
+	// ViewerStrategy is an authenticated per-account delivery of settings for
+	// this target device. It independently describes the Viewer consumer; a
+	// host receipt can never satisfy it.
+	ViewerStrategy    *account.ViewerStrategyDelivery `json:"viewer_strategy,omitempty"`
+	ConfigSerial      int64                           `json:"config_serial,omitempty"`
+	RendezvousServers []string                        `json:"rendezvous_servers,omitempty"`
 }
 
 type batchLookupResponse struct {
@@ -862,6 +879,7 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 	if !s.attachLookupTransport(w, r, subject, id, &resp) {
 		return
 	}
+	s.attachLookupViewerStrategy(r, subject, id, &resp)
 	resp.Software = s.software()
 	resp.PunchV6 = s.punchV6(r)
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()

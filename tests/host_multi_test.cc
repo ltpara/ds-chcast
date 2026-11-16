@@ -383,6 +383,44 @@ void test_connection_cap(const std::filesystem::path& dir) {
     stop_host(host);
 }
 
+void test_strategy_admission_gate(const std::filesystem::path& dir) {
+    const uint16_t port = free_udp_port();
+    check(port != 0, "a strategy-gate loopback port is available");
+    if (port == 0) {
+        return;
+    }
+    std::string error;
+    std::unique_ptr<chast::HostServer> host =
+        start_host(port, 1, false, dir, &error);
+    if (!host) {
+        check(false, "the strategy-gate host starts");
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+
+    host->set_strategy_admission_allowed(false);
+    chast::ServerInfo info;
+    std::unique_ptr<chast::QuicSession> viewer = connect_viewer(
+        port, host->status().fingerprint, chast::SessionMode::FileTransfer,
+        "f6f6f6f6f6f6f6f6", &info, &error);
+    check(!viewer && error.find("managed client strategy") != std::string::npos,
+          "an unsupported strategy blocks a new viewer at admission");
+
+    host->set_strategy_admission_allowed(true);
+    error.clear();
+    viewer = connect_viewer(port, host->status().fingerprint,
+                            chast::SessionMode::FileTransfer,
+                            "a7a7a7a7a7a7a7a7", &info, &error);
+    check(viewer != nullptr,
+          "clearing the strategy gate permits later viewer admissions");
+    if (viewer) {
+        check(finish_viewer(*viewer),
+              "the viewer admitted after clearing the gate closes cleanly");
+        viewer.reset();
+    }
+    stop_host(host);
+}
+
 void test_pending_does_not_take_viewer_slot(const std::filesystem::path& dir) {
     for (auto limit : {1u, 2u}) {
         const auto port = free_udp_port();
@@ -721,6 +759,7 @@ int main() {
     const std::filesystem::path dir = temp_dir();
     test_two_viewers(dir);
     test_connection_cap(dir);
+    test_strategy_admission_gate(dir);
     test_pending_does_not_take_viewer_slot(dir);
     test_duplicate_audit_ref(dir);
     test_input_lease(dir);

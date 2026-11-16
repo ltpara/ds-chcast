@@ -71,7 +71,10 @@ private:
 // forward-declares them, so an inline constructor would need their destructors
 // in every translation unit that includes it.
 HostServer::HostServer(HostServerConfig config)
-    : config_(std::move(config)), settings_(config_.settings) {}
+    : config_(std::move(config)), settings_(config_.settings),
+      session_auto_disconnect_minutes_(settings_.auto_disconnect_minutes),
+      next_session_auto_disconnect_minutes_(settings_.auto_disconnect_minutes),
+      strategy_locked_preferences_(settings_.managed_locked_preferences) {}
 
 // Coordination between a listener and its per-viewer workers. The listener
 // owns the object; workers hold the same shared_ptr. All fields are guarded by
@@ -87,6 +90,10 @@ struct ViewerRegistry {
     size_t pending = 0;
     uint64_t admitted = 0;
     size_t max_viewers = 1;
+    // Managed strategy state is shared by the listener and every per-viewer
+    // worker. A worker has its own HostServer instance, so keeping this only on
+    // the listener would let multi-viewer admissions bypass a blocked policy.
+    std::atomic<bool> strategy_admission_allowed{true};
     // The desktop viewer allowed to inject input and change host-wide state.
     HostServer* controller = nullptr;
     // Viewer audit references held by live sessions. A second connection that
@@ -152,6 +159,7 @@ struct ViewerRegistry {
     // Read by the last worker at session teardown, possibly from a different
     // worker than the one that set it.
     std::atomic<bool> lock_after_session_end{false};
+    std::atomic<uint32_t> auto_disconnect_minutes{0};
     std::atomic<uint64_t> remote_settings_version{0};
 };
 
@@ -1108,6 +1116,7 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
         copy_remote_config_fields(server->settings_, server->registry_->remote_settings);
         server->registry_->remote_settings_valid = true;
         server->registry_->lock_after_session_end = server->settings_.lock_after_session_end;
+        server->registry_->auto_disconnect_minutes = server->settings_.auto_disconnect_minutes;
     }
     server->publish_security_status();
     if (server->config_.service_mode && server->settings_.password_hash.empty() &&
@@ -1389,6 +1398,15 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
 
 ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
     ClientAuthResult auth;
+    const bool strategy_allowed =
+        registry_ ? registry_->strategy_admission_allowed.load()
+                  : strategy_admission_allowed_.load();
+    if (!strategy_allowed) {
+        auth.action = ClientAuthAction::Deny;
+        auth.denial = AccessDenial::Declined;
+        auth.reason = "managed client strategy is unavailable";
+        return auth;
+    }
     if (!security_) {
         auth.action = ClientAuthAction::Deny;
         auth.denial = AccessDenial::Declined;
@@ -1732,6 +1750,10 @@ bool HostServer::set_permissions(uint64_t id, PermissionMask permissions) {
 }
 
 void HostServer::set_lock_after_session_end(bool enabled) {
+    if ((strategy_locked_preferences_.load() &
+         (uint32_t{1} << static_cast<uint32_t>(HostPreference::LockAfterSessionEnd))) != 0) {
+        return;
+    }
     settings_.lock_after_session_end = enabled;
     if (!registry_) {
         return;
@@ -1741,6 +1763,29 @@ void HostServer::set_lock_after_session_end(bool enabled) {
     registry_->remote_settings_valid = true;
     registry_->lock_after_session_end.store(enabled);
     ++registry_->remote_settings_version;
+}
+
+void HostServer::set_next_session_strategy(bool lock_after_session_end,
+                                           uint32_t auto_disconnect_minutes) {
+    settings_.lock_after_session_end = lock_after_session_end;
+    next_session_auto_disconnect_minutes_ =
+        (std::min)(auto_disconnect_minutes, uint32_t{10080});
+    if (!registry_) return;
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->remote_settings.lock_after_session_end = settings_.lock_after_session_end;
+    registry_->lock_after_session_end.store(settings_.lock_after_session_end);
+    registry_->auto_disconnect_minutes.store(next_session_auto_disconnect_minutes_);
+    registry_->remote_settings_valid = true;
+    ++registry_->remote_settings_version;
+}
+
+void HostServer::set_strategy_admission_allowed(bool allowed) {
+    strategy_admission_allowed_.store(allowed);
+    if (registry_) registry_->strategy_admission_allowed.store(allowed);
+}
+
+void HostServer::set_strategy_locked_preferences(uint32_t mask) {
+    strategy_locked_preferences_.store(mask);
 }
 
 void HostServer::set_voice_microphone(const std::string& device_id) {
@@ -1972,8 +2017,17 @@ void HostServer::run_single() {
         failures = 0;
         std::string error;
         bool peer_left = false;
+        if (registry_) {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            session_lock_after_end_ = registry_->lock_after_session_end.load();
+            session_auto_disconnect_minutes_ =
+                registry_->auto_disconnect_minutes.load();
+        } else {
+            session_lock_after_end_ = settings_.lock_after_session_end;
+            session_auto_disconnect_minutes_ = next_session_auto_disconnect_minutes_;
+        }
         const bool ok = serve_current_session(stats, true, &error, &peer_left);
-        if (settings_.lock_after_session_end) {
+        if (session_lock_after_end_) {
             lock_after_session_end_workstation();
         }
         if (!ok || !error.empty()) {
@@ -2089,18 +2143,19 @@ bool HostServer::apply_ticket_renewals(std::string* error) {
 }
 
 
-Clock::duration HostServer::idle_disconnect_timeout() const {    if (config_.auto_disconnect_ms != 0) {
+Clock::duration HostServer::idle_disconnect_timeout() const {
+    if (config_.auto_disconnect_ms != 0) {
         return std::chrono::duration_cast<Clock::duration>(
             std::chrono::milliseconds(config_.auto_disconnect_ms));
     }
     return std::chrono::duration_cast<Clock::duration>(
-        std::chrono::minutes(settings_.auto_disconnect_minutes));
+        std::chrono::minutes(session_auto_disconnect_minutes_));
 }
 
 long long HostServer::idle_disconnect_seconds() const {
     return (std::max)(1LL, config_.auto_disconnect_ms != 0
                                ? static_cast<long long>(config_.auto_disconnect_ms) / 1000
-                               : static_cast<long long>(settings_.auto_disconnect_minutes) * 60);
+                               : static_cast<long long>(session_auto_disconnect_minutes_) * 60);
 }
 
 void HostServer::touch_viewer_activity() { last_viewer_activity_ = Clock::now(); }
@@ -2475,8 +2530,11 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
         if (registry_->voice_microphone_valid) {
             viewer->settings_.voice_microphone = registry_->voice_microphone;
         }
-        viewer->settings_.lock_after_session_end =
-            registry_->lock_after_session_end.load();
+        viewer->session_lock_after_end_ = registry_->lock_after_session_end.load();
+        viewer->settings_.auto_disconnect_minutes =
+            registry_->auto_disconnect_minutes.load();
+        viewer->session_auto_disconnect_minutes_ =
+            viewer->settings_.auto_disconnect_minutes;
     }
     viewer->session_ = std::move(connection);
     viewer->security_ = security_;
@@ -2662,7 +2720,7 @@ void HostServer::run_adopted() {
             --registry_->active;
         }
         last_viewer = registry_->active == 0;
-        lock_after = registry_->lock_after_session_end.load();
+        lock_after = session_lock_after_end_;
         std::shared_ptr<HostServer> focused = registry_->focused.lock();
         if (focused.get() == this) {
             registry_->focused.reset();
@@ -9530,7 +9588,6 @@ bool HostServer::sync_remote_policy() {
     if (registry_ && remote_settings_version_ != registry_->remote_settings_version.load()) {
         std::lock_guard<std::mutex> lock(registry_->mutex);
         copy_remote_config_fields(registry_->remote_settings, settings_);
-        settings_.lock_after_session_end = registry_->lock_after_session_end.load();
         remote_settings_version_ = registry_->remote_settings_version.load();
         changed = true;
     }
@@ -9629,6 +9686,11 @@ bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::stri
         } else if (changing && registry_ && !registry_->may_change_host_state(this)) {
             state.code = RemoteConfigCode::Busy;
             state.reason = "another viewer controls this host";
+        } else if (changing && (request.keys & kRemoteConfigLockAfterSessionEnd) != 0 &&
+                   (strategy_locked_preferences_.load() &
+                    (uint32_t{1} << static_cast<uint32_t>(HostPreference::LockAfterSessionEnd))) != 0) {
+            state.code = RemoteConfigCode::Denied;
+            state.reason = "lock after session end is locked by managed strategy";
         } else if (changing) {
             uint32_t changed = 0;
             auto assign = [&request, &changed](uint32_t bit, bool& field) {

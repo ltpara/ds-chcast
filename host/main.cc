@@ -39,6 +39,7 @@
 #include "chast/audio.h"
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
+#include "chast/host_client_strategy.h"
 #include "chast/host_settings.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
@@ -182,6 +183,16 @@ struct HostApp {
     bool elevation_transferring = false;
     std::shared_ptr<chast::host::ElevationHandoff> handled_elevation;
     HostSettings settings;
+    HostSettings effective_settings;
+    HostClientStrategy managed_strategy;
+    HostStrategyIdentity strategy_identity;
+    bool managed_strategy_loaded = false;
+    bool strategy_start_blocked = false;
+    bool strategy_server_ready = false;
+    bool strategy_tunnel_ready = false;
+    bool strategy_server_failed = false;
+    bool strategy_tunnel_failed = false;
+    ULONGLONG next_strategy_check = 0;
     // Device ids behind the dynamic entries of the tray's microphone submenu,
     // rebuilt every time the menu opens.
     std::vector<std::string> tray_voice_mics;
@@ -328,6 +339,9 @@ void server_password_hash_changed(const std::string& hash) {
 // The switches a viewer may change remotely. Credentials, ports and the
 // remote-config gate itself stay with the listener's copy of the settings.
 void apply_remote_switches(const HostSettings& from, HostSettings& to) {
+    if (to.lock_after_session_end != from.lock_after_session_end) {
+        mark_host_preference(to, HostPreference::LockAfterSessionEnd);
+    }
     to.lock_after_session_end = from.lock_after_session_end;
     to.allow_clipboard = from.allow_clipboard;
     to.allow_file_transfer = from.allow_file_transfer;
@@ -694,6 +708,8 @@ ClientApproval server_approve(const ClientRequest& request) {
     return ClientApproval{true, mask};
 }
 
+bool load_managed_strategy(bool apply_runtime);
+
 bool save_settings() {
     std::string error;
     ScopedUserContext original(g_app->identity_user_token.get());
@@ -701,11 +717,133 @@ bool save_settings() {
         post_log(tr(L"保存设置失败：") + widen(error));
         return false;
     }
+    load_managed_strategy(false);
     return true;
+}
+
+void restart_server();
+void restart_tunnel();
+
+bool managed_strategy_file_exists(const std::string& path, bool& exists, std::string& error) {
+    exists = false;
+    const std::wstring native = widen(path);
+    const DWORD attributes = GetFileAttributesW(native.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        exists = (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        if (!exists) error = "客户端策略缓存路径不是文件";
+        return exists;
+    }
+    const DWORD code = GetLastError();
+    if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return true;
+    error = "无法检查客户端策略缓存（错误 " + std::to_string(code) + "）";
+    return false;
+}
+
+bool load_managed_strategy(bool apply_runtime) {
+    const HostSettings local = g_app->settings;
+    g_app->strategy_start_blocked = false;
+    const std::string path = host_client_strategy_path(local);
+    if (path.empty()) {
+        g_app->managed_strategy_loaded = false;
+        g_app->effective_settings = local;
+        if (g_app->server) g_app->server->set_strategy_admission_allowed(true);
+        return true;
+    }
+
+    std::string error;
+    bool present = false;
+    if (!managed_strategy_file_exists(path, present, error)) {
+        g_app->strategy_start_blocked = true;
+        if (g_app->server) g_app->server->set_strategy_admission_allowed(false);
+        append_log_line(tr(L"客户端策略缓存检查失败：") + widen(error));
+        return false;
+    }
+    if (!present) {
+        // A cache can be absent before the tunnel has completed its first
+        // fetch. Keep a previously accepted overlay during later outages;
+        // only a genuinely uninitialised tray falls back to local settings.
+        if (!g_app->managed_strategy_loaded) g_app->effective_settings = local;
+        g_app->strategy_start_blocked = false;
+        if (g_app->server) g_app->server->set_strategy_admission_allowed(true);
+        return true;
+    }
+    HostStrategyIdentity identity;
+    if (!host_strategy_identity(local, "", identity, &error)) {
+        g_app->strategy_start_blocked = true;
+        if (g_app->server) g_app->server->set_strategy_admission_allowed(false);
+        append_log_line(tr(L"无法建立客户端策略身份：") + widen(error));
+        return false;
+    }
+    HostClientStrategy next;
+    const HostClientStrategy* previous =
+        g_app->managed_strategy_loaded ? &g_app->managed_strategy : nullptr;
+    if (!read_host_client_strategy(path, identity, previous, next, &error)) {
+        g_app->strategy_start_blocked = true;
+        if (g_app->server) g_app->server->set_strategy_admission_allowed(false);
+        append_log_line(tr(L"读取客户端策略失败，继续使用已接受版本：") + widen(error));
+        return false;
+    }
+    const bool unsupported = host_strategy_has_unsupported_settings(next);
+    g_app->strategy_start_blocked = unsupported;
+    const HostSettings next_effective = host_strategy_effective_settings(local, next);
+    if (g_app->server) {
+        g_app->server->set_strategy_admission_allowed(!unsupported);
+        g_app->server->set_strategy_locked_preferences(
+            next_effective.managed_locked_preferences);
+    }
+    if (unsupported) {
+        append_log_line(tr(L"客户端策略包含本版本不支持的设置，已阻止新查看器接入；将持续回报 unsupported"));
+    }
+    if (g_app->managed_strategy_loaded && next.revision == g_app->managed_strategy.revision &&
+        next.digest == g_app->managed_strategy.digest &&
+        identity.scope == g_app->strategy_identity.scope) {
+        return true;
+    }
+
+    const HostSettings old_effective = g_app->effective_settings;
+    g_app->managed_strategy = std::move(next);
+    g_app->strategy_identity = std::move(identity);
+    g_app->managed_strategy_loaded = true;
+    g_app->effective_settings = next_effective;
+    if (!apply_runtime) return true;
+
+    const bool server_restart =
+        old_effective.keep_awake != next_effective.keep_awake ||
+        old_effective.max_viewers != next_effective.max_viewers ||
+        old_effective.carrier != next_effective.carrier;
+    const bool tunnel_restart =
+        old_effective.lan_discovery != next_effective.lan_discovery;
+    if (server_restart && g_app->server) {
+        append_log_line(tr(L"客户端策略改变主机启动项，正在重启主机监听"));
+        restart_server();
+    } else if (g_app->server) {
+        g_app->server->set_next_session_strategy(
+            next_effective.lock_after_session_end,
+            next_effective.auto_disconnect_minutes);
+    }
+    if (tunnel_restart && !server_restart && g_app->server) {
+        append_log_line(tr(L"客户端策略改变 LAN 发现，正在重启连接服务"));
+        restart_tunnel();
+    }
+    return true;
+}
+
+void write_managed_strategy_receipt() {
+    if (!g_app->managed_strategy_loaded) return;
+    std::string error;
+    if (!write_host_client_strategy_ack(
+            g_app->settings, g_app->strategy_identity, g_app->managed_strategy,
+            g_app->strategy_server_ready, g_app->strategy_tunnel_ready, &error,
+            g_app->strategy_server_failed, g_app->strategy_tunnel_failed)) {
+        append_log_line(tr(L"写入客户端策略应用回执失败：") + widen(error));
+    }
 }
 
 void stop_tunnel() {
     g_app->tunnel.stop();
+    g_app->strategy_tunnel_ready = false;
+    g_app->strategy_tunnel_failed = false;
+    write_managed_strategy_receipt();
     {
         std::lock_guard<std::mutex> lock(g_app->tunnel_mutex);
         g_app->tunnel_events.clear();
@@ -716,18 +854,26 @@ void stop_tunnel() {
 }
 
 void start_tunnel() {
-    if (!g_app->settings.tunnel || g_app->tunnel.running()) {
+    const HostSettings& effective = g_app->effective_settings;
+    g_app->strategy_tunnel_ready = false;
+    g_app->strategy_tunnel_failed = false;
+    if (!effective.tunnel || g_app->tunnel.running()) {
+        write_managed_strategy_receipt();
         return;
     }
-    if (g_app->settings.server_url.empty()) {
+    if (effective.server_url.empty()) {
         g_app->tunnel_error = "尚未配置服务器地址";
+        g_app->strategy_tunnel_failed = effective.tunnel;
         append_log_line(tr(L"连接服务：尚未配置服务器地址"));
+        write_managed_strategy_receipt();
         return;
     }
     std::string error;
-    if (!validate_tunnel_settings(g_app->settings, &error)) {
+    if (!validate_tunnel_settings(effective, &error)) {
         g_app->tunnel_error = error;
+        g_app->strategy_tunnel_failed = true;
         append_log_line(tr(L"连接服务：") + widen(error));
+        write_managed_strategy_receipt();
         return;
     }
     std::string fingerprint;
@@ -738,17 +884,20 @@ void start_tunnel() {
     g_app->tunnel_viewer_path.clear();
     g_app->tunnel_viewer_remote.clear();
     g_app->tunnel_error.clear();
-    if (!g_app->tunnel.start(g_app->settings, g_app->settings.port, fingerprint, tunnel_event,
+    if (!g_app->tunnel.start(effective, effective.port, fingerprint, tunnel_event,
                              tunnel_log, tunnel_exited, &error)) {
         g_app->tunnel_error = error;
+        g_app->strategy_tunnel_failed = true;
         append_log_line(tr(L"连接服务启动失败：") + widen(error));
+        write_managed_strategy_receipt();
         return;
     }
-    append_log_line(tr(L"正在注册设备 ") + widen(g_app->settings.tunnel_id) + L"…");
+    append_log_line(tr(L"正在注册设备 ") + widen(effective.tunnel_id) + L"…");
 }
 
 void stop_server() {
     stop_tunnel();
+    g_app->strategy_server_ready = false;
     if (!g_app->server) {
         return;
     }
@@ -767,9 +916,10 @@ void start_server() {
         append_log_line(tr(L"已安装主机服务，请使用服务连接管理。"));
         return;
     }
+    const HostSettings& effective = g_app->effective_settings;
     HostServerConfig config;
-    config.settings = g_app->settings;
-    config.audio_silence_gate_ms = g_app->settings.audio_silence_gate_ms;
+    config.settings = effective;
+    config.audio_silence_gate_ms = effective.audio_silence_gate_ms;
     config.serve_once = false;
     config.first_client_timeout_ms = 0;
     // The policy decides when to ask; the dialog is available for both and
@@ -787,22 +937,26 @@ void start_server() {
     config.elevation_state = [elevation] { return elevation->state(); };
     config.request_elevation = [elevation] { return elevation->request(); };
     std::string error;
+    g_app->strategy_server_failed = false;
     g_app->server = HostServer::create(std::move(config), &error);
     if (!g_app->server) {
+        g_app->strategy_server_failed = true;
+        write_managed_strategy_receipt();
         append_log_line(tr(L"启动失败：") + widen(error));
         const std::wstring message = tr(L"无法启动共享：\n") + widen(error);
         if (!g_app->elevated_child) MessageBoxW(g_app->window, message.c_str(), window_title(), MB_ICONERROR | MB_OK);
         return;
     }
+    g_app->server->set_strategy_admission_allowed(!g_app->strategy_start_blocked);
     if (g_app->elevated_child && g_app->server->status().fingerprint != g_app->elevated_child->snapshot.fingerprint) {
         append_log_line(L"Elevation failed: the original device identity could not be retained.");
         g_app->server.reset();
         return;
     }
-    g_app->listener_microphone = g_app->settings.allow_microphone;
-    g_app->listener_privacy = g_app->settings.allow_privacy_mode;
+    g_app->listener_microphone = effective.allow_microphone;
+    g_app->listener_privacy = effective.allow_privacy_mode;
     g_app->server->start();
-    append_log_line(tr(L"正在等待查看器（端口 ") + std::to_wstring(g_app->settings.port) + tr(L"）"));
+    append_log_line(tr(L"正在等待查看器（端口 ") + std::to_wstring(effective.port) + tr(L"）"));
     start_tunnel();
 }
 
@@ -1262,8 +1416,11 @@ void apply_tunnel_event(const TunnelEvent& event) {
     if (event.event == "ready") {
         g_app->tunnel_relay = event.relay;
         g_app->tunnel_error.clear();
+        g_app->strategy_tunnel_ready = true;
+        g_app->strategy_tunnel_failed = false;
+        write_managed_strategy_receipt();
         const std::string device =
-            event.host.empty() ? g_app->settings.tunnel_id : event.host;
+            event.host.empty() ? g_app->effective_settings.tunnel_id : event.host;
         std::wstring line = tr(L"连接服务已上线 · 设备 ID ") + widen(device);
         if (!event.listen.empty()) {
             line += tr(L" · 隧道 ") + widen(event.listen);
@@ -1374,6 +1531,7 @@ void load_settings() {
             g_app->startup_save_error = error;
         }
     }
+    load_managed_strategy(false);
 }
 
 constexpr UINT kMenuShow = 1;
@@ -1906,6 +2064,8 @@ enum SecurityDialogId {
     kSecVirtualDisplayCount,
     kSecVirtualDisplayResolution,
     kSecPrivacyModeImpl,
+    kSecLanDiscovery,
+    kSecRestoreInheritanceBase,
     kSecSave,
     kSecCancel,
 };
@@ -1969,6 +2129,12 @@ struct SecurityDialogState {
     HWND virtual_display_count = nullptr;
     HWND virtual_display_resolution = nullptr;
     HWND privacy_mode_impl = nullptr;
+    HWND lan_discovery = nullptr;
+    HWND strategy_source = nullptr;
+    HWND strategy_values[static_cast<size_t>(HostPreference::Count)]{};
+    HWND strategy_restore[static_cast<size_t>(HostPreference::Count)]{};
+    uint32_t clear_explicit_preferences = 0;
+    bool lan_discovery_touched = false;
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
@@ -1979,6 +2145,7 @@ struct SecurityDialogState {
     std::vector<HWND> access_page;
     std::vector<HWND> advanced_page;
     std::vector<HWND> recording_page;
+    std::vector<HWND> strategy_page;
     std::vector<TrustedDevice> devices;
     std::vector<std::vector<uint8_t>> revoked;
     // A generated but not yet protected secret; empty when 2FA is untouched.
@@ -2036,7 +2203,7 @@ std::wstring receive_directory_text(const std::string& directory) {
 }
 
 void show_security_page(SecurityDialogState& dialog, int page) {
-    if (page < 0 || page > 3) {
+    if (page < 0 || page > 4) {
         page = 0;
     }
     const auto show = [](const std::vector<HWND>& controls, bool visible) {
@@ -2048,6 +2215,7 @@ void show_security_page(SecurityDialogState& dialog, int page) {
     show(dialog.access_page, page == 1);
     show(dialog.advanced_page, page == 2);
     show(dialog.recording_page, page == 3);
+    show(dialog.strategy_page, page == 4);
 }
 
 void refresh_audio_devices(SecurityDialogState& dialog) {
@@ -2213,6 +2381,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     };
 
     HostSettings updated = g_app->settings;
+    updated.explicit_preferences &= ~dialog.clear_explicit_preferences;
     if (is_checked(dialog.mode_click)) {
         updated.auth_mode = HostAuthMode::Click;
     } else if (is_checked(dialog.mode_both)) {
@@ -2260,6 +2429,19 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
         }
         updated.auto_disconnect_minutes = static_cast<uint32_t>(minutes);
     }
+    if (dialog.lan_discovery_touched && dialog.lan_discovery != nullptr) {
+        updated.lan_discovery = is_checked(dialog.lan_discovery);
+        mark_host_preference(updated, HostPreference::LanDiscovery);
+    }
+    if (updated.lock_after_session_end != g_app->settings.lock_after_session_end) {
+        mark_host_preference(updated, HostPreference::LockAfterSessionEnd);
+    }
+    if (updated.keep_awake != g_app->settings.keep_awake) {
+        mark_host_preference(updated, HostPreference::KeepAwake);
+    }
+    if (updated.auto_disconnect_minutes != g_app->settings.auto_disconnect_minutes) {
+        mark_host_preference(updated, HostPreference::AutoDisconnectMinutes);
+    }
     if (dialog.trusted_days != nullptr) {
         const std::string days_text = trim_ascii(narrow(control_text(dialog.trusted_days)));
         unsigned long days = 0;
@@ -2286,14 +2468,14 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     if (!parse_ip_whitelist(whitelist, ranges, &whitelist_error)) {
         return complain(tr(L"IP 白名单无效：") + widen(whitelist_error));
     }
-    std::string normalized;
+    std::string normalized_ranges;
     for (const IpRange& range : ranges) {
-        if (!normalized.empty()) {
-            normalized += ",";
+        if (!normalized_ranges.empty()) {
+            normalized_ranges += ",";
         }
-        normalized += format_ip_range(range);
+        normalized_ranges += format_ip_range(range);
     }
-    updated.ip_whitelist = normalized;
+    updated.ip_whitelist = normalized_ranges;
 
     const std::wstring current = control_text(dialog.password_current);
     const std::wstring next = control_text(dialog.password_new);
@@ -2474,6 +2656,11 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                     set_text(dialog->token_edit, widen(generate_access_token()));
                     dialog->token_edited = true;
                     return 0;
+                case kSecLanDiscovery:
+                    if (HIWORD(wparam) == BN_CLICKED) {
+                        dialog->lan_discovery_touched = true;
+                    }
+                    return 0;
                 case kSecAudioRefresh: {
                     const LRESULT selected =
                         SendMessageW(dialog->audio_device, CB_GETCURSEL, 0, 0);
@@ -2564,6 +2751,51 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                     return 0;
                 }
                 default:
+                    if (LOWORD(wparam) >= kSecRestoreInheritanceBase &&
+                        LOWORD(wparam) <
+                            kSecRestoreInheritanceBase +
+                                static_cast<UINT>(HostPreference::Count)) {
+                        const auto preference = static_cast<HostPreference>(
+                            LOWORD(wparam) - kSecRestoreInheritanceBase);
+                        const uint32_t mask =
+                            uint32_t{1} << static_cast<uint32_t>(preference);
+                        if ((g_app->effective_settings.managed_locked_preferences & mask) != 0) {
+                            return 0;
+                        }
+                        dialog->clear_explicit_preferences |= mask;
+                        EnableWindow(
+                            dialog->strategy_restore[static_cast<size_t>(preference)],
+                            FALSE);
+                        HostSettings preview = g_app->settings;
+                        preview.explicit_preferences &=
+                            ~dialog->clear_explicit_preferences;
+                        preview = host_strategy_effective_settings(
+                            preview, g_app->managed_strategy);
+                        switch (preference) {
+                        case HostPreference::LockAfterSessionEnd:
+                            set_check(dialog->lock_after_end,
+                                      preview.lock_after_session_end);
+                            break;
+                        case HostPreference::KeepAwake:
+                            set_check(dialog->keep_awake, preview.keep_awake);
+                            break;
+                        case HostPreference::AutoDisconnectMinutes:
+                            set_text(dialog->idle_minutes,
+                                     widen(std::to_string(
+                                         preview.auto_disconnect_minutes)));
+                            break;
+                        case HostPreference::LanDiscovery:
+                            set_check(dialog->lan_discovery,
+                                      preview.lan_discovery);
+                            dialog->lan_discovery_touched = false;
+                            break;
+                        default:
+                            break;
+                        }
+                        set_text(
+                            dialog->strategy_values[static_cast<size_t>(preference)],
+                            tr(L"已选择继承；保存后生效"));
+                    }
                     break;
             }
             break;
@@ -2686,6 +2918,8 @@ bool edit_security_settings(HostSettings& result) {
         TabCtrl_InsertItem(dialog.tab, 2, &item);
         item.pszText = const_cast<wchar_t*>(tr(L"主机录屏"));
         TabCtrl_InsertItem(dialog.tab, 3, &item);
+        item.pszText = const_cast<wchar_t*>(tr(L"客户端策略"));
+        TabCtrl_InsertItem(dialog.tab, 4, &item);
     }
 
     // ----- authentication page -----
@@ -3054,6 +3288,134 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", tr(L"此设置只允许在本机修改，与允许查看者录制相互独立。录像不会自动删除；保存失败会显示在主机日志中。"),
         SS_LEFT, 0, 32, 398, page_text_width, 64, 0, nullptr, &dialog.recording_page);
 
+    // ----- managed client strategy page -----
+    const HostSettings& effective_for_strategy = g_app->effective_settings;
+    add(L"STATIC", tr(L"客户端策略"), SS_LEFT, 0, 32, 56, 240, 22, 0, nullptr,
+        &dialog.strategy_page);
+    std::wstring strategy_source;
+    if (g_app->managed_strategy_loaded) {
+        strategy_source = tr(L"来源：");
+        strategy_source += g_app->managed_strategy.policy_id.empty()
+                               ? tr(L"未命名策略")
+                               : widen(g_app->managed_strategy.policy_id);
+        strategy_source += tr(L" · revision ") +
+                           std::to_wstring(g_app->managed_strategy.revision);
+        if (g_app->strategy_start_blocked) {
+            strategy_source += tr(L"\n包含本版本不支持的设置：监听保留，但已阻止新查看器接入。");
+        }
+    } else {
+        strategy_source = tr(
+            L"尚未收到客户端策略，当前使用本地设置。\n远端撤销或尚无分配时也会回到本地设置。");
+    }
+    dialog.strategy_source =
+        add(L"STATIC", strategy_source.c_str(), SS_LEFT, 0, 32, 84,
+            page_text_width, 44, 0, nullptr, &dialog.strategy_page);
+    add(L"STATIC",
+        tr(L"locked 项由策略强制覆盖；“恢复继承”只清除本地显式偏好，不会修改或撤销策略。"),
+        SS_LEFT, 0, 32, 138, page_text_width, 36, 0, nullptr,
+        &dialog.strategy_page);
+
+    const wchar_t* strategy_names[] = {
+        tr(L"会话结束后锁定本机"),
+        tr(L"连接期间防止自动休眠"),
+        tr(L"空闲断开（分钟）"),
+        tr(L"最大并发查看者"),
+        tr(L"弱网回退（TCP/WebSocket）"),
+        tr(L"LAN 发现应答"),
+    };
+    const char* strategy_keys[] = {
+        "host.lock_after_session_end",
+        "host.keep_awake",
+        "host.auto_disconnect_minutes",
+        "host.max_viewers",
+        "host.carrier",
+        "host.lan_discovery",
+    };
+    const auto strategy_value_text =
+        [&effective_for_strategy](HostPreference preference) {
+            switch (preference) {
+            case HostPreference::LockAfterSessionEnd:
+                return std::wstring(
+                    effective_for_strategy.lock_after_session_end ? tr(L"开启")
+                                                                  : tr(L"关闭"));
+            case HostPreference::KeepAwake:
+                return std::wstring(effective_for_strategy.keep_awake
+                                        ? tr(L"开启")
+                                        : tr(L"关闭"));
+            case HostPreference::AutoDisconnectMinutes:
+                return std::to_wstring(
+                           effective_for_strategy.auto_disconnect_minutes) +
+                       tr(L" 分钟");
+            case HostPreference::MaxViewers:
+                return std::to_wstring(effective_for_strategy.max_viewers);
+            case HostPreference::Carrier:
+                return std::wstring(effective_for_strategy.carrier
+                                        ? tr(L"开启")
+                                        : tr(L"关闭"));
+            case HostPreference::LanDiscovery:
+                return std::wstring(effective_for_strategy.lan_discovery
+                                        ? tr(L"开启")
+                                        : tr(L"关闭"));
+            default:
+                return std::wstring();
+            }
+        };
+    for (size_t index = 0; index < static_cast<size_t>(HostPreference::Count);
+         ++index) {
+        const auto preference = static_cast<HostPreference>(index);
+        const uint32_t mask = uint32_t{1} << static_cast<uint32_t>(preference);
+        const bool locked =
+            (effective_for_strategy.managed_locked_preferences & mask) != 0;
+        const bool explicit_local =
+            host_preference_is_explicit(g_app->settings, preference);
+        const bool managed =
+            g_app->managed_strategy.settings.contains(strategy_keys[index]);
+        const int top = 182 + static_cast<int>(index) * 48;
+        if (preference == HostPreference::LanDiscovery) {
+            dialog.lan_discovery = add(
+                L"BUTTON", strategy_names[index],
+                BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, top, 210, 26,
+                kSecLanDiscovery, nullptr, &dialog.strategy_page);
+            set_check(dialog.lan_discovery,
+                      effective_for_strategy.lan_discovery);
+            EnableWindow(dialog.lan_discovery, locked ? FALSE : TRUE);
+        } else {
+            add(L"STATIC", strategy_names[index], SS_LEFT, 0, 32, top + 3,
+                210, 22, 0, nullptr, &dialog.strategy_page);
+        }
+        std::wstring state_text;
+        if (locked) {
+            state_text = tr(L"策略锁定 · ");
+        } else if (managed && !explicit_local) {
+            state_text = tr(L"策略默认 · ");
+        } else if (managed) {
+            state_text = tr(L"本地偏好 · ");
+        } else {
+            state_text = tr(L"本地设置 · ");
+        }
+        state_text += strategy_value_text(preference);
+        dialog.strategy_values[index] = add(
+            L"STATIC", state_text.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0,
+            256, top + 3, page_right - 256 - 112, 22, 0, nullptr,
+            &dialog.strategy_page);
+        dialog.strategy_restore[index] = add(
+            L"BUTTON", tr(L"恢复继承"), BS_PUSHBUTTON | WS_TABSTOP, 0,
+            page_right - 96, top, 96, 28,
+            kSecRestoreInheritanceBase + static_cast<int>(index), nullptr,
+            &dialog.strategy_page);
+        EnableWindow(dialog.strategy_restore[index],
+                     explicit_local && !locked ? TRUE : FALSE);
+    }
+    add(L"STATIC",
+        tr(L"启动项：防止休眠、并发查看者、弱网回退在主机监听就绪后回报 applied；"
+           L"LAN 发现需连接服务就绪。会话锁屏和空闲断开固定到下一会话。"),
+        SS_LEFT, 0, 32, 492, page_text_width, 52, 0, nullptr,
+        &dialog.strategy_page);
+    add(L"STATIC",
+        tr(L"启动失败会回报 failed；本机保存始终写入本地偏好，受管运行时副本不会写回配置文件。"),
+        SS_LEFT, 0, 32, 556, page_text_width, 48, 0, nullptr,
+        &dialog.strategy_page);
+
     const int sec_cancel_left = dialog_width - 20 - 90;
     const int save_y = 752;
     const int save_width = g_app->machine_settings_editor ? 220 : 90;
@@ -3106,6 +3468,22 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.lock_after_end, settings.lock_after_session_end);
     set_check(dialog.keep_awake, settings.keep_awake);
     set_text(dialog.idle_minutes, widen(std::to_string(settings.auto_disconnect_minutes)));
+    const uint32_t locked_preferences =
+        g_app->effective_settings.managed_locked_preferences;
+    const auto preference_locked = [locked_preferences](
+                                       HostPreference preference) {
+        return (locked_preferences &
+                (uint32_t{1} << static_cast<uint32_t>(preference))) != 0;
+    };
+    EnableWindow(
+        dialog.lock_after_end,
+        preference_locked(HostPreference::LockAfterSessionEnd) ? FALSE : TRUE);
+    EnableWindow(
+        dialog.keep_awake,
+        preference_locked(HostPreference::KeepAwake) ? FALSE : TRUE);
+    EnableWindow(
+        dialog.idle_minutes,
+        preference_locked(HostPreference::AutoDisconnectMinutes) ? FALSE : TRUE);
     set_text(dialog.trusted_days, widen(std::to_string(settings.trusted_device_days)));
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
@@ -3344,13 +3722,26 @@ void show_tray_menu() {
                 kSessionSelectCheck, tr(L"允许查看者切换 Windows 会话（仅服务模式）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_remote_config ? MF_CHECKED : 0),
                 kRemoteConfigCheck, tr(L"允许查看者修改主机设置"));
-    AppendMenuW(menu,
-                MF_STRING | (g_app->settings.lock_after_session_end ? MF_CHECKED : 0),
-                kLockAfterEndCheck, tr(L"会话结束后锁定本机"));
+    const uint32_t locked_preferences =
+        g_app->effective_settings.managed_locked_preferences;
+    const auto managed_locked = [locked_preferences](HostPreference preference) {
+        return (locked_preferences &
+                (uint32_t{1} << static_cast<uint32_t>(preference))) != 0;
+    };
+    AppendMenuW(
+        menu,
+        MF_STRING |
+            (managed_locked(HostPreference::LockAfterSessionEnd) ? MF_GRAYED : 0) |
+            (g_app->effective_settings.lock_after_session_end ? MF_CHECKED : 0),
+        kLockAfterEndCheck, tr(L"会话结束后锁定本机"));
     AppendMenuW(menu,
                 MF_STRING | (g_app->settings.remove_wallpaper ? MF_CHECKED : 0),
                 kRemoveWallpaperCheck, tr(L"会话期间移除壁纸（降低静止画面开销）"));
-    AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
+    AppendMenuW(menu,
+                MF_STRING |
+                    (managed_locked(HostPreference::Carrier) ? MF_GRAYED : 0) |
+                    (g_app->effective_settings.carrier ? MF_CHECKED : 0),
+                kCarrierCheck,
                 tr(L"弱网回退（TCP/WebSocket）"));
     AppendMenuW(menu,
                 MF_STRING | (g_app->portable ? MF_GRAYED
@@ -3359,6 +3750,16 @@ void show_tray_menu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kSecurityButton, tr(L"安全设置…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    if (g_app->managed_strategy_loaded) {
+        std::wstring source = tr(L"客户端策略 · revision ") +
+                              std::to_wstring(g_app->managed_strategy.revision);
+        if (g_app->strategy_start_blocked)
+            source += tr(L" · 有不受支持项，已阻止新连接");
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, source.c_str());
+    } else {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+                    tr(L"客户端策略 · 尚未下发，使用本地设置"));
+    }
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, tunnel_text().c_str());
     const VirtualDisplayProbe vdisplay_probe = probe_virtual_display();
     const VirtualDisplayStatus vdisplay_status =
@@ -3764,6 +4165,14 @@ void handle_command(int id) {
             break;
         }
         case kLockAfterEndCheck: {
+            if ((g_app->effective_settings.managed_locked_preferences &
+                 (uint32_t{1} << static_cast<uint32_t>(
+                      HostPreference::LockAfterSessionEnd))) != 0) {
+                append_log_line(
+                    tr(L"该设置由客户端策略锁定，无法从本机修改"));
+                break;
+            }
+            mark_host_preference(g_app->settings, HostPreference::LockAfterSessionEnd);
             g_app->settings.lock_after_session_end =
                 !g_app->settings.lock_after_session_end;
             save_settings();
@@ -3794,6 +4203,13 @@ void handle_command(int id) {
             }
             break;
         case kCarrierCheck:
+            if ((g_app->effective_settings.managed_locked_preferences &
+                 (uint32_t{1} << static_cast<uint32_t>(
+                      HostPreference::Carrier))) != 0) {
+                append_log_line(tr(L"该设置由客户端策略锁定，无法从本机修改"));
+                break;
+            }
+            mark_host_preference(g_app->settings, HostPreference::Carrier);
             g_app->settings.carrier = !g_app->settings.carrier;
             save_settings();
             if (session_is_live()) {
@@ -4023,6 +4439,18 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                         return 0;
                     }
                 }
+                if (now >= g_app->next_strategy_check) {
+                    g_app->next_strategy_check = now + 2000;
+                    load_managed_strategy(true);
+                    if (g_app->server) {
+                        const HostState state = g_app->server->status().state;
+                        g_app->strategy_server_ready =
+                            state == HostState::Listening || state == HostState::Streaming;
+                    } else {
+                        g_app->strategy_server_ready = false;
+                    }
+                    write_managed_strategy_receipt();
+                }
                 refresh_ui();
             }
             return 0;
@@ -4075,6 +4503,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         case kTunnelExitMessage: {
             const uint32_t code = static_cast<uint32_t>(wparam);
             g_app->tunnel.stop();
+            g_app->strategy_tunnel_ready = false;
+            g_app->strategy_tunnel_failed = code != 0;
+            write_managed_strategy_receipt();
             g_app->tunnel_error = "代理已退出（代码 " + std::to_string(code) + "）";
             g_app->tunnel_relay.clear();
             g_app->tunnel_viewer_path.clear();

@@ -310,6 +310,7 @@ add_library(chast.host STATIC
     src/host/shared_loopback.cc
     src/host/host_security.cc
     src/host/host_settings.cc
+    src/host/host_client_strategy.cc
     src/host/host_server.cc
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
@@ -542,6 +543,8 @@ if(CHAST_BUILD_TESTS)
     # Settings file round-trip: no GPU, no network, no certificate store.
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host.tray)
+    add_executable(chast-host-client-strategy-test tests/host_client_strategy_test.cc)
+    target_link_libraries(chast-host-client-strategy-test PRIVATE chast.host)
 
     # JSONL records for the service and worker: timestamp shape, escaping,
     # invalid-UTF-8 replacement, rotation and concurrent appends.
@@ -754,6 +757,9 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME desktop COMMAND chast-desktop-test)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
+    add_test(NAME host_client_strategy COMMAND chast-host-client-strategy-test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/host_client_strategy.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/viewer_client_strategy.json")
     add_test(NAME service_log COMMAND chast-service-log-test)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)

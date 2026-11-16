@@ -43,32 +43,11 @@ class AddressBookPlan {
   final int removed;
 }
 
-/// Merges the server address book into the local device list.
-///
-/// Pull rules: a server peer missing locally becomes a saved device; a saved
-/// device with no local name takes the server name, empty local tags take
-/// the server tags, and an empty local note takes the server note; an unsaved
-/// recent entry is promoted to the address book.
-///
-/// Deletion rules: a tombstone from [tombstones] removes the matching saved
-/// device and blocks it from the push list, so a peer deleted on another
-/// viewer is not resurrected by this device's stale local copy. A local
-/// deletion that has not reached the server is passed in
-/// [pendingDeletions]; it blocks the peer even while the server still reports
-/// it alive, so a failed delete is not undone by the next pull. Neither kind
-/// touches unsaved recents, which were never part of the account book.
-///
-/// Push rules: every saved device of [serverUrl] missing from the server is
-/// uploaded, and a non-empty local name, tag list or note wins over a
-/// different server value. Empty tags, note or group normally mean "no
-/// preference" and are never uploaded; [Device.tagsCleared],
-/// [Device.noteCleared] and [Device.groupCleared] record an explicit offline
-/// clear and push the empty value until it succeeds. A clear whose server row
-/// already matches is settled without an upload.
-///
-/// Group rules: the server group wins while the local entry is ungrouped, and
-/// a local group id that no longer exists on the server is dropped. A live
-/// local group assignment wins over a different server value and is pushed.
+/// Merges a complete server snapshot with locally edited fields. Cached
+/// fields accept remote changes (including clears). Only explicit local edits
+/// or never-synced entries are pushed, using the revision they were based on.
+/// Pending edits retain that baseline until a write succeeds or a conflict is
+/// resolved; merely reading a newer revision must not authorize a stale write.
 AddressBookPlan planAddressBookSync({
   required List<Device> devices,
   required List<AddressBookPeer> peers,
@@ -78,49 +57,125 @@ AddressBookPlan planAddressBookSync({
   required String serverUrl,
   required DateTime now,
 }) {
-  final Set<String> liveGroups = <String>{
-    for (final AddressBookGroup group in groups)
+  final Set<String> liveGroups = {
+    for (final group in groups)
       if (!group.deleted) group.id,
   };
-  final List<Device> normalized = <Device>[
-    for (final Device device in devices)
-      _normalizeDevice(device, serverUrl, liveGroups),
-  ];
-  final Map<String, AddressBookPeer> peerById = <String, AddressBookPeer>{
-    for (final AddressBookPeer peer in peers) peer.id: peer,
+  final Map<String, AddressBookPeer> peerById = {
+    for (final peer in peers) peer.id: peer,
   };
-  final Set<String> tombstoned = <String>{
-    for (final AddressBookPeer peer in tombstones)
+  final Set<String> blocked = {
+    ...pendingDeletions,
+    for (final peer in tombstones)
       if (peer.deleted && !peerById.containsKey(peer.id)) peer.id,
   };
-  final Set<String> blocked = <String>{...tombstoned, ...pendingDeletions};
-  final List<Device> merged = List<Device>.of(normalized);
+  final List<Device> merged = [];
+  final List<AddressBookPush> pushes = [];
+  final Set<String> seen = {};
   int added = 0;
   int updated = 0;
   int removed = 0;
-
-  merged.removeWhere((Device device) {
-    final bool remove = device.saved &&
-        device.server == serverUrl &&
-        blocked.contains(device.id);
-    if (remove) {
-      removed++;
-    }
-    return remove;
-  });
-
-  for (final AddressBookPeer peer in peers) {
-    if (pendingDeletions.contains(peer.id)) {
+  for (final original in devices) {
+    if (original.server != serverUrl) {
+      merged.add(original);
       continue;
     }
-    final String key =
-        Device(id: peer.id, server: serverUrl, addedAt: now).key;
-    final int index = merged.indexWhere((Device device) => device.key == key);
-    if (index < 0) {
-      merged.add(Device(
+    if (original.saved && blocked.contains(original.id)) {
+      removed++;
+      continue;
+    }
+    seen.add(original.id);
+    if (pendingDeletions.contains(original.id)) {
+      merged.add(original);
+      continue;
+    }
+    Device device = original;
+    int dirty =
+        device.dirtyFields |
+        (device.tagsCleared && device.tags.isEmpty ? Device.tagsField : 0) |
+        (device.noteCleared && device.note.isEmpty ? Device.noteField : 0) |
+        (device.groupCleared && device.groupId.isEmpty ? Device.groupField : 0);
+    // Preserve first-login imports, but never infer edits from a synced cache.
+    if (device.revision == 0) {
+      dirty |=
+          (device.name.isNotEmpty ? Device.nameField : 0) |
+          (device.tags.isNotEmpty ? Device.tagsField : 0) |
+          (device.note.isNotEmpty ? Device.noteField : 0) |
+          (device.groupId.isNotEmpty ? Device.groupField : 0);
+    }
+    if (device.groupId.isNotEmpty && !liveGroups.contains(device.groupId)) {
+      device = device.copyWith(groupId: '');
+      dirty &= ~Device.groupField;
+    }
+    final AddressBookPeer? peer = peerById[device.id];
+    if (peer == null) {
+      merged.add(device.copyWith(dirtyFields: dirty));
+      if (device.saved && !blocked.contains(device.id)) {
+        pushes.add(
+          AddressBookPush(
+            id: device.id,
+            name: device.name,
+            tags: device.tags.isEmpty ? null : device.tags,
+            note: device.note.isEmpty ? null : Device.cleanNote(device.note),
+            groupId: device.groupId.isEmpty ? null : device.groupId,
+          ),
+        );
+      }
+      continue;
+    }
+    // A matching server value acknowledges an edit even after a lost response.
+    if (device.name == peer.name) dirty &= ~Device.nameField;
+    if (Device.sameTags(device.tags, peer.tags)) dirty &= ~Device.tagsField;
+    if (Device.cleanNote(device.note) == peer.note) dirty &= ~Device.noteField;
+    if (device.groupId == peer.groupId) dirty &= ~Device.groupField;
+    bool pending(int field) => dirty & field != 0;
+    final Device result = device.copyWith(
+      name: pending(Device.nameField) ? device.name : peer.name,
+      tags: pending(Device.tagsField) ? device.tags : peer.tags,
+      note: pending(Device.noteField)
+          ? device.note
+          : Device.cleanNote(peer.note),
+      groupId: pending(Device.groupField) ? device.groupId : peer.groupId,
+      position: peer.position,
+      revision: dirty != 0 && device.revision > 0
+          ? device.revision
+          : peer.revision,
+      dirtyFields: dirty,
+      tagsCleared: pending(Device.tagsField) && device.tags.isEmpty,
+      noteCleared: pending(Device.noteField) && device.note.isEmpty,
+      groupCleared: pending(Device.groupField) && device.groupId.isEmpty,
+      saved: true,
+    );
+    merged.add(result);
+    if (original.name != result.name ||
+        !Device.sameTags(original.tags, result.tags) ||
+        original.note != result.note ||
+        original.groupId != result.groupId ||
+        !original.saved) {
+      updated++;
+    }
+    if (device.saved && dirty != 0) {
+      pushes.add(
+        AddressBookPush(
+          id: device.id,
+          name: pending(Device.nameField) ? device.name : null,
+          tags: pending(Device.tagsField) ? device.tags : null,
+          note: pending(Device.noteField)
+              ? Device.cleanNote(device.note)
+              : null,
+          groupId: pending(Device.groupField) ? device.groupId : null,
+          revision: device.revision > 0 ? device.revision : peer.revision,
+        ),
+      );
+    }
+  }
+  for (final peer in peers) {
+    if (seen.contains(peer.id) || pendingDeletions.contains(peer.id)) continue;
+    merged.add(
+      Device(
         id: peer.id,
-        name: peer.name,
         server: serverUrl,
+        name: peer.name,
         tags: peer.tags,
         note: Device.cleanNote(peer.note),
         groupId: peer.groupId,
@@ -128,185 +183,18 @@ AddressBookPlan planAddressBookSync({
         revision: peer.revision,
         saved: true,
         addedAt: now,
-      ));
-      added++;
-      continue;
-    }
-    final Device old = merged[index];
-    bool changed = false;
-    bool promoted = false;
-    String name = old.name;
-    List<String> tags = old.tags;
-    String note = old.note;
-    String groupId = old.groupId;
-    if (peer.name.isNotEmpty && old.name.isEmpty) {
-      name = peer.name;
-      changed = true;
-    }
-    if (peer.tags.isNotEmpty && old.tags.isEmpty && !old.tagsCleared) {
-      tags = peer.tags;
-      changed = true;
-    }
-    if (peer.note.isNotEmpty && old.note.isEmpty && !old.noteCleared) {
-      note = Device.cleanNote(peer.note);
-      changed = true;
-    }
-    if (peer.groupId.isNotEmpty && old.groupId.isEmpty && !old.groupCleared) {
-      groupId = peer.groupId;
-      changed = true;
-    }
-    if (!old.saved) {
-      promoted = true;
-    }
-    if (changed ||
-        promoted ||
-        old.revision != peer.revision ||
-        old.position != peer.position) {
-      merged[index] = old.copyWith(
-        name: name,
-        tags: tags,
-        note: note,
-        groupId: groupId,
-        position: peer.position,
-        revision: peer.revision,
-        saved: true,
-      );
-      if (changed || promoted) {
-        updated++;
-      }
-    }
+      ),
+    );
+    added++;
   }
-
-  final List<AddressBookPush> pushes = <AddressBookPush>[];
-  for (final Device device in normalized) {
-    if (!device.saved || device.server != serverUrl) {
-      continue;
-    }
-    if (blocked.contains(device.id)) {
-      continue;
-    }
-    final AddressBookPeer? peer = peerById[device.id];
-    if (peer == null) {
-      pushes.add(AddressBookPush(
-        id: device.id,
-        name: device.name,
-        tags: device.tags.isEmpty ? null : device.tags,
-        note: device.note.isEmpty ? null : Device.cleanNote(device.note),
-        groupId: device.groupId.isEmpty ? null : device.groupId,
-      ));
-      continue;
-    }
-    final String? name =
-        device.name.isNotEmpty && device.name != peer.name ? device.name : null;
-    final List<String>? tags;
-    if (device.tagsCleared && peer.tags.isNotEmpty) {
-      tags = const <String>[];
-    } else if (device.tags.isNotEmpty && !_sameTags(device.tags, peer.tags)) {
-      tags = device.tags;
-    } else {
-      tags = null;
-    }
-    final String? note;
-    if (device.noteCleared && peer.note.isNotEmpty) {
-      note = '';
-    } else if (device.note.isNotEmpty &&
-        Device.cleanNote(device.note) != peer.note) {
-      note = Device.cleanNote(device.note);
-    } else {
-      note = null;
-    }
-    final String? groupId;
-    if (device.groupCleared && peer.groupId.isNotEmpty) {
-      groupId = '';
-    } else if (device.groupId.isNotEmpty && device.groupId != peer.groupId) {
-      groupId = device.groupId;
-    } else {
-      groupId = null;
-    }
-    if (name != null || tags != null || note != null || groupId != null) {
-      pushes.add(AddressBookPush(
-        id: device.id,
-        name: name,
-        tags: tags,
-        note: note,
-        groupId: groupId,
-        revision: peer.revision,
-      ));
-    }
-  }
-
-  final List<Device> settled = <Device>[
-    for (final Device device in merged)
-      _settleConfirmedClear(device, serverUrl, peerById[device.id]),
-  ];
-  settled.sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
+  merged.sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
   return AddressBookPlan(
-    devices: settled,
+    devices: merged,
     pushes: pushes,
     added: added,
     updated: updated,
     removed: removed,
   );
-}
-
-Device _normalizeDevice(
-  Device device,
-  String serverUrl,
-  Set<String> liveGroups,
-) {
-  Device result = device;
-  if (result.tags.isNotEmpty && result.tagsCleared) {
-    result = result.copyWith(tagsCleared: false);
-  }
-  if (result.note.isNotEmpty && result.noteCleared) {
-    result = result.copyWith(noteCleared: false);
-  }
-  if (result.groupId.isNotEmpty && result.groupCleared) {
-    result = result.copyWith(groupCleared: false);
-  }
-  if (result.saved &&
-      result.server == serverUrl &&
-      result.groupId.isNotEmpty &&
-      !liveGroups.contains(result.groupId)) {
-    result = result.copyWith(groupId: '');
-  }
-  return result;
-}
-
-/// Drops an offline clear marker once the server row already matches it. A
-/// marker whose clear still needs an upload stays set until the caller reports
-/// success, so a failed request is retried on the next sync.
-Device _settleConfirmedClear(
-  Device device,
-  String serverUrl,
-  AddressBookPeer? peer,
-) {
-  if (!device.saved || device.server != serverUrl) {
-    return device;
-  }
-  Device result = device;
-  if (result.tagsCleared && (peer == null || peer.tags.isEmpty)) {
-    result = result.copyWith(tagsCleared: false);
-  }
-  if (result.noteCleared && (peer == null || peer.note.isEmpty)) {
-    result = result.copyWith(noteCleared: false);
-  }
-  if (result.groupCleared && (peer == null || peer.groupId.isEmpty)) {
-    result = result.copyWith(groupCleared: false);
-  }
-  return result;
-}
-
-bool _sameTags(List<String> local, List<String> server) {
-  if (local.length != server.length) {
-    return false;
-  }
-  for (int i = 0; i < local.length; i++) {
-    if (local[i] != server[i]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 /// Applies one address-book read to the cached group list. A full read (or a

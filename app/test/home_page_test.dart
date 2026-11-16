@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/gestures.dart';
@@ -70,7 +71,7 @@ class _MemoryDevices extends DeviceStore {
   Future<List<Device>> rename(String key, String name) async {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
-      devices[index] = devices[index].copyWith(name: name.trim());
+      devices[index] = devices[index].edit(name: name);
     }
     return List<Device>.of(devices);
   }
@@ -89,10 +90,7 @@ class _MemoryDevices extends DeviceStore {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
       final List<String> clean = Device.cleanTags(tags);
-      devices[index] = devices[index].copyWith(
-        tags: clean,
-        tagsCleared: clean.isEmpty,
-      );
+      devices[index] = devices[index].edit(tags: clean);
     }
     return List<Device>.of(devices);
   }
@@ -102,10 +100,7 @@ class _MemoryDevices extends DeviceStore {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
       final String value = groupId.trim();
-      devices[index] = devices[index].copyWith(
-        groupId: value,
-        groupCleared: value.isEmpty,
-      );
+      devices[index] = devices[index].edit(groupId: value);
     }
     return List<Device>.of(devices);
   }
@@ -144,10 +139,7 @@ class _MemoryDevices extends DeviceStore {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
       final String clean = Device.cleanNote(note);
-      devices[index] = devices[index].copyWith(
-        note: clean,
-        noteCleared: clean.isEmpty,
-      );
+      devices[index] = devices[index].edit(note: clean);
     }
     return List<Device>.of(devices);
   }
@@ -155,13 +147,29 @@ class _MemoryDevices extends DeviceStore {
   @override
   Future<List<Device>> markPushSettled(
     String key, {
+    bool name = false,
     bool tags = false,
     bool note = false,
     bool group = false,
+    Device? expected,
   }) async {
     final int index = devices.indexWhere((Device device) => device.key == key);
     if (index >= 0) {
+      final current = devices[index];
+      name = name && (expected == null || current.name == expected.name);
+      tags =
+          tags &&
+          (expected == null || Device.sameTags(current.tags, expected.tags));
+      note = note && (expected == null || current.note == expected.note);
+      group =
+          group && (expected == null || current.groupId == expected.groupId);
       devices[index] = devices[index].copyWith(
+        dirtyFields:
+            devices[index].dirtyFields &
+            ~((name ? Device.nameField : 0) |
+                (tags ? Device.tagsField : 0) |
+                (note ? Device.noteField : 0) |
+                (group ? Device.groupField : 0)),
         tagsCleared: tags ? false : null,
         noteCleared: note ? false : null,
         groupCleared: group ? false : null,
@@ -319,6 +327,183 @@ String _savedCount(WidgetTester tester) =>
     tester.widget<Text>(find.byKey(const Key('saved-count'))).data ?? '';
 
 void main() {
+  for (final (lateUnauthorized, relogin) in [
+    (false, false),
+    (true, false),
+    (false, true),
+    (true, true),
+  ]) {
+    testWidgets(
+      'logout ignores late sync ${lateUnauthorized ? "401" : "success"} relogin=$relogin',
+      (tester) async {
+        tester.view.physicalSize = const Size(1600, 1000);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final accounts = _MemoryAccount(
+          AccountSession(
+            server: 'http://127.0.0.1:8443',
+            username: 'alice',
+            token: 'tok',
+            expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          ),
+        );
+        final pending = Completer<AddressBookSnapshot>();
+        int requests = 0;
+        int renewals = 0;
+        final devices = _MemoryDevices([]);
+        await tester.pumpWidget(
+          MaterialApp(
+            home: HomePage(
+              deviceStore: devices,
+              serverStore: _MemoryServers(
+                const ServerSettings(url: 'http://127.0.0.1:8443'),
+              ),
+              identityStore: _MemoryIdentity(),
+              trustStore: _MemoryTrust({}),
+              accountStore: accounts,
+              lookupBatch: (server, ids) async =>
+                  const BatchLookupResult(hosts: {}),
+              addressBookFetcher: (server, token, since) {
+                requests++;
+                if (token == 'bob-token') {
+                  return Future.value(
+                    const AddressBookSnapshot(revision: 2, peers: []),
+                  );
+                }
+                return pending.future;
+              },
+              accountRefresh: (server, refresh) async {
+                renewals++;
+                throw const ServerApiException('stale', statusCode: 401);
+              },
+              accountLogout: (server, token) async {},
+              accountLogin:
+                  (
+                    server, {
+                    required username,
+                    required password,
+                    totpCode = '',
+                    recoveryCode = '',
+                    smsCode = '',
+                    emailCode = '',
+                  }) async => const AccountLoginResult(
+                    username: 'bob',
+                    token: 'bob-token',
+                    expiresInMs: 3600000,
+                  ),
+            ),
+          ),
+        );
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 20));
+        }
+        expect(requests, 1);
+        await tester.tap(find.byKey(const Key('account-tile')));
+        await tester.pump(const Duration(milliseconds: 300));
+        await tester.tap(find.byKey(const Key('account-logout')));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 20));
+        }
+        expect(accounts.session, isNull);
+        if (relogin) {
+          await tester.tap(find.byKey(const Key('account-tile')));
+          await tester.pumpAndSettle();
+          await tester.enterText(
+            find.byKey(const Key('account-username')),
+            'bob',
+          );
+          await tester.enterText(
+            find.byKey(const Key('account-password')),
+            'secret',
+          );
+          await tester.tap(find.byKey(const Key('account-login')));
+          await tester.pumpAndSettle();
+          expect(accounts.session?.token, 'bob-token');
+        }
+        if (lateUnauthorized) {
+          pending.completeError(
+            const ServerApiException('old login', statusCode: 401),
+          );
+        } else {
+          pending.complete(
+            const AddressBookSnapshot(
+              revision: 1,
+              peers: [
+                AddressBookPeer(id: 'old-account-device', name: 'Private'),
+              ],
+            ),
+          );
+        }
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 20));
+        }
+        if (relogin) {
+          expect(accounts.session?.username, 'bob');
+          expect(accounts.session?.token, 'bob-token');
+          expect(accounts.session?.bookRevision, 2);
+        } else {
+          expect(accounts.session, isNull);
+        }
+        expect(devices.devices, isEmpty);
+        expect(renewals, 0);
+        expect(find.text('登录账号'), relogin ? findsNothing : findsOneWidget);
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
+
+  testWidgets('logout clear follows an account save already in progress', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final accounts = _PausedAccount(
+      AccountSession(
+        server: 'http://127.0.0.1:8443',
+        username: 'alice',
+        token: 'tok',
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices([]),
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust({}),
+          accountStore: accounts,
+          lookupBatch: (server, ids) async =>
+              const BatchLookupResult(hosts: {}),
+          addressBookFetcher: (server, token, since) async =>
+              const AddressBookSnapshot(revision: 1, peers: []),
+          accountLogout: (server, token) async {},
+        ),
+      ),
+    );
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(accounts.saving, isTrue);
+    await tester.tap(find.byKey(const Key('account-tile')));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.byKey(const Key('account-logout')));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('登录账号'), findsOneWidget);
+    accounts.release.complete();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(accounts.session, isNull);
+    expect(find.text('登录账号'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   // The saved tag filter lives in the user profile; keep every home page test
   // pointed at a throwaway file so a developer's real filter never leaks in.
   late Directory filterDir;
@@ -5083,4 +5268,16 @@ void main() {
 
     await tester.pumpWidget(const SizedBox());
   });
+}
+
+class _PausedAccount extends _MemoryAccount {
+  _PausedAccount(super.session);
+  final release = Completer<void>();
+  bool saving = false;
+  @override
+  Future<void> save(AccountSession value) async {
+    saving = true;
+    await release.future;
+    await super.save(value);
+  }
 }

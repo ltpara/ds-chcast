@@ -167,6 +167,9 @@ class ServerSettings {
     this.proxy = '',
     this.uploadRecordings = false,
     this.useWebSocket = false,
+    this.modeConfigured = false,
+    this.uploadRecordingsConfigured = false,
+    this.useWebSocketConfigured = false,
   });
 
   final String url;
@@ -201,6 +204,13 @@ class ServerSettings {
   /// unchanged. RustDesk exposes the same switch as `allow-websocket`.
   final bool useWebSocket;
 
+  /// Whether each viewer setting has an explicit local value. A server
+  /// `default` mode applies its recommendation only until the operator makes a
+  /// local choice; built-in defaults do not count as that choice.
+  final bool modeConfigured;
+  final bool uploadRecordingsConfigured;
+  final bool useWebSocketConfigured;
+
   bool get configured => url.isNotEmpty;
 
   ServerSettings copyWith({
@@ -211,6 +221,9 @@ class ServerSettings {
     String? proxy,
     bool? uploadRecordings,
     bool? useWebSocket,
+    bool? modeConfigured,
+    bool? uploadRecordingsConfigured,
+    bool? useWebSocketConfigured,
   }) {
     return ServerSettings(
       url: url ?? this.url,
@@ -220,18 +233,25 @@ class ServerSettings {
       proxy: proxy ?? this.proxy,
       uploadRecordings: uploadRecordings ?? this.uploadRecordings,
       useWebSocket: useWebSocket ?? this.useWebSocket,
+      modeConfigured: modeConfigured ?? (mode != null || this.modeConfigured),
+      uploadRecordingsConfigured:
+          uploadRecordingsConfigured ??
+          (uploadRecordings != null || this.uploadRecordingsConfigured),
+      useWebSocketConfigured:
+          useWebSocketConfigured ??
+          (useWebSocket != null || this.useWebSocketConfigured),
     );
   }
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'url': url,
-        'mode': mode.name,
-        'key': key,
-        'link_key': linkKey,
-        'proxy': proxy,
-        'upload_recordings': uploadRecordings,
-        'use_websocket': useWebSocket,
-      };
+    'url': url,
+    'mode': mode.name,
+    'key': key,
+    'link_key': linkKey,
+    'proxy': proxy,
+    'upload_recordings': uploadRecordings,
+    'use_websocket': useWebSocket,
+  };
 
   static ServerSettings fromJson(Object? value) {
     if (value is! Map) {
@@ -248,6 +268,9 @@ class ServerSettings {
       proxy: value['proxy']?.toString().trim() ?? '',
       uploadRecordings: value['upload_recordings'] == true,
       useWebSocket: value['use_websocket'] == true,
+      modeConfigured: value.containsKey('mode'),
+      uploadRecordingsConfigured: value.containsKey('upload_recordings'),
+      useWebSocketConfigured: value.containsKey('use_websocket'),
     );
   }
 }
@@ -263,9 +286,9 @@ class ServerSettingsStore {
     File? file,
     ServerKeyProtector? protectSecret,
     ServerKeyUnprotector? unprotectSecret,
-  })  : _injected = file,
-        _protector = protectSecret,
-        _unprotector = unprotectSecret;
+  }) : _injected = file,
+       _protector = protectSecret,
+       _unprotector = unprotectSecret;
 
   final File? _injected;
   final ServerKeyProtector? _protector;
@@ -328,8 +351,7 @@ class ServerSettingsStore {
               settings.proxy.isNotEmpty)) {
         try {
           final String blob = await protect(text);
-          text =
-              jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
+          text = jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
         } catch (_) {
           // Never fall back to writing secrets in the clear: keep the
           // non-secret fields on disk and leave them for this run only.

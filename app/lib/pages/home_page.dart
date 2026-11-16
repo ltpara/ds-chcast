@@ -259,6 +259,55 @@ class _HomePageState extends State<HomePage> {
   Map<String, ServerIdentityPin> _serverPins = <String, ServerIdentityPin>{};
   AccountSession? _account;
   bool _syncing = false;
+  int _accountEpoch = 0;
+  Future<void> _accountWrites = Future<void>.value();
+
+  bool _accountCurrent(int epoch) => mounted && epoch == _accountEpoch;
+
+  // Called synchronously inside setState before any logout/login I/O.
+  void _invalidateAccount() {
+    _accountEpoch++;
+    _account = null;
+    _syncing = false;
+    _renewing = false;
+    _groups = <AddressBookGroup>[];
+    _groupsSynced = false;
+  }
+
+  // A logout clear must run after an already-started save, while queued stale
+  // saves must never run after that clear. Metadata writes retain renewed tokens.
+  Future<bool> _persistAccount(
+    int epoch,
+    AccountSession? session, {
+    bool metadataOnly = false,
+  }) {
+    final Future<bool> operation = _accountWrites.then((_) async {
+      // A requested logout clear must still finish if the page closes while
+      // an earlier save is in flight. A newer login invalidates it instead.
+      if (epoch != _accountEpoch || (!mounted && session != null)) return false;
+      final AccountSession? next = metadataOnly
+          ? _account?.copyWith(
+              syncedAt: session!.syncedAt,
+              bookRevision: session.bookRevision,
+              groups: session.groups,
+            )
+          : session;
+      if (next == null) {
+        await _accountStore.clear();
+      } else {
+        await _accountStore.save(next);
+      }
+      if (!_accountCurrent(epoch)) return false;
+      _account = next;
+      return true;
+    });
+    _accountWrites = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return operation;
+  }
+
   final Map<String, DevicePresence> _presence = <String, DevicePresence>{};
   SoftwareInfo? _software;
   String? _softwareDismissed;
@@ -482,7 +531,7 @@ class _HomePageState extends State<HomePage> {
     if (storedAccount != null) {
       if (!storedAccount.isUsableAt(DateTime.now()) ||
           storedAccount.server != server.url) {
-        unawaited(_accountStore.clear());
+        await _persistAccount(_accountEpoch, null);
       } else {
         account = storedAccount;
       }
@@ -537,6 +586,7 @@ class _HomePageState extends State<HomePage> {
   /// session for the next tick and still counts as usable. `force` skips the
   /// "still fresh" shortcut so a 401 gets one renewal attempt before sign-out.
   Future<bool> _renewAccount({bool force = false}) async {
+    final int epoch = _accountEpoch;
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
       return false;
@@ -557,11 +607,11 @@ class _HomePageState extends State<HomePage> {
         _server,
         account.refreshToken,
       );
-      if (!mounted || !identical(_account, account)) {
+      if (!_accountCurrent(epoch)) {
         return true;
       }
       final DateTime issued = DateTime.now().toUtc();
-      final AccountSession session = account.copyWith(
+      final AccountSession session = _account!.copyWith(
         token: renewed.token,
         expiresAt: issued.add(Duration(milliseconds: renewed.expiresInMs)),
         refreshToken: renewed.refreshToken.isEmpty
@@ -571,19 +621,17 @@ class _HomePageState extends State<HomePage> {
             ? null
             : issued.add(Duration(milliseconds: renewed.refreshExpiresInMs)),
       );
-      await _accountStore.save(session);
-      if (mounted) {
-        setState(() => _account = session);
-      }
+      if (await _persistAccount(epoch, session)) setState(() {});
       return true;
     } on ServerApiException catch (error) {
-      return error.statusCode != HttpStatus.unauthorized;
+      return !_accountCurrent(epoch) ||
+          error.statusCode != HttpStatus.unauthorized;
     } catch (_) {
       // A transient network failure leaves the stored refresh token intact;
       // the next tick retries before the access token expires.
       return true;
     } finally {
-      _renewing = false;
+      if (_accountCurrent(epoch)) _renewing = false;
     }
   }
 
@@ -1040,7 +1088,12 @@ class _HomePageState extends State<HomePage> {
     }
     setState(() => _devices = devices);
     unawaited(_refreshPresence());
-    unawaited(_pushAccountPeer(device, allowEmptyName: true));
+    unawaited(
+      _pushAccountPeer(
+        devices.firstWhere((item) => item.key == device.key),
+        allowEmptyName: true,
+      ),
+    );
   }
 
   Future<Device?> _showDeviceDialog() {
@@ -1072,7 +1125,12 @@ class _HomePageState extends State<HomePage> {
         addedAt: DateTime.now(),
       );
       devices = await _deviceStore.save(device);
-      unawaited(_pushAccountPeer(device, allowEmptyName: true));
+      unawaited(
+        _pushAccountPeer(
+          devices.firstWhere((item) => item.key == device.key),
+          allowEmptyName: true,
+        ),
+      );
     }
     if (!mounted) {
       return;
@@ -1107,7 +1165,7 @@ class _HomePageState extends State<HomePage> {
         (Device item) => item.key == device.key,
         orElse: () => device.copyWith(name: result.trim()),
       );
-      unawaited(_pushAccountPeer(updated));
+      unawaited(_pushAccountPeer(updated, allowEmptyName: true));
     }
   }
 
@@ -1236,6 +1294,7 @@ class _HomePageState extends State<HomePage> {
   /// Writes the group locally first so the card moves even when the upload
   /// fails; the pending group flag retries it on the next sync.
   Future<void> _assignDeviceToGroup(Device device, String choice) async {
+    final int epoch = _accountEpoch;
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
       return;
@@ -1261,13 +1320,16 @@ class _HomePageState extends State<HomePage> {
         groupId: choice,
         ifRevision: updated.revision > 0 ? updated.revision : null,
       );
+      if (!_accountCurrent(epoch)) return;
       List<Device> settled = await _deviceStore.setPeerRevision(
         device.key,
         written.revision,
       );
-      if (choice.isEmpty) {
-        settled = await _deviceStore.markPushSettled(device.key, group: true);
-      }
+      settled = await _deviceStore.markPushSettled(
+        device.key,
+        group: true,
+        expected: updated,
+      );
       if (mounted) {
         setState(() => _devices = settled);
       }
@@ -1275,6 +1337,7 @@ class _HomePageState extends State<HomePage> {
         _showSnack(choice.isEmpty ? tr('已移到未分组') : tr('已移动到分组'));
       }
     } on ServerApiException catch (error) {
+      if (!_accountCurrent(epoch)) return;
       if (error.statusCode == HttpStatus.unauthorized) {
         await _recoverAccountSession();
         return;
@@ -1524,6 +1587,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _showAccount() async {
+    final int dialogEpoch = _accountEpoch;
     final _AccountResult? result = await showDialog<_AccountResult>(
       context: context,
       builder: (BuildContext context) {
@@ -1544,16 +1608,17 @@ class _HomePageState extends State<HomePage> {
         );
       },
     );
-    if (result == null || !mounted) {
+    if (result == null || !_accountCurrent(dialogEpoch)) {
       return;
     }
     if (result.session != null) {
       final AccountSession session = result.session!;
-      await _accountStore.save(session);
-      if (!mounted) {
-        return;
-      }
-      setState(() => _account = session);
+      if (session.server != _server.url) return;
+      setState(() {
+        _invalidateAccount();
+        _account = session;
+      });
+      if (!await _persistAccount(_accountEpoch, session)) return;
       await _syncAddressBook();
     } else if (result.logout) {
       await _signOutAccount();
@@ -1574,41 +1639,32 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _signOutAccount() async {
     final AccountSession? account = _account;
+    final ServerSettings server = _server;
+    setState(_invalidateAccount);
+    final int epoch = _accountEpoch;
+    await _persistAccount(epoch, null);
     if (account != null) {
       try {
-        await _logoutAccount(_server, account.token);
+        await _logoutAccount(server, account.token);
       } catch (_) {
-        // A token that cannot be revoked server-side still leaves this device.
+        // Local logout is immediate even when revocation is unavailable.
       }
     }
-    await _accountStore.clear();
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _account = null;
-      _groups = <AddressBookGroup>[];
-      _groupsSynced = false;
-    });
-    _showSnack(tr('已退出账号'));
+    if (_accountCurrent(epoch)) _showSnack(tr('已退出账号'));
   }
 
   Future<void> _expireAccount() async {
-    await _accountStore.clear();
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _account = null;
-      _groups = <AddressBookGroup>[];
-      _groupsSynced = false;
-    });
+    if (!mounted) return;
+    setState(_invalidateAccount);
+    await _persistAccount(_accountEpoch, null);
   }
 
   /// Pulls the account address book, merges it locally and uploads local
   /// entries the account does not have. A 401 drops the stored token so the
   /// next attempt goes through the login dialog instead of looping.
   Future<void> _syncAddressBook({bool announce = true}) async {
+    final int epoch = _accountEpoch;
+    final ServerSettings server = _server;
     AccountSession? account = _account;
     if (account == null) {
       if (announce) {
@@ -1620,32 +1676,37 @@ class _HomePageState extends State<HomePage> {
       // The access token lapsed (suspend, clock jump); a session-level
       // refresh token can still bring the account back.
       if (!await _renewAccount(force: true)) {
+        if (!_accountCurrent(epoch)) return;
         await _expireAccount();
         if (announce) {
           _showSnack(tr('账号登录已过期，请重新登录'));
         }
         return;
       }
+      if (!_accountCurrent(epoch)) return;
       account = _account;
       if (account == null || !account.isActiveAt(DateTime.now())) {
         return;
       }
     }
-    if (_syncing || account.server != _server.url) {
+    if (_syncing || account.server != server.url) {
       return;
     }
     setState(() => _syncing = true);
     try {
       final List<PendingDeletion> queued = await _deviceStore
           .loadPendingDeletions();
+      if (!_accountCurrent(epoch)) return;
       for (final PendingDeletion deletion in queued) {
-        if (deletion.server != _server.url ||
+        if (!_accountCurrent(epoch)) return;
+        if (deletion.server != server.url ||
             deletion.username != account.username) {
           continue;
         }
         try {
-          await _deleteAddressBookPeer(_server, account.token, deletion.id);
+          await _deleteAddressBookPeer(server, account.token, deletion.id);
         } on ServerApiException catch (error) {
+          if (!_accountCurrent(epoch)) return;
           if (error.statusCode == HttpStatus.unauthorized) {
             await _handleSyncUnauthorized(announce, error.message);
             return;
@@ -1656,23 +1717,26 @@ class _HomePageState extends State<HomePage> {
         } catch (_) {
           continue;
         }
+        if (!_accountCurrent(epoch)) return;
         await _deviceStore.removePendingDeletion(deletion.key);
       }
       final Set<String> pendingDeletions = <String>{
         for (final PendingDeletion deletion
             in await _deviceStore.loadPendingDeletions())
-          if (deletion.server == _server.url &&
+          if (deletion.server == server.url &&
               deletion.username == account.username)
             deletion.id,
       };
+      if (!_accountCurrent(epoch)) return;
       // The group cache travels with the session, so the first sync after
       // launch reads the whole book only when no cache exists.
       final int since = _groupsSynced ? account.bookRevision : 0;
       final AddressBookSnapshot snapshot = await _fetchAddressBook(
-        _server,
+        server,
         account.token,
         since,
       );
+      if (!_accountCurrent(epoch)) return;
       final List<AddressBookGroup> groups = mergeAddressBookGroups(
         current: _groups,
         snapshot: snapshot,
@@ -1684,17 +1748,19 @@ class _HomePageState extends State<HomePage> {
         groups: groups,
         tombstones: snapshot.tombstones,
         pendingDeletions: pendingDeletions,
-        serverUrl: _server.url,
+        serverUrl: server.url,
         now: DateTime.now(),
       );
+      if (!_accountCurrent(epoch)) return;
       int failed = 0;
       final Map<String, AddressBookPush> uploaded = <String, AddressBookPush>{};
       final Map<String, AddressBookPeer> written = <String, AddressBookPeer>{};
       final Set<String> conflicts = <String>{};
       for (final AddressBookPush push in plan.pushes) {
+        if (!_accountCurrent(epoch)) return;
         try {
           final AddressBookPeer peer = await _writeAddressBookPeer(
-            _server,
+            server,
             account.token,
             push.id,
             name: push.name,
@@ -1706,6 +1772,7 @@ class _HomePageState extends State<HomePage> {
           uploaded[push.id] = push;
           written[push.id] = peer;
         } on ServerApiException catch (error) {
+          if (!_accountCurrent(epoch)) return;
           if (error.statusCode == HttpStatus.unauthorized) {
             await _handleSyncUnauthorized(announce, error.message);
             return;
@@ -1719,15 +1786,17 @@ class _HomePageState extends State<HomePage> {
           failed++;
         }
       }
+      if (!_accountCurrent(epoch)) return;
       AddressBookSnapshot? refreshed;
       if (conflicts.isNotEmpty) {
         try {
-          refreshed = await _fetchAddressBook(_server, account.token, 0);
+          refreshed = await _fetchAddressBook(server, account.token, 0);
         } catch (_) {
           // Without a fresh read the conflicting entries stay local and are
           // retried next sync; the server never applied the stale write.
         }
       }
+      if (!_accountCurrent(epoch)) return;
       final Map<String, AddressBookPeer> refreshedById =
           <String, AddressBookPeer>{
             if (refreshed != null)
@@ -1739,7 +1808,7 @@ class _HomePageState extends State<HomePage> {
             refreshed != null &&
             conflicts.contains(item.id) &&
             item.saved &&
-            item.server == _server.url;
+            item.server == server.url;
         if (!conflicted) {
           merged.add(_settleUploadedClears(item, uploaded, written));
           continue;
@@ -1755,6 +1824,7 @@ class _HomePageState extends State<HomePage> {
             note: peer.note,
             groupId: peer.groupId,
             revision: peer.revision,
+            dirtyFields: 0,
             tagsCleared: false,
             noteCleared: false,
             groupCleared: false,
@@ -1763,20 +1833,17 @@ class _HomePageState extends State<HomePage> {
         );
       }
       final List<Device> devices = await _deviceStore.replaceAll(merged);
+      if (!_accountCurrent(epoch)) return;
       final AccountSession session = account.copyWith(
         syncedAt: DateTime.now(),
         bookRevision: refreshed?.revision ?? snapshot.revision,
         groups: groups,
       );
-      await _accountStore.save(session);
-      if (!mounted) {
-        return;
-      }
+      if (!await _persistAccount(epoch, session, metadataOnly: true)) return;
       setState(() {
         _devices = devices;
         _groups = groups;
         _groupsSynced = true;
-        _account = session;
       });
       unawaited(_refreshPresence());
       if (announce) {
@@ -1785,21 +1852,19 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } on ServerApiException catch (error) {
+      if (!_accountCurrent(epoch)) return;
       if (error.statusCode == HttpStatus.unauthorized) {
         await _handleSyncUnauthorized(announce, error.message);
       } else if (announce) {
         _showSnack(tr('地址簿同步失败：{p5}', <String, Object?>{'p5': error.message}));
       }
     } catch (error) {
+      if (!_accountCurrent(epoch)) return;
       if (announce) {
         _showSnack(tr('地址簿同步失败：{error}', <String, Object?>{'error': error}));
       }
     } finally {
-      if (mounted) {
-        setState(() => _syncing = false);
-      } else {
-        _syncing = false;
-      }
+      if (_accountCurrent(epoch)) setState(() => _syncing = false);
     }
   }
 
@@ -1844,6 +1909,12 @@ class _HomePageState extends State<HomePage> {
       return device;
     }
     return device.copyWith(
+      dirtyFields:
+          device.dirtyFields &
+          ~((push.name != null ? Device.nameField : 0) |
+              (push.tags != null ? Device.tagsField : 0) |
+              (push.note != null ? Device.noteField : 0) |
+              (push.groupId != null ? Device.groupField : 0)),
       tagsCleared: push.tags == null ? device.tagsCleared : false,
       noteCleared: push.note == null ? device.noteCleared : false,
       groupCleared: push.groupId == null ? device.groupCleared : false,
@@ -1858,28 +1929,32 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _refreshAfterConflicts(Set<String> peerIds) async {
+    final int epoch = _accountEpoch;
+    final ServerSettings server = _server;
     final AccountSession? account = _account;
-    if (account == null || account.server != _server.url) {
-      if (mounted) {
+    if (account == null || account.server != server.url) {
+      if (_accountCurrent(epoch)) {
         _showSnack(tr('该条目已在其他设备修改，请重新同步'));
       }
       return;
     }
     try {
       final AddressBookSnapshot snapshot = await _fetchAddressBook(
-        _server,
+        server,
         account.token,
         0,
       );
+      if (!_accountCurrent(epoch)) return;
       final Map<String, AddressBookPeer> byId = <String, AddressBookPeer>{
         for (final AddressBookPeer peer in snapshot.peers) peer.id: peer,
       };
       final List<Device> current = await _deviceStore.load();
+      if (!_accountCurrent(epoch)) return;
       final List<Device> next = <Device>[];
       for (final Device item in current) {
         if (!peerIds.contains(item.id) ||
             !item.saved ||
-            item.server != _server.url) {
+            item.server != server.url) {
           next.add(item);
           continue;
         }
@@ -1894,6 +1969,7 @@ class _HomePageState extends State<HomePage> {
             note: peer.note,
             groupId: peer.groupId,
             revision: peer.revision,
+            dirtyFields: 0,
             tagsCleared: false,
             noteCleared: false,
             groupCleared: false,
@@ -1902,6 +1978,7 @@ class _HomePageState extends State<HomePage> {
         );
       }
       final List<Device> devices = await _deviceStore.replaceAll(next);
+      if (!_accountCurrent(epoch)) return;
       final List<AddressBookGroup> groups = mergeAddressBookGroups(
         current: _groups,
         snapshot: snapshot,
@@ -1912,19 +1989,15 @@ class _HomePageState extends State<HomePage> {
         bookRevision: snapshot.revision,
         groups: groups,
       );
-      await _accountStore.save(session);
-      if (!mounted) {
-        return;
-      }
+      if (!await _persistAccount(epoch, session, metadataOnly: true)) return;
       setState(() {
         _devices = devices;
         _groups = groups;
         _groupsSynced = true;
-        _account = session;
       });
       _showSnack(tr('该条目已在其他设备修改，已刷新为服务器版本'));
     } catch (_) {
-      if (mounted) {
+      if (_accountCurrent(epoch)) {
         _showSnack(tr('该条目已在其他设备修改，请重新同步'));
       }
     }
@@ -1938,17 +2011,24 @@ class _HomePageState extends State<HomePage> {
     bool syncTags = false,
     bool syncNote = false,
   }) async {
+    final int epoch = _accountEpoch;
     final AccountSession? account = _account;
-    final String? name = device.name.isNotEmpty || allowEmptyName
+    final bool initial = device.revision == 0;
+    final String? name =
+        (device.dirtyFields & Device.nameField != 0 ||
+            initial && (device.name.isNotEmpty || allowEmptyName))
         ? device.name
         : null;
-    // A rename must not clear tags it never touched; an explicit tag edit
-    // sends the list even when empty so clearing propagates.
-    final List<String>? tags = device.tags.isNotEmpty || syncTags
+    final List<String>? tags =
+        (device.dirtyFields & Device.tagsField != 0 ||
+            syncTags ||
+            initial && device.tags.isNotEmpty)
         ? device.tags
         : null;
-    // Same rule for the note: only a note edit sends an empty value.
-    final String? note = device.note.isNotEmpty || syncNote
+    final String? note =
+        (device.dirtyFields & Device.noteField != 0 ||
+            syncNote ||
+            initial && device.note.isNotEmpty)
         ? Device.cleanNote(device.note)
         : null;
     if ((name == null && tags == null && note == null) ||
@@ -1969,13 +2049,16 @@ class _HomePageState extends State<HomePage> {
         note: note,
         ifRevision: device.revision > 0 ? device.revision : null,
       );
+      if (!_accountCurrent(epoch)) return;
       List<Device> settled = await _deviceStore.setPeerRevision(
         device.key,
         written.revision,
       );
-      if (tags != null || note != null) {
+      if (name != null || tags != null || note != null) {
         settled = await _deviceStore.markPushSettled(
           device.key,
+          expected: device,
+          name: name != null,
           tags: tags != null,
           note: note != null,
         );
@@ -1984,6 +2067,7 @@ class _HomePageState extends State<HomePage> {
         setState(() => _devices = settled);
       }
     } on ServerApiException catch (error) {
+      if (!_accountCurrent(epoch)) return;
       if (error.statusCode == HttpStatus.unauthorized) {
         await _recoverAccountSession();
         return;
@@ -2057,17 +2141,12 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) {
       return;
     }
-    final bool serverChanged =
-        _account != null && _account!.server != settings.url;
-    if (serverChanged) {
-      await _accountStore.clear();
-    }
+    final bool urlChanged = _server.url != settings.url;
     setState(() {
+      if (urlChanged) _invalidateAccount();
       _server = settings;
-      if (serverChanged) {
-        _account = null;
-      }
     });
+    if (urlChanged) await _persistAccount(_accountEpoch, null);
     unawaited(_refreshPresence());
   }
 
@@ -6917,7 +6996,11 @@ class _ServerDialogState extends State<_ServerDialog> {
         key: _key.text.trim(),
         linkKey: _linkKey.text.trim(),
         proxy: proxy,
+        uploadRecordings: widget.initial.uploadRecordings,
         useWebSocket: _useWebSocket,
+        modeConfigured: true,
+        uploadRecordingsConfigured: widget.initial.uploadRecordingsConfigured,
+        useWebSocketConfigured: true,
       ),
     );
   }

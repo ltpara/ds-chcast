@@ -1,0 +1,1 @@
+{"receipt":{"digest":"a7dfc548700e69901d347c34a660804298e6a4cd6b39699fef8a717e40ffeedb","results":{},"revision":8,"status":"applied","sequence":1},"scope":"7bd9e8a6de93933e9e9e7603ab2d0c776886ecba73ab0e92db8da543e45797ef"}

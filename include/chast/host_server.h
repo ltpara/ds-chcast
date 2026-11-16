@@ -603,6 +603,14 @@ public:
     // listener also shares it with its workers, so the last viewer of a
     // multi-viewer host triggers the lock. Safe to call from the UI thread.
     void set_lock_after_session_end(bool enabled);
+    // Publishes session-scoped strategy changes for connections admitted from
+    // now on. Connected viewers keep their admission snapshot.
+    void set_next_session_strategy(bool lock_after_session_end,
+                                   uint32_t auto_disconnect_minutes);
+    // Invalid managed strategy state blocks new admissions while the host can
+    // stay alive to receive a repaired cache and write a failure receipt.
+    void set_strategy_admission_allowed(bool allowed);
+    void set_strategy_locked_preferences(uint32_t mask);
 
     // Host microphone an active voice call sends. Changing it restarts that
     // call's capture on the new device without ending the call: the viewer
@@ -835,6 +843,14 @@ private:
     // end first; the guard calls the platform again so the operator's input
     // returns before the worker exits.
     std::atomic<bool> block_input_active_{false};
+    std::atomic<bool> strategy_admission_allowed_{true};
+    std::atomic<uint32_t> strategy_locked_preferences_{0};
+    // Captured when this viewer/session is admitted. A remote policy refresh
+    // may prepare later sessions, but must not change what this session does
+    // after its final viewer leaves.
+    bool session_lock_after_end_ = false;
+    uint32_t session_auto_disconnect_minutes_ = 0;
+    uint32_t next_session_auto_disconnect_minutes_ = 0;
 
     // Owned by the host thread after start(); created in create(). A viewer
     // worker owns the accepted connection instead and leaves this null.

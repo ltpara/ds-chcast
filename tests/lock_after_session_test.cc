@@ -4,9 +4,10 @@
 // the default, a live enable, a live cancel, a failing platform call (logged,
 // then retried by the next session) and the shutdown exemption; the shared
 // host checks that a departing viewer cannot lock while another remains, that
-// cancelling while connected wins, and that shutdown still suppresses the
-// lock. Needs a desktop session, so it skips itself when no interactive
-// desktop exists.
+// changing the switch while connected affects the next session rather than
+// rewriting the current one, and that shutdown still suppresses the lock.
+// Needs a desktop session, so it skips itself when no interactive desktop
+// exists.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -279,8 +280,11 @@ void run_single(uint16_t port) {
     host->set_lock_after_session_end(false);
     finish_viewer(*viewer);
     viewer.reset();
-    check(wait_listening(host, std::chrono::seconds(5)), "the cancelled host returns to listening");
-    check(backend->attempt_count() == 1, "cancelling while connected prevents the lock");
+    check(wait_listening(host, std::chrono::seconds(5)) &&
+              wait_for([&] { return backend->attempt_count() == 2; },
+                       std::chrono::seconds(5)),
+          "a live change does not rewrite the admitted session snapshot");
+    check(backend->success_count() == 2, "the admitted session keeps its enabled snapshot");
 
     host->set_lock_after_session_end(true);
     backend->fail_once();
@@ -294,10 +298,10 @@ void run_single(uint16_t port) {
     finish_viewer(*viewer);
     viewer.reset();
     check(wait_listening(host, std::chrono::seconds(5)) &&
-              wait_for([&] { return backend->attempt_count() == 2; },
+              wait_for([&] { return backend->attempt_count() == 3; },
                        std::chrono::seconds(5)),
           "a failing lock is attempted once per session end");
-    check(backend->success_count() == 1, "the failure is not reported as a success");
+    check(backend->success_count() == 2, "the failure is not reported as a success");
     check(logs->count("cannot lock the workstation after the session: injected lock failure") == 1,
           "the platform failure is logged with its reason");
 
@@ -311,10 +315,10 @@ void run_single(uint16_t port) {
     finish_viewer(*viewer);
     viewer.reset();
     check(wait_listening(host, std::chrono::seconds(5)) &&
-              wait_for([&] { return backend->attempt_count() == 3; },
+              wait_for([&] { return backend->attempt_count() == 4; },
                        std::chrono::seconds(5)),
           "the still-enabled setting locks the later session");
-    check(backend->success_count() == 2, "the retry succeeds");
+    check(backend->success_count() == 3, "the retry succeeds");
 
     const int before_stop = backend->attempt_count();
     viewer = connect_viewer(port, fingerprint, &info, &error);
@@ -426,9 +430,9 @@ void run_shared(uint16_t port) {
         check(wait_for([&] { return host->status().active_viewers == 0; },
                        std::chrono::seconds(5)),
               "the cancelled shared host drains");
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        check(backend->attempt_count() == 1,
-              "cancelling while connected prevents the deferred lock");
+        check(wait_for([&] { return backend->attempt_count() == 2; },
+                       std::chrono::seconds(5)),
+              "both admitted viewers keep their enabled session snapshots");
     } else {
         if (first) {
             first.reset();
@@ -454,10 +458,10 @@ void run_shared(uint16_t port) {
         second.reset();
         check(wait_for([&] { return host->status().active_viewers == 0; },
                        std::chrono::seconds(5)) &&
-                  wait_for([&] { return backend->attempt_count() == 2; },
+                  wait_for([&] { return backend->attempt_count() == 3; },
                            std::chrono::seconds(5)),
               "the last shared session attempts the failing lock");
-        check(backend->success_count() == 1, "the shared failure is not a success");
+        check(backend->success_count() == 2, "the shared failure is not a success");
         check(logs->count("cannot lock the workstation after the session: injected lock failure") == 1,
               "the shared failure is logged with its reason");
     } else {

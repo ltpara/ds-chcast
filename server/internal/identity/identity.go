@@ -60,7 +60,12 @@ const (
 	// DomainDevicePolicy covers a host acknowledging the policy version it
 	// applied. The signature binds the receipt to the host id, so another
 	// machine holding the shared host key cannot report on its behalf.
-	DomainDevicePolicy = "chast-device-policy-v1"
+	DomainDevicePolicy   = "chast-device-policy-v1"
+	DomainClientStrategy = "chast-client-strategy-v1"
+	// DomainLiveConnections covers the native host's complete active-session
+	// snapshots, command polls and exact disconnect receipts. It is separate
+	// from completed-session audit so an old report cannot target a new viewer.
+	DomainLiveConnections = "chast-live-connections-v1"
 	// DomainHostEvents covers a host subscribing to its revocation event
 	// stream. The device key binds the subscription to the host id, so the
 	// shared host credential alone cannot read another device's events.
@@ -196,6 +201,46 @@ func HostEventsSubscribeMessage(hostID string, after uint64, timestamp int64) []
 		strconv.FormatUint(after, 10), strconv.FormatInt(timestamp, 10))
 }
 
+// Client strategy messages use their own domain; a host event subscription
+// or admission-policy receipt cannot be replayed as a configuration action.
+func HostClientStrategyFetchMessage(hostID string, timestamp int64) []byte {
+	return fieldsMessage(DomainClientStrategy, "fetch", hostID, "host", strconv.FormatInt(timestamp, 10))
+}
+
+func HostClientStrategyReceiptMessage(hostID string, canonicalReceipt []byte, timestamp int64) []byte {
+	return fieldsMessage(DomainClientStrategy, "receipt", hostID, "host", string(canonicalReceipt), strconv.FormatInt(timestamp, 10))
+}
+
+func HostLiveSnapshotMessage(hostID, runtimeID string, sequence uint64, terminal bool,
+	digest string, timestamp int64) []byte {
+	return fieldsMessage(DomainLiveConnections, "snapshot", hostID,
+		strings.ToLower(runtimeID), strconv.FormatUint(sequence, 10), boolText(terminal),
+		strings.ToLower(digest), strconv.FormatInt(timestamp, 10))
+}
+
+func HostLiveCommandsFetchMessage(hostID, runtimeID string, timestamp int64) []byte {
+	return fieldsMessage(DomainLiveConnections, "commands", hostID,
+		strings.ToLower(runtimeID), strconv.FormatInt(timestamp, 10))
+}
+
+// ServerLiveCommandsResponseMessage binds a command response to the exact host,
+// runtime and request timestamp. The host agent verifies this with the pinned
+// server key before persisting or executing anything from the reply.
+func ServerLiveCommandsResponseMessage(hostID, runtimeID string, timestamp int64,
+	digest string) []byte {
+	return fieldsMessage(DomainLiveConnections, "commands-response", hostID,
+		strings.ToLower(runtimeID), strconv.FormatInt(timestamp, 10),
+		strings.ToLower(digest))
+}
+
+func HostLiveReceiptMessage(hostID, runtimeID string, receiptSequence uint64,
+	commandID, status string, confirmedAbsent bool, detail string, timestamp int64) []byte {
+	return fieldsMessage(DomainLiveConnections, "receipt", hostID,
+		strings.ToLower(runtimeID), strconv.FormatUint(receiptSequence, 10),
+		commandID, status, boolText(confirmedAbsent), detail,
+		strconv.FormatInt(timestamp, 10))
+}
+
 // SoftwareMessage binds the update notice fields a client verifies before
 // trusting a downloaded binary.
 func SoftwareMessage(version, downloadURL, digest string, size int64) []byte {
@@ -317,6 +362,12 @@ func (s *Server) SignRendezvousChallenge(id, clientNonce, serverNonce string) st
 
 func (s *Server) SignRendezvousTrigger(id, connectionNonce, nonce, candidate, nat string, local bool, unix int64) string {
 	return Sign(s.priv, RendezvousTriggerMessage(id, connectionNonce, nonce, candidate, nat, local, unix))
+}
+
+func (s *Server) SignLiveCommandsResponse(hostID, runtimeID string, timestamp int64,
+	digest string) string {
+	return Sign(s.priv, ServerLiveCommandsResponseMessage(
+		hostID, runtimeID, timestamp, digest))
 }
 
 // TCPDirectMessage binds the host hello a viewer checks on a punched TCP
