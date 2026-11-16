@@ -301,7 +301,7 @@ func TestConsoleExposesAPITokenManagement(t *testing.T) {
 		"function showTokenSecret",
 		"expires_in_seconds",
 		"GROUP_SCOPED_RESOURCES",
-		"tokenAdmin",
+		"canPermission('accounts.write')",
 	} {
 		if !strings.Contains(js, want) {
 			t.Errorf("app.js is missing %q", want)
@@ -806,7 +806,59 @@ func TestConsoleExposesLiveConnections(t *testing.T) {
 		"function openConnectionDetail",
 		"function refreshConnectionDetail",
 		"function requestDisconnect",
-		"connections: read && !restricted",
+		"connections: 'connections.read',",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing %q", want)
+		}
+	}
+}
+
+// TestConsoleExposesNamedRolesAndBindings keeps the S03 console surface tied
+// to the stable permission catalogue. The page must load role definitions and
+// bindings, render write controls only with roles.write, and never allow a
+// built-in role to be edited or deleted from the browser.
+func TestConsoleExposesNamedRolesAndBindings(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(index)
+	for _, want := range []string{
+		`data-tab="roles"`,
+		`id="panel-roles"`,
+		`id="role-rows"`,
+		`id="roles-create"`,
+		`id="role-permission-options"`,
+		`id="role-binding-create"`,
+		`id="role-binding-rows"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html is missing %q", want)
+		}
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(script)
+	for _, want := range []string{
+		"'/v1/admin-roles'",
+		"'/v1/role-bindings'",
+		"roles: 'roles.read',",
+		"canPermission('roles.write')",
+		"if (!role.builtin)",
+		"function loadRoles",
+		"function saveRole",
+		"function createRoleBinding",
+		"function resetRoleConsole",
+		"function clearRolePanels",
+		"resetRoleConsole();",
+		"clearRolePanels();",
+		"'/v1/role-bindings/' + encodeURIComponent(binding.id)",
+		"fmtTime(role.updated_at)",
+		"fmtTime(binding.created_at)",
+		"该角色的全部绑定也会一并删除。",
 	} {
 		if !strings.Contains(js, want) {
 			t.Errorf("app.js is missing %q", want)

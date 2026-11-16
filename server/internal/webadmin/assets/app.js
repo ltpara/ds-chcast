@@ -4,13 +4,12 @@
   const STORAGE_KEY = 'chast.admin.session';
   const LEGACY_KEY = 'chast.admin.key';
   const REFRESH_MS = 15000;
-  const ROLE_RANK = { readonly: 1, operator: 2, admin: 3 };
 
   const $ = (id) => document.getElementById(id);
 
   const state = {
     // {mode:'key', key} for the server key, or
-    // {mode:'account', token, refresh, username, role} for an operator login.
+    // {mode:'account', token, refresh, username, role, permissions} for an account login.
     auth: null,
     tab: 'overview',
     publicKey: '',
@@ -82,6 +81,11 @@
     // Security keys: null until loaded; enabled=false when the server has no
     // WebAuthn relying party configured (the list route answers 503).
     accountKeys: null,
+    roles: [],
+    rolePermissions: [],
+    roleBindings: [],
+    roleEditing: null,
+    rolesLoading: false,
   };
 
   class ApiError extends Error {
@@ -214,8 +218,13 @@
     return Math.floor(hour / 24) + ' 天前';
   }
 
-  function fmtTime(ms) {
-    const n = Number(ms);
+  // fmtTime accepts both millisecond timestamps used by older event APIs and
+  // RFC3339 strings returned by the account role/binding APIs.
+  function fmtTime(value) {
+    if (value === undefined || value === null || value === '') return '—';
+    const numeric = typeof value === 'number' ||
+      (typeof value === 'string' && /^\d+$/.test(value));
+    const n = numeric ? Number(value) : Date.parse(value);
     if (!Number.isFinite(n) || n <= 0) return '—';
     return new Date(n).toLocaleString('zh-CN', { hour12: false });
   }
@@ -289,31 +298,49 @@
     }
   }
 
-  function can(level) {
+  // canPermission checks the stable permission catalogue returned by login,
+  // refresh and /v1/account. The server key is intentionally unrestricted.
+  function canPermission(key) {
     const auth = state.auth;
     if (!auth) return false;
     if (auth.mode === 'key') return true;
-    return (ROLE_RANK[auth.role] || 0) >= ROLE_RANK[level];
+    return Array.isArray(auth.permissions) && auth.permissions.includes(key);
   }
 
-  // groupOnly is an account whose console access comes from group membership
-  // alone; it may only use the Groups tab and group-scoped audit views.
+  // groupOnly is an account with no console-wide stable permission. Group
+  // access still comes from group memberships and group-scoped role bindings.
   function groupOnly() {
     const auth = state.auth;
-    return Boolean(auth && auth.mode === 'account' && !ROLE_RANK[auth.role]);
+    return Boolean(auth && auth.mode === 'account' &&
+      (!Array.isArray(auth.permissions) || auth.permissions.length === 0));
+  }
+
+  function sessionPermissions(data) {
+    return data && Array.isArray(data.permissions) ? data.permissions.slice() : [];
+  }
+
+  function applySessionPermissions(data) {
+    const auth = state.auth;
+    if (!auth || auth.mode !== 'account') return [];
+    auth.permissions = sessionPermissions(data);
+    writeSession(auth);
+    renderSession();
+    applyPermissions();
+    return auth.permissions;
   }
 
   function groupByID(id) {
     return state.groups.find((group) => group.id === id) || null;
   }
 
-  // group.role already carries the stronger of the global console role and
-  // the membership role, so this mirrors the server's groupActor decision.
+  // Group rows expose the effective legacy role. Group-scoped named bindings
+  // are collapsed by the server into this role for group management checks.
   function canGroup(group, level) {
     const auth = state.auth;
     if (!auth || !group) return false;
     if (auth.mode === 'key') return true;
-    return (ROLE_RANK[group.role] || 0) >= ROLE_RANK[level];
+    const rank = { readonly: 1, operator: 2, admin: 3 };
+    return (rank[group.role] || 0) >= rank[level];
   }
 
   function authToken() {
@@ -408,6 +435,7 @@
         auth.username = data.user.username || auth.username;
         auth.role = data.user.role || auth.role;
       }
+      auth.permissions = sessionPermissions(data);
       writeSession(auth);
       renderSession();
       applyPermissions();
@@ -475,14 +503,15 @@
   // instead of being kept around unused.
   async function adoptAccountSession(data, username) {
     const user = data && data.user ? data.user : {};
-    if (!ROLE_RANK[user.role] && !(await hasGroupConsoleAccess(data.token))) {
+    const permissions = sessionPermissions(data);
+    if (!permissions.length && !(await hasGroupConsoleAccess(data.token))) {
       // The session is valid but useless here; revoke it right away.
       fetch('/v1/account/logout', {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + data.token },
         cache: 'no-store',
       }).catch(() => {});
-      throw new ApiError('该账号没有管理台权限（需要 readonly、operator 或 admin 角色，或至少一个分组授权）。', 403);
+      throw new ApiError('该账号没有管理台权限（需要命名角色权限或至少一个分组授权）。', 403);
     }
     state.auth = {
       mode: 'account',
@@ -490,6 +519,7 @@
       refresh: data.refresh_token,
       username: user.username || username,
       role: user.role,
+      permissions,
     };
     writeSession(state.auth);
     await enterConsole();
@@ -816,56 +846,118 @@
       // A server without the account store still has a key-only console.
       if (!err || err.status !== 503) throw err;
       state.groups = [];
+      state.roles = [];
+      state.rolePermissions = [];
+      state.roleBindings = [];
+      state.roleEditing = null;
       state.groupsLoaded = true;
     }
-    if (groupOnly() && !state.groups.length) {
-      lock('该账号没有分组授权。');
+    const permissions = Array.isArray(state.auth.permissions) ? state.auth.permissions : [];
+    if (!permissions.length && groupOnly() && !state.groups.length) {
+      lock('该账号没有管理台或分组授权。');
       return;
     }
     applyPermissions();
     startTimer();
-    switchTab(groupOnly() ? 'groups' : 'overview');
+    const first = firstVisibleTab();
+    switchTab(first || 'overview');
   }
 
   function renderSession() {
     const auth = state.auth;
     if (!auth) return;
-    const role = auth.mode === 'key' ? 'server-key' : (ROLE_RANK[auth.role] ? auth.role : 'group');
+    const role = auth.mode === 'key' ? 'server-key' : (auth.role || 'group');
+    const names = Array.isArray(auth.permissions) ? auth.permissions : [];
     const pill = $('session-role');
-    pill.textContent = role;
-    pill.className = 'pill ' + (role === 'admin' || role === 'server-key' ? 'ok'
-      : role === 'operator' ? 'warn' : '');
+    pill.textContent = auth.mode === 'key' ? role : names.length ? role + ' · ' + names.length + ' 项权限' : 'group';
+    pill.className = 'pill ' + (auth.mode === 'key' || names.includes('roles.write') || names.includes('accounts.write') ? 'ok'
+      : names.includes('devices.write') || names.includes('connections.disconnect') ? 'warn' : '');
     $('session-label').textContent = auth.mode === 'key' ? '服务器密钥' : auth.username;
   }
 
+  const TAB_PERMISSIONS = {
+    overview: 'devices.read',
+    devices: 'devices.read',
+    connections: 'connections.read',
+    policies: 'devices.policy.read',
+    accounts: 'accounts.read',
+    mine: null,
+    tokens: 'accounts.write',
+    groups: 'groups.read',
+    roles: 'roles.read',
+    recordings: 'recordings.read',
+    audit: 'audit.read',
+    server: 'ops.read',
+  };
+
+  function tabVisible(tab) {
+    const auth = state.auth;
+    if (!auth) return false;
+    if (tab === 'mine') return auth.mode === 'account';
+    if (tab === 'groups' || tab === 'audit') {
+      return groupOnly() || canPermission(TAB_PERMISSIONS[tab]);
+    }
+    if (tab === 'overview' && groupOnly()) return false;
+    return canPermission(TAB_PERMISSIONS[tab]);
+  }
+
+  function firstVisibleTab() {
+    return Object.keys(TAB_PERMISSIONS).find((tab) => tabVisible(tab)) || '';
+  }
+
   function applyPermissions() {
-    const admin = can('admin');
-    const write = can('operator');
-    const read = can('readonly');
-    const restricted = groupOnly();
-    const tokenAdmin = admin && !restricted && Boolean(state.auth && state.auth.mode === 'account');
-    const visibility = {
-      overview: read && !restricted,
-      devices: read && !restricted,
-      connections: read && !restricted,
-      policies: admin,
-      accounts: admin,
-      mine: Boolean(state.auth && state.auth.mode === 'account'),
-      tokens: tokenAdmin,
-      groups: true,
-      recordings: read && !restricted,
-      audit: read || restricted,
-      server: read && !restricted,
-    };
+    const auth = state.auth;
+    if (!auth) return;
+    const visibility = {};
+    Object.keys(TAB_PERMISSIONS).forEach((tab) => {
+      visibility[tab] = tabVisible(tab);
+    });
     document.querySelectorAll('.tab').forEach((node) => {
       node.classList.toggle('hidden', !visibility[node.dataset.tab]);
+      node.setAttribute('aria-selected', node.dataset.tab === state.tab ? 'true' : 'false');
     });
-    $('device-readonly').classList.toggle('hidden', write);
-    $('connection-readonly').classList.toggle('hidden', write);
-    $('recording-readonly').classList.toggle('hidden', write);
-    $('group-create-panel').classList.toggle('hidden', !admin);
-    $('group-readonly').classList.toggle('hidden', admin);
-    if (!visibility[state.tab]) switchTab(restricted ? 'groups' : 'overview');
+    const policyWrite = canPermission('devices.policy.write');
+    const accountsWrite = canPermission('accounts.write');
+    const groupsWrite = canPermission('groups.write');
+    const rolesWrite = canPermission('roles.write');
+    $('device-readonly').classList.toggle('hidden', canPermission('devices.write') || canPermission('devices.delete'));
+    $('connection-readonly').classList.toggle('hidden', canPermission('connections.disconnect'));
+    $('recording-readonly').classList.toggle('hidden', canPermission('recordings.delete'));
+    $('group-create-panel').classList.toggle('hidden', !groupsWrite);
+    $('group-readonly').classList.toggle('hidden', groupsWrite);
+    $('policy-object-create').disabled = !policyWrite;
+    $('policy-assignment-create').disabled = !policyWrite;
+    $('policy-create').disabled = !policyWrite;
+    $('policy-import-json').disabled = !policyWrite;
+    $('account-create').querySelectorAll('input,select,button').forEach((node) => { node.disabled = !accountsWrite; });
+    $('token-create').querySelectorAll('input,select,button').forEach((node) => { node.disabled = !accountsWrite; });
+    applyRoleControlPermissions();
+
+    if (!visibility[state.tab]) {
+      const fallback = firstVisibleTab();
+      if (fallback) switchTab(fallback);
+    }
+  }
+
+  function applyRoleControlPermissions() {
+    const rolesWrite = canPermission('roles.write');
+    $('role-editor-reset').disabled = !rolesWrite;
+    $('role-refresh').disabled = !canPermission('roles.read');
+    $('role-binding-refresh').disabled = !canPermission('roles.read');
+    $('roles-create').querySelectorAll('input,textarea,button').forEach((node) => {
+      node.disabled = !rolesWrite;
+    });
+    $('role-binding-create').querySelectorAll('input,select,button').forEach((node) => {
+      node.disabled = !rolesWrite;
+    });
+    $('role-rows').querySelectorAll('button').forEach((node) => {
+      node.disabled = !rolesWrite;
+    });
+    $('role-binding-rows').querySelectorAll('button').forEach((node) => {
+      node.disabled = !rolesWrite;
+    });
+    // Keep the server and browser in agreement after the role rows load.
+    syncRoleBindingScope();
   }
 
   function lock(message) {
@@ -902,6 +994,8 @@
     state.groups = [];
     state.groupsLoaded = false;
     state.groupEditing = null;
+    resetRoleConsole();
+    clearRolePanels();
     state.policies = [];
     state.policiesLoaded = false;
     state.policyEditing = null;
@@ -999,6 +1093,7 @@
     else if (tab === 'recordings') loadRecordings(true).catch(reportError);
     else if (tab === 'audit') loadAudit(true).catch(reportError);
     else if (tab === 'server') loadServerPanel().catch(reportError);
+    else if (tab === 'roles') loadRoles().catch(reportError);
   }
 
   // ---------- overview ----------
@@ -1258,7 +1353,7 @@
     resetBulkPrompt();
     const count = state.deviceSelection.size;
     $('device-selection').textContent = count ? '已选择 ' + count + ' 台' : '未选择设备';
-    const writable = can('operator');
+    const writable = canPermission('devices.write');
     $('device-bulk-disable').disabled = !writable || count === 0;
     $('device-bulk-enable').disabled = !writable || count === 0;
     $('device-bulk-clear').disabled = count === 0;
@@ -1356,13 +1451,17 @@
     tr.appendChild(cell(fmtAge(peer.last_seen_ms)));
 
     const actions = el('div', 'actions-wrap');
-    if (!can('operator')) {
+    const canWrite = canPermission('devices.write');
+    const canDelete = canPermission('devices.delete');
+    if (!canWrite && !canDelete) {
       tr.appendChild(cell(el('span', 'muted', '只读')));
       return tr;
     }
-    const edit = button('编辑', 'small');
-    edit.addEventListener('click', () => openDeviceDialog(peer));
-    actions.appendChild(edit);
+    if (canWrite) {
+      const edit = button('编辑', 'small');
+      edit.addEventListener('click', () => openDeviceDialog(peer));
+      actions.appendChild(edit);
+    }
 
     const toggle = button(peer.disabled ? '启用设备' : '禁用设备',
       'small' + (peer.disabled ? '' : ' danger'));
@@ -1376,6 +1475,7 @@
       toast((peer.disabled ? '已启用 ' : '已禁用 ') + peer.id);
       await loadDevices();
     }));
+    toggle.disabled = !canWrite;
     actions.appendChild(toggle);
 
     const reset = button('重置身份', 'small danger');
@@ -1385,6 +1485,7 @@
       toast('已重置 ' + peer.id);
       await loadDevices();
     }));
+    reset.disabled = !canDelete;
     actions.appendChild(reset);
 
     if (peer.online) {
@@ -1395,6 +1496,7 @@
         toast('已移除租约 ' + peer.id);
         await loadDevices();
       }));
+      drop.disabled = !canDelete;
       actions.appendChild(drop);
     }
 
@@ -1556,7 +1658,7 @@
     clear(objectBody);
     state.policyObjects.forEach((policy) => objectBody.appendChild(policyObjectRow(policy)));
     $('policy-object-empty').classList.toggle('hidden', state.policyObjects.length > 0);
-    $('policy-object-readonly').classList.toggle('hidden', can('admin'));
+    $('policy-object-readonly').classList.toggle('hidden', canPermission('devices.policy.write'));
 
     const assignmentBody = $('policy-assignment-rows');
     clear(assignmentBody);
@@ -1568,7 +1670,7 @@
     clear(body);
     state.policies.forEach((policy) => body.appendChild(policyRow(policy)));
     $('policy-empty').classList.toggle('hidden', state.policies.length > 0);
-    $('policy-readonly').classList.toggle('hidden', can('admin'));
+    $('policy-readonly').classList.toggle('hidden', canPermission('devices.policy.write'));
     const applied = state.policies.filter((policy) => {
       const receipt = policy.receipt;
       return Boolean(receipt && receipt.applied && receipt.policy_version === policy.policy_version);
@@ -1874,7 +1976,7 @@
       });
       state.clientStrategy = {policy, revision: config.revision, fields, auth, generation};
       $('client-strategy-note').textContent = '配置版本 ' + config.revision + '。保存后等待客户端应用回报；“使用本地设置”会撤销该项覆盖。';
-      $('client-strategy-save').disabled = !can('admin');
+      $('client-strategy-save').disabled = !canPermission('devices.policy.write');
       $('client-strategy-reload').disabled = false;
     } catch (err) {
       if (generation === state.clientStrategyGen && auth === state.auth && dialog.open) {
@@ -2698,6 +2800,327 @@
     else window.prompt('令牌密钥（只显示一次）：', state.tokenSecret);
   }
 
+
+  // ---------- named roles and bindings ----------
+
+  const ROLE_PERMISSION_LABELS = {
+    'accounts.read': '查看账号',
+    'accounts.write': '管理账号',
+    'audit.read': '查看审计',
+    'connections.disconnect': '断开连接',
+    'connections.read': '查看活动连接',
+    'devices.delete': '删除设备身份',
+    'devices.policy.read': '查看设备策略',
+    'devices.policy.write': '修改设备策略',
+    'devices.read': '查看设备',
+    'devices.write': '修改设备',
+    'groups.read': '查看分组',
+    'groups.write': '管理分组',
+    'ops.read': '查看服务运维',
+    'recordings.delete': '删除录制',
+    'recordings.read': '查看录制',
+    'roles.read': '查看角色',
+    'roles.write': '管理角色',
+  };
+
+  function permissionLabel(key) {
+    return ROLE_PERMISSION_LABELS[key] || key;
+  }
+
+  function permissionKeys(permissions) {
+    return Array.isArray(permissions) ? permissions.slice().sort() : [];
+  }
+
+  function renderPermissionOptions() {
+    const box = $('role-permission-options');
+    clear(box);
+    state.rolePermissions.forEach((key) => {
+      const label = el('label', 'check');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = key;
+      label.appendChild(input);
+      label.appendChild(document.createTextNode(permissionLabel(key) + ' · ' + key));
+      box.appendChild(label);
+    });
+  }
+
+  function selectedRolePermissions() {
+    return Array.from(document.querySelectorAll('#role-permission-options input:checked'))
+      .map((node) => node.value);
+  }
+
+  function setRolePermissions(permissions) {
+    const selected = new Set(permissionKeys(permissions));
+    document.querySelectorAll('#role-permission-options input').forEach((node) => {
+      node.checked = selected.has(node.value);
+    });
+  }
+
+  // Role state is cleared on logout and before a new account takes over the
+  // console. Keeping data and DOM cleanup separate makes the session invariant
+  // testable without a browser DOM.
+  function resetRoleConsole() {
+    state.roles = [];
+    state.rolePermissions = [];
+    state.roleBindings = [];
+    state.roleEditing = null;
+    state.rolesLoading = false;
+  }
+
+  function clearRolePanels() {
+    clear($('role-rows'));
+    clear($('role-binding-rows'));
+    clear($('role-permission-options'));
+    $('role-empty').classList.add('hidden');
+    $('role-binding-empty').classList.add('hidden');
+    $('role-note').textContent = '';
+    resetRoleEditor();
+  }
+
+  async function loadRoles(silent) {
+    if (state.rolesLoading) return;
+    state.rolesLoading = true;
+    try {
+      const [roleData, bindingData] = await Promise.all([
+        api('/v1/admin-roles'),
+        api('/v1/role-bindings'),
+      ]);
+      state.roles = roleData && Array.isArray(roleData.roles) ? roleData.roles : [];
+      state.rolePermissions = roleData && Array.isArray(roleData.permissions)
+        ? roleData.permissions : Object.keys(ROLE_PERMISSION_LABELS).sort();
+      state.roleBindings = bindingData && Array.isArray(bindingData.bindings)
+        ? bindingData.bindings : [];
+      renderPermissionOptions();
+      renderRoles();
+      renderRoleBindings();
+      renderRoleSelects();
+      applyRoleControlPermissions();
+    } catch (err) {
+      if (!silent) throw err;
+    } finally {
+      state.rolesLoading = false;
+    }
+  }
+
+  function renderRoles() {
+    const body = $('role-rows');
+    clear(body);
+    state.roles.forEach((role) => body.appendChild(roleRow(role)));
+    $('role-empty').classList.toggle('hidden', state.roles.length > 0);
+    $('role-note').textContent = '已加载 ' + state.roles.length + ' 个角色、' +
+      state.roleBindings.length + ' 条绑定；当前账号持有 ' +
+      ((state.auth && state.auth.permissions) || []).length + ' 项稳定权限。';
+  }
+
+  function roleRow(role) {
+    const tr = document.createElement('tr');
+    const id = cell(role.id);
+    id.className = 'mono';
+    tr.appendChild(id);
+    tr.appendChild(cell(role.name || '—'));
+    tr.appendChild(cell(role.description || '—'));
+    const permissions = permissionKeys(role.permissions);
+    const permissionText = el('div', 'stack');
+    if (permissions.length) {
+      const wrap = el('div', 'actions-wrap');
+      permissions.forEach((key) => {
+        const tag = el('span', 'tag', permissionLabel(key));
+        tag.title = key;
+        wrap.appendChild(tag);
+      });
+      permissionText.appendChild(wrap);
+    } else {
+      permissionText.appendChild(el('span', 'muted', '无'));
+    }
+    tr.appendChild(cell(permissionText));
+    tr.appendChild(cell(role.builtin ? pill('内置', 'warn') : pill('自定义', 'ok')));
+    tr.appendChild(cell(fmtTime(role.updated_at)));
+    const actions = el('div', 'actions-wrap');
+    if (!role.builtin) {
+      const edit = button('编辑', 'small');
+      edit.addEventListener('click', () => editRole(role));
+      actions.appendChild(edit);
+      const remove = button('删除', 'small danger');
+      remove.addEventListener('click', () => withButton(remove, () => deleteRole(role)));
+      actions.appendChild(remove);
+    } else {
+      actions.appendChild(el('span', 'muted', '只读'));
+    }
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function editRole(role) {
+    state.roleEditing = role;
+    $('role-editor-title').textContent = '编辑命名角色 · ' + role.id;
+    $('role-editor-note').textContent = '内置角色不可修改；保存会立即影响绑定到该角色的账号权限。';
+    $('role-id').value = role.id;
+    $('role-id').readOnly = true;
+    $('role-name').value = role.name || '';
+    $('role-description').value = role.description || '';
+    setRolePermissions(role.permissions);
+    $('role-save').textContent = '保存角色';
+    $('role-save-note').textContent = '修改权限会写入审计；已登录账号刷新会话后生效。';
+    $('role-id').scrollIntoView({block: 'center'});
+  }
+
+  function resetRoleEditor() {
+    state.roleEditing = null;
+    $('role-editor-title').textContent = '新建命名角色';
+    $('role-editor-note').textContent = '选择该角色允许执行的管理台操作。';
+    $('roles-create').reset();
+    $('role-id').readOnly = false;
+    setRolePermissions([]);
+    $('role-save').textContent = '创建角色';
+    $('role-save-note').textContent = '';
+  }
+
+  async function saveRole(event) {
+    event.preventDefault();
+    const role = state.roleEditing;
+    const id = $('role-id').value.trim();
+    const name = $('role-name').value.trim();
+    const description = $('role-description').value.trim();
+    const permissions = selectedRolePermissions();
+    if (!id || !name) {
+      toast('请填写角色 ID 与名称', true);
+      return;
+    }
+    await withButton($('role-save'), async () => {
+      await api(role ? '/v1/admin-roles/' + encodeURIComponent(role.id) : '/v1/admin-roles', {
+        method: role ? 'PUT' : 'POST',
+        body: { id, name, description, permissions },
+      });
+      toast(role ? '角色已更新' : '角色已创建');
+      resetRoleEditor();
+      await loadRoles();
+    });
+  }
+
+  async function deleteRole(role) {
+    if (!window.confirm('删除命名角色 ' + role.id + '？\n该角色的全部绑定也会一并删除。')) return;
+    await api('/v1/admin-roles/' + encodeURIComponent(role.id), { method: 'DELETE' });
+    toast('已删除角色 ' + role.id);
+    if (state.roleEditing && state.roleEditing.id === role.id) resetRoleEditor();
+    await loadRoles();
+  }
+
+  function renderRoleSelects() {
+    const select = $('role-binding-role');
+    const current = select.value;
+    clear(select);
+    state.roles.forEach((role) => {
+      const option = document.createElement('option');
+      option.value = role.id;
+      option.textContent = role.id + ' · ' + (role.name || role.id);
+      select.appendChild(option);
+    });
+    if (state.roles.some((role) => role.id === current)) select.value = current;
+    const groups = $('role-binding-groups');
+    clear(groups);
+    state.groups.forEach((group) => {
+      const option = document.createElement('option');
+      option.value = group.id;
+      option.label = group.name || group.id;
+      groups.appendChild(option);
+    });
+  }
+
+  function syncRoleBindingScope() {
+    const kind = $('role-binding-scope').value;
+    const value = $('role-binding-value');
+    const objectKind = $('role-binding-object-kind');
+    value.disabled = kind === 'global' || !canPermission('roles.write');
+    value.required = kind !== 'global';
+    objectKind.disabled = kind !== 'object';
+    objectKind.required = kind === 'object';
+    if (kind === 'global') value.value = '';
+    if (kind === 'group') {
+      value.setAttribute('list', 'role-binding-groups');
+      value.placeholder = 'lab-a';
+    } else if (kind === 'object') {
+      value.removeAttribute('list');
+      value.placeholder = '设备或对象 ID';
+    } else {
+      value.removeAttribute('list');
+    }
+    $('role-binding-note').textContent = kind === 'global'
+      ? '全局绑定对所有对象生效；请确认角色权限不超过当前账号可授予的范围。'
+      : kind === 'group'
+        ? '分组绑定只在指定分组的上下文中生效。'
+        : '对象绑定需要对象类型和稳定 ID 同时匹配。';
+  }
+
+  async function createRoleBinding(event) {
+    event.preventDefault();
+    const roleID = $('role-binding-role').value;
+    const username = $('role-binding-username').value.trim();
+    const scopeKind = $('role-binding-scope').value;
+    const scopeValue = scopeKind === 'global' ? '' : $('role-binding-value').value.trim();
+    const objectKind = scopeKind === 'object' ? $('role-binding-object-kind').value.trim() : '';
+    if (!username || !roleID) {
+      toast('请填写用户名并选择角色', true);
+      return;
+    }
+    if (scopeKind !== 'global' && !scopeValue) {
+      toast('请填写范围值', true);
+      return;
+    }
+    if (scopeKind === 'object' && !objectKind) {
+      toast('对象范围需要填写对象类型', true);
+      return;
+    }
+    const submit = $('role-binding-create').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/role-bindings', {
+        method: 'POST',
+        body: {
+          username,
+          role_id: roleID,
+          scope_kind: scopeKind,
+          scope_value: scopeValue,
+          object_kind: objectKind,
+        },
+      });
+      $('role-binding-username').value = '';
+      $('role-binding-value').value = '';
+      toast('已绑定 ' + roleID + ' → ' + username);
+      await loadRoles();
+    });
+  }
+
+  function renderRoleBindings() {
+    const body = $('role-binding-rows');
+    clear(body);
+    state.roleBindings.forEach((binding) => body.appendChild(roleBindingRow(binding)));
+    $('role-binding-empty').classList.toggle('hidden', state.roleBindings.length > 0);
+  }
+
+  function roleBindingRow(binding) {
+    const tr = document.createElement('tr');
+    const user = cell(binding.username || binding.user_id || '—');
+    user.className = 'mono';
+    tr.appendChild(user);
+    tr.appendChild(cell(binding.role_name || binding.role_id));
+    tr.appendChild(cell(binding.scope_kind || 'global'));
+    tr.appendChild(cell(binding.scope_value || '—'));
+    tr.appendChild(cell(binding.object_kind || '—'));
+    tr.appendChild(cell(fmtTime(binding.created_at)));
+    const actions = el('div', 'actions-wrap');
+    const remove = button('解绑', 'small danger');
+    remove.addEventListener('click', () => withButton(remove, async () => {
+      if (!window.confirm('解除 ' + (binding.username || binding.user_id) + ' 的 ' +
+        (binding.role_name || binding.role_id) + ' 绑定？')) return;
+      await api('/v1/role-bindings/' + encodeURIComponent(binding.id), { method: 'DELETE' });
+      toast('已解除绑定');
+      await loadRoles();
+    }));
+    actions.appendChild(remove);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
   // ---------- groups ----------
 
   async function loadGroups(silent) {
@@ -2707,15 +3130,6 @@
       const data = await api('/v1/groups') || {};
       state.groups = Array.isArray(data.groups) ? data.groups : [];
       state.groupsLoaded = true;
-      if (state.auth && state.auth.mode === 'account') {
-        const role = data.global_role || 'user';
-        if (state.auth.role !== role) {
-          state.auth.role = role;
-          writeSession(state.auth);
-          renderSession();
-          applyPermissions();
-        }
-      }
       renderGroups();
       renderAuditGroups();
       return state.groups;
@@ -2737,7 +3151,7 @@
     clear(body);
     state.groups.forEach((group) => body.appendChild(groupRow(group)));
     $('group-empty').classList.toggle('hidden', state.groups.length > 0);
-    $('group-readonly').classList.toggle('hidden', can('admin'));
+    $('group-readonly').classList.toggle('hidden', canPermission('groups.write'));
     renderTokenGroups();
   }
 
@@ -2790,8 +3204,8 @@
     $('group-dialog-role').textContent = group.role || '';
     $('group-dialog-role').className = 'pill ' +
       (group.role === 'admin' ? 'ok' : group.role === 'operator' ? 'warn' : '');
-    const admin = canGroup(group, 'admin');
-    const write = canGroup(group, 'operator');
+    const admin = canPermission('groups.write') || canGroup(group, 'admin');
+    const write = canPermission('groups.write') || canGroup(group, 'operator');
     $('group-edit-name').value = group.name || '';
     $('group-edit-description').value = group.description || '';
     $('group-edit-member-quota').value = group.member_quota || 0;
@@ -2824,8 +3238,8 @@
       updated_at_ms: group.updated_at_ms || state.groupEditing.updated_at_ms,
     });
     state.groupEditing = merged;
-    const admin = canGroup(merged, 'admin');
-    const write = canGroup(merged, 'operator');
+    const admin = canPermission('groups.write') || canGroup(merged, 'admin');
+    const write = canPermission('groups.write') || canGroup(merged, 'operator');
     $('group-dialog-title').textContent = merged.name || merged.id;
     $('group-edit-name').value = merged.name || '';
     $('group-edit-description').value = merged.description || '';
@@ -3150,7 +3564,7 @@
     actions.appendChild(detail);
     const terminal = conn.state === 'closed' || conn.state === 'stale' ||
       conn.command_status === 'queued' || conn.command_status === 'delivered';
-    if (can('operator') && !terminal) {
+    if (canPermission('connections.disconnect') && !terminal) {
       const disconnect = button('断开', 'small danger');
       disconnect.addEventListener('click', () => {
         openConnectionDetail(conn).then(() => {
@@ -3283,9 +3697,9 @@
     }
 
     const form = $('connection-disconnect');
-    const canDisconnect = can('operator') && conn.state === 'active';
+    const canDisconnect = canPermission('connections.disconnect') && conn.state === 'active';
     for (const node of form.querySelectorAll('input, button')) node.disabled = !canDisconnect || state.connectionSending;
-    form.classList.toggle('hidden', !can('operator'));
+    form.classList.toggle('hidden', !canPermission('connections.disconnect'));
   }
 
   function appendPair(list, label, value) {
@@ -3401,7 +3815,7 @@
     download.addEventListener('click', () => withButton(download, () => downloadRecording(rec)));
     actions.appendChild(download);
 
-    if (can('operator')) {
+    if (canPermission('recordings.delete')) {
       const remove = button('删除', 'small danger');
       remove.addEventListener('click', () => withButton(remove, async () => {
         if (!window.confirm('删除 ' + (rec.username || '') + ' 的录制「' + (rec.name || rec.id) +
@@ -4079,6 +4493,19 @@
       $('token-secret-value').textContent = '';
     });
 
+    $('roles-create').addEventListener('submit', saveRole);
+    $('role-editor-reset').addEventListener('click', resetRoleEditor);
+    $('role-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadRoles();
+      toast('已刷新');
+    }));
+    $('role-binding-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadRoles();
+      toast('已刷新');
+    }));
+    $('role-binding-scope').addEventListener('change', syncRoleBindingScope);
+    $('role-binding-create').addEventListener('submit', createRoleBinding);
+
     $('group-create').addEventListener('submit', (event) => {
       event.preventDefault();
       createGroup();
@@ -4185,6 +4612,7 @@
       else if (state.tab === 'connections') loadConnections(true).catch(() => {});
       else if (state.tab === 'policies') loadPolicies(true).catch(() => {});
       else if (state.tab === 'groups') loadGroups(true).catch(() => {});
+      else if (state.tab === 'roles') loadRoles(true).catch(() => {});
     });
   }
 
@@ -4252,6 +4680,7 @@
           }),
       ]);
       state.accountInfo = info || null;
+      applySessionPermissions(info);
       state.accountSessions = sessions && Array.isArray(sessions.sessions) ? sessions.sessions : [];
       state.mineSessionsTotal = sessions && Number.isInteger(sessions.total)
         ? sessions.total
@@ -4719,13 +5148,17 @@
   function boot() {
     bindEvents();
     syncLoginMode();
+    syncRoleBindingScope();
     probeSingleSignOn();
-    $('login-note').textContent = '使用服务器密钥，或以账号登录：readonly / operator / admin 可使用完整管理台，仅有分组授权的账号只能查看所属分组；已注册安全密钥的账号可点“使用安全密钥登录”，服务器配置了单点登录时还可点“使用单点登录”。';
+    $('login-note').textContent = '使用服务器密钥，或以账号登录。页面和按钮由账号的命名角色权限决定；固定 user 账号绑定命名角色后也可进入管理台。仅有分组授权的账号只能查看所属分组。';
     const saved = readSession();
     if (!saved) return;
     state.auth = saved;
-    const probe = saved.mode === 'key' || ROLE_RANK[saved.role] ? '/v1/stats' : '/v1/groups';
-    api(probe).then(() => enterConsole()).catch((err) => {
+    const probe = saved.mode === 'key' ? '/v1/stats' : '/v1/account';
+    api(probe).then((data) => {
+      if (saved.mode === 'account') applySessionPermissions(data);
+      return enterConsole();
+    }).catch((err) => {
       if (err && err.status === 401) return;
       lock('自动连接失败：' + (err && err.message ? err.message : err));
     });

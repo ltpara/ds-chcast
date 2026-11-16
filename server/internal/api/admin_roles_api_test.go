@@ -11,11 +11,13 @@ import (
 )
 
 type adminRoleReply struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Permissions []string `json:"permissions"`
-	Builtin     bool     `json:"builtin"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Permissions []string  `json:"permissions"`
+	Builtin     bool      `json:"builtin"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type adminRoleListReply struct {
@@ -101,6 +103,10 @@ func TestAdminRoleAPICreateUpdateDeleteAndBuiltinGuard(t *testing.T) {
 		!hasPermission(role.Permissions, account.PermissionAuditRead) || len(role.Permissions) != 2 {
 		t.Fatalf("created role = %+v", role)
 	}
+	if role.CreatedAt.IsZero() || role.UpdatedAt.IsZero() {
+		t.Fatalf("created role timestamps = created %v, updated %v", role.CreatedAt, role.UpdatedAt)
+	}
+	createdAt := role.CreatedAt
 
 	status, body = request(t, http.MethodPut, s.URL+"/v1/admin-roles/device-auditor",
 		`{"name":"Device reader","description":"read only","permissions":["devices.read"]}`, admin)
@@ -110,6 +116,13 @@ func TestAdminRoleAPICreateUpdateDeleteAndBuiltinGuard(t *testing.T) {
 	if err := json.Unmarshal(body, &role); err != nil || role.Name != "Device reader" ||
 		len(role.Permissions) != 1 || role.Permissions[0] != account.PermissionDevicesRead {
 		t.Fatalf("updated role = %+v, %v", role, err)
+	}
+	// Account timestamps are persisted at millisecond precision. The create
+	// response still carries the clock's nanosecond precision, while update and
+	// list responses round-trip through SQLite.
+	if !role.CreatedAt.Equal(createdAt.Truncate(time.Millisecond)) || role.UpdatedAt.Before(createdAt) {
+		t.Fatalf("updated role timestamps = created %v, updated %v; creation was %v",
+			role.CreatedAt, role.UpdatedAt, createdAt)
 	}
 
 	status, body = request(t, http.MethodGet, s.URL+"/v1/admin-roles", "", admin)
@@ -246,6 +259,74 @@ func TestRoleBindingsApplyGlobalGroupAndObjectScopes(t *testing.T) {
 	}
 	if len(listed.Bindings) != 2 {
 		t.Fatalf("bindings after group and object = %+v", listed.Bindings)
+	}
+}
+
+func TestRolePermissionChangesConvergeForLiveSessions(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	admin := login(t, s.URL, "alice", "correct horse").Token
+	createNamedRole(t, s.URL, admin, "live-reader", account.PermissionDevicesRead)
+	binding := bindNamedRole(t, s.URL, admin, "bob", "live-reader", "global", "", "")
+	bob := login(t, s.URL, "bob", "battery staple")
+	if !hasPermission(bob.Permissions, account.PermissionDevicesRead) {
+		t.Fatalf("initial login permissions = %v", bob.Permissions)
+	}
+
+	status, body := request(t, http.MethodPut, s.URL+"/v1/admin-roles/live-reader",
+		`{"name":"Live reader","permissions":["audit.read"]}`, admin)
+	if status != http.StatusOK {
+		t.Fatalf("update role: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/account", "", bob.Token)
+	if status != http.StatusOK {
+		t.Fatalf("account after role update: %d %s", status, body)
+	}
+	var current struct {
+		Permissions []string `json:"permissions"`
+	}
+	if err := json.Unmarshal(body, &current); err != nil {
+		t.Fatalf("account reply: %v", err)
+	}
+	if hasPermission(current.Permissions, account.PermissionDevicesRead) ||
+		!hasPermission(current.Permissions, account.PermissionAuditRead) {
+		t.Fatalf("live permissions after role update = %v", current.Permissions)
+	}
+
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+		mustJSON(t, map[string]string{"refresh_token": bob.RefreshToken}), "")
+	if status != http.StatusOK {
+		t.Fatalf("refresh after role update: %d %s", status, data)
+	}
+	var rotated loginReply
+	if err := json.Unmarshal(data, &rotated); err != nil {
+		t.Fatalf("refresh reply: %v", err)
+	}
+	if hasPermission(rotated.Permissions, account.PermissionDevicesRead) ||
+		!hasPermission(rotated.Permissions, account.PermissionAuditRead) {
+		t.Fatalf("refreshed permissions after role update = %v", rotated.Permissions)
+	}
+
+	status, body = request(t, http.MethodDelete, s.URL+"/v1/role-bindings/"+binding.ID, "", admin)
+	if status != http.StatusNoContent {
+		t.Fatalf("unbind role: %d %s", status, body)
+	}
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+		mustJSON(t, map[string]string{"refresh_token": rotated.RefreshToken}), "")
+	if status != http.StatusOK {
+		t.Fatalf("refresh after unbind: %d %s", status, data)
+	}
+	if err := json.Unmarshal(data, &rotated); err != nil {
+		t.Fatalf("refresh after unbind reply: %v", err)
+	}
+	if hasPermission(rotated.Permissions, account.PermissionAuditRead) ||
+		hasPermission(rotated.Permissions, account.PermissionDevicesRead) {
+		t.Fatalf("permissions survived unbind: %v", rotated.Permissions)
 	}
 }
 

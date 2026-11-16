@@ -59,6 +59,7 @@
       <button type="button" class="tab" data-tab="groups" role="tab">分组</button>
       <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
       <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
+      <button type="button" class="tab" data-tab="roles" role="tab">角色</button>
       <button type="button" class="tab" data-tab="server" role="tab">服务</button>
     </nav>
 
@@ -536,6 +537,90 @@
           <button type="button" id="audit-more" class="hidden">加载更多</button>
         </div>
         <p id="audit-empty" class="muted hidden">没有记录</p>
+      </div>
+    </section>
+
+    <section id="panel-roles" class="panel-page">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>命名角色</h2>
+          <div class="toolbar">
+            <button type="button" id="role-refresh">刷新</button>
+          </div>
+        </div>
+        <p class="muted">页面和按钮由稳定的权限键决定。admin、operator、readonly 为内置角色，不能修改；自定义角色可以分配给固定角色为 user 的账号，使其进入管理台。</p>
+        <p id="role-note" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>名称</th><th>说明</th><th>权限</th><th>类型</th><th>更新时间</th><th class="actions-col">操作</th></tr></thead>
+            <tbody id="role-rows"></tbody>
+          </table>
+        </div>
+        <p id="role-empty" class="muted hidden">还没有命名角色</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 id="role-editor-title">新建命名角色</h2>
+            <p id="role-editor-note" class="muted">选择该角色允许执行的管理台操作。</p>
+          </div>
+          <button type="button" id="role-editor-reset" class="ghost">清空</button>
+        </div>
+        <form id="roles-create" class="dialog-stack" autocomplete="off">
+          <div class="grid-2">
+            <label>角色 ID<input id="role-id" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}" maxlength="64" spellcheck="false" placeholder="device-auditor"></label>
+            <label>名称<input id="role-name" required maxlength="128" spellcheck="false" placeholder="Device auditor"></label>
+          </div>
+          <label>说明<input id="role-description" maxlength="512" spellcheck="false" placeholder="只能查看设备与审计记录"></label>
+          <fieldset class="dialog-stack">
+            <legend>权限</legend>
+            <div id="role-permission-options" class="check-grid"></div>
+          </fieldset>
+          <p id="role-save-note" class="muted"></p>
+          <div class="dialog-actions">
+            <button type="submit" id="role-save" class="primary">创建角色</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>新建角色绑定</h2>
+            <p class="muted">绑定可作用于全局、分组或指定对象；group 和 object 范围使用稳定 ID。</p>
+          </div>
+        </div>
+        <form id="role-binding-create" class="inline-form" autocomplete="off">
+          <label>用户名<input id="role-binding-username" required maxlength="64" spellcheck="false" placeholder="alice"></label>
+          <label>角色<select id="role-binding-role" required></select></label>
+          <label>范围
+            <select id="role-binding-scope">
+              <option value="global">global（全局）</option>
+              <option value="group">group（分组）</option>
+              <option value="object">object（对象）</option>
+            </select>
+          </label>
+          <label>范围值<input id="role-binding-value" maxlength="128" spellcheck="false" placeholder="lab-a" list="role-binding-groups"></label>
+          <datalist id="role-binding-groups"></datalist>
+          <label>对象类型<input id="role-binding-object-kind" maxlength="64" spellcheck="false" placeholder="device" disabled></label>
+          <button type="submit" class="primary">添加绑定</button>
+        </form>
+        <p id="role-binding-note" class="muted"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>角色绑定</h2>
+          <button type="button" id="role-binding-refresh">刷新</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>用户名</th><th>角色</th><th>范围</th><th>范围值</th><th>对象类型</th><th>创建时间</th><th class="actions-col">操作</th></tr></thead>
+            <tbody id="role-binding-rows"></tbody>
+          </table>
+        </div>
+        <p id="role-binding-empty" class="muted hidden">还没有角色绑定</p>
       </div>
     </section>
 

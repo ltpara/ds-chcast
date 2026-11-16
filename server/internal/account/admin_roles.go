@@ -299,8 +299,11 @@ func (s *Store) UpdateAdminRole(id, name, description string, permissions []stri
 		return AdminRole{}, fmt.Errorf("account store %s: begin update admin role: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	var builtin int
-	if err := tx.QueryRow(`SELECT builtin FROM admin_roles WHERE id = ?`, id).Scan(&builtin); errors.Is(err, sql.ErrNoRows) {
+	var (
+		builtin int
+		created int64
+	)
+	if err := tx.QueryRow(`SELECT builtin, created_at FROM admin_roles WHERE id = ?`, id).Scan(&builtin, &created); errors.Is(err, sql.ErrNoRows) {
 		return AdminRole{}, ErrUnknownAdminRole
 	} else if err != nil {
 		return AdminRole{}, fmt.Errorf("account store %s: read admin role: %w", s.path, err)
@@ -326,7 +329,7 @@ func (s *Store) UpdateAdminRole(id, name, description string, permissions []stri
 		return AdminRole{}, fmt.Errorf("account store %s: commit admin role: %w", s.path, err)
 	}
 	return AdminRole{ID: id, Name: name, Description: description, Permissions: perms,
-		UpdatedAt: now}, nil
+		CreatedAt: timeFromMillis(created), UpdatedAt: now}, nil
 }
 
 // DeleteAdminRole removes a custom role and every binding that references it.

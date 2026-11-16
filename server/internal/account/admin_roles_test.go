@@ -3,6 +3,7 @@ package account
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func containsPermission(keys []string, want string) bool {
@@ -39,6 +40,35 @@ func TestNamedRolesAreSeededAndBuiltinsAreImmutable(t *testing.T) {
 	}
 	if err := store.DeleteAdminRole(RoleAdmin); !errors.Is(err, ErrBuiltinRoleImmutable) {
 		t.Fatalf("delete built-in role = %v", err)
+	}
+}
+
+func TestUpdateAdminRolePreservesCreatedAt(t *testing.T) {
+	store := openTemp(t, "update-role-times.db")
+	createdAt := time.Date(2026, 11, 16, 13, 50, 54, 0, time.UTC)
+	store.SetClock(func() time.Time { return createdAt })
+	role, err := store.CreateAdminRole("device-reader", "Device reader", "", []string{PermissionDevicesRead})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	updatedAt := createdAt.Add(time.Second)
+	store.SetClock(func() time.Time { return updatedAt })
+	updated, err := store.UpdateAdminRole(role.ID, "Device viewer", "updated", []string{PermissionAuditRead})
+	if err != nil {
+		t.Fatalf("update role: %v", err)
+	}
+	if !updated.CreatedAt.Equal(role.CreatedAt) || updated.CreatedAt.IsZero() {
+		t.Fatalf("updated role creation time = %v, want %v", updated.CreatedAt, role.CreatedAt)
+	}
+	if !updated.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("updated role modification time = %v, want %v", updated.UpdatedAt, updatedAt)
+	}
+	persisted, err := store.AdminRole(role.ID)
+	if err != nil {
+		t.Fatalf("read updated role: %v", err)
+	}
+	if !persisted.CreatedAt.Equal(role.CreatedAt) || !persisted.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("persisted role times = created %v, updated %v", persisted.CreatedAt, persisted.UpdatedAt)
 	}
 }
 

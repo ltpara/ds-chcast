@@ -22,11 +22,24 @@ function app(fetch) {
   vm.runInNewContext(source.replace('  boot();\n})();', `
     renderSession = () => {};
     applyPermissions = () => {};
+    // Keep the real lock cleanup available to role/session regressions.
+    const realLock = lock;
     lock = () => { locks++; state.auth = null; };
-    Object.assign(exported, {state, api, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled});
+    Object.assign(exported, {state, api, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled, loadRoles, fmtTime, realLock, resetRoleConsole, renderPermissionOptions, renderRoles, renderRoleBindings, renderRoleSelects, applyRoleControlPermissions});
   })();`), runtime);
   return {...runtime.exported, runtime, saved};
 }
+
+test('fmtTime renders millisecond and RFC3339 API timestamps', () => {
+  const loaded = app(async () => reply(200, {}));
+  assert.equal(loaded.fmtTime(undefined), '—');
+  assert.equal(loaded.fmtTime(null), '—');
+  assert.equal(loaded.fmtTime(''), '—');
+  assert.equal(loaded.fmtTime('not a timestamp'), '—');
+  assert.equal(loaded.fmtTime(0), '—');
+  assert.notEqual(loaded.fmtTime(1763320255000), '—');
+  assert.notEqual(loaded.fmtTime('2026-11-16T21:50:55Z'), '—');
+});
 
 test('late 401 cannot retry an old write using the newly signed-in account', async () => {
   const response = deferred();
@@ -72,6 +85,45 @@ test('simultaneous expired requests share one refresh rotation', async () => {
   refreshResponse.resolve(reply(200, {token:'fresh', refresh_token:'next'}));
   await Promise.all([first, second]);
   assert.equal(loaded.runtime.locks, 0);
+});
+
+test('a stale role response is rejected before it can render after account switch', async () => {
+  const roleResponse = deferred();
+  const bindingResponse = deferred();
+  const loaded = app((url) => {
+    if (url === '/v1/admin-roles') return roleResponse.promise;
+    if (url === '/v1/role-bindings') return bindingResponse.promise;
+    return reply(200, {});
+  });
+  const calls = {permissions: 0, roles: 0, bindings: 0, selects: 0};
+  loaded.renderPermissionOptions = () => { calls.permissions++; };
+  loaded.renderRoles = () => { calls.roles++; };
+  loaded.renderRoleBindings = () => { calls.bindings++; };
+  loaded.renderRoleSelects = () => { calls.selects++; };
+  loaded.applyRoleControlPermissions = () => {};
+  loaded.state.auth = {mode:'account', token:'old', refresh:'old-refresh', permissions:['roles.read']};
+  const loading = loaded.loadRoles();
+  loaded.state.auth = {mode:'account', token:'new', refresh:'new-refresh', permissions:['roles.read']};
+  roleResponse.resolve(reply(200, {roles:[{id:'old-role', permissions:[]}], permissions:[]}));
+  bindingResponse.resolve(reply(200, {bindings:[{id:'old-binding', username:'old-user', role_id:'old-role'}]}));
+  await assert.rejects(loading, /登录身份已变化/);
+  assert.equal(loaded.state.roles.length, 0);
+  assert.equal(loaded.state.roleBindings.length, 0);
+  assert.deepEqual(calls, {permissions:0, roles:0, bindings:0, selects:0});
+});
+
+test('logout role state reset clears in-flight data for the next account', () => {
+  const loaded = app(async () => reply(200, {}));
+  loaded.state.auth = {mode:'account', token:'old', refresh:'old-refresh', permissions:['roles.read']};
+  loaded.state.rolesLoading = true;
+  loaded.state.roles = [{id:'old-role'}];
+  loaded.state.roleBindings = [{id:'old-binding'}];
+  loaded.state.roleEditing = {id:'old-role'};
+  loaded.resetRoleConsole();
+  assert.equal(loaded.state.rolesLoading, false);
+  assert.equal(loaded.state.roles.length, 0);
+  assert.equal(loaded.state.roleBindings.length, 0);
+  assert.equal(loaded.state.roleEditing, null);
 });
 
 test('live connection success claims require closed, applied and confirmed absence', async () => {
