@@ -167,8 +167,20 @@ func TestLiveDisconnectIdempotencyReceiptAndExactTarget(t *testing.T) {
 	if err != nil || len(commands) != 1 || commands[0].CommandID != first.CommandID {
 		t.Fatalf("poll = %+v, %v", commands, err)
 	}
-	if commands, err := store.PollLiveCommands("devbox", liveRuntimeA, 32); err != nil || len(commands) != 0 {
-		t.Fatalf("queued command redelivered: %+v, %v", commands, err)
+	var firstDeliveredAt int64
+	if err := store.db.QueryRow(`SELECT delivered_at FROM live_connection_commands
+		WHERE command_id = ?`, first.CommandID).Scan(&firstDeliveredAt); err != nil || firstDeliveredAt != now.UnixMilli() {
+		t.Fatalf("first delivered_at = %d, %v; want %d", firstDeliveredAt, err, now.UnixMilli())
+	}
+	now = now.Add(5 * time.Second)
+	commands, err = store.PollLiveCommands("devbox", liveRuntimeA, 32)
+	if err != nil || len(commands) != 1 || commands[0].CommandID != first.CommandID {
+		t.Fatalf("unacknowledged command redelivery = %+v, %v", commands, err)
+	}
+	var deliveredAt int64
+	if err := store.db.QueryRow(`SELECT delivered_at FROM live_connection_commands
+		WHERE command_id = ?`, first.CommandID).Scan(&deliveredAt); err != nil || deliveredAt != firstDeliveredAt {
+		t.Fatalf("redelivery changed delivered_at = %d, %v; want %d", deliveredAt, err, firstDeliveredAt)
 	}
 	if _, err := store.RecordLiveCommandReceipt("devbox", liveRuntimeA, liveconn.Receipt{
 		ReceiptSequence: 1, CommandID: first.CommandID, Status: liveconn.CommandApplied,
@@ -185,6 +197,9 @@ func TestLiveDisconnectIdempotencyReceiptAndExactTarget(t *testing.T) {
 	if got, err := store.RecordLiveCommandReceipt("devbox", liveRuntimeA, receipt); err != nil || got != receipt {
 		t.Fatalf("receipt retry = %+v, %v", got, err)
 	}
+	if commands, err := store.PollLiveCommands("devbox", liveRuntimeA, 32); err != nil || len(commands) != 0 {
+		t.Fatalf("settled command redelivered: %+v, %v", commands, err)
+	}
 	lower := receipt
 	lower.ReceiptSequence = 2
 	lower.Detail = "later native result"
@@ -197,7 +212,7 @@ func TestLiveDisconnectIdempotencyReceiptAndExactTarget(t *testing.T) {
 	}
 	closed, err := store.LiveConnection("devbox", liveConnA)
 	if err != nil || closed.State != liveconn.ConnectionClosed ||
-		closed.CommandStatus != liveconn.CommandApplied {
+		closed.CommandStatus != liveconn.CommandApplied || !closed.ReceiptConfirmedAbsent {
 		t.Fatalf("target detail = %+v, %v", closed, err)
 	}
 	other, err := store.LiveConnection("devbox", liveConnB)

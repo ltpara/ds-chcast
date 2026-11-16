@@ -23,7 +23,7 @@ function app(fetch) {
     renderSession = () => {};
     applyPermissions = () => {};
     lock = () => { locks++; state.auth = null; };
-    Object.assign(exported, {state, api, refreshSession});
+    Object.assign(exported, {state, api, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled});
   })();`), runtime);
   return {...runtime.exported, runtime, saved};
 }
@@ -72,4 +72,56 @@ test('simultaneous expired requests share one refresh rotation', async () => {
   refreshResponse.resolve(reply(200, {token:'fresh', refresh_token:'next'}));
   await Promise.all([first, second]);
   assert.equal(loaded.runtime.locks, 0);
+});
+
+test('live connection success claims require closed, applied and confirmed absence', async () => {
+  const loaded = app(async () => reply(200, {}));
+  const confirmed = loaded.connectionConfirmedDisconnected;
+  assert.ok(confirmed, 'the console exposes the confirmation predicate for testing');
+  assert.equal(confirmed({state:'closed', command_status:'applied', receipt_confirmed_absent:true}), true);
+  // A closed row alone is not proof; neither is an applied command without the
+  // host's confirmed_absent receipt, nor a stale heartbeat.
+  assert.equal(confirmed({state:'closed', command_status:'applied', receipt_confirmed_absent:false}), false);
+  assert.equal(confirmed({state:'closed', command_status:'applied'}), false);
+  assert.equal(confirmed({state:'closed'}), false);
+  assert.equal(confirmed({state:'stale', command_status:'applied', receipt_confirmed_absent:true}), false);
+  assert.equal(confirmed({state:'active', command_status:'applied', receipt_confirmed_absent:true}), false);
+  assert.equal(confirmed(null), false);
+});
+
+test('a settled failed or expired disconnect releases the retry key', async () => {
+  const loaded = app(async () => reply(200, {}));
+  const conn = {host_id:'devbox', connection_id:'a'.repeat(32)};
+  loaded.state.connectionRequestKey = {connection:'devbox/' + conn.connection_id, key:'request-key'};
+  loaded.releaseConnectionRequestKeyIfSettled({...conn, command_status:'queued'});
+  assert.equal(loaded.state.connectionRequestKey.key, 'request-key');
+  loaded.releaseConnectionRequestKeyIfSettled({...conn, command_status:'failed'});
+  assert.equal(loaded.state.connectionRequestKey, null);
+
+  loaded.state.connectionRequestKey = {connection:'devbox/' + conn.connection_id, key:'request-key'};
+  loaded.releaseConnectionRequestKeyIfSettled({...conn, command_status:'expired'});
+  assert.equal(loaded.state.connectionRequestKey, null);
+
+  const confirmed = {...conn, state:'closed', command_status:'applied', receipt_confirmed_absent:true};
+  loaded.state.connectionRequestKey = {connection:'devbox/' + conn.connection_id, key:'request-key'};
+  loaded.releaseConnectionRequestKeyIfSettled(confirmed);
+  assert.equal(loaded.state.connectionRequestKey, null);
+});
+
+test('one disconnect action reuses its request key for a retried request', async () => {
+  const sent = [];
+  const loaded = app(async (url, options) => {
+    sent.push({url, body: options && options.body ? JSON.parse(options.body) : null});
+    if (sent.length === 1) return reply(500, {error:'temporary failure'});
+    return reply(202, {command_id:'cmd-1', status:'queued'});
+  });
+  const conn = {host_id:'devbox', connection_id:'a'.repeat(32)};
+  const first = loaded.connectionRequestKeyFor(conn);
+  const second = loaded.connectionRequestKeyFor(conn);
+  assert.equal(first, second);
+  assert.ok(first.length >= 8 && first.length <= 128);
+  // A different target gets its own key so two viewers are never conflated.
+  const other = loaded.connectionRequestKeyFor(
+    {host_id:'devbox', connection_id:'b'.repeat(32)});
+  assert.notEqual(first, other);
 });

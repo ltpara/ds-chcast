@@ -98,6 +98,12 @@ type HostConfig struct {
 	// current policy version. The agent signs the server receipt only when
 	// this file names the same policy instance. Empty disables receipts.
 	PolicyAck string
+	// LiveState is the machine file the native host writes with its current
+	// viewer connections and disconnect receipts. The agent reads it, signs
+	// snapshots and receipts, and keeps the command inbox in
+	// "<LiveState>.commands" so a polled disconnect survives a crash. Empty
+	// disables the live connection loop.
+	LiveState string
 	// WakeRelay makes this agent a cross-subnet Wake-on-LAN proxy: the server
 	// may hand it jobs for targets whose last reported link shares an endpoint
 	// with this machine's link. It is opt-in because it sends packets to
@@ -434,6 +440,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	go h.hostEventLoop()
 	if cfg.PolicyState != "" {
 		go h.clientStrategyLoop()
+	}
+	if cfg.LiveState != "" {
+		go h.liveConnectionsLoop()
 	}
 	if h.carrier != nil {
 		go h.carrierLinkLoop()

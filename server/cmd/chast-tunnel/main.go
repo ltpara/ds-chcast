@@ -71,6 +71,7 @@ func runHost(args []string) error {
 	auditSpool := fs.String("audit-spool", "", "chast-host JSONL audit spool; the agent signs and forwards it")
 	policyState := fs.String("policy-state", "", "machine file that caches the server device policy; shared with chast-host as its managed marker")
 	policyAck := fs.String("policy-ack", "", "machine file chast-host writes after accepting a policy version; the agent signs the server receipt from it")
+	liveState := fs.String("live-state", "", "machine file chast-host writes with active viewer connections and disconnect receipts; the agent signs snapshots and keeps commands in <file>.commands")
 	listen := fs.String("listen", "[::]:14434", "public-facing UDP address of this agent (dual-stack where available)")
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
@@ -154,6 +155,7 @@ func runHost(args []string) error {
 		AuditSpool:                *auditSpool,
 		PolicyState:               *policyState,
 		PolicyAck:                 *policyAck,
+		LiveState:                 *liveState,
 		ListenAddr:                *listen,
 		Keepalive:                 *keepalive,
 		UPnP:                      *upnpEnabled,

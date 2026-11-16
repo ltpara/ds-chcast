@@ -21,6 +21,7 @@
 
 #include "chast/host_server.h"
 #include "chast/security.h"
+#include "test_workdir.h"
 
 namespace {
 
@@ -75,14 +76,7 @@ bool wait_for(const std::function<bool()>& predicate, std::chrono::milliseconds 
 }
 
 std::filesystem::path temp_dir() {
-    wchar_t buffer[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, buffer);
-    const std::filesystem::path dir =
-        std::filesystem::path(buffer) / L"chast-host-multi-test";
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return chast_test::scratch_directory("chast-host-multi-test");
 }
 
 std::vector<std::string> read_lines(const std::filesystem::path& path) {

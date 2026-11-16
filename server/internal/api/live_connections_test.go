@@ -29,16 +29,17 @@ type liveSnapshotReply struct {
 }
 
 type liveConnectionReply struct {
-	HostID          string    `json:"host_id"`
-	RuntimeID       string    `json:"runtime_id"`
-	ConnectionID    string    `json:"connection_id"`
-	State           string    `json:"state"`
-	StartedAt       time.Time `json:"started_at"`
-	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
-	CommandID       string    `json:"command_id"`
-	CommandStatus   string    `json:"command_status"`
-	CommandDeadline time.Time `json:"command_deadline"`
-	ReceiptDetail   string    `json:"receipt_detail"`
+	HostID                 string    `json:"host_id"`
+	RuntimeID              string    `json:"runtime_id"`
+	ConnectionID           string    `json:"connection_id"`
+	State                  string    `json:"state"`
+	StartedAt              time.Time `json:"started_at"`
+	LastHeartbeatAt        time.Time `json:"last_heartbeat_at"`
+	CommandID              string    `json:"command_id"`
+	CommandStatus          string    `json:"command_status"`
+	CommandDeadline        time.Time `json:"command_deadline"`
+	ReceiptConfirmedAbsent bool      `json:"receipt_confirmed_absent"`
+	ReceiptDetail          string    `json:"receipt_detail"`
 }
 
 type liveConnectionListReply struct {
@@ -421,8 +422,18 @@ func TestLiveConnectionDisconnectPollAndReceiptHTTP(t *testing.T) {
 	if err := json.Unmarshal(body, &polled); err != nil {
 		t.Fatal(err)
 	}
-	if len(polled.Commands) != 0 {
-		t.Fatalf("command redelivered: %+v", polled)
+	if len(polled.Commands) != 1 || polled.Commands[0].CommandID != command.CommandID {
+		t.Fatalf("lost command response was not redelivered: %+v", polled)
+	}
+	commandsDigest, err = liveconn.CommandsDigest(polled.Commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serverPub, err := identity.ParsePublicKey(s.Identity.PublicKeyText()); err != nil ||
+		!identity.Verify(serverPub, identity.ServerLiveCommandsResponseMessage(
+			"devbox", apiLiveRuntime, polled.Timestamp, commandsDigest),
+			polled.Signature) {
+		t.Fatalf("redelivered command response did not verify: %+v", polled)
 	}
 
 	receiptPath := s.URL + "/v1/hosts/devbox/live-connections/" +
@@ -471,7 +482,7 @@ func TestLiveConnectionDisconnectPollAndReceiptHTTP(t *testing.T) {
 	detail := decodeLiveConnection(t, body)
 	if detail.State != liveconn.ConnectionClosed ||
 		detail.CommandStatus != liveconn.CommandApplied ||
-		detail.ReceiptDetail != receipt.Detail {
+		!detail.ReceiptConfirmedAbsent || detail.ReceiptDetail != receipt.Detail {
 		t.Fatalf("closed detail = %+v", detail)
 	}
 	status, body = request(t, http.MethodGet,

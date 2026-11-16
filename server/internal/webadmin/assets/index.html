@@ -51,6 +51,7 @@
     <nav class="tabs" id="tabs" role="tablist">
       <button type="button" class="tab active" data-tab="overview" role="tab">概览</button>
       <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
+      <button type="button" class="tab" data-tab="connections" role="tab">活动连接</button>
       <button type="button" class="tab" data-tab="policies" role="tab">设备策略</button>
       <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
       <button type="button" class="tab" data-tab="mine" role="tab">我的账号</button>
@@ -118,6 +119,30 @@
         </div>
         <p id="device-empty" class="muted hidden">没有匹配的设备</p>
         <p id="device-readonly" class="muted hidden">当前角色为只读，设备编辑与重置不可用。</p>
+      </div>
+    </section>
+
+    <section id="panel-connections" class="panel-page">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>活动连接</h2>
+          <div class="toolbar">
+            <input id="connection-query" type="search" placeholder="筛选主机 / 查看者 / 地址" spellcheck="false">
+            <button type="button" id="connection-refresh">刷新</button>
+          </div>
+        </div>
+        <p id="connection-summary" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>主机</th><th>查看者</th><th>地址</th><th>模式</th><th>路由</th><th>权限</th><th>连接状态</th><th>最近心跳</th><th>断开指令</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="connection-rows"></tbody>
+          </table>
+        </div>
+        <p id="connection-empty" class="muted hidden">没有活动连接</p>
+        <p id="connection-readonly" class="muted hidden">当前角色为只读，只能查看连接，不能发起断开。</p>
+        <p class="muted">只显示主机当前报告的连接。仅当连接为 closed、指令为 applied 且收到“确认不存在”回执时，详情才显示“已确认断开”；其他状态一律视为待处理、失败或状态未知。</p>
       </div>
     </section>
 
@@ -746,6 +771,32 @@
         <button type="button" id="group-delete" class="danger">删除分组</button>
         <span class="spacer"></span>
         <button type="button" id="group-close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="connection-dialog" class="wide">
+    <div class="dialog-stack">
+      <div class="panel-head">
+        <div>
+          <h2 id="connection-dialog-title">连接详情</h2>
+          <p id="connection-dialog-id" class="mono muted"></p>
+        </div>
+        <span id="connection-dialog-state" class="pill"></span>
+      </div>
+      <dl id="connection-detail" class="kv"></dl>
+      <h3>断开指令</h3>
+      <p id="connection-command-note" class="muted"></p>
+      <dl id="connection-command-detail" class="kv"></dl>
+      <form id="connection-disconnect" class="inline-form" autocomplete="off">
+        <label>原因（可选）<input id="connection-disconnect-reason" maxlength="512" spellcheck="false"></label>
+        <button type="submit" id="connection-disconnect-send" class="danger">请求断开</button>
+      </form>
+      <p id="connection-disconnect-note" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" id="connection-dialog-refresh">刷新</button>
+        <span class="spacer"></span>
+        <button type="button" id="connection-dialog-close">关闭</button>
       </div>
     </div>
   </dialog>

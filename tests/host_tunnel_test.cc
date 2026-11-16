@@ -247,6 +247,8 @@ void test_command_line() {
           "an empty policy cache leaves out the flag");
     check(!contains(without_optional, L"--policy-ack"),
           "an empty policy acknowledgement leaves out the flag");
+    check(!contains(without_optional, L"--live-state"),
+          "an unmanaged host publishes no live connection snapshot");
 
     settings.audit_spool = "C:\\ProgramData\\chast\\host.audit.jsonl";
     const std::wstring with_spool =
@@ -259,6 +261,9 @@ void test_command_line() {
         chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
     check(contains(with_policy, L"--policy-state C:\\ProgramData\\chast\\host.policy.json"),
           "the shared policy cache is passed to the agent");
+    check(contains(with_policy,
+                   L"--live-state C:\\ProgramData\\chast\\host.policy.json.live-connections"),
+          "the live connection snapshot sits beside the policy cache");
 
     settings.policy_ack = "C:\\ProgramData\\chast\\host.policy-ack.json";
     const std::wstring with_ack =

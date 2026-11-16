@@ -31,37 +31,39 @@ var (
 // LiveConnection is the administrator-facing state of one admitted host
 // session. Freshness is calculated by the server clock on every read.
 type LiveConnection struct {
-	HostID          string    `json:"host_id"`
-	RuntimeID       string    `json:"runtime_id"`
-	ConnectionID    string    `json:"connection_id"`
-	PeerAddress     string    `json:"peer_address,omitempty"`
-	Viewer          string    `json:"viewer,omitempty"`
-	Mode            string    `json:"mode,omitempty"`
-	Route           string    `json:"route,omitempty"`
-	Permissions     uint32    `json:"permissions,omitempty"`
-	Controller      bool      `json:"controller"`
-	StartedAt       time.Time `json:"started_at"`
-	State           string    `json:"state"`
-	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
-	CommandID       string    `json:"command_id,omitempty"`
-	CommandStatus   string    `json:"command_status,omitempty"`
-	CommandDeadline time.Time `json:"command_deadline,omitempty"`
-	ReceiptDetail   string    `json:"receipt_detail,omitempty"`
+	HostID                 string    `json:"host_id"`
+	RuntimeID              string    `json:"runtime_id"`
+	ConnectionID           string    `json:"connection_id"`
+	PeerAddress            string    `json:"peer_address,omitempty"`
+	Viewer                 string    `json:"viewer,omitempty"`
+	Mode                   string    `json:"mode,omitempty"`
+	Route                  string    `json:"route,omitempty"`
+	Permissions            uint32    `json:"permissions,omitempty"`
+	Controller             bool      `json:"controller"`
+	StartedAt              time.Time `json:"started_at"`
+	State                  string    `json:"state"`
+	LastHeartbeatAt        time.Time `json:"last_heartbeat_at"`
+	CommandID              string    `json:"command_id,omitempty"`
+	CommandStatus          string    `json:"command_status,omitempty"`
+	CommandDeadline        time.Time `json:"command_deadline,omitempty"`
+	ReceiptConfirmedAbsent bool      `json:"receipt_confirmed_absent"`
+	ReceiptDetail          string    `json:"receipt_detail,omitempty"`
 }
 
 type liveConnectionRow struct {
 	liveconn.Connection
-	HostID            string
-	RuntimeID         string
-	NativeState       string
-	FirstSeenMS       int64
-	LastSeenMS        int64
-	ClosedAtMS        int64
-	CloseReason       string
-	CommandID         string
-	CommandStatus     string
-	CommandDeadlineMS int64
-	ReceiptDetail     string
+	HostID                 string
+	RuntimeID              string
+	NativeState            string
+	FirstSeenMS            int64
+	LastSeenMS             int64
+	ClosedAtMS             int64
+	CloseReason            string
+	CommandID              string
+	CommandStatus          string
+	CommandDeadlineMS      int64
+	ReceiptConfirmedAbsent bool
+	ReceiptDetail          string
 }
 
 func applyLiveConnections(db *sql.DB) error {
@@ -433,7 +435,7 @@ func (s *Store) queryLiveConnections(suffix string, args ...any) ([]liveConnecti
 		c.started_at, c.first_seen_at, c.last_seen_at, c.native_state,
 		c.closed_at, c.close_reason, COALESCE(k.command_id, ''),
 		COALESCE(k.status, ''), COALESCE(k.deadline_at, 0),
-		COALESCE(r.detail, '')
+		COALESCE(r.confirmed_absent, FALSE), COALESCE(r.detail, '')
 		FROM live_connections c
 		JOIN host_runtimes h ON h.host_id = c.host_id AND h.runtime_id = c.runtime_id
 		LEFT JOIN live_connection_commands k ON k.command_id = (
@@ -455,7 +457,8 @@ func (s *Store) queryLiveConnections(suffix string, args ...any) ([]liveConnecti
 			&row.Permissions, &row.Controller, &row.StartedAtMS,
 			&row.FirstSeenMS, &row.LastSeenMS, &row.NativeState,
 			&row.ClosedAtMS, &row.CloseReason, &row.CommandID,
-			&row.CommandStatus, &row.CommandDeadlineMS, &row.ReceiptDetail); err != nil {
+			&row.CommandStatus, &row.CommandDeadlineMS, &row.ReceiptConfirmedAbsent,
+			&row.ReceiptDetail); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
@@ -474,7 +477,8 @@ func (r liveConnectionRow) view(now time.Time) LiveConnection {
 		Route: r.Route, Permissions: r.Permissions, Controller: r.Controller,
 		StartedAt: timeFromMillis(r.StartedAtMS), State: state,
 		LastHeartbeatAt: timeFromMillis(r.LastSeenMS), CommandID: r.CommandID,
-		CommandStatus: r.CommandStatus, ReceiptDetail: r.ReceiptDetail,
+		CommandStatus: r.CommandStatus, ReceiptConfirmedAbsent: r.ReceiptConfirmedAbsent,
+		ReceiptDetail: r.ReceiptDetail,
 	}
 	if r.CommandDeadlineMS > 0 {
 		out.CommandDeadline = timeFromMillis(r.CommandDeadlineMS)
@@ -608,9 +612,10 @@ func (s *Store) DisconnectLiveConnection(hostID, connectionID, requestKey, actor
 	return command, nil
 }
 
-// PollLiveCommands returns queued commands once, marks them delivered, and
-// expires commands that missed their deadline. Re-delivery is safe because the
-// command identity and request key are stable.
+// PollLiveCommands returns queued and previously delivered commands until a
+// native receipt settles them, and expires commands that missed their deadline.
+// Re-delivery is safe because the command identity and request key are stable;
+// delivered_at records the first successful response rather than every poll.
 func (s *Store) PollLiveCommands(hostID, runtimeID string, limit int) ([]liveconn.Command, error) {
 	hostID = strings.TrimSpace(hostID)
 	runtimeID = strings.ToLower(strings.TrimSpace(runtimeID))
@@ -640,7 +645,7 @@ func (s *Store) PollLiveCommands(hostID, runtimeID string, limit int) ([]livecon
 	rows, err := tx.Query(`SELECT command_id, host_id, runtime_id, connection_id,
 		operation, request_key, reason, status, issued_at, deadline_at
 		FROM live_connection_commands WHERE host_id = ? AND runtime_id = ?
-		AND status = 'queued' AND deadline_at > ?
+		AND status IN ('queued', 'delivered') AND deadline_at > ?
 		ORDER BY issued_at, command_id LIMIT ?`, hostID, runtimeID, now, limit)
 	if err != nil {
 		return nil, err

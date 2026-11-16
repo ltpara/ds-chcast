@@ -22,6 +22,16 @@
     deviceOffset: 0,
     deviceLimit: 200,
     deviceTotal: 0,
+    // Live connections: list rows, the open-detail snapshot and its polling
+    // handle. connectionRequestKey survives a failed HTTP response so a retry
+    // reuses the same idempotency key instead of queueing a second command.
+    connectionRows: [],
+    connectionGen: 0,
+    connectionDetail: null,
+    connectionDetailKey: null,
+    connectionPollTimer: 0,
+    connectionRequestKey: null,
+    connectionSending: false,
     pendingBulk: '',
     bulkTimer: 0,
     auditTab: 'events',
@@ -837,6 +847,7 @@
     const visibility = {
       overview: read && !restricted,
       devices: read && !restricted,
+      connections: read && !restricted,
       policies: admin,
       accounts: admin,
       mine: Boolean(state.auth && state.auth.mode === 'account'),
@@ -850,6 +861,7 @@
       node.classList.toggle('hidden', !visibility[node.dataset.tab]);
     });
     $('device-readonly').classList.toggle('hidden', write);
+    $('connection-readonly').classList.toggle('hidden', write);
     $('recording-readonly').classList.toggle('hidden', write);
     $('group-create-panel').classList.toggle('hidden', !admin);
     $('group-readonly').classList.toggle('hidden', admin);
@@ -877,6 +889,16 @@
     state.deviceOffset = 0;
     state.deviceTotal = 0;
     state.deviceSelection.clear();
+    state.connectionRows = [];
+    state.connectionGen++;
+    state.connectionDetail = null;
+    state.connectionDetailKey = null;
+    state.connectionRequestKey = null;
+    state.connectionSending = false;
+    stopConnectionPoll();
+    const connectionDialog = $('connection-dialog');
+    if (connectionDialog.open) connectionDialog.close();
+    clear($('connection-rows'));
     state.groups = [];
     state.groupsLoaded = false;
     state.groupEditing = null;
@@ -939,6 +961,8 @@
         refreshOverview().catch(() => {});
       } else if (state.tab === 'devices') {
         loadDevices(true).catch(() => {});
+      } else if (state.tab === 'connections') {
+        loadConnections(true).catch(() => {});
       } else if (state.tab === 'policies') {
         loadPolicies(true).catch(() => {});
       } else if (state.tab === 'groups') {
@@ -966,6 +990,7 @@
     });
     if (tab === 'overview') refreshOverview().catch(reportError);
     else if (tab === 'devices') loadDevices().catch(reportError);
+    else if (tab === 'connections') loadConnections(true).catch(reportError);
     else if (tab === 'policies') loadPolicies().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
     else if (tab === 'mine') loadMine().catch(reportError);
@@ -2976,6 +3001,337 @@
     await loadGroups(true);
   }
 
+  // ---------- live connections ----------
+
+  // The server draws the line between "the viewer is gone" and "the command
+  // was confirmed" - the console must never infer a disconnect from a timeout,
+  // a stale heartbeat or a closed row on its own. Only this exact combination
+  // proves the operator's command removed the named native connection.
+  function connectionConfirmedDisconnected(conn) {
+    return Boolean(conn) && conn.state === 'closed' &&
+      conn.command_status === 'applied' && conn.receipt_confirmed_absent === true;
+  }
+
+  const CONNECTION_STATE_LABELS = {
+    active: '活动中',
+    stale: '心跳过期',
+    closed: '已结束',
+  };
+  const CONNECTION_STATE_KINDS = { active: 'ok', stale: 'warn', closed: '' };
+
+  const COMMAND_STATE_LABELS = {
+    queued: '已排队',
+    delivered: '已投递，待回执',
+    applied: '已应用',
+    failed: '失败',
+    expired: '已过期',
+  };
+  const COMMAND_STATE_KINDS = {
+    queued: 'warn', delivered: 'warn', applied: 'ok', failed: 'bad', expired: 'bad',
+  };
+
+  function connectionStatus(conn) {
+    if (connectionConfirmedDisconnected(conn)) return ['已确认断开', 'ok'];
+    const status = conn && conn.command_status;
+    if (conn && conn.state === 'closed') {
+      if (status === 'applied') return ['已结束，未确认来源', 'warn'];
+      return ['已结束', ''];
+    }
+    if (conn && conn.state === 'stale') return [CONNECTION_STATE_LABELS.stale, 'warn'];
+    if (status === 'queued' || status === 'delivered') return ['断开待确认', 'warn'];
+    if (status === 'failed' || status === 'expired') return ['断开未完成', 'bad'];
+    return [CONNECTION_STATE_LABELS.active, 'ok'];
+  }
+
+  function connectionKey(conn) {
+    return (conn.host_id || '') + '/' + (conn.connection_id || '');
+  }
+
+  // request_key must survive a retried POST: the server treats a second key as
+  // a second command and would audit two disconnects for one operator action.
+  function connectionRequestKeyFor(conn) {
+    if (!state.connectionRequestKey ||
+        state.connectionRequestKey.connection !== connectionKey(conn)) {
+      state.connectionRequestKey = {
+        connection: connectionKey(conn),
+        key: connectionRequestKeyValue(),
+      };
+    }
+    return state.connectionRequestKey.key;
+  }
+
+  // A transient HTTP failure must keep the key so a retry stays idempotent.
+  // If the command is already failed/expired after refreshing, however, that
+  // key must not force every later operator attempt back to the same terminal
+  // command.
+  function releaseConnectionRequestKeyIfSettled(conn) {
+    if (conn && (conn.command_status === 'failed' ||
+        conn.command_status === 'expired' || connectionConfirmedDisconnected(conn))) {
+      state.connectionRequestKey = null;
+    }
+  }
+
+  function connectionRequestKeyValue() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        let out = '';
+        for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+        return out;
+      }
+    } catch {
+      /* fall through to the non-crypto form below */
+    }
+    // Browsers without Web Crypto still need an idempotency key; the server
+    // only requires 8..128 printable characters, and this path is not a secret.
+    return Date.now().toString(16) + '-' + Math.random().toString(16).slice(2, 18);
+  }
+
+  async function loadConnections(reset) {
+    const generation = ++state.connectionGen;
+    const query = $('connection-query').value.trim().toLowerCase();
+    let data;
+    try {
+      data = await api('/v1/live-connections?limit=500') || {};
+    } catch (err) {
+      if (generation !== state.connectionGen) return;
+      throw err;
+    }
+    if (generation !== state.connectionGen) return;
+    const list = Array.isArray(data.connections) ? data.connections : [];
+    state.connectionRows = list.filter((conn) => {
+      if (!query) return true;
+      return [conn.host_id, conn.viewer, conn.peer_address, conn.mode, conn.route]
+        .some((value) => String(value || '').toLowerCase().includes(query));
+    });
+    renderConnections();
+    const known = { active: 0, stale: 0, closed: 0 };
+    for (const conn of state.connectionRows) {
+      if (known[conn.state] !== undefined) known[conn.state] += 1;
+    }
+    const bits = ['活动中 ' + known.active, '心跳过期 ' + known.stale, '已结束 ' + known.closed];
+    if (query) bits.push('筛选 ' + state.connectionRows.length + ' / ' + list.length);
+    $('connection-summary').textContent = bits.join(' · ');
+  }
+
+  function renderConnections() {
+    const body = $('connection-rows');
+    clear(body);
+    state.connectionRows.forEach((conn) => body.appendChild(connectionRow(conn)));
+    $('connection-empty').classList.toggle('hidden', state.connectionRows.length > 0);
+  }
+
+  function connectionRow(conn) {
+    const tr = document.createElement('tr');
+    const host = cell(refCell(conn.host_id));
+    host.title = conn.host_id || '';
+    tr.appendChild(host);
+    tr.appendChild(cell(conn.viewer || '—'));
+    tr.appendChild(cell(conn.peer_address || '—'));
+    tr.appendChild(cell(conn.mode || '—'));
+    tr.appendChild(cell(routeCell(conn.route)));
+    tr.appendChild(cell(permissionSummary(conn.permissions)));
+    const [statusText, statusKind] = connectionStatus(conn);
+    tr.appendChild(cell(pill(statusText, statusKind)));
+    tr.appendChild(cell(fmtTime(conn.last_heartbeat_at ? new Date(conn.last_heartbeat_at).getTime() : 0)));
+    const command = conn.command_status
+      ? pill(COMMAND_STATE_LABELS[conn.command_status] || conn.command_status,
+        COMMAND_STATE_KINDS[conn.command_status] || '')
+      : el('span', 'muted', '—');
+    tr.appendChild(cell(command));
+
+    const actions = el('div', 'actions-wrap');
+    const detail = button('详情', 'small');
+    detail.addEventListener('click', () => openConnectionDetail(conn).catch(reportError));
+    actions.appendChild(detail);
+    const terminal = conn.state === 'closed' || conn.state === 'stale' ||
+      conn.command_status === 'queued' || conn.command_status === 'delivered';
+    if (can('operator') && !terminal) {
+      const disconnect = button('断开', 'small danger');
+      disconnect.addEventListener('click', () => {
+        openConnectionDetail(conn).then(() => {
+          $('connection-disconnect-reason').focus();
+        }).catch(reportError);
+      });
+      actions.appendChild(disconnect);
+    }
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  // Mirrors PermissionBit in include/chast/protocol.h. 0x40 is reserved and
+  // must not be shown as a permission.
+  function permissionSummary(mask) {
+    const bits = [];
+    const known = [
+      [0x0001, '输入'], [0x0002, '剪贴板'], [0x0004, '音频'], [0x0008, '文件'],
+      [0x0010, '麦克风'], [0x0020, '隐私'], [0x0080, '端口'], [0x0100, '终端'],
+      [0x0200, '录制'], [0x0400, '摄像头'], [0x0800, '重启'],
+      [0x1000, '阻止输入'], [0x2000, '系统登录'], [0x4000, '会话切换'],
+      [0x8000, '远程配置'],
+    ];
+    for (const [bit, label] of known) {
+      if (Number(mask || 0) & bit) bits.push(label);
+    }
+    return bits.length ? bits.join(' / ') : '—';
+  }
+
+  async function openConnectionDetail(conn) {
+    state.connectionDetailKey = connectionKey(conn);
+    state.connectionDetail = conn;
+    state.connectionRequestKey = null;
+    $('connection-disconnect-reason').value = '';
+    $('connection-disconnect-note').textContent = '';
+    if (!$('connection-dialog').open) $('connection-dialog').showModal();
+    renderConnectionDetail();
+    await refreshConnectionDetail(false);
+  }
+
+  async function refreshConnectionDetail(manual) {
+    const key = state.connectionDetailKey;
+    if (!key) return;
+    const conn = state.connectionDetail;
+    const host = conn ? conn.host_id : key.split('/')[0];
+    const id = conn ? conn.connection_id : key.split('/')[1];
+    const data = await api('/v1/live-connections/' + encodeURIComponent(host) + '/' +
+      encodeURIComponent(id));
+    if (state.connectionDetailKey !== key) return;
+    state.connectionDetail = data;
+    renderConnectionDetail();
+    if (connectionConfirmedDisconnected(data) || data.command_status === 'failed' ||
+        data.command_status === 'expired') {
+      stopConnectionPoll();
+      if (state.tab === 'connections') loadConnections(true).catch(() => {});
+    } else if (data.command_status === 'queued' || data.command_status === 'delivered') {
+      // Poll until the host settles the command. This is a bounded wait that
+      // ends on success, failure, expiry or closing the dialog.
+      stopConnectionPoll();
+      state.connectionPollTimer = setTimeout(() => {
+        refreshConnectionDetail(false).catch((err) => {
+          if (err && err.status === 404) {
+            // The host runtime ended and the row is gone; stop guessing.
+            $('connection-disconnect-note').textContent = '连接记录已不再可用，状态未知。';
+            stopConnectionPoll();
+            return;
+          }
+          reportError(err);
+          state.connectionPollTimer = setTimeout(() => refreshConnectionDetail(false).catch(() => {}), 3000);
+        });
+      }, 1500);
+    } else if (manual) {
+      toast('连接状态已刷新');
+    }
+  }
+
+  function stopConnectionPoll() {
+    if (state.connectionPollTimer) {
+      clearTimeout(state.connectionPollTimer);
+      state.connectionPollTimer = 0;
+    }
+  }
+
+  function renderConnectionDetail() {
+    const conn = state.connectionDetail;
+    if (!conn) return;
+    const [statusText, statusKind] = connectionStatus(conn);
+    const badge = $('connection-dialog-state');
+    badge.textContent = statusText;
+    badge.className = 'pill' + (statusKind ? ' ' + statusKind : '');
+    $('connection-dialog-title').textContent = conn.host_id || '连接详情';
+    $('connection-dialog-id').textContent = conn.connection_id || '';
+
+    const detail = $('connection-detail');
+    clear(detail);
+    appendPair(detail, '查看者', conn.viewer || '—');
+    appendPair(detail, '地址', conn.peer_address || '—');
+    appendPair(detail, '模式', conn.mode || '—');
+    appendPair(detail, '路由', conn.route || '—');
+    appendPair(detail, '权限', permissionSummary(conn.permissions));
+    appendPair(detail, '控制者', conn.controller ? '是' : '否');
+    appendPair(detail, '开始时间', fmtTime(conn.started_at ? new Date(conn.started_at).getTime() : 0));
+    appendPair(detail, '最近心跳', fmtTime(conn.last_heartbeat_at ? new Date(conn.last_heartbeat_at).getTime() : 0));
+    appendPair(detail, '运行实例', conn.runtime_id || '—');
+
+    const command = $('connection-command-detail');
+    clear(command);
+    appendPair(command, '指令 ID', conn.command_id || '—');
+    appendPair(command, '指令状态', conn.command_status
+      ? (COMMAND_STATE_LABELS[conn.command_status] || conn.command_status) : '无');
+    appendPair(command, '截止时间', fmtTime(conn.command_deadline ? new Date(conn.command_deadline).getTime() : 0));
+    appendPair(command, '确认不存在', conn.receipt_confirmed_absent ? '是' : '否');
+    appendPair(command, '回执说明', conn.receipt_detail || '—');
+
+    const note = $('connection-command-note');
+    if (connectionConfirmedDisconnected(conn)) {
+      note.textContent = '目标连接已从主机实际连接集合中消失，且该指令回执绑定了 confirmed_absent=true。';
+    } else if (conn.state === 'stale') {
+      note.textContent = '主机心跳已过期，连接和指令状态均未知；此时不能显示为已断开。';
+    } else if (conn.state === 'closed' && conn.command_status === 'applied') {
+      note.textContent = '连接已结束，但回执没有确认目标曾经不存在；请核对其他原因导致的关闭。';
+    } else if (conn.command_status === 'failed') {
+      note.textContent = '主机明确报告断开失败：' + (conn.receipt_detail || '未提供原因') + '。';
+    } else if (conn.command_status === 'expired') {
+      note.textContent = '命令到期仍未收到主机确认；连接可能仍然存在。';
+    } else if (conn.command_status === 'queued' || conn.command_status === 'delivered') {
+      note.textContent = '指令已排队或已投递，正在等待目标主机确认；这不是断开成功。';
+    } else {
+      note.textContent = '尚未请求断开。';
+    }
+
+    const form = $('connection-disconnect');
+    const canDisconnect = can('operator') && conn.state === 'active';
+    for (const node of form.querySelectorAll('input, button')) node.disabled = !canDisconnect || state.connectionSending;
+    form.classList.toggle('hidden', !can('operator'));
+  }
+
+  function appendPair(list, label, value) {
+    list.appendChild(el('dt', '', label));
+    list.appendChild(el('dd', '', value));
+  }
+
+  async function requestDisconnect() {
+    const conn = state.connectionDetail;
+    if (!conn || state.connectionSending) return;
+    const reason = $('connection-disconnect-reason').value.trim();
+    if (!window.confirm('请求断开 ' + (conn.viewer || conn.peer_address || conn.connection_id) + '？\n' +
+      '只有主机确认该连接已不存在后，管理台才会显示“已确认断开”。')) {
+      return;
+    }
+    const key = connectionRequestKeyFor(conn);
+    state.connectionSending = true;
+    $('connection-disconnect-send').disabled = true;
+    $('connection-disconnect-note').textContent = '';
+    try {
+      const command = await api('/v1/live-connections/' + encodeURIComponent(conn.host_id) + '/' +
+        encodeURIComponent(conn.connection_id) + '/disconnect', {
+        method: 'POST',
+        body: { request_key: key, reason },
+      });
+      state.connectionRequestKey = null;
+      $('connection-disconnect-note').textContent = command && command.command_id
+        ? '指令已受理（' + (COMMAND_STATE_LABELS[command.status] || command.status) + '），等待主机确认。'
+        : '指令已受理。';
+      await refreshConnectionDetail(false);
+      if (state.tab === 'connections') loadConnections(true).catch(() => {});
+    } catch (err) {
+      // Keep the request key on a failed response: a retry of the same action
+      // must be idempotent. Refresh in case the command did land server-side.
+      $('connection-disconnect-note').textContent =
+        '断开请求未成功：' + (err && err.message ? err.message : String(err));
+      await refreshConnectionDetail(false).catch(() => {});
+      releaseConnectionRequestKeyIfSettled(state.connectionDetail);
+      throw err;
+    } finally {
+      state.connectionSending = false;
+      $('connection-disconnect-send').disabled = false;
+      renderConnectionDetail();
+    }
+  }
+
   // ---------- recordings ----------
 
   async function loadRecordings(reset) {
@@ -3749,6 +4105,25 @@
       state.groupEditing = null;
     });
 
+    $('connection-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadConnections(true);
+    }));
+    $('connection-query').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') loadConnections(true).catch(reportError);
+    });
+    $('connection-dialog-close').addEventListener('click', () => $('connection-dialog').close());
+    $('connection-dialog-refresh').addEventListener('click', (event) => withButton(event.currentTarget,
+      () => refreshConnectionDetail(true)));
+    $('connection-dialog').addEventListener('close', () => {
+      stopConnectionPoll();
+      state.connectionDetail = null;
+      state.connectionDetailKey = null;
+    });
+    $('connection-disconnect').addEventListener('submit', (event) => {
+      event.preventDefault();
+      requestDisconnect().catch(reportError);
+    });
+
     $('recording-reload').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
       await loadRecordings(true);
     }));
@@ -3807,6 +4182,7 @@
       if ($('workspace').classList.contains('hidden')) return;
       if (state.tab === 'overview') refreshOverview().catch(() => {});
       else if (state.tab === 'devices') loadDevices(true).catch(() => {});
+      else if (state.tab === 'connections') loadConnections(true).catch(() => {});
       else if (state.tab === 'policies') loadPolicies(true).catch(() => {});
       else if (state.tab === 'groups') loadGroups(true).catch(() => {});
     });

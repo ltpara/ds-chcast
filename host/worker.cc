@@ -25,6 +25,7 @@
 #include "chast/host_server.h"
 #include "chast/host_client_strategy.h"
 #include "chast/identity.h"
+#include "chast/live_connection.h"
 #include "chast/virtual_display.h"
 #include "platform.h"
 #include "service_log.h"
@@ -543,6 +544,12 @@ int run_worker(std::string* error) {
         return 1;
     }
     server->set_strategy_admission_allowed(!strategy_blocked);
+    // The worker is the only process reporting viewer connections while the
+    // service owns the listener. It publishes beside the policy cache, which
+    // the tray also uses, so exactly one controller is ever live.
+    chast::host::LiveConnectionController live_connections(
+        chast::host::live_connection_state_path(effective_settings));
+    std::string live_state_error;
     std::string control_error;
     if (!control.start(*server, &control_error, [&context] {
         std::lock_guard lock(context.settings_mutex);
@@ -601,6 +608,16 @@ int run_worker(std::string* error) {
             break;
         }
         const auto now = std::chrono::steady_clock::now();
+        if (live_connections.enabled()) {
+            std::string live_error;
+            if (live_connections.tick(*server, &live_error)) {
+                live_state_error.clear();
+            } else if (!live_error.empty() && live_error != live_state_error) {
+                // Once per distinct failure: this runs every half second.
+                live_state_error = live_error;
+                worker_event("live_connections.unavailable", {{"error", live_error}});
+            }
+        }
         const bool server_ready =
             server->status().state == HostState::Listening ||
             server->status().state == HostState::Streaming;
@@ -676,6 +693,13 @@ int run_worker(std::string* error) {
     worker_event("worker.stopping");
     tunnel.stop();
     control.stop();
+    if (live_connections.enabled()) {
+        // Terminal snapshot: the operator view must not keep showing viewers
+        // of a runtime that is going away, and any later command for one of
+        // them has to be answered as already ended.
+        std::string live_error;
+        live_connections.publish_terminal(*server, &live_error);
+    }
     server->stop();
     CloseHandle(stop);
     worker_event("worker.stopped");

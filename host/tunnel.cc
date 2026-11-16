@@ -373,6 +373,10 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
         // The agent caches the server's device policy there; the host reads
         // the same file as its managed marker.
         add(L"--policy-state", widen(settings.policy_state));
+        // The host writes its viewer snapshot beside the policy file and the
+        // agent turns accepted disconnects into commands in the matching
+        // ".commands" file. Unmanaged hosts publish neither.
+        add(L"--live-state", widen(settings.policy_state) + L".live-connections");
     }
     if (!settings.policy_ack.empty()) {
         // The host writes this after it accepted the current policy version;

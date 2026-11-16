@@ -412,6 +412,14 @@ dialog .inline-form label { margin-top: 0; }
   font-size: 12px;
 }
 
+/* Live connections: the detail dialog reuses .kv, but its values wrap rather
+   than force the dialog to scroll sideways on long addresses. */
+#connection-detail dd,
+#connection-command-detail dd { white-space: normal; }
+
+#connection-dialog form { margin-top: 4px; }
+#connection-dialog form label { margin-top: 0; }
+
 @media (max-width: 720px) {
   .topbar { flex-direction: column; align-items: stretch; }
   .login input { flex: 1; }

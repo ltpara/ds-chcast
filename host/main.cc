@@ -41,6 +41,7 @@
 #include "chast/host_server.h"
 #include "chast/host_client_strategy.h"
 #include "chast/host_settings.h"
+#include "chast/live_connection.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/virtual_display.h"
@@ -206,6 +207,14 @@ struct HostApp {
     bool startup_created = false;
     std::string startup_save_error;
     std::unique_ptr<HostServer> server;
+    // Publishes the managed viewer snapshot the agent signs, and applies
+    // verified disconnect commands. One instance per process: a listener
+    // restart publishes the old runtime's terminal snapshot and then begins a
+    // new runtime, so stale command ids are still recognised as already-ended
+    // instead of resolving to new viewers.
+    std::unique_ptr<chast::host::LiveConnectionController> live_connections;
+    std::string live_state_path;
+    std::string live_state_error;
     TunnelProcess tunnel;
     std::mutex tunnel_mutex;
     std::deque<TunnelEvent> tunnel_events;
@@ -895,6 +904,39 @@ void start_tunnel() {
     append_log_line(tr(L"正在注册设备 ") + widen(effective.tunnel_id) + L"…");
 }
 
+// Managed hosts publish their viewer set beside the policy cache; the agent
+// signs each snapshot and turns accepted disconnects into queued commands.
+// Unmanaged hosts have no policy file, so nothing is written at all.
+void ensure_live_connections() {
+    const std::string path = chast::host::live_connection_state_path(g_app->effective_settings);
+    if (path.empty()) {
+        g_app->live_connections.reset();
+        g_app->live_state_path.clear();
+        g_app->live_state_error.clear();
+        return;
+    }
+    if (g_app->live_connections && g_app->live_state_path == path) return;
+    g_app->live_connections = std::make_unique<chast::host::LiveConnectionController>(path);
+    g_app->live_state_path = path;
+    g_app->live_state_error.clear();
+}
+
+void tick_live_connections() {
+    ensure_live_connections();
+    if (!g_app->live_connections || !g_app->server) return;
+    std::string error;
+    if (g_app->live_connections->tick(*g_app->server, &error)) {
+        g_app->live_state_error.clear();
+        return;
+    }
+    // Log a repeated failure once: the tick runs four times a second and an
+    // unwritable state path would otherwise flood the window.
+    if (!error.empty() && error != g_app->live_state_error) {
+        g_app->live_state_error = error;
+        append_log_line(tr(L"实时连接状态上报失败：") + widen(error));
+    }
+}
+
 void stop_server() {
     stop_tunnel();
     g_app->strategy_server_ready = false;
@@ -904,6 +946,13 @@ void stop_server() {
     g_app->server_stopping.store(true);
     g_app->server->stop();
     g_app->server_stopping.store(false);
+    if (g_app->live_connections) {
+        // The final snapshot of this runtime: no viewers, terminal set. A
+        // later process publishes under its own runtime id, so commands that
+        // arrive late cannot be applied to a connection they never named.
+        std::string error;
+        g_app->live_connections->publish_terminal(*g_app->server, &error);
+    }
     g_app->server.reset();
     append_log_line(tr(L"共享已停止"));
 }
@@ -956,6 +1005,13 @@ void start_server() {
     g_app->listener_microphone = effective.allow_microphone;
     g_app->listener_privacy = effective.allow_privacy_mode;
     g_app->server->start();
+    // Every start is a new native runtime. Restarting the listener in place
+    // (port, password or policy change) already published the previous
+    // runtime's terminal snapshot, and the server refuses to resurrect a
+    // terminal runtime, so the id must rotate here rather than at first use.
+    ensure_live_connections();
+    if (g_app->live_connections) g_app->live_connections->start_runtime();
+    tick_live_connections();
     append_log_line(tr(L"正在等待查看器（端口 ") + std::to_wstring(effective.port) + tr(L"）"));
     start_tunnel();
 }
@@ -4439,6 +4495,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                         return 0;
                     }
                 }
+                // Twice a second keeps the operator view close to a viewer
+                // joining or leaving, while the controller only rewrites the
+                // file when something actually changed.
+                tick_live_connections();
                 if (now >= g_app->next_strategy_check) {
                     g_app->next_strategy_check = now + 2000;
                     load_managed_strategy(true);

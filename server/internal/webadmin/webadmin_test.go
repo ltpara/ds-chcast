@@ -757,3 +757,59 @@ func TestConsoleExposesConnectionNotes(t *testing.T) {
 		}
 	}
 }
+
+// TestConsoleExposesLiveConnections keeps the live-connection console wired to
+// the account API. The "confirmed disconnected" claim is deliberately narrow:
+// a closed row alone is not success, and a plain "applied" without the host's
+// confirmed_absent receipt is not either.
+func TestConsoleExposesLiveConnections(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(index)
+	for _, want := range []string{
+		`data-tab="connections"`,
+		`id="panel-connections"`,
+		`id="connection-query"`,
+		`id="connection-rows"`,
+		`id="connection-empty"`,
+		`id="connection-readonly"`,
+		`id="connection-dialog"`,
+		`id="connection-detail"`,
+		`id="connection-command-detail"`,
+		`id="connection-disconnect"`,
+		`id="connection-disconnect-reason"`,
+		`id="connection-disconnect-send"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html is missing %q", want)
+		}
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(script)
+	for _, want := range []string{
+		"'/v1/live-connections?limit=500'",
+		"'/v1/live-connections/' + encodeURIComponent(host)",
+		"'/disconnect'",
+		"function connectionConfirmedDisconnected",
+		"conn.state === 'closed' &&",
+		"conn.command_status === 'applied' && conn.receipt_confirmed_absent === true",
+		"function connectionRequestKey",
+		"request_key: key",
+		"function stopConnectionPoll",
+		"state.connectionPollTimer",
+		"function loadConnections",
+		"function openConnectionDetail",
+		"function refreshConnectionDetail",
+		"function requestDisconnect",
+		"connections: read && !restricted",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing %q", want)
+		}
+	}
+}

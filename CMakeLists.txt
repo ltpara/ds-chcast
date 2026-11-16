@@ -311,6 +311,7 @@ add_library(chast.host STATIC
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_client_strategy.cc
+    src/host/live_connection.cc
     src/host/host_server.cc
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
@@ -545,6 +546,11 @@ if(CHAST_BUILD_TESTS)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host.tray)
     add_executable(chast-host-client-strategy-test tests/host_client_strategy_test.cc)
     target_link_libraries(chast-host-client-strategy-test PRIVATE chast.host)
+    # Live connection control plane: runtime and connection id generation, the
+    # snapshot file the agent signs, and the command/receipt state machine.
+    # File-only, so it needs no GPU, network or interactive desktop.
+    add_executable(chast-host-live-connection-test tests/host_live_connection_test.cc)
+    target_link_libraries(chast-host-live-connection-test PRIVATE chast.host)
 
     # JSONL records for the service and worker: timestamp shape, escaping,
     # invalid-UTF-8 replacement, rotation and concurrent appends.
@@ -743,6 +749,14 @@ if(CHAST_BUILD_TESTS)
         "${FFMPEG_ROOT}/lib/avformat.lib" secur32 crypt32 ws2_32 bcrypt ncrypt)
 
     enable_testing()
+
+    # Codex and service runners may expose an inherited %TEMP% that is readable
+    # but not writable, and some fixtures use fixed names inside it. Keep the
+    # whole CTest tree inside the build directory so child host/viewer processes
+    # inherit a writable, isolated location.
+    set(CHAST_TEST_TEMP "${CMAKE_CURRENT_BINARY_DIR}/test-env")
+    file(MAKE_DIRECTORY "${CHAST_TEST_TEMP}")
+
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME shared_capture COMMAND chast-shared-capturer-test)
     add_test(NAME capture_transform COMMAND chast-capture-transform-test)
@@ -760,6 +774,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_client_strategy COMMAND chast-host-client-strategy-test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/host_client_strategy.json"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/viewer_client_strategy.json")
+    add_test(NAME host_live_connection COMMAND chast-host-live-connection-test)
+    set_tests_properties(host_live_connection PROPERTIES TIMEOUT 120)
     add_test(NAME service_log COMMAND chast-service-log-test)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
@@ -996,4 +1012,15 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_weak_network
         COMMAND chast-quic verify --port 45513 --netem --quiet)
     set_tests_properties(quic_weak_network PROPERTIES TIMEOUT 180)
+
+    # Apply the isolated temp root to every test registered above. <TEST_NAME>
+    # is expanded by CTest per test, so parallel jobs never share the fixed
+    # fixture names used by several host tests.
+    get_property(CHAST_TESTS DIRECTORY PROPERTY TESTS)
+    foreach(test_name IN LISTS CHAST_TESTS)
+        set(test_temp "${CHAST_TEST_TEMP}/${test_name}")
+        file(MAKE_DIRECTORY "${test_temp}")
+        set_tests_properties("${test_name}" PROPERTIES
+            ENVIRONMENT "TEMP=${test_temp};TMP=${test_temp}")
+    endforeach()
 endif()

@@ -15,6 +15,7 @@
 #include "chast/quic.h"
 #include "chast/wallpaper.h"
 #include "service_settings.h"
+#include "test_workdir.h"
 #include "windows_sessions.h"
 
 namespace {
@@ -29,13 +30,7 @@ void check(bool condition, const char* what) {
 }
 
 std::filesystem::path temp_dir() {
-    wchar_t buffer[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, buffer);
-    std::filesystem::path dir = std::filesystem::path(buffer) / L"chast-settings-test";
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return chast_test::scratch_directory("chast-settings-test");
 }
 
 void write_text(const std::filesystem::path& path, const std::string& text) {
