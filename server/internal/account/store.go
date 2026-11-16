@@ -881,37 +881,15 @@ func (s *Store) ChangePassword(userID, currentToken, currentPassword, newPasswor
 }
 
 func (s *Store) DeleteUser(username string) error {
+	username = strings.TrimSpace(username)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var (
-		role   string
-		banned bool
-	)
-	err := s.db.QueryRow(`SELECT role, banned FROM users WHERE username = ?`,
-		strings.TrimSpace(username)).Scan(&role, &banned)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrUnknownUser
-	}
+	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("account store %s: delete user: %w", s.path, err)
+		return fmt.Errorf("account store %s: begin delete user: %w", s.path, err)
 	}
-	if role == RoleAdmin && !banned {
-		var admins, total int
-		if err := s.db.QueryRow(
-			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
-		).Scan(&admins); err != nil {
-			return fmt.Errorf("account store %s: count admins: %w", s.path, err)
-		}
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&total); err != nil {
-			return fmt.Errorf("account store %s: count users: %w", s.path, err)
-		}
-		// Removing every account is safe because the next CreateUser becomes
-		// admin again; leaving users behind without an admin is not.
-		if admins <= 1 && total > 1 {
-			return ErrLastAdmin
-		}
-	}
-	res, err := s.db.Exec(`DELETE FROM users WHERE username = ?`, strings.TrimSpace(username))
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM users WHERE username = ?`, username)
 	if err != nil {
 		return fmt.Errorf("account store %s: delete user: %w", s.path, err)
 	}
@@ -921,6 +899,12 @@ func (s *Store) DeleteUser(username string) error {
 	}
 	if affected == 0 {
 		return ErrUnknownUser
+	}
+	if err := ensureLastManagementAdmin(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("account store %s: commit delete user: %w", s.path, err)
 	}
 	return nil
 }
@@ -1092,16 +1076,22 @@ func (s *Store) SetRole(username, role string) (User, error) {
 	if !ValidRole(role) {
 		return User{}, ErrInvalidRole
 	}
+	username = strings.TrimSpace(username)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return User{}, fmt.Errorf("account store %s: begin set role: %w", s.path, err)
+	}
+	defer tx.Rollback()
 	var (
 		user    User
 		created int64
 		banned  bool
 	)
-	err := s.db.QueryRow(
+	err = tx.QueryRow(
 		`SELECT id, username, role, created_at, banned, email, phone FROM users WHERE username = ?`,
-		strings.TrimSpace(username),
+		username,
 	).Scan(&user.ID, &user.Username, &user.Role, &created, &banned, &user.Email, &user.Phone)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrUnknownUser
@@ -1114,19 +1104,14 @@ func (s *Store) SetRole(username, role string) (User, error) {
 		user.Banned = banned
 		return user, nil
 	}
-	if user.Role == RoleAdmin && !banned {
-		var admins int
-		if err := s.db.QueryRow(
-			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
-		).Scan(&admins); err != nil {
-			return User{}, fmt.Errorf("account store %s: count admins: %w", s.path, err)
-		}
-		if admins <= 1 {
-			return User{}, ErrLastAdmin
-		}
-	}
-	if _, err := s.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, role, user.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE users SET role = ? WHERE id = ?`, role, user.ID); err != nil {
 		return User{}, fmt.Errorf("account store %s: set role: %w", s.path, err)
+	}
+	if err := ensureLastManagementAdmin(tx); err != nil {
+		return User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, fmt.Errorf("account store %s: commit set role: %w", s.path, err)
 	}
 	user.Role = role
 	user.CreatedAt = timeFromMillis(created)
@@ -1138,16 +1123,22 @@ func (s *Store) SetRole(username, role string) (User, error) {
 // so the account loses access immediately, and the last usable admin cannot be
 // banned so the deployment keeps a way to manage accounts.
 func (s *Store) SetBanned(username string, banned bool) (User, error) {
+	username = strings.TrimSpace(username)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return User{}, fmt.Errorf("account store %s: begin ban: %w", s.path, err)
+	}
+	defer tx.Rollback()
 	var (
 		user      User
 		created   int64
 		wasBanned bool
 	)
-	err := s.db.QueryRow(
+	err = tx.QueryRow(
 		`SELECT id, username, role, created_at, banned, email, phone FROM users WHERE username = ?`,
-		strings.TrimSpace(username),
+		username,
 	).Scan(&user.ID, &user.Username, &user.Role, &created, &wasBanned, &user.Email, &user.Phone)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrUnknownUser
@@ -1155,24 +1146,11 @@ func (s *Store) SetBanned(username string, banned bool) (User, error) {
 	if err != nil {
 		return User{}, fmt.Errorf("account store %s: find user: %w", s.path, err)
 	}
-	if banned && !wasBanned && user.Role == RoleAdmin {
-		var admins int
-		if err := s.db.QueryRow(
-			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
-		).Scan(&admins); err != nil {
-			return User{}, fmt.Errorf("account store %s: count admins: %w", s.path, err)
-		}
-		if admins <= 1 {
-			return User{}, ErrLastAdmin
-		}
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return User{}, fmt.Errorf("account store %s: begin ban: %w", s.path, err)
-	}
-	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE users SET banned = ? WHERE id = ?`, banned, user.ID); err != nil {
 		return User{}, fmt.Errorf("account store %s: set banned: %w", s.path, err)
+	}
+	if err := ensureLastManagementAdmin(tx); err != nil {
+		return User{}, err
 	}
 	if banned {
 		if _, err := tx.Exec(`DELETE FROM user_tokens WHERE user_id = ?`, user.ID); err != nil {

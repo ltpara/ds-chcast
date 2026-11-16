@@ -37,6 +37,7 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[20].Apply = applyClientStrategyReceipts
 	list[21].Apply = applyViewerStrategyDeliveries
 	list[22].Apply = applyLiveConnections
+	list[23].Apply = applyNamedConsoleRoles
 	return list
 }()
 
