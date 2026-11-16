@@ -98,7 +98,7 @@ func viewDevicePolicy(policy account.DevicePolicy) devicePolicyView {
 }
 
 func (s *server) listDevicePolicies(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok {
 		return
 	}
@@ -133,7 +133,7 @@ func (s *server) listDevicePolicies(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) devicePolicyDetail(w http.ResponseWriter, r *http.Request) {
 	peerID := r.PathValue("peer")
-	if _, ok := s.deviceActor(w, r, consoleAdmin, peerID); !ok {
+	if _, ok := s.devicePermissionActor(w, r, account.PermissionDevicesPolicyRead, peerID); !ok {
 		return
 	}
 	policy, managed, err := s.cfg.Accounts.DevicePolicy(peerID)
@@ -151,7 +151,7 @@ func (s *server) devicePolicyDetail(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) setDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	peerID := r.PathValue("peer")
-	principal, ok := s.deviceActor(w, r, consoleAdmin, peerID)
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionDevicesPolicyWrite, peerID)
 	if !ok {
 		return
 	}
@@ -179,7 +179,7 @@ func (s *server) setDevicePolicy(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) deleteDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	peerID := r.PathValue("peer")
-	principal, ok := s.deviceActor(w, r, consoleAdmin, peerID)
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionDevicesPolicyWrite, peerID)
 	if !ok {
 		return
 	}

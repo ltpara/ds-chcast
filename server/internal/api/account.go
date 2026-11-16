@@ -45,6 +45,7 @@ type loginResponse struct {
 	RefreshToken       string      `json:"refresh_token,omitempty"`
 	RefreshExpiresInMS int64       `json:"refresh_expires_in_ms,omitempty"`
 	User               accountView `json:"user"`
+	Permissions        []string    `json:"permissions"`
 }
 
 type refreshRequest struct {
@@ -55,6 +56,7 @@ type accountResponse struct {
 	User          accountView `json:"user"`
 	TwoFactor     bool        `json:"two_factor"`
 	RecoveryCodes int         `json:"recovery_codes"`
+	Permissions   []string    `json:"permissions"`
 }
 
 type twoFactorStartResponse struct {
@@ -470,12 +472,17 @@ func (s *server) finishLogin(w http.ResponseWriter, r *http.Request, req loginRe
 	}
 	s.auditLogin(r, user.Username, detail, true)
 	s.cfg.Logger.Info("account login", "user", user.Username, "method", detail)
+	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
+	if err != nil {
+		s.cfg.Logger.Error("login permissions", "error", err)
+	}
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:              token,
 		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
 		RefreshToken:       refresh,
 		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
 		User:               viewAccount(user),
+		Permissions:        permissionKeys(permissions),
 	})
 }
 
@@ -521,12 +528,17 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordAudit(r, user.Username, account.AuditRefresh, "rotated", true)
+	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
+	if err != nil {
+		s.cfg.Logger.Error("refresh permissions", "error", err)
+	}
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:              token,
 		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
 		RefreshToken:       refresh,
 		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
 		User:               viewAccount(user),
+		Permissions:        permissionKeys(permissions),
 	})
 }
 
@@ -641,10 +653,17 @@ func (s *server) accountInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read the account")
 		return
 	}
+	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
+	if err != nil {
+		s.cfg.Logger.Error("account permissions", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read the account permissions")
+		return
+	}
 	writeJSON(w, http.StatusOK, accountResponse{
 		User:          viewAccount(user),
 		TwoFactor:     enabled,
 		RecoveryCodes: remaining,
+		Permissions:   permissionKeys(permissions),
 	})
 }
 

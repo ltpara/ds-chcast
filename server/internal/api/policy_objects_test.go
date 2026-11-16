@@ -109,13 +109,14 @@ func TestPolicyObjectRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		method string
 		path   string
+		want   int
 	}{
-		{http.MethodGet, "/v1/policies"},
-		{http.MethodPost, "/v1/policies"},
-		{http.MethodGet, "/v1/policy-assignments"},
-		{http.MethodPost, "/v1/policy-assignments"},
+		{http.MethodGet, "/v1/policies", http.StatusOK},
+		{http.MethodPost, "/v1/policies", http.StatusForbidden},
+		{http.MethodGet, "/v1/policy-assignments", http.StatusOK},
+		{http.MethodPost, "/v1/policy-assignments", http.StatusForbidden},
 	} {
-		if status, body := request(t, tc.method, s.URL+tc.path, `{"name":"x"}`, operator); status != http.StatusForbidden {
+		if status, body := request(t, tc.method, s.URL+tc.path, `{"name":"x"}`, operator); status != tc.want {
 			t.Fatalf("operator %s %s = %d %s", tc.method, tc.path, status, body)
 		}
 	}

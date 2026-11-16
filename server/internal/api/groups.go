@@ -114,6 +114,7 @@ func groupView(group account.AccountGroup, role string) accountGroupView {
 // machine token uses its own role, must cover the resource, and a group-scoped
 // token only reaches its own group.
 func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID string, need consolePermission, resource string) (account.User, string, bool) {
+	permission := consolePermissionKey(need, resource)
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return account.User{}, "", false
@@ -148,23 +149,22 @@ func (s *server) groupActor(w http.ResponseWriter, r *http.Request, groupID stri
 		writeError(w, http.StatusUnauthorized, "server key or account token required")
 		return account.User{}, "", false
 	}
-	effective := consolePermission(-1)
-	if perm, ok := rolePermission(user.Role); ok {
-		effective = perm
-	}
-	role, member, err := s.cfg.Accounts.GroupRole(groupID, user.ID)
+	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, groupID, "", "")
 	if err != nil {
-		writeGroupError(w, err)
+		s.cfg.Logger.Error("group permission check", "group", groupID, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not check the group permission")
 		return account.User{}, "", false
 	}
-	if member {
-		if perm, ok := rolePermission(role); ok {
-			effective = maxPermission(effective, perm)
+	if !permissions[permission] {
+		role, member, memberErr := s.cfg.Accounts.GroupRole(groupID, user.ID)
+		if memberErr != nil {
+			writeGroupError(w, memberErr)
+			return account.User{}, "", false
 		}
-	}
-	if effective < need {
-		writeError(w, http.StatusForbidden, "group role does not allow this action")
-		return account.User{}, "", false
+		if !member || rolePermissionLess(role, permission) {
+			writeError(w, http.StatusForbidden, "group role does not allow this action")
+			return account.User{}, "", false
+		}
 	}
 	return user, user.Username, true
 }
@@ -282,6 +282,19 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if user.ID != "" && !apiToken {
+		permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
+		if err != nil {
+			s.cfg.Logger.Error("list account groups", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not read group permissions")
+			return
+		}
+		if permissions[account.PermissionGroupsWrite] {
+			globalPerm = maxPermission(globalPerm, consoleWrite)
+		} else if permissions[account.PermissionGroupsRead] {
+			globalPerm = maxPermission(globalPerm, consoleRead)
+		}
+	}
 	memberships := make(map[string]string)
 	if user.ID != "" && !apiToken {
 		access, err := s.cfg.Accounts.GroupsForUser(user.ID)
@@ -295,7 +308,22 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var groups []account.AccountGroup
-	if globalPerm >= consoleRead {
+	namedGroupAccess := false
+	if user.ID != "" && !apiToken {
+		bindings, err := s.cfg.Accounts.RoleBindings(user.ID)
+		if err != nil {
+			s.cfg.Logger.Error("list named group access", "error", err)
+			writeError(w, http.StatusInternalServerError, "could not list group permissions")
+			return
+		}
+		for _, binding := range bindings {
+			if binding.ScopeKind == account.RoleScopeGroup || binding.ScopeKind == account.RoleScopeGlobal {
+				namedGroupAccess = true
+				break
+			}
+		}
+	}
+	if globalPerm >= consoleRead || namedGroupAccess {
 		var err error
 		groups, err = s.cfg.Accounts.Groups()
 		if err != nil {
@@ -328,6 +356,24 @@ func (s *server) listAccountGroups(w http.ResponseWriter, r *http.Request) {
 			if perm, ok := rolePermission(role); ok {
 				effective = maxPermission(effective, perm)
 			}
+		}
+		// Named bindings are resolved per group. They can grant access to a
+		// group the caller does not belong to, or add a console role to an
+		// otherwise group-only account.
+		if user.ID != "" && !apiToken {
+			permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, group.ID, "", "")
+			if err != nil {
+				s.cfg.Logger.Error("list group permissions", "group", group.ID, "error", err)
+				writeError(w, http.StatusInternalServerError, "could not read group permissions")
+				return
+			}
+			groupPerm := consolePermission(-1)
+			if permissions[account.PermissionGroupsWrite] {
+				groupPerm = consoleWrite
+			} else if permissions[account.PermissionGroupsRead] {
+				groupPerm = consoleRead
+			}
+			effective = maxPermission(effective, groupPerm)
 		}
 		if effective < consoleRead {
 			continue
@@ -630,4 +676,19 @@ func writeGroupError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "could not complete the group change")
 	}
+}
+
+// rolePermissionLess maps the legacy group-membership ladder into the stable
+// permission catalogue while old group rows remain supported.
+func rolePermissionLess(role, permission string) bool {
+	keys, ok := account.BuiltinRolePermissions(role)
+	if !ok {
+		return true
+	}
+	for _, key := range keys {
+		if key == permission {
+			return false
+		}
+	}
+	return true
 }

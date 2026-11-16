@@ -130,6 +130,31 @@ func normalizePermissionKeys(keys []string) ([]string, error) {
 	return out, nil
 }
 
+// PermissionAllowedForTokenResource reports whether a stable permission is
+// reachable through one machine-token resource family. It prevents a token
+// minted for devices from gaining role management or account access merely
+// because its owner holds a named role with those permissions.
+func PermissionAllowedForTokenResource(permission, resource string) bool {
+	if resource == TokenResourceAll {
+		return true
+	}
+	switch resource {
+	case TokenResourceDevices:
+		return strings.HasPrefix(permission, "devices.")
+	case TokenResourceAudit:
+		return permission == PermissionAuditRead
+	case TokenResourceAccounts:
+		return permission == PermissionAccountsRead || permission == PermissionAccountsWrite
+	case TokenResourceGroups:
+		return permission == PermissionGroupsRead || permission == PermissionGroupsWrite
+	case TokenResourceRecordings:
+		return permission == PermissionRecordingsRead || permission == PermissionRecordingsDelete
+	case TokenResourceOps:
+		return permission == PermissionOpsRead
+	}
+	return false
+}
+
 // BuiltinRolePermissions maps the existing account roles to permission keys.
 // The fixed roles keep their prior ladder while all new authorization flows
 // through the same catalogue as named roles.
@@ -144,7 +169,7 @@ func BuiltinRolePermissions(role string) ([]string, bool) {
 			PermissionConnectionsRead, PermissionDevicesDelete,
 			PermissionDevicesPolicyRead, PermissionDevicesRead,
 			PermissionDevicesWrite, PermissionGroupsRead,
-			PermissionOpsRead, PermissionRecordingsRead,
+			PermissionOpsRead, PermissionRecordingsDelete, PermissionRecordingsRead,
 		}
 	case RoleReadonly:
 		keys = []string{

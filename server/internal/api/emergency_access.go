@@ -45,7 +45,7 @@ func (s *server) issueEmergencyAccess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "the access ticket issuer key has been revoked")
 		return
 	}
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionConnectionsDisconnect, account.TokenResourceDevices)
 	if !ok {
 		return
 	}

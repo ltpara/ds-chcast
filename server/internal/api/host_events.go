@@ -256,7 +256,7 @@ func viewRevokedAccessKid(record account.RevokedAccessKid) revokedAccessKidView 
 }
 
 func (s *server) listRevokedAccessKids(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionConnectionsRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -283,7 +283,7 @@ type revokeAccessKidRequest struct {
 // push ends sessions that are already running instead of waiting for their
 // 60-second lease to lapse.
 func (s *server) revokeAccessKid(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionConnectionsDisconnect, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}

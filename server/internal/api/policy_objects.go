@@ -133,7 +133,7 @@ func viewPolicyAssignment(assignment account.PolicyAssignment) policyAssignmentV
 }
 
 func (s *server) listPolicyObjects(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -151,7 +151,7 @@ func (s *server) listPolicyObjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) exportPolicyObjects(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -200,7 +200,7 @@ func (s *server) exportPolicyObjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) importPolicyObjects(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -296,7 +296,7 @@ func decodePolicyImportBody(w http.ResponseWriter, r *http.Request, dst any) err
 }
 
 func (s *server) createPolicyObject(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -318,7 +318,7 @@ func (s *server) createPolicyObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) policyObjectDetail(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -331,7 +331,7 @@ func (s *server) policyObjectDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) updatePolicyObject(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -356,7 +356,7 @@ func (s *server) updatePolicyObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deletePolicyObject(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -371,7 +371,7 @@ func (s *server) deletePolicyObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listPolicyAssignments(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -389,7 +389,7 @@ func (s *server) listPolicyAssignments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createPolicyAssignment(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -415,7 +415,7 @@ func (s *server) createPolicyAssignment(w http.ResponseWriter, r *http.Request) 
 // Devices that already hold an assignment come back in skipped instead of
 // failing the call, so one stale id cannot discard the rest of the batch.
 func (s *server) bulkPolicyAssignments(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -467,7 +467,7 @@ func (s *server) bulkPolicyAssignments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deletePolicyAssignment(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}

@@ -90,7 +90,7 @@ func writeAPITokenError(w http.ResponseWriter, err error) {
 }
 
 func (s *server) listAPITokens(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	user, _, ok := s.accountActor(w, r, account.PermissionAccountsRead)
 	if !ok || !tokenOwner(w, user) {
 		return
 	}

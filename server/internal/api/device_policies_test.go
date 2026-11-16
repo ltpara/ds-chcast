@@ -67,7 +67,7 @@ func TestDevicePolicyRoutes(t *testing.T) {
 	if reply := decodePolicy(t, body); reply.Managed || reply.Policy != nil {
 		t.Fatalf("unmanaged detail = %+v", reply)
 	}
-	if status, body := request(t, http.MethodGet, s.URL+"/v1/device-policies/devbox", "", operator); status != http.StatusForbidden {
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/device-policies/devbox", "", operator); status != http.StatusOK {
 		t.Fatalf("operator detail = %d %s", status, body)
 	}
 

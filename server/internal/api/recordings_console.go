@@ -22,7 +22,7 @@ type consoleRecordingsResponse struct {
 // username filter is the owner, not the caller, so an operator can inspect one
 // account without knowing its user id.
 func (s *server) consoleRecordings(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, consoleRead, account.TokenResourceRecordings)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionRecordingsRead, account.TokenResourceRecordings)
 	if !ok {
 		return
 	}
@@ -71,7 +71,7 @@ func (s *server) consoleRecordings(w http.ResponseWriter, r *http.Request) {
 // owner comes from the row, so the archive lookup is a plain file open and
 // never trusts a caller-supplied owner.
 func (s *server) consoleDownloadRecording(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, consoleRead, account.TokenResourceRecordings)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionRecordingsRead, account.TokenResourceRecordings)
 	if !ok {
 		return
 	}
@@ -122,7 +122,7 @@ func (s *server) consoleDownloadRecording(w http.ResponseWriter, r *http.Request
 // the owner, with the operator in the detail, so the account trail still shows
 // who removed the file.
 func (s *server) consoleDeleteRecording(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, consoleWrite, account.TokenResourceRecordings)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionRecordingsDelete, account.TokenResourceRecordings)
 	if !ok {
 		return
 	}

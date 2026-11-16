@@ -34,14 +34,18 @@ func TestClientStrategyRoutesAndExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	endpoint := s.URL + "/v1/policies/" + policy.ID + "/client-strategy"
-	for _, tc := range []struct {
-		token  string
-		status int
-	}{{"", http.StatusUnauthorized}, {operator, http.StatusForbidden}, {reader, http.StatusForbidden}} {
-		for _, method := range []string{http.MethodGet, http.MethodPut} {
-			if status, body := request(t, method, endpoint, `{}`, tc.token); status != tc.status {
-				t.Fatalf("unauthorized config: %d %s", status, body)
-			}
+	if status, body := request(t, http.MethodGet, endpoint, "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("unauthorized config read: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPut, endpoint, `{}`, ""); status != http.StatusUnauthorized {
+		t.Fatalf("unauthorized config write: %d %s", status, body)
+	}
+	for _, token := range []string{operator, reader} {
+		if status, body := request(t, http.MethodGet, endpoint, "", token); status != http.StatusOK {
+			t.Fatalf("authorized config read: %d %s", status, body)
+		}
+		if status, body := request(t, http.MethodPut, endpoint, `{}`, token); status != http.StatusForbidden {
+			t.Fatalf("read-only config write: %d %s", status, body)
 		}
 	}
 	if status, body := request(t, http.MethodGet, s.URL+"/v1/client-strategies/catalog", "", admin); status != http.StatusOK {

@@ -13,7 +13,7 @@ import (
 )
 
 func (s *server) clientStrategyCatalog(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -21,7 +21,7 @@ func (s *server) clientStrategyCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) getClientStrategy(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
@@ -34,7 +34,7 @@ func (s *server) getClientStrategy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) setClientStrategy(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyWrite, account.TokenResourceDevices)
 	if !ok || !requireUnscoped(w, principal) {
 		return
 	}

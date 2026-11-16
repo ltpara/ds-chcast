@@ -28,6 +28,7 @@ type loginReply struct {
 		Username string `json:"username"`
 		Role     string `json:"role"`
 	} `json:"user"`
+	Permissions []string `json:"permissions"`
 }
 
 type peerReply struct {

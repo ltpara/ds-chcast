@@ -385,6 +385,14 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/api-tokens", s.listAPITokens)
 	mux.HandleFunc("POST /v1/api-tokens", s.createAPIToken)
 	mux.HandleFunc("DELETE /v1/api-tokens/{id}", s.revokeAPIToken)
+	mux.HandleFunc("GET /v1/admin-roles", s.listAdminRoles)
+	mux.HandleFunc("POST /v1/admin-roles", s.createAdminRole)
+	mux.HandleFunc("GET /v1/admin-roles/{id}", s.getAdminRole)
+	mux.HandleFunc("PUT /v1/admin-roles/{id}", s.updateAdminRole)
+	mux.HandleFunc("DELETE /v1/admin-roles/{id}", s.deleteAdminRole)
+	mux.HandleFunc("GET /v1/role-bindings", s.listRoleBindings)
+	mux.HandleFunc("POST /v1/role-bindings", s.createRoleBinding)
+	mux.HandleFunc("DELETE /v1/role-bindings/{id}", s.deleteRoleBinding)
 	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /v1/accounts", s.adminCreateAccount)
 	mux.HandleFunc("PATCH /v1/accounts/{username}", s.adminUpdateAccount)
@@ -1265,7 +1273,7 @@ type deviceBulkResponse struct {
 // reported back instead of failing the whole request, so a console selection
 // that went stale still applies to the devices that remain.
 func (s *server) bulkDevices(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, consoleWrite, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesWrite, account.TokenResourceDevices)
 	if !ok {
 		return
 	}

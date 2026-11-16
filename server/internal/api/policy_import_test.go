@@ -50,11 +50,12 @@ func TestPolicyObjectImportExportRoutes(t *testing.T) {
 		method string
 		path   string
 		body   string
+		want   int
 	}{
-		{http.MethodGet, "/v1/policies/export", ""},
-		{http.MethodPost, "/v1/policies/import", `{"format":"chast-policy-objects","version":1,"policies":[]}`},
+		{http.MethodGet, "/v1/policies/export", "", http.StatusOK},
+		{http.MethodPost, "/v1/policies/import", `{"format":"chast-policy-objects","version":1,"policies":[]}`, http.StatusForbidden},
 	} {
-		if status, body := request(t, tc.method, s.URL+tc.path, tc.body, operator); status != http.StatusForbidden {
+		if status, body := request(t, tc.method, s.URL+tc.path, tc.body, operator); status != tc.want {
 			t.Fatalf("operator %s %s = %d %s", tc.method, tc.path, status, body)
 		}
 		if status, body := request(t, tc.method, s.URL+tc.path, tc.body, ""); status != http.StatusUnauthorized {

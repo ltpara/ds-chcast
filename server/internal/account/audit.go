@@ -64,6 +64,12 @@ const (
 	AuditGroupDeviceAdd    = "group_device_add"
 	AuditGroupDeviceRemove = "group_device_remove"
 
+	AuditRoleCreate = "role_create"
+	AuditRoleUpdate = "role_update"
+	AuditRoleDelete = "role_delete"
+	AuditRoleBind   = "role_bind"
+	AuditRoleUnbind = "role_unbind"
+
 	AuditDevicePolicyUpdate  = "device_policy_update"
 	AuditDevicePolicyDelete  = "device_policy_delete"
 	AuditDevicePolicyReceipt = "device_policy_receipt"

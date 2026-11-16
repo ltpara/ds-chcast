@@ -40,7 +40,7 @@ type hostLiveReceiptRequest struct {
 }
 
 func (s *server) listLiveConnections(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, consoleRead, account.TokenResourceDevices)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionConnectionsRead, account.TokenResourceDevices)
 	if !ok {
 		return
 	}
@@ -60,7 +60,7 @@ func (s *server) listLiveConnections(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) getLiveConnection(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("host")
-	_, ok := s.deviceActor(w, r, consoleRead, hostID)
+	_, ok := s.devicePermissionActor(w, r, account.PermissionConnectionsRead, hostID)
 	if !ok {
 		return
 	}
@@ -75,7 +75,7 @@ func (s *server) getLiveConnection(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) disconnectLiveConnection(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("host")
-	principal, ok := s.deviceActor(w, r, consoleWrite, hostID)
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionConnectionsDisconnect, hostID)
 	if !ok {
 		return
 	}

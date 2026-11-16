@@ -86,7 +86,7 @@ func (s *server) adminPrincipal(w http.ResponseWriter, r *http.Request, resource
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return consolePrincipal{}, false
 	}
-	return s.consolePrincipalFor(w, r, consoleAdmin, resource)
+	return s.consolePrincipalFor(w, r, account.PermissionAccountsWrite, resource)
 }
 
 func (s *server) adminActor(w http.ResponseWriter, r *http.Request, resource string) (account.User, string, bool) {
@@ -97,8 +97,20 @@ func (s *server) adminActor(w http.ResponseWriter, r *http.Request, resource str
 	return principal.User, principal.Actor, true
 }
 
+func (s *server) accountActor(w http.ResponseWriter, r *http.Request, permission string) (account.User, string, bool) {
+	principal, ok := s.consolePrincipalFor(w, r, permission, account.TokenResourceAccounts)
+	if !ok {
+		return account.User{}, "", false
+	}
+	return principal.User, principal.Actor, true
+}
+
 func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.adminActor(w, r, account.TokenResourceAccounts); !ok {
+	if s.cfg.Accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
+		return
+	}
+	if _, _, ok := s.accountActor(w, r, account.PermissionAccountsRead); !ok {
 		return
 	}
 	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
@@ -205,7 +217,7 @@ func (s *server) exportAccounts(w http.ResponseWriter, users []account.User, cap
 // of any single device policy. The next ticket issuance applies the new mask;
 // the device policy ceiling still tightens it further where configured.
 func (s *server) adminSetAccountSessionCap(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}
@@ -233,7 +245,7 @@ func (s *server) adminSetAccountSessionCap(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}
@@ -291,7 +303,7 @@ func (s *server) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}
@@ -305,7 +317,7 @@ func (s *server) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminResetAccountPassword(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}
@@ -340,7 +352,7 @@ func (s *server) adminResetAccountPassword(w http.ResponseWriter, r *http.Reques
 // adminSetAccountBan blocks or restores an account. A ban revokes every live
 // session in the store; lifting it lets the next login through again.
 func (s *server) adminSetAccountBan(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}
@@ -363,7 +375,7 @@ func (s *server) adminSetAccountBan(w http.ResponseWriter, r *http.Request) {
 // where it is signed in and cut a stale device without banning the account.
 // The caller's own session is flagged only when the target account is theirs.
 func (s *server) adminAccountSessions(w http.ResponseWriter, r *http.Request) {
-	_, _, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, _, ok := s.accountActor(w, r, account.PermissionAccountsRead)
 	if !ok {
 		return
 	}
@@ -398,7 +410,7 @@ func (s *server) adminAccountSessions(w http.ResponseWriter, r *http.Request) {
 // itself signed in with; that account keeps RevokeOtherSessions for its own
 // sign-outs.
 func (s *server) adminRevokeAccountSession(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}
@@ -444,7 +456,7 @@ func (s *server) adminRevokeAccountSession(w http.ResponseWriter, r *http.Reques
 // signed in as that same account keeps the session it is calling with, so
 // "sign out everywhere" cannot lock the caller out of the console.
 func (s *server) adminRevokeAccountSessions(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.adminPrincipal(w, r, account.TokenResourceAccounts)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionAccountsWrite, account.TokenResourceAccounts)
 	if !ok {
 		return
 	}
@@ -471,7 +483,7 @@ func (s *server) adminRevokeAccountSessions(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *server) adminResetAccountTwoFactor(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
+	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
 	if !ok {
 		return
 	}

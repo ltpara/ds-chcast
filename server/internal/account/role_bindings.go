@@ -242,3 +242,24 @@ func (s *Store) UnbindRole(bindingID string) (RoleBindingView, error) {
 	}
 	return binding, nil
 }
+
+// RoleBindingEscalation reports whether assigning role would give a binding
+// subject permissions the caller does not already hold globally. Role managers
+// must not be able to bootstrap stronger permissions by rebinding themselves
+// or another account.
+func (s *Store) RoleBindingEscalation(userID string, role AdminRole) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ErrUnknownUser
+	}
+	held, err := s.EffectiveConsolePermissions(userID, "", "", "")
+	if err != nil {
+		return err
+	}
+	for _, key := range role.Permissions {
+		if !held[key] {
+			return ErrPermissionDenied
+		}
+	}
+	return nil
+}
