@@ -22,7 +22,7 @@
 
 `ds-chcast` 的服务器通信主干已经基本覆盖 RustDesk OSS 的核心能力，在部分中继调度和企业安全能力上更丰富，包括会合、注册、NAT 探测、打洞、中继、账号认证、设备准入、地址簿共享、审计、录制上传和运维监控。
 
-当前仍不能认定服务器端已经完整对齐 RustDesk Server Pro。主要差距集中在企业管理面：完整客户端 Strategy、自定义 Admin Role、活动远控会话强制断开、地址簿密码同步、独立命名共享地址簿、Control Role 三态覆盖、Alarm 日志、用户邀请和邮件偏好，以及定制客户端生成。
+当前仍不能认定服务器端已经完整对齐 RustDesk Server Pro。完整客户端 Strategy、活动远控会话强制断开和自定义 Admin Role 的服务端主体已经接通；管理台角色接入与浏览器验收仍待完成。其余差距集中在地址簿密码同步、独立命名共享地址簿、Control Role 三态覆盖、Alarm 日志、用户邀请和邮件偏好，以及定制客户端生成。
 
 如果目标还包括让官方 RustDesk 客户端直接连接本项目服务器，则存在更高优先级的协议兼容差距：本项目使用自有 HTTP/JSON、wire 和 QUIC 协议，没有实现 RustDesk protobuf hbbs/hbbr 线协议。
 
@@ -76,19 +76,16 @@ RustDesk 客户端心跳可以接收 Strategy，并将任意 `config_options` �
 
 RustDesk Pro 支持自定义管理角色，并可按全局、单对象和组范围细分用户、设备、组、策略、审计和定制客户端等管理权限。
 
-本项目的人类账号使用固定角色：
+服务端已经实现稳定权限键、命名 Admin Role、全局/组/对象作用域绑定、角色和绑定 API、审计及角色提权防护，提交为 `d65d62c`。现有固定角色继续映射到同一权限目录，保持原语义。
 
-- `admin`
-- `operator`
-- `readonly`
-- `user`
+主要入口：
 
-证据：
+- `server/internal/account/admin_roles.go`
+- `server/internal/account/role_bindings.go`
+- `server/internal/api/admin_roles.go`
+- `server/internal/api/console.go`
 
-- `server/internal/account/store.go:161-179`
-- `server/internal/api/console.go:20-29`
-
-API Token 虽然支持资源集合和账号组范围，但不能代替可分配给人类管理员的自定义命名角色。
+剩余差距集中在管理台：`app.js` 仍按固定角色判断，尚未保存和消费 `/v1/account` 的 `permissions`，也没有角色创建、权限多选和绑定界面。因此当前不能把本项写成完全完成，仍需管理台浏览器 E2E、PostgreSQL 实库和完整越权回归。
 
 ### 4.3 活动远控会话查询和强制断开（P1）
 
@@ -221,7 +218,7 @@ RustDesk Pro 可以结合 GeoLocation/MaxMind 信息选择较近的中继节点�
 
 1. **P1：补齐通用 Strategy 数据模型和客户端同步通道。** 在现有访问策略之外增加类型化或受控键集合的客户端配置载荷、优先级、版本、回执和失败可见性。
 2. **P1：实现活动连接目录与强制断开。** 让主机心跳上报活动连接标识，由管理端授权后向指定主机推送断开命令，并完整记录审计。
-3. **P1：实现可自定义 Admin Role。** 将现有控制台动作映射为稳定权限键，支持命名角色、作用域和人类账号分配。
+3. **P1：完成自定义 Admin Role 的管理台接入。** 服务端稳定权限键、命名角色、作用域和人类账号分配已完成；下一步接入管理台权限渲染、角色与绑定界面，并执行浏览器 E2E。
 4. **P1/P2：设计地址簿密码端到端加密。** 先完成威胁模型、密钥派生、共享密钥封装和恢复设计，再扩展服务端存储。
 5. **P2：增加独立共享地址簿实体。** 将共享簿从“用户个人簿视图”提升为独立资源，并保留现有分组授权能力。
 6. **P2：补齐 Control Role、Alarm、用户邀请和邮件偏好。** 这些能力可以复用现有权限位、审计和邮件基础设施。
@@ -231,4 +228,4 @@ RustDesk Pro 可以结合 GeoLocation/MaxMind 信息选择较近的中继节点�
 
 服务器端已经具备可用且较完整的远控基础设施，RustDesk OSS 的核心会合和中继能力没有发现明显功能断层。当前差距主要位于 RustDesk Server Pro 的集中管理和企业治理功能。
 
-在完成完整 Strategy、自定义 Admin Role、活动会话断开、地址簿密码与独立共享簿之前，不应将服务器端状态描述为“已与 RustDesk Pro 完全对齐”。
+在完成 S03 管理台接入与外部验收、地址簿密码与独立共享簿之前，不应将服务器端状态描述为“已与 RustDesk Pro 完全对齐”。
