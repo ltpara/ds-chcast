@@ -412,6 +412,15 @@ if(GO_EXECUTABLE)
 endif()
 
 if(CHAST_BUILD_TESTS)
+    # Opt-in process acceptance uses the actual tray/tunnel executables and
+    # separate files-only viewers. No desktop capture or UI automation.
+    add_executable(chast-live-viewer-probe tools/live_viewer_probe.cc)
+    target_link_libraries(chast-live-viewer-probe PRIVATE chast.host)
+    add_custom_command(TARGET chast-live-viewer-probe POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-live-viewer-probe>
+        VERBATIM)
+
     add_executable(chast-capture tools/capture.cc tools/crash_handler.cc)
     target_link_libraries(chast-capture PRIVATE chast.dxgi dbghelp)
 

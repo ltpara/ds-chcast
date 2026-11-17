@@ -1078,7 +1078,7 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool, viewerIP n
 
 func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	principal, ok := s.deviceActor(w, r, consoleWrite, id)
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionDevicesDelete, id)
 	if !ok {
 		return
 	}
@@ -1109,7 +1109,7 @@ func (s *server) releaseLease(id string, host registry.Host) {
 // removes the permanent binding as well as any live lease.
 func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	principal, ok := s.deviceActor(w, r, consoleWrite, id)
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionDevicesDelete, id)
 	if !ok {
 		return
 	}
@@ -1273,7 +1273,7 @@ type deviceBulkResponse struct {
 // reported back instead of failing the whole request, so a console selection
 // that went stale still applies to the devices that remain.
 func (s *server) bulkDevices(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesWrite, account.TokenResourceDevices)
+	scope, ok := s.deviceCollectionActor(w, r, account.PermissionDevicesWrite)
 	if !ok {
 		return
 	}
@@ -1308,16 +1308,17 @@ func (s *server) bulkDevices(w http.ResponseWriter, r *http.Request) {
 		seen[id] = true
 		ids = append(ids, id)
 	}
-	if principal.GroupID != "" {
+	if scope.allowed != nil {
 		for _, id := range ids {
-			if !s.deviceInScope(w, principal, id) {
+			if !scope.allowed[id] {
+				writeError(w, http.StatusForbidden, "device is outside the authorized scope")
 				return
 			}
 		}
 	}
 	resp := deviceBulkResponse{Disabled: *req.Disabled, Updated: []string{}, Missing: []string{}}
 	for _, id := range ids {
-		if _, found, err := s.setDeviceDisabled(r, principal.Actor, id, *req.Disabled); err != nil {
+		if _, found, err := s.setDeviceDisabled(r, scope.principal.Actor, id, *req.Disabled); err != nil {
 			s.cfg.Logger.Error("bulk device state", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, "could not persist the device state")
 			return
@@ -1328,9 +1329,9 @@ func (s *server) bulkDevices(w http.ResponseWriter, r *http.Request) {
 		resp.Updated = append(resp.Updated, id)
 	}
 	if *req.Disabled {
-		s.cfg.Logger.Info("devices disabled", "count", len(resp.Updated), "actor", principal.Actor)
+		s.cfg.Logger.Info("devices disabled", "count", len(resp.Updated), "actor", scope.principal.Actor)
 	} else {
-		s.cfg.Logger.Info("devices enabled", "count", len(resp.Updated), "actor", principal.Actor)
+		s.cfg.Logger.Info("devices enabled", "count", len(resp.Updated), "actor", scope.principal.Actor)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

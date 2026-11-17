@@ -30,7 +30,10 @@
     connectionDetailKey: null,
     connectionPollTimer: 0,
     connectionRequestKey: null,
+    connectionRequests: new Map(),
     connectionSending: false,
+    connectionDetailGen: 0,
+    connectionRefreshGen: 0,
     pendingBulk: '',
     bulkTimer: 0,
     auditTab: 'events',
@@ -86,6 +89,11 @@
     roleBindings: [],
     roleEditing: null,
     rolesLoading: false,
+    roleEpoch: 0,
+    roleListGen: 0,
+    roleWriteBusy: false,
+    roleConflict: false,
+    roleAction: null,
   };
 
   class ApiError extends Error {
@@ -307,6 +315,73 @@
     return Array.isArray(auth.permissions) && auth.permissions.includes(key);
   }
 
+  function sessionScopedPermissions(data) {
+    return data && Array.isArray(data.scoped_permissions) ? data.scoped_permissions : [];
+  }
+
+  // This predicate is only for device/connection navigation. Global pages keep
+  // using canPermission; each row carries permissions resolved by the server.
+  function canDeviceCollection(key) {
+    if (canPermission(key)) return true;
+    return sessionScopedPermissions(state.auth).some((grant) =>
+      (grant.scope_kind === 'group' || (grant.scope_kind === 'object' && grant.object_kind === 'device')) &&
+      Array.isArray(grant.permissions) && grant.permissions.includes(key));
+  }
+
+  function hasScopedDeviceAccess(data) {
+    return sessionScopedPermissions(data).some((grant) =>
+      (grant.scope_kind === 'group' || (grant.scope_kind === 'object' && grant.object_kind === 'device')) &&
+      Array.isArray(grant.permissions) && grant.permissions.some((key) =>
+        key === 'devices.read' || key === 'connections.read'));
+  }
+
+  function canDeviceAction(row, key) {
+    if (!state.auth) return false;
+    if (state.auth.mode === 'key') return true;
+    if (!canDeviceCollection(key)) return false;
+    return Array.isArray(row && row.console_permissions) && row.console_permissions.includes(key);
+  }
+
+  function updateSessionGrants(auth, data) {
+    const permissions = sessionPermissions(data);
+    const scoped = sessionScopedPermissions(data);
+    const changed = JSON.stringify([auth.permissions, auth.scoped_permissions]) !== JSON.stringify([permissions, scoped]);
+    auth.permissions = permissions;
+    auth.scoped_permissions = scoped;
+    if (changed) {
+      // Never keep actionable rows or dialogs from a revoked scope.
+      state.deviceSelection.clear();
+      state.deviceList = [];
+      state.connectionRows = [];
+      state.connectionGen++;
+      state.connectionDetail = null;
+      state.connectionDetailKey = null;
+      resetConnectionDetail();
+      state.connectionRequests.clear();
+      state.connectionRequestKey = null;
+      resetPolicyConsole();
+      // Role visibility also depends on the credential's permission ceiling.
+      // Invalidate responses and drafts captured before the grants changed.
+      resetRoleConsole();
+      if (typeof document !== 'undefined') {
+        clearRolePanels();
+        stopConnectionPoll();
+        clear($('device-rows'));
+        clear($('connection-rows'));
+        for (const id of ['device-dialog', 'connection-dialog']) {
+          if ($(id).open) $(id).close();
+        }
+      }
+    }
+  }
+
+  async function refreshConsolePermissions() {
+    const auth = state.auth;
+    if (!auth || auth.mode !== 'account') return;
+    const data = await api('/v1/account');
+    if (state.auth === auth) applySessionPermissions(data);
+  }
+
   // groupOnly is an account with no console-wide stable permission. Group
   // access still comes from group memberships and group-scoped role bindings.
   function groupOnly() {
@@ -322,7 +397,7 @@
   function applySessionPermissions(data) {
     const auth = state.auth;
     if (!auth || auth.mode !== 'account') return [];
-    auth.permissions = sessionPermissions(data);
+    updateSessionGrants(auth, data);
     writeSession(auth);
     renderSession();
     applyPermissions();
@@ -435,7 +510,7 @@
         auth.username = data.user.username || auth.username;
         auth.role = data.user.role || auth.role;
       }
-      auth.permissions = sessionPermissions(data);
+      updateSessionGrants(auth, data);
       writeSession(auth);
       renderSession();
       applyPermissions();
@@ -472,7 +547,9 @@
     }
     if (!resp.ok) {
       const message = data && data.error ? data.error : resp.status + ' ' + resp.statusText;
-      throw new ApiError(message, resp.status);
+      const error = new ApiError(message, resp.status);
+      if (data && data.code) error.code = data.code;
+      throw error;
     }
     return data;
   }
@@ -504,7 +581,7 @@
   async function adoptAccountSession(data, username) {
     const user = data && data.user ? data.user : {};
     const permissions = sessionPermissions(data);
-    if (!permissions.length && !(await hasGroupConsoleAccess(data.token))) {
+    if (!permissions.length && !hasScopedDeviceAccess(data) && !(await hasGroupConsoleAccess(data.token))) {
       // The session is valid but useless here; revoke it right away.
       fetch('/v1/account/logout', {
         method: 'POST',
@@ -520,6 +597,7 @@
       username: user.username || username,
       role: user.role,
       permissions,
+      scoped_permissions: sessionScopedPermissions(data),
     };
     writeSession(state.auth);
     await enterConsole();
@@ -833,6 +911,7 @@
   }
 
   async function enterConsole() {
+    await refreshConsolePermissions();
     // Any login that wins the console cancels a still-running SSO poll.
     state.oidcGen++;
     $('login-form').classList.add('hidden');
@@ -853,7 +932,7 @@
       state.groupsLoaded = true;
     }
     const permissions = Array.isArray(state.auth.permissions) ? state.auth.permissions : [];
-    if (!permissions.length && groupOnly() && !state.groups.length) {
+    if (!permissions.length && !hasScopedDeviceAccess(state.auth) && groupOnly() && !state.groups.length) {
       lock('该账号没有管理台或分组授权。');
       return;
     }
@@ -876,7 +955,7 @@
   }
 
   const TAB_PERMISSIONS = {
-    overview: 'devices.read',
+    overview: 'ops.read',
     devices: 'devices.read',
     connections: 'connections.read',
     policies: 'devices.policy.read',
@@ -894,8 +973,9 @@
     const auth = state.auth;
     if (!auth) return false;
     if (tab === 'mine') return auth.mode === 'account';
+    if (tab === 'devices' || tab === 'connections') return canDeviceCollection(TAB_PERMISSIONS[tab]);
     if (tab === 'groups' || tab === 'audit') {
-      return groupOnly() || canPermission(TAB_PERMISSIONS[tab]);
+      return (groupOnly() && state.groups.length > 0) || canPermission(TAB_PERMISSIONS[tab]);
     }
     if (tab === 'overview' && groupOnly()) return false;
     return canPermission(TAB_PERMISSIONS[tab]);
@@ -920,8 +1000,8 @@
     const accountsWrite = canPermission('accounts.write');
     const groupsWrite = canPermission('groups.write');
     const rolesWrite = canPermission('roles.write');
-    $('device-readonly').classList.toggle('hidden', canPermission('devices.write') || canPermission('devices.delete'));
-    $('connection-readonly').classList.toggle('hidden', canPermission('connections.disconnect'));
+    $('device-readonly').classList.toggle('hidden', canDeviceCollection('devices.write') || canDeviceCollection('devices.delete'));
+    $('connection-readonly').classList.toggle('hidden', canDeviceCollection('connections.disconnect'));
     $('recording-readonly').classList.toggle('hidden', canPermission('recordings.delete'));
     $('group-create-panel').classList.toggle('hidden', !groupsWrite);
     $('group-readonly').classList.toggle('hidden', groupsWrite);
@@ -940,10 +1020,14 @@
   }
 
   function applyRoleControlPermissions() {
-    const rolesWrite = canPermission('roles.write');
+    const rolesWrite = canPermission('roles.write') && !state.roleWriteBusy;
     $('role-editor-reset').disabled = !rolesWrite;
-    $('role-refresh').disabled = !canPermission('roles.read');
-    $('role-binding-refresh').disabled = !canPermission('roles.read');
+    // Background polling must not blur a focused refresh button. loadRoles
+    // already coalesces clicks while a request is running.
+    for (const id of ['role-refresh', 'role-binding-refresh']) {
+      $(id).disabled = !canPermission('roles.read');
+      $(id).setAttribute('aria-busy', String(state.rolesLoading));
+    }
     $('roles-create').querySelectorAll('input,textarea,button').forEach((node) => {
       node.disabled = !rolesWrite;
     });
@@ -956,6 +1040,12 @@
     $('role-binding-rows').querySelectorAll('button').forEach((node) => {
       node.disabled = !rolesWrite;
     });
+    $('role-save').disabled = !rolesWrite || state.roleConflict;
+    $('role-editor-reload').disabled = !rolesWrite;
+    $('role-action-confirm').disabled = !rolesWrite || !state.roleAction || !!state.roleAction.blocked;
+    $('role-action-cancel').disabled = state.roleWriteBusy;
+    $('role-action-dialog').setAttribute('aria-busy', String(state.roleWriteBusy));
+    $('role-action-status').textContent = state.roleAction && state.roleWriteBusy ? '正在提交，请稍候…' : '';
     // Keep the server and browser in agreement after the role rows load.
     syncRoleBindingScope();
   }
@@ -986,7 +1076,9 @@
     state.connectionDetail = null;
     state.connectionDetailKey = null;
     state.connectionRequestKey = null;
+    state.connectionRequests.clear();
     state.connectionSending = false;
+    resetConnectionDetail();
     stopConnectionPoll();
     const connectionDialog = $('connection-dialog');
     if (connectionDialog.open) connectionDialog.close();
@@ -1002,6 +1094,7 @@
     state.policyObjects = [];
     state.policyAssignments = [];
     state.policyObjectEditing = null;
+    resetPolicyConsole();
     state.clientStrategyGen++;
     state.clientStrategyStatusGen++;
     state.clientStrategy = null;
@@ -1049,19 +1142,27 @@
 
   function startTimer() {
     stopTimer();
-    state.timer = setInterval(() => {
-      if (document.hidden) return;
-      if (state.tab === 'overview') {
-        refreshOverview().catch(() => {});
-      } else if (state.tab === 'devices') {
-        loadDevices(true).catch(() => {});
-      } else if (state.tab === 'connections') {
-        loadConnections(true).catch(() => {});
-      } else if (state.tab === 'policies') {
-        loadPolicies(true).catch(() => {});
-      } else if (state.tab === 'groups') {
-        loadGroups(true).catch(() => {});
-      }
+    let running = false;
+    state.timer = setInterval(async () => {
+      if (document.hidden || running) return;
+      running = true;
+      try {
+        await refreshConsolePermissions();
+        if (!state.auth) return;
+        if (state.tab === 'overview') {
+          refreshOverview().catch(() => {});
+        } else if (state.tab === 'devices') {
+          loadDevices(true).catch(() => {});
+        } else if (state.tab === 'connections') {
+          loadConnections(true).catch(() => {});
+        } else if (state.tab === 'policies') {
+          loadPolicies(true).catch(() => {});
+        } else if (state.tab === 'groups') {
+          loadGroups(true).catch(() => {});
+        } else if (state.tab === 'roles') {
+          loadRoles(true).catch(() => {});
+        }
+      } catch { /* retry on the next tick */ } finally { running = false; }
     }, REFRESH_MS);
   }
 
@@ -1078,6 +1179,7 @@
     state.tab = tab;
     document.querySelectorAll('.tab').forEach((node) => {
       node.classList.toggle('active', node.dataset.tab === tab);
+      node.setAttribute('aria-selected', node.dataset.tab === tab ? 'true' : 'false');
     });
     document.querySelectorAll('.panel-page').forEach((node) => {
       node.classList.toggle('active', node.id === 'panel-' + tab);
@@ -1294,6 +1396,7 @@
 
   async function loadDevices(silent) {
     if (state.devicesLoading) return;
+    const grants = JSON.stringify([state.auth.permissions, state.auth.scoped_permissions]);
     state.devicesLoading = true;
     try {
       const params = new URLSearchParams();
@@ -1303,6 +1406,7 @@
       params.set('limit', String(state.deviceLimit));
       params.set('offset', String(state.deviceOffset));
       const data = await api('/v1/identities?' + params.toString());
+      if (grants !== JSON.stringify([state.auth.permissions, state.auth.scoped_permissions])) return;
       renderDevices(data || {});
     } catch (err) {
       if (!silent) throw err;
@@ -1316,7 +1420,7 @@
     state.deviceList = peers;
     const known = new Set(peers.map((peer) => peer.id));
     Array.from(state.deviceSelection).forEach((id) => {
-      if (!known.has(id)) state.deviceSelection.delete(id);
+      if (!known.has(id) || !canDeviceAction(peers.find((peer) => peer.id === id), 'devices.write')) state.deviceSelection.delete(id);
     });
     const total = data.total === undefined ? peers.length : data.total;
     const online = data.online === undefined ? 0 : data.online;
@@ -1353,16 +1457,17 @@
     resetBulkPrompt();
     const count = state.deviceSelection.size;
     $('device-selection').textContent = count ? '已选择 ' + count + ' 台' : '未选择设备';
-    const writable = canPermission('devices.write');
+    const writable = Array.from(state.deviceSelection).every((id) =>
+      canDeviceAction(state.deviceList.find((peer) => peer.id === id), 'devices.write'));
     $('device-bulk-disable').disabled = !writable || count === 0;
     $('device-bulk-enable').disabled = !writable || count === 0;
     $('device-bulk-clear').disabled = count === 0;
     const all = $('device-select-all');
-    const visible = state.deviceList.length;
+    const visible = state.deviceList.filter((peer) => canDeviceAction(peer, 'devices.write')).length;
     const selected = state.deviceList.filter((peer) => state.deviceSelection.has(peer.id)).length;
     all.checked = visible > 0 && selected === visible;
     all.indeterminate = selected > 0 && selected < visible;
-    all.disabled = !writable || visible === 0;
+    all.disabled = visible === 0;
   }
 
   function resetBulkPrompt() {
@@ -1402,6 +1507,7 @@
 
     const pick = document.createElement('input');
     pick.type = 'checkbox';
+    pick.disabled = !canDeviceAction(peer, 'devices.write');
     pick.checked = state.deviceSelection.has(peer.id);
     pick.title = '选择 ' + peer.id;
     pick.addEventListener('change', () => {
@@ -1451,8 +1557,8 @@
     tr.appendChild(cell(fmtAge(peer.last_seen_ms)));
 
     const actions = el('div', 'actions-wrap');
-    const canWrite = canPermission('devices.write');
-    const canDelete = canPermission('devices.delete');
+    const canWrite = canDeviceAction(peer, 'devices.write');
+    const canDelete = canDeviceAction(peer, 'devices.delete');
     if (!canWrite && !canDelete) {
       tr.appendChild(cell(el('span', 'muted', '只读')));
       return tr;
@@ -1597,7 +1703,11 @@
   }
 
   async function loadPolicies(silent) {
+    if (!canPermission('devices.policy.read')) return;
     if (state.policiesLoading) return;
+    const auth = state.auth;
+    const epoch = state.roleEpoch;
+    const current = () => state.auth === auth && state.roleEpoch === epoch;
     state.policiesLoading = true;
     try {
       const [devices, objects, assignments] = await Promise.all([
@@ -1605,6 +1715,7 @@
         api('/v1/policies'),
         api('/v1/policy-assignments'),
       ]);
+      if (!current()) return;
       state.policies = Array.isArray(devices && devices.policies) ? devices.policies : [];
       state.policyObjects = Array.isArray(objects && objects.policies) ? objects.policies : [];
       state.policyAssignments = Array.isArray(assignments && assignments.assignments)
@@ -1612,6 +1723,7 @@
       state.policiesLoaded = true;
       renderPolicies();
     } catch (err) {
+      if (!current()) return;
       if (err && err.status === 503) {
         state.policies = [];
         state.policyObjects = [];
@@ -1623,8 +1735,33 @@
       }
       if (!silent) throw err;
     } finally {
-      state.policiesLoading = false;
+      if (current()) state.policiesLoading = false;
     }
+  }
+
+  function resetPolicyConsole() {
+    state.policiesLoading = false;
+    state.policiesLoaded = false;
+    state.policies = [];
+    state.policyObjects = [];
+    state.policyAssignments = [];
+    state.policyEditing = null;
+    state.policyObjectEditing = null;
+    state.clientStrategyGen++;
+    state.clientStrategyStatusGen++;
+    state.clientStrategy = null;
+    state.clientStrategyPeer = '';
+    if (typeof document === 'undefined') return;
+    for (const id of ['policy-dialog', 'policy-object-dialog', 'policy-assignment-dialog', 'client-strategy-dialog', 'client-strategy-status-dialog']) {
+      if ($(id).open) $(id).close();
+    }
+    for (const id of ['policy-rows', 'policy-object-rows', 'policy-assignment-rows', 'client-strategy-fields', 'client-strategy-status-results']) clear($(id));
+    $('client-strategy-save').disabled = true;
+    $('client-strategy-reload').disabled = true;
+    $('client-strategy-note').textContent = '';
+    $('client-strategy-error').textContent = '';
+    $('client-strategy-status-note').textContent = '';
+    $('policy-summary').textContent = '';
   }
 
   async function exportPolicyObjects() {
@@ -1921,6 +2058,7 @@
   }
 
   async function openClientStrategy(policy) {
+    if (!canPermission('devices.policy.read') || (state.clientStrategy && state.clientStrategy.saving)) return;
     const generation = ++state.clientStrategyGen;
     const auth = state.auth;
     state.clientStrategy = null;
@@ -1974,7 +2112,8 @@
         $('client-strategy-fields').appendChild(box);
         fields.push({def, mode, value});
       });
-      state.clientStrategy = {policy, revision: config.revision, fields, auth, generation};
+      state.clientStrategy = {policy, revision: config.revision, fields, auth, generation, saving: false};
+      $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = !canPermission('devices.policy.write'); });
       $('client-strategy-note').textContent = '配置版本 ' + config.revision + '。保存后等待客户端应用回报；“使用本地设置”会撤销该项覆盖。';
       $('client-strategy-save').disabled = !canPermission('devices.policy.write');
       $('client-strategy-reload').disabled = false;
@@ -1988,7 +2127,7 @@
 
   async function saveClientStrategy() {
     const editing = state.clientStrategy;
-    if (!editing || editing.auth !== state.auth) return;
+    if (!editing || editing.auth !== state.auth || editing.saving || editing.conflict || !canPermission('devices.policy.write')) return;
     const settings = {};
     for (const {def, mode, value} of editing.fields) {
       if (mode.value === 'inherit') continue;
@@ -2004,31 +2143,35 @@
       settings[def.key] = {mode: mode.value, value: typed};
     }
     $('client-strategy-error').textContent = '';
-    await withButton($('client-strategy-save'), async () => {
-      $('client-strategy-reload').disabled = true;
-      $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = true; });
-      try {
-        const saved = await api('/v1/policies/' + encodeURIComponent(editing.policy.id) + '/client-strategy', {
-          method: 'PUT', body: {if_revision: editing.revision, settings},
-        });
-        if (editing !== state.clientStrategy || editing.auth !== state.auth) return;
-        editing.revision = saved.revision;
-        $('client-strategy-note').textContent = '配置版本 ' + saved.revision + ' 已保存，等待客户端应用回报。';
-        toast('客户端设置已保存，尚需确认设备应用状态');
-      } catch (err) {
-        if (editing !== state.clientStrategy || editing.auth !== state.auth) return;
-        $('client-strategy-error').textContent = err.status === 409
-          ? '配置已被其他管理员修改。当前输入已保留；重新加载后核对并再次编辑。' : err.message;
-      } finally {
-        if (editing === state.clientStrategy) {
-          $('client-strategy-reload').disabled = false;
-          $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = false; });
-        }
+    editing.saving = true;
+    $('client-strategy-save').disabled = true;
+    $('client-strategy-reload').disabled = true;
+    $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = true; });
+    try {
+      const saved = await api('/v1/policies/' + encodeURIComponent(editing.policy.id) + '/client-strategy', {
+        method: 'PUT', body: {if_revision: editing.revision, settings},
+      });
+      if (editing !== state.clientStrategy || editing.auth !== state.auth) return;
+      editing.revision = saved.revision;
+      $('client-strategy-note').textContent = '配置版本 ' + saved.revision + ' 已保存，等待客户端应用回报。';
+      toast('客户端设置已保存，尚需确认设备应用状态');
+    } catch (err) {
+      if (editing !== state.clientStrategy || editing.auth !== state.auth) return;
+      editing.conflict = err.status === 409;
+      $('client-strategy-error').textContent = err.status === 409
+        ? '配置已被其他管理员修改。当前输入已保留；重新加载后核对并再次编辑。' : err.message;
+    } finally {
+      if (editing === state.clientStrategy && editing.auth === state.auth) {
+        editing.saving = false;
+        $('client-strategy-save').disabled = !!editing.conflict || !canPermission('devices.policy.write');
+        $('client-strategy-reload').disabled = false;
+        $('client-strategy-fields').querySelectorAll('fieldset').forEach((field) => { field.disabled = !canPermission('devices.policy.write'); });
       }
-    });
+    }
   }
 
   async function openClientStrategyStatus(peer) {
+    if (!canDeviceCollection('devices.policy.read')) return;
     const generation = ++state.clientStrategyStatusGen;
     const auth = state.auth;
     state.clientStrategyPeer = peer;
@@ -2810,6 +2953,7 @@
     'connections.disconnect': '断开连接',
     'connections.read': '查看活动连接',
     'devices.delete': '删除设备身份',
+    'devices.emergency_access': '应急访问设备',
     'devices.policy.read': '查看设备策略',
     'devices.policy.write': '修改设备策略',
     'devices.read': '查看设备',
@@ -2833,16 +2977,21 @@
 
   function renderPermissionOptions() {
     const box = $('role-permission-options');
+    // Refreshing rows or adding a binding must not silently erase a draft's
+    // permission selection before the operator saves it.
+    const selected = selectedRolePermissions();
     clear(box);
     state.rolePermissions.forEach((key) => {
       const label = el('label', 'check');
       const input = document.createElement('input');
       input.type = 'checkbox';
       input.value = key;
+      input.dataset.roleFocus = 'permission:' + key;
       label.appendChild(input);
       label.appendChild(document.createTextNode(permissionLabel(key) + ' · ' + key));
       box.appendChild(label);
     });
+    setRolePermissions(selected);
   }
 
   function selectedRolePermissions() {
@@ -2861,11 +3010,17 @@
   // console. Keeping data and DOM cleanup separate makes the session invariant
   // testable without a browser DOM.
   function resetRoleConsole() {
+    if (typeof document !== 'undefined') closeRoleAction(false);
+    state.roleAction = null;
+    state.roleEpoch++;
+    state.roleListGen++;
     state.roles = [];
     state.rolePermissions = [];
     state.roleBindings = [];
     state.roleEditing = null;
     state.rolesLoading = false;
+    state.roleWriteBusy = false;
+    state.roleConflict = false;
   }
 
   function clearRolePanels() {
@@ -2876,30 +3031,88 @@
     $('role-binding-empty').classList.add('hidden');
     $('role-note').textContent = '';
     resetRoleEditor();
+    $('role-binding-create').reset();
+    clear($('role-binding-role'));
+    clear($('role-binding-groups'));
+    syncRoleBindingScope();
   }
 
   async function loadRoles(silent) {
-    if (state.rolesLoading) return;
+    if (state.rolesLoading || !canPermission('roles.read')) return false;
+    const epoch = state.roleEpoch;
+    const generation = ++state.roleListGen;
+    const current = () => epoch === state.roleEpoch && generation === state.roleListGen;
+    let focusKey;
     state.rolesLoading = true;
+    if (typeof document !== 'undefined') applyRoleControlPermissions();
     try {
       const [roleData, bindingData] = await Promise.all([
         api('/v1/admin-roles'),
         api('/v1/role-bindings'),
       ]);
+      if (!current()) return false;
       state.roles = roleData && Array.isArray(roleData.roles) ? roleData.roles : [];
       state.rolePermissions = roleData && Array.isArray(roleData.permissions)
         ? roleData.permissions : Object.keys(ROLE_PERMISSION_LABELS).sort();
       state.roleBindings = bindingData && Array.isArray(bindingData.bindings)
         ? bindingData.bindings : [];
+      focusKey = document.activeElement && document.activeElement.dataset.roleFocus;
       renderPermissionOptions();
       renderRoles();
       renderRoleBindings();
       renderRoleSelects();
       applyRoleControlPermissions();
+      return true;
     } catch (err) {
-      if (!silent) throw err;
+      if (current() && !silent) throw err;
+      return false;
     } finally {
+      if (current()) {
+        state.rolesLoading = false;
+        if (typeof document !== 'undefined') applyRoleControlPermissions();
+        if (focusKey) restoreRoleFocus(focusKey);
+      }
+    }
+  }
+
+  async function refreshRoles() {
+    try {
+      if (await loadRoles()) toast('已刷新');
+    } catch (err) { reportError(err); }
+  }
+
+  // A write owns the editor until it settles. Polling must not re-enable it,
+  // and an old write must not reset a new session's editor or busy state.
+  async function mutateRoles(path, options, onSuccess, onError) {
+    if (!canPermission('roles.write') || state.roleWriteBusy) return;
+    const auth = state.auth;
+    const epoch = state.roleEpoch;
+    const current = () => state.auth === auth && state.roleEpoch === epoch;
+    state.roleWriteBusy = true;
+    applyRoleControlPermissions();
+    let applied = false;
+    try {
+      const data = await api(path, options);
+      if (!current()) return;
+      applied = true;
+      onSuccess(data);
+      // A role mutation can remove the caller's own grants. Refresh them
+      // before loading rows, so self-unbind does not leave privileged UI up
+      // until the next poll. Session/epoch changes invalidate this write.
+      if (options.method && options.method !== 'GET') await refreshConsolePermissions();
+      if (!current()) return;
+      // A list request started before the write may contain pre-write rows.
+      // Abandon it so this reload always observes the completed mutation.
       state.rolesLoading = false;
+      state.roleListGen++;
+      await loadRoles();
+    } catch (err) {
+      if (current() && !(!applied && onError && onError(err))) reportError(err);
+    } finally {
+      if (current()) {
+        state.roleWriteBusy = false;
+        applyRoleControlPermissions();
+      }
     }
   }
 
@@ -2923,7 +3136,7 @@
     const permissions = permissionKeys(role.permissions);
     const permissionText = el('div', 'stack');
     if (permissions.length) {
-      const wrap = el('div', 'actions-wrap');
+      const wrap = el('div', 'actions-wrap role-permissions');
       permissions.forEach((key) => {
         const tag = el('span', 'tag', permissionLabel(key));
         tag.title = key;
@@ -2939,10 +3152,12 @@
     const actions = el('div', 'actions-wrap');
     if (!role.builtin) {
       const edit = button('编辑', 'small');
+      edit.dataset.roleFocus = 'role:' + role.id + ':edit';
       edit.addEventListener('click', () => editRole(role));
       actions.appendChild(edit);
       const remove = button('删除', 'small danger');
-      remove.addEventListener('click', () => withButton(remove, () => deleteRole(role)));
+      remove.dataset.roleFocus = 'role:' + role.id + ':delete';
+      remove.addEventListener('click', () => deleteRole(role));
       actions.appendChild(remove);
     } else {
       actions.appendChild(el('span', 'muted', '只读'));
@@ -2952,6 +3167,15 @@
   }
 
   function editRole(role) {
+    if (!canPermission('roles.write') || state.roleWriteBusy) return;
+    populateRoleEditor(role);
+    applyRoleControlPermissions();
+    $('role-name').focus({preventScroll: true});
+  }
+
+  function populateRoleEditor(role) {
+    state.roleConflict = false;
+    $('role-editor-reload').classList.add('hidden');
     state.roleEditing = role;
     $('role-editor-title').textContent = '编辑命名角色 · ' + role.id;
     $('role-editor-note').textContent = '内置角色不可修改；保存会立即影响绑定到该角色的账号权限。';
@@ -2961,11 +3185,13 @@
     $('role-description').value = role.description || '';
     setRolePermissions(role.permissions);
     $('role-save').textContent = '保存角色';
-    $('role-save-note').textContent = '修改权限会写入审计；已登录账号刷新会话后生效。';
+    $('role-save-note').textContent = '修改权限会写入审计；保存后服务端立即按新权限鉴权，页面会自动更新。';
     $('role-id').scrollIntoView({block: 'center'});
   }
 
   function resetRoleEditor() {
+    state.roleConflict = false;
+    $('role-editor-reload').classList.add('hidden');
     state.roleEditing = null;
     $('role-editor-title').textContent = '新建命名角色';
     $('role-editor-note').textContent = '选择该角色允许执行的管理台操作。';
@@ -2973,11 +3199,35 @@
     $('role-id').readOnly = false;
     setRolePermissions([]);
     $('role-save').textContent = '创建角色';
+    $('role-save').disabled = !canPermission('roles.write') || state.roleWriteBusy;
     $('role-save-note').textContent = '';
+  }
+
+  function roleEditError(err) {
+    if (err.code !== 'role_revision_conflict' && err.code !== 'role_revision_required' && err.status !== 404) return false;
+    state.roleConflict = true;
+    const message = err.status === 404 ? '该角色已被删除。草稿已保留，可复制内容后清空编辑器。'
+      : '角色已发生变化，未保存本次修改。草稿已保留；请先核对角色列表，重新载入最新版本后再编辑。';
+    $('role-save-note').textContent = message;
+    $('role-editor-reload').classList.remove('hidden');
+    toast(message, true);
+    return true;
+  }
+
+  async function reloadRoleEditor() {
+    const role = state.roleEditing;
+    if (!role || !state.roleConflict) return;
+    const epoch = state.roleEpoch;
+    await mutateRoles('/v1/admin-roles/' + encodeURIComponent(role.id), {}, (latest) => {
+      populateRoleEditor(latest);
+      toast('已载入最新版本，请核对后重新编辑。');
+    }, roleEditError);
+    if (epoch === state.roleEpoch && !state.roleConflict && !state.roleWriteBusy) $('role-name').focus();
   }
 
   async function saveRole(event) {
     event.preventDefault();
+    if (state.roleConflict) return;
     const role = state.roleEditing;
     const id = $('role-id').value.trim();
     const name = $('role-name').value.trim();
@@ -2987,23 +3237,102 @@
       toast('请填写角色 ID 与名称', true);
       return;
     }
-    await withButton($('role-save'), async () => {
-      await api(role ? '/v1/admin-roles/' + encodeURIComponent(role.id) : '/v1/admin-roles', {
-        method: role ? 'PUT' : 'POST',
-        body: { id, name, description, permissions },
-      });
+    await mutateRoles(role ? '/v1/admin-roles/' + encodeURIComponent(role.id) : '/v1/admin-roles', {
+      method: role ? 'PUT' : 'POST',
+      body: { id, name, description, permissions, ...(role ? {if_revision: role.revision} : {}) },
+    }, () => {
       toast(role ? '角色已更新' : '角色已创建');
       resetRoleEditor();
-      await loadRoles();
-    });
+    }, role ? roleEditError : undefined);
   }
 
   async function deleteRole(role) {
-    if (!window.confirm('删除命名角色 ' + role.id + '？\n该角色的全部绑定也会一并删除。')) return;
-    await api('/v1/admin-roles/' + encodeURIComponent(role.id), { method: 'DELETE' });
-    toast('已删除角色 ' + role.id);
-    if (state.roleEditing && state.roleEditing.id === role.id) resetRoleEditor();
-    await loadRoles();
+    openRoleAction('role', role);
+  }
+
+  function restoreRoleFocus(key, fallback = 'role-refresh') {
+    const target = Array.from($('panel-roles').querySelectorAll('[data-role-focus]'))
+      .find((node) => node.dataset.roleFocus === key && !node.disabled);
+    if (target) target.focus({preventScroll: true});
+    else $(fallback).focus();
+  }
+
+  function closeRoleAction(restore = true) {
+    if (restore && state.roleWriteBusy) return;
+    const action = state.roleAction;
+    state.roleAction = null;
+    const dialog = $('role-action-dialog');
+    if (dialog.open) dialog.close();
+    $('role-action-target').textContent = '';
+    $('role-action-error').textContent = '';
+    $('role-action-status').textContent = '';
+    if (restore && action && state.auth === action.auth && state.roleEpoch === action.epoch) {
+      restoreRoleFocus(action.focusKey, action.fallback);
+    }
+  }
+
+  function openRoleAction(kind, target) {
+    if (!canPermission('roles.write') || state.roleWriteBusy || state.roleAction || (kind === 'role' && target.builtin)) return;
+    const deleting = kind === 'role';
+    // Capture exactly what the operator saw; polling must never silently
+    // replace a confirmed role's revision with a newer one.
+    state.roleAction = {
+      kind, target: {...target}, auth: state.auth, epoch: state.roleEpoch,
+      focusKey: deleting ? 'role:' + target.id + ':delete' : 'binding:' + target.id,
+      fallback: deleting ? 'role-refresh' : 'role-binding-refresh',
+    };
+    $('role-action-title').textContent = deleting ? '删除命名角色' : '解除角色绑定';
+    $('role-action-target').textContent = deleting
+      ? '角色：' + (target.name || target.id) + '（' + target.id + '）'
+      : '账号：' + (target.username || target.user_id) + '\n角色：' + (target.role_name || target.role_id) +
+        '（' + target.role_id + '）\n范围：' + (target.scope_kind || 'global') +
+        (target.scope_value ? ' · ' + target.scope_value : '') + (target.object_kind ? '\n对象类型：' + target.object_kind : '');
+    $('role-action-impact').textContent = deleting
+      ? '该角色的全部绑定也会一并删除。相关账号将失去由这些绑定授予的权限。'
+      : '仅解除上述范围的这一条绑定。账号将失去由该绑定授予的权限，其他绑定仍然有效。';
+    $('role-action-error').textContent = '';
+    $('role-action-confirm').textContent = deleting ? '确认删除' : '确认解绑';
+    applyRoleControlPermissions();
+    $('role-action-dialog').showModal();
+    $('role-action-cancel').focus();
+  }
+
+  async function confirmRoleAction() {
+    const action = state.roleAction;
+    if (!action || action.blocked || state.roleWriteBusy) return;
+    if (state.auth !== action.auth || state.roleEpoch !== action.epoch || !canPermission('roles.write')) {
+      closeRoleAction(false);
+      return;
+    }
+    const target = action.target;
+    const deleting = action.kind === 'role';
+    const path = deleting
+      ? '/v1/admin-roles/' + encodeURIComponent(target.id) + '?if_revision=' + encodeURIComponent(target.revision || '')
+      : '/v1/role-bindings/' + encodeURIComponent(target.id);
+    $('role-action-error').textContent = '';
+    await mutateRoles(path, {method: 'DELETE'}, () => {
+      closeRoleAction(false);
+      if (deleting && state.roleEditing && state.roleEditing.id === target.id) resetRoleEditor();
+      toast(deleting ? '已删除角色 ' + target.id : '已解除绑定');
+    }, (err) => {
+      const stale = err.code === 'role_revision_conflict' || err.code === 'role_revision_required';
+      action.blocked = stale || err.status === 404;
+      $('role-action-error').textContent = stale ? '角色已发生变化，未删除。请取消后刷新列表并核对，再重新操作。'
+        : err.status === 404 ? '目标已不存在。请取消后刷新列表。' : (err.message || '操作失败，请稍后重试。');
+      return true;
+    });
+    if (state.auth !== action.auth || state.roleEpoch !== action.epoch) return;
+    if (state.roleAction === action) $('role-action-cancel').focus();
+    else restoreRoleFocus(action.focusKey, action.fallback);
+  }
+
+  function roleActionKeydown(event) {
+    if (event.key !== 'Tab') return;
+    event.preventDefault();
+    const buttons = [$('role-action-cancel'), $('role-action-confirm')].filter((node) => !node.disabled);
+    if (!buttons.length) return;
+    const index = buttons.indexOf(document.activeElement);
+    buttons[(index + (event.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
   }
 
   function renderRoleSelects() {
@@ -3031,9 +3360,9 @@
     const kind = $('role-binding-scope').value;
     const value = $('role-binding-value');
     const objectKind = $('role-binding-object-kind');
-    value.disabled = kind === 'global' || !canPermission('roles.write');
+    value.disabled = kind === 'global' || !canPermission('roles.write') || state.roleWriteBusy;
     value.required = kind !== 'global';
-    objectKind.disabled = kind !== 'object';
+    objectKind.disabled = kind !== 'object' || !canPermission('roles.write') || state.roleWriteBusy;
     objectKind.required = kind === 'object';
     if (kind === 'global') value.value = '';
     if (kind === 'group') {
@@ -3071,22 +3400,19 @@
       toast('对象范围需要填写对象类型', true);
       return;
     }
-    const submit = $('role-binding-create').querySelector('button[type="submit"]');
-    await withButton(submit, async () => {
-      await api('/v1/role-bindings', {
-        method: 'POST',
-        body: {
-          username,
-          role_id: roleID,
-          scope_kind: scopeKind,
-          scope_value: scopeValue,
-          object_kind: objectKind,
-        },
-      });
+    await mutateRoles('/v1/role-bindings', {
+      method: 'POST',
+      body: {
+        username,
+        role_id: roleID,
+        scope_kind: scopeKind,
+        scope_value: scopeValue,
+        object_kind: objectKind,
+      },
+    }, () => {
       $('role-binding-username').value = '';
       $('role-binding-value').value = '';
       toast('已绑定 ' + roleID + ' → ' + username);
-      await loadRoles();
     });
   }
 
@@ -3109,13 +3435,8 @@
     tr.appendChild(cell(fmtTime(binding.created_at)));
     const actions = el('div', 'actions-wrap');
     const remove = button('解绑', 'small danger');
-    remove.addEventListener('click', () => withButton(remove, async () => {
-      if (!window.confirm('解除 ' + (binding.username || binding.user_id) + ' 的 ' +
-        (binding.role_name || binding.role_id) + ' 绑定？')) return;
-      await api('/v1/role-bindings/' + encodeURIComponent(binding.id), { method: 'DELETE' });
-      toast('已解除绑定');
-      await loadRoles();
-    }));
+    remove.dataset.roleFocus = 'binding:' + binding.id;
+    remove.addEventListener('click', () => openRoleAction('binding', binding));
     actions.appendChild(remove);
     tr.appendChild(cell(actions));
     return tr;
@@ -3464,13 +3785,15 @@
   // request_key must survive a retried POST: the server treats a second key as
   // a second command and would audit two disconnects for one operator action.
   function connectionRequestKeyFor(conn) {
-    if (!state.connectionRequestKey ||
-        state.connectionRequestKey.connection !== connectionKey(conn)) {
-      state.connectionRequestKey = {
+    const target = connectionKey(conn);
+    if (!state.connectionRequests.has(target)) {
+      state.connectionRequests.set(target, {
         connection: connectionKey(conn),
         key: connectionRequestKeyValue(),
-      };
+        previousCommandID: conn.command_id || '',
+      });
     }
+    state.connectionRequestKey = state.connectionRequests.get(target);
     return state.connectionRequestKey.key;
   }
 
@@ -3481,7 +3804,14 @@
   function releaseConnectionRequestKeyIfSettled(conn) {
     if (conn && (conn.command_status === 'failed' ||
         conn.command_status === 'expired' || connectionConfirmedDisconnected(conn))) {
-      state.connectionRequestKey = null;
+      const target = connectionKey(conn);
+      const attempt = state.connectionRequests.get(target);
+      // A late list/detail can still contain the previous failed command
+      // while the next POST is in flight or its response has been lost.
+      if (attempt && (!conn.command_id || conn.command_id === attempt.previousCommandID ||
+          (attempt.commandID && conn.command_id !== attempt.commandID))) return;
+      if (state.connectionRequestKey && state.connectionRequestKey.connection === target) state.connectionRequestKey = null;
+      state.connectionRequests.delete(target);
     }
   }
 
@@ -3517,6 +3847,7 @@
     }
     if (generation !== state.connectionGen) return;
     const list = Array.isArray(data.connections) ? data.connections : [];
+    list.forEach(releaseConnectionRequestKeyIfSettled);
     state.connectionRows = list.filter((conn) => {
       if (!query) return true;
       return [conn.host_id, conn.viewer, conn.peer_address, conn.mode, conn.route]
@@ -3564,7 +3895,7 @@
     actions.appendChild(detail);
     const terminal = conn.state === 'closed' || conn.state === 'stale' ||
       conn.command_status === 'queued' || conn.command_status === 'delivered';
-    if (canPermission('connections.disconnect') && !terminal) {
+    if (canDeviceAction(conn, 'connections.disconnect') && !terminal) {
       const disconnect = button('断开', 'small danger');
       disconnect.addEventListener('click', () => {
         openConnectionDetail(conn).then(() => {
@@ -3595,26 +3926,63 @@
   }
 
   async function openConnectionDetail(conn) {
+    resetConnectionDetail();
     state.connectionDetailKey = connectionKey(conn);
     state.connectionDetail = conn;
-    state.connectionRequestKey = null;
-    $('connection-disconnect-reason').value = '';
+    const attempt = state.connectionRequests.get(connectionKey(conn));
+    $('connection-disconnect-reason').value = attempt && attempt.reason || '';
     $('connection-disconnect-note').textContent = '';
     if (!$('connection-dialog').open) $('connection-dialog').showModal();
     renderConnectionDetail();
     await refreshConnectionDetail(false);
   }
 
+  function resetConnectionDetail() {
+    stopConnectionPoll();
+    state.connectionDetailGen++;
+    state.connectionRefreshGen++;
+    state.connectionDetailKey = null;
+    state.connectionDetail = null;
+    state.connectionSending = false;
+    if (typeof document !== 'undefined') {
+      $('connection-disconnect-confirm').checked = false;
+      $('connection-disconnect-note').textContent = '';
+    }
+  }
+
   async function refreshConnectionDetail(manual) {
     const key = state.connectionDetailKey;
     if (!key) return;
+    const auth = state.auth;
+    const generation = state.connectionDetailGen;
+    const request = ++state.connectionRefreshGen;
+    const current = () => auth === state.auth && generation === state.connectionDetailGen && request === state.connectionRefreshGen;
+    stopConnectionPoll();
     const conn = state.connectionDetail;
     const host = conn ? conn.host_id : key.split('/')[0];
     const id = conn ? conn.connection_id : key.split('/')[1];
-    const data = await api('/v1/live-connections/' + encodeURIComponent(host) + '/' +
-      encodeURIComponent(id));
-    if (state.connectionDetailKey !== key) return;
+    let data;
+    try {
+      data = await api('/v1/live-connections/' + encodeURIComponent(host) + '/' + encodeURIComponent(id));
+    } catch (err) {
+      if (!current()) return;
+      $('connection-disconnect-note').textContent = err.status === 404
+        ? '连接记录已不再可用，状态未知。' : err.status === 403
+          ? '已无权读取此连接，请关闭详情并刷新权限。' : '连接状态查询失败，将继续重试：' + err.message;
+      if (err.status === 404 || err.status === 403) {
+        state.connectionDetail = {...conn, state: 'stale'};
+        renderConnectionDetail();
+      } else {
+        state.connectionPollTimer = setTimeout(() => refreshConnectionDetail(false), 3000);
+      }
+      return;
+    }
+    if (!current()) return;
     state.connectionDetail = data;
+    if (data.command_id || $('connection-disconnect-note').textContent.startsWith('连接状态查询失败')) {
+      $('connection-disconnect-note').textContent = '';
+    }
+    releaseConnectionRequestKeyIfSettled(data);
     renderConnectionDetail();
     if (connectionConfirmedDisconnected(data) || data.command_status === 'failed' ||
         data.command_status === 'expired') {
@@ -3623,19 +3991,7 @@
     } else if (data.command_status === 'queued' || data.command_status === 'delivered') {
       // Poll until the host settles the command. This is a bounded wait that
       // ends on success, failure, expiry or closing the dialog.
-      stopConnectionPoll();
-      state.connectionPollTimer = setTimeout(() => {
-        refreshConnectionDetail(false).catch((err) => {
-          if (err && err.status === 404) {
-            // The host runtime ended and the row is gone; stop guessing.
-            $('connection-disconnect-note').textContent = '连接记录已不再可用，状态未知。';
-            stopConnectionPoll();
-            return;
-          }
-          reportError(err);
-          state.connectionPollTimer = setTimeout(() => refreshConnectionDetail(false).catch(() => {}), 3000);
-        });
-      }, 1500);
+      state.connectionPollTimer = setTimeout(() => refreshConnectionDetail(false), 1500);
     } else if (manual) {
       toast('连接状态已刷新');
     }
@@ -3683,7 +4039,7 @@
     if (connectionConfirmedDisconnected(conn)) {
       note.textContent = '目标连接已从主机实际连接集合中消失，且该指令回执绑定了 confirmed_absent=true。';
     } else if (conn.state === 'stale') {
-      note.textContent = '主机心跳已过期，连接和指令状态均未知；此时不能显示为已断开。';
+      note.textContent = '主机心跳已过期，当前连接状态未知；指令结果请查看下方状态，不能据此认定连接已断开。';
     } else if (conn.state === 'closed' && conn.command_status === 'applied') {
       note.textContent = '连接已结束，但回执没有确认目标曾经不存在；请核对其他原因导致的关闭。';
     } else if (conn.command_status === 'failed') {
@@ -3697,9 +4053,11 @@
     }
 
     const form = $('connection-disconnect');
-    const canDisconnect = canPermission('connections.disconnect') && conn.state === 'active';
+    const canDisconnect = canDeviceAction(conn, 'connections.disconnect') && conn.state === 'active' &&
+      conn.command_status !== 'queued' && conn.command_status !== 'delivered';
     for (const node of form.querySelectorAll('input, button')) node.disabled = !canDisconnect || state.connectionSending;
-    form.classList.toggle('hidden', !canPermission('connections.disconnect'));
+    $('connection-disconnect-send').disabled = !canDisconnect || state.connectionSending || !$('connection-disconnect-confirm').checked;
+    form.classList.toggle('hidden', !canDeviceAction(conn, 'connections.disconnect'));
   }
 
   function appendPair(list, label, value) {
@@ -3709,40 +4067,51 @@
 
   async function requestDisconnect() {
     const conn = state.connectionDetail;
-    if (!conn || state.connectionSending) return;
+    if (!conn || state.connectionSending || !canDeviceAction(conn, 'connections.disconnect') ||
+        conn.state !== 'active' || conn.command_status === 'queued' || conn.command_status === 'delivered' ||
+        !$('connection-disconnect-confirm').checked) return;
     const reason = $('connection-disconnect-reason').value.trim();
-    if (!window.confirm('请求断开 ' + (conn.viewer || conn.peer_address || conn.connection_id) + '？\n' +
-      '只有主机确认该连接已不存在后，管理台才会显示“已确认断开”。')) {
-      return;
-    }
+    const auth = state.auth;
+    const generation = state.connectionDetailGen;
+    const current = () => auth === state.auth && generation === state.connectionDetailGen;
     const key = connectionRequestKeyFor(conn);
+    const attempt = state.connectionRequests.get(connectionKey(conn));
+    if (attempt.reason === undefined) attempt.reason = reason;
     state.connectionSending = true;
-    $('connection-disconnect-send').disabled = true;
+    state.connectionRefreshGen++;
+    stopConnectionPoll();
+    renderConnectionDetail();
     $('connection-disconnect-note').textContent = '';
     try {
       const command = await api('/v1/live-connections/' + encodeURIComponent(conn.host_id) + '/' +
         encodeURIComponent(conn.connection_id) + '/disconnect', {
         method: 'POST',
-        body: { request_key: key, reason },
+        body: { request_key: key, reason: attempt.reason },
       });
-      state.connectionRequestKey = null;
+      if (!current()) return;
+      attempt.commandID = command.command_id;
+      // Show accepted state even if the following detail query is unavailable.
+      state.connectionDetail = {...conn, command_id: command.command_id, command_status: command.status};
+      renderConnectionDetail();
       $('connection-disconnect-note').textContent = command && command.command_id
         ? '指令已受理（' + (COMMAND_STATE_LABELS[command.status] || command.status) + '），等待主机确认。'
         : '指令已受理。';
       await refreshConnectionDetail(false);
       if (state.tab === 'connections') loadConnections(true).catch(() => {});
     } catch (err) {
+      if (!current()) return;
       // Keep the request key on a failed response: a retry of the same action
       // must be idempotent. Refresh in case the command did land server-side.
       $('connection-disconnect-note').textContent =
         '断开请求未成功：' + (err && err.message ? err.message : String(err));
       await refreshConnectionDetail(false).catch(() => {});
-      releaseConnectionRequestKeyIfSettled(state.connectionDetail);
-      throw err;
+      if (current()) releaseConnectionRequestKeyIfSettled(state.connectionDetail);
     } finally {
-      state.connectionSending = false;
-      $('connection-disconnect-send').disabled = false;
-      renderConnectionDetail();
+      if (current()) {
+        state.connectionSending = false;
+        $('connection-disconnect-confirm').checked = false;
+        renderConnectionDetail();
+      }
     }
   }
 
@@ -4238,7 +4607,7 @@
     $('device-export').addEventListener('click', (event) => withButton(event.currentTarget, exportDevices));
     $('device-select-all').addEventListener('change', (event) => {
       if (event.currentTarget.checked) {
-        state.deviceList.forEach((peer) => state.deviceSelection.add(peer.id));
+        state.deviceList.filter((peer) => canDeviceAction(peer, 'devices.write')).forEach((peer) => state.deviceSelection.add(peer.id));
       } else {
         state.deviceSelection.clear();
       }
@@ -4494,17 +4863,22 @@
     });
 
     $('roles-create').addEventListener('submit', saveRole);
-    $('role-editor-reset').addEventListener('click', resetRoleEditor);
-    $('role-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
-      await loadRoles();
-      toast('已刷新');
-    }));
-    $('role-binding-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
-      await loadRoles();
-      toast('已刷新');
-    }));
+    $('role-editor-reset').addEventListener('click', () => {
+      resetRoleEditor();
+      $('role-id').focus();
+    });
+    $('role-editor-reload').addEventListener('click', reloadRoleEditor);
+    $('role-refresh').addEventListener('click', refreshRoles);
+    $('role-binding-refresh').addEventListener('click', refreshRoles);
     $('role-binding-scope').addEventListener('change', syncRoleBindingScope);
     $('role-binding-create').addEventListener('submit', createRoleBinding);
+    $('role-action-cancel').addEventListener('click', () => closeRoleAction());
+    $('role-action-confirm').addEventListener('click', confirmRoleAction);
+    $('role-action-dialog').addEventListener('keydown', roleActionKeydown);
+    $('role-action-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      if (!state.roleWriteBusy) closeRoleAction();
+    });
 
     $('group-create').addEventListener('submit', (event) => {
       event.preventDefault();
@@ -4542,10 +4916,9 @@
     $('connection-dialog-refresh').addEventListener('click', (event) => withButton(event.currentTarget,
       () => refreshConnectionDetail(true)));
     $('connection-dialog').addEventListener('close', () => {
-      stopConnectionPoll();
-      state.connectionDetail = null;
-      state.connectionDetailKey = null;
+      resetConnectionDetail();
     });
+    $('connection-disconnect-confirm').addEventListener('change', renderConnectionDetail);
     $('connection-disconnect').addEventListener('submit', (event) => {
       event.preventDefault();
       requestDisconnect().catch(reportError);

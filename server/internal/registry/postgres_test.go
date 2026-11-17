@@ -2,21 +2,18 @@ package registry
 
 import (
 	"crypto/ed25519"
-	"os"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/pgtest"
 )
 
 // TestPostgresStore is gated on CHAST_TEST_POSTGRES_DSN like the account
 // integration test so the default test run needs no external database.
 func TestPostgresStore(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	store, err := NewStorePostgres(dsn)
 	if err != nil {
 		t.Fatal(err)

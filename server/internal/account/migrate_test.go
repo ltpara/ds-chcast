@@ -446,3 +446,67 @@ func TestSchemaMigrationRejectsNewerDatabase(t *testing.T) {
 		t.Fatalf("open newer database error = %v", err)
 	}
 }
+
+func TestMigration25UpdatesBuiltinPermissionsAndPreservesCustomRoles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v24.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUser("root", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUser("limited", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	role, err := store.CreateAdminRole("custom", "Custom", "", []string{PermissionConnectionsDisconnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindRole("limited", role.ID, RoleScopeGlobal, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE version>=25`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE admin_roles SET permissions=? WHERE id='admin'`, PermissionAccountsWrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		upgraded, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admin, err := upgraded.AdminRole(RoleAdmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !containsPermission(admin.Permissions, PermissionDevicesEmergencyAccess) {
+			t.Fatal("builtin admin was not upgraded")
+		}
+		custom, err := upgraded.AdminRole(role.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(custom.Permissions) != 1 || custom.Permissions[0] != PermissionConnectionsDisconnect {
+			t.Fatal("custom role widened")
+		}
+		bindings, err := upgraded.RoleBindings("")
+		if err != nil || len(bindings) != 1 {
+			t.Fatalf("bindings changed: %v %v", bindings, err)
+		}
+		if err := upgraded.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

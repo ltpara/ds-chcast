@@ -550,7 +550,7 @@
         </div>
         <p class="muted">页面和按钮由稳定的权限键决定。admin、operator、readonly 为内置角色，不能修改；自定义角色可以分配给固定角色为 user 的账号，使其进入管理台。</p>
         <p id="role-note" class="muted"></p>
-        <div class="table-wrap">
+        <div class="table-wrap" tabindex="0" role="region" aria-label="命名角色列表，可横向滚动">
           <table>
             <thead><tr><th>ID</th><th>名称</th><th>说明</th><th>权限</th><th>类型</th><th>更新时间</th><th class="actions-col">操作</th></tr></thead>
             <tbody id="role-rows"></tbody>
@@ -579,6 +579,7 @@
           </fieldset>
           <p id="role-save-note" class="muted"></p>
           <div class="dialog-actions">
+            <button type="button" id="role-editor-reload" class="hidden">重新载入（放弃草稿）</button>
             <button type="submit" id="role-save" class="primary">创建角色</button>
           </div>
         </form>
@@ -614,7 +615,7 @@
           <h2>角色绑定</h2>
           <button type="button" id="role-binding-refresh">刷新</button>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap" tabindex="0" role="region" aria-label="角色绑定列表，可横向滚动">
           <table>
             <thead><tr><th>用户名</th><th>角色</th><th>范围</th><th>范围值</th><th>对象类型</th><th>创建时间</th><th class="actions-col">操作</th></tr></thead>
             <tbody id="role-binding-rows"></tbody>
@@ -643,6 +644,18 @@
   </main>
 
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <dialog id="role-action-dialog" aria-labelledby="role-action-title" aria-describedby="role-action-target role-action-impact">
+    <h2 id="role-action-title"></h2>
+    <p id="role-action-target"></p>
+    <p id="role-action-impact" class="muted"></p>
+    <p id="role-action-error" role="alert"></p>
+    <p id="role-action-status" class="muted" role="status"></p>
+    <div class="dialog-actions">
+      <button type="button" id="role-action-cancel" autofocus>取消</button>
+      <button type="button" id="role-action-confirm" class="danger">确认删除</button>
+    </div>
+  </dialog>
 
   <dialog id="device-dialog">
     <form id="device-form" method="dialog">
@@ -875,6 +888,7 @@
       <dl id="connection-command-detail" class="kv"></dl>
       <form id="connection-disconnect" class="inline-form" autocomplete="off">
         <label>原因（可选）<input id="connection-disconnect-reason" maxlength="512" spellcheck="false"></label>
+        <label class="check"><input type="checkbox" id="connection-disconnect-confirm">我已核对上述设备与连接 ID，确认请求断开这条连接</label>
         <button type="submit" id="connection-disconnect-send" class="danger">请求断开</button>
       </form>
       <p id="connection-disconnect-note" role="alert"></p>

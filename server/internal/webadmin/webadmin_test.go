@@ -855,7 +855,7 @@ func TestConsoleExposesNamedRolesAndBindings(t *testing.T) {
 		"function clearRolePanels",
 		"resetRoleConsole();",
 		"clearRolePanels();",
-		"'/v1/role-bindings/' + encodeURIComponent(binding.id)",
+		"'/v1/role-bindings/' + encodeURIComponent(target.id)",
 		"fmtTime(role.updated_at)",
 		"fmtTime(binding.created_at)",
 		"该角色的全部绑定也会一并删除。",

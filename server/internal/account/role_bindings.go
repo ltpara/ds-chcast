@@ -13,7 +13,8 @@ import (
 // console without a second lookup per row.
 type RoleBindingView struct {
 	RoleBinding
-	RoleName string `json:"role_name"`
+	RoleName    string   `json:"role_name"`
+	Permissions []string `json:"permissions"`
 }
 
 // EffectiveConsolePermissions resolves a fixed role and every applicable named
@@ -87,7 +88,7 @@ func (s *Store) RoleBindings(userID string) ([]RoleBindingView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	query := `SELECT b.id, b.role_id, b.user_id, u.username, b.scope_kind,
-	                 b.scope_value, b.object_kind, b.created_at, r.name
+	                 b.scope_value, b.object_kind, b.created_at, r.name, r.permissions
 	          FROM role_bindings b
 	          JOIN users u ON u.id = b.user_id
 	          JOIN admin_roles r ON r.id = b.role_id`
@@ -105,15 +106,20 @@ func (s *Store) RoleBindings(userID string) ([]RoleBindingView, error) {
 	out := make([]RoleBindingView, 0)
 	for rows.Next() {
 		var (
-			binding RoleBindingView
-			created int64
+			binding     RoleBindingView
+			created     int64
+			permissions string
 		)
 		if err := rows.Scan(&binding.ID, &binding.RoleID, &binding.UserID,
 			&binding.Username, &binding.ScopeKind, &binding.ScopeValue,
-			&binding.ObjectKind, &created, &binding.RoleName); err != nil {
+			&binding.ObjectKind, &created, &binding.RoleName, &permissions); err != nil {
 			return nil, fmt.Errorf("account store %s: scan role binding: %w", s.path, err)
 		}
 		binding.CreatedAt = timeFromMillis(created)
+		binding.Permissions = []string{}
+		if permissions != "" {
+			binding.Permissions = strings.Split(permissions, ",")
+		}
 		out = append(out, binding)
 	}
 	return out, rows.Err()

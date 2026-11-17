@@ -4,13 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/pgtest"
 	"github.com/ltpara/ds-chcast/server/internal/strategy"
 )
 
@@ -182,10 +182,7 @@ func TestClientStrategySurvivesRestartAndConcurrentEdits(t *testing.T) {
 }
 
 func TestPostgresClientStrategy(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	store, err := OpenPostgres(dsn)
 	if err != nil {
 		t.Fatal(err)

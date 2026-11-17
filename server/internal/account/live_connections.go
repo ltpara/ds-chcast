@@ -384,6 +384,64 @@ func (s *Store) LiveConnectionsInGroup(groupID string, limit int) ([]LiveConnect
 	return out, nil
 }
 
+// LiveConnectionsForDevices filters before LIMIT. Batches keep the query below
+// database parameter limits; merging each batch's top N gives the global top N
+// of the authorized union, even when unrelated hosts have newer activity.
+func (s *Store) LiveConnectionsForDevices(allowed map[string]bool, limit int) ([]LiveConnection, error) {
+	if allowed == nil {
+		return s.LiveConnections(limit)
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	ids := make([]string, 0, len(allowed))
+	for id, ok := range allowed {
+		if ok {
+			ids = append(ids, id)
+		}
+	}
+	all := make([]liveConnectionRow, 0)
+	for start := 0; start < len(ids); start += 400 {
+		end := start + 400
+		if end > len(ids) {
+			end = len(ids)
+		}
+		args := make([]any, 0, end-start+1)
+		for _, id := range ids[start:end] {
+			args = append(args, id)
+		}
+		args = append(args, limit)
+		rows, err := s.queryLiveConnections(`WHERE c.native_state = 'active' AND c.host_id IN (`+
+			strings.TrimSuffix(strings.Repeat("?,", end-start), ",")+`)
+			ORDER BY c.last_seen_at DESC, c.host_id, c.connection_id LIMIT ?`, args...)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, rows...)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].LastSeenMS != all[j].LastSeenMS {
+			return all[i].LastSeenMS > all[j].LastSeenMS
+		}
+		if all[i].HostID != all[j].HostID {
+			return all[i].HostID < all[j].HostID
+		}
+		return all[i].ConnectionID < all[j].ConnectionID
+	})
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	out := make([]LiveConnection, 0, len(all))
+	now := s.now().UTC()
+	for _, row := range all {
+		out = append(out, row.view(now))
+	}
+	return out, nil
+}
+
 // LiveConnection returns one connection visible to the administrator.
 func (s *Store) LiveConnection(hostID, connectionID string) (LiveConnection, error) {
 	hostID = strings.TrimSpace(hostID)
@@ -482,6 +540,12 @@ func (r liveConnectionRow) view(now time.Time) LiveConnection {
 	}
 	if r.CommandDeadlineMS > 0 {
 		out.CommandDeadline = timeFromMillis(r.CommandDeadlineMS)
+		// List reads must also show expiry when an offline host never polls
+		// again. Only pending commands expire; this is not a disconnect receipt.
+		if r.CommandDeadlineMS <= now.UnixMilli() &&
+			(r.CommandStatus == liveconn.CommandQueued || r.CommandStatus == liveconn.CommandDelivered) {
+			out.CommandStatus = liveconn.CommandExpired
+		}
 	}
 	return out
 }

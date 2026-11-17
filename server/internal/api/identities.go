@@ -15,10 +15,11 @@ import (
 // operator needs. Credentials such as the carrier token stay out of the list.
 type identityListEntry struct {
 	registry.Identity
-	Online     bool   `json:"online"`
-	Relay      string `json:"relay,omitempty"`
-	Candidate  string `json:"candidate,omitempty"`
-	LastSeenMS int64  `json:"last_seen_ms,omitempty"`
+	Online             bool     `json:"online"`
+	Relay              string   `json:"relay,omitempty"`
+	Candidate          string   `json:"candidate,omitempty"`
+	LastSeenMS         int64    `json:"last_seen_ms,omitempty"`
+	ConsolePermissions []string `json:"console_permissions"`
 }
 
 type identityListResponse struct {
@@ -33,7 +34,7 @@ type identityListResponse struct {
 // identity, including offline peers, with a substring search and an optional
 // online filter. RustDesk's hbbs console lists the same peer-table view.
 func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, consoleRead, account.TokenResourceDevices)
+	scope, ok := s.deviceCollectionActor(w, r, account.PermissionDevicesRead)
 	if !ok {
 		return
 	}
@@ -60,25 +61,12 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var groupDevices map[string]bool
-	if principal.GroupID != "" {
-		devices, err := s.cfg.Accounts.GroupDevices(principal.GroupID)
-		if err != nil {
-			s.cfg.Logger.Error("identity group scope", "group", principal.GroupID, "error", err)
-			writeError(w, http.StatusInternalServerError, "could not read the device group")
-			return
-		}
-		groupDevices = make(map[string]bool, len(devices))
-		for _, device := range devices {
-			groupDevices[device.PeerID] = true
-		}
-	}
 	now := time.Now()
 	out := identityListResponse{Identities: make([]identityListEntry, 0)}
 	export := s.newCSVExport(w, "chast-devices", "device", identityExportHeader)
 	rows := make([][]string, 0, exportEventBatch)
 	for _, record := range s.cfg.Registry.Identities() {
-		if groupDevices != nil && !groupDevices[record.ID] {
+		if scope.allowed != nil && !scope.allowed[record.ID] {
 			continue
 		}
 		host, live := s.cfg.Registry.Lookup(record.ID)
@@ -121,6 +109,7 @@ func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
 		if len(out.Identities) >= limit {
 			continue
 		}
+		entry.ConsolePermissions = scope.permissions(record.ID)
 		out.Identities = append(out.Identities, entry)
 	}
 	if csv {

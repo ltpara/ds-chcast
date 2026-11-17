@@ -19,7 +19,12 @@ import (
 const maxLiveConnectionBody = 128 << 10
 
 type liveConnectionsResponse struct {
-	Connections []account.LiveConnection `json:"connections"`
+	Connections []consoleLiveConnection `json:"connections"`
+}
+
+type consoleLiveConnection struct {
+	account.LiveConnection
+	ConsolePermissions []string `json:"console_permissions"`
 }
 
 type liveDisconnectRequest struct {
@@ -40,7 +45,7 @@ type hostLiveReceiptRequest struct {
 }
 
 func (s *server) listLiveConnections(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, account.PermissionConnectionsRead, account.TokenResourceDevices)
+	scope, ok := s.deviceCollectionActor(w, r, account.PermissionConnectionsRead)
 	if !ok {
 		return
 	}
@@ -48,19 +53,23 @@ func (s *server) listLiveConnections(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	connections, err := s.cfg.Accounts.LiveConnectionsInGroup(principal.GroupID, limit)
+	connections, err := s.cfg.Accounts.LiveConnectionsForDevices(scope.allowed, limit)
 	if err != nil {
 		s.cfg.Logger.Error("list live connections", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not list live connections")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, liveConnectionsResponse{Connections: connections})
+	views := make([]consoleLiveConnection, 0, len(connections))
+	for _, connection := range connections {
+		views = append(views, consoleLiveConnection{connection, scope.permissions(connection.HostID)})
+	}
+	writeJSON(w, http.StatusOK, liveConnectionsResponse{Connections: views})
 }
 
 func (s *server) getLiveConnection(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("host")
-	_, ok := s.devicePermissionActor(w, r, account.PermissionConnectionsRead, hostID)
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionConnectionsRead, hostID)
 	if !ok {
 		return
 	}
@@ -70,7 +79,7 @@ func (s *server) getLiveConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, connection)
+	writeJSON(w, http.StatusOK, consoleLiveConnection{connection, permissionKeys(principal.Permissions)})
 }
 
 func (s *server) disconnectLiveConnection(w http.ResponseWriter, r *http.Request) {

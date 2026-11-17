@@ -35,10 +35,10 @@ func TestNamedRolesAreSeededAndBuiltinsAreImmutable(t *testing.T) {
 			t.Fatalf("built-in %s permissions = %v, want %v", fixedRole, role.Permissions, want)
 		}
 	}
-	if _, err := store.UpdateAdminRole(RoleAdmin, "Changed", "", nil); !errors.Is(err, ErrBuiltinRoleImmutable) {
+	if _, err := store.UpdateAdminRole(RoleAdmin, "Changed", "", nil, byID[RoleAdmin].Revision); !errors.Is(err, ErrBuiltinRoleImmutable) {
 		t.Fatalf("update built-in role = %v", err)
 	}
-	if err := store.DeleteAdminRole(RoleAdmin); !errors.Is(err, ErrBuiltinRoleImmutable) {
+	if err := store.DeleteAdminRole(RoleAdmin, byID[RoleAdmin].Revision); !errors.Is(err, ErrBuiltinRoleImmutable) {
 		t.Fatalf("delete built-in role = %v", err)
 	}
 }
@@ -53,7 +53,7 @@ func TestUpdateAdminRolePreservesCreatedAt(t *testing.T) {
 	}
 	updatedAt := createdAt.Add(time.Second)
 	store.SetClock(func() time.Time { return updatedAt })
-	updated, err := store.UpdateAdminRole(role.ID, "Device viewer", "updated", []string{PermissionAuditRead})
+	updated, err := store.UpdateAdminRole(role.ID, "Device viewer", "updated", []string{PermissionAuditRead}, role.Revision)
 	if err != nil {
 		t.Fatalf("update role: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestNamedGlobalManagerProtectsLastManagementAccess(t *testing.T) {
 		t.Fatalf("create bob: %v", err)
 	}
 	role, err := store.CreateAdminRole("account-manager", "Account manager", "",
-		[]string{PermissionAccountsRead, PermissionAccountsWrite})
+		AllPermissions())
 	if err != nil {
 		t.Fatalf("create named role: %v", err)
 	}
@@ -126,14 +126,14 @@ func TestNamedGlobalManagerProtectsLastManagementAccess(t *testing.T) {
 		t.Fatalf("binding after rejected unbind = %+v, %v", bindings, err)
 	}
 	if _, err := store.UpdateAdminRole(role.ID, role.Name, role.Description,
-		[]string{PermissionAccountsRead}); !errors.Is(err, ErrLastManagementAdmin) {
+		[]string{PermissionAccountsRead}, role.Revision); !errors.Is(err, ErrLastManagementAdmin) {
 		t.Fatalf("remove named manager permission = %v", err)
 	}
 	unchanged, err := store.AdminRole(role.ID)
 	if err != nil || !containsPermission(unchanged.Permissions, PermissionAccountsWrite) {
 		t.Fatalf("role after rejected update = %+v, %v", unchanged, err)
 	}
-	if err := store.DeleteAdminRole(role.ID); !errors.Is(err, ErrLastManagementAdmin) {
+	if err := store.DeleteAdminRole(role.ID, role.Revision); !errors.Is(err, ErrLastManagementAdmin) {
 		t.Fatalf("delete last named manager role = %v", err)
 	}
 	if _, err := store.AdminRole(role.ID); err != nil {
@@ -214,5 +214,44 @@ func TestObjectScopedPermissionsRequireExactTarget(t *testing.T) {
 	unmatched, err := store.EffectiveConsolePermissions(bob.ID, "", "device", "peer-2")
 	if err != nil || unmatched[PermissionDevicesRead] {
 		t.Fatalf("unmatched object permissions = %v, %v", unmatched, err)
+	}
+}
+
+func TestPartialGlobalManagerCannotReplaceLastAdmin(t *testing.T) {
+	store := openTemp(t, "partial-manager.db")
+	for _, name := range []string{"root", "limited"} {
+		if _, err := store.CreateUser(name, "correct horse"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	role, err := store.CreateAdminRole("partial", "Partial", "", []string{PermissionAccountsWrite, PermissionRolesWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindRole("limited", role.ID, RoleScopeGlobal, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetRole("root", RoleUser); !errors.Is(err, ErrLastManagementAdmin) {
+		t.Fatalf("partial manager allowed demotion: %v", err)
+	}
+	// Complete privileges may be split across several global bindings.
+	remaining := []string{}
+	for _, key := range AllPermissions() {
+		if key != PermissionAccountsWrite && key != PermissionRolesWrite {
+			remaining = append(remaining, key)
+		}
+	}
+	rest, err := store.CreateAdminRole("rest", "Rest", "", remaining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindRole("limited", rest.ID, RoleScopeGlobal, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetRole("root", RoleUser); err != nil {
+		t.Fatalf("complete union could not protect access: %v", err)
+	}
+	if err := store.DeleteAdminRole(rest.ID, rest.Revision); !errors.Is(err, ErrLastManagementAdmin) {
+		t.Fatalf("removed last complete manager: %v", err)
 	}
 }

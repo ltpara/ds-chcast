@@ -98,22 +98,9 @@ func viewDevicePolicy(policy account.DevicePolicy) devicePolicyView {
 }
 
 func (s *server) listDevicePolicies(w http.ResponseWriter, r *http.Request) {
-	principal, ok := s.consolePrincipalFor(w, r, account.PermissionDevicesPolicyRead, account.TokenResourceDevices)
+	scope, ok := s.deviceCollectionActor(w, r, account.PermissionDevicesPolicyRead)
 	if !ok {
 		return
-	}
-	var groupDevices map[string]bool
-	if principal.GroupID != "" {
-		devices, err := s.cfg.Accounts.GroupDevices(principal.GroupID)
-		if err != nil {
-			s.cfg.Logger.Error("device policy group scope", "group", principal.GroupID, "error", err)
-			writeError(w, http.StatusInternalServerError, "could not read the device group")
-			return
-		}
-		groupDevices = make(map[string]bool, len(devices))
-		for _, device := range devices {
-			groupDevices[device.PeerID] = true
-		}
 	}
 	policies, err := s.cfg.Accounts.DevicePolicies()
 	if err != nil {
@@ -123,7 +110,7 @@ func (s *server) listDevicePolicies(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]devicePolicyView, 0, len(policies))
 	for _, policy := range policies {
-		if groupDevices != nil && !groupDevices[policy.PeerID] {
+		if scope.allowed != nil && !scope.allowed[policy.PeerID] {
 			continue
 		}
 		out = append(out, viewDevicePolicy(policy))

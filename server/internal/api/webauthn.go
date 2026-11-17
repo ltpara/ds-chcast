@@ -572,11 +572,5 @@ func (s *server) finishWebAuthnAssertion(w http.ResponseWriter, r *http.Request,
 	}
 	s.auditLogin(r, user.Username, detail, true)
 	s.cfg.Logger.Info("account login", "user", user.Username, "factor", factor)
-	writeJSON(w, http.StatusOK, loginResponse{
-		Token:              token,
-		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
-		RefreshToken:       refresh,
-		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
-		User:               viewAccount(user),
-	})
+	s.writeConsoleLoginResponse(w, user, token, refresh)
 }

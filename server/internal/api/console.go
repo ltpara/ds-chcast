@@ -170,7 +170,7 @@ func (s *server) consolePrincipalFor(w http.ResponseWriter, r *http.Request, nee
 		writeError(w, http.StatusInternalServerError, "could not resolve console permissions")
 		return consolePrincipal{}, false
 	}
-	if !perms[permission] {
+	if permission != "" && !perms[permission] {
 		writeError(w, http.StatusForbidden, "console permission does not allow this action")
 		return consolePrincipal{}, false
 	}
@@ -198,23 +198,18 @@ func (s *server) apiTokenPrincipal(w http.ResponseWriter, token, permission, res
 		keys, _ := account.BuiltinRolePermissions(principal.Token.Role)
 		ceiling := permissionSet(keys)
 		for key := range perms {
-			if !ceiling[key] || !account.PermissionAllowedForTokenResource(key, resource) {
+			covered := false
+			for _, held := range principal.Token.Resources {
+				covered = covered || account.PermissionAllowedForTokenResource(key, held)
+			}
+			if !ceiling[key] || !covered {
 				delete(perms, key)
 			}
-		}
-		// Device inspection and live-connection reads use the device resource
-		// ceiling. Mutations such as disconnect and policy writes stay on their
-		// dedicated stable permissions.
-		if resource == account.TokenResourceDevices {
-			perms[account.PermissionDevicesPolicyRead] =
-				ceiling[account.PermissionDevicesPolicyRead] && perms[account.PermissionDevicesRead]
-			perms[account.PermissionConnectionsRead] =
-				ceiling[account.PermissionConnectionsRead] && perms[account.PermissionDevicesRead]
 		}
 	} else {
 		perms = map[string]bool{}
 	}
-	if !perms[permission] {
+	if permission != "" && !perms[permission] {
 		writeError(w, http.StatusForbidden, "API token role does not allow this action")
 		return consolePrincipal{}, false
 	}

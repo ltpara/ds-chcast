@@ -12,6 +12,7 @@ import (
 
 type adminRoleReply struct {
 	ID          string    `json:"id"`
+	Revision    string    `json:"revision"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
 	Permissions []string  `json:"permissions"`
@@ -109,7 +110,7 @@ func TestAdminRoleAPICreateUpdateDeleteAndBuiltinGuard(t *testing.T) {
 	createdAt := role.CreatedAt
 
 	status, body = request(t, http.MethodPut, s.URL+"/v1/admin-roles/device-auditor",
-		`{"name":"Device reader","description":"read only","permissions":["devices.read"]}`, admin)
+		mustJSON(t, map[string]any{"name": "Device reader", "description": "read only", "permissions": []string{"devices.read"}, "if_revision": role.Revision}), admin)
 	if status != http.StatusOK {
 		t.Fatalf("update role: %d %s", status, body)
 	}
@@ -162,7 +163,7 @@ func TestAdminRoleAPICreateUpdateDeleteAndBuiltinGuard(t *testing.T) {
 		`{"id":"bad-permission","name":"Bad","permissions":["root.everything"]}`, admin); status != http.StatusBadRequest {
 		t.Fatalf("invalid permission: %d %s", status, body)
 	}
-	if status, body := request(t, http.MethodDelete, s.URL+"/v1/admin-roles/device-auditor", "", admin); status != http.StatusNoContent {
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/admin-roles/device-auditor?if_revision="+role.Revision, "", admin); status != http.StatusNoContent {
 		t.Fatalf("delete role: %d %s", status, body)
 	}
 }
@@ -271,7 +272,7 @@ func TestRolePermissionChangesConvergeForLiveSessions(t *testing.T) {
 		t.Fatalf("create bob: %v", err)
 	}
 	admin := login(t, s.URL, "alice", "correct horse").Token
-	createNamedRole(t, s.URL, admin, "live-reader", account.PermissionDevicesRead)
+	role := createNamedRole(t, s.URL, admin, "live-reader", account.PermissionDevicesRead)
 	binding := bindNamedRole(t, s.URL, admin, "bob", "live-reader", "global", "", "")
 	bob := login(t, s.URL, "bob", "battery staple")
 	if !hasPermission(bob.Permissions, account.PermissionDevicesRead) {
@@ -279,7 +280,7 @@ func TestRolePermissionChangesConvergeForLiveSessions(t *testing.T) {
 	}
 
 	status, body := request(t, http.MethodPut, s.URL+"/v1/admin-roles/live-reader",
-		`{"name":"Live reader","permissions":["audit.read"]}`, admin)
+		mustJSON(t, map[string]any{"name": "Live reader", "permissions": []string{"audit.read"}, "if_revision": role.Revision}), admin)
 	if status != http.StatusOK {
 		t.Fatalf("update role: %d %s", status, body)
 	}

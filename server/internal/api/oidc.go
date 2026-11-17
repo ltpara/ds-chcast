@@ -278,13 +278,7 @@ func (s *server) oidcPoll(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, loginResponse{
-		Token:              entryCopy.token,
-		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
-		RefreshToken:       entryCopy.refresh,
-		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
-		User:               viewAccount(entryCopy.user),
-	})
+	s.writeConsoleLoginResponse(w, entryCopy.user, entryCopy.token, entryCopy.refresh)
 }
 
 func (s *server) finishOIDC(stateKey, code, message string) {

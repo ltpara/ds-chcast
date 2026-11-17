@@ -3,7 +3,6 @@ package account
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,15 +10,13 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/pgtest"
 )
 
 // TestPostgresStore exercises the PostgreSQL backend end to end. It is gated
 // on CHAST_TEST_POSTGRES_DSN so the default SQLite test run stays self-contained.
 func TestPostgresStore(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	store, err := OpenPostgres(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -229,10 +226,7 @@ func TestPostgresStore(t *testing.T) {
 // pool is no longer capped at one connection, so the advisory lock, not the
 // pool, must serialise the read-modify-write on the shared key.
 func TestPostgresConcurrentLoginLocks(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	first, err := OpenPostgres(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -291,10 +285,7 @@ func TestPostgresConcurrentLoginLocks(t *testing.T) {
 // has an equivalent raw-database test, but PostgreSQL needs its own ALTER and
 // backfill syntax verified against a real server.
 func TestPostgresSchemaMigrationBackfillsSessionActivity(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	store, err := OpenPostgres(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -323,7 +314,7 @@ func TestPostgresSchemaMigrationBackfillsSessionActivity(t *testing.T) {
 	for _, statement := range []string{
 		`ALTER TABLE user_tokens DROP COLUMN IF EXISTS login_at,
 			DROP COLUMN IF EXISTS last_seen_at`,
-		`DELETE FROM schema_migrations WHERE version = 18`,
+		`DELETE FROM schema_migrations WHERE version >= 18`,
 	} {
 		if _, err := store.db.Exec(statement); err != nil {
 			store.DeleteUser(username)
@@ -364,10 +355,7 @@ func TestPostgresSchemaMigrationBackfillsSessionActivity(t *testing.T) {
 // TestPostgresDevicePolicyReceipt exercises both branches of receipt storage
 // against PostgreSQL, where applied is a BOOLEAN rather than SQLite's INTEGER.
 func TestPostgresDevicePolicyReceipt(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	store, err := OpenPostgres(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -418,6 +406,9 @@ func TestPostgresDevicePolicyReceipt(t *testing.T) {
 	if !admission.Allowed || admission.Reason != "user allowed" {
 		t.Fatalf("restricted admission = %+v", admission)
 	}
+	if _, err := store.CreateUserWithRole("ReceiptBackupAdmin", "correct horse battery", "", "", RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.SetBanned(username, true); err != nil {
 		t.Fatal(err)
 	}
@@ -434,10 +425,7 @@ func TestPostgresDevicePolicyReceipt(t *testing.T) {
 // paths against PostgreSQL. The FOR UPDATE quota lock and the group event
 // subqueries are the parts most likely to differ from SQLite.
 func TestPostgresAccountGroups(t *testing.T) {
-	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
-	}
+	dsn := pgtest.Schema(t)
 	store, err := OpenPostgres(dsn)
 	if err != nil {
 		t.Fatal(err)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
@@ -108,14 +109,26 @@ func (s *server) listAPITokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createAPIToken(w http.ResponseWriter, r *http.Request) {
-	user, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
-	if !ok || !tokenOwner(w, user) {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceAccounts)
+	if !ok || !tokenOwner(w, principal.User) {
 		return
 	}
+	user, actor := principal.User, principal.Actor
 	var req apiTokenCreateRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// A restricted machine credential cannot mint a stronger credential owned
+	// by its administrator and thereby escape its resource or role ceiling.
+	keys, _ := account.BuiltinRolePermissions(req.Role)
+	for _, key := range keys {
+		for _, resource := range req.Resources {
+			if account.PermissionAllowedForTokenResource(key, strings.ToLower(strings.TrimSpace(resource))) && !principal.Permissions[key] {
+				writeError(w, http.StatusForbidden, "API token permissions exceed the caller's permissions")
+				return
+			}
+		}
 	}
 	ttl := defaultAPITokenTTL
 	if req.ExpiresInSeconds != 0 {

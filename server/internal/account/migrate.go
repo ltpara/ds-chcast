@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 24
+const accountSchemaVersion = 26
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -38,6 +38,8 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 22, Name: "viewer strategy deliveries and receipts", Apply: applyViewerStrategyDeliveries},
 	{Version: 23, Name: "live remote connections and commands", Apply: applyLiveConnections},
 	{Version: 24, Name: "named console roles and bindings", Apply: applyNamedConsoleRoles},
+	{Version: 25, Name: "independent emergency access permission", Apply: applyNamedConsoleRoles},
+	{Version: 26, Name: "admin role edit revisions", Apply: applyAdminRoleRevisions},
 }
 
 // applyConnectionNote stores the viewer's end-of-session remark on the

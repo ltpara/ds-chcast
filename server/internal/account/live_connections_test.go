@@ -221,6 +221,63 @@ func TestLiveDisconnectIdempotencyReceiptAndExactTarget(t *testing.T) {
 	}
 }
 
+func TestLiveConnectionListsExpireCommandsWithoutHostOrDetailRead(t *testing.T) {
+	for _, status := range []string{liveconn.CommandQueued, liveconn.CommandDelivered} {
+		t.Run(status, func(t *testing.T) {
+			store := openGroupStore(t)
+			now := time.Date(2026, 11, 16, 5, 0, 0, 0, time.UTC)
+			store.SetClock(func() time.Time { return now })
+			if _, err := store.CreateGroup("lab", "Lab", "", 0, 0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.AddGroupDevice("lab", "devbox", "alice"); err != nil {
+				t.Fatal(err)
+			}
+			mustLiveSnapshot(t, store, testLiveSnapshot(liveRuntimeA, 1, false, liveConnA, liveConnB))
+			command, err := store.DisconnectLiveConnection("devbox", liveConnA, "request-expire", "alice", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status == liveconn.CommandDelivered {
+				if _, err := store.PollLiveCommands("devbox", liveRuntimeA, 32); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lists := map[string]func() ([]LiveConnection, error){
+				"global": func() ([]LiveConnection, error) { return store.LiveConnections(100) },
+				"group":  func() ([]LiveConnection, error) { return store.LiveConnectionsInGroup("lab", 100) },
+				"devices": func() ([]LiveConnection, error) {
+					return store.LiveConnectionsForDevices(map[string]bool{"devbox": true}, 100)
+				},
+			}
+			for _, offset := range []time.Duration{-time.Millisecond, 0, time.Second} {
+				now = time.UnixMilli(command.DeadlineMS).Add(offset)
+				wantStatus := liveconn.CommandExpired
+				if offset < 0 {
+					wantStatus = status
+				}
+				for name, list := range lists {
+					items, err := list()
+					if err != nil || len(items) != 2 {
+						t.Fatalf("%s at %v = %+v, %v", name, offset, items, err)
+					}
+					for _, item := range items {
+						if item.State != liveconn.ConnectionStale || item.ReceiptConfirmedAbsent {
+							t.Fatalf("expiry must not imply disconnect: %+v", item)
+						}
+						if item.ConnectionID == liveConnA && (item.CommandID != command.CommandID || item.CommandStatus != wantStatus) {
+							t.Fatalf("%s at %v: target = %+v, want %s", name, offset, item, wantStatus)
+						}
+						if item.ConnectionID == liveConnB && item.CommandID != "" {
+							t.Fatalf("other connection changed: %+v", item)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestLiveDisconnectExpiryAndFailedReceipt(t *testing.T) {
 	store := openGroupStore(t)
 	now := time.Date(2026, 11, 16, 5, 0, 0, 0, time.UTC)

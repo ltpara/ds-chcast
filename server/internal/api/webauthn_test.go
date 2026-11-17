@@ -235,6 +235,9 @@ func TestWebAuthnSecurityKeyFlow(t *testing.T) {
 		reply.User.Username != "alice" {
 		t.Fatalf("login reply = %s (%v)", data, err)
 	}
+	if len(reply.Permissions) == 0 {
+		t.Fatal("security-key login omitted console permissions")
+	}
 	status, data = request(t, http.MethodGet, s.URL+"/v1/account", "", reply.Token)
 	if status != http.StatusOK {
 		t.Fatalf("issued token: %d %s", status, data)

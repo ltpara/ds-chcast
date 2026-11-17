@@ -86,7 +86,14 @@ func (s *server) adminPrincipal(w http.ResponseWriter, r *http.Request, resource
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return consolePrincipal{}, false
 	}
-	return s.consolePrincipalFor(w, r, account.PermissionAccountsWrite, resource)
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionAccountsWrite, resource)
+	if !ok || !requireUnscoped(w, principal) {
+		return consolePrincipal{}, false
+	}
+	if username := r.PathValue("username"); username != "" && !s.requireAccountTargetCeiling(w, principal, username) {
+		return consolePrincipal{}, false
+	}
+	return principal, true
 }
 
 func (s *server) adminActor(w http.ResponseWriter, r *http.Request, resource string) (account.User, string, bool) {
@@ -102,7 +109,49 @@ func (s *server) accountActor(w http.ResponseWriter, r *http.Request, permission
 	if !ok {
 		return account.User{}, "", false
 	}
+	if !requireUnscoped(w, principal) {
+		return account.User{}, "", false
+	}
+	if permission == account.PermissionAccountsWrite && r.PathValue("username") != "" {
+		if !s.requireAccountTargetCeiling(w, principal, r.PathValue("username")) {
+			return account.User{}, "", false
+		}
+	}
 	return principal.User, principal.Actor, true
+}
+
+// Account maintenance must not become an alternative way to acquire a role:
+// credentials, bans, sessions and deletion of a privileged subject need role
+// management and a global ceiling covering every grant on that subject.
+func (s *server) requireAccountTargetCeiling(w http.ResponseWriter, principal consolePrincipal, username string) bool {
+	// A credential holding the full global catalogue already covers every
+	// target. Keep the handler's original existence/configuration error order.
+	if permissionSubset(account.AllPermissions(), principal.Permissions) {
+		return true
+	}
+	user, err := s.cfg.Accounts.FindUser(username)
+	if err != nil {
+		writeAccountError(w, err)
+		return false
+	}
+	keys, _ := account.BuiltinRolePermissions(user.Role)
+	bindings, err := s.cfg.Accounts.RoleBindings(user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not check account permissions")
+		return false
+	}
+	for _, binding := range bindings {
+		keys = append(keys, binding.Permissions...)
+	}
+	return s.requireAccountGrantCeiling(w, principal, keys)
+}
+
+func (s *server) requireAccountGrantCeiling(w http.ResponseWriter, principal consolePrincipal, keys []string) bool {
+	if len(keys) > 0 && (!principal.Permissions[account.PermissionRolesWrite] || !permissionSubset(keys, principal.Permissions)) {
+		writeError(w, http.StatusForbidden, "privileged account changes require roles.write and the subject's permissions")
+		return false
+	}
+	return true
 }
 
 func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -245,10 +294,11 @@ func (s *server) adminSetAccountSessionCap(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.accountActor(w, r, account.PermissionAccountsWrite)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceAccounts)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	var req adminAccountCreateRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -257,6 +307,10 @@ func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 	role := strings.TrimSpace(req.Role)
 	if role == "" {
 		role = account.RoleUser
+	}
+	keys, _ := account.BuiltinRolePermissions(role)
+	if !s.requireAccountGrantCeiling(w, principal, keys) {
+		return
 	}
 	password := req.Password
 	generated := false
@@ -283,13 +337,19 @@ func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
-	_, actor, ok := s.adminActor(w, r, account.TokenResourceAccounts)
-	if !ok {
+	principal, ok := s.adminPrincipal(w, r, account.TokenResourceAccounts)
+	if !ok || !requireUnscoped(w, principal) {
 		return
 	}
+	actor := principal.Actor
 	var req adminAccountPatchRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Role = strings.TrimSpace(req.Role)
+	keys, _ := account.BuiltinRolePermissions(req.Role)
+	if !s.requireAccountGrantCeiling(w, principal, keys) {
 		return
 	}
 	user, err := s.cfg.Accounts.SetRole(r.PathValue("username"), req.Role)
@@ -458,6 +518,9 @@ func (s *server) adminRevokeAccountSession(w http.ResponseWriter, r *http.Reques
 func (s *server) adminRevokeAccountSessions(w http.ResponseWriter, r *http.Request) {
 	principal, ok := s.consolePrincipalFor(w, r, account.PermissionAccountsWrite, account.TokenResourceAccounts)
 	if !ok {
+		return
+	}
+	if !requireUnscoped(w, principal) || !s.requireAccountTargetCeiling(w, principal, r.PathValue("username")) {
 		return
 	}
 	user, err := s.cfg.Accounts.FindUser(r.PathValue("username"))

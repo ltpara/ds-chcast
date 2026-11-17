@@ -45,11 +45,6 @@ func (s *server) issueEmergencyAccess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "the access ticket issuer key has been revoked")
 		return
 	}
-	principal, ok := s.consolePrincipalFor(w, r, account.PermissionConnectionsDisconnect, account.TokenResourceDevices)
-	if !ok {
-		return
-	}
-	actor := principal.Actor
 	var req emergencyAccessRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -60,9 +55,11 @@ func (s *server) issueEmergencyAccess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "host id must be 1..64 characters of [A-Za-z0-9_.-]")
 		return
 	}
-	if !s.deviceInScope(w, principal, peerID) {
+	principal, ok := s.devicePermissionActor(w, r, account.PermissionDevicesEmergencyAccess, peerID)
+	if !ok {
 		return
 	}
+	actor := principal.Actor
 	reason := strings.TrimSpace(req.Reason)
 	if reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required for emergency access")

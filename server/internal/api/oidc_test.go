@@ -203,6 +203,9 @@ func TestOIDCLoginEndToEnd(t *testing.T) {
 		reply.User.Username != "sso-alice" || reply.User.Role != "admin" {
 		t.Fatalf("unexpected login reply: %+v", reply)
 	}
+	if len(reply.Permissions) == 0 || !strings.Contains(string(data), `"scoped_permissions":[]`) {
+		t.Fatal("OIDC login omitted the console permission contract")
+	}
 	if status, data := request(t, http.MethodGet, server.URL+"/v1/account", "", reply.Token); status != http.StatusOK {
 		t.Fatalf("OIDC token did not authenticate: %d %s", status, data)
 	}

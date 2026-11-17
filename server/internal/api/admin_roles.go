@@ -18,6 +18,7 @@ type adminRoleRequest struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
 	Permissions []string `json:"permissions"`
+	IfRevision  string   `json:"if_revision"`
 }
 
 type roleBindingRequest struct {
@@ -41,6 +42,9 @@ func (s *server) rolePrincipal(w http.ResponseWriter, r *http.Request, permissio
 	if !ok {
 		return consolePrincipal{}, false
 	}
+	if !requireUnscoped(w, principal) {
+		return consolePrincipal{}, false
+	}
 	return principal, true
 }
 
@@ -62,10 +66,16 @@ func permissionSubset(candidate []string, held map[string]bool) bool {
 }
 
 func (s *server) requireRolePermissionCeiling(w http.ResponseWriter, principal consolePrincipal, permissions []string) bool {
-	if principal.Actor == "server-key" || principal.User.Role == account.RoleAdmin {
-		return true
+	keys := make([]string, 0, len(permissions))
+	for _, key := range permissions {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if !account.ValidPermissionKey(key) {
+			writeRoleError(w, account.ErrInvalidAdminPermission)
+			return false
+		}
+		keys = append(keys, key)
 	}
-	if !permissionSubset(permissions, principal.Permissions) {
+	if !permissionSubset(keys, principal.Permissions) {
 		writeError(w, http.StatusForbidden, "role permissions exceed the caller's effective permissions")
 		return false
 	}
@@ -73,19 +83,7 @@ func (s *server) requireRolePermissionCeiling(w http.ResponseWriter, principal c
 }
 
 func (s *server) requireBindingPermissionCeiling(w http.ResponseWriter, principal consolePrincipal, role account.AdminRole) bool {
-	if principal.Actor == "server-key" || principal.User.Role == account.RoleAdmin {
-		return true
-	}
-	if err := s.cfg.Accounts.RoleBindingEscalation(principal.User.ID, role); err != nil {
-		if errors.Is(err, account.ErrPermissionDenied) {
-			writeError(w, http.StatusForbidden, "role binding would exceed the caller's effective permissions")
-			return false
-		}
-		s.cfg.Logger.Error("role binding ceiling", "error", err)
-		writeError(w, http.StatusInternalServerError, "could not check role bindings")
-		return false
-	}
-	return true
+	return s.requireRolePermissionCeiling(w, principal, role.Permissions)
 }
 
 func (s *server) listAdminRoles(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +157,14 @@ func (s *server) updateAdminRole(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRolePermissionCeiling(w, principal, req.Permissions) {
 		return
 	}
-	role, err := s.cfg.Accounts.UpdateAdminRole(existing.ID, req.Name, req.Description, req.Permissions)
+	if existing.Builtin {
+		writeRoleError(w, account.ErrBuiltinRoleImmutable)
+		return
+	}
+	if !requireAdminRoleRevision(w, existing, req.IfRevision) {
+		return
+	}
+	role, err := s.cfg.Accounts.UpdateAdminRole(existing.ID, req.Name, req.Description, req.Permissions, req.IfRevision)
 	if err != nil {
 		writeRoleError(w, err)
 		return
@@ -182,12 +187,34 @@ func (s *server) deleteAdminRole(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRolePermissionCeiling(w, principal, existing.Permissions) {
 		return
 	}
-	if err := s.cfg.Accounts.DeleteAdminRole(existing.ID); err != nil {
+	if existing.Builtin {
+		writeRoleError(w, account.ErrBuiltinRoleImmutable)
+		return
+	}
+	ifRevision := r.URL.Query().Get("if_revision")
+	if !requireAdminRoleRevision(w, existing, ifRevision) {
+		return
+	}
+	if err := s.cfg.Accounts.DeleteAdminRole(existing.ID, ifRevision); err != nil {
 		writeRoleError(w, err)
 		return
 	}
 	s.recordAudit(r, principal.Actor, account.AuditRoleDelete, "deleted role "+existing.ID, true)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func requireAdminRoleRevision(w http.ResponseWriter, role account.AdminRole, revision string) bool {
+	if revision == "" {
+		writeRoleError(w, account.ErrAdminRoleRevisionRequired)
+		return false
+	}
+	// Also tie the Store write to the exact version whose permission ceiling
+	// was checked above; it must not mutate an intervening, stronger role.
+	if revision != role.Revision {
+		writeRoleError(w, account.ErrAdminRoleRevisionConflict)
+		return false
+	}
+	return true
 }
 
 func (s *server) listRoleBindings(w http.ResponseWriter, r *http.Request) {
@@ -211,20 +238,17 @@ func (s *server) listRoleBindings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not list role bindings")
 		return
 	}
-	if !s.canReadAllBindings(principal) {
-		filtered := bindings[:0]
-		for _, binding := range bindings {
-			if binding.UserID == principal.User.ID {
-				filtered = append(filtered, binding)
-			}
+	filtered := bindings[:0]
+	for _, binding := range bindings {
+		// A named role manager must be able to discover the bindings it can
+		// maintain. Keep read-only callers limited to their own bindings, and
+		// apply the same credential ceiling used by bind/unbind operations.
+		if binding.UserID == principal.User.ID || principal.Actor == "server-key" ||
+			(principal.Permissions[account.PermissionRolesWrite] && permissionSubset(binding.Permissions, principal.Permissions)) {
+			filtered = append(filtered, binding)
 		}
-		bindings = filtered
 	}
-	writeJSON(w, http.StatusOK, roleBindingListResponse{Bindings: bindings})
-}
-
-func (s *server) canReadAllBindings(principal consolePrincipal) bool {
-	return principal.Actor == "server-key" || principal.User.Role == account.RoleAdmin
+	writeJSON(w, http.StatusOK, roleBindingListResponse{Bindings: filtered})
 }
 
 // roleBindingByID is used before an unbind so the caller's permission ceiling
@@ -302,6 +326,10 @@ func (s *server) deleteRoleBinding(w http.ResponseWriter, r *http.Request) {
 
 func writeRoleError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, account.ErrAdminRoleRevisionRequired):
+		writeJSON(w, http.StatusPreconditionRequired, map[string]string{"error": err.Error(), "code": "role_revision_required"})
+	case errors.Is(err, account.ErrAdminRoleRevisionConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "role_revision_conflict"})
 	case errors.Is(err, account.ErrUnknownAdminRole),
 		errors.Is(err, account.ErrUnknownRoleBinding),
 		errors.Is(err, account.ErrUnknownUser),

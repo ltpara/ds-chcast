@@ -15,23 +15,24 @@ import (
 // these keys, not HTTP routes or UI labels, so moving a handler does not
 // silently grant or revoke an operation.
 const (
-	PermissionDevicesRead           = "devices.read"
-	PermissionDevicesWrite          = "devices.write"
-	PermissionDevicesDelete         = "devices.delete"
-	PermissionDevicesPolicyRead     = "devices.policy.read"
-	PermissionDevicesPolicyWrite    = "devices.policy.write"
-	PermissionConnectionsRead       = "connections.read"
-	PermissionConnectionsDisconnect = "connections.disconnect"
-	PermissionAuditRead             = "audit.read"
-	PermissionAccountsRead          = "accounts.read"
-	PermissionAccountsWrite         = "accounts.write"
-	PermissionGroupsRead            = "groups.read"
-	PermissionGroupsWrite           = "groups.write"
-	PermissionRecordingsRead        = "recordings.read"
-	PermissionRecordingsDelete      = "recordings.delete"
-	PermissionOpsRead               = "ops.read"
-	PermissionRolesRead             = "roles.read"
-	PermissionRolesWrite            = "roles.write"
+	PermissionDevicesRead            = "devices.read"
+	PermissionDevicesWrite           = "devices.write"
+	PermissionDevicesDelete          = "devices.delete"
+	PermissionDevicesEmergencyAccess = "devices.emergency_access"
+	PermissionDevicesPolicyRead      = "devices.policy.read"
+	PermissionDevicesPolicyWrite     = "devices.policy.write"
+	PermissionConnectionsRead        = "connections.read"
+	PermissionConnectionsDisconnect  = "connections.disconnect"
+	PermissionAuditRead              = "audit.read"
+	PermissionAccountsRead           = "accounts.read"
+	PermissionAccountsWrite          = "accounts.write"
+	PermissionGroupsRead             = "groups.read"
+	PermissionGroupsWrite            = "groups.write"
+	PermissionRecordingsRead         = "recordings.read"
+	PermissionRecordingsDelete       = "recordings.delete"
+	PermissionOpsRead                = "ops.read"
+	PermissionRolesRead              = "roles.read"
+	PermissionRolesWrite             = "roles.write"
 )
 
 // RoleScope restricts where a named role applies. Global roles apply to every
@@ -44,16 +45,18 @@ const (
 )
 
 var (
-	ErrInvalidAdminRoleID     = errors.New("admin role id must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-	ErrInvalidAdminRoleName   = errors.New("admin role name is required")
-	ErrUnknownAdminRole       = errors.New("unknown admin role")
-	ErrAdminRoleExists        = errors.New("admin role already exists")
-	ErrInvalidAdminPermission = errors.New("unknown console permission")
-	ErrBuiltinRoleImmutable   = errors.New("built-in roles cannot be changed")
-	ErrRoleBindingExists      = errors.New("role binding already exists")
-	ErrUnknownRoleBinding     = errors.New("unknown role binding")
-	ErrInvalidRoleScope       = errors.New("role scope must be global, group or object")
-	ErrLastManagementAdmin    = ErrLastAdmin
+	ErrInvalidAdminRoleID        = errors.New("admin role id must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+	ErrInvalidAdminRoleName      = errors.New("admin role name is required")
+	ErrUnknownAdminRole          = errors.New("unknown admin role")
+	ErrAdminRoleExists           = errors.New("admin role already exists")
+	ErrInvalidAdminPermission    = errors.New("unknown console permission")
+	ErrBuiltinRoleImmutable      = errors.New("built-in roles cannot be changed")
+	ErrAdminRoleRevisionRequired = errors.New("admin role revision is required; reload the role before changing it")
+	ErrAdminRoleRevisionConflict = errors.New("admin role changed; reload the role before changing it")
+	ErrRoleBindingExists         = errors.New("role binding already exists")
+	ErrUnknownRoleBinding        = errors.New("unknown role binding")
+	ErrInvalidRoleScope          = errors.New("role scope must be global, group or object")
+	ErrLastManagementAdmin       = ErrLastAdmin
 )
 
 // AdminRole is a named permission set. Built-in roles are materialised by the
@@ -66,6 +69,9 @@ type AdminRole struct {
 	Builtin     bool      `json:"builtin"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	// Revision is an opaque incarnation/version token, independent of wall time.
+	// Recreating the same role ID must not make a deleted role's draft valid.
+	Revision string `json:"revision"`
 }
 
 // RoleBinding assigns one named role to one account. ScopeValue is empty for a
@@ -91,6 +97,7 @@ func AllPermissions() []string {
 		PermissionConnectionsDisconnect,
 		PermissionConnectionsRead,
 		PermissionDevicesDelete,
+		PermissionDevicesEmergencyAccess,
 		PermissionDevicesPolicyRead,
 		PermissionDevicesPolicyWrite,
 		PermissionDevicesRead,
@@ -140,11 +147,11 @@ func PermissionAllowedForTokenResource(permission, resource string) bool {
 	}
 	switch resource {
 	case TokenResourceDevices:
-		return strings.HasPrefix(permission, "devices.")
+		return strings.HasPrefix(permission, "devices.") || permission == PermissionConnectionsRead || permission == PermissionConnectionsDisconnect
 	case TokenResourceAudit:
 		return permission == PermissionAuditRead
 	case TokenResourceAccounts:
-		return permission == PermissionAccountsRead || permission == PermissionAccountsWrite
+		return permission == PermissionAccountsRead || permission == PermissionAccountsWrite || permission == PermissionRolesRead || permission == PermissionRolesWrite
 	case TokenResourceGroups:
 		return permission == PermissionGroupsRead || permission == PermissionGroupsWrite
 	case TokenResourceRecordings:
@@ -201,7 +208,7 @@ func scanAdminRole(row rowScanner) (AdminRole, error) {
 		builtin          int
 	)
 	if err := row.Scan(&role.ID, &role.Name, &role.Description, &permissions,
-		&builtin, &created, &updated); err != nil {
+		&builtin, &created, &updated, &role.Revision); err != nil {
 		return AdminRole{}, err
 	}
 	role.Builtin = builtin != 0
@@ -217,7 +224,7 @@ func (s *Store) ListAdminRoles() ([]AdminRole, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT id, name, description, permissions, builtin, created_at, updated_at
+		`SELECT id, name, description, permissions, builtin, created_at, updated_at, revision
 		 FROM admin_roles ORDER BY builtin DESC, LOWER(name), id`)
 	if err != nil {
 		return nil, fmt.Errorf("account store %s: list admin roles: %w", s.path, err)
@@ -242,7 +249,7 @@ func (s *Store) AdminRole(id string) (AdminRole, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	role, err := scanAdminRole(s.db.QueryRow(
-		`SELECT id, name, description, permissions, builtin, created_at, updated_at
+		`SELECT id, name, description, permissions, builtin, created_at, updated_at, revision
 		 FROM admin_roles WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminRole{}, ErrUnknownAdminRole
@@ -269,13 +276,17 @@ func (s *Store) CreateAdminRole(id, name, description string, permissions []stri
 		return AdminRole{}, err
 	}
 	description = normalizeText(description, maxGroupDescription)
+	revision, err := newRandomHex(16)
+	if err != nil {
+		return AdminRole{}, err
+	}
 	now := s.now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, err := s.db.Exec(
-		`INSERT INTO admin_roles (id, name, description, permissions, builtin, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, 0, ?, ?)`,
-		id, name, description, strings.Join(perms, ","), unixMillis(now), unixMillis(now),
+		`INSERT INTO admin_roles (id, name, description, permissions, builtin, created_at, updated_at, revision)
+		 VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+		id, name, description, strings.Join(perms, ","), unixMillis(now), unixMillis(now), revision,
 	); err != nil {
 		if isUniqueViolation(err) {
 			return AdminRole{}, ErrAdminRoleExists
@@ -283,10 +294,13 @@ func (s *Store) CreateAdminRole(id, name, description string, permissions []stri
 		return AdminRole{}, fmt.Errorf("account store %s: create admin role: %w", s.path, err)
 	}
 	return AdminRole{ID: id, Name: name, Description: description, Permissions: perms,
-		CreatedAt: now, UpdatedAt: now}, nil
+		CreatedAt: now, UpdatedAt: now, Revision: revision}, nil
 }
 
-func (s *Store) UpdateAdminRole(id, name, description string, permissions []string) (AdminRole, error) {
+func (s *Store) UpdateAdminRole(id, name, description string, permissions []string, ifRevision string) (AdminRole, error) {
+	if ifRevision == "" {
+		return AdminRole{}, ErrAdminRoleRevisionRequired
+	}
 	id = strings.TrimSpace(id)
 	perms, err := normalizePermissionKeys(permissions)
 	if err != nil {
@@ -299,28 +313,31 @@ func (s *Store) UpdateAdminRole(id, name, description string, permissions []stri
 		return AdminRole{}, fmt.Errorf("account store %s: begin update admin role: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	var (
-		builtin int
-		created int64
-	)
-	if err := tx.QueryRow(`SELECT builtin, created_at FROM admin_roles WHERE id = ?`, id).Scan(&builtin, &created); errors.Is(err, sql.ErrNoRows) {
-		return AdminRole{}, ErrUnknownAdminRole
-	} else if err != nil {
-		return AdminRole{}, fmt.Errorf("account store %s: read admin role: %w", s.path, err)
-	}
-	if builtin != 0 {
-		return AdminRole{}, ErrBuiltinRoleImmutable
-	}
 	name = normalizeText(name, maxName)
 	if name == "" {
 		return AdminRole{}, ErrInvalidAdminRoleName
 	}
 	description = normalizeText(description, maxGroupDescription)
+	revision, err := newRandomHex(16)
+	if err != nil {
+		return AdminRole{}, err
+	}
 	now := s.now().UTC()
-	if _, err := tx.Exec(
-		`UPDATE admin_roles SET name = ?, description = ?, permissions = ?, updated_at = ? WHERE id = ?`,
-		name, description, strings.Join(perms, ","), unixMillis(now), id); err != nil {
+	// The first statement is a conditional write, not a read/check/write pair.
+	// This works across Store instances and avoids SQLite read-lock upgrades.
+	result, err := tx.Exec(
+		`UPDATE admin_roles SET name = ?, description = ?, permissions = ?, updated_at = ?, revision = ?
+		 WHERE id = ? AND revision = ? AND builtin = 0`,
+		name, description, strings.Join(perms, ","), unixMillis(now), revision, id, ifRevision)
+	if err != nil {
 		return AdminRole{}, fmt.Errorf("account store %s: update admin role: %w", s.path, err)
+	}
+	if err := checkAdminRoleMutation(tx, result, id); err != nil {
+		return AdminRole{}, err
+	}
+	var created int64
+	if err := tx.QueryRow(`SELECT created_at FROM admin_roles WHERE id = ?`, id).Scan(&created); err != nil {
+		return AdminRole{}, err
 	}
 	if err := ensureLastManagementAdmin(tx); err != nil {
 		return AdminRole{}, err
@@ -329,11 +346,14 @@ func (s *Store) UpdateAdminRole(id, name, description string, permissions []stri
 		return AdminRole{}, fmt.Errorf("account store %s: commit admin role: %w", s.path, err)
 	}
 	return AdminRole{ID: id, Name: name, Description: description, Permissions: perms,
-		CreatedAt: timeFromMillis(created), UpdatedAt: now}, nil
+		CreatedAt: timeFromMillis(created), UpdatedAt: now, Revision: revision}, nil
 }
 
 // DeleteAdminRole removes a custom role and every binding that references it.
-func (s *Store) DeleteAdminRole(id string) error {
+func (s *Store) DeleteAdminRole(id, ifRevision string) error {
+	if ifRevision == "" {
+		return ErrAdminRoleRevisionRequired
+	}
 	id = strings.TrimSpace(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -342,26 +362,86 @@ func (s *Store) DeleteAdminRole(id string) error {
 		return fmt.Errorf("account store %s: begin delete admin role: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	var builtin int
-	if err := tx.QueryRow(`SELECT builtin FROM admin_roles WHERE id = ?`, id).Scan(&builtin); errors.Is(err, sql.ErrNoRows) {
-		return ErrUnknownAdminRole
-	} else if err != nil {
-		return fmt.Errorf("account store %s: read admin role: %w", s.path, err)
-	}
-	if builtin != 0 {
-		return ErrBuiltinRoleImmutable
-	}
-	if _, err := tx.Exec(`DELETE FROM role_bindings WHERE role_id = ?`, id); err != nil {
-		return fmt.Errorf("account store %s: delete role bindings: %w", s.path, err)
-	}
-	if _, err := tx.Exec(`DELETE FROM admin_roles WHERE id = ?`, id); err != nil {
+	// ON DELETE CASCADE removes bindings only after the role version matches.
+	result, err := tx.Exec(`DELETE FROM admin_roles WHERE id = ? AND revision = ? AND builtin = 0`, id, ifRevision)
+	if err != nil {
 		return fmt.Errorf("account store %s: delete admin role: %w", s.path, err)
+	}
+	if err := checkAdminRoleMutation(tx, result, id); err != nil {
+		return err
 	}
 	if err := ensureLastManagementAdmin(tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit delete admin role: %w", s.path, err)
+	}
+	return nil
+}
+
+func checkAdminRoleMutation(tx *sql.Tx, result sql.Result, id string) error {
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 1 {
+		return nil
+	}
+	var builtin int
+	if err := tx.QueryRow(`SELECT builtin FROM admin_roles WHERE id = ?`, id).Scan(&builtin); errors.Is(err, sql.ErrNoRows) {
+		return ErrUnknownAdminRole
+	} else if err != nil {
+		return err
+	}
+	if builtin != 0 {
+		return ErrBuiltinRoleImmutable
+	}
+	return ErrAdminRoleRevisionConflict
+}
+
+func applyAdminRoleRevisions(db *sql.DB) error {
+	if err := ensureColumn(db, "admin_roles", "revision", "revision TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return backfillAdminRoleRevisions(db)
+}
+
+func applyAdminRoleRevisionsPostgres(db *sql.DB) error {
+	if _, err := db.Exec(`ALTER TABLE admin_roles ADD COLUMN IF NOT EXISTS revision TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	return backfillAdminRoleRevisions(db)
+}
+
+// Resume safely if migration stopped after adding the column or filling some
+// rows. Existing revisions, timestamps, permissions and bindings stay intact.
+func backfillAdminRoleRevisions(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id FROM admin_roles WHERE revision = ''`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		revision, err := newRandomHex(16)
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE admin_roles SET revision = ? WHERE id = ? AND revision = ''`, revision, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -436,22 +516,10 @@ func permissionSetContains(keys []string, want string) bool {
 	return false
 }
 
-func effectiveGlobalManagementPermissions(fixedRole, permissions string) bool {
-	if keys, ok := BuiltinRolePermissions(fixedRole); ok &&
-		permissionSetContains(keys, PermissionAccountsWrite) {
-		return true
-	}
-	for _, key := range strings.Split(permissions, ",") {
-		if strings.TrimSpace(key) == PermissionAccountsWrite {
-			return true
-		}
-	}
-	return false
-}
-
 // ensureLastManagementAdmin checks the post-mutation state of the current
-// transaction. A fixed admin and a global named role carrying accounts.write
-// are equivalent; group/object-scoped assignments do not protect the
+// transaction. A manager must hold the complete global catalogue, possibly
+// through several bindings, so it can restore an administrator without
+// exceeding its own permission ceiling. Scoped assignments do not protect the
 // deployment because they cannot manage every account. No users is allowed so
 // a fresh deployment can bootstrap its first account as admin.
 func ensureLastManagementAdmin(tx *sql.Tx) error {
@@ -475,21 +543,31 @@ func ensureLastManagementAdmin(tx *sql.Tx) error {
 		return fmt.Errorf("read global management assignments: %w", err)
 	}
 	defer rows.Close()
-	managers := make(map[string]bool)
+	grants := make(map[string]map[string]bool)
 	for rows.Next() {
 		var id, fixedRole, permissions string
 		if err := rows.Scan(&id, &fixedRole, &permissions); err != nil {
 			return fmt.Errorf("scan global management assignment: %w", err)
 		}
-		if effectiveGlobalManagementPermissions(fixedRole, permissions) {
-			managers[id] = true
+		if grants[id] == nil {
+			grants[id] = make(map[string]bool)
+		}
+		keys, _ := BuiltinRolePermissions(fixedRole)
+		for _, key := range append(keys, strings.Split(permissions, ",")...) {
+			grants[id][key] = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("list global management assignments: %w", err)
 	}
-	if len(managers) == 0 {
-		return ErrLastManagementAdmin
+	for _, held := range grants {
+		complete := true
+		for _, key := range AllPermissions() {
+			complete = complete && held[key]
+		}
+		if complete {
+			return nil
+		}
 	}
-	return nil
+	return ErrLastManagementAdmin
 }

@@ -81,6 +81,9 @@ type Options struct {
 	// NoAccounts leaves login and address-book routes unavailable, matching a
 	// server started with --state "".
 	NoAccounts bool
+	// PostgresDSN selects an isolated account schema supplied by pgtest.Schema.
+	// StartWith owns and closes the resulting store; the caller owns the schema.
+	PostgresDSN string
 	// RecordingsDir enables the account recording archive at this directory.
 	// RecordingsQuota and RecordingsMax default to 8 GiB and 2 GiB when zero,
 	// so a test only names the directory.
@@ -172,7 +175,11 @@ func StartWith(t testing.TB, opts Options) *Server {
 	var accounts *account.Store
 	if !opts.NoAccounts {
 		var err error
-		accounts, err = account.Open(filepath.Join(t.TempDir(), "accounts.db"))
+		if opts.PostgresDSN != "" {
+			accounts, err = account.OpenPostgres(opts.PostgresDSN)
+		} else {
+			accounts, err = account.Open(filepath.Join(t.TempDir(), "accounts.db"))
+		}
 		if err != nil {
 			t.Fatalf("accounts: %v", err)
 		}

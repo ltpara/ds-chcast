@@ -40,12 +40,13 @@ type accountView struct {
 }
 
 type loginResponse struct {
-	Token              string      `json:"token"`
-	ExpiresInMS        int64       `json:"expires_in_ms"`
-	RefreshToken       string      `json:"refresh_token,omitempty"`
-	RefreshExpiresInMS int64       `json:"refresh_expires_in_ms,omitempty"`
-	User               accountView `json:"user"`
-	Permissions        []string    `json:"permissions"`
+	Token              string         `json:"token"`
+	ExpiresInMS        int64          `json:"expires_in_ms"`
+	RefreshToken       string         `json:"refresh_token,omitempty"`
+	RefreshExpiresInMS int64          `json:"refresh_expires_in_ms,omitempty"`
+	User               accountView    `json:"user"`
+	Permissions        []string       `json:"permissions"`
+	ScopedPermissions  []consoleGrant `json:"scoped_permissions"`
 }
 
 type refreshRequest struct {
@@ -53,10 +54,11 @@ type refreshRequest struct {
 }
 
 type accountResponse struct {
-	User          accountView `json:"user"`
-	TwoFactor     bool        `json:"two_factor"`
-	RecoveryCodes int         `json:"recovery_codes"`
-	Permissions   []string    `json:"permissions"`
+	User              accountView    `json:"user"`
+	TwoFactor         bool           `json:"two_factor"`
+	RecoveryCodes     int            `json:"recovery_codes"`
+	Permissions       []string       `json:"permissions"`
+	ScopedPermissions []consoleGrant `json:"scoped_permissions"`
 }
 
 type twoFactorStartResponse struct {
@@ -472,17 +474,26 @@ func (s *server) finishLogin(w http.ResponseWriter, r *http.Request, req loginRe
 	}
 	s.auditLogin(r, user.Username, detail, true)
 	s.cfg.Logger.Info("account login", "user", user.Username, "method", detail)
+	s.writeConsoleLoginResponse(w, user, token, refresh)
+}
+
+// Every login method returns the same permission contract, including OIDC and
+// security keys; a scoped account must not depend on password login to enter.
+func (s *server) writeConsoleLoginResponse(w http.ResponseWriter, user account.User, token, refresh string) {
+	grants, err := s.consoleGrants(user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not resolve console grants")
+		return
+	}
 	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
 	if err != nil {
-		s.cfg.Logger.Error("login permissions", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not resolve console permissions")
+		return
 	}
 	writeJSON(w, http.StatusOK, loginResponse{
-		Token:              token,
-		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
-		RefreshToken:       refresh,
-		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
-		User:               viewAccount(user),
-		Permissions:        permissionKeys(permissions),
+		Token: token, ExpiresInMS: account.AccessTokenTTL.Milliseconds(),
+		RefreshToken: refresh, RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
+		User: viewAccount(user), Permissions: permissionKeys(permissions), ScopedPermissions: grants,
 	})
 }
 
@@ -528,18 +539,7 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordAudit(r, user.Username, account.AuditRefresh, "rotated", true)
-	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
-	if err != nil {
-		s.cfg.Logger.Error("refresh permissions", "error", err)
-	}
-	writeJSON(w, http.StatusOK, loginResponse{
-		Token:              token,
-		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
-		RefreshToken:       refresh,
-		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
-		User:               viewAccount(user),
-		Permissions:        permissionKeys(permissions),
-	})
+	s.writeConsoleLoginResponse(w, user, token, refresh)
 }
 
 // recordAudit persists an account-security outcome for operators. Audit write
@@ -653,6 +653,11 @@ func (s *server) accountInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read the account")
 		return
 	}
+	grants, grantErr := s.consoleGrants(user.ID)
+	if grantErr != nil {
+		writeError(w, http.StatusInternalServerError, "could not resolve console grants")
+		return
+	}
 	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
 	if err != nil {
 		s.cfg.Logger.Error("account permissions", "error", err)
@@ -660,10 +665,11 @@ func (s *server) accountInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, accountResponse{
-		User:          viewAccount(user),
-		TwoFactor:     enabled,
-		RecoveryCodes: remaining,
-		Permissions:   permissionKeys(permissions),
+		User:              viewAccount(user),
+		TwoFactor:         enabled,
+		RecoveryCodes:     remaining,
+		Permissions:       permissionKeys(permissions),
+		ScopedPermissions: grants,
 	})
 }
 
