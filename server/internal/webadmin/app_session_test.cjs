@@ -27,7 +27,7 @@ function app(fetch, stubEntry = false) {
     const realLock = lock;
     lock = () => { locks++; state.auth = null; };
     Object.assign(exported, {loadPolicies, resetPolicyConsole, openClientStrategy, saveClientStrategy, openClientStrategyStatus, openConnectionDetail, refreshConnectionDetail, resetConnectionDetail, requestDisconnect, renderConnectionDetail});
-    Object.assign(exported, {state, api, adoptAccountSession, canPermission, canDeviceCollection, canDeviceAction, tabVisible, applySessionPermissions, refreshConsolePermissions, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled, loadRoles, fmtTime, realLock, resetRoleConsole, renderPermissionOptions, renderRoles, renderRoleBindings, renderRoleSelects, applyRoleControlPermissions, syncRoleBindingScope, mutateRoles, clearRolePanels, editRole, saveRole, reloadRoleEditor, resetRoleEditor, deleteRole, openRoleAction, closeRoleAction, confirmRoleAction, roleActionKeydown});
+    Object.assign(exported, {state, api, adoptAccountSession, canPermission, canDeviceCollection, canDeviceAction, tabVisible, applySessionPermissions, refreshConsolePermissions, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled, loadRoles, fmtTime, realLock, resetRoleConsole, renderPermissionOptions, renderRoles, renderRoleBindings, renderRoleSelects, applyRoleControlPermissions, syncRoleBindingScope, mutateRoles, clearRolePanels, editRole, saveRole, reloadRoleEditor, resetRoleEditor, deleteRole, openRoleAction, closeRoleAction, confirmRoleAction, roleActionKeydown, updateTabSelection, handleTabKeydown, initializeTableRegions});
   })();`), runtime);
   return {...runtime.exported, runtime, saved};
 }
@@ -98,6 +98,129 @@ function managementDOM(loaded) {
   loaded.runtime.clearTimeout = id => timers.delete(id);
   return {node, timers};
 }
+
+function classList(initial = []) {
+  const values = new Set(initial);
+  return {
+    add(value) { values.add(value); },
+    remove(value) { values.delete(value); },
+    contains(value) { return values.has(value); },
+    toggle(value, force) {
+      if (force === undefined ? !values.has(value) : force) values.add(value);
+      else values.delete(value);
+    },
+  };
+}
+
+function navigationDOM(loaded) {
+  const tabs = ['overview', 'devices', 'connections'].map((tab, index) => ({
+    dataset: {tab},
+    attributes: {},
+    tabIndex: index === 0 ? 0 : -1,
+    classList: classList(index === 0 ? ['active'] : []),
+    setAttribute(key, value) { this.attributes[key] = value; },
+    focus() { this.focused = true; },
+  }));
+  const panels = tabs.map((tab) => ({
+    id: 'panel-' + tab.dataset.tab,
+    classList: classList(tab.dataset.tab === 'overview' ? ['active'] : []),
+  }));
+  loaded.runtime.document = {
+    querySelectorAll(selector) {
+      if (selector === '.tab') return tabs;
+      if (selector === '.panel-page') return panels;
+      throw new Error('unexpected selector: ' + selector);
+    },
+  };
+  return {tabs, panels};
+}
+
+test('admin tabs expose linked panels and standard keyboard navigation', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'assets/index.html'), 'utf8');
+  const tabButtons = Array.from(html.matchAll(/<button\b([^>]*\brole="tab"[^>]*)>/g), match => match[1]);
+  assert.equal(tabButtons.length, 12);
+  for (const markup of tabButtons) {
+    const tab = markup.match(/\bdata-tab="([^"]+)"/)[1];
+    assert.match(markup, new RegExp('\\bid="tab-' + tab + '"'));
+    assert.match(markup, new RegExp('\\baria-controls="panel-' + tab + '"'));
+    assert.match(markup, new RegExp('\\baria-selected="' + (tab === 'overview' ? 'true' : 'false') + '"'));
+    assert.match(markup, new RegExp('\\btabindex="' + (tab === 'overview' ? '0' : '-1') + '"'));
+    assert.match(html, new RegExp('<section\\b(?=[^>]*\\bid="panel-' + tab + '")(?=[^>]*\\brole="tabpanel")(?=[^>]*\\baria-labelledby="tab-' + tab + '")[^>]*>'));
+  }
+
+  const loaded = app(async () => reply(200, {}));
+  const {tabs, panels} = navigationDOM(loaded);
+  const activate = tab => loaded.updateTabSelection(tab);
+  function press(tabIndex, key) {
+    let prevented = false;
+    loaded.handleTabKeydown({
+      currentTarget: tabs[tabIndex], key,
+      preventDefault() { prevented = true; },
+    }, activate);
+    return prevented;
+  }
+
+  assert.equal(press(0, 'ArrowRight'), true);
+  assert.equal(loaded.state.tab, 'devices');
+  assert.equal(tabs[1].tabIndex, 0);
+  assert.equal(tabs[1].attributes['aria-selected'], 'true');
+  assert.equal(panels[1].classList.contains('active'), true);
+  assert.equal(tabs[1].focused, true);
+  assert.equal(press(1, 'ArrowRight'), true);
+  assert.equal(loaded.state.tab, 'connections');
+  assert.equal(press(2, 'ArrowRight'), true);
+  assert.equal(loaded.state.tab, 'overview');
+  assert.equal(press(0, 'ArrowLeft'), true);
+  assert.equal(loaded.state.tab, 'connections');
+  assert.equal(press(0, 'End'), true);
+  assert.equal(loaded.state.tab, 'connections');
+  assert.equal(press(2, 'Home'), true);
+  assert.equal(loaded.state.tab, 'overview');
+  tabs[1].classList.add('hidden');
+  assert.equal(press(0, 'ArrowRight'), true);
+  assert.equal(loaded.state.tab, 'connections');
+  tabs[1].classList.remove('hidden');
+  assert.equal(press(0, 'Enter'), false);
+});
+
+test('scrollable table regions are focusable and named by their columns', () => {
+  const loaded = app(async () => reply(200, {}));
+  const headers = ['用户名', '角色', '范围', '隐藏列'].map(textContent => ({textContent}));
+  const region = {
+    tabIndex: -1,
+    clientWidth: 200,
+    scrollWidth: 500,
+    scrollLeft: 0,
+    attributes: {},
+    listeners: {},
+    setAttribute(key, value) { this.attributes[key] = value; },
+    hasAttribute(key) { return Object.hasOwn(this.attributes, key); },
+    addEventListener(type, listener) { this.listeners[type] = listener; },
+    querySelectorAll(selector) { assert.equal(selector, 'thead th'); return headers; },
+  };
+  const namedRegion = {
+    ...region,
+    attributes: {role: 'region', 'aria-label': '命名角色列表，可横向滚动'},
+    listeners: {},
+  };
+  loaded.runtime.document = {querySelectorAll: selector => {
+    assert.equal(selector, '.table-wrap');
+    return [region, namedRegion];
+  }};
+  loaded.initializeTableRegions();
+  assert.equal(region.tabIndex, 0);
+  assert.equal(region.attributes.role, 'region');
+  assert.equal(region.attributes['aria-label'], '表格列：用户名、角色、范围，可横向滚动');
+  assert.equal(namedRegion.attributes['aria-label'], '命名角色列表，可横向滚动');
+  let prevented = false;
+  region.listeners.keydown({target: region, key: 'ArrowRight', preventDefault() { prevented = true; }});
+  assert.equal(prevented, true);
+  assert.equal(region.scrollLeft, 160);
+  region.listeners.keydown({target: region, key: 'End', preventDefault() {}});
+  assert.equal(region.scrollLeft, 300);
+  region.listeners.keydown({target: {}, key: 'Home', preventDefault() { throw new Error('child controls keep their key behavior'); }});
+  assert.equal(region.scrollLeft, 300);
+});
 
 const liveRow = (id = 'a') => ({host_id:'eastbox', runtime_id:'runtime', connection_id:id.repeat(32), state:'active', console_permissions:['connections.read','connections.disconnect']});
 const strategyCatalog = {version:1, settings:[{key:'host.keep_awake', type:'boolean', apply:'restart'}]};

@@ -4,9 +4,9 @@
 //
 // The wire format is platform neutral (chast/protocol.h): pointer coordinates
 // in virtual-desktop pixels and keys as USB HID usages. This layer is the
-// Windows end of it: it turns a usage id into a PS/2 set 1 scan code and
-// drives SendInput, which is layout independent (KEYEVENTF_SCANCODE) and never
-// needs to know what character the host layout would produce there.
+// Windows end of it: it maps a usage's physical scan position through the
+// foreground layout and injects the resulting virtual key, allowing the host
+// layout and IME to interpret the key.
 //
 // Input arrives on an MsQuic callback thread, so submit() only enqueues; one
 // injection thread applies the events in order. That keeps SendInput on a
@@ -45,6 +45,10 @@ bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended);
 // is identified by virtual key because its E1 sequence is not a set-1 key.
 uint16_t windows_key_to_hid(uint32_t virtual_key, uint32_t scan_code, bool extended);
 bool make_keyboard_input(uint16_t usage, bool down, INPUT& input);
+// Explicit-layout variant for deterministic mapping checks.
+bool make_keyboard_input(uint16_t usage, bool down, INPUT& input, HKL layout);
+// Raw scan-code representation retained for low-level diagnostics/tests.
+bool make_scancode_input(uint16_t usage, bool down, INPUT& input);
 // Legacy keyboard mode injects a named virtual key instead of a scan code.
 // Windows resolves it against the host layout; extended keys keep their
 // navigation behavior. VK_PACKET and VK_PROCESSKEY are rejected because they
@@ -76,8 +80,11 @@ public:
     // into the focused window.
     // An optional dry-run observer receives each OS input in injection order
     // on the worker thread; it must outlive stop(). Ignored for live input.
+    // Optional providers pin the host layout and IME-open state for tests.
     static std::unique_ptr<InputInjector> create(bool dry_run, std::string* error,
-        std::function<void(const INPUT&)> dry_run_observer = {});
+        std::function<void(const INPUT&)> dry_run_observer = {},
+        std::function<HKL()> keyboard_layout_provider = {},
+        std::function<bool()> ime_open_provider = {});
 
     ~InputInjector();
     InputInjector(const InputInjector&) = delete;
@@ -153,6 +160,8 @@ private:
     void release_fallback_pointer();
     void release_all();
     UINT send(const INPUT& input);
+    HKL keyboard_layout() const;
+    bool keyboard_ime_open() const;
     // Moves the injection thread onto the desktop that currently receives
     // input, at most every 250 ms or immediately after SendInput rejected an
     // event. An actual switch forgets held keys and buttons: they do not
@@ -161,6 +170,8 @@ private:
 
     bool dry_run_ = false;
     std::function<void(const INPUT&)> dry_run_observer_;
+    std::function<HKL()> keyboard_layout_provider_;
+    std::function<bool()> ime_open_provider_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     struct Pending {
@@ -178,6 +189,8 @@ private:
     struct HeldKey {
         uint16_t usage = 0;
         bool legacy = false;
+        uint16_t virtual_key = 0;
+        bool scan_code = false;
         std::chrono::steady_clock::time_point last_down;
     };
     // Keys currently down, in press order, so release_all lifts them in

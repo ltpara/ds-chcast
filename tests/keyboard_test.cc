@@ -1,5 +1,7 @@
 #include "keyboard_capture.h"
 #include "local_text_input.h"
+#include <imm.h>
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -20,7 +22,12 @@ chast::InputEvent input_key(uint16_t usage, bool down, uint16_t modifiers = 0) {
 }
 
 bool is_key(const INPUT& input, WORD scan, bool down, bool extended = false) {
-    return input.type == INPUT_KEYBOARD && input.ki.wScan == scan &&
+    const bool mapped_virtual_key = input.ki.wVk != 0 &&
+        (input.ki.dwFlags & KEYEVENTF_SCANCODE) == 0;
+    const bool raw_scan_code = input.ki.wVk == 0 &&
+        (input.ki.dwFlags & KEYEVENTF_SCANCODE) != 0;
+    return input.type == INPUT_KEYBOARD && (mapped_virtual_key || raw_scan_code) &&
+        input.ki.wScan == scan &&
         ((input.ki.dwFlags & KEYEVENTF_KEYUP) == 0) == down &&
         ((input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0) == extended;
 }
@@ -169,6 +176,28 @@ int main() {
         local_key(VK_RMENU, 0x38, true, false, LLKHF_EXTENDED);
         check(!local_key('Q', 0x10, true), "AltGr character remains local text");
     }
+    const HKL us_layout = LoadKeyboardLayoutW(L"00000409", KLF_NOTELLSHELL);
+    const HKL german_layout = LoadKeyboardLayoutW(L"00000407", KLF_NOTELLSHELL);
+    check(us_layout != nullptr && german_layout != nullptr,
+          "US and German layouts load for deterministic mapping checks");
+    check(chast::make_keyboard_input(0x1C, true, input, german_layout) &&
+          input.ki.wVk == 'Z' && input.ki.wScan == 0x15 &&
+          (input.ki.dwFlags & KEYEVENTF_SCANCODE) == 0,
+          "German layout maps the physical US-Y position to VK_Z");
+    check(chast::make_keyboard_input(0x1D, true, input, german_layout) &&
+          input.ki.wVk == 'Y' && input.ki.wScan == 0x2C,
+          "German layout maps the physical US-Z position to VK_Y");
+    HKL ime_layout = nullptr;
+    for (const wchar_t* id : {L"00000804", L"E0080804", L"E0200804"}) {
+        const HKL candidate = LoadKeyboardLayoutW(id, KLF_NOTELLSHELL);
+        if (candidate != nullptr && ImmIsIME(candidate)) {
+            ime_layout = candidate;
+            break;
+        }
+    }
+    check(chast::make_scancode_input(0x1C, true, input) && input.ki.wVk == 0 &&
+          input.ki.wScan == 0x15 && (input.ki.dwFlags & KEYEVENTF_SCANCODE) != 0,
+          "raw scan-code control remains available for diagnostics");
     check(chast::make_keyboard_input(0x55, true, input) && input.ki.wScan == 0x37 &&
           (input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) == 0, "multiply is not PrintScreen");
     check(chast::make_keyboard_input(0x46, true, input) &&
@@ -194,10 +223,119 @@ int main() {
     }
 
     std::string error;
+    const std::function<HKL()> us_layout_provider = [us_layout] { return us_layout; };
+    if (us_layout != nullptr && german_layout != nullptr) {
+        {
+            std::atomic<HKL> active_layout{german_layout};
+            std::promise<void> down_injected;
+            auto down_future = down_injected.get_future();
+            std::vector<INPUT> injected;
+            auto injector = chast::InputInjector::create(true, &error,
+                [&](const INPUT& value) {
+                    injected.push_back(value);
+                    if (injected.size() == 1) down_injected.set_value();
+                },
+                [&] { return active_layout.load(); },
+                [] { return false; });
+            check(injector != nullptr, "layout-snapshot observer starts");
+            if (injector) {
+                injector->submit(input_key(0x1C, true));
+                const bool down_ready = down_future.wait_for(std::chrono::seconds(2)) ==
+                    std::future_status::ready;
+                check(down_ready, "German-layout key down reaches the injector");
+                active_layout.store(us_layout);
+                injector->submit(input_key(0x1C, false));
+                injector->stop();
+                check(down_ready && injected.size() == 2 &&
+                      injected[0].ki.wVk == 'Z' && injected[1].ki.wVk == 'Z' &&
+                      is_key(injected[0], 0x15, true) &&
+                      is_key(injected[1], 0x15, false),
+                      "key up reuses the key-down VK after a layout change");
+            }
+        }
+        if (ime_layout != nullptr) {
+            std::atomic<HKL> active_layout{ime_layout};
+            std::promise<void> down_injected;
+            auto down_future = down_injected.get_future();
+            std::vector<INPUT> injected;
+            auto injector = chast::InputInjector::create(true, &error,
+                [&](const INPUT& value) {
+                    injected.push_back(value);
+                    if (injected.size() == 1) down_injected.set_value();
+                },
+                [&] { return active_layout.load(); },
+                [] { return true; });
+            check(injector != nullptr, "IME-layout observer starts");
+            if (injector) {
+                injector->submit(input_key(0x04, true));
+                const bool down_ready = down_future.wait_for(std::chrono::seconds(2)) ==
+                    std::future_status::ready;
+                check(down_ready, "IME-layout key down reaches the injector");
+                active_layout.store(german_layout);
+                injector->submit(input_key(0x04, false));
+                injector->stop();
+                check(down_ready && injected.size() == 2 &&
+                      injected[0].ki.wVk == 0 && injected[1].ki.wVk == 0 &&
+                      is_key(injected[0], 0x1E, true) &&
+                      is_key(injected[1], 0x1E, false),
+                      "IME key up retains scan-code mode after a layout change");
+            }
+        }
+        {
+            const SHORT at_key = VkKeyScanExW(L'@', german_layout);
+            check(at_key != -1 && ((static_cast<WORD>(at_key) >> 8) & 0x06) == 0x06,
+                  "German layout identifies @ on its Ctrl+Alt layer");
+            std::vector<INPUT> injected;
+            auto injector = chast::InputInjector::create(true, &error,
+                [&](const INPUT& value) { injected.push_back(value); },
+                [=] { return german_layout; },
+                [] { return false; });
+            check(injector != nullptr, "German AltGr observer starts");
+            if (injector) {
+                const uint16_t altgr = chast::kModifierRightAlt;
+                injector->submit(input_key(0xE6, true, altgr));
+                injector->submit(input_key(0x14, true, altgr));
+                injector->submit(input_key(0x14, false, altgr));
+                injector->submit(input_key(0xE6, false));
+                injector->stop();
+                check(injected.size() == 6 &&
+                      is_key(injected[0], 0x1D, true) &&
+                      injected[0].ki.wVk == VK_LCONTROL &&
+                      is_key(injected[1], 0x38, true, true) &&
+                      is_key(injected[2], 0x10, true) &&
+                      is_key(injected[3], 0x10, false) &&
+                      is_key(injected[4], 0x38, false, true) &&
+                      is_key(injected[5], 0x1D, false),
+                      "AltGr adds one Ctrl companion and releases it after RightAlt");
+            }
+        }
+        {
+            std::vector<INPUT> injected;
+            auto injector = chast::InputInjector::create(true, &error,
+                [&](const INPUT& value) { injected.push_back(value); },
+                [=] { return us_layout; },
+                [] { return false; });
+            check(injector != nullptr, "US RightAlt observer starts");
+            if (injector) {
+                const uint16_t altgr = chast::kModifierRightAlt;
+                injector->submit(input_key(0xE6, true, altgr));
+                injector->submit(input_key(0x14, true, altgr));
+                injector->submit(input_key(0x14, false, altgr));
+                injector->submit(input_key(0xE6, false));
+                injector->stop();
+                check(injected.size() == 4 &&
+                      is_key(injected[0], 0x38, true, true) &&
+                      is_key(injected[1], 0x10, true) &&
+                      is_key(injected[2], 0x10, false) &&
+                      is_key(injected[3], 0x38, false, true),
+                      "US RightAlt does not gain a synthetic Ctrl");
+            }
+        }
+    }
     {
         std::vector<INPUT> injected;
         auto injector = chast::InputInjector::create(true, &error,
-            [&](const INPUT& value) { injected.push_back(value); });
+            [&](const INPUT& value) { injected.push_back(value); }, us_layout_provider);
         check(injector != nullptr, "sequence observer starts");
         if (injector) {
             const uint16_t ctrl = chast::kModifierLeftCtrl;
@@ -222,7 +360,7 @@ int main() {
     {
         std::vector<INPUT> injected;
         auto injector = chast::InputInjector::create(true, &error,
-            [&](const INPUT& value) { injected.push_back(value); });
+            [&](const INPUT& value) { injected.push_back(value); }, us_layout_provider);
         check(injector != nullptr, "legacy sequence observer starts");
         if (injector) {
             const uint16_t ctrl = chast::kModifierLeftCtrl;
@@ -242,7 +380,7 @@ int main() {
     {
         std::vector<INPUT> injected;
         auto injector = chast::InputInjector::create(true, &error,
-            [&](const INPUT& value) { injected.push_back(value); });
+            [&](const INPUT& value) { injected.push_back(value); }, us_layout_provider);
         check(injector != nullptr, "lock sequence observer starts");
         if (injector) {
             injector->submit(input_key(0x1E, true, chast::kLockCaps));
@@ -259,7 +397,7 @@ int main() {
     {
         std::vector<INPUT> injected;
         auto injector = chast::InputInjector::create(true, &error,
-            [&](const INPUT& value) { injected.push_back(value); });
+            [&](const INPUT& value) { injected.push_back(value); }, us_layout_provider);
         check(injector != nullptr, "text observer starts");
         if (injector) {
             injector->submit_text("A\n\t");
@@ -284,7 +422,7 @@ int main() {
                     entered.set_value();
                     resume_future.wait();
                 }
-            });
+            }, us_layout_provider);
         check(injector != nullptr, "saturation observer starts");
         if (injector) {
             injector->submit(input_key(0x04, true));
@@ -306,7 +444,7 @@ int main() {
     {
         std::vector<INPUT> injected;
         auto injector = chast::InputInjector::create(true, &error,
-            [&](const INPUT& value) { injected.push_back(value); });
+            [&](const INPUT& value) { injected.push_back(value); }, us_layout_provider);
         check(injector != nullptr, "legacy lock collision observer starts");
         if (injector) {
             // 0x39 is both VK_9 and the Caps Lock HID usage. Hold the legacy

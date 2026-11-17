@@ -29,7 +29,13 @@ const String _digest =
 ViewerStrategyDelivery _delivery({
   String context = 'viewer-context',
   TunnelMode tunnelMode = TunnelMode.relay,
+  String settingMode = 'locked',
+  bool useWebSocket = true,
+  bool uploadRecordings = true,
+  bool syncInitialClipboard = true,
+  int viewFit = 1,
   int revision = 4,
+  String digest = _digest,
   bool includeUnknown = true,
   String peerId = 'devbox',
 }) {
@@ -44,25 +50,28 @@ ViewerStrategyDelivery _delivery({
       peerId: peerId,
       target: 'viewer',
       revision: revision,
-      digest: _digest,
+      digest: digest,
       settings: <String, ViewerStrategySetting>{
         viewerTunnelModeKey: ViewerStrategySetting(
-          mode: 'locked',
+          mode: settingMode,
           value: tunnelMode.name,
         ),
-        viewerUseWebSocketKey: const ViewerStrategySetting(
-          mode: 'locked',
-          value: true,
+        viewerUseWebSocketKey: ViewerStrategySetting(
+          mode: settingMode,
+          value: useWebSocket,
         ),
-        viewerUploadRecordingsKey: const ViewerStrategySetting(
-          mode: 'locked',
-          value: true,
+        viewerUploadRecordingsKey: ViewerStrategySetting(
+          mode: settingMode,
+          value: uploadRecordings,
         ),
-        viewerSyncInitialClipboardKey: const ViewerStrategySetting(
-          mode: 'locked',
-          value: true,
+        viewerSyncInitialClipboardKey: ViewerStrategySetting(
+          mode: settingMode,
+          value: syncInitialClipboard,
         ),
-        viewerViewFitKey: const ViewerStrategySetting(mode: 'locked', value: 1),
+        viewerViewFitKey: ViewerStrategySetting(
+          mode: settingMode,
+          value: viewFit,
+        ),
         if (includeUnknown)
           'viewer.future_setting': const ViewerStrategySetting(
             mode: 'default',
@@ -724,7 +733,7 @@ void main() {
     await tester.pump();
   });
 
-  testWidgets('ticket renewal does not replace the session strategy snapshot', (
+  testWidgets('viewer defaults are session snapshots and explicit prefs win', (
     WidgetTester tester,
   ) async {
     final Directory dir = Directory.systemTemp.createTempSync(
@@ -741,7 +750,26 @@ void main() {
             pinnedAt: DateTime.now().toUtc(),
           ),
         });
+    const ConnectTarget target = ConnectTarget(
+      '',
+      0,
+      server: 'https://example.test',
+      hostId: 'devbox',
+    );
+    const ConnectTarget explicitTarget = ConnectTarget(
+      '',
+      0,
+      server: 'https://example.test',
+      hostId: 'devbox',
+      mode: TunnelMode.direct,
+    );
     final tunnelSettings = <ServerSettings>[];
+    final starts = <Map<Object?, Object?>>[];
+    final uploads = <String>[];
+    final File recording = File('${dir.path}/recording.mp4')
+      ..writeAsBytesSync(<int>[1, 2, 3]);
+    bool recordingLive = true;
+    int stops = 0;
     int lookups = 0;
     final messenger = tester.binding.defaultBinaryMessenger;
     messenger.setMockMethodCallHandler(gpu, (MethodCall call) async => 1);
@@ -752,12 +780,18 @@ void main() {
         case 'loadPassword':
           return '';
         case 'start':
+          starts.add(call.arguments as Map<Object?, Object?>);
+          return null;
+        case 'stop':
+          stops++;
           return null;
         case 'renewAccessTicket':
           return true;
         case 'status':
           return <String, Object>{
             'state': 'streaming',
+            'recording': recordingLive,
+            'recordPath': recording.path,
             'width': 640,
             'height': 480,
             'sourceWidth': 640,
@@ -783,64 +817,173 @@ void main() {
       dir.deleteSync(recursive: true);
     });
 
-    await tester.pumpWidget(
-      MaterialApp(
-        home: SessionPage(
-          target: const ConnectTarget(
-            '',
-            0,
-            server: 'https://example.test',
-            hostId: 'devbox',
-          ),
-          account: account,
-          settings: const ServerSettings(),
-          trustStore: TrustStore(file: File('${dir.path}/trust.json')),
-          identityStore: identities,
-          serverIdentityLoader: (_) async => identity,
-          accountResolver: () async => account,
-          hostLookup:
-              ({
-                required ServerSettings settings,
-                required String hostId,
-                required String accountToken,
-                required String clientPublicKey,
-              }) async {
-                lookups++;
-                return _hostInfo(
-                  _delivery(
-                    context: 'context-$lookups',
-                    tunnelMode: lookups == 1
-                        ? TunnelMode.direct
-                        : TunnelMode.relay,
-                  ),
-                );
-              },
-          tunnelStarter:
-              ({
-                required ServerSettings server,
-                required String hostId,
-                required String accountToken,
-                required String serverPublicKey,
-                required EmergencyAccessRequest? emergency,
-              }) async {
-                tunnelSettings.add(server);
-                return _FakeTunnel(server.mode);
-              },
-        ),
+    Widget managedSession({
+      ConnectTarget sessionTarget = target,
+      ServerSettings settings = const ServerSettings(),
+    }) => MaterialApp(
+      home: SessionPage(
+        target: sessionTarget,
+        account: account,
+        settings: settings,
+        trustStore: TrustStore(file: File('${dir.path}/trust.json')),
+        identityStore: identities,
+        serverIdentityLoader: (_) async => identity,
+        accountResolver: () async => account,
+        hostLookup:
+            ({
+              required ServerSettings settings,
+              required String hostId,
+              required String accountToken,
+              required String clientPublicKey,
+            }) async {
+              final bool firstPolicy = ++lookups == 1;
+              return _hostInfo(
+                _delivery(
+                  context: 'context-$lookups',
+                  settingMode: 'default',
+                  tunnelMode: firstPolicy
+                      ? TunnelMode.direct
+                      : TunnelMode.relay,
+                  useWebSocket: firstPolicy,
+                  uploadRecordings: !firstPolicy,
+                  syncInitialClipboard: firstPolicy,
+                  viewFit: firstPolicy ? 1 : 0,
+                  revision: firstPolicy ? 4 : 5,
+                  digest: firstPolicy
+                      ? _digest
+                      : '1123456789abcdef1123456789abcdef1123456789abcdef1123456789abcdef',
+                  includeUnknown: false,
+                ),
+              );
+            },
+        tunnelStarter:
+            ({
+              required ServerSettings server,
+              required String hostId,
+              required String accountToken,
+              required String serverPublicKey,
+              required EmergencyAccessRequest? emergency,
+            }) async {
+              tunnelSettings.add(server);
+              return _FakeTunnel(server.mode);
+            },
+        viewerStrategyReceiptReporter:
+            ({
+              required ServerSettings settings,
+              required String accountToken,
+              required String peerId,
+              required String context,
+              required String clientPublicKey,
+              required Map<String, Object?> receipt,
+            }) async {},
+        recordingUploader:
+            (
+              AccountSession uploadedBy,
+              File file,
+              DateTime startedAt,
+              DateTime endedAt,
+            ) async {
+              uploads.add(uploadedBy.token);
+            },
       ),
     );
-    await _waitFor(tester, () => tunnelSettings.isNotEmpty);
+
+    await tester.pumpWidget(managedSession());
+    await _waitFor(tester, () => starts.isNotEmpty);
     expect(tunnelSettings.single.mode, TunnelMode.direct);
+    expect(starts.single['transport'], 'ws');
+    expect(starts.single['syncInitClipboard'], isTrue);
     await _waitFor(
       tester,
       () => find.byType(RemoteToolbar).evaluate().isNotEmpty,
     );
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
+      ViewFit.original,
+    );
+    await tester.pump(const Duration(milliseconds: 250));
+    recordingLive = false;
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(uploads, isEmpty);
+
+    // A newer delivery arrives during ticket renewal, but cannot mutate this
+    // session's already captured routing and display settings.
     await tester.pump(const Duration(seconds: 20));
     await _waitFor(tester, () => lookups >= 2);
     expect(tunnelSettings, hasLength(1));
+    expect(starts, hasLength(1));
     expect(tunnelSettings.single.mode, TunnelMode.direct);
+    expect(starts.single['transport'], 'ws');
+    expect(starts.single['syncInitClipboard'], isTrue);
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
+      ViewFit.original,
+    );
+
     await tester.pumpWidget(const SizedBox.shrink());
-    await tester.pump();
+    await _waitFor(tester, () => stops >= 1);
+
+    // A new SessionPage consumes the latest default strategy snapshot.
+    recordingLive = true;
+    await tester.pumpWidget(managedSession());
+    await _waitFor(tester, () => starts.length >= 2);
+    expect(tunnelSettings[1].mode, TunnelMode.relay);
+    expect(starts[1]['transport'], 'auto');
+    expect(starts[1]['syncInitClipboard'], isFalse);
+    await _waitFor(
+      tester,
+      () => find.byType(RemoteToolbar).evaluate().isNotEmpty,
+    );
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
+      ViewFit.adaptive,
+    );
+    await tester.pump(const Duration(milliseconds: 250));
+    recordingLive = false;
+    await tester.pump(const Duration(milliseconds: 250));
+    await _waitFor(tester, () => uploads.length == 1);
+    expect(uploads, <String>['alice-token']);
+
+    // Persisted explicit local choices take precedence over default-mode
+    // recommendations on the following session.
+    ViewPreferences.update(
+      peerId: target.preferencesKey,
+      fit: 1,
+      syncInitClipboard: true,
+    );
+    recordingLive = true;
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _waitFor(tester, () => stops >= 2);
+    await tester.pumpWidget(
+      managedSession(
+        sessionTarget: explicitTarget,
+        settings: const ServerSettings(
+          modeConfigured: true,
+          useWebSocket: true,
+          uploadRecordingsConfigured: true,
+          useWebSocketConfigured: true,
+        ),
+      ),
+    );
+    await _waitFor(tester, () => starts.length >= 3);
+    expect(tunnelSettings[2].mode, TunnelMode.direct);
+    expect(starts[2]['transport'], 'ws');
+    expect(starts[2]['syncInitClipboard'], isTrue);
+    await _waitFor(
+      tester,
+      () => find.byType(RemoteToolbar).evaluate().isNotEmpty,
+    );
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
+      ViewFit.original,
+    );
+    await tester.pump(const Duration(milliseconds: 250));
+    recordingLive = false;
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(uploads, <String>['alice-token']);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _waitFor(tester, () => stops >= 3);
   });
 }
 

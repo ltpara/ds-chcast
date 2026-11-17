@@ -334,7 +334,7 @@ target_link_libraries(chast.host PUBLIC "${FFMPEG_ROOT}/lib/avformat.lib" secur3
 # Media Foundation supplies camera enumeration and capture; mf holds the
 # device-source helpers and mfuuid the format GUIDs. SetupAPI and CfgMgr
 # identify virtual display adapters and their monitor children.
-target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer chast.access shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt winmm OpenSSL::Crypto crypt32 ws2_32)
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer chast.access shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt winmm imm32 OpenSSL::Crypto crypt32 ws2_32)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from

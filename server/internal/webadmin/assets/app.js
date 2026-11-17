@@ -1176,14 +1176,7 @@
   // ---------- tabs ----------
 
   function switchTab(tab) {
-    state.tab = tab;
-    document.querySelectorAll('.tab').forEach((node) => {
-      node.classList.toggle('active', node.dataset.tab === tab);
-      node.setAttribute('aria-selected', node.dataset.tab === tab ? 'true' : 'false');
-    });
-    document.querySelectorAll('.panel-page').forEach((node) => {
-      node.classList.toggle('active', node.id === 'panel-' + tab);
-    });
+    updateTabSelection(tab);
     if (tab === 'overview') refreshOverview().catch(reportError);
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'connections') loadConnections(true).catch(reportError);
@@ -1196,6 +1189,64 @@
     else if (tab === 'audit') loadAudit(true).catch(reportError);
     else if (tab === 'server') loadServerPanel().catch(reportError);
     else if (tab === 'roles') loadRoles().catch(reportError);
+  }
+
+  function updateTabSelection(tab) {
+    state.tab = tab;
+    document.querySelectorAll('.tab').forEach((node) => {
+      const selected = node.dataset.tab === tab;
+      node.classList.toggle('active', selected);
+      node.setAttribute('aria-selected', selected ? 'true' : 'false');
+      node.tabIndex = selected ? 0 : -1;
+    });
+    document.querySelectorAll('.panel-page').forEach((node) => {
+      node.classList.toggle('active', node.id === 'panel-' + tab);
+    });
+  }
+
+  function handleTabKeydown(event, activate = switchTab) {
+    const tabs = Array.from(document.querySelectorAll('.tab'))
+      .filter((node) => !node.classList.contains('hidden'));
+    const currentIndex = tabs.indexOf(event.currentTarget);
+    if (currentIndex < 0 || tabs.length === 0) return;
+    let nextIndex;
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+    else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else if (event.key === 'End') nextIndex = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    const next = tabs[nextIndex];
+    activate(next.dataset.tab);
+    next.focus();
+  }
+
+  function initializeTableRegions() {
+    document.querySelectorAll('.table-wrap').forEach((node) => {
+      node.tabIndex = 0;
+      if (!node.hasAttribute('role')) node.setAttribute('role', 'region');
+      if (!node.hasAttribute('aria-label')) {
+        const columns = Array.from(node.querySelectorAll('thead th'))
+          .map((header) => header.textContent.trim())
+          .filter(Boolean)
+          .slice(0, 3);
+        const label = columns.length ? '表格列：' + columns.join('、') : '表格';
+        node.setAttribute('aria-label', label + '，可横向滚动');
+      }
+      node.addEventListener('keydown', (event) => {
+        if (event.target !== node) return;
+        const maxScroll = Math.max(0, node.scrollWidth - node.clientWidth);
+        const step = Math.max(40, Math.round(node.clientWidth * 0.8));
+        let nextScroll;
+        if (event.key === 'ArrowLeft') nextScroll = Math.max(0, node.scrollLeft - step);
+        else if (event.key === 'ArrowRight') nextScroll = Math.min(maxScroll, node.scrollLeft + step);
+        else if (event.key === 'Home') nextScroll = 0;
+        else if (event.key === 'End') nextScroll = maxScroll;
+        else return;
+        event.preventDefault();
+        node.scrollLeft = nextScroll;
+      });
+    });
   }
 
   // ---------- overview ----------
@@ -4579,8 +4630,10 @@
       toast('已断开');
     });
 
+    initializeTableRegions();
     document.querySelectorAll('.tab').forEach((node) => {
       node.addEventListener('click', () => switchTab(node.dataset.tab));
+      node.addEventListener('keydown', handleTabKeydown);
     });
 
     $('device-query').addEventListener('input', () => {

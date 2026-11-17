@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include "chast/access_ticket.h"
 #include "chast/quic.h"
 
 int main(int argc, char** argv) {
@@ -31,6 +32,20 @@ int main(int argc, char** argv) {
     // this probe without changing the product viewer's timeout.
     config.idle_timeout_ms = 15000;
     std::getline(std::cin, config.access_token);
+    std::string encoded_ticket;
+    std::string encoded_ticket_key;
+    std::getline(std::cin, encoded_ticket);
+    std::getline(std::cin, encoded_ticket_key);
+    if (!encoded_ticket.empty() &&
+        !chast::decode_ticket_base64url(encoded_ticket, &config.access_ticket)) {
+        std::fprintf(stderr, "invalid access ticket encoding\n");
+        return 2;
+    }
+    if (!encoded_ticket_key.empty() &&
+        !chast::decode_ticket_base64url(encoded_ticket_key, &config.access_ticket_key)) {
+        std::fprintf(stderr, "invalid access-ticket key encoding\n");
+        return 2;
+    }
     std::string error;
     auto session = chast::QuicSession::create_client(config, &error);
     if (!session) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }

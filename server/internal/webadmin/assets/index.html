@@ -48,22 +48,22 @@
   <p id="login-note" class="login-note muted"></p>
 
   <main id="workspace" class="hidden">
-    <nav class="tabs" id="tabs" role="tablist">
-      <button type="button" class="tab active" data-tab="overview" role="tab">概览</button>
-      <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
-      <button type="button" class="tab" data-tab="connections" role="tab">活动连接</button>
-      <button type="button" class="tab" data-tab="policies" role="tab">设备策略</button>
-      <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
-      <button type="button" class="tab" data-tab="mine" role="tab">我的账号</button>
-      <button type="button" class="tab" data-tab="tokens" role="tab">API 令牌</button>
-      <button type="button" class="tab" data-tab="groups" role="tab">分组</button>
-      <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
-      <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
-      <button type="button" class="tab" data-tab="roles" role="tab">角色</button>
-      <button type="button" class="tab" data-tab="server" role="tab">服务</button>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="管理台页面">
+      <button type="button" id="tab-overview" class="tab active" data-tab="overview" role="tab" aria-controls="panel-overview" aria-selected="true" tabindex="0">概览</button>
+      <button type="button" id="tab-devices" class="tab" data-tab="devices" role="tab" aria-controls="panel-devices" aria-selected="false" tabindex="-1">设备</button>
+      <button type="button" id="tab-connections" class="tab" data-tab="connections" role="tab" aria-controls="panel-connections" aria-selected="false" tabindex="-1">活动连接</button>
+      <button type="button" id="tab-policies" class="tab" data-tab="policies" role="tab" aria-controls="panel-policies" aria-selected="false" tabindex="-1">设备策略</button>
+      <button type="button" id="tab-accounts" class="tab" data-tab="accounts" role="tab" aria-controls="panel-accounts" aria-selected="false" tabindex="-1">账号</button>
+      <button type="button" id="tab-mine" class="tab" data-tab="mine" role="tab" aria-controls="panel-mine" aria-selected="false" tabindex="-1">我的账号</button>
+      <button type="button" id="tab-tokens" class="tab" data-tab="tokens" role="tab" aria-controls="panel-tokens" aria-selected="false" tabindex="-1">API 令牌</button>
+      <button type="button" id="tab-groups" class="tab" data-tab="groups" role="tab" aria-controls="panel-groups" aria-selected="false" tabindex="-1">分组</button>
+      <button type="button" id="tab-recordings" class="tab" data-tab="recordings" role="tab" aria-controls="panel-recordings" aria-selected="false" tabindex="-1">录制</button>
+      <button type="button" id="tab-audit" class="tab" data-tab="audit" role="tab" aria-controls="panel-audit" aria-selected="false" tabindex="-1">审计</button>
+      <button type="button" id="tab-roles" class="tab" data-tab="roles" role="tab" aria-controls="panel-roles" aria-selected="false" tabindex="-1">角色</button>
+      <button type="button" id="tab-server" class="tab" data-tab="server" role="tab" aria-controls="panel-server" aria-selected="false" tabindex="-1">服务</button>
     </nav>
 
-    <section id="panel-overview" class="panel-page active">
+    <section id="panel-overview" class="panel-page active" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
       <div id="stat-cards" class="cards"></div>
       <div class="grid-2">
         <div class="panel">
@@ -89,7 +89,7 @@
       </div>
     </section>
 
-    <section id="panel-devices" class="panel-page">
+    <section id="panel-devices" class="panel-page" role="tabpanel" aria-labelledby="tab-devices" tabindex="0">
       <div class="panel">
         <div class="panel-head">
           <h2>设备</h2>
@@ -123,7 +123,7 @@
       </div>
     </section>
 
-    <section id="panel-connections" class="panel-page">
+    <section id="panel-connections" class="panel-page" role="tabpanel" aria-labelledby="tab-connections" tabindex="0">
       <div class="panel">
         <div class="panel-head">
           <h2>活动连接</h2>
@@ -147,7 +147,7 @@
       </div>
     </section>
 
-    <section id="panel-policies" class="panel-page">
+    <section id="panel-policies" class="panel-page" role="tabpanel" aria-labelledby="tab-policies" tabindex="0">
       <div class="panel">
         <div class="panel-head">
           <h2>策略对象</h2>
@@ -213,7 +213,7 @@
       </div>
     </section>
 
-    <section id="panel-accounts" class="panel-page">
+    <section id="panel-accounts" class="panel-page" role="tabpanel" aria-labelledby="tab-accounts" tabindex="0">
       <div class="panel">
         <div class="panel-head"><h2>新建账号</h2></div>
         <form id="account-create" class="inline-form" autocomplete="off">
@@ -273,7 +273,7 @@
       </div>
     </section>
 
-    <section id="panel-mine" class="panel-page">
+    <section id="panel-mine" class="panel-page" role="tabpanel" aria-labelledby="tab-mine" tabindex="0">
       <div class="grid-2">
         <div class="panel">
           <div class="panel-head"><h2>我的账号</h2><button type="button" id="mine-refresh">刷新</button></div>
@@ -403,7 +403,7 @@
       </div>
     </section>
 
-    <section id="panel-tokens" class="panel-page">
+    <section id="panel-tokens" class="panel-page" role="tabpanel" aria-labelledby="tab-tokens" tabindex="0">
       <div class="panel" id="token-create-panel">
         <div class="panel-head"><h2>新建 API 令牌</h2></div>
         <form id="token-create" class="inline-form" autocomplete="off">
@@ -451,7 +451,7 @@
       </div>
     </section>
 
-    <section id="panel-groups" class="panel-page">
+    <section id="panel-groups" class="panel-page" role="tabpanel" aria-labelledby="tab-groups" tabindex="0">
       <div class="panel" id="group-create-panel">
         <div class="panel-head"><h2>新建分组</h2></div>
         <form id="group-create" class="inline-form" autocomplete="off">
@@ -479,7 +479,7 @@
       </div>
     </section>
 
-    <section id="panel-recordings" class="panel-page">
+    <section id="panel-recordings" class="panel-page" role="tabpanel" aria-labelledby="tab-recordings" tabindex="0">
       <div class="panel">
         <div class="panel-head">
           <h2>云端录制</h2>
@@ -506,7 +506,7 @@
       </div>
     </section>
 
-    <section id="panel-audit" class="panel-page">
+    <section id="panel-audit" class="panel-page" role="tabpanel" aria-labelledby="tab-audit" tabindex="0">
       <div class="panel">
         <div class="subtabs">
           <div id="audit-subtabs" class="subtab-group">
@@ -540,7 +540,7 @@
       </div>
     </section>
 
-    <section id="panel-roles" class="panel-page">
+    <section id="panel-roles" class="panel-page" role="tabpanel" aria-labelledby="tab-roles" tabindex="0">
       <div class="panel">
         <div class="panel-head">
           <h2>命名角色</h2>
@@ -625,7 +625,7 @@
       </div>
     </section>
 
-    <section id="panel-server" class="panel-page">
+    <section id="panel-server" class="panel-page" role="tabpanel" aria-labelledby="tab-server" tabindex="0">
       <div class="grid-2">
         <div class="panel">
           <div class="panel-head"><h2>服务信息</h2><button type="button" id="server-copy" class="ghost">复制公钥</button></div>

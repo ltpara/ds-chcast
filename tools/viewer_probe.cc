@@ -3418,6 +3418,12 @@ bool send_legacy_key(chast_viewer::ViewerEngine& viewer, uint16_t virtual_key,
     return viewer.SendInput(event);
 }
 
+bool send_local_probe_key(uint16_t usage, bool down) {
+    INPUT input{};
+    return chast::make_scancode_input(usage, down, input) &&
+           SendInput(1, &input, sizeof(input)) == 1;
+}
+
 bool pump_until_text(HWND edit, const std::wstring& expected,
                      std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -3431,9 +3437,9 @@ bool pump_until_text(HWND edit, const std::wstring& expected,
 bool type_usage(chast_viewer::ViewerEngine& viewer, uint16_t usage,
                 uint16_t held, uint16_t locks) {
     if (!send_probe_key(viewer, usage, true, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, usage, false, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     return true;
 }
 
@@ -3441,13 +3447,13 @@ bool type_shifted(chast_viewer::ViewerEngine& viewer, uint16_t usage,
                   uint16_t locks) {
     const uint16_t held = chast::kModifierLeftShift;
     if (!send_probe_key(viewer, 0xE1, true, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, usage, true, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, usage, false, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, 0xE1, false, locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     return true;
 }
 
@@ -3455,23 +3461,28 @@ bool type_altgr(chast_viewer::ViewerEngine& viewer, uint16_t usage,
                 uint16_t locks) {
     const uint16_t held = chast::kModifierRightAlt;
     if (!send_probe_key(viewer, 0xE6, true, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, usage, true, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, usage, false, held | locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     if (!send_probe_key(viewer, 0xE6, false, locks)) return false;
-    pump_messages(25ms);
+    pump_messages(75ms);
     return true;
 }
 
 bool activate_keyboard_layout(HKL layout, std::string* error) {
-    if (layout == nullptr || ActivateKeyboardLayout(layout, 0) == nullptr) {
+    if (layout == nullptr ||
+        ActivateKeyboardLayout(layout, KLF_SETFORPROCESS) == nullptr) {
         *error = "ActivateKeyboardLayout failed with " +
                  std::to_string(GetLastError());
         return false;
     }
-    pump_messages(120ms);
+    pump_messages(500ms);
+    wchar_t active[KL_NAMELENGTH]{};
+    if (GetKeyboardLayoutNameW(active)) {
+        std::printf("viewer-probe: active keyboard layout %ls\n", active);
+    }
     return true;
 }
 
@@ -3510,6 +3521,8 @@ int keyboard_probe() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     KeyboardWindow window;
     std::string error;
+    std::mutex input_log_mutex;
+    std::vector<std::string> input_log;
     if (!create_keyboard_window(window, &error)) {
         std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
         return 1;
@@ -3524,7 +3537,34 @@ int keyboard_probe() {
     } else {
         // A real desktop session with input: the host injects into the
         // foreground edit control below. No shared folder is involved.
-        host = start_host({}, port, &error);
+        host = start_host({}, port, &error, true, {}, {}, {},
+                          chast::ClipboardDirection::Both, {}, {},
+                          [&](chast::HostServerConfig& config) {
+                              config.settings.allow_input = true;
+                              config.input_event = [&](const chast::InputEvent& event) {
+                                  char line[128]{};
+                                  if (event.kind == chast::InputKind::Key) {
+                                      std::snprintf(line, sizeof(line),
+                                                    "hid=%02X %s mods=%04X",
+                                                    event.key.hid_usage,
+                                                    event.key.action == chast::KeyAction::Down
+                                                        ? "down" : "up",
+                                                    event.modifiers);
+                                  } else if (event.kind == chast::InputKind::LegacyKey) {
+                                      std::snprintf(line, sizeof(line),
+                                                    "vk=%02X %s mods=%04X",
+                                                    event.legacy_key.virtual_key,
+                                                    event.legacy_key.action == chast::KeyAction::Down
+                                                        ? "down" : "up",
+                                                    event.modifiers);
+                                  } else {
+                                      std::snprintf(line, sizeof(line), "kind=%u",
+                                                    static_cast<unsigned>(event.kind));
+                                  }
+                                  std::lock_guard<std::mutex> lock(input_log_mutex);
+                                  input_log.emplace_back(line);
+                              };
+                          });
     }
     std::unique_ptr<chast_viewer::ViewerEngine> engine;
     if (host) {
@@ -3632,6 +3672,20 @@ int keyboard_probe() {
                                type_usage(viewer, 0x12, 0, current_locks()) &&  // O
                                type_usage(viewer, 0x2C, 0, current_locks());    // Space
                     })) {
+                    SetWindowTextW(window.edit, L"");
+                    if (ensure_keyboard_foreground(window)) {
+                        constexpr uint16_t raw_ime_usages[] = {
+                            0x11, 0x0C, 0x0B, 0x04, 0x12, 0x2C};
+                        for (const uint16_t usage : raw_ime_usages) {
+                            send_local_probe_key(usage, true);
+                            pump_messages(75ms);
+                            send_local_probe_key(usage, false);
+                            pump_messages(75ms);
+                        }
+                        std::fprintf(stderr,
+                                     "viewer-probe: raw scan-code IME control produced '%s'\n",
+                                     to_utf8(edit_text(window.edit)).c_str());
+                    }
                     break;
                 }
             } else {
@@ -3649,6 +3703,24 @@ int keyboard_probe() {
         } while (false);
         if (!success && !error.empty()) {
             std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());
+            if (host) {
+                const chast::HostStatus status = host->status();
+                const chast::InputStats& stats = status.stats.input_stats;
+                std::fprintf(stderr,
+                             "viewer-probe: input events=%llu applied=%llu rejected=%llu "
+                             "failed=%llu dropped=%llu lock-toggles=%llu\n",
+                             static_cast<unsigned long long>(status.stats.input_events),
+                             static_cast<unsigned long long>(stats.applied),
+                             static_cast<unsigned long long>(stats.rejected),
+                             static_cast<unsigned long long>(stats.failed),
+                             static_cast<unsigned long long>(stats.dropped),
+                             static_cast<unsigned long long>(stats.lock_toggles));
+                std::lock_guard<std::mutex> lock(input_log_mutex);
+                for (size_t i = 0; i < input_log.size(); ++i) {
+                    std::fprintf(stderr, "viewer-probe: input[%zu] %s\n", i,
+                                 input_log[i].c_str());
+                }
+            }
         }
     } else if (!error.empty()) {
         std::fprintf(stderr, "viewer-probe: %s\n", error.c_str());

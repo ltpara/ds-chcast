@@ -3618,448 +3618,497 @@ class _Sidebar extends StatelessWidget {
       width: 208,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 26, 20, 20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            Row(
-              children: <Widget>[
-                Container(
-                  width: 36,
-                  height: 36,
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: <Color>[kAccentBright, kAccent],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Icon(
-                    Icons.desktop_windows_rounded,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
+        // Keep the footer low on tall windows and scroll the sidebar on short ones.
+        child: LayoutBuilder(
+          builder: (BuildContext context, BoxConstraints constraints) {
+            return SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                child: IntrinsicHeight(
                   child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
+                      Row(
+                        children: <Widget>[
+                          Container(
+                            width: 36,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: <Color>[kAccentBright, kAccent],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              ),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(
+                              Icons.desktop_windows_rounded,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Text(
+                                  'chast',
+                                  style: theme.textTheme.titleLarge?.copyWith(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: -0.4,
+                                    height: 1.0,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  tr('远程桌面'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: mutedStyle(context, size: 10),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 34),
                       Text(
-                        'chast',
-                        style: theme.textTheme.titleLarge?.copyWith(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: -0.4,
-                          height: 1.0,
+                        tr('本机信息'),
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 1.1,
+                          color: dark
+                              ? Colors.white38
+                              : const Color(0xFF8A919C),
                         ),
                       ),
-                      const SizedBox(height: 3),
-                      Text(
-                        tr('远程桌面'),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: mutedStyle(context, size: 10),
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Container(
+                          height: 58,
+                          color: theme.colorScheme.surface,
+                          child: Row(
+                            children: <Widget>[
+                              Container(width: 3, color: kAccent),
+                              Expanded(
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                  ),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        hostname,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: theme.colorScheme.onSurface,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 3),
+                                      Text(
+                                        tr('查看器 · Windows'),
+                                        style: mutedStyle(context, size: 10),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 34),
-            Text(
-              tr('本机信息'),
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 1.1,
-                color: dark ? Colors.white38 : const Color(0xFF8A919C),
-              ),
-            ),
-            const SizedBox(height: 8),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                height: 58,
-                color: theme.colorScheme.surface,
-                child: Row(
-                  children: <Widget>[
-                    Container(width: 3, color: kAccent),
-                    Expanded(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                      const SizedBox(height: 20),
+                      Text(
+                        tr('连接服务'),
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 1.1,
+                          color: dark
+                              ? Colors.white38
+                              : const Color(0xFF8A919C),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Material(
+                        color: theme.colorScheme.surface,
+                        borderRadius: BorderRadius.circular(8),
+                        clipBehavior: Clip.antiAlias,
+                        child: InkWell(
+                          onTap: onConfigureServer,
+                          child: Container(
+                            padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: subtle),
+                            ),
+                            child: Row(
+                              children: <Widget>[
+                                Icon(
+                                  server.configured
+                                      ? Icons.cloud_done_outlined
+                                      : Icons.cloud_off_outlined,
+                                  size: 17,
+                                  color: server.configured
+                                      ? kAccent
+                                      : (dark
+                                            ? Colors.white38
+                                            : const Color(0xFF8A919C)),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        service,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: theme.colorScheme.onSurface,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        server.configured
+                                            ? tr('{p17}{p18}', <
+                                                String,
+                                                Object?
+                                              >{
+                                                'p17': server.mode.shortLabel,
+                                                'p18': onlineCount > 0
+                                                    ? tr(
+                                                        ' · {onlineCount} 台在线',
+                                                        <String, Object?>{
+                                                          'onlineCount':
+                                                              onlineCount,
+                                                        },
+                                                      )
+                                                    : '',
+                                              })
+                                            : tr('点击配置'),
+                                        style: mutedStyle(context, size: 9.5),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Icon(
+                                  Icons.settings_outlined,
+                                  size: 15,
+                                  color: dark
+                                      ? Colors.white38
+                                      : const Color(0xFF9AA0A6),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Icon(
+                            Icons.shield_outlined,
+                            size: 13,
+                            color: trustedCount > 0
+                                ? kAccent
+                                : (dark
+                                      ? Colors.white30
+                                      : const Color(0xFFA8AEB8)),
+                          ),
+                          const SizedBox(width: 5),
+                          Expanded(
+                            child: Text(
+                              trustedCount > 0
+                                  ? tr(
+                                      '已固定 {trustedCount} 个主机身份',
+                                      <String, Object?>{
+                                        'trustedCount': trustedCount,
+                                      },
+                                    )
+                                  : tr('首次连接时记录主机证书指纹'),
+                              style: mutedStyle(context, size: 10),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 20),
+                      Text(
+                        tr('账号'),
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 1.1,
+                          color: dark
+                              ? Colors.white38
+                              : const Color(0xFF8A919C),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Material(
+                        color: theme.colorScheme.surface,
+                        borderRadius: BorderRadius.circular(8),
+                        clipBehavior: Clip.antiAlias,
+                        child: InkWell(
+                          key: const Key('account-tile'),
+                          onTap: onAccount,
+                          child: Container(
+                            padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: subtle),
+                            ),
+                            child: Row(
+                              children: <Widget>[
+                                Icon(
+                                  account == null
+                                      ? Icons.person_outline_rounded
+                                      : Icons.person_rounded,
+                                  size: 17,
+                                  color: account == null
+                                      ? (dark
+                                            ? Colors.white38
+                                            : const Color(0xFF8A919C))
+                                      : kAccent,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        account?.username ?? tr('登录账号'),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: theme.colorScheme.onSurface,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        syncing
+                                            ? tr('同步中…')
+                                            : account == null
+                                            ? tr('登录以同步地址簿')
+                                            : tr('账号地址簿已连接'),
+                                        style: mutedStyle(context, size: 9.5),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (syncing)
+                                  const SizedBox(
+                                    width: 13,
+                                    height: 13,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 1.6,
+                                      color: kAccent,
+                                    ),
+                                  )
+                                else
+                                  Icon(
+                                    Icons.sync_rounded,
+                                    size: 14,
+                                    color: dark
+                                        ? Colors.white38
+                                        : const Color(0xFF9AA0A6),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: <Color>[
+                              Color(0xFFE242BC),
+                              Color(0xFFF4727C),
+                            ],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
                         child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
+                            Container(
+                              width: 30,
+                              height: 30,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.22),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.bolt_rounded,
+                                color: Colors.white,
+                                size: 18,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
                             Text(
-                              hostname,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                              tr('直连优先'),
                               style: TextStyle(
-                                fontSize: 13,
+                                color: Colors.white,
+                                fontSize: 14,
                                 fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.onSurface,
                               ),
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              tr('查看器 · Windows'),
+                              tr('打洞失败自动中继\n端到端加密'),
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.85),
+                                fontSize: 11,
+                                height: 1.4,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      PopupMenuButton<String>(
+                        key: const Key('language-menu'),
+                        tooltip: tr('界面语言'),
+                        initialValue: AppLanguage.code,
+                        onSelected: AppLanguage.set,
+                        itemBuilder: (BuildContext context) =>
+                            <PopupMenuEntry<String>>[
+                              CheckedPopupMenuItem<String>(
+                                value: kLanguageChinese,
+                                checked: AppLanguage.code == kLanguageChinese,
+                                child: Text(tr('简体中文')),
+                              ),
+                              CheckedPopupMenuItem<String>(
+                                value: kLanguageEnglish,
+                                checked: AppLanguage.code == kLanguageEnglish,
+                                child: const Text('English'),
+                              ),
+                            ],
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          child: Row(
+                            children: <Widget>[
+                              Icon(
+                                Icons.translate_rounded,
+                                size: 14,
+                                color: dark
+                                    ? Colors.white38
+                                    : const Color(0xFF8A919C),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  tr('界面语言'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: mutedStyle(context, size: 10),
+                                ),
+                              ),
+                              Text(
+                                AppLanguage.label,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: mutedStyle(context, size: 10),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      PopupMenuButton<bool>(
+                        key: const Key('session-note-menu'),
+                        tooltip: tr('会话备注'),
+                        onSelected: onAskSessionNoteChanged,
+                        itemBuilder: (BuildContext context) =>
+                            <PopupMenuEntry<bool>>[
+                              CheckedPopupMenuItem<bool>(
+                                value: !askSessionNote,
+                                checked: askSessionNote,
+                                child: Text(tr('结束会话时填写备注')),
+                              ),
+                            ],
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          child: Row(
+                            children: <Widget>[
+                              Icon(
+                                Icons.edit_note_rounded,
+                                size: 14,
+                                color: askSessionNote
+                                    ? kAccent
+                                    : (dark
+                                          ? Colors.white38
+                                          : const Color(0xFF8A919C)),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  tr('会话备注'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: mutedStyle(context, size: 10),
+                                ),
+                              ),
+                              Text(
+                                askSessionNote ? tr('已开启') : tr('未开启'),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: mutedStyle(context, size: 10),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        children: <Widget>[
+                          Icon(
+                            Icons.circle,
+                            size: 7,
+                            color: dark
+                                ? Colors.white24
+                                : const Color(0xFFB6BCC6),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              'chast $chastVersion · Windows',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                               style: mutedStyle(context, size: 10),
                             ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            Text(
-              tr('连接服务'),
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 1.1,
-                color: dark ? Colors.white38 : const Color(0xFF8A919C),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Material(
-              color: theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(8),
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                onTap: onConfigureServer,
-                child: Container(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: subtle),
-                  ),
-                  child: Row(
-                    children: <Widget>[
-                      Icon(
-                        server.configured
-                            ? Icons.cloud_done_outlined
-                            : Icons.cloud_off_outlined,
-                        size: 17,
-                        color: server.configured
-                            ? kAccent
-                            : (dark ? Colors.white38 : const Color(0xFF8A919C)),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text(
-                              service,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.onSurface,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              server.configured
-                                  ? tr('{p17}{p18}', <String, Object?>{
-                                      'p17': server.mode.shortLabel,
-                                      'p18': onlineCount > 0
-                                          ? tr(
-                                              ' · {onlineCount} 台在线',
-                                              <String, Object?>{
-                                                'onlineCount': onlineCount,
-                                              },
-                                            )
-                                          : '',
-                                    })
-                                  : tr('点击配置'),
-                              style: mutedStyle(context, size: 9.5),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Icon(
-                        Icons.settings_outlined,
-                        size: 15,
-                        color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Icon(
-                  Icons.shield_outlined,
-                  size: 13,
-                  color: trustedCount > 0
-                      ? kAccent
-                      : (dark ? Colors.white30 : const Color(0xFFA8AEB8)),
-                ),
-                const SizedBox(width: 5),
-                Expanded(
-                  child: Text(
-                    trustedCount > 0
-                        ? tr('已固定 {trustedCount} 个主机身份', <String, Object?>{
-                            'trustedCount': trustedCount,
-                          })
-                        : tr('首次连接时记录主机证书指纹'),
-                    style: mutedStyle(context, size: 10),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 20),
-            Text(
-              tr('账号'),
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 1.1,
-                color: dark ? Colors.white38 : const Color(0xFF8A919C),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Material(
-              color: theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(8),
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                key: const Key('account-tile'),
-                onTap: onAccount,
-                child: Container(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: subtle),
-                  ),
-                  child: Row(
-                    children: <Widget>[
-                      Icon(
-                        account == null
-                            ? Icons.person_outline_rounded
-                            : Icons.person_rounded,
-                        size: 17,
-                        color: account == null
-                            ? (dark ? Colors.white38 : const Color(0xFF8A919C))
-                            : kAccent,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text(
-                              account?.username ?? tr('登录账号'),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.onSurface,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              syncing
-                                  ? tr('同步中…')
-                                  : account == null
-                                  ? tr('登录以同步地址簿')
-                                  : tr('账号地址簿已连接'),
-                              style: mutedStyle(context, size: 9.5),
-                            ),
-                          ],
-                        ),
-                      ),
-                      if (syncing)
-                        const SizedBox(
-                          width: 13,
-                          height: 13,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 1.6,
-                            color: kAccent,
                           ),
-                        )
-                      else
-                        Icon(
-                          Icons.sync_rounded,
-                          size: 14,
-                          color: dark
-                              ? Colors.white38
-                              : const Color(0xFF9AA0A6),
-                        ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Container(height: 1, color: subtle),
                     ],
                   ),
                 ),
               ),
-            ),
-            const Spacer(),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: <Color>[Color(0xFFE242BC), Color(0xFFF4727C)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Container(
-                    width: 30,
-                    height: 30,
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.22),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.bolt_rounded,
-                      color: Colors.white,
-                      size: 18,
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    tr('直连优先'),
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    tr('打洞失败自动中继\n端到端加密'),
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.85),
-                      fontSize: 11,
-                      height: 1.4,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            PopupMenuButton<String>(
-              key: const Key('language-menu'),
-              tooltip: tr('界面语言'),
-              initialValue: AppLanguage.code,
-              onSelected: AppLanguage.set,
-              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-                CheckedPopupMenuItem<String>(
-                  value: kLanguageChinese,
-                  checked: AppLanguage.code == kLanguageChinese,
-                  child: Text(tr('简体中文')),
-                ),
-                CheckedPopupMenuItem<String>(
-                  value: kLanguageEnglish,
-                  checked: AppLanguage.code == kLanguageEnglish,
-                  child: const Text('English'),
-                ),
-              ],
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Row(
-                  children: <Widget>[
-                    Icon(
-                      Icons.translate_rounded,
-                      size: 14,
-                      color: dark ? Colors.white38 : const Color(0xFF8A919C),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        tr('界面语言'),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: mutedStyle(context, size: 10),
-                      ),
-                    ),
-                    Text(
-                      AppLanguage.label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: mutedStyle(context, size: 10),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 2),
-            PopupMenuButton<bool>(
-              key: const Key('session-note-menu'),
-              tooltip: tr('会话备注'),
-              onSelected: onAskSessionNoteChanged,
-              itemBuilder: (BuildContext context) => <PopupMenuEntry<bool>>[
-                CheckedPopupMenuItem<bool>(
-                  value: !askSessionNote,
-                  checked: askSessionNote,
-                  child: Text(tr('结束会话时填写备注')),
-                ),
-              ],
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Row(
-                  children: <Widget>[
-                    Icon(
-                      Icons.edit_note_rounded,
-                      size: 14,
-                      color: askSessionNote
-                          ? kAccent
-                          : (dark ? Colors.white38 : const Color(0xFF8A919C)),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        tr('会话备注'),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: mutedStyle(context, size: 10),
-                      ),
-                    ),
-                    Text(
-                      askSessionNote ? tr('已开启') : tr('未开启'),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: mutedStyle(context, size: 10),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 2),
-            Row(
-              children: <Widget>[
-                Icon(
-                  Icons.circle,
-                  size: 7,
-                  color: dark ? Colors.white24 : const Color(0xFFB6BCC6),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    'chast $chastVersion · Windows',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: mutedStyle(context, size: 10),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            Container(height: 1, color: subtle),
-          ],
+            );
+          },
         ),
       ),
     );

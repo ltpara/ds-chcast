@@ -1,15 +1,12 @@
-// Windows input injection: USB HID usage -> scan code -> SendInput.
-//
-// The table below is page 0x07 (keyboard/keypad) of the HID Usage Tables
-// mapped to PS/2 set 1 scan codes. Scan codes are what a remote desktop
-// should send: SendInput with KEYEVENTF_SCANCODE feeds the same code to the
-// same keyboard driver a physical key would, so the host's layout, IME and
-// dead keys behave exactly as if the key were pressed locally.
+// Windows input injection: USB HID usage -> scan position -> host layout -> SendInput.
 
 #include "chast/input.h"
 
+#include <imm.h>
+
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -330,6 +327,93 @@ bool virtual_screen_rect(int32_t& left, int32_t& top, int32_t& width, int32_t& h
     return width > 0 && height > 0;
 }
 
+HKL foreground_keyboard_layout() {
+    const HWND foreground = GetForegroundWindow();
+    const DWORD thread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    return GetKeyboardLayout(thread);
+}
+
+bool foreground_ime_is_open() {
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr) return false;
+    const DWORD thread = GetWindowThreadProcessId(foreground, nullptr);
+    GUITHREADINFO gui{};
+    gui.cbSize = sizeof(gui);
+    const HWND focused = thread != 0 && GetGUIThreadInfo(thread, &gui) &&
+                                 gui.hwndFocus != nullptr
+                             ? gui.hwndFocus : foreground;
+    HWND context_window = focused;
+    HIMC context = ImmGetContext(context_window);
+    if (context == nullptr && focused != foreground) {
+        context_window = foreground;
+        context = ImmGetContext(context_window);
+    }
+    if (context == nullptr) return false;
+    const bool open = ImmGetOpenStatus(context) != FALSE;
+    ImmReleaseContext(context_window, context);
+    return open;
+}
+
+bool layout_uses_altgr(HKL layout) {
+    if (layout == nullptr) return false;
+    static std::mutex cache_mutex;
+    static std::unordered_map<HKL, bool> cache;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        const auto found = cache.find(layout);
+        if (found != cache.end()) return found->second;
+    }
+
+    bool uses_altgr = false;
+    for (wchar_t character = 0x20; character <= 0xFF; ++character) {
+        const SHORT mapping = VkKeyScanExW(character, layout);
+        if (mapping == -1) continue;
+        const WORD modifiers = static_cast<WORD>(mapping) >> 8;
+        if ((modifiers & 0x06) == 0x06) {
+            uses_altgr = true;
+            break;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.emplace(layout, uses_altgr);
+    }
+    return uses_altgr;
+}
+
+bool hid_usage_to_virtual_key(uint16_t usage, HKL layout, WORD& virtual_key) {
+    if (usage == 0x48) {
+        virtual_key = VK_PAUSE;
+        return true;
+    }
+    uint16_t scan = 0;
+    bool extended = false;
+    if (!lookup(usage, scan, extended)) return false;
+    if (layout == nullptr) layout = foreground_keyboard_layout();
+    const UINT layout_scan = scan | (extended ? 0xE000u : 0u);
+    const UINT mapped = MapVirtualKeyExW(layout_scan, MAPVK_VSC_TO_VK_EX, layout);
+    if (mapped == 0 || mapped > 0xFF) return false;
+    virtual_key = static_cast<WORD>(mapped);
+    return true;
+}
+
+bool make_hid_input_with_virtual_key(uint16_t usage, WORD virtual_key, bool down,
+                                     INPUT& input) {
+    if (virtual_key == 0) return false;
+    uint16_t scan = 0;
+    bool extended = false;
+    if (usage != 0x48 && !lookup(usage, scan, extended)) return false;
+    input = INPUT{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = virtual_key;
+    input.ki.wScan = scan;
+    input.ki.dwFlags = (extended || extended_virtual_key(virtual_key))
+                           ? KEYEVENTF_EXTENDEDKEY : 0;
+    if (!down) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    input.ki.dwExtraInfo = kInputInjectionTag;
+    return true;
+}
+
 }  // namespace
 
 bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended) {
@@ -351,6 +435,17 @@ uint16_t windows_key_to_hid(uint32_t vk, uint32_t scan, bool extended) {
 }
 
 bool make_keyboard_input(uint16_t usage, bool down, INPUT& input) {
+    if (foreground_ime_is_open()) return make_scancode_input(usage, down, input);
+    return make_keyboard_input(usage, down, input, foreground_keyboard_layout());
+}
+
+bool make_keyboard_input(uint16_t usage, bool down, INPUT& input, HKL layout) {
+    WORD virtual_key = 0;
+    return hid_usage_to_virtual_key(usage, layout, virtual_key) &&
+           make_hid_input_with_virtual_key(usage, virtual_key, down, input);
+}
+
+bool make_scancode_input(uint16_t usage, bool down, INPUT& input) {
     input = INPUT{};
     input.type = INPUT_KEYBOARD;
     input.ki.dwExtraInfo = kInputInjectionTag;
@@ -404,10 +499,14 @@ bool make_legacy_keyboard_input(uint16_t virtual_key, bool down, INPUT& input) {
 }
 
 std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* error,
-    std::function<void(const INPUT&)> dry_run_observer) {
+    std::function<void(const INPUT&)> dry_run_observer,
+    std::function<HKL()> keyboard_layout_provider,
+    std::function<bool()> ime_open_provider) {
     std::unique_ptr<InputInjector> injector(new InputInjector());
     injector->dry_run_ = dry_run;
     injector->dry_run_observer_ = std::move(dry_run_observer);
+    injector->keyboard_layout_provider_ = std::move(keyboard_layout_provider);
+    injector->ime_open_provider_ = std::move(ime_open_provider);
     try {
         injector->thread_ = std::thread(&InputInjector::run, injector.get());
     } catch (const std::exception& e) {
@@ -435,6 +534,18 @@ UINT InputInjector::send(const INPUT& input) {
         desktop_check_due_ = true;
     }
     return inserted;
+}
+
+HKL InputInjector::keyboard_layout() const {
+    if (keyboard_layout_provider_) {
+        const HKL layout = keyboard_layout_provider_();
+        if (layout != nullptr) return layout;
+    }
+    return foreground_keyboard_layout();
+}
+
+bool InputInjector::keyboard_ime_open() const {
+    return ime_open_provider_ ? ime_open_provider_() : foreground_ime_is_open();
 }
 
 void InputInjector::follow_input_desktop_if_due() {
@@ -638,10 +749,11 @@ void InputInjector::apply(const InputEvent& event) {
             // restore the host's state. Never toggle locks during a Win/Alt
             // chord or mouse drag, and never synchronize a lock with itself.
             const uint16_t usage = event.key.hid_usage;
-            INPUT mapped{};
+            uint16_t scan = 0;
+            bool extended = false;
             uint16_t mask = 0;
             if (lock_bit_for_usage(usage) == 0 && usage != 0x28 && usage != 0x2B &&
-                make_keyboard_input(usage, true, mapped)) {
+                hid_to_scancode(usage, scan, extended)) {
                 // Caps affects punctuation/digits on some layouts too.
                 mask = kLockCaps;
                 if ((usage >= 0x54 && usage <= 0x63) || usage == 0x67 || usage == 0x85) {
@@ -741,6 +853,15 @@ uint16_t InputInjector::sync_locks(uint16_t reported, uint16_t mask) {
 }
 
 void InputInjector::sync_modifiers(uint16_t reported, bool legacy) {
+    if (!legacy && (reported & kModifierRightAlt) != 0 &&
+        (reported & (kModifierLeftCtrl | kModifierRightCtrl)) == 0 &&
+        !keyboard_ime_open() &&
+        layout_uses_altgr(keyboard_layout())) {
+        // Windows layouts expose AltGr characters through Ctrl+RightAlt.
+        // The viewer filters AltGr's synthetic Ctrl, so recreate it only for
+        // layouts that actually define a Ctrl+Alt character layer.
+        reported |= kModifierLeftCtrl;
+    }
     const auto bit_for = [](const HeldKey& key) {
         return key.legacy ? modifier_bit_for_vk(key.usage)
                           : modifier_bit_for_usage(key.usage);
@@ -1238,18 +1359,32 @@ void InputInjector::release_pen() {
 void InputInjector::apply_key(const KeyEvent& event) {
     INPUT input{};
     const bool pressed = event.action == KeyAction::Down;
-    if (!make_keyboard_input(event.hid_usage, pressed, input)) {
-        std::lock_guard<std::mutex> lock(stats_mutex_);
-        ++stats_.rejected;
-        return;
-    }
-
     const auto matches = [&event](const HeldKey& held) {
         // A HID usage and a virtual key can share the same number. A lock-state
         // tap must not hijack a legacy-held key (or release it on its way up).
         return !held.legacy && held.usage == event.hid_usage;
     };
     const auto found = std::find_if(held_keys_.begin(), held_keys_.end(), matches);
+    WORD virtual_key = found == held_keys_.end() ? 0 : found->virtual_key;
+    bool scan_code = found != held_keys_.end() && found->scan_code;
+    bool valid = false;
+    if (found != held_keys_.end()) {
+        valid = scan_code ? make_scancode_input(event.hid_usage, pressed, input)
+                          : make_hid_input_with_virtual_key(event.hid_usage, virtual_key,
+                                                            pressed, input);
+    } else if (keyboard_ime_open()) {
+        scan_code = true;
+        valid = make_scancode_input(event.hid_usage, pressed, input);
+    } else {
+        valid = hid_usage_to_virtual_key(event.hid_usage, keyboard_layout(), virtual_key) &&
+                make_hid_input_with_virtual_key(event.hid_usage, virtual_key,
+                                                pressed, input);
+    }
+    if (!valid) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.rejected;
+        return;
+    }
     const UINT inserted = send(input);
     if (inserted != 1) {
         std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -1261,7 +1396,8 @@ void InputInjector::apply_key(const KeyEvent& event) {
         // in the held set; otherwise a single Up would leave the key stuck.
         if (found == held_keys_.end()) {
             held_keys_.push_back(
-                HeldKey{event.hid_usage, false, std::chrono::steady_clock::now()});
+                HeldKey{event.hid_usage, false, virtual_key, scan_code,
+                        std::chrono::steady_clock::now()});
             // Whether the tap came from the peer or from sync_locks(), the
             // host's lock state just changed under us.
             if (const uint16_t lock = lock_bit_for_usage(event.hid_usage); lock != 0) {
@@ -1300,7 +1436,8 @@ void InputInjector::apply_legacy_key(const LegacyKeyEvent& event) {
     if (pressed) {
         if (found == held_keys_.end()) {
             held_keys_.push_back(
-                HeldKey{event.virtual_key, true, std::chrono::steady_clock::now()});
+                HeldKey{event.virtual_key, true, event.virtual_key, false,
+                        std::chrono::steady_clock::now()});
             if (const uint16_t lock = lock_bit_for_vk(event.virtual_key); lock != 0) {
                 host_locks_ ^= lock;
             }
@@ -1426,7 +1563,10 @@ void InputInjector::release_all() {
         held_keys_.pop_back();
         INPUT input{};
         if (!(held.legacy ? make_legacy_keyboard_input(held.usage, false, input)
-                          : make_keyboard_input(held.usage, false, input))) {
+                          : (held.scan_code
+                                 ? make_scancode_input(held.usage, false, input)
+                                 : make_hid_input_with_virtual_key(held.usage,
+                                       held.virtual_key, false, input)))) {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             ++stats_.rejected;
             continue;

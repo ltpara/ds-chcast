@@ -3406,7 +3406,7 @@ void main() {
   testWidgets('the server dialog can force the WebSocket carrier', (
     WidgetTester tester,
   ) async {
-    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.physicalSize = const Size(800, 600);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
