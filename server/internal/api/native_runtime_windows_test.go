@@ -104,12 +104,12 @@ func nativeWait(t *testing.T, what string, timeout time.Duration, predicate func
 	t.Fatalf("timeout: %s", what)
 }
 
-func runNativeBrowserDisconnect(t *testing.T, url, connectionID, username, password string) {
+func runNativeBrowserDisconnect(t *testing.T, url, connectionID, username, password, artifacts string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	script := filepath.Join("..", "webadmin", "native_disconnect_browser.cjs")
-	cmd := exec.CommandContext(ctx, "node", script, url, connectionID)
+	cmd := exec.CommandContext(ctx, "node", script, url, connectionID, artifacts)
 	cmd.Env = append(os.Environ(),
 		"CHAST_BROWSER_USERNAME="+username,
 		"CHAST_BROWSER_PASSWORD="+password,
@@ -198,17 +198,17 @@ func startNativeFlutterViewer(t *testing.T, dir, binary, serverURL, serverPublic
 		return protectedNativeProfileFile(filepath.Join(chastDir, "server.json")) &&
 			protectedNativeProfileFile(filepath.Join(chastDir, "account.json"))
 	})
-	runNativeFlutterHomeConnect(t, proc.cmd.Process.Pid, peer, "native-runtime-viewer-token")
+	runNativeFlutterHomeConnect(t, proc.cmd.Process.Pid, peer, "native-runtime-viewer-token", dir)
 	return proc
 }
 
-func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token string) {
+func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts string) {
 	t.Helper()
 	script := filepath.Join("..", "..", "..", "tools", "native-flutter-home-connect.ps1")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-		"-ExecutionPolicy", "Bypass", "-File", script, strconv.Itoa(pid), peer)
+		"-ExecutionPolicy", "Bypass", "-File", script, strconv.Itoa(pid), peer, artifacts)
 	cmd.Stdin = strings.NewReader(token + "\n")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.CombinedOutput()
@@ -463,12 +463,19 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		firstConnectionTimeout = 90 * time.Second
 	}
 	nativeWait(t, "first real connection reaches API", firstConnectionTimeout, func() bool {
+		if flutterUI {
+			select {
+			case <-flutterViewer.done:
+				t.Fatalf("Flutter viewer exited before reporting its session: %v (see flutter-viewer.log)", flutterViewer.err)
+			default:
+			}
+		}
 		rows := list()
 		if len(rows) != 1 {
 			return false
 		}
 		first = rows[0]
-		return first.State == "active"
+		return first.HostID == peer && first.RuntimeID != "" && first.State == "active"
 	})
 	_, secondDir := startViewer("viewer-b")
 	var second liveConnectionReply
@@ -486,7 +493,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	})
 	var command liveconn.Command
 	if browserUI {
-		runNativeBrowserDisconnect(t, front.URL+"/admin/", first.ConnectionID, "native-acceptance", accountPassword)
+		runNativeBrowserDisconnect(t, front.URL+"/admin/", first.ConnectionID, "native-acceptance", accountPassword, dir)
 		requestKey, _ := browserDisconnectRequestKey.Load().(string)
 		if requestKey == "" {
 			t.Fatal("management UI did not submit a disconnect request key")

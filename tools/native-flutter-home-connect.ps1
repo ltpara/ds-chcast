@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][int]$ProcessId,
-    [Parameter(Mandatory = $true)][string]$PeerId
+    [Parameter(Mandatory = $true)][string]$PeerId,
+    [Parameter(Mandatory = $true)][string]$ArtifactDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,7 +10,64 @@ if ([string]::IsNullOrWhiteSpace($token)) {
     throw 'The test host token was not provided on standard input.'
 }
 
-Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class FlutterHomeInput {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect { public int Left, Top, Right, Bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessageW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
+}
+'@
+
+function Capture-Window([IntPtr]$Window, [string]$Path) {
+    $rect = New-Object FlutterHomeInput+Rect
+    if (-not [FlutterHomeInput]::GetWindowRect($Window, [ref]$rect)) {
+        throw 'Could not read the Flutter window bounds.'
+    }
+    $bitmap = New-Object Drawing.Bitmap(($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $dc = $graphics.GetHdc()
+    try {
+        if (-not [FlutterHomeInput]::PrintWindow($Window, $dc, 2)) {
+            throw "Could not capture the Flutter window: $Path"
+        }
+    } finally {
+        $graphics.ReleaseHdc($dc)
+    }
+    try {
+        $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
+function Send-Click([IntPtr]$Window, [int]$X, [int]$Y) {
+    $point = [IntPtr]([int64]$X -bor ([int64]$Y -shl 16))
+    [void][FlutterHomeInput]::SendMessageW($Window, 0x0200, [IntPtr]::Zero, $point)
+    [void][FlutterHomeInput]::SendMessageW($Window, 0x0201, [IntPtr]1, $point)
+    [void][FlutterHomeInput]::SendMessageW($Window, 0x0202, [IntPtr]::Zero, $point)
+}
+
+function Send-Text([IntPtr]$Window, [string]$Text) {
+    foreach ($character in $Text.ToCharArray()) {
+        if ([int]$character -gt 127) {
+            throw 'The native Flutter acceptance input only supports ASCII credentials.'
+        }
+        [void][FlutterHomeInput]::SendMessageW($Window, 0x0102, [IntPtr][int]$character, [IntPtr]::Zero)
+    }
+}
+
 $deadline = [DateTime]::UtcNow.AddSeconds(20)
 do {
     $viewer = Get-Process -Id $ProcessId -ErrorAction Stop
@@ -20,15 +78,32 @@ if ($viewer.MainWindowHandle -eq 0) {
     throw 'The Flutter home window did not appear.'
 }
 
-$shell = New-Object -ComObject WScript.Shell
-Start-Sleep -Seconds 2
-if (-not $shell.AppActivate($ProcessId)) {
-    throw 'Could not activate the Flutter home window.'
-}
 Start-Sleep -Milliseconds 500
-[System.Windows.Forms.SendKeys]::SendWait($PeerId)
-[System.Windows.Forms.SendKeys]::SendWait('{TAB}')
-[System.Windows.Forms.SendKeys]::SendWait($token)
-[System.Windows.Forms.SendKeys]::SendWait('+{TAB}')
-[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-Write-Output "Submitted the Flutter viewer connection for $PeerId."
+$root = [Windows.Automation.AutomationElement]::FromHandle($viewer.MainWindowHandle)
+$condition = New-Object Windows.Automation.PropertyCondition(
+    [Windows.Automation.AutomationElement]::ClassNameProperty, 'FLUTTERVIEW')
+$view = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+if ($null -eq $view -or $view.Current.NativeWindowHandle -eq 0) {
+    throw 'The Flutter render window was not exposed for native input.'
+}
+$viewHandle = [IntPtr]$view.Current.NativeWindowHandle
+$client = New-Object FlutterHomeInput+Rect
+if (-not [FlutterHomeInput]::GetClientRect($viewHandle, [ref]$client)) {
+    throw 'Could not read the Flutter render client bounds.'
+}
+if (($client.Right - $client.Left) -lt 1100 -or ($client.Bottom - $client.Top) -lt 650) {
+    throw "Flutter home window is smaller than the acceptance layout: $($client.Right - $client.Left)x$($client.Bottom - $client.Top)."
+}
+
+New-Item -ItemType Directory -Path $ArtifactDirectory -Force | Out-Null
+Capture-Window $viewer.MainWindowHandle (Join-Path $ArtifactDirectory 'flutter-home-before-input.png')
+
+# Target the Flutter HWND directly. SendKeys can silently type into another
+# foreground/topmost application and falsely report a submitted connection.
+Send-Click $viewHandle 664 167
+Send-Text $viewHandle $PeerId
+Send-Click $viewHandle 664 229
+Send-Text $viewHandle $token
+Capture-Window $viewer.MainWindowHandle (Join-Path $ArtifactDirectory 'flutter-home-filled.png')
+Send-Click $viewHandle 616 309
+Write-Output "Submitted Flutter connection for $PeerId through HWND $viewHandle."

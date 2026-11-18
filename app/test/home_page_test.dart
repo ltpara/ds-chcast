@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/gestures.dart';
@@ -27,6 +28,9 @@ class _MemoryDevices extends DeviceStore {
 
   @override
   Future<List<Device>> load() async => List<Device>.of(devices);
+
+  @override
+  Future<List<Device>> touch(Device device) async => List<Device>.of(devices);
 
   @override
   Future<List<PendingDeletion>> loadPendingDeletions() async =>
@@ -623,6 +627,85 @@ void main() {
     await tester.tap(find.byTooltip('仅文件传输'));
     await tester.pump();
     expect(find.text('请输入设备 ID 或主机地址'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('submitting the access token connects to the entered address', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const MethodChannel channel = MethodChannel('chast/viewer');
+    final List<MethodCall> calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+      MethodCall call,
+    ) async {
+      calls.add(call);
+      return call.method == 'openSessionWindow' ? true : null;
+    });
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        null,
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: _MemoryServers(const ServerSettings()),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.enterText(
+      find.byKey(const Key('connect-address')),
+      '127.0.0.1:45443',
+    );
+    await tester.tap(find.byKey(const Key('connect-token')));
+    await tester.enterText(find.byKey(const Key('connect-token')), 'one-time');
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('connect-address')))
+          .controller!
+          .text,
+      '127.0.0.1:45443',
+    );
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('connect-token')))
+          .controller!
+          .text,
+      'one-time',
+    );
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    for (int i = 0; i < 10; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(
+      calls.map((MethodCall call) => call.method),
+      contains('openSessionWindow'),
+    );
+    final MethodCall openCall = calls.singleWhere(
+      (MethodCall call) => call.method == 'openSessionWindow',
+    );
+    final Map<String, dynamic> request =
+        jsonDecode(openCall.arguments as String) as Map<String, dynamic>;
+    expect(request['host'], '127.0.0.1');
+    expect(request['port'], 45443);
+    expect(request['token'], 'one-time');
 
     await tester.pumpWidget(const SizedBox());
   });

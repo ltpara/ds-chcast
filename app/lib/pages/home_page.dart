@@ -2514,6 +2514,7 @@ class _HomePageState extends State<HomePage> {
                           ),
                           const SizedBox(height: 18),
                           TextField(
+                            key: const Key('connect-address'),
                             controller: _address,
                             autofocus: widget.initialTarget == null,
                             onSubmitted: _connect,
@@ -2560,8 +2561,9 @@ class _HomePageState extends State<HomePage> {
                           ),
                           const SizedBox(height: 10),
                           TextField(
+                            key: const Key('connect-token'),
                             controller: _token,
-                            onSubmitted: _connect,
+                            onSubmitted: (_) => _connect(_address.text),
                             style: TextStyle(
                               fontSize: 14,
                               letterSpacing: 0.6,

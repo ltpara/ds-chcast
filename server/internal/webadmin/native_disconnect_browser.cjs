@@ -6,10 +6,10 @@ const path = require('node:path');
 const {spawn, execFileSync} = require('node:child_process');
 const {setTimeout: delay} = require('node:timers/promises');
 
-const [url, targetConnectionID] = process.argv.slice(2);
+const [url, targetConnectionID, artifactDirectory] = process.argv.slice(2);
 const username = process.env.CHAST_BROWSER_USERNAME || '';
 const password = process.env.CHAST_BROWSER_PASSWORD || '';
-if (!url || !targetConnectionID || !username || !password) {
+if (!url || !targetConnectionID || !artifactDirectory || !username || !password) {
   throw new Error('missing browser acceptance inputs');
 }
 
@@ -164,14 +164,58 @@ async function main() {
     const before = await evaluate("document.querySelector('#connection-dialog-state').textContent.trim()");
     if (before !== '活动中') throw new Error(`target was not active before disconnect: ${before}`);
     await evaluate(`(() => {
+      window.__disconnectFetches = [];
+      window.__disconnectTrace = [];
+      const dialog = document.querySelector('#connection-dialog');
+      const form = document.querySelector('#connection-disconnect');
+      form.addEventListener('submit', event => {
+        window.__disconnectTrace.push('submit event');
+        queueMicrotask(() => window.__disconnectTrace.push('submit prevented=' + event.defaultPrevented));
+      }, true);
+      dialog.addEventListener('close', () => window.__disconnectTrace.push('dialog closed'));
+      new MutationObserver(() => window.__disconnectTrace.push({
+        state: document.querySelector('#connection-dialog-state').textContent.trim(),
+        command: document.querySelector('#connection-command-detail').innerText,
+        note: document.querySelector('#connection-disconnect-note').textContent.trim(),
+      })).observe(dialog, {subtree: true, childList: true, characterData: true, attributes: true});
+      const originalFetch = window.fetch;
+      window.fetch = async (...args) => {
+        const response = await originalFetch(...args);
+        if (String(args[0]).includes('/v1/live-connections/')) {
+          window.__disconnectFetches.push({
+            url: String(args[0]),
+            status: response.status,
+            body: await response.clone().text(),
+          });
+        }
+        return response;
+      };
+      return true;
+    })()`);
+    await evaluate(`(() => {
       const confirmation = document.querySelector('#connection-disconnect-confirm');
       confirmation.checked = true;
       confirmation.dispatchEvent(new Event('change', {bubbles: true}));
       document.querySelector('#connection-disconnect-send').click();
       return true;
     })()`);
-    await waitFor('UI-confirmed exact disconnect', () => evaluate(
-      "document.querySelector('#connection-dialog-state').textContent.trim() === '已确认断开'"), 30000);
+    try {
+      await waitFor('UI-confirmed exact disconnect', () => evaluate(
+        "document.querySelector('#connection-dialog-state').textContent.trim() === '已确认断开'"), 30000);
+    } catch (error) {
+      const diagnostic = await evaluate(`(() => ({
+        state: document.querySelector('#connection-dialog-state').textContent.trim(),
+        note: document.querySelector('#connection-command-note').textContent.trim(),
+        requestNote: document.querySelector('#connection-disconnect-note').textContent.trim(),
+        command: document.querySelector('#connection-command-detail').innerText,
+        fetches: window.__disconnectFetches,
+        trace: window.__disconnectTrace,
+      }))()`);
+      const screenshot = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});
+      const screenshotPath = path.join(artifactDirectory, 'browser-disconnect-timeout.png');
+      fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+      throw new Error(`${error.message}; final page state=${JSON.stringify(diagnostic)}; screenshot=${screenshotPath}`);
+    }
     process.stdout.write(`browser UI confirmed target disconnect ${targetConnectionID}\n`);
   } finally {
     if (socket && socket.readyState === WebSocket.OPEN) socket.close();
