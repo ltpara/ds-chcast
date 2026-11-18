@@ -13,10 +13,12 @@ if ([string]::IsNullOrWhiteSpace($token)) {
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing
 Add-Type @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class FlutterHomeInput {
     [StructLayout(LayoutKind.Sequential)]
     public struct Rect { public int Left, Top, Right, Bottom; }
+    private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
 
     [DllImport("user32.dll")]
     public static extern bool GetClientRect(IntPtr window, out Rect rect);
@@ -26,6 +28,24 @@ public static class FlutterHomeInput {
     public static extern IntPtr SendMessageW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll")]
     public static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+    public static long[] FindVisibleProcessWindows(int ownerProcessId) {
+        var windows = new List<long>();
+        EnumWindows((window, _) => {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (processId == (uint)ownerProcessId && IsWindowVisible(window)) {
+                windows.Add(window.ToInt64());
+            }
+            return true;
+        }, IntPtr.Zero);
+        return windows.ToArray();
+    }
 }
 '@
 
@@ -107,4 +127,26 @@ Send-Click $viewHandle 664 229
 Send-Text $viewHandle $token
 Capture-Window $viewer.MainWindowHandle (Join-Path $ArtifactDirectory 'flutter-home-filled.png')
 Send-Click $viewHandle 616 309
+function Get-SessionWindows {
+    @([FlutterHomeInput]::FindVisibleProcessWindows($ProcessId) |
+        Where-Object { [IntPtr]([int64]$_) -ne $viewer.MainWindowHandle })
+}
+
+$sessionWindows = @(Get-SessionWindows)
+$retryAt = [DateTime]::UtcNow.AddSeconds(4)
+$deadline = [DateTime]::UtcNow.AddSeconds(14)
+$retried = $false
+while ($sessionWindows.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline) {
+    if (-not $retried -and [DateTime]::UtcNow -ge $retryAt) {
+        Capture-Window $viewer.MainWindowHandle (Join-Path $ArtifactDirectory 'flutter-home-after-submit.png')
+        Send-Click $viewHandle 616 309
+        $retried = $true
+    }
+    Start-Sleep -Milliseconds 100
+    $sessionWindows = @(Get-SessionWindows)
+}
+if ($sessionWindows.Count -eq 0) {
+    Capture-Window $viewer.MainWindowHandle (Join-Path $ArtifactDirectory 'flutter-home-after-submit.png')
+    throw 'The Flutter connect action did not open a session window after one retry.'
+}
 Write-Output "Submitted Flutter connection for $PeerId through HWND $viewHandle."

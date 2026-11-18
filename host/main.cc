@@ -30,6 +30,7 @@
 #include <iterator>
 #include <future>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -957,6 +958,76 @@ void stop_server() {
     append_log_line(tr(L"共享已停止"));
 }
 
+std::string input_kind_name(InputKind kind) {
+    switch (kind) {
+        case InputKind::Mouse: return "mouse";
+        case InputKind::Key: return "key";
+        case InputKind::LegacyKey: return "legacy_key";
+        case InputKind::Touch: return "touch";
+        case InputKind::Pen: return "pen";
+        case InputKind::Gesture: return "gesture";
+    }
+    return "unknown";
+}
+
+std::string input_action_name(const InputEvent& event) {
+    switch (event.kind) {
+        case InputKind::Mouse:
+            switch (event.mouse.action) {
+                case MouseAction::Move: return "move";
+                case MouseAction::MoveRelative: return "move_relative";
+                case MouseAction::ButtonDown: return "button_down";
+                case MouseAction::ButtonUp: return "button_up";
+                case MouseAction::Wheel: return "wheel";
+                case MouseAction::WheelHorizontal: return "wheel_horizontal";
+            }
+            break;
+        case InputKind::Key:
+            return event.key.action == KeyAction::Down ? "down" : "up";
+        case InputKind::LegacyKey:
+            return event.legacy_key.action == KeyAction::Down ? "down" : "up";
+        case InputKind::Touch:
+            switch (event.touch.action) {
+                case TouchAction::Down: return "down";
+                case TouchAction::Move: return "move";
+                case TouchAction::Up: return "up";
+                case TouchAction::Cancel: return "cancel";
+            }
+            break;
+        case InputKind::Pen:
+            switch (event.pen.action) {
+                case TouchAction::Down: return "down";
+                case TouchAction::Move: return "move";
+                case TouchAction::Up: return "up";
+                case TouchAction::Cancel: return "cancel";
+            }
+            break;
+        case InputKind::Gesture:
+            return event.gesture.action == GestureAction::Pan ? "pan" : "zoom";
+    }
+    return "event";
+}
+
+struct NativeInputTrace {
+    std::mutex mutex;
+    std::ofstream stream;
+};
+
+void write_native_input_trace(NativeInputTrace& trace, const InputEvent& event) {
+    std::lock_guard lock(trace.mutex);
+    trace.stream << "{\"at_ms\":" << GetTickCount64()
+                 << ",\"kind\":\"" << input_kind_name(event.kind) << "\""
+                 << ",\"action\":\"" << input_action_name(event) << "\""
+                 << ",\"buttons\":" << event.mouse.buttons
+                 << ",\"x\":" << event.mouse.x
+                 << ",\"y\":" << event.mouse.y
+                 << ",\"hid_usage\":" << event.key.hid_usage
+                 << ",\"virtual_key\":" << event.legacy_key.virtual_key
+                 << ",\"modifiers\":" << event.modifiers
+                 << "}\n";
+    trace.stream.flush();
+}
+
 void start_server() {
     if (g_app->server) {
         return;
@@ -981,6 +1052,24 @@ void start_server() {
     config.settings_changed = server_settings_changed;
     config.viewer_chat_message = server_chat;
     config.identity_user_token = g_app->identity_user_token;
+    // The native acceptance path records decoded input without ever calling
+    // SendInput. Production hosts never set either test variable.
+    const char* native_testing = std::getenv("CHAST_NATIVE_TESTING");
+    const char* native_input_dry_run = std::getenv("CHAST_NATIVE_INPUT_DRY_RUN");
+    if (native_testing != nullptr && std::string(native_testing) == "1" &&
+        native_input_dry_run != nullptr && std::string(native_input_dry_run) == "1") {
+        config.dry_run_input = true;
+        const char* trace_path = std::getenv("CHAST_NATIVE_INPUT_TRACE");
+        if (trace_path != nullptr && *trace_path != '\0') {
+            auto trace = std::make_shared<NativeInputTrace>();
+            trace->stream.open(trace_path, std::ios::out | std::ios::trunc);
+            if (trace->stream) {
+                config.input_event = [trace](const InputEvent& event) {
+                    write_native_input_trace(*trace, event);
+                };
+            }
+        }
+    }
     if (g_app->elevated_child) config.expected_identity_fingerprint = g_app->elevated_child->snapshot.fingerprint;
     const auto elevation = g_app->elevation;
     config.elevation_state = [elevation] { return elevation->state(); };

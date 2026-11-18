@@ -3988,6 +3988,12 @@
     await refreshConnectionDetail(false);
   }
 
+  function handleConnectionDialogClose(event) {
+    // A close event can arrive after the operator has opened another row.
+    if (event.currentTarget.open) return;
+    resetConnectionDetail();
+  }
+
   function resetConnectionDetail() {
     stopConnectionPoll();
     state.connectionDetailGen++;
@@ -4968,9 +4974,7 @@
     $('connection-dialog-close').addEventListener('click', () => $('connection-dialog').close());
     $('connection-dialog-refresh').addEventListener('click', (event) => withButton(event.currentTarget,
       () => refreshConnectionDetail(true)));
-    $('connection-dialog').addEventListener('close', () => {
-      resetConnectionDetail();
-    });
+    $('connection-dialog').addEventListener('close', handleConnectionDialogClose);
     $('connection-disconnect-confirm').addEventListener('change', renderConnectionDetail);
     $('connection-disconnect').addEventListener('submit', (event) => {
       event.preventDefault();

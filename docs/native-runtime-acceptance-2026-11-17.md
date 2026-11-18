@@ -24,6 +24,14 @@
 
 2026-11-18 双 Flutter 视频流单机断开验收：隔离启动两个独立 Release Flutter 进程，服务端快照确认两个连接均 active。管理台页面按目标 connection ID 断开其中一个视频会话，页面显示“已确认断开”，主机签名 `confirmed_absent` 回执被接受；目标 Flutter 进程仍运行，非目标 Flutter 会话仍 active。断开操作开始前启动第二窗口统计区采样器，直到页面确认后停止；250 ms 间隔共保存 56 张 1120×720 PNG，统计面板区域有 50/55 组相邻样本检测到像素变化。首末截图可见接收/解码帧数从 173 增至 707。此为单机 loopback 证据，主机仍禁用键鼠注入；未验证实际 Flutter 输入、文件传输或跨机行为。Go 用例耗时 43.08 秒。完整日志为 `build/native-runtime-20261118-185528-4b34fb51/acceptance.log`；运行目录 `build/native-runtime-20261118-185528-4b34fb51/run-1266503374/`，包含 56 张会话采样图和两个查看端独立日志。
 
+2026-11-18 修复管理台连接详情切换竞态并补充真实浏览器回归：连续切换连接时，前一 `<dialog>` 排队的 `close` 事件可能在新详情打开后到达；旧处理器会无条件清空新连接状态，使确认框可选但断开按钮仍禁用。现在仅在对话框确实关闭时重置状态，新增回归覆盖旧关闭事件迟到及随后请求精确断开；Node 页面回归 **48/48 通过**。同时修正原生验收主机无效的 `tunnel_listen=127.0.0.1:0`：该值会被配置解析器拒绝并落到默认通配监听；测试现在为主机和 tunnel 分配不同的动态 UDP 回环端口。通过运行实际观察到 tunnel 监听 `127.0.0.1:57908`，未使用固定公网/通配监听。
+
+2026-11-18 Flutter 文件浏览器、管理台和双 Flutter 组合验收通过：运行 `tools/test-native-runtime.ps1 -Browser -Flutter -DualFlutter -FileTransfer`，两份独立 Release Flutter 会话连接隔离 Windows 托盘主机。目标 Flutter 通过真实文件浏览器上传和下载 524325 字节，源文件、主机接收文件和测试保留的下载副本均独立核验为 SHA-256 `7F942F752AD9EEE5ED89B3EE510E50B5A7A0684B33D07943C315A55F0CE36446`。随后隔离无头 Chrome 经管理台确认并提交目标 connection ID；目标收到主机签名 `confirmed_absent` 回执，非目标 Flutter 连接仍 active。断开期间采样 55 张非目标窗口 PNG，统计区有 46/54 组相邻样本变化。用例 54.66 秒通过。日志位于 `build/native-runtime-20261118-215415-dbfc4d4a/acceptance.log`，证据目录 `build/native-runtime-20261118-215415-dbfc4d4a/run-369350478/`；包含源、接收副本、保留下载副本、传输结果 JSON、两端日志和 55 张采样图。此证据仅代表本机 loopback，不代表双机、键鼠或跨网验收。
+
+2026-11-18 Flutter 文件操作与完整原生恢复链路组合复验：运行 `tools/test-native-runtime.ps1 -Browser -Flutter -FileTransfer`，真实 Flutter Release 文件浏览器上传/下载同一 524325 字节夹具并核对上述 SHA-256；管理台页面断开 Flutter 目标会话、目标签名缺席回执、另一文件模式会话保持活动，以及控制面故障、代理重启恢复、异常退出/runtime 隔离和受管/本地连接上限均通过。`TestWindowsNativeRuntimeAcceptance` 177.05 秒通过，日志位于 `build/native-runtime-20261118-214914-882e8a81/acceptance.log`，运行目录 `build/native-runtime-20261118-214914-882e8a81/run-1386584130/`。下载副本另存于 profile 清理目录之外，以便验后复核。
+
+2026-11-18 Flutter 查看端策略投递、更新和撤回实机补测：运行 `tools/test-native-runtime.ps1 -Flutter -ViewerStrategy`，用隔离账号创建 all-scope 策略，并由真实 Windows Release `chast_viewer.exe` 通过 host lookup 获取 delivery。revision 1 的五项设置均收到同 revision/digest 的 `applied` 回执。保持首个会话 active 时修改 `viewer.view_fit`，第二个真实 Flutter 会话经新的 lookup 收到 revision 2，五项结果均 `applied`；首会话原 delivery context 下的 revision 1 回执仍保持不变。关闭这两个测试会话并删除策略分配后，再启动第三个 Flutter 会话；实际 lookup 返回 revision 3 空 settings，空结果回执为 `applied`。完整验收 50.90 秒通过，日志为 `build/native-runtime-20261118-222855-69bd0658/acceptance.log`，三阶段逐项证据为 `build/native-runtime-20261118-222855-69bd0658/run-3522303953/flutter-viewer-strategy-results.json`。初次仅验证 revision 1 的运行记录仍留在 `build/native-runtime-20261118-221923-d18d06a3/`。以上是单机 loopback 的真实 Flutter delivery/receipt 及下一会话更新/撤回证据；双机/跨网行为仍未验证。
+
 早期原生进程验收新增的是测试工具、显式启用的集成用例、构建目标和执行脚本。后续 Flutter 自动化排查另发现并修复首页令牌框回车误将令牌当作地址的问题：现在始终使用地址框内容连接，并以页面回归核对目标主机、端口和令牌。修复后首页测试 61/61、Flutter 全量 815/815、`flutter analyze` 和管理台 Node 47/47 通过。全量 Flutter 日志为 `build/w1-flutter-full-20261118-final.log`。协议和 schema 保持 v26。
 
 验收边界：
@@ -58,11 +66,12 @@
 | Flutter Release 视频回环 | 隔离 `APPDATA` 启动真实查看端，密码认证后核对并确认首次主机指纹，连接仅回环、`--input-dry-run` 主机 | 会话持续约 266 秒；主机发送 7869 帧，查看端收到/解码 7868 帧，目标 30 FPS、发送错误 0；主机输入计数 0 |
 | Flutter 视频会话管理台精准断开 | Release Flutter SessionPage 建立视频会话；隔离 Chrome 管理台按 connection ID 断开 | 页面显示已确认；真实主机签名 `confirmed_absent` 回执被接受；Flutter 进程仍存活，非目标文件模式 QUIC 会话保持 active；完整用例 161.32 秒通过 |
 | 双 Flutter 视频会话断开期间持续收流 | 两个独立 Release Flutter 查看端同时接流；管理台页面断开目标，采集非目标统计面板 | 目标签名缺席回执被接受；非目标 API 状态 active；56 张 250 ms 样本中统计区 50/55 组相邻样本持续变化，首末接收/解码计数 173→707；43.08 秒通过 |
+| Flutter UI 文件传输及双 Flutter 精确断开 | 真实 Release Flutter 文件浏览器上传/下载夹具，然后经管理台断开目标；同时采集非目标 Flutter 窗口 | 三份文件均为 524325 字节且 SHA-256 一致；目标签名缺席回执被接受、非目标连接 active；55 张样本统计区 46/54 组相邻变化；54.66 秒通过 |
 | 原生键盘回环探针 | `chast-viewer-probe.exe --keyboard`，使用真实 loopback QUIC/ViewerEngine 并注入到受控编辑框 | US、German `zy/@`/AltGr、Legacy `VK_Y`、Unicode 中文及 Microsoft Pinyin `你好` 文本断言通过；退出码 0；键盘单测 `keyboard failures=0` |
 | 两个 Flutter Release 查看端并发 | 两个独立隔离配置均完成密码和指纹确认；同时收流，结束 B 后观察 A 画面变化 | 并发采样约 10 秒；主机/A/B CPU 增量约 3.27/2.25/1.70 秒；B 有 `success=true` 结束审计（约 294.8 秒），B 结束后 A 仍有 91.64% 采样像素变化；A 本地结束后没有对应成功结束审计，故不作为 A 正常关闭或管理台精准断开的证据 |
 | 管理台页面精准断开 | 隔离无头 Chrome 登录嵌入式管理台，按目标 connection ID 打开详情并在页面确认断开；由页面真实发起 API 请求 | 页面显示“已确认断开”；目标签名缺席回执被接受，目标文件模式 QUIC 会话消失，另一会话仍 active；页面 request key 重试返回同一 command ID；真实浏览器/页面/API/主机单机联测通过 |
 
-三/四及二/三连接边界由实际独立进程和 QUIC 握手验证，不只是单元测试。管理台真实页面已对文件模式 QUIC 会话和 Flutter 视频会话分别完成单机精准断开，均收到签名 `confirmed_absent` 回执。双 Flutter 单机补测还证明断开一个目标时非目标连接保持 active，Flutter 统计面板帧计数继续增长。Flutter 窗口实际键鼠/文件操作及双机行为仍待验。原生键盘回环探针已验证 Windows 布局映射、AltGr、Unicode 及主机拼音文本输入。策略变更会重启监听器并结束现有连接；撤回前先正常结束三个受管探针。
+三/四及二/三连接边界由实际独立进程和 QUIC 握手验证，不只是单元测试。管理台真实页面已对文件模式 QUIC 会话和 Flutter 视频会话分别完成单机精准断开，均收到签名 `confirmed_absent` 回执。双 Flutter 单机补测还证明断开一个目标时非目标连接保持 active，Flutter 统计面板帧计数继续增长。真实 Flutter 文件浏览器上传/下载已在本机 loopback 通过；Flutter 窗口实际键鼠注入、双物理机及跨机文件传输仍待验。原生键盘回环探针已验证 Windows 布局映射、AltGr、Unicode 及主机拼音文本输入。策略变更会重启监听器并结束现有连接；撤回前先正常结束三个受管探针。
 
 桌面流探针与受管连接上限测试是两项不同验收。桌面流探针的 `FrameSink` 只记录真实解码帧数；截图 API 使用确定性合成像素，因此不把探针 PNG 作为真实画面内容证据。桌面流与连接上限两项原生探针没有启动 Flutter UI，也没有注入键鼠。独立原生键盘探针使用真实输入注入，但目标是本进程创建的受控编辑框。Flutter 补测使用真实 Release 应用并完成首次指纹确认；未发送输入事件，dry-run 配置确保即使收到输入，也不会注入操作系统。
 
@@ -114,6 +123,8 @@ go test ./internal/api -run '^$' -count=1
 
 通过。`go vet ./internal/api` 通过。依照用户要求，本轮未查看 Git 状态或差异，也未运行 `git diff --check`。
 
+2026-11-18 最新工作区门禁：`go test ./...`、`go vet ./...` 通过；`node --test server/internal/webadmin/app_session_test.cjs` **48/48 通过**，`node --check server/internal/webadmin/native_disconnect_browser.cjs` 通过；Release 原生验收构建中的 Flutter 与 CMake 目标通过；`ctest --test-dir build -C Release -R '^host_settings$' --output-on-failure` **1/1 通过**。Go 全量测试未设置原生进程验收环境变量，桌面进程验收以本节列出的 opt-in 命令单独执行。
+
 日志中的 `proxy error: context canceled` 出现在故意终止/重启代理的阶段，测试没有失败。结束后确认本轮 host/tunnel/probe 进程均为 0；临时服务由测试清理。测试产物留在 build 目录。没有重跑上一轮 Node 45 项、Go 全量、PostgreSQL 或原生全量 CTest；Flutter 静态分析和 814 项测试已在本轮执行并单独记录。
 
 ## 4. 后续复跑
@@ -128,6 +139,12 @@ go test ./internal/api -run '^$' -count=1
 .\tools\test-native-runtime.ps1 -Browser -Flutter
 # 两个 Flutter 视频会话，其中一个经管理台断开，验证另一个持续更新帧统计：
 .\tools\test-native-runtime.ps1 -Browser -Flutter -DualFlutter
+# Flutter UI 文件上传/下载后，由管理台断开目标会话：
+.\tools\test-native-runtime.ps1 -Browser -Flutter -FileTransfer
+# 组合双 Flutter 收流、文件上传/下载及管理台精确断开：
+.\tools\test-native-runtime.ps1 -Browser -Flutter -DualFlutter -FileTransfer
+# 真实 Flutter viewer 获取五项策略并上报逐键回执：
+.\tools\test-native-runtime.ps1 -Flutter -ViewerStrategy
 # 使用其他已有构建树：
 .\tools\test-native-runtime.ps1 -BuildDirectory D:\path\to\build
 ```
@@ -136,8 +153,8 @@ go test ./internal/api -run '^$' -count=1
 
 ## 5. W1 后续工作
 
-1. 第二台可连接 Windows 测试机上运行完整 Flutter 查看端，与本机主机组成跨机拓扑，并验证实际键鼠/文件操作及复杂网络。单机管理台页面已精准断开一个 Flutter 视频会话；双 Flutter 补测确认非目标 Flutter 连接保持 active，统计面板接收/解码帧计数在断开操作期间持续增长。跨机行为及 Flutter 实际键鼠/文件操作仍待验。
-2. 自动化层的 host/viewer default、locked、显式偏好、未知键及下一会话快照已有对应回归；本轮补充 `SessionPage` default 合并与续票快照固定测试。仍需真实查看端验证逐键回执，以及服务器策略变更/撤回后下一次连接采用新 revision。受管三连接准入边界已由本机进程验收覆盖。
+1. 第二台可连接 Windows 测试机上运行完整 Flutter 查看端，与本机主机组成跨机拓扑，并验证实际键鼠操作、跨机文件传输及复杂网络。单机真实 Flutter 文件浏览器已完成上传/下载并核验 SHA-256；双 Flutter 补测确认管理台断开目标期间，非目标 Flutter 连接保持 active 且统计面板持续更新。跨机行为与 Flutter 窗口键鼠注入仍待验。
+2. 自动化层的 host/viewer default、locked、显式偏好、未知键及下一会话快照已有对应回归；真实 Release Flutter 单机补测已验证五项 viewer key 的逐项回执、更新策略由下一会话采用新 revision，以及撤销分配后下一会话取得空策略。双机/跨网复验仍待完成。受管三连接准入边界已由本机进程验收覆盖。
 3. 在明确的服务验收环境验证 SCM 服务/worker 启停、账号切换和安全桌面；本轮便携托盘不能替代服务路径。
 4. 验证真实链路断网、重连、跨 NAT/代理、旧回执重放及较长故障窗口；本轮 503 故障只覆盖 HTTP 控制面。
 5. 最后汇总 W1 缺口，执行发布所需完整门禁；生产数据库、灾备及性能对照继续按既定后续阶段安排。

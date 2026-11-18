@@ -324,6 +324,21 @@ void test_missing_file(const std::filesystem::path& dir) {
           "the tunnel listens on the documented UDP port");
 }
 
+void test_native_file_transfer_acceptance_settings(const std::filesystem::path& dir) {
+    const std::string receive = (dir / L"native-acceptance-receive").string();
+    const auto loaded = chast::parse_host_settings(
+        "input=0\nclipboard=0\naudio=0\nfile_transfer=1\nfile_receive_dir=" +
+            receive + "\n",
+        (dir / L"native-acceptance.ini").string());
+    check(loaded.warning.empty(),
+          "native file-transfer acceptance settings use recognized keys");
+    check(!loaded.settings.allow_input && !loaded.settings.allow_clipboard &&
+              !loaded.settings.allow_audio && loaded.settings.allow_file_transfer,
+          "native file-transfer acceptance disables input, clipboard, and audio only");
+    check(loaded.settings.file_receive_directory == receive,
+          "native file-transfer acceptance uses its isolated receive directory");
+}
+
 void test_invalid_values(const std::filesystem::path& dir) {
     const std::filesystem::path path = dir / "invalid.ini";
     write_text(path,
@@ -1320,6 +1335,7 @@ int main() {
     const std::filesystem::path dir = temp_dir();
     test_round_trip(dir);
     test_missing_file(dir);
+    test_native_file_transfer_acceptance_settings(dir);
     test_invalid_values(dir);
     test_file_share_roots(dir);
     test_audio_settings(dir);

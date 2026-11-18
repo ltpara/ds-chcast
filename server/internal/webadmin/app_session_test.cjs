@@ -26,7 +26,7 @@ function app(fetch, stubEntry = false) {
     // Keep the real lock cleanup available to role/session regressions.
     const realLock = lock;
     lock = () => { locks++; state.auth = null; };
-    Object.assign(exported, {loadPolicies, resetPolicyConsole, openClientStrategy, saveClientStrategy, openClientStrategyStatus, openConnectionDetail, refreshConnectionDetail, resetConnectionDetail, requestDisconnect, renderConnectionDetail});
+    Object.assign(exported, {loadPolicies, resetPolicyConsole, openClientStrategy, saveClientStrategy, openClientStrategyStatus, openConnectionDetail, refreshConnectionDetail, handleConnectionDialogClose, resetConnectionDetail, requestDisconnect, renderConnectionDetail});
     Object.assign(exported, {state, api, adoptAccountSession, canPermission, canDeviceCollection, canDeviceAction, tabVisible, applySessionPermissions, refreshConsolePermissions, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled, loadRoles, fmtTime, realLock, resetRoleConsole, renderPermissionOptions, renderRoles, renderRoleBindings, renderRoleSelects, applyRoleControlPermissions, syncRoleBindingScope, mutateRoles, clearRolePanels, editRole, saveRole, reloadRoleEditor, resetRoleEditor, deleteRole, openRoleAction, closeRoleAction, confirmRoleAction, roleActionKeydown, updateTabSelection, handleTabKeydown, initializeTableRegions});
   })();`), runtime);
   return {...runtime.exported, runtime, saved};
@@ -323,6 +323,38 @@ test('connection detail refresh orders responses and rejects same-target reopen 
   await oldOpen;
   assert.equal(loaded.state.connectionDetail.command_status,'queued');
   assert.equal(node('connection-disconnect-send').disabled,true);
+});
+
+test('a queued close from the previous row leaves the reopened connection actionable', async () => {
+  const posts = [];
+  const loaded = app((url, options) => {
+    const row = liveRow(url.includes('b'.repeat(32)) ? 'b' : 'a');
+    if (options.method === 'POST') {
+      posts.push(url);
+      return reply(202, {command_id:'cmd', status:'queued'});
+    }
+    return reply(200, row);
+  });
+  const {node} = managementDOM(loaded);
+  const dialog = node('connection-dialog');
+  const confirm = node('connection-disconnect-confirm');
+  await loaded.openConnectionDetail(liveRow());
+  confirm.checked = true;
+  dialog.close();
+  await loaded.openConnectionDetail(liveRow('b'));
+  loaded.handleConnectionDialogClose({currentTarget:dialog});
+  assert.equal(loaded.state.connectionDetail?.connection_id, liveRow('b').connection_id);
+  assert.equal(confirm.checked, false);
+  assert.equal(node('connection-disconnect-send').disabled, true);
+  confirm.checked = true;
+  loaded.renderConnectionDetail();
+  assert.equal(node('connection-disconnect-send').disabled, false);
+  await loaded.requestDisconnect();
+  assert.deepEqual(posts, ['/v1/live-connections/eastbox/' + liveRow('b').connection_id + '/disconnect']);
+  dialog.close();
+  loaded.handleConnectionDialogClose({currentTarget:dialog});
+  assert.equal(loaded.state.connectionDetail, null);
+  assert.equal(confirm.checked, false);
 });
 
 test('late disconnect does not write into another detail or unlock its pending request', async () => {

@@ -1,14 +1,29 @@
 # Opt-in, loopback-only Windows tray/tunnel acceptance. Requires an existing
 # CMake build tree and Go. Does not install a service or alter host profiles.
 [CmdletBinding()]
-param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter)
+param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter, [switch]$FileTransfer, [switch]$ViewerStrategy, [switch]$InputInjection)
 
 $ErrorActionPreference = 'Stop'
-if ($Flutter -and -not $Browser) {
+if ($Flutter -and -not $Browser -and -not $FileTransfer -and -not $ViewerStrategy -and -not $InputInjection) {
     throw '-Flutter requires -Browser so the real Flutter session is disconnected through the management page.'
 }
 if ($DualFlutter -and -not ($Flutter -and $Browser)) {
     throw '-DualFlutter requires both -Flutter and -Browser.'
+}
+if ($FileTransfer -and -not $Flutter) {
+    throw '-FileTransfer requires -Flutter.'
+}
+if ($ViewerStrategy -and -not $Flutter) {
+    throw '-ViewerStrategy requires -Flutter.'
+}
+if ($ViewerStrategy -and ($Browser -or $DualFlutter -or $FileTransfer)) {
+    throw '-ViewerStrategy runs as a dedicated Flutter-only acceptance; do not combine it with browser, dual-viewer, or file-transfer modes.'
+}
+if ($InputInjection -and -not $Flutter) {
+    throw '-InputInjection requires -Flutter.'
+}
+if ($InputInjection -and ($Browser -or $DualFlutter -or $FileTransfer -or $ViewerStrategy)) {
+    throw '-InputInjection runs as a dedicated Flutter-only acceptance; do not combine it with browser, dual-viewer, file-transfer, or viewer-strategy modes.'
 }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 if (-not [IO.Path]::IsPathRooted($BuildDirectory)) {
@@ -27,6 +42,9 @@ $oldBrowserUI = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_BROWSER_UI',
 $oldFlutterUI = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FLUTTER_UI', 'Process')
 $oldFlutterBin = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FLUTTER_BIN', 'Process')
 $oldDualFlutter = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_DUAL_FLUTTER', 'Process')
+$oldFileTransfer = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FILE_TRANSFER', 'Process')
+$oldViewerStrategy = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_VIEWER_STRATEGY', 'Process')
+$oldInputInjection = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_INPUT_INJECTION', 'Process')
 Push-Location $repoRoot
 try {
     & cmake --build $buildRoot --config Release --target chast-host chast-live-viewer-probe -j 4 *> (Join-Path $runRoot 'build.log')
@@ -46,10 +64,28 @@ try {
         } else {
             Remove-Item Env:CHAST_NATIVE_DUAL_FLUTTER -ErrorAction SilentlyContinue
         }
+        if ($FileTransfer) {
+            $env:CHAST_NATIVE_FILE_TRANSFER = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_FILE_TRANSFER -ErrorAction SilentlyContinue
+        }
+        if ($ViewerStrategy) {
+            $env:CHAST_NATIVE_VIEWER_STRATEGY = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_VIEWER_STRATEGY -ErrorAction SilentlyContinue
+        }
+        if ($InputInjection) {
+            $env:CHAST_NATIVE_INPUT_INJECTION = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_INPUT_INJECTION -ErrorAction SilentlyContinue
+        }
     } else {
         Remove-Item Env:CHAST_NATIVE_FLUTTER_UI -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_FLUTTER_BIN -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_DUAL_FLUTTER -ErrorAction SilentlyContinue
+        Remove-Item Env:CHAST_NATIVE_FILE_TRANSFER -ErrorAction SilentlyContinue
+        Remove-Item Env:CHAST_NATIVE_VIEWER_STRATEGY -ErrorAction SilentlyContinue
+        Remove-Item Env:CHAST_NATIVE_INPUT_INJECTION -ErrorAction SilentlyContinue
     }
     $env:CHAST_NATIVE_BIN_DIR = Join-Path $buildRoot 'Release'
     $env:CHAST_NATIVE_ARTIFACT_DIR = $runRoot
@@ -71,5 +107,8 @@ try {
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FLUTTER_UI', $oldFlutterUI, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FLUTTER_BIN', $oldFlutterBin, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_DUAL_FLUTTER', $oldDualFlutter, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FILE_TRANSFER', $oldFileTransfer, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_VIEWER_STRATEGY', $oldViewerStrategy, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_INPUT_INJECTION', $oldInputInjection, 'Process')
     Pop-Location
 }

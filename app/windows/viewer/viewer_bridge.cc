@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -140,6 +141,21 @@ std::string utf8_from_wide(const std::wstring& wide) {
     std::string out(static_cast<size_t>(size), '\0');
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
                         static_cast<int>(wide.size()), out.data(), size, nullptr, nullptr);
+    return out;
+}
+
+std::wstring wide_from_utf8(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                         static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) {
+        return {};
+    }
+    std::wstring out(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                        static_cast<int>(text.size()), out.data(), size);
     return out;
 }
 
@@ -322,6 +338,26 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window,
     : engine_(engine), window_(window),
       session_(session ? std::move(session) : std::make_shared<SharedViewerSession>()),
       display_stream_(display_stream) {
+    char* test_mode = nullptr;
+    size_t test_mode_size = 0;
+    std::string test_download_directory;
+    if (_dupenv_s(&test_mode, &test_mode_size, "CHAST_NATIVE_TESTING") == 0 &&
+        test_mode != nullptr && std::string(test_mode) == "1") {
+        char* directory = nullptr;
+        size_t directory_size = 0;
+        if (_dupenv_s(&directory, &directory_size,
+                      "CHAST_NATIVE_TEST_DOWNLOAD_DIR") == 0 &&
+            directory != nullptr) {
+            test_download_directory = directory;
+        }
+        std::free(directory);
+    }
+    std::free(test_mode);
+    if (!test_download_directory.empty() &&
+        !session_->viewer.SetFileReceiveDirectoryForTesting(test_download_directory)) {
+        std::fprintf(stderr,
+                     "chast_viewer: rejected isolated test download directory\n");
+    }
     session_generation_ = session_->generation.load();
     texture_sink_ = &session_->primary;
     camera_sink_ = &session_->camera;
@@ -1831,6 +1867,26 @@ void ViewerBridge::HandleMethodCall(
         dialog.nMaxFile = static_cast<DWORD>(selected.size());
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR |
                        OFN_HIDEREADONLY | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+        std::wstring test_upload_directory;
+        char* test_mode = nullptr;
+        size_t test_mode_size = 0;
+        char* test_upload_path = nullptr;
+        size_t test_upload_path_size = 0;
+        if (_dupenv_s(&test_mode, &test_mode_size, "CHAST_NATIVE_TESTING") == 0 &&
+            test_mode != nullptr && std::string(test_mode) == "1" &&
+            _dupenv_s(&test_upload_path, &test_upload_path_size,
+                      "CHAST_NATIVE_TEST_UPLOAD_DIR") == 0 &&
+            test_upload_path != nullptr) {
+            test_upload_directory = wide_from_utf8(test_upload_path);
+            std::error_code directory_error;
+            if (!test_upload_directory.empty() &&
+                std::filesystem::path(test_upload_directory).is_absolute() &&
+                std::filesystem::is_directory(test_upload_directory, directory_error)) {
+                dialog.lpstrInitialDir = test_upload_directory.c_str();
+            }
+        }
+        std::free(test_upload_path);
+        std::free(test_mode);
         if (!GetOpenFileNameW(&dialog)) {
             // Cancelling is not an error; the picker simply closed.
             result->Success();

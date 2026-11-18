@@ -136,11 +136,15 @@ func protectedNativeProfileFile(path string) bool {
 }
 
 func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, serverPublicKey,
-	peer, fingerprint, username, accountToken string) *nativeProcess {
+	peer, fingerprint, username, accountToken string, isolatedDownloads bool) *nativeProcess {
 	t.Helper()
 	profile := filepath.Join(dir, name+"-profile")
+	downloadDir := filepath.Join(profile, "downloads")
 	chastDir := filepath.Join(profile, "chast")
 	if err := os.MkdirAll(chastDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(downloadDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 	// Remove only this test-owned profile, after the viewer process has stopped.
@@ -193,12 +197,22 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 	env := os.Environ()
 	filtered := env[:0]
 	for _, entry := range env {
-		if !strings.EqualFold(strings.SplitN(entry, "=", 2)[0], "APPDATA") {
-			filtered = append(filtered, entry)
+		key := strings.SplitN(entry, "=", 2)[0]
+		if strings.EqualFold(key, "APPDATA") || strings.EqualFold(key, "CHAST_NATIVE_TESTING") ||
+			strings.EqualFold(key, "CHAST_NATIVE_TEST_DOWNLOAD_DIR") ||
+			strings.EqualFold(key, "CHAST_NATIVE_TEST_UPLOAD_DIR") {
+			continue
 		}
+		filtered = append(filtered, entry)
 	}
-	proc := startNativeProcessWithEnv(t, dir, name, binary, "",
-		append(filtered, "APPDATA="+profile), true)
+	viewerEnv := append(filtered, "APPDATA="+profile)
+	if isolatedDownloads {
+		viewerEnv = append(viewerEnv,
+			"CHAST_NATIVE_TESTING=1",
+			"CHAST_NATIVE_TEST_DOWNLOAD_DIR="+downloadDir,
+			"CHAST_NATIVE_TEST_UPLOAD_DIR="+dir)
+	}
+	proc := startNativeProcessWithEnv(t, dir, name, binary, "", viewerEnv, true)
 	nativeWait(t, "Flutter account and server credentials are DPAPI-protected", 20*time.Second, func() bool {
 		select {
 		case <-proc.done:
@@ -330,6 +344,129 @@ func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts s
 	t.Log(strings.TrimSpace(string(output)))
 }
 
+func runNativeFlutterFileTransferUI(t *testing.T, pid int, artifacts, phase, uploadPath string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+	defer cancel()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "tools", "native-flutter-file-transfer.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+		"-File", script, "-ProcessId", strconv.Itoa(pid),
+		"-ArtifactDirectory", artifacts, "-Phase", phase)
+	if uploadPath != "" {
+		cmd.Args = append(cmd.Args, "-UploadPath", uploadPath)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Flutter file browser %s failed: %v\n%s", phase, err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func runNativeFlutterInputUI(t *testing.T, pid int, artifacts, tracePath string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "tools", "native-flutter-input.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass", "-File", script,
+		"-ProcessId", strconv.Itoa(pid), "-ArtifactDirectory", artifacts, "-TracePath", tracePath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Flutter keyboard/mouse input acceptance failed: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string) {
+	t.Helper()
+	resultData, err := os.ReadFile(filepath.Join(artifacts, "flutter-input-results.json"))
+	if err != nil {
+		t.Fatalf("read Flutter input result: %v", err)
+	}
+	var result struct {
+		ControlOnClicked                 bool `json:"control_on_clicked"`
+		ControlOnVerified                bool `json:"control_on_verified"`
+		ControlOffClicked                bool `json:"control_off_clicked"`
+		ControlOffVerified               bool `json:"control_off_verified"`
+		RemoteAUpBeforePhysicalCleanup   bool `json:"remote_a_up_before_physical_cleanup"`
+		PhysicalCleanupHasNoKeyAEvent    bool `json:"physical_cleanup_has_no_key_a_event"`
+		TraceEventsBeforePhysicalCleanup int  `json:"trace_events_before_physical_cleanup"`
+		TraceEventsAfterPhysicalCleanup  int  `json:"trace_events_after_physical_cleanup"`
+	}
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		t.Fatalf("parse Flutter input result: %v", err)
+	}
+	if !result.ControlOnClicked || !result.ControlOnVerified ||
+		!result.ControlOffClicked || !result.ControlOffVerified ||
+		!result.RemoteAUpBeforePhysicalCleanup || !result.PhysicalCleanupHasNoKeyAEvent {
+		t.Fatalf("Flutter input UI did not verify the complete release sequence: %+v", result)
+	}
+	traceData, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read native input trace: %v", err)
+	}
+	var sawMouse bool
+	aDownIndex, aUpIndex := -1, -1
+	traceEvents := make([]struct {
+		Kind     string `json:"kind"`
+		Action   string `json:"action"`
+		HIDUsage int    `json:"hid_usage"`
+	}, 0)
+	for _, line := range strings.Split(string(traceData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Kind     string `json:"kind"`
+			Action   string `json:"action"`
+			HIDUsage int    `json:"hid_usage"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("parse native input trace line %q: %v", line, err)
+		}
+		traceEvents = append(traceEvents, event)
+		index := len(traceEvents) - 1
+		if event.Kind == "mouse" {
+			sawMouse = true
+		}
+		if event.Kind == "key" && event.HIDUsage == 0x04 && event.Action == "down" && aDownIndex == -1 {
+			aDownIndex = index
+		}
+		if event.Kind == "key" && event.HIDUsage == 0x04 && event.Action == "up" && aDownIndex >= 0 && aUpIndex == -1 {
+			aUpIndex = index
+		}
+	}
+	if !sawMouse || aDownIndex < 0 || aUpIndex < 0 {
+		t.Fatalf("native input trace missing mouse/A down/A up evidence: mouse=%t down=%d up=%d (%s)", sawMouse, aDownIndex, aUpIndex, tracePath)
+	}
+	if aDownIndex >= aUpIndex {
+		t.Fatalf("native input trace has A up before A down: down=%d up=%d (%s)", aDownIndex, aUpIndex, tracePath)
+	}
+	if result.TraceEventsBeforePhysicalCleanup <= 0 || result.TraceEventsBeforePhysicalCleanup > len(traceEvents) {
+		t.Fatalf("invalid trace event count before physical cleanup: before=%d total=%d", result.TraceEventsBeforePhysicalCleanup, len(traceEvents))
+	}
+	if result.TraceEventsAfterPhysicalCleanup < result.TraceEventsBeforePhysicalCleanup || result.TraceEventsAfterPhysicalCleanup > len(traceEvents) {
+		t.Fatalf("invalid trace event count after physical cleanup: before=%d after=%d total=%d", result.TraceEventsBeforePhysicalCleanup, result.TraceEventsAfterPhysicalCleanup, len(traceEvents))
+	}
+	if aUpIndex >= result.TraceEventsBeforePhysicalCleanup {
+		t.Fatalf("A up was not emitted before the physical cleanup boundary: up=%d boundary=%d", aUpIndex, result.TraceEventsBeforePhysicalCleanup)
+	}
+	for _, event := range traceEvents[result.TraceEventsBeforePhysicalCleanup:] {
+		if event.Kind == "key" && event.HIDUsage == 0x04 {
+			t.Fatalf("physical A cleanup emitted an unexpected trace event after the release boundary: %+v", event)
+		}
+	}
+	t.Logf("PASS: real Flutter control toggle forwarded mouse and A down/up; A up index=%d preceded physical cleanup boundary=%d and cleanup added no A event (%s)", aUpIndex, result.TraceEventsBeforePhysicalCleanup, tracePath)
+}
+
 func nativeFile(path string) bool { _, err := os.Stat(path); return err == nil }
 
 func nativeAgentPID(parent int) (uint32, error) {
@@ -360,11 +497,23 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	browserUI := os.Getenv("CHAST_NATIVE_BROWSER_UI") == "1"
 	flutterUI := os.Getenv("CHAST_NATIVE_FLUTTER_UI") == "1"
 	dualFlutter := os.Getenv("CHAST_NATIVE_DUAL_FLUTTER") == "1"
-	if flutterUI && !browserUI {
-		t.Fatal("Flutter UI acceptance requires CHAST_NATIVE_BROWSER_UI=1")
+	fileTransferUI := os.Getenv("CHAST_NATIVE_FILE_TRANSFER") == "1"
+	viewerStrategyUI := os.Getenv("CHAST_NATIVE_VIEWER_STRATEGY") == "1"
+	inputInjectionUI := os.Getenv("CHAST_NATIVE_INPUT_INJECTION") == "1"
+	if flutterUI && !browserUI && !fileTransferUI && !viewerStrategyUI && !inputInjectionUI {
+		t.Fatal("Flutter UI acceptance requires browser, file-transfer, viewer-strategy, or input-injection mode")
 	}
-	if dualFlutter && !flutterUI {
-		t.Fatal("dual Flutter acceptance requires CHAST_NATIVE_FLUTTER_UI=1")
+	if dualFlutter && (!flutterUI || !browserUI) {
+		t.Fatal("dual Flutter acceptance requires CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_BROWSER_UI=1")
+	}
+	if fileTransferUI && !flutterUI {
+		t.Fatal("Flutter file transfer acceptance requires CHAST_NATIVE_FLUTTER_UI=1")
+	}
+	if viewerStrategyUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI) {
+		t.Fatal("viewer strategy acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_VIEWER_STRATEGY=1")
+	}
+	if inputInjectionUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI) {
+		t.Fatal("input injection acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_INPUT_INJECTION=1")
 	}
 	for _, name := range []string{"chast-host.exe", "chast-tunnel.exe", "chast-live-viewer-probe.exe"} {
 		if !nativeFile(filepath.Join(bin, name)) {
@@ -387,6 +536,30 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	s := testutil.StartWith(t, testutil.Options{AccessIssuer: issuer})
 	target, _ := url.Parse(s.URL)
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	var capturedViewerDelivery atomic.Pointer[account.ViewerStrategyDelivery]
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if !viewerStrategyUI || resp.StatusCode != http.StatusOK || resp.Request == nil ||
+			resp.Request.URL.Path != "/v1/hosts/nativebox" {
+			return nil
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		if err := resp.Body.Close(); err != nil {
+			return err
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		var lookup struct {
+			ViewerStrategy *account.ViewerStrategyDelivery `json:"viewer_strategy"`
+		}
+		if err := json.Unmarshal(body, &lookup); err == nil && lookup.ViewerStrategy != nil {
+			capturedViewerDelivery.Store(lookup.ViewerStrategy)
+		}
+		return nil
+	}
 	var offline atomic.Bool
 	var blockReceipts atomic.Bool
 	var browserDisconnectRequestKey atomic.Value
@@ -418,13 +591,46 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := udp.LocalAddr().(*net.UDPAddr).Port
-	udp.Close()
+	defer udp.Close()
+	// The tray INI rejects port 0 and would fall back to a wildcard listener.
+	// Reserve the tunnel port while the host port is still held so they differ.
+	tunnelUDP, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnelUDP.Close()
+	tunnelListen := tunnelUDP.LocalAddr().String()
 	const peer = "nativebox"
 	const deviceKey = "native-runtime-device-key"
 	const token = "native-runtime-viewer-token"
 	const accountPassword = "native acceptance password"
-	if _, err := s.Accounts.CreateUser("native-acceptance", accountPassword); err != nil {
+	viewerUser, err := s.Accounts.CreateUser("native-acceptance", accountPassword)
+	if err != nil {
 		t.Fatal(err)
+	}
+	var viewerStrategyPolicyID, viewerStrategyAssignmentID string
+	var viewerStrategySettings strategy.Settings
+	if viewerStrategyUI {
+		policy, err := s.Accounts.CreatePolicyObject("native viewer strategy acceptance", account.DevicePolicyOpen, 0, nil, nil, "native-acceptance")
+		if err != nil {
+			t.Fatalf("create isolated viewer strategy policy: %v", err)
+		}
+		assignment, err := s.Accounts.CreatePolicyAssignment(policy.ID, account.PolicyScopeAll, "", 0, "native-acceptance")
+		if err != nil {
+			t.Fatalf("assign isolated viewer strategy policy: %v", err)
+		}
+		viewerStrategyPolicyID = policy.ID
+		viewerStrategyAssignmentID = assignment.ID
+		viewerStrategySettings = strategy.Settings{
+			"viewer.tunnel_mode":            {Mode: strategy.Locked, Value: json.RawMessage(`"auto"`)},
+			"viewer.use_websocket":          {Mode: strategy.Locked, Value: json.RawMessage(`false`)},
+			"viewer.upload_recordings":      {Mode: strategy.Locked, Value: json.RawMessage(`false`)},
+			"viewer.sync_initial_clipboard": {Mode: strategy.Locked, Value: json.RawMessage(`false`)},
+			"viewer.view_fit":               {Mode: strategy.Locked, Value: json.RawMessage(`1`)},
+		}
+		if _, err := s.Accounts.SetClientStrategy(policy.ID, 0, viewerStrategySettings, "native-acceptance"); err != nil {
+			t.Fatalf("configure isolated viewer strategy policy: %v", err)
+		}
 	}
 	if browserUI {
 		if _, err := s.Accounts.CreateAdminRole("native-runtime-manager", "Native Runtime Manager", "isolated browser acceptance", account.AllPermissions()); err != nil {
@@ -452,13 +658,35 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	configPath := filepath.Join(dir, "host.ini")
 	policyPath := filepath.Join(dir, "host.policy.json")
 	livePath := policyPath + ".live-connections"
-	config := fmt.Sprintf("bind=127.0.0.1\nport=%d\ncarrier=false\nlan_discovery=false\nmax_viewers=2\nkeep_awake=false\nlock_after_session_end=false\nauto_disconnect_minutes=0\nallow_input=false\nallow_clipboard=false\nallow_audio=false\nallow_file_transfer=true\nallow_terminal=false\nallow_remote_config=false\nallow_restart=false\nallow_block_input=false\nallow_privacy_mode=false\nallow_microphone=false\nallow_camera=false\nrecord_incoming=false\nautostart=false\nauth_mode=password\ntoken_auth=true\ntoken_mode=reusable\ntoken=%s\ntunnel=true\nserver_url=%s\nhost_key=%s\ntunnel_id=%s\ntunnel_key=%s\ntunnel_listen=127.0.0.1:0\naccess_issuer=%s\naccess_key=%s:%s\nfile_receive_directory=%s\n",
-		port, token, front.URL, testutil.ServerKey, peer, deviceKey, issuer.Name(), issuer.KeyID(), issuer.PublicKeyText(), filepath.Join(dir, "receive"))
+	receiveDirectory := filepath.Join(dir, "receive")
+	if err := os.MkdirAll(receiveDirectory, 0700); err != nil {
+		t.Fatalf("create isolated host receive directory: %v", err)
+	}
+	inputTracePath := filepath.Join(dir, "input-events.jsonl")
+	config := fmt.Sprintf("bind=127.0.0.1\nport=%d\ncarrier=false\nlan_discovery=false\nmax_viewers=2\nkeep_awake=false\nlock_after_session_end=false\nauto_disconnect_minutes=0\ninput=false\nclipboard=false\naudio=false\nfile_transfer=true\nterminal=false\nallow_remote_config=false\nrestart=false\nblock_input=false\nprivacy_mode=false\nmicrophone=false\ncamera=false\nrecord_incoming=false\nautostart=false\nauth_mode=password\ntoken_auth=true\ntoken_mode=reusable\ntoken=%s\ntunnel=true\nserver_url=%s\nhost_key=%s\ntunnel_id=%s\ntunnel_key=%s\ntunnel_listen=%s\naccess_issuer=%s\naccess_key=%s:%s\nfile_receive_dir=%s\n",
+		port, token, front.URL, testutil.ServerKey, peer, deviceKey, tunnelListen, issuer.Name(), issuer.KeyID(), issuer.PublicKeyText(), receiveDirectory)
+	if inputInjectionUI {
+		config = strings.Replace(config, "input=false", "input=true", 1)
+	}
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
 	startHost := func(name string) *nativeProcess {
+		if inputInjectionUI {
+			env := append(os.Environ(),
+				"CHAST_NATIVE_TESTING=1",
+				"CHAST_NATIVE_INPUT_DRY_RUN=1",
+				"CHAST_NATIVE_INPUT_TRACE="+inputTracePath)
+			return startNativeProcessWithEnv(t, dir, name, filepath.Join(bin, "chast-host.exe"), "", env, false,
+				"--portable", "--tray", "--config", configPath)
+		}
 		return startNativeProcess(t, dir, name, filepath.Join(bin, "chast-host.exe"), "", "--portable", "--tray", "--config", configPath)
+	}
+	if err := udp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tunnelUDP.Close(); err != nil {
+		t.Fatal(err)
 	}
 	host := startHost("host-1")
 	var fingerprint string
@@ -569,7 +797,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	var flutterViewer *nativeProcess
 	if flutterUI {
 		flutterViewer = startNativeFlutterViewer(t, dir, "flutter-target", flutterBin, front.URL, serverPublicKey,
-			peer, fingerprint, "native-acceptance", accountToken)
+			peer, fingerprint, "native-acceptance", accountToken, fileTransferUI)
 	} else {
 		_, firstDir = startViewer("viewer-a")
 	}
@@ -593,11 +821,150 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		first = rows[0]
 		return first.HostID == peer && first.RuntimeID != "" && first.State == "active"
 	})
+	if inputInjectionUI {
+		runNativeFlutterInputUI(t, flutterViewer.cmd.Process.Pid, dir, inputTracePath)
+		verifyNativeFlutterInputEvidence(t, dir, inputTracePath)
+		return
+	}
+	if viewerStrategyUI {
+		verifyStrategyDelivery := func(label string, expectedRevision int64, expected strategy.Settings) (*account.ViewerStrategyDelivery, *account.ClientStrategyReceipt) {
+			t.Helper()
+			var delivery *account.ViewerStrategyDelivery
+			nativeWait(t, label+" lookup delivered the expected viewer strategy revision", 30*time.Second, func() bool {
+				delivery = capturedViewerDelivery.Load()
+				return delivery != nil && delivery.Snapshot.Revision == expectedRevision
+			})
+			if len(delivery.Snapshot.Settings) != len(expected) {
+				t.Fatalf("%s delivery settings count = %d, want %d", label, len(delivery.Snapshot.Settings), len(expected))
+			}
+			for key, want := range expected {
+				got, ok := delivery.Snapshot.Settings[key]
+				if !ok || got.Mode != want.Mode || !bytes.Equal(bytes.TrimSpace(got.Value), bytes.TrimSpace(want.Value)) {
+					t.Fatalf("%s delivery setting %s = %+v (present=%t), want %+v", label, key, got, ok, want)
+				}
+			}
+			var receipt *account.ClientStrategyReceipt
+			nativeWait(t, label+" session reported a receipt for its exact delivery", 45*time.Second, func() bool {
+				var err error
+				receipt, err = s.Accounts.ViewerStrategyReceipt(viewerUser.ID, peer, delivery.Context)
+				if err != nil {
+					t.Fatalf("read %s viewer strategy receipt: %v", label, err)
+				}
+				return receipt != nil
+			})
+			if receipt.Revision != expectedRevision || receipt.Revision != delivery.Snapshot.Revision || receipt.Digest != delivery.Snapshot.Digest {
+				t.Fatalf("%s receipt identity does not match delivery: revision=%d/%d digest=%s/%s",
+					label, receipt.Revision, delivery.Snapshot.Revision, receipt.Digest, delivery.Snapshot.Digest)
+			}
+			if receipt.Status != strategy.Applied || len(receipt.Results) != len(expected) {
+				t.Fatalf("%s receipt status/results = %s/%d, want applied/%d", label, receipt.Status, len(receipt.Results), len(expected))
+			}
+			for key := range expected {
+				if result, ok := receipt.Results[key]; !ok || result.Status != strategy.Applied {
+					t.Fatalf("%s receipt result for %s = %+v (present=%t)", label, key, result, ok)
+				}
+			}
+			t.Logf("verified: %s Flutter strategy revision=%d has %d applied settings", label, receipt.Revision, len(expected))
+			return delivery, receipt
+		}
+		toEvidence := func(label string, receipt *account.ClientStrategyReceipt) map[string]any {
+			return map[string]any{
+				"label":          label,
+				"revision":       receipt.Revision,
+				"digest":         receipt.Digest,
+				"status":         receipt.Status,
+				"results":        receipt.Results,
+				"reported_at_ms": receipt.ReportedAtMS,
+			}
+		}
+		initialDelivery, initialReceipt := verifyStrategyDelivery("initial", 1, viewerStrategySettings)
+		evidence := []map[string]any{toEvidence("initial", initialReceipt)}
+
+		updatedSettings := make(strategy.Settings, len(viewerStrategySettings))
+		for key, setting := range viewerStrategySettings {
+			updatedSettings[key] = setting
+		}
+		updatedSettings["viewer.view_fit"] = strategy.Setting{Mode: strategy.Locked, Value: json.RawMessage(`0`)}
+		updatedPolicy, err := s.Accounts.SetClientStrategy(viewerStrategyPolicyID, 1, updatedSettings, "native-acceptance")
+		if err != nil || updatedPolicy.Revision != 2 {
+			t.Fatalf("update viewer strategy for next session: revision=%d err=%v", updatedPolicy.Revision, err)
+		}
+		capturedViewerDelivery.Store(nil)
+		updatedViewer := startNativeFlutterViewer(t, dir, "flutter-viewer-strategy-updated", flutterBin, front.URL, serverPublicKey,
+			peer, fingerprint, "native-acceptance", accountToken, false)
+		nativeWait(t, "updated Flutter session connects while the first session stays active", 90*time.Second, func() bool {
+			select {
+			case <-updatedViewer.done:
+				t.Fatalf("updated Flutter viewer exited before connecting: %v", updatedViewer.err)
+			default:
+			}
+			rows := list()
+			if len(rows) != 2 {
+				return false
+			}
+			for _, row := range rows {
+				if row.ConnectionID == first.ConnectionID && row.State == "active" {
+					for _, candidate := range rows {
+						if candidate.ConnectionID != first.ConnectionID && candidate.State == "active" {
+							return true
+						}
+					}
+				}
+			}
+			return false
+		})
+		_, updatedReceipt := verifyStrategyDelivery("updated-next-session", 2, updatedSettings)
+		oldReceipt, err := s.Accounts.ViewerStrategyReceipt(viewerUser.ID, peer, initialDelivery.Context)
+		if err != nil || oldReceipt == nil || oldReceipt.Revision != initialReceipt.Revision || oldReceipt.Digest != initialReceipt.Digest {
+			t.Fatalf("updating policy replaced the original session receipt: receipt=%+v err=%v", oldReceipt, err)
+		}
+		evidence = append(evidence, toEvidence("updated-next-session", updatedReceipt))
+
+		if err := s.Accounts.DeletePolicyAssignment(viewerStrategyAssignmentID); err != nil {
+			t.Fatalf("withdraw viewer strategy assignment: %v", err)
+		}
+		flutterViewer.stop(t)
+		updatedViewer.stop(t)
+		nativeWait(t, "prior Flutter sessions close before the withdrawal session", 30*time.Second, func() bool {
+			for _, row := range list() {
+				if row.State == "active" {
+					return false
+				}
+			}
+			return true
+		})
+		capturedViewerDelivery.Store(nil)
+		withdrawnViewer := startNativeFlutterViewer(t, dir, "flutter-viewer-strategy-withdrawn", flutterBin, front.URL, serverPublicKey,
+			peer, fingerprint, "native-acceptance", accountToken, false)
+		nativeWait(t, "withdrawn-strategy Flutter session connects", 90*time.Second, func() bool {
+			select {
+			case <-withdrawnViewer.done:
+				t.Fatalf("withdrawn-strategy Flutter viewer exited before connecting: %v", withdrawnViewer.err)
+			default:
+			}
+			rows := list()
+			return len(rows) == 1 && rows[0].State == "active"
+		})
+		_, withdrawnReceipt := verifyStrategyDelivery("withdrawn-next-session", 3, strategy.Settings{})
+		evidence = append(evidence, toEvidence("withdrawn-next-session", withdrawnReceipt))
+		result, err := json.MarshalIndent(map[string]any{
+			"scope":    "Windows single-machine loopback, real Flutter viewer strategy update and withdrawal",
+			"sessions": evidence,
+		}, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "flutter-viewer-strategy-results.json"), result, 0600); err != nil {
+			t.Fatalf("write viewer strategy evidence: %v", err)
+		}
+		t.Log("PASS: real Flutter strategy delivery/update/withdrawal applied on revisions 1, 2, and 3")
+		return
+	}
 	var secondDir string
 	var secondFlutterViewer *nativeProcess
 	if dualFlutter {
 		secondFlutterViewer = startNativeFlutterViewer(t, dir, "flutter-nontarget", flutterBin, front.URL, serverPublicKey,
-			peer, fingerprint, "native-acceptance", accountToken)
+			peer, fingerprint, "native-acceptance", accountToken, false)
 	} else {
 		_, secondDir = startViewer("viewer-b")
 	}
@@ -614,6 +981,57 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		}
 		return second.State == "active"
 	})
+	if fileTransferUI {
+		fixtureName := "native-flutter-file-transfer.bin"
+		fixturePath := filepath.Join(dir, fixtureName)
+		fixture := make([]byte, 512*1024+37)
+		for i := range fixture {
+			fixture[i] = byte((i*131 + 17) % 251)
+		}
+		if err := os.WriteFile(fixturePath, fixture, 0600); err != nil {
+			t.Fatalf("write isolated Flutter file-transfer fixture: %v", err)
+		}
+		expectedHash := sha256.Sum256(fixture)
+		verifyFile := func(path string) bool {
+			data, err := os.ReadFile(path)
+			return err == nil && len(data) == len(fixture) && sha256.Sum256(data) == expectedHash
+		}
+		runNativeFlutterFileTransferUI(t, flutterViewer.cmd.Process.Pid, dir, "Upload", fixturePath)
+		hostCopy := filepath.Join(receiveDirectory, fixtureName)
+		nativeWait(t, "Flutter UI upload has the expected size and SHA-256 on the host", 60*time.Second, func() bool {
+			return verifyFile(hostCopy)
+		})
+		runNativeFlutterFileTransferUI(t, flutterViewer.cmd.Process.Pid, dir, "Download", "")
+		viewerCopy := filepath.Join(dir, "flutter-target-profile", "downloads", fixtureName)
+		nativeWait(t, "Flutter UI download has the expected size and SHA-256 in its isolated directory", 60*time.Second, func() bool {
+			return verifyFile(viewerCopy)
+		})
+		downloaded, err := os.ReadFile(viewerCopy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Keep the verified bytes outside the temporary profile for independent review.
+		downloadArtifact := filepath.Join(dir, "verified-flutter-download.bin")
+		if err := os.WriteFile(downloadArtifact, downloaded, 0600); err != nil {
+			t.Fatal(err)
+		}
+		result, err := json.MarshalIndent(map[string]any{
+			"scope": "Windows single-machine loopback, real Flutter file browser",
+			"size":  len(fixture), "sha256": fmt.Sprintf("%X", expectedHash),
+			"source": fixturePath, "host_copy": hostCopy, "viewer_copy": viewerCopy,
+			"retained_download": downloadArtifact, "upload_verified": true, "download_verified": true,
+		}, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "flutter-file-transfer-result.json"), result, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("PASS: Flutter UI upload and download verified size=%d SHA-256=%X", len(fixture), expectedHash)
+		if !browserUI {
+			return
+		}
+	}
 	var command liveconn.Command
 	if browserUI {
 		var frameSampler *nativeProcess

@@ -1,12 +1,12 @@
 # 当前完成状态与后续计划
 
-日期：2026-11-18
+日期：2026-11-19（2026-11-18 状态基线延续）
 
 分支：`codex/s03-role-console-2026-11-17`
 
 基线：`202a228`
 
-本文记录截至 2026-11-18 的实际完成状态，作为当前状态入口。详细命令、日志和验收边界仍以各专项记录为准；历史文档中的中间状态不得覆盖本文结论。
+本文记录截至 2026-11-19 的实际完成状态，作为当前状态入口；阶段明细见 [2026-11-19 W1 状态与后续计划](w1-status-and-next-plan-2026-11-19.md)。详细命令、日志和验收边界仍以各专项记录为准；历史文档中的中间状态不得覆盖本文结论。
 
 ## 1. 当前结论
 
@@ -47,12 +47,24 @@ Windows 原生进程综合验收于 2026-11-17 首次通过（151.68 秒），�
 
 2026-11-18 本轮补充修复：首页令牌输入框按回车时，使用地址框内容发起连接，避免将令牌作为地址。新增页面回归同时核对目标主机、端口与令牌；测试设备存储覆盖 `touch`，避免写入真实用户配置。修复后首页测试 61/61、Flutter 全量测试 815/815 通过，`flutter analyze` 无问题；管理台 Node 回归 47/47、脚本语法检查及 `git diff --check` 通过。全量 Flutter 日志为 `build/w1-flutter-full-20261118-final.log`。
 
+2026-11-18 最新 W1 本机组合验收：修复管理台连接详情快速切换竞态，旧详情的异步 `close` 事件不再清空已打开的新连接；管理台页面回归 **48/48** 通过。原生验收配置此前把不接受的 `tunnel_listen=127.0.0.1:0` 写入主机，解析器会退回默认通配监听；测试现改为分配独立回环 UDP 端口，实测 tunnel 监听在 `127.0.0.1`。Release Flutter 文件浏览器实际上传、下载 **524325 字节**，源文件、主机接收副本和保留下载副本 SHA-256 均为 `7F942F752AD9EEE5ED89B3EE510E50B5A7A0684B33D07943C315A55F0CE36446`。随后以真实管理台页面断开目标 Flutter 会话；双 Flutter 组合中的非目标连接保持 active，55 张窗口样本里统计区有 46/54 组相邻样本变化。单 Flutter 全流程（含故障恢复、runtime 隔离及连接上限）177.05 秒通过；双 Flutter、文件传输与管理台断开组合 54.66 秒通过。当前工作区 Go `go test ./...`、`go vet ./...` 通过，管理台 Node 回归 48/48，`host_settings` CTest 1/1 通过。证据目录：`build/native-runtime-20261118-214914-882e8a81/` 与 `build/native-runtime-20261118-215415-dbfc4d4a/run-369350478/`。这些都是单机 loopback 验收，不是双物理机、键鼠或跨网验收。
+
+2026-11-18 Flutter viewer 策略真实投递、更新及撤回补测：`tools/test-native-runtime.ps1 -Flutter -ViewerStrategy` 通过（Go 用例 50.90 秒）。首个真实 Flutter 会话的五项 viewer 设置在 revision 1 全部收到 `applied`；保持该会话 active 并更新策略后，第二个会话实际取得 revision 2、五项均 `applied`，首会话原 delivery context 的回执仍保持 revision 1。删除策略分配后，后续第三个会话取得 revision 3 空配置并回报空结果 `applied`。三阶段证据位于 `build/native-runtime-20261118-222855-69bd0658/`。这是单机 loopback 实际 delivery/receipt 及下一会话更新、撤回证据；双机/跨网及 Flutter 窗口键鼠仍待验收。
+
+## 2.1 2026-11-19 最新结论
+
+`tools/test-native-runtime.ps1 -Flutter -InputInjection` 已从“点错工具栏位置”推进到真实控制态：键盘按钮截图识别、控制开启/关闭状态断言、鼠标 down/up 和 A down 均已在主机轨迹中出现。但关闭远程控制后没有观察到远端 A up，最终检查超时。因此 Flutter 窗口键鼠释放序列仍是明确的未完成阻断项，不能标记为已通过。
+
+证据目录：`build/native-runtime-20261119-001020-ef1059e1/run-2160080674/`。其中 `flutter-input-results.json` 显示 `control_on_verified=true`、`control_off_verified=true`，同时 `remote_a_up_before_physical_cleanup=false`。后续优先补充主机侧 `InputRelease`/dry-run `release_all()` 证据并修复链路，见 [2026-11-19 状态文档](w1-status-and-next-plan-2026-11-19.md)。
+
+临时 SYSTEM 服务监督验收已有全 PASS 日志，但仅证明临时服务监督路径，不证明正式 SCM `--install`、`--run`、`--worker`、服务身份或安全桌面。
+
 ## 3. 仍待完成
 
 ### 3.1 W1 外部验收
 
-1. 使用第二台 Windows 实机完成跨机 Flutter 查看端、实际键鼠/文件操作及复杂网络验收。单机已通过管理台页面/API/主机断开一个 Flutter 视频会话，并确认第二个 Flutter 视频会话在操作期间持续更新接收/解码统计（56 张 250 ms 样本中 50/55 组相邻样本有变化，首末计数为 173→707），目标签名缺席回执被接受、非目标连接仍 active。跨机行为及 Flutter 实际键鼠/文件操作仍未验收。
-2. 自动化覆盖已验证 host 的 default/locked/本地恢复/未知键准入，以及 viewer 的 default/locked/显式本地偏好/未知键回执和会话快照。本轮 `SessionPage` 集成回归覆盖五项 viewer 设置：默认建议只在新会话应用、续票收到新建议不改当前快照、下一会话读取新策略，以及本地显式路由/WebSocket/录制/剪贴板/视图偏好优先。仍需真实双机与 Flutter 查看端验证服务器策略应用/撤回和实际逐键回执；受管三连接准入上限边界已完成单机原生进程验收。
+1. 使用第二台 Windows 实机完成跨机 Flutter 查看端、实际键鼠操作和复杂网络验收。真实 Release Flutter 文件浏览器已在单机 loopback 下完成上传/下载并逐字节核对 SHA-256；双 Flutter 组合中，管理台断开目标会话时非目标连接仍 active，55 张样本的统计区域有 46/54 组相邻变化。跨机文件传输、Flutter 键鼠注入及复杂网络仍未验收。
+2. 自动化覆盖已验证 host 的 default/locked/本地恢复/未知键准入，以及 viewer 的 default/locked/显式本地偏好/未知键回执和会话快照。`SessionPage` 集成回归覆盖五项 viewer 设置：默认建议只在新会话应用、续票收到新建议不改当前快照、下一会话读取新策略，以及本地显式路由/WebSocket/录制/剪贴板/视图偏好优先。真实 Release Flutter 单机已验证五项逐键回执、策略更新由下一会话取得新 revision、分配撤销后下一会话取得空策略；双机/跨网复验仍待完成。受管三连接准入上限边界已完成单机原生进程验收。
 3. 在 Windows SCM 服务/worker 路径验证启停、崩溃恢复、账号切换、锁屏和安全桌面；便携托盘运行不能替代服务安装验收。
 4. 验证真实断网、重连、跨 NAT、IPv6、代理/CDN、旧回执重放和较长故障窗口；当前 503 只覆盖本机回环控制面。
 5. 完成全管理台响应式、键盘和辅助技术覆盖，以及生产 PostgreSQL 拓扑、整库灾备、目标 RPO/RTO 和故障切换验收。本轮修复 tab 键盘导航/ARIA 关联、表格滚动区键盘访问及窄屏双列溢出；Node DOM 契约回归 47 项通过。Chromium 实际检查了 320/375/768/1280px、12 个面板和 18 个表格滚动区，未发现页面/双列溢出或无名称交互控件，并实测 tab 与表格键盘导航；屏幕阅读器和生产数据库验收仍待完成。
@@ -110,6 +122,7 @@ macOS、Linux、Android、iOS 完整产品化，官方 RustDesk hbbs/hbbr 无修
 
 - [功能完成情况与后续计划](feature-status-and-plan-2026-11-16.md)
 - [RustDesk 对照审核执行方案](rustdesk-execution-plan-2026-11-16.md)
+- [W1 2026-11-19 当前状态与后续计划](w1-status-and-next-plan-2026-11-19.md)
 - [W1/S01–S02 原生进程验收](native-runtime-acceptance-2026-11-17.md)
 - [W1/S01–S02 管理台联动验收](strategy-connection-console-acceptance-2026-11-17.md)
 - [S03 角色管理台完成状态](s03-role-console-status-2026-11-17.md)

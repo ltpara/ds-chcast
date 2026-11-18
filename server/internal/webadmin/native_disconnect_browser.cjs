@@ -133,11 +133,39 @@ async function main() {
     await waitFor('manager login', () => evaluate(
       "!document.querySelector('#workspace').classList.contains('hidden')"), 45000);
 
+    await evaluate(`(() => {
+      window.__connectionApiResponses = [];
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const response = await originalFetch(...args);
+        const url = String(args[0]);
+        if (url.includes('/v1/live-connections')) {
+          const body = await response.clone().json().catch(() => null);
+          const connections = Array.isArray(body && body.connections)
+            ? body.connections : [body];
+          window.__connectionApiResponses.push({
+            url,
+            status: response.status,
+            connections: connections.filter(Boolean).map(connection => ({
+              host_id: connection.host_id,
+              connection_id: connection.connection_id,
+              state: connection.state,
+              command_status: connection.command_status,
+              command_id: connection.command_id,
+              console_permissions: connection.console_permissions,
+            })),
+          });
+        }
+        return response;
+      };
+      return true;
+    })()`);
+
     await evaluate("document.querySelector('#tab-connections').click()");
     await waitFor('active connection list', () => evaluate(
       "document.querySelectorAll('#connection-rows tr').length > 0"), 20000);
     const rowCount = await evaluate("document.querySelectorAll('#connection-rows tr').length");
-    let targetFound = false;
+    let targetIndex = -1;
     for (let index = 0; index < rowCount; index++) {
       const opened = await evaluate(`(() => {
         const row = document.querySelectorAll('#connection-rows tr')[${index}];
@@ -152,14 +180,41 @@ async function main() {
       const currentConnectionID = await evaluate(
         "document.querySelector('#connection-dialog-id').textContent.trim()");
       if (currentConnectionID === targetConnectionID) {
-        targetFound = true;
+        targetIndex = index;
         break;
       }
       await evaluate("document.querySelector('#connection-dialog-close').click()");
       await waitFor('connection detail close', () => evaluate(
         "!document.querySelector('#connection-dialog').open"));
     }
-    if (!targetFound) throw new Error('the console did not open the requested connection ID');
+    if (targetIndex < 0) throw new Error('the console did not open the requested connection ID');
+
+    // Exercise rapid switching even when the target happens to sort first.
+    // Close and reopen in one task to make the old dialog's queued close observable.
+    await evaluate(`(async () => {
+      const dialog = document.querySelector('#connection-dialog');
+      const close = document.querySelector('#connection-dialog-close');
+      const rows = document.querySelectorAll('#connection-rows tr');
+      const target = rows[${targetIndex}].querySelector('button');
+      const other = rows[${targetIndex === 0 ? 1 : 0}].querySelector('button');
+      const nextClose = () => new Promise(resolve => dialog.addEventListener('close', resolve, {once: true}));
+      const firstClose = nextClose();
+      close.click();
+      await firstClose;
+      other.click();
+      const currentID = () => document.querySelector('#connection-dialog-id').textContent.trim();
+      if (!dialog.open || !currentID() || currentID() === ${JSON.stringify(targetConnectionID)}) {
+        throw new Error('expected a different connection before reopening target');
+      }
+      const previousClose = nextClose();
+      close.click();
+      target.click();
+      await previousClose;
+      if (!dialog.open || currentID() !== ${JSON.stringify(targetConnectionID)}) {
+        throw new Error('target dialog changed after previous close event');
+      }
+      return true;
+    })()`);
 
     const before = await evaluate("document.querySelector('#connection-dialog-state').textContent.trim()");
     if (before !== '活动中') throw new Error(`target was not active before disconnect: ${before}`);
@@ -194,8 +249,19 @@ async function main() {
     })()`);
     await evaluate(`(() => {
       const confirmation = document.querySelector('#connection-disconnect-confirm');
-      confirmation.checked = true;
-      confirmation.dispatchEvent(new Event('change', {bubbles: true}));
+      if (confirmation.checked) throw new Error('new target unexpectedly kept previous confirmation');
+      confirmation.click();
+      const form = document.querySelector('#connection-disconnect');
+      const button = document.querySelector('#connection-disconnect-send');
+      window.__disconnectControlsBeforeClick = {
+        confirmationChecked: confirmation.checked,
+        confirmationDisabled: confirmation.disabled,
+        buttonDisabled: button.disabled,
+        formHidden: form.classList.contains('hidden'),
+        disabledControls: [...form.querySelectorAll('input, button')]
+          .filter(control => control.disabled)
+          .map(control => control.id),
+      };
       document.querySelector('#connection-disconnect-send').click();
       return true;
     })()`);
@@ -208,6 +274,21 @@ async function main() {
         note: document.querySelector('#connection-command-note').textContent.trim(),
         requestNote: document.querySelector('#connection-disconnect-note').textContent.trim(),
         command: document.querySelector('#connection-command-detail').innerText,
+        disconnectControls: (() => {
+          const form = document.querySelector('#connection-disconnect');
+          const confirmation = document.querySelector('#connection-disconnect-confirm');
+          const button = document.querySelector('#connection-disconnect-send');
+          return {
+            hidden: form.classList.contains('hidden'),
+            confirmationChecked: confirmation.checked,
+            confirmationDisabled: confirmation.disabled,
+            buttonDisabled: button.disabled,
+            buttonText: button.textContent.trim(),
+          };
+        })(),
+        controlsBeforeClick: window.__disconnectControlsBeforeClick || null,
+        connectionApiResponses: window.__connectionApiResponses || [],
+        dialogConnectionID: document.querySelector('#connection-dialog-id').textContent.trim(),
         fetches: window.__disconnectFetches,
         trace: window.__disconnectTrace,
       }))()`);
