@@ -1,11 +1,14 @@
 # Opt-in, loopback-only Windows tray/tunnel acceptance. Requires an existing
 # CMake build tree and Go. Does not install a service or alter host profiles.
 [CmdletBinding()]
-param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter)
+param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter)
 
 $ErrorActionPreference = 'Stop'
 if ($Flutter -and -not $Browser) {
     throw '-Flutter requires -Browser so the real Flutter session is disconnected through the management page.'
+}
+if ($DualFlutter -and -not ($Flutter -and $Browser)) {
+    throw '-DualFlutter requires both -Flutter and -Browser.'
 }
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 if (-not [IO.Path]::IsPathRooted($BuildDirectory)) {
@@ -23,6 +26,7 @@ $oldArtifacts = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_ARTIFACT_DIR
 $oldBrowserUI = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_BROWSER_UI', 'Process')
 $oldFlutterUI = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FLUTTER_UI', 'Process')
 $oldFlutterBin = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FLUTTER_BIN', 'Process')
+$oldDualFlutter = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_DUAL_FLUTTER', 'Process')
 Push-Location $repoRoot
 try {
     & cmake --build $buildRoot --config Release --target chast-host chast-live-viewer-probe -j 4 *> (Join-Path $runRoot 'build.log')
@@ -37,9 +41,15 @@ try {
         }
         $env:CHAST_NATIVE_FLUTTER_BIN = Join-Path $repoRoot 'app\build\windows\x64\runner\Release\chast_viewer.exe'
         $env:CHAST_NATIVE_FLUTTER_UI = '1'
+        if ($DualFlutter) {
+            $env:CHAST_NATIVE_DUAL_FLUTTER = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_DUAL_FLUTTER -ErrorAction SilentlyContinue
+        }
     } else {
         Remove-Item Env:CHAST_NATIVE_FLUTTER_UI -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_FLUTTER_BIN -ErrorAction SilentlyContinue
+        Remove-Item Env:CHAST_NATIVE_DUAL_FLUTTER -ErrorAction SilentlyContinue
     }
     $env:CHAST_NATIVE_BIN_DIR = Join-Path $buildRoot 'Release'
     $env:CHAST_NATIVE_ARTIFACT_DIR = $runRoot
@@ -60,5 +70,6 @@ try {
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_BROWSER_UI', $oldBrowserUI, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FLUTTER_UI', $oldFlutterUI, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FLUTTER_BIN', $oldFlutterBin, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_DUAL_FLUTTER', $oldDualFlutter, 'Process')
     Pop-Location
 }

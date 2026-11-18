@@ -1,8 +1,8 @@
 package api_test
 
 // Opt-in acceptance against the actual Windows tray and tunnel processes.
-// Separate QUIC viewers use files-only mode: no screen capture, clipboard,
-// input injection, installed service or system configuration is needed.
+// Default QUIC viewers use files-only mode. Opt-in Flutter modes use isolated
+// profiles; the host still disables input and no service is installed.
 
 import (
 	"bytes"
@@ -13,6 +13,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -132,10 +135,10 @@ func protectedNativeProfileFile(path string) bool {
 	return json.Unmarshal(data, &envelope) == nil && envelope.Protected != ""
 }
 
-func startNativeFlutterViewer(t *testing.T, dir, binary, serverURL, serverPublicKey,
+func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, serverPublicKey,
 	peer, fingerprint, username, accountToken string) *nativeProcess {
 	t.Helper()
-	profile := filepath.Join(dir, "flutter-profile")
+	profile := filepath.Join(dir, name+"-profile")
 	chastDir := filepath.Join(profile, "chast")
 	if err := os.MkdirAll(chastDir, 0700); err != nil {
 		t.Fatal(err)
@@ -170,6 +173,13 @@ func startNativeFlutterViewer(t *testing.T, dir, binary, serverURL, serverPublic
 		"trust.json": map[string]string{
 			"server:" + serverURL + "/" + peer: fingerprint,
 		},
+		"ui.json": map[string]any{
+			"peers": map[string]any{
+				fmt.Sprintf("server:v1:%x/%s", sha256.Sum256([]byte(serverURL)), peer): map[string]any{
+					"view_stats": true,
+				},
+			},
+		},
 	}
 	for name, value := range profileFiles {
 		data, err := json.Marshal(value)
@@ -187,12 +197,12 @@ func startNativeFlutterViewer(t *testing.T, dir, binary, serverURL, serverPublic
 			filtered = append(filtered, entry)
 		}
 	}
-	proc := startNativeProcessWithEnv(t, dir, "flutter-viewer", binary, "",
+	proc := startNativeProcessWithEnv(t, dir, name, binary, "",
 		append(filtered, "APPDATA="+profile), true)
 	nativeWait(t, "Flutter account and server credentials are DPAPI-protected", 20*time.Second, func() bool {
 		select {
 		case <-proc.done:
-			t.Fatalf("Flutter viewer exited during startup: %v (see flutter-viewer.log)", proc.err)
+			t.Fatalf("%s exited during startup: %v (see %s.log)", name, proc.err, name)
 		default:
 		}
 		return protectedNativeProfileFile(filepath.Join(chastDir, "server.json")) &&
@@ -200,6 +210,108 @@ func startNativeFlutterViewer(t *testing.T, dir, binary, serverURL, serverPublic
 	})
 	runNativeFlutterHomeConnect(t, proc.cmd.Process.Pid, peer, "native-runtime-viewer-token", dir)
 	return proc
+}
+
+func startNativeFlutterFrameSampler(t *testing.T, pid int, artifacts string) *nativeProcess {
+	t.Helper()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "tools", "native-flutter-frame-sampler.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return startNativeProcess(t, artifacts, "flutter-frame-sampler", "powershell.exe", "",
+		"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+		"-File", script, strconv.Itoa(pid), artifacts,
+		filepath.Join(artifacts, "flutter-frame-sampler.stop"))
+}
+
+func finishNativeFlutterFrameSampler(t *testing.T, sampler *nativeProcess, artifacts string) []string {
+	t.Helper()
+	stopPath := filepath.Join(artifacts, "flutter-frame-sampler.stop")
+	if err := os.WriteFile(stopPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sampler.done:
+		if sampler.err != nil {
+			log, _ := os.ReadFile(filepath.Join(artifacts, "flutter-frame-sampler.log"))
+			t.Fatalf("Flutter frame sampler failed: %v\n%s", sampler.err, log)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Flutter frame sampler did not stop after its stop marker")
+	}
+	paths, err := filepath.Glob(filepath.Join(artifacts, "flutter-secondary-frame-*.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) < 6 {
+		log, _ := os.ReadFile(filepath.Join(artifacts, "flutter-frame-sampler.log"))
+		t.Fatalf("Flutter frame sampler captured only %d samples\n%s", len(paths), log)
+	}
+	return paths
+}
+
+func changedFlutterStatsPixels(previousPath, nextPath string) (int, error) {
+	previousFile, err := os.Open(previousPath)
+	if err != nil {
+		return 0, err
+	}
+	previous, err := png.Decode(previousFile)
+	_ = previousFile.Close()
+	if err != nil {
+		return 0, err
+	}
+	nextFile, err := os.Open(nextPath)
+	if err != nil {
+		return 0, err
+	}
+	next, err := png.Decode(nextFile)
+	_ = nextFile.Close()
+	if err != nil {
+		return 0, err
+	}
+	if previous.Bounds() != next.Bounds() {
+		return 0, fmt.Errorf("Flutter sample dimensions changed: %v != %v", previous.Bounds(), next.Bounds())
+	}
+	bounds := previous.Bounds()
+	region := image.Rect(bounds.Max.X-300, bounds.Min.Y+35, bounds.Max.X-8, bounds.Min.Y+430).Intersect(bounds)
+	changed := 0
+	for y := region.Min.Y; y < region.Max.Y; y += 4 {
+		for x := region.Min.X; x < region.Max.X; x += 4 {
+			a := color.RGBAModel.Convert(previous.At(x, y)).(color.RGBA)
+			b := color.RGBAModel.Convert(next.At(x, y)).(color.RGBA)
+			delta := absInt(int(a.R)-int(b.R)) + absInt(int(a.G)-int(b.G)) + absInt(int(a.B)-int(b.B))
+			if delta > 48 {
+				changed++
+			}
+		}
+	}
+	return changed, nil
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func assertFlutterStatsChanged(t *testing.T, paths []string) {
+	t.Helper()
+	changedPairs := 0
+	for i := 1; i < len(paths); i++ {
+		changed, err := changedFlutterStatsPixels(paths[i-1], paths[i])
+		if err != nil {
+			t.Fatalf("compare Flutter frame samples: %v", err)
+		}
+		if changed >= 3 {
+			changedPairs++
+		}
+	}
+	comparisons := len(paths) - 1
+	if changedPairs < comparisons*2/3 {
+		t.Fatalf("non-target Flutter stats region changed in only %d/%d samples; inspect %s", changedPairs, comparisons, filepath.Dir(paths[0]))
+	}
+	t.Logf("verified non-target Flutter stats region changed across %d/%d consecutive samples (%d PNGs)", changedPairs, comparisons, len(paths))
 }
 
 func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts string) {
@@ -247,8 +359,12 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	}
 	browserUI := os.Getenv("CHAST_NATIVE_BROWSER_UI") == "1"
 	flutterUI := os.Getenv("CHAST_NATIVE_FLUTTER_UI") == "1"
+	dualFlutter := os.Getenv("CHAST_NATIVE_DUAL_FLUTTER") == "1"
 	if flutterUI && !browserUI {
 		t.Fatal("Flutter UI acceptance requires CHAST_NATIVE_BROWSER_UI=1")
+	}
+	if dualFlutter && !flutterUI {
+		t.Fatal("dual Flutter acceptance requires CHAST_NATIVE_FLUTTER_UI=1")
 	}
 	for _, name := range []string{"chast-host.exe", "chast-tunnel.exe", "chast-live-viewer-probe.exe"} {
 		if !nativeFile(filepath.Join(bin, name)) {
@@ -452,7 +568,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	var firstDir string
 	var flutterViewer *nativeProcess
 	if flutterUI {
-		flutterViewer = startNativeFlutterViewer(t, dir, flutterBin, front.URL, serverPublicKey,
+		flutterViewer = startNativeFlutterViewer(t, dir, "flutter-target", flutterBin, front.URL, serverPublicKey,
 			peer, fingerprint, "native-acceptance", accountToken)
 	} else {
 		_, firstDir = startViewer("viewer-a")
@@ -477,7 +593,14 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		first = rows[0]
 		return first.HostID == peer && first.RuntimeID != "" && first.State == "active"
 	})
-	_, secondDir := startViewer("viewer-b")
+	var secondDir string
+	var secondFlutterViewer *nativeProcess
+	if dualFlutter {
+		secondFlutterViewer = startNativeFlutterViewer(t, dir, "flutter-nontarget", flutterBin, front.URL, serverPublicKey,
+			peer, fingerprint, "native-acceptance", accountToken)
+	} else {
+		_, secondDir = startViewer("viewer-b")
+	}
 	var second liveConnectionReply
 	nativeWait(t, "two real viewers reported", 15*time.Second, func() bool {
 		rows := list()
@@ -493,7 +616,14 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	})
 	var command liveconn.Command
 	if browserUI {
+		var frameSampler *nativeProcess
+		if dualFlutter {
+			frameSampler = startNativeFlutterFrameSampler(t, secondFlutterViewer.cmd.Process.Pid, dir)
+		}
 		runNativeBrowserDisconnect(t, front.URL+"/admin/", first.ConnectionID, "native-acceptance", accountPassword, dir)
+		if dualFlutter {
+			assertFlutterStatsChanged(t, finishNativeFlutterFrameSampler(t, frameSampler, dir))
+		}
 		requestKey, _ := browserDisconnectRequestKey.Load().(string)
 		if requestKey == "" {
 			t.Fatal("management UI did not submit a disconnect request key")
@@ -514,13 +644,24 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		default:
 		}
 	}
-	if nativeFile(filepath.Join(secondDir, "disconnected")) || detail(second.ConnectionID).State != "active" {
+	if dualFlutter {
+		select {
+		case <-secondFlutterViewer.done:
+			t.Fatalf("non-target Flutter viewer exited during exact disconnect: %v", secondFlutterViewer.err)
+		default:
+		}
+	}
+	if (!dualFlutter && nativeFile(filepath.Join(secondDir, "disconnected"))) || detail(second.ConnectionID).State != "active" {
 		t.Fatal("non-target viewer disconnected")
 	}
 	if retry := disconnect(first.ConnectionID, command.RequestKey); retry.CommandID != command.CommandID {
 		t.Fatal("retry created another command")
 	}
 	t.Logf("exact target runtime=%s connection=%s command=%s; other=%s remains active", first.RuntimeID, first.ConnectionID, command.CommandID, second.ConnectionID)
+	if dualFlutter {
+		t.Log("PASS: real management page disconnected one Flutter video session; the non-target Flutter viewer stayed active and its stats region continued updating during the operation")
+		return
+	}
 
 	// Lose control-plane HTTP access without dropping real QUIC sessions.
 	offline.Store(true)

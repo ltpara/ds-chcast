@@ -96,6 +96,7 @@ if (($client.Right - $client.Left) -lt 1100 -or ($client.Bottom - $client.Top) -
 }
 
 New-Item -ItemType Directory -Path $ArtifactDirectory -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $ArtifactDirectory "flutter-home-window-$ProcessId.txt") -Value $viewer.MainWindowHandle.ToInt64() -NoNewline -Encoding ASCII
 Capture-Window $viewer.MainWindowHandle (Join-Path $ArtifactDirectory 'flutter-home-before-input.png')
 
 # Target the Flutter HWND directly. SendKeys can silently type into another
