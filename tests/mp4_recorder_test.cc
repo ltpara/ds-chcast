@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <barrier>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -20,6 +22,7 @@
 #include <mutex>
 #include <chrono>
 #include <stdexcept>
+#include <thread>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -224,7 +227,8 @@ bool check_segment(const std::string& path, chast::VideoCodec codec,
         std::fprintf(stderr, "FAIL %s: %s\n", path.c_str(), error.c_str());
         return false;
     }
-    if (samples != info.frames || samples != expected_pts.size()) {
+    if (info.frames < 0 || samples != static_cast<uint64_t>(info.frames) ||
+        samples != expected_pts.size()) {
         std::fprintf(stderr,
                      "FAIL %s: verify counted %llu samples, demuxer %lld, expected %zu\n",
                      path.c_str(), static_cast<unsigned long long>(samples),
@@ -369,6 +373,106 @@ int main() {
 
     const std::vector<uint8_t> key(std::begin(kKeyAccessUnit), std::end(kKeyAccessUnit));
     const std::vector<uint8_t> delta(std::begin(kDeltaAccessUnit), std::end(kDeltaAccessUnit));
+
+    namespace fs = std::filesystem;
+    const fs::path exclusive_dir =
+        "chast-mp4-exclusive-" + std::to_string(GetCurrentProcessId()) + "-" +
+        std::to_string(GetTickCount64());
+    if (!fs::create_directory(exclusive_dir)) {
+        std::fprintf(stderr, "FAIL could not create the isolated exclusive-path test directory\n");
+        return 1;
+    }
+    const std::string shared_path = (exclusive_dir / "shared.mp4").string();
+    {
+        std::ofstream original(shared_path, std::ios::binary);
+        original << "preserve-existing-recording";
+        if (!original) return 1;
+    }
+
+    chast_tools::Mp4Recorder concurrent_a;
+    chast_tools::Mp4Recorder concurrent_b;
+    if (!concurrent_a.open(shared_path, chast::VideoCodec::H264, 2560, 1440, &error) ||
+        !concurrent_b.open(shared_path, chast::VideoCodec::H264, 2560, 1440, &error)) {
+        std::fprintf(stderr, "FAIL concurrent recorders could not open: %s\n", error.c_str());
+        return 1;
+    }
+    chast::FrameHeader concurrent_header;
+    concurrent_header.codec = chast::VideoCodec::H264;
+    concurrent_header.width = 2560;
+    concurrent_header.height = 1440;
+    concurrent_header.keyframe = true;
+    concurrent_header.pts_ms = 1000;
+    std::barrier first_start(3);
+    std::thread first_a([&] {
+        first_start.arrive_and_wait();
+        concurrent_a.write(concurrent_header, key.data(), key.size());
+    });
+    std::thread first_b([&] {
+        first_start.arrive_and_wait();
+        concurrent_b.write(concurrent_header, key.data(), key.size());
+    });
+    first_start.arrive_and_wait();
+    first_a.join();
+    first_b.join();
+
+    auto rollover_header = concurrent_header;
+    rollover_header.width = 1280;
+    rollover_header.height = 720;
+    rollover_header.pts_ms = 1033;
+    std::barrier rollover_start(3);
+    std::thread rollover_a([&] {
+        rollover_start.arrive_and_wait();
+        concurrent_a.write(rollover_header, key.data(), key.size());
+    });
+    std::thread rollover_b([&] {
+        rollover_start.arrive_and_wait();
+        concurrent_b.write(rollover_header, key.data(), key.size());
+    });
+    rollover_start.arrive_and_wait();
+    rollover_a.join();
+    rollover_b.join();
+    concurrent_a.close();
+    concurrent_b.close();
+
+    const auto& paths_a = concurrent_a.segments();
+    const auto& paths_b = concurrent_b.segments();
+    bool paths_unique = paths_a.size() == 2 && paths_b.size() == 2;
+    for (const std::string& path_a : paths_a) {
+        for (const std::string& path_b : paths_b) {
+            paths_unique = paths_unique && path_a != path_b;
+        }
+    }
+    std::string original_contents;
+    {
+        std::ifstream original(shared_path, std::ios::binary);
+        original_contents.assign(std::istreambuf_iterator<char>(original),
+                                 std::istreambuf_iterator<char>());
+    }
+    if (concurrent_a.failed() || concurrent_b.failed() || !paths_unique ||
+        original_contents != "preserve-existing-recording") {
+        std::fprintf(stderr, "FAIL concurrent recordings collided or changed the existing file\n");
+        return 1;
+    }
+    for (const std::string& path : paths_a) {
+        if (!check_segment(path, chast::VideoCodec::H264, {0}, 1)) return 1;
+    }
+    for (const std::string& path : paths_b) {
+        if (!check_segment(path, chast::VideoCodec::H264, {0}, 1)) return 1;
+    }
+    chast_tools::Mp4Recorder no_keyframe;
+    const std::string no_keyframe_path = (exclusive_dir / "no-keyframe.mp4").string();
+    if (!no_keyframe.open(no_keyframe_path, chast::VideoCodec::H264, 2560, 1440, &error)) return 1;
+    auto delta_header = concurrent_header;
+    delta_header.keyframe = false;
+    no_keyframe.write(delta_header, delta.data(), delta.size());
+    no_keyframe.close();
+    if (!no_keyframe.segments().empty() || fs::exists(no_keyframe_path)) {
+        std::fprintf(stderr, "FAIL a recording without a key frame left an empty file\n");
+        return 1;
+    }
+    fs::remove_all(exclusive_dir);
+    std::printf("ok   concurrent MP4 recorders reserve unique segments and preserve existing files\n");
+
     const std::vector<Write> writes = {
         // Arrives mid-GOP: there is no configuration record yet, so the
         // recorder must skip it rather than open a segment on a delta frame.

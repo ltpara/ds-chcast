@@ -59,6 +59,24 @@ Windows 原生进程综合验收于 2026-11-17 首次通过（151.68 秒），�
 
 临时 SYSTEM 服务监督验收已有全 PASS 日志，但仅证明临时服务监督路径，不证明正式 SCM `--install`、`--run`、`--worker`、服务身份或安全桌面。
 
+2026-11-19 SCM 只读预检：Release `chast-service` 重建、`--help`、SCM 外 `--run` 拒绝启动，以及 `service_log`、`host_parity`、`host_security`、`host_settings`、`host_multi`、`host_i18n`、`lock_after_session`、`host_ticket_lease` CTest 共 8/8 通过。检查时本机没有 chast 服务注册或 `%ProgramData%\chast\host.ini`。正式安装会写机器配置、创建自动启动服务并调整防火墙，尚未确认本机是可回滚测试环境，因此未执行；范围与后续门槛见 [W1 状态文档](w1-status-and-next-plan-2026-11-19.md)。
+
+## 2.2 2026-11-20 最新结论
+
+SCM 安装/卸载编排新增快照、逆序回滚及 fake SCM/防火墙事务覆盖；停止请求失败时也会查询当前 SCM 状态，并尽力恢复安装/卸载前的运行或暂停状态。防火墙规则创建改用 Firewall COM `INetFwRule`/`Rules.Add`，owner 信任判定有独立纯策略测试。Release `chast-host`、`chast-service` 与 P1 测试目标构建通过；最新完整 P1 CTest 为 18 项中 17 项 PASS、`machine_state_security_untrusted_owner` 因无法启用 `SeRestorePrivilege`（错误 1300）单独 Skipped，总耗时 188.52 秒，`host_parity` 用时 124.10 秒。该 Skipped 不是通过，6 项合成 SID 策略断言也不等同于真实 NTFS owner 集成验收。
+
+本轮未执行正式 `--install`/`--uninstall`、真实 SCM 生命周期、Firewall COM 写入、真实 ProgramData ACL 修改或双机测试；测试前后确认无产品服务/进程、机器配置及产品防火墙规则。真实 SCM/COM 失败回滚、owner 集成分支、生产 PostgreSQL 拓扑和双机/跨网验收仍待专用环境。具体证据与限制见 [2026-11-20 W1 状态文档](w1-status-and-next-plan-2026-11-19.md)。
+
+补充验证：Firewall COM 规则属性现先设协议再设端口；真实 `INetFwRule` 内存对象的 UDP/TCP 配置与读回测试通过。SCM 停止超时的回滚路径现会按查询到的状态等待/恢复原状态，并避免对仍运行的服务重复启动。`chast-host`、`chast-service` Release 重建通过；完整 P1 CTest 复跑为 17 项 PASS、owner 专项因错误 1300 Skipped，总耗时 188.52 秒。测试未调用 `INetFwRules::Add`，不代表真实防火墙规则写入/回滚已验收；只读复查确认无 chast 服务/产品进程、无 `%ProgramData%\chast\host.ini`、无四条产品防火墙规则。
+
+2026-11-20 W2 C01/C02 本机门禁复验：C01 `reference_counted_lease` 与 `viewer_awake_request` Release CTest 重建后 2/2 PASS；Flutter `analyze --no-pub` 无问题、全量测试 825/825 PASS、Windows Release 构建成功。C02 当前工作区包含按设备持久化的视图/光标倍率控制，并覆盖主视图、桌面多显示器布局及独立显示器窗口；新增测试验证变焦输入映射、独立光标热点、普通滚轮远端转发与 Shift+滚轮本地横向平移，并在固定逻辑窗口尺寸下模拟 DPR 从 1 到 2，确认相对输入倍率同步更新。上述均为代码/单机自动化证据，真实混合 DPI、旋转、全屏与多屏视觉验收尚未完成。未启动远端会话、未更改持久电源设置、SCM、ProgramData 或防火墙；双机验证继续后置。
+
+2026-11-20 W2 C03 首个实现切片：独立远端显示器窗口首次打开时，会将远端虚拟桌面布局等比例映射到本机虚拟桌面；单屏远端使用本机主显示器区域。已有按设备/远端显示索引保存的手动窗口位置继续优先。几何边界的 Release CTest 1/1 通过，Flutter analyze、全量测试 825/825 和 Windows Release 构建通过。该切片没有实现多连接标签页、音频/录制状态隔离，也未做真实混合 DPI/显示器热插拔验收；双机验证仍后置。
+
+2026-11-20 W2 C03 本机显示拓扑恢复与隔离回归：独立显示窗口收到 `WM_DISPLAYCHANGE` 后检查当前矩形；可用交集不足 320×240 时，按远端屏幕拓扑重新映射，并在系统显示拓扑尚未稳定时每 250 ms 重试、最多约 10 秒。关闭时及下次恢复时均忽略可用交集不足 320×240 的旧位置。几何/当前显示器及位置持久化 Release CTest 均通过，`display_layout` 连续 10 次通过；位置测试验证 peer/display 索引隔离与更新保留，不模拟显示拓扑变化。没有实际拔插显示器，因此不代表物理热插拔验收。架构审计确认每个独立会话窗口创建自己的 `SharedViewerSession`/`ViewerEngine`；新增 `viewer_session_isolation` CTest 1/1 通过：双 ViewerEngine loopback 的会话音频选项状态、本地录制目录与停止行为彼此隔离，停止一个 viewer 后另一个仍收流/录制，两份 VP9 MP4 均通过重开校验。同进程双 Flutter 窗口 loopback 验收也通过，精确断开其中一条连接后另一条仍 active。真实逐窗口录制/音频 UI、实际 DSP、物理热插拔或双机尚未验证；多连接标签页仍未实现。
+
+2026-11-20 录制文件名并发冲突修复：发现查看端默认文件名只有秒级时间戳，且 FFmpeg 写入会截断同名文件；两个同秒启动的会话可能覆盖录制。`Mp4Recorder` 现只在首个关键帧到达时用 Windows CRT `O_CREAT|O_EXCL` 原子占用候选文件名，冲突时递增编号；首个关键帧前不创建文件，初始化失败则删除本次占位文件。新增并发录制器/分段回归，验证四个 MP4 均可重开、路径互异、既存哨兵内容不变、无关键帧不留下空文件。Release `chast-mp4-recorder-test`、`chast-viewer-probe`、`chast-quic` 构建通过；MP4 专项测试及 `viewer_session_isolation` loopback 探针通过。测试产物仅在隔离目录 `build/test-temp/mp4-exclusive-run-b95d76d7b21c4b9a9d0af6c7b9a394f1/`；保留既有 LNK4098/LNK4199 链接警告。此为单机文件协调和回环证据，不替代双机验收。
+
 ## 3. 仍待完成
 
 ### 3.1 W1 外部验收

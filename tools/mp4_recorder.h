@@ -19,10 +19,16 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 extern "C" {
@@ -185,6 +191,70 @@ private:
                codec == chast::VideoCodec::Av1 ? AV_CODEC_ID_AV1 :
                codec == chast::VideoCodec::Vp9 ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
     }
+
+    static std::wstring wide_path(const std::string& path) {
+        std::u8string utf8;
+        utf8.reserve(path.size());
+        for (unsigned char byte : path) {
+            utf8.push_back(static_cast<char8_t>(byte));
+        }
+        return std::filesystem::path(utf8).wstring();
+    }
+
+    static bool create_reserved_file(const std::string& path, int* error_code) {
+        const std::wstring wide = wide_path(path);
+        int fd = -1;
+        const int result = _wsopen_s(&fd, wide.c_str(),
+                                     _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+                                     _SH_DENYNO, _S_IREAD | _S_IWRITE);
+        if (result != 0) {
+            *error_code = result;
+            return false;
+        }
+        if (_close(fd) == 0) {
+            return true;
+        }
+        *error_code = errno;
+        _wunlink(wide.c_str());
+        return false;
+    }
+
+    static void remove_reserved_file(const std::string& path) {
+        const std::wstring wide = wide_path(path);
+        _wunlink(wide.c_str());
+    }
+
+    bool reserve_segment_path(std::string* path, std::string* error) const {
+        const size_t first_number = segments_.size() + 1;
+        for (size_t offset = 0; offset < 10000; ++offset) {
+            const std::string candidate = segment_path(first_number + offset);
+            int error_code = 0;
+            if (create_reserved_file(candidate, &error_code)) {
+                *path = candidate;
+                return true;
+            }
+            if (error_code != EEXIST) {
+                *error = "could not reserve " + candidate + " (error " +
+                         std::to_string(error_code) + ")";
+                return false;
+            }
+        }
+        *error = "could not find an unused MP4 recording path for " + base_path_;
+        return false;
+    }
+
+    void discard_unstarted_segment(const std::string& path) {
+        if (format_) {
+            if (format_->pb) {
+                avio_closep(&format_->pb);
+            }
+            avformat_free_context(format_);
+            format_ = nullptr;
+            stream_ = nullptr;
+        }
+        remove_reserved_file(path);
+    }
+
     bool start(const chast::FrameHeader& header, const uint8_t* data, size_t size,
                std::string* error) {
         codec_ = header.codec;
@@ -204,15 +274,20 @@ private:
         // frame header carries; the announced size is only a sanity check.
         width_ = header.width;
         height_ = header.height;
-        const std::string path = segment_path();
+        std::string path;
+        if (!reserve_segment_path(&path, error)) {
+            return false;
+        }
         if (avformat_alloc_output_context2(&format_, nullptr, "mp4", path.c_str()) < 0 ||
             !format_) {
             *error = "could not create the MP4 muxer for " + path;
+            discard_unstarted_segment(path);
             return false;
         }
         stream_ = avformat_new_stream(format_, nullptr);
         if (!stream_) {
             *error = "could not create the MP4 video stream";
+            discard_unstarted_segment(path);
             return false;
         }
         stream_->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
@@ -239,24 +314,27 @@ private:
             stream_->codecpar->chroma_location = AVCHROMA_LOC_LEFT;
         }
         if (!extradata.empty()) {
-        stream_->codecpar->extradata =
-            static_cast<uint8_t*>(av_malloc(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
-        if (!stream_->codecpar->extradata) {
-            *error = "out of memory for the decoder configuration record";
-            return false;
-        }
-        std::memcpy(stream_->codecpar->extradata, extradata.data(), extradata.size());
-        std::memset(stream_->codecpar->extradata + extradata.size(), 0,
-                    AV_INPUT_BUFFER_PADDING_SIZE);
-        stream_->codecpar->extradata_size = static_cast<int>(extradata.size());
+            stream_->codecpar->extradata =
+                static_cast<uint8_t*>(av_malloc(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!stream_->codecpar->extradata) {
+                *error = "out of memory for the decoder configuration record";
+                discard_unstarted_segment(path);
+                return false;
+            }
+            std::memcpy(stream_->codecpar->extradata, extradata.data(), extradata.size());
+            std::memset(stream_->codecpar->extradata + extradata.size(), 0,
+                        AV_INPUT_BUFFER_PADDING_SIZE);
+            stream_->codecpar->extradata_size = static_cast<int>(extradata.size());
         }
         stream_->time_base = AVRational{1, 1000};
         if (avio_open(&format_->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) {
             *error = "could not open " + path + " for writing";
+            discard_unstarted_segment(path);
             return false;
         }
         if (avformat_write_header(format_, nullptr) < 0) {
             *error = "could not write the MP4 header to " + path;
+            discard_unstarted_segment(path);
             return false;
         }
         segments_.push_back(path);
@@ -297,16 +375,20 @@ private:
         header_started_ = false;
     }
 
-    // base_path_ for the first segment, then -2, -3… before the extension:
-    // out.mp4, out-2.mp4, out-3.mp4.
-    std::string segment_path() const {
-        if (segments_.empty()) {
+    // Segment 1 uses base_path_; later segments add their number before the
+    // extension. A conflicting name advances to the next available number.
+    std::string segment_path(size_t number) const {
+        if (number == 1) {
             return base_path_;
         }
-        const size_t dot = base_path_.find_last_of('.');
+        const size_t separator = base_path_.find_last_of("/\\");
+        size_t dot = base_path_.find_last_of('.');
+        if (dot != std::string::npos && separator != std::string::npos && dot < separator) {
+            dot = std::string::npos;
+        }
         const std::string stem = dot == std::string::npos ? base_path_ : base_path_.substr(0, dot);
         const std::string ext = dot == std::string::npos ? std::string() : base_path_.substr(dot);
-        return stem + "-" + std::to_string(segments_.size() + 1) + ext;
+        return stem + "-" + std::to_string(number) + ext;
     }
 
     void write_packet(const chast::FrameHeader& header, const uint8_t* data, size_t size) {
