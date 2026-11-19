@@ -1028,6 +1028,32 @@ void write_native_input_trace(NativeInputTrace& trace, const InputEvent& event) 
     trace.stream.flush();
 }
 
+void write_native_release_trace(NativeInputTrace& trace, const char* stage) {
+    std::lock_guard lock(trace.mutex);
+    trace.stream << "{\"at_ms\":" << GetTickCount64()
+                 << ",\"kind\":\"release_control\",\"stage\":\"" << stage
+                 << "\"}\n";
+    trace.stream.flush();
+}
+
+void write_native_injected_input_trace(NativeInputTrace& trace, const INPUT& input) {
+    std::lock_guard lock(trace.mutex);
+    trace.stream << "{\"at_ms\":" << GetTickCount64()
+                 << ",\"kind\":\"injected\",\"input_type\":" << input.type;
+    if (input.type == INPUT_KEYBOARD) {
+        trace.stream << ",\"virtual_key\":" << input.ki.wVk
+                     << ",\"scan_code\":" << input.ki.wScan
+                     << ",\"flags\":" << input.ki.dwFlags;
+    } else if (input.type == INPUT_MOUSE) {
+        trace.stream << ",\"mouse_flags\":" << input.mi.dwFlags
+                     << ",\"mouse_data\":" << input.mi.mouseData
+                     << ",\"x\":" << input.mi.dx
+                     << ",\"y\":" << input.mi.dy;
+    }
+    trace.stream << "}\n";
+    trace.stream.flush();
+}
+
 void start_server() {
     if (g_app->server) {
         return;
@@ -1066,6 +1092,12 @@ void start_server() {
             if (trace->stream) {
                 config.input_event = [trace](const InputEvent& event) {
                     write_native_input_trace(*trace, event);
+                };
+                config.input_release_trace = [trace](const char* stage) {
+                    write_native_release_trace(*trace, stage);
+                };
+                config.dry_run_input_observer = [trace](const INPUT& input) {
+                    write_native_injected_input_trace(*trace, input);
                 };
             }
         }

@@ -2230,11 +2230,16 @@ int native_clipboard_probe() {
     return result;
 }
 
-int host_recording_probe() {
+int host_recording_probe(bool viewer_session_isolation = false) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const auto root = probe_scratch_root() / ("chast-host-recording-probe-" +
-        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
+    const std::string probe_name =
+        (viewer_session_isolation ? "chast-viewer-session-isolation-probe-"
+                                  : "chast-host-recording-probe-") +
+        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());
+    const fs::path root = probe_scratch_root() / probe_name;
     const auto recordings = root / L"录像 archive";
+    const auto first_viewer_recordings = root / L"viewer-a";
+    const auto second_viewer_recordings = root / L"viewer-b";
     std::string error;
     ProbeSink first_sink, second_sink;
     std::unique_ptr<chast::HostServer> host;
@@ -2247,8 +2252,15 @@ int host_recording_probe() {
         require(first_sink.create(&error) && second_sink.create(&error), error);
         const auto port = pick_free_port();
         require(port != 0, "no loopback port");
+        std::function<void(chast::HostServerConfig&)> configure;
+        if (viewer_session_isolation) {
+            configure = [](chast::HostServerConfig& config) {
+                config.settings.allow_record = true;
+            };
+        }
         host = start_host(utf8(root / "share"), port, &error, false, {}, {}, {},
-                         chast::ClipboardDirection::Disabled, {}, utf8(recordings));
+                         chast::ClipboardDirection::Disabled, {}, utf8(recordings),
+                         std::move(configure));
         require(host != nullptr, error);
         const auto connect = [&](ProbeSink& sink) {
             auto viewer = std::make_unique<chast_viewer::ViewerEngine>(&sink);
@@ -2260,6 +2272,11 @@ int host_recording_probe() {
         };
         first = connect(first_sink);
         second = connect(second_sink);
+        if (viewer_session_isolation) {
+            require(wait_permission(*first, chast::kPermissionRecord, 5s) &&
+                        wait_permission(*second, chast::kPermissionRecord, 5s),
+                    "both viewers receive local-recording consent");
+        }
         const auto wait_frames = [&](auto& viewer, uint64_t previous) {
             const auto until = std::chrono::steady_clock::now() + 10s;
             while (std::chrono::steady_clock::now() < until) {
@@ -2270,8 +2287,43 @@ int host_recording_probe() {
             return false;
         };
         require(wait_frames(*first, 0) && wait_frames(*second, 0), "both viewers receive encoded video");
-        require(!first->Snapshot().recording && !second->Snapshot().recording,
-                "viewer-side recorders remain off");
+        const chast::VideoCodec recording_codec = first->Snapshot().codec;
+        require(second->Snapshot().codec == recording_codec,
+                "viewers of one source negotiate the same recording codec");
+        if (viewer_session_isolation) {
+            require(first->SetAudioProcessing(false, true) &&
+                        second->SetAudioProcessing(true, false),
+                    "each viewer accepts its own audio-processing choices");
+            require(first->Snapshot().audio_aec == false &&
+                        first->Snapshot().audio_noise_suppression == true &&
+                        second->Snapshot().audio_aec == true &&
+                        second->Snapshot().audio_noise_suppression == false,
+                    "audio-processing state is isolated by viewer engine");
+
+            require(first->SetRecording(true, utf8(first_viewer_recordings)) &&
+                        second->SetRecording(true, utf8(second_viewer_recordings)),
+                    "each viewer starts its own local recorder");
+            const auto recording_deadline = std::chrono::steady_clock::now() + 10s;
+            while (std::chrono::steady_clock::now() < recording_deadline &&
+                   (!first->Snapshot().recording || !second->Snapshot().recording)) {
+                std::this_thread::sleep_for(20ms);
+            }
+            require(first->Snapshot().recording && second->Snapshot().recording,
+                    "both session-local recorders become active");
+            std::this_thread::sleep_for(1200ms);
+            require(first->SetRecording(false), "the first viewer stops only its recorder");
+            const auto stop_deadline = std::chrono::steady_clock::now() + 5s;
+            while (std::chrono::steady_clock::now() < stop_deadline &&
+                   first->Snapshot().recording) {
+                std::this_thread::sleep_for(20ms);
+            }
+            require(!first->Snapshot().recording && second->Snapshot().recording &&
+                        second->Snapshot().state == chast_viewer::ViewerState::kStreaming,
+                    "stopping one viewer leaves the other stream and recorder active");
+        } else {
+            require(!first->Snapshot().recording && !second->Snapshot().recording,
+                    "viewer-side recorders remain off");
+        }
         first->Stop(); first.reset();
         const auto before = second->Snapshot().received;
         require(wait_frames(*second, before), "remaining viewer survives the first viewer leaving");
@@ -2284,14 +2336,40 @@ int host_recording_probe() {
         for (const auto& entry : fs::recursive_directory_iterator(recordings)) {
             if (entry.path().extension() != ".mp4") continue;
             uint64_t samples = 0, keys = 0;
-            require(chast_tools::Mp4Recorder::verify(utf8(entry.path()), chast::VideoCodec::H264,
-                        &samples, &keys, &error) && keys > 0, "cannot reopen host recording: " + error);
+            const bool valid = chast_tools::Mp4Recorder::verify(
+                utf8(entry.path()), recording_codec, &samples, &keys, &error);
+            require(valid && keys > 0, "cannot reopen host recording: " + error);
             std::printf("host-recording-probe: %s samples=%llu keys=%llu\n", utf8(entry.path()).c_str(),
                 static_cast<unsigned long long>(samples), static_cast<unsigned long long>(keys));
             ++files;
         }
         require(files == 1, "stable shared stream should produce exactly one finished MP4");
-        std::puts("host-recording-probe: PASS real QUIC + Auto encoder, two viewers, publisher departure, final save and Unicode folder");
+        if (viewer_session_isolation) {
+            const auto verify_viewer_recording = [&](const fs::path& directory,
+                                                      const char* label) {
+                size_t viewer_files = 0;
+                for (const auto& entry : fs::recursive_directory_iterator(directory)) {
+                    if (entry.path().extension() != ".mp4") continue;
+                    uint64_t samples = 0, keys = 0;
+                    const bool valid = chast_tools::Mp4Recorder::verify(
+                        utf8(entry.path()), recording_codec, &samples, &keys, &error);
+                    require(valid && samples > 0 && keys > 0,
+                            std::string(label) + " recording is not a playable MP4: " + error);
+                    std::printf("viewer-session-isolation: %s %s samples=%llu keys=%llu\n",
+                                label, utf8(entry.path()).c_str(),
+                                static_cast<unsigned long long>(samples),
+                                static_cast<unsigned long long>(keys));
+                    ++viewer_files;
+                }
+                require(viewer_files == 1,
+                        std::string(label) + " must own exactly one recording file");
+            };
+            verify_viewer_recording(first_viewer_recordings, "viewer-a");
+            verify_viewer_recording(second_viewer_recordings, "viewer-b");
+            std::puts("viewer-session-isolation: PASS two loopback sessions kept audio preferences and local recordings separate");
+        } else {
+            std::puts("host-recording-probe: PASS real QUIC + Auto encoder, two viewers, publisher departure, final save and Unicode folder");
+        }
         ok = true;
     } catch (const std::exception& exception) {
         std::fprintf(stderr, "host-recording-probe: FAIL %s\n", exception.what());
@@ -3735,6 +3813,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--elevation") return elevation_probe();
     if (argc == 2 && std::string(argv[1]) == "--clipboard-native") return native_clipboard_probe();
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
+    if (argc == 2 && std::string(argv[1]) == "--viewer-session-isolation")
+        return host_recording_probe(true);
     if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();
     if (argc == 2 && std::string(argv[1]) == "--file-conflict") return file_conflict_probe();
     if (argc == 2 && std::string(argv[1]) == "--directory-upload") return directory_upload_probe();

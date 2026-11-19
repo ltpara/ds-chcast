@@ -22,6 +22,7 @@ func TestSettingsRejectAmbiguousAndInvalidInput(t *testing.T) {
 		`{"host.max_viewers":{"mode":"locked","value":1e0}}`,
 		`{"host.auto_disconnect_minutes":{"mode":"locked","value":-1}}`,
 		`{"viewer.tunnel_mode":{"mode":"locked","value":"proxy"}}`,
+		`{"viewer.default_view_only":{"mode":"locked","value":"yes"}}`,
 		`{"host.password":{"mode":"locked","value":"secret"}}`,
 	} {
 		t.Run(raw, func(t *testing.T) {
@@ -39,7 +40,7 @@ func TestSettingsRejectAmbiguousAndInvalidInput(t *testing.T) {
 
 func TestSettingsCanonicalCopyAndTargetIsolation(t *testing.T) {
 	var settings Settings
-	if err := json.Unmarshal([]byte(`{"viewer.tunnel_mode":{"value":"relay","mode":"locked"},"host.keep_awake":{"value":false,"mode":"default"}}`), &settings); err != nil {
+	if err := json.Unmarshal([]byte(`{"viewer.tunnel_mode":{"value":"relay","mode":"locked"},"viewer.default_view_only":{"value":true,"mode":"default"},"host.keep_awake":{"value":false,"mode":"default"}}`), &settings); err != nil {
 		t.Fatal(err)
 	}
 	host, err := ForTarget(settings, Host)
@@ -49,6 +50,14 @@ func TestSettingsCanonicalCopyAndTargetIsolation(t *testing.T) {
 	encoded, err := Encode(host)
 	if err != nil || encoded != `{"host.keep_awake":{"mode":"default","value":false}}` {
 		t.Fatalf("host = %s %v", encoded, err)
+	}
+	viewer, err := ForTarget(settings, Viewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err = Encode(viewer)
+	if err != nil || encoded != `{"viewer.default_view_only":{"mode":"default","value":true},"viewer.tunnel_mode":{"mode":"locked","value":"relay"}}` {
+		t.Fatalf("viewer = %s %v", encoded, err)
 	}
 	host["host.keep_awake"].Value[0] = 'x'
 	if string(settings["host.keep_awake"].Value) != "false" {

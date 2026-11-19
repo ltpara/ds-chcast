@@ -2092,6 +2092,7 @@
     'viewer.upload_recordings': '查看端：自动上传录制',
     'viewer.sync_initial_clipboard': '查看端：连接时同步剪贴板',
     'viewer.view_fit': '查看端：画面大小',
+    'viewer.default_view_only': '查看端：新会话默认仅查看',
   };
   const strategyStatusLabels = {
     applied: '已应用', pending_restart: '待重启', pending_session: '下次会话生效',

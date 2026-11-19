@@ -13,7 +13,9 @@
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
  public:
-  using OpenDisplayWindow = std::function<bool(std::shared_ptr<chast_viewer::SharedViewerSession>, uint32_t, const std::string&, uint32_t)>;
+  using OpenDisplayWindow = std::function<bool(
+      std::shared_ptr<chast_viewer::SharedViewerSession>, uint32_t,
+      const std::string&, uint32_t, RECT, RECT, uint32_t)>;
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project,
                          std::function<bool(const std::string&)> open_window = {},
@@ -25,6 +27,7 @@ class FlutterWindow : public Win32Window {
   // Runs once when the user (or Dart) closes this window, before the HWND is
   // destroyed, so the runner can still read its final bounds.
   void SetCloseHook(std::function<void(HWND)> hook);
+  void SetDisplayTopologyHook(std::function<bool(HWND)> hook);
 
  protected:
   // Win32Window:
@@ -43,6 +46,9 @@ class FlutterWindow : public Win32Window {
   std::shared_ptr<chast_viewer::SharedViewerSession> session_;
   std::optional<uint32_t> stream_;
   std::function<void(HWND)> close_hook_;
+  std::function<bool(HWND)> display_topology_hook_;
+  UINT display_topology_retries_ = 0;
+  UINT_PTR display_topology_timer_ = 0;
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;

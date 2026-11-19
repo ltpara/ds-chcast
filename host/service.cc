@@ -12,9 +12,15 @@
 #include <vector>
 
 #include "chast/host_settings.h"
+#include "chast/machine_state_security.h"
+#include "file_snapshot.h"
 #include "platform.h"
+#include "rollback_stack.h"
+#include "service_install.h"
 #include "service_log.h"
 #include "service_manager_startup.h"
+#include "service_stop.h"
+#include "service_uninstall.h"
 #include "windows_sessions.h"
 
 namespace chast::host {
@@ -88,7 +94,7 @@ bool wait_for_state(SC_HANDLE service, DWORD desired, DWORD timeout_ms) {
         if (status.dwCurrentState == desired) {
             return true;
         }
-        if (desired == SERVICE_RUNNING && status.dwCurrentState == SERVICE_STOPPED) {
+        if (desired != SERVICE_STOPPED && status.dwCurrentState == SERVICE_STOPPED) {
             return false;
         }
         if (GetTickCount64() >= deadline) {
@@ -96,6 +102,190 @@ bool wait_for_state(SC_HANDLE service, DWORD desired, DWORD timeout_ms) {
         }
         Sleep(200);
     }
+}
+
+class ServiceConfigSnapshot {
+public:
+    DWORD capture(SC_HANDLE service) {
+        DWORD bytes = 0;
+        SetLastError(ERROR_SUCCESS);
+        if (QueryServiceConfigW(service, nullptr, 0, &bytes)) return ERROR_INVALID_DATA;
+        const DWORD query_error = GetLastError();
+        if (query_error != ERROR_INSUFFICIENT_BUFFER || bytes == 0) {
+            return query_error;
+        }
+        std::vector<BYTE> buffer(bytes);
+        auto* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
+        if (!QueryServiceConfigW(service, config, bytes, &bytes)) return GetLastError();
+        if (config->lpBinaryPathName == nullptr) return ERROR_INVALID_DATA;
+        start_type_ = config->dwStartType;
+        binary_path_ = config->lpBinaryPathName;
+        captured_ = true;
+        return ERROR_SUCCESS;
+    }
+
+    bool matches_target_configuration(const std::wstring& binary_path) const {
+        return captured_ && detail::service_configuration_matches_target(
+                                start_type_, binary_path_, SERVICE_AUTO_START, binary_path);
+    }
+
+    DWORD capture_runtime_configuration(SC_HANDLE service) {
+        DWORD error = query_config2(service, SERVICE_CONFIG_DESCRIPTION, description_buffer_);
+        if (error != ERROR_SUCCESS) return error;
+        const auto* description = reinterpret_cast<const SERVICE_DESCRIPTIONW*>(
+            description_buffer_.data());
+        description_ = description->lpDescription == nullptr ? L"" : description->lpDescription;
+
+        error = query_config2(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                              delayed_buffer_);
+        if (error != ERROR_SUCCESS) return error;
+        delayed_start_ = reinterpret_cast<const SERVICE_DELAYED_AUTO_START_INFO*>(
+                             delayed_buffer_.data())
+                             ->fDelayedAutostart;
+
+        error = query_config2(service, SERVICE_CONFIG_FAILURE_ACTIONS, failure_buffer_);
+        if (error != ERROR_SUCCESS) return error;
+        const auto* failure = reinterpret_cast<const SERVICE_FAILURE_ACTIONSW*>(
+            failure_buffer_.data());
+        reset_period_ = failure->dwResetPeriod;
+        reboot_message_ = failure->lpRebootMsg == nullptr ? L"" : failure->lpRebootMsg;
+        command_ = failure->lpCommand == nullptr ? L"" : failure->lpCommand;
+        if (failure->cActions > 0 && failure->lpsaActions == nullptr) {
+            return ERROR_INVALID_DATA;
+        }
+        if (failure->cActions > 0) {
+            actions_.assign(failure->lpsaActions,
+                            failure->lpsaActions + failure->cActions);
+        }
+        runtime_captured_ = true;
+        return ERROR_SUCCESS;
+    }
+
+    DWORD restore(SC_HANDLE service) const {
+        if (!captured_) return ERROR_INVALID_STATE;
+        if (!ChangeServiceConfigW(service, SERVICE_NO_CHANGE, start_type_, SERVICE_NO_CHANGE,
+                                  binary_path_.c_str(), nullptr, nullptr, nullptr, nullptr,
+                                  nullptr, nullptr)) {
+            return GetLastError();
+        }
+        return ERROR_SUCCESS;
+    }
+
+    DWORD restore_runtime_configuration(SC_HANDLE service) const {
+        if (!runtime_captured_) return ERROR_INVALID_STATE;
+        SERVICE_DESCRIPTIONW description{};
+        description.lpDescription = const_cast<LPWSTR>(description_.c_str());
+        if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description)) {
+            return GetLastError();
+        }
+        SERVICE_DELAYED_AUTO_START_INFO delayed{};
+        delayed.fDelayedAutostart = delayed_start_;
+        if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed)) {
+            return GetLastError();
+        }
+        SERVICE_FAILURE_ACTIONSW failure{};
+        failure.dwResetPeriod = reset_period_;
+        failure.lpRebootMsg = reboot_message_.empty()
+                                  ? nullptr
+                                  : const_cast<LPWSTR>(reboot_message_.c_str());
+        failure.lpCommand = command_.empty() ? nullptr : const_cast<LPWSTR>(command_.c_str());
+        failure.cActions = static_cast<DWORD>(actions_.size());
+        failure.lpsaActions = actions_.empty()
+                                  ? nullptr
+                                  : const_cast<SC_ACTION*>(actions_.data());
+        return ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure)
+                   ? ERROR_SUCCESS
+                   : GetLastError();
+    }
+
+    bool runtime_captured() const { return runtime_captured_; }
+
+private:
+    static DWORD query_config2(SC_HANDLE service, DWORD level, std::vector<BYTE>& buffer) {
+        DWORD bytes = 0;
+        SetLastError(ERROR_SUCCESS);
+        if (QueryServiceConfig2W(service, level, nullptr, 0, &bytes)) return ERROR_INVALID_DATA;
+        const DWORD query_error = GetLastError();
+        if (query_error != ERROR_INSUFFICIENT_BUFFER || bytes == 0) return query_error;
+        buffer.resize(bytes);
+        return QueryServiceConfig2W(service, level, buffer.data(), bytes, &bytes)
+                   ? ERROR_SUCCESS
+                   : GetLastError();
+    }
+
+    DWORD start_type_ = SERVICE_DEMAND_START;
+    std::wstring binary_path_;
+    bool captured_ = false;
+    std::vector<BYTE> description_buffer_;
+    std::vector<BYTE> delayed_buffer_;
+    std::vector<BYTE> failure_buffer_;
+    std::wstring description_;
+    std::wstring reboot_message_;
+    std::wstring command_;
+    DWORD delayed_start_ = FALSE;
+    DWORD reset_period_ = INFINITE;
+    std::vector<SC_ACTION> actions_;
+    bool runtime_captured_ = false;
+};
+
+DWORD stop_service_if_running(SC_HANDLE service) {
+    return detail::stop_service_until_stopped(
+        30000,
+        [service](DWORD* state) -> DWORD {
+            SERVICE_STATUS status{};
+            if (!QueryServiceStatus(service, &status)) return GetLastError();
+            *state = status.dwCurrentState;
+            return ERROR_SUCCESS;
+        },
+        [service]() -> DWORD {
+            SERVICE_STATUS ignored{};
+            return ControlService(service, SERVICE_CONTROL_STOP, &ignored)
+                       ? ERROR_SUCCESS
+                       : GetLastError();
+        },
+        [] { return GetTickCount64(); },
+        [](DWORD delay) { Sleep(delay); });
+}
+
+DWORD restore_service_state(SC_HANDLE service, DWORD previous_state) {
+    return detail::restore_service_state_after_stop(
+        previous_state,
+        [service](DWORD* state) -> DWORD {
+            SERVICE_STATUS status{};
+            if (!QueryServiceStatus(service, &status)) return GetLastError();
+            *state = status.dwCurrentState;
+            return ERROR_SUCCESS;
+        },
+        [service]() -> DWORD {
+            if (StartServiceW(service, 0, nullptr)) return ERROR_SUCCESS;
+            const DWORD error = GetLastError();
+            return error == ERROR_SERVICE_ALREADY_RUNNING ? ERROR_SUCCESS : error;
+        },
+        [service](DWORD desired, DWORD timeout) {
+            return wait_for_state(service, desired, timeout);
+        },
+        [service] {
+            SERVICE_STATUS ignored{};
+            return ControlService(service, SERVICE_CONTROL_CONTINUE, &ignored)
+                       ? ERROR_SUCCESS
+                       : GetLastError();
+        },
+        [service] {
+            SERVICE_STATUS ignored{};
+            return ControlService(service, SERVICE_CONTROL_PAUSE, &ignored)
+                       ? ERROR_SUCCESS
+                       : GetLastError();
+        });
+}
+
+DWORD delete_created_service(SC_HANDLE service) {
+    const DWORD stopped = stop_service_if_running(service);
+    if (stopped != ERROR_SUCCESS) return stopped;
+    if (!DeleteService(service)) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_SERVICE_MARKED_FOR_DELETE) return error;
+    }
+    return ERROR_SUCCESS;
 }
 
 uint16_t tunnel_port_of(const HostSettings& settings) {
@@ -350,6 +540,13 @@ void service_main(DWORD argc, LPWSTR* argv) {
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwCheckPoint = 0;
     report_status(SERVICE_START_PENDING, NO_ERROR, 30000);
+    std::string state_error;
+    if (!harden_machine_state_directory(widen(machine_settings_directory()), &state_error) ||
+        !harden_machine_state_file(widen(machine_settings_path()), &state_error)) {
+        OutputDebugStringA(("chast-service: machine state security failed: " + state_error + "\n").c_str());
+        report_status(SERVICE_STOPPED, ERROR_ACCESS_DENIED);
+        return;
+    }
     g_log_path = service_log_path("service.log");
     log_event(g_log_path, "service.start");
 
@@ -367,11 +564,15 @@ void service_main(DWORD argc, LPWSTR* argv) {
         log_event(g_log_path, "settings.warning", {{"text", settings_warning}});
     }
 
-    const int firewall = apply_firewall_rule(settings.port, tunnel_port_of(settings));
+    int firewall_rollback = 0;
+    const int firewall = apply_firewall_rule(settings.port, tunnel_port_of(settings),
+                                             &firewall_rollback);
     if (firewall == 0) {
         log_event(g_log_path, "firewall.applied");
     } else {
-        log_event(g_log_path, "firewall.failed", {{"error", std::to_string(firewall)}});
+        log_event(g_log_path, "firewall.failed",
+                  {{"error", std::to_string(firewall)},
+                   {"rollback_error", std::to_string(firewall_rollback)}});
     }
 
     g_service_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -570,13 +771,24 @@ bool service_running() {
 }
 
 bool load_machine_settings(HostSettings& settings, std::string* path, std::string* warning,
-                           std::string* error) {
+                           std::string* error, bool persist_changes, bool* changed_out) {
+    if (changed_out != nullptr) *changed_out = false;
     const std::string file = machine_settings_path();
     if (path != nullptr) {
         *path = file;
     }
     if (warning != nullptr) {
         warning->clear();
+    }
+    if (!file.empty()) {
+        std::string security_error;
+        if (!machine_state_directory_trusted(widen(machine_settings_directory()), &security_error) ||
+            !machine_state_file_trusted(widen(file), &security_error)) {
+            if (error != nullptr) {
+                *error = "机器设置目录或文件不可信：" + security_error;
+            }
+            return false;
+        }
     }
     bool changed = false;
     if (file.empty()) {
@@ -591,13 +803,14 @@ bool load_machine_settings(HostSettings& settings, std::string* path, std::strin
         changed = !loaded.existed;
     }
     fill_machine_identity(settings, &changed);
+    if (changed_out != nullptr) *changed_out = changed;
     if (file.empty()) {
         if (error != nullptr) {
             *error = "无法确定 %ProgramData%\\chast 的位置";
         }
         return false;
     }
-    if (!changed) {
+    if (!changed || !persist_changes) {
         return true;
     }
     std::string save_error;
@@ -621,54 +834,153 @@ int install_service(std::string* error) {
         *error = "安装服务需要同目录下的 chast-host.exe，用于用户登录后的连接管理与审批";
         return 1;
     }
-    HostSettings settings;
-    if (!load_machine_settings(settings, nullptr, nullptr, error)) {
-        return 1;
-    }
-
-    const int firewall = apply_firewall_rule(settings.port, tunnel_port_of(settings));
-    if (firewall != 0) {
-        *error = "防火墙规则添加失败（netsh 退出码 " + std::to_string(firewall) + "）";
-        return 1;
-    }
-
     SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (manager == nullptr) {
         *error = "无法打开服务管理器（错误 " + std::to_string(GetLastError()) + "）";
         return 1;
     }
+
+    SC_HANDLE service = nullptr;
+    detail::FileSnapshot settings_snapshot;
+    FirewallRuleUpdate firewall_update;
+    detail::RollbackStack rollback;
+    const auto close_handles = [&] {
+        if (service != nullptr) {
+            CloseServiceHandle(service);
+            service = nullptr;
+        }
+        if (manager != nullptr) {
+            CloseServiceHandle(manager);
+            manager = nullptr;
+        }
+    };
+    const auto fail = [&](std::string message) {
+        if (error != nullptr) *error = std::move(message);
+        const int rollback_error = rollback.rollback();
+        if (error != nullptr && rollback_error != 0) {
+            *error += "；回滚也失败（错误 " + std::to_string(rollback_error) + "）";
+        }
+        close_handles();
+        return 1;
+    };
+
     const std::wstring command = L"\"" + executable_path() + L"\" --run";
-    SC_HANDLE service = CreateServiceW(
+    DWORD initial_service_state = SERVICE_STOPPED;
+    bool existing_service = false;
+    bool service_config_changed = false;
+    ServiceConfigSnapshot previous_config;
+    service = CreateServiceW(
         manager, kServiceName, L"chast 主机服务", SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, command.c_str(), nullptr, nullptr, nullptr,
         nullptr, nullptr);
-    if (service == nullptr) {
+    if (service != nullptr) {
+        rollback.push([service] { return delete_created_service(service); });
+    } else {
         const DWORD created_error = GetLastError();
         if (created_error != ERROR_SERVICE_EXISTS) {
-            *error = "创建服务失败（错误 " + std::to_string(created_error) + "）";
-            CloseServiceHandle(manager);
-            return 1;
+            return fail("创建服务失败（错误 " + std::to_string(created_error) + "）");
         }
         service = OpenServiceW(manager, kServiceName,
-                               SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS);
-        if (service == nullptr ||
+                               SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS |
+                                   SERVICE_QUERY_CONFIG | SERVICE_STOP);
+        if (service == nullptr) {
+            return fail("无法打开现有服务（错误 " + std::to_string(GetLastError()) + "）");
+        }
+        existing_service = true;
+        SERVICE_STATUS before_config{};
+        if (!QueryServiceStatus(service, &before_config)) {
+            return fail("无法读取现有服务状态（错误 " + std::to_string(GetLastError()) + "）");
+        }
+        initial_service_state = before_config.dwCurrentState;
+        const DWORD config_error = previous_config.capture(service);
+        if (config_error != ERROR_SUCCESS) {
+            return fail("无法保存现有服务配置（错误 " +
+                        std::to_string(config_error) + "）");
+        }
+        const DWORD runtime_config_error =
+            previous_config.capture_runtime_configuration(service);
+        if (runtime_config_error != ERROR_SUCCESS) {
+            return fail("无法保存现有服务启动策略（错误 " +
+                        std::to_string(runtime_config_error) + "）");
+        }
+        if (!detail::supported_existing_service_install_state(initial_service_state)) {
+            return fail("现有服务处于启动、停止、暂停或其他过渡状态，拒绝更新");
+        }
+        service_config_changed = !previous_config.matches_target_configuration(command);
+    }
+
+    const std::string settings_file = machine_settings_path();
+    if (settings_file.empty()) {
+        return fail("无法确定 %ProgramData%\\chast 的位置");
+    }
+    std::string state_security_error;
+    if (!harden_machine_state_directory(widen(machine_settings_directory()),
+                                        &state_security_error) ||
+        !harden_machine_state_file(widen(settings_file), &state_security_error)) {
+        return fail("无法保护机器设置目录：" + state_security_error);
+    }
+    const DWORD settings_snapshot_error = settings_snapshot.capture(widen(settings_file));
+    if (settings_snapshot_error != ERROR_SUCCESS) {
+        return fail("无法读取现有机器配置（错误 " +
+                    std::to_string(settings_snapshot_error) + "）");
+    }
+
+    HostSettings settings;
+    bool settings_changed = false;
+    if (!load_machine_settings(settings, nullptr, nullptr, error, false, &settings_changed)) {
+        return fail(error == nullptr ? "无法准备机器配置" : *error);
+    }
+
+    if (existing_service) {
+        const DWORD stop_error = detail::prepare_existing_service_for_update(
+            initial_service_state, service_config_changed, settings_changed, rollback,
+            [service] { return stop_service_if_running(service); },
+            [service](DWORD state) { return restore_service_state(service, state); });
+        if (stop_error != ERROR_SUCCESS) {
+            return fail("停止现有服务以更新安装失败（错误 " +
+                        std::to_string(stop_error) + "）");
+        }
+        rollback.push([&previous_config, service] {
+            return static_cast<int>(previous_config.restore_runtime_configuration(service));
+        });
+        rollback.push([&previous_config, service] { return previous_config.restore(service); });
+        if (service_config_changed &&
             !ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_AUTO_START,
                                   SERVICE_NO_CHANGE, command.c_str(), nullptr, nullptr, nullptr,
                                   nullptr, nullptr, nullptr)) {
-            *error = "更新现有服务失败（错误 " + std::to_string(GetLastError()) + "）";
-            if (service != nullptr) {
-                CloseServiceHandle(service);
-            }
-            CloseServiceHandle(manager);
-            return 1;
+            return fail("更新现有服务失败（错误 " + std::to_string(GetLastError()) + "）");
         }
     }
+
+    if (settings_changed) {
+        std::string save_error;
+        const bool saved = detail::save_settings_with_rollback(
+            rollback,
+            [&] { return save_host_settings(settings_file, settings, &save_error); },
+            [&settings_snapshot] { return settings_snapshot.restore(); });
+        if (!saved) {
+            return fail("无法保存 " + settings_file + "：" + save_error);
+        }
+    }
+
+    int firewall_rollback = 0;
+    const int firewall = firewall_update.apply(settings.port, tunnel_port_of(settings),
+                                               &firewall_rollback);
+    if (firewall != 0) {
+        std::string message = firewall == ERROR_ALREADY_EXISTS
+                                 ? "同名防火墙规则指向其他程序，已拒绝修改"
+                                 : "防火墙规则操作失败（代码 " + std::to_string(firewall) + "）";
+        if (firewall_rollback != 0) {
+            message += "；规则回滚失败（代码 " + std::to_string(firewall_rollback) + "）";
+        }
+        return fail(std::move(message));
+    }
+    rollback.push([&firewall_update] { return firewall_update.rollback(); });
+
     SERVICE_DESCRIPTIONW description{};
     description.lpDescription = const_cast<LPWSTR>(kServiceDescription);
-    (void)ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description);
     SERVICE_DELAYED_AUTO_START_INFO delayed{};
     delayed.fDelayedAutostart = TRUE;
-    (void)ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
     SC_ACTION actions[3] = {{SC_ACTION_RESTART, 5000},
                             {SC_ACTION_RESTART, 10000},
                             {SC_ACTION_RESTART, 30000}};
@@ -676,25 +988,46 @@ int install_service(std::string* error) {
     failures.dwResetPeriod = 3600;
     failures.cActions = 3;
     failures.lpsaActions = actions;
-    (void)ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failures);
+    const DWORD runtime_config_apply = detail::apply_service_runtime_configuration(
+        [service, &description] {
+            return ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description)
+                       ? ERROR_SUCCESS
+                       : GetLastError();
+        },
+        [service, &delayed] {
+            return ChangeServiceConfig2W(service,
+                                        SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed)
+                       ? ERROR_SUCCESS
+                       : GetLastError();
+        },
+        [service, &failures] {
+            return ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failures)
+                       ? ERROR_SUCCESS
+                       : GetLastError();
+        });
+    if (runtime_config_apply != ERROR_SUCCESS) {
+        return fail("应用服务启动策略失败（错误 " +
+                    std::to_string(runtime_config_apply) + "）");
+    }
 
-    if (!StartServiceW(service, 0, nullptr)) {
-        const DWORD started = GetLastError();
-        if (started != ERROR_SERVICE_ALREADY_RUNNING) {
-            *error = "服务已安装，但启动失败（错误 " + std::to_string(started) + "）";
-            CloseServiceHandle(service);
-            CloseServiceHandle(manager);
-            return 1;
+    const bool start_service = !existing_service || initial_service_state != SERVICE_RUNNING ||
+                               service_config_changed || settings_changed;
+    if (start_service) {
+        if (!StartServiceW(service, 0, nullptr)) {
+            const DWORD started = GetLastError();
+            if (started != ERROR_SERVICE_ALREADY_RUNNING) {
+                return fail("服务已安装，但启动失败（错误 " + std::to_string(started) + "）");
+            }
         }
+        rollback.push([service] { return static_cast<int>(stop_service_if_running(service)); });
     }
     if (!wait_for_state(service, SERVICE_RUNNING, 15000)) {
-        *error = "服务已安装，但没有在 15 秒内进入运行状态";
-        CloseServiceHandle(service);
-        CloseServiceHandle(manager);
-        return 1;
+        return fail("服务已安装，但没有在 15 秒内进入运行状态");
     }
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager);
+
+    firewall_update.commit();
+    rollback.commit();
+    close_handles();
     return 0;
 }
 
@@ -709,7 +1042,9 @@ int uninstall_service(std::string* error) {
         return 1;
     }
     SC_HANDLE service =
-        OpenServiceW(manager, kServiceName, SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+        OpenServiceW(manager, kServiceName,
+                     SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_START |
+                         SERVICE_PAUSE_CONTINUE | DELETE);
     if (service == nullptr) {
         const DWORD opened = GetLastError();
         CloseServiceHandle(manager);
@@ -717,26 +1052,76 @@ int uninstall_service(std::string* error) {
             *error = "无法打开服务（错误 " + std::to_string(opened) + "）";
             return 1;
         }
-        remove_firewall_rules();
-        return 0;
-    }
-    SERVICE_STATUS status{};
-    if (ControlService(service, SERVICE_CONTROL_STOP, &status) ||
-        GetLastError() == ERROR_SERVICE_NOT_ACTIVE) {
-        (void)wait_for_state(service, SERVICE_STOPPED, 30000);
-    }
-    if (!DeleteService(service)) {
-        const DWORD deleted = GetLastError();
-        if (deleted != ERROR_SERVICE_MARKED_FOR_DELETE) {
-            *error = "删除服务失败（错误 " + std::to_string(deleted) + "）";
-            CloseServiceHandle(service);
-            CloseServiceHandle(manager);
+        int rollback_error = 0;
+        const int firewall_error = remove_firewall_rules(&rollback_error);
+        if (firewall_error != 0) {
+            *error = "服务不存在，但防火墙清理命令失败（错误 " +
+                     std::to_string(firewall_error) + "）";
+            if (rollback_error != 0) {
+                *error += "；规则回滚也失败（错误 " + std::to_string(rollback_error) + "）";
+            }
             return 1;
         }
+        return 0;
     }
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager);
-    remove_firewall_rules();
+
+    SERVICE_STATUS previous_status{};
+    if (!QueryServiceStatus(service, &previous_status)) {
+        const DWORD query_error = GetLastError();
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        *error = "无法读取服务状态（错误 " + std::to_string(query_error) + "）";
+        return 1;
+    }
+
+    FirewallRuleUpdate firewall_update;
+    const auto close_handles = [&] {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    };
+    const detail::ServiceUninstallResult result =
+        detail::run_service_uninstall_transaction(
+            previous_status.dwCurrentState,
+            [service] { return stop_service_if_running(service); },
+            [&firewall_update](int* rollback_error) {
+                return firewall_update.clear(rollback_error);
+            },
+            [&firewall_update] { return firewall_update.rollback(); },
+            [service]() -> DWORD {
+                if (DeleteService(service)) return ERROR_SUCCESS;
+                const DWORD error = GetLastError();
+                return error == ERROR_SERVICE_MARKED_FOR_DELETE ? ERROR_SUCCESS : error;
+            },
+            [service](DWORD state) { return restore_service_state(service, state); });
+    if (result.error != ERROR_SUCCESS) {
+        switch (result.stage) {
+            case detail::ServiceUninstallStage::Stop:
+                *error = "停止服务失败，未继续删除服务或清理防火墙规则（错误 " +
+                         std::to_string(result.error) + "）";
+                break;
+            case detail::ServiceUninstallStage::Firewall:
+                *error = "防火墙清理失败（错误 " + std::to_string(result.error) + "）";
+                if (result.firewall_rollback_error != 0) {
+                    *error += "；防火墙回滚也失败（错误 " +
+                              std::to_string(result.firewall_rollback_error) + "）";
+                }
+                break;
+            case detail::ServiceUninstallStage::Delete:
+                *error = "删除服务失败（错误 " + std::to_string(result.error) + "）";
+                break;
+            case detail::ServiceUninstallStage::Complete:
+                *error = "卸载事务返回了不一致状态";
+                break;
+        }
+        if (result.rollback_error != 0) {
+            *error += "；恢复原服务/防火墙状态也失败（错误 " +
+                      std::to_string(result.rollback_error) + "）";
+        }
+        close_handles();
+        return 1;
+    }
+    firewall_update.commit();
+    close_handles();
     return 0;
 }
 

@@ -5,6 +5,7 @@ const String viewerUseWebSocketKey = 'viewer.use_websocket';
 const String viewerUploadRecordingsKey = 'viewer.upload_recordings';
 const String viewerSyncInitialClipboardKey = 'viewer.sync_initial_clipboard';
 const String viewerViewFitKey = 'viewer.view_fit';
+const String viewerDefaultViewOnlyKey = 'viewer.default_view_only';
 
 class ViewerStrategySetting {
   const ViewerStrategySetting({required this.mode, required this.value});
@@ -27,6 +28,7 @@ class ViewerStrategySetting {
       case viewerUseWebSocketKey:
       case viewerUploadRecordingsKey:
       case viewerSyncInitialClipboardKey:
+      case viewerDefaultViewOnlyKey:
         if (value is! bool) {
           return null;
         }
@@ -166,11 +168,13 @@ class ViewerLocalSettings {
     required this.uploadRecordings,
     required this.syncInitialClipboard,
     required this.viewFit,
+    required this.defaultViewOnly,
     this.tunnelModeSet = false,
     this.useWebSocketSet = false,
     this.uploadRecordingsSet = false,
     this.syncInitialClipboardSet = false,
     this.viewFitSet = false,
+    this.defaultViewOnlySet = false,
   });
 
   final TunnelMode tunnelMode;
@@ -178,12 +182,14 @@ class ViewerLocalSettings {
   final bool uploadRecordings;
   final bool syncInitialClipboard;
   final int viewFit;
+  final bool defaultViewOnly;
 
   final bool tunnelModeSet;
   final bool useWebSocketSet;
   final bool uploadRecordingsSet;
   final bool syncInitialClipboardSet;
   final bool viewFitSet;
+  final bool defaultViewOnlySet;
 
   bool isSet(String key) => switch (key) {
     viewerTunnelModeKey => tunnelModeSet,
@@ -191,6 +197,7 @@ class ViewerLocalSettings {
     viewerUploadRecordingsKey => uploadRecordingsSet,
     viewerSyncInitialClipboardKey => syncInitialClipboardSet,
     viewerViewFitKey => viewFitSet,
+    viewerDefaultViewOnlyKey => defaultViewOnlySet,
     _ => false,
   };
 }
@@ -202,6 +209,7 @@ class ViewerEffectiveSettings {
     required this.uploadRecordings,
     required this.syncInitialClipboard,
     required this.viewFit,
+    required this.defaultViewOnly,
     this.unsupportedKeys = const <String>[],
   });
 
@@ -210,6 +218,7 @@ class ViewerEffectiveSettings {
   final bool uploadRecordings;
   final bool syncInitialClipboard;
   final int viewFit;
+  final bool defaultViewOnly;
   final List<String> unsupportedKeys;
 
   static ViewerEffectiveSettings resolve(
@@ -226,6 +235,7 @@ class ViewerEffectiveSettings {
           viewerUploadRecordingsKey,
           viewerSyncInitialClipboardKey,
           viewerViewFitKey,
+          viewerDefaultViewOnlyKey,
         }.contains(key))
           key,
     ]..sort();
@@ -244,6 +254,9 @@ class ViewerEffectiveSettings {
       viewerSyncInitialClipboardKey,
     );
     final ViewerStrategySetting? fit = overridden(viewerViewFitKey);
+    final ViewerStrategySetting? viewOnly = overridden(
+      viewerDefaultViewOnlyKey,
+    );
     return ViewerEffectiveSettings(
       tunnelMode: tunnel == null
           ? local.tunnelMode
@@ -258,8 +271,36 @@ class ViewerEffectiveSettings {
           ? local.syncInitialClipboard
           : clipboard.value as bool,
       viewFit: fit == null ? local.viewFit : fit.value as int,
+      defaultViewOnly: viewOnly == null
+          ? local.defaultViewOnly
+          : viewOnly.value as bool,
       unsupportedKeys: List<String>.unmodifiable(unsupported),
     );
+  }
+}
+
+/// Resolves initial control once per connection. A requested control start
+/// waits for the first desktop frame and the host input gate; later permission
+/// changes cannot turn control back on.
+class ViewerInitialControlPolicy {
+  bool _resolved = false;
+
+  void reset() => _resolved = false;
+
+  bool? resolve({
+    required bool desktop,
+    required bool sessionReady,
+    required bool acceptsInput,
+    required bool defaultViewOnly,
+  }) {
+    if (_resolved || !desktop || !sessionReady) return null;
+    if (defaultViewOnly) {
+      _resolved = true;
+      return false;
+    }
+    if (!acceptsInput) return null;
+    _resolved = true;
+    return true;
   }
 }
 
@@ -274,6 +315,7 @@ Map<String, Object?> viewerStrategyReceipt({
     viewerUploadRecordingsKey,
     viewerSyncInitialClipboardKey,
     viewerViewFitKey,
+    viewerDefaultViewOnlyKey,
   };
   for (final String key in snapshot.settings.keys) {
     results[key] = <String, String>{

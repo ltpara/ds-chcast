@@ -843,9 +843,12 @@ void test_state_directory_security() {
     check(set_users_write_acl(state), "a planted record gets a Users-write DACL");
     check(!chast::read_install_record(&parsed), "the planted record is not trusted");
     check(chast::harden_virtual_display_state_directory(&error),
-          "hardening succeeds over a planted record");
-    check(GetFileAttributesW(state.c_str()) == INVALID_FILE_ATTRIBUTES,
-          "hardening discards a record that other accounts could change");
+          "hardening removes a Users-write grant from a trusted-owner record");
+    check(GetFileAttributesW(state.c_str()) != INVALID_FILE_ATTRIBUTES,
+          "the trusted-owner record is preserved while its DACL is replaced");
+    check(chast::read_install_record(&parsed) && !parsed.owned,
+          "the secured record remains readable after migration");
+    DeleteFileW(state.c_str());
 
     write_bytes(state, chast::virtual_display_install_json(record));
     const std::wstring user_sid = current_user_sid_text();

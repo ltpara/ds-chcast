@@ -1267,6 +1267,8 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_remote_config = settings_.allow_remote_config;
     quic.permission_policy = permission_policy_;
     quic.dry_run_input = config_.dry_run_input;
+    quic.dry_run_input_observer = config_.dry_run_input_observer;
+    quic.input_release_trace = config_.input_release_trace;
     // The one-shot tool reports a refused password instead of waiting for the
     // next viewer; the interactive host keeps listening.
     quic.stop_after_denial = config_.serve_once;

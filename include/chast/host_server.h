@@ -370,6 +370,10 @@ struct HostServerConfig {
     bool service_approval = false;
     // Walk the injection path without calling SendInput. Only for tests.
     bool dry_run_input = false;
+    // Optional dry-run evidence hooks for isolated native acceptance tests.
+    // Production callers leave these unset.
+    std::function<void(const INPUT&)> dry_run_input_observer;
+    std::function<void(const char*)> input_release_trace;
     bool want_hdr = true;
     bool capture_cursor = true;
     CaptureBackend capture_backend = CaptureBackend::Auto;

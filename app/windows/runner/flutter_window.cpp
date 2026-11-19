@@ -2,6 +2,12 @@
 
 #include <optional>
 
+namespace {
+
+constexpr UINT kMaxDisplayTopologyRetries = 40;
+
+}  // namespace
+
 #include "flutter/generated_plugin_registrant.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project,
@@ -66,10 +72,44 @@ void FlutterWindow::SetCloseHook(std::function<void(HWND)> hook) {
   close_hook_ = std::move(hook);
 }
 
+void FlutterWindow::SetDisplayTopologyHook(std::function<bool(HWND)> hook) {
+  display_topology_hook_ = std::move(hook);
+}
+
 LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_DISPLAYCHANGE && display_topology_hook_) {
+    display_topology_retries_ = 0;
+    if (display_topology_timer_ != 0) {
+      KillTimer(hwnd, display_topology_timer_);
+      display_topology_timer_ = 0;
+    }
+    bool recovered = false;
+    try {
+      recovered = display_topology_hook_(hwnd);
+    } catch (...) {
+      // Keep exceptions from crossing the noexcept window procedure.
+    }
+    if (!recovered) {
+      display_topology_timer_ = SetTimer(hwnd, 0, 250, nullptr);
+    }
+  } else if (message == WM_TIMER &&
+             display_topology_timer_ != 0 &&
+             wparam == display_topology_timer_ &&
+             display_topology_hook_) {
+    bool recovered = false;
+    try {
+      recovered = display_topology_hook_(hwnd);
+    } catch (...) {
+      // A later timer tick can retry a transient monitor query failure.
+    }
+    if (recovered || ++display_topology_retries_ >= kMaxDisplayTopologyRetries) {
+      KillTimer(hwnd, display_topology_timer_);
+      display_topology_timer_ = 0;
+    }
+  }
   if (message == WM_CLOSE && close_hook_) {
     close_hook_(hwnd);
   }

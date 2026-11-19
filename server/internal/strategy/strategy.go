@@ -49,6 +49,7 @@ var definitions = []Definition{
 	{Key: "viewer.upload_recordings", Target: Viewer, Type: "boolean", Apply: "next_session"},
 	{Key: "viewer.sync_initial_clipboard", Target: Viewer, Type: "boolean", Apply: "next_session"},
 	{Key: "viewer.view_fit", Target: Viewer, Type: "integer", Apply: "next_session", Max: 1},
+	{Key: "viewer.default_view_only", Target: Viewer, Type: "boolean", Apply: "next_session"},
 }
 
 func Catalog() []Definition {

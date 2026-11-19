@@ -12,9 +12,11 @@ import '../annotation_stroke_controller.dart';
 import '../session_window.dart';
 import '../viewer_bridge.dart';
 import '../view_prefs.dart';
+import '../view_scale.dart';
 import '../widgets/keyboard_mode_button.dart';
 import '../widgets/display_stream_view.dart';
 import '../widgets/remote_view.dart';
+import '../widgets/view_scale_controls.dart';
 
 /// The runner supplies the existing session. This engine owns only its texture
 /// and local input state; authentication and reconnect stay in the parent.
@@ -49,6 +51,8 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   ViewerKeyboardMode _keyboardMode = ViewerKeyboardMode.physical;
   bool _keyboardChanging = false;
   ViewFit _fit = ViewFit.adaptive;
+  int _zoomPercent = defaultViewZoomPercent;
+  int _cursorZoomPercent = defaultCursorZoomPercent;
   MouseMapping _mouseMapping = const MouseMapping();
   // Same per-device preference as the session window: the hint is draw-only,
   // so it keeps working while remote control is off.
@@ -87,6 +91,8 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     super.initState();
     final prefs = ViewPreferences.load(peerId: widget.peerId);
     _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+    _zoomPercent = prefs.zoomPercent;
+    _cursorZoomPercent = prefs.cursorZoomPercent;
     _mouseMapping = MouseMapping(
       reverseWheel: prefs.reverseWheel,
       swapButtons: prefs.swapButtons,
@@ -182,6 +188,8 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     if (_showMyCursor && !prefs.showMyCursor) _hideCursorHint();
     setState(() {
       _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+      _zoomPercent = prefs.zoomPercent;
+      _cursorZoomPercent = prefs.cursorZoomPercent;
       _mouseMapping = MouseMapping(
         reverseWheel: prefs.reverseWheel,
         swapButtons: prefs.swapButtons,
@@ -192,6 +200,24 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     if (mode != _keyboardMode) {
       unawaited(_changeKeyboardMode(mode, persist: false));
     }
+  }
+
+  void _setFit(ViewFit fit) {
+    setState(() => _fit = fit);
+    ViewPreferences.update(
+      peerId: widget.peerId,
+      fit: fit == ViewFit.original ? 1 : 0,
+    );
+  }
+
+  void _setZoomPercent(int percent) {
+    setState(() => _zoomPercent = percent);
+    ViewPreferences.update(peerId: widget.peerId, zoomPercent: percent);
+  }
+
+  void _setCursorZoomPercent(int percent) {
+    setState(() => _cursorZoomPercent = percent);
+    ViewPreferences.update(peerId: widget.peerId, cursorZoomPercent: percent);
   }
 
   Future<void> _setCapture(bool enabled, int generation) async {
@@ -604,20 +630,13 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                 ? () => unawaited(_clearAnnotation())
                 : null,
           ),
-          IconButton(
-            tooltip: tr('缩放'),
-            icon: const Icon(Icons.fit_screen),
-            onPressed: () {
-              setState(
-                () => _fit = _fit == ViewFit.adaptive
-                    ? ViewFit.original
-                    : ViewFit.adaptive,
-              );
-              ViewPreferences.update(
-                peerId: widget.peerId,
-                fit: _fit == ViewFit.original ? 1 : 0,
-              );
-            },
+          ViewScaleControlsButton(
+            fit: _fit,
+            zoomPercent: _zoomPercent,
+            cursorZoomPercent: _cursorZoomPercent,
+            onFitChanged: _setFit,
+            onZoomPercentChanged: _setZoomPercent,
+            onCursorZoomPercentChanged: _setCursorZoomPercent,
           ),
           IconButton(
             tooltip: tr('全屏'),
@@ -661,6 +680,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           sourceWidth: s.sourceWidth,
                           sourceHeight: s.sourceHeight,
                           fit: _fit,
+                          zoomPercent: _zoomPercent,
                           drawEnabled: _annotationMode,
                           captureInput: _input && !_annotationMode,
                           hideCursor:
@@ -668,8 +688,11 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                               texture.pointer?.visible == true &&
                               texture.cursor != null &&
                               texture.cursorShape == texture.pointer?.shapeId,
-                          overlayBuilder: (size) =>
-                              displayCursorOverlay(texture, size),
+                          overlayBuilder: (size) => displayCursorOverlay(
+                            texture,
+                            size,
+                            cursorScale: _cursorZoomPercent / 100.0,
+                          ),
                           onFocusRequested: () {
                             _focus.requestFocus();
                             unawaited(_displays.focus(s.streamId));

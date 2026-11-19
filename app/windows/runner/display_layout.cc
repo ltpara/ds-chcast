@@ -16,6 +16,21 @@ struct Entry {
     RECT bounds{};
 };
 
+struct LocalLayout {
+    std::vector<RECT> monitors;
+    std::optional<RECT> primary;
+};
+
+BOOL CALLBACK collect_local_monitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    auto* layout = reinterpret_cast<LocalLayout*>(data);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return TRUE;
+    layout->monitors.push_back(info.rcMonitor);
+    if (info.dwFlags & MONITORINFOF_PRIMARY) layout->primary = info.rcMonitor;
+    return TRUE;
+}
+
 bool valid_bounds(const RECT& bounds) {
     const long long width = static_cast<long long>(bounds.right) - bounds.left;
     const long long height = static_cast<long long>(bounds.bottom) - bounds.top;
@@ -127,6 +142,42 @@ std::filesystem::path DisplayLayoutPath() {
     return path / L"chast" / L"display-windows.tsv";
 }
 
+std::optional<RECT> AutoDisplayBounds(const RECT& remote_display,
+                                     const RECT& remote_desktop,
+                                     uint32_t remote_display_count) {
+    LocalLayout layout;
+    if (!EnumDisplayMonitors(nullptr, nullptr, collect_local_monitor,
+                             reinterpret_cast<LPARAM>(&layout)) ||
+        layout.monitors.empty()) {
+        return std::nullopt;
+    }
+
+    RECT local_desktop = layout.monitors.front();
+    for (const RECT& monitor : layout.monitors) {
+        local_desktop.left = std::min(local_desktop.left, monitor.left);
+        local_desktop.top = std::min(local_desktop.top, monitor.top);
+        local_desktop.right = std::max(local_desktop.right, monitor.right);
+        local_desktop.bottom = std::max(local_desktop.bottom, monitor.bottom);
+    }
+    if (remote_display_count <= 1 && layout.primary) {
+        local_desktop = *layout.primary;
+    }
+
+    const auto mapped =
+        MapRemoteDisplayBounds(remote_display, remote_desktop, local_desktop);
+    if (!mapped || !valid_bounds(*mapped)) return std::nullopt;
+    return mapped;
+}
+
+bool DisplayBoundsHaveUsableVisibility(const RECT& bounds) {
+    LocalLayout layout;
+    if (!EnumDisplayMonitors(nullptr, nullptr, collect_local_monitor,
+                             reinterpret_cast<LPARAM>(&layout))) {
+        return false;
+    }
+    return HasUsableDisplayIntersection(bounds, layout.monitors);
+}
+
 std::optional<RECT> LoadDisplayBounds(const std::filesystem::path& file,
                                       const std::string& peer_id,
                                       uint32_t display_index) {
@@ -163,7 +214,7 @@ void SaveDisplayBounds(const std::filesystem::path& file,
 }
 
 bool DisplayBoundsVisible(const RECT& bounds) {
-    return MonitorFromRect(&bounds, MONITOR_DEFAULTTONULL) != nullptr;
+    return DisplayBoundsHaveUsableVisibility(bounds);
 }
 
 }  // namespace chast

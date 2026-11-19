@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../annotation_ink.dart';
 import '../viewer_bridge.dart';
@@ -13,17 +14,21 @@ enum ViewFit { adaptive, original }
 /// added. The host may encode a smaller picture than the desktop, so these are
 /// source pixels, not texture pixels; the session page adds the origin last.
 typedef FramePointerHandler = void Function(Offset position, int buttons);
-typedef FrameButtonHandler = void Function(Offset position, int button, bool down);
+typedef FrameButtonHandler =
+    void Function(Offset position, int button, bool down);
 typedef FrameScrollHandler = void Function(Offset position, Offset delta);
+
 /// Precision-touchpad pan or pinch. Deltas are WHEEL_DELTA units (120 per
 /// notch); zoom uses only [deltaY] and is a complete Ctrl+wheel chord.
 typedef FrameGestureHandler =
     void Function(Offset position, bool zoom, int deltaX, int deltaY);
+
 /// Touch and stylus events, which carry pressure and tilt the mouse path does
 /// not model.
 typedef FrameDeviceHandler = void Function(PointerEvent event, Offset position);
 
-const int _mouseButtonMask = ViewerMouse.left |
+const int _mouseButtonMask =
+    ViewerMouse.left |
     ViewerMouse.right |
     ViewerMouse.middle |
     ViewerMouse.back |
@@ -51,10 +56,14 @@ const List<int> _mouseButtons = <int>[
 }) {
   final int w = width > 0 ? width : 1;
   final int h = height > 0 ? height : 1;
-  final int x =
-      (originX + frame.dx).round().clamp(originX, originX + w - 1).toInt();
-  final int y =
-      (originY + frame.dy).round().clamp(originY, originY + h - 1).toInt();
+  final int x = (originX + frame.dx)
+      .round()
+      .clamp(originX, originX + w - 1)
+      .toInt();
+  final int y = (originY + frame.dy)
+      .round()
+      .clamp(originY, originY + h - 1)
+      .toInt();
   return (x, y);
 }
 
@@ -67,6 +76,7 @@ class RemoteView extends StatefulWidget {
     this.sourceWidth = 0,
     this.sourceHeight = 0,
     required this.fit,
+    this.zoomPercent = 100,
     this.captureInput = false,
     this.drawEnabled = false,
     this.hideCursor = false,
@@ -103,6 +113,7 @@ class RemoteView extends StatefulWidget {
   final int sourceWidth;
   final int sourceHeight;
   final ViewFit fit;
+  final int zoomPercent;
 
   int get _pointerWidth => sourceWidth > 0 ? sourceWidth : videoWidth;
   int get _pointerHeight => sourceHeight > 0 ? sourceHeight : videoHeight;
@@ -145,6 +156,7 @@ class RemoteView extends StatefulWidget {
   /// remote control is off, because the hint is draw-only. [onCursorHintExit]
   /// fires when the pointer leaves the picture so the host can hide it.
   final ValueChanged<Offset>? onCursorHint;
+
   /// The primary-button press edge at the given position. It is sent ahead of
   /// the throttled moves so the host overlay can ripple at the click instead
   /// of at the next move sample.
@@ -236,10 +248,12 @@ class _RemoteViewState extends State<RemoteView> {
     }
     final int width = widget._pointerWidth;
     final int height = widget._pointerHeight;
-    final double x =
-        (local.dx * width / box.width).clamp(0.0, width - 1.0).toDouble();
-    final double y =
-        (local.dy * height / box.height).clamp(0.0, height - 1.0).toDouble();
+    final double x = (local.dx * width / box.width)
+        .clamp(0.0, width - 1.0)
+        .toDouble();
+    final double y = (local.dy * height / box.height)
+        .clamp(0.0, height - 1.0)
+        .toDouble();
     return Offset(x, y);
   }
 
@@ -254,6 +268,30 @@ class _RemoteViewState extends State<RemoteView> {
         widget.onButton?.call(_lastFrame, bit, false);
       }
     }
+  }
+
+  void _handlePointerSignal(PointerSignalEvent event, Size box) {
+    if (event is! PointerScrollEvent) return;
+    if (widget.zoomPercent > 100 &&
+        widget.captureInput &&
+        HardwareKeyboard.instance.isShiftPressed) {
+      return;
+    }
+    if (widget.zoomPercent != 100 && widget.captureInput) {
+      GestureBinding.instance.pointerSignalResolver.register(event, (resolved) {
+        if (resolved is PointerScrollEvent) {
+          widget.onScroll?.call(
+            _toFrame(resolved.localPosition, box),
+            resolved.scrollDelta,
+          );
+        }
+      });
+      return;
+    }
+    widget.onScroll?.call(
+      _toFrame(event.localPosition, box),
+      event.scrollDelta,
+    );
   }
 
   /// Reconciles the buttons this view believes are down with the bitmask the
@@ -325,13 +363,20 @@ class _RemoteViewState extends State<RemoteView> {
     _reportScale(box);
     Widget texture = Texture(
       textureId: widget.textureId,
-      filterQuality: widget.fit == ViewFit.original ? FilterQuality.none : FilterQuality.low,
+      filterQuality: widget.fit == ViewFit.original
+          ? FilterQuality.none
+          : FilterQuality.low,
     );
     if (widget.overlayBuilder != null) {
-      texture = ClipRect(child: Stack(fit: StackFit.expand, children: [
-        texture,
-        IgnorePointer(child: widget.overlayBuilder!(box)),
-      ]));
+      texture = ClipRect(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            texture,
+            IgnorePointer(child: widget.overlayBuilder!(box)),
+          ],
+        ),
+      );
     }
     final ViewerAnnotationInk? ink = widget.ink;
     if (widget.drawEnabled && ink != null) {
@@ -416,7 +461,9 @@ class _RemoteViewState extends State<RemoteView> {
           onPointerDown: (PointerDownEvent event) {
             widget.onFocusRequested?.call();
             if (event.buttons & kPrimaryMouseButton != 0) {
-              widget.onCursorHintPress?.call(_toFrame(event.localPosition, box));
+              widget.onCursorHintPress?.call(
+                _toFrame(event.localPosition, box),
+              );
             }
           },
           onPointerMove: (PointerMoveEvent event) =>
@@ -509,9 +556,7 @@ class _RemoteViewState extends State<RemoteView> {
           _resetGesture();
         },
         onPointerSignal: (PointerSignalEvent event) {
-          if (event is PointerScrollEvent) {
-            widget.onScroll?.call(_toFrame(event.localPosition, box), event.scrollDelta);
-          }
+          _handlePointerSignal(event, box);
         },
         child: texture,
       ),
@@ -523,14 +568,43 @@ class _RemoteViewState extends State<RemoteView> {
     if (widget.videoWidth <= 0 || widget.videoHeight <= 0) {
       return const SizedBox.shrink();
     }
-    final Size videoSize =
-        Size(widget.videoWidth.toDouble(), widget.videoHeight.toDouble());
+    final Size videoSize = Size(
+      widget.videoWidth.toDouble(),
+      widget.videoHeight.toDouble(),
+    );
+
+    if (widget.zoomPercent != 100) {
+      return LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          Size available = constraints.biggest;
+          if (!available.isFinite ||
+              available.width <= 0 ||
+              available.height <= 0) {
+            available = videoSize;
+          }
+          final double fitScale = widget.fit == ViewFit.adaptive
+              ? math.min(
+                  available.width / videoSize.width,
+                  available.height / videoSize.height,
+                )
+              : 1.0;
+          final double scale = fitScale * widget.zoomPercent / 100.0;
+          final Size drawn = Size(
+            videoSize.width * scale,
+            videoSize.height * scale,
+          );
+          return _scrollableView(drawn, available);
+        },
+      );
+    }
 
     if (widget.fit == ViewFit.adaptive) {
       return LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
           Size available = constraints.biggest;
-          if (!available.isFinite || available.width <= 0 || available.height <= 0) {
+          if (!available.isFinite ||
+              available.width <= 0 ||
+              available.height <= 0) {
             available = videoSize;
           }
           final double scale = math.min(
@@ -568,30 +642,37 @@ class _RemoteViewState extends State<RemoteView> {
 
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
-        return Scrollbar(
-          controller: _vertical,
+        return _scrollableView(videoSize, constraints.biggest);
+      },
+    );
+  }
+
+  Widget _scrollableView(Size drawn, Size viewport) {
+    return Scrollbar(
+      controller: _vertical,
+      child: SingleChildScrollView(
+        controller: _vertical,
+        child: Scrollbar(
+          controller: _horizontal,
           child: SingleChildScrollView(
-            controller: _vertical,
-            child: SingleChildScrollView(
-              controller: _horizontal,
-              scrollDirection: Axis.horizontal,
-              child: ConstrainedBox(
-                constraints: BoxConstraints(
-                  minWidth: constraints.maxWidth,
-                  minHeight: constraints.maxHeight,
-                ),
-                child: Center(
-                  child: SizedBox(
-                    width: videoSize.width,
-                    height: videoSize.height,
-                    child: _layer(videoSize),
-                  ),
+            controller: _horizontal,
+            scrollDirection: Axis.horizontal,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minWidth: viewport.width,
+                minHeight: viewport.height,
+              ),
+              child: Center(
+                child: SizedBox(
+                  width: drawn.width,
+                  height: drawn.height,
+                  child: _layer(drawn),
                 ),
               ),
             ),
           ),
-        );
-      },
+        ),
+      ),
     );
   }
 }

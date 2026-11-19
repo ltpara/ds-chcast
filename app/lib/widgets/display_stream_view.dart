@@ -74,7 +74,11 @@ class DisplayStreamView extends StatelessWidget {
 
 /// Cursor positions and sprite sizes are source pixels, independent of the
 /// encoder's downscaled picture and of the neighbouring display's geometry.
-Widget displayCursorOverlay(DisplayTexture texture, Size drawn) {
+Widget displayCursorOverlay(
+  DisplayTexture texture,
+  Size drawn, {
+  double cursorScale = 1.0,
+}) {
   final stream = texture.stream;
   final cursor = texture.pointer;
   final image = texture.cursor;
@@ -87,15 +91,19 @@ Widget displayCursorOverlay(DisplayTexture texture, Size drawn) {
   final width = stream.sourceWidth > 0 ? stream.sourceWidth : stream.width;
   final height = stream.sourceHeight > 0 ? stream.sourceHeight : stream.height;
   if (width <= 0 || height <= 0) return const SizedBox.shrink();
+  final double safeCursorScale = cursorScale.isFinite
+      ? cursorScale.clamp(0.25, 4.0).toDouble()
+      : 1.0;
   final x = drawn.width / width, y = drawn.height / height;
+  final cursorX = x * safeCursorScale, cursorY = y * safeCursorScale;
   // The protocol reports the hotspot, so the sprite's top-left sits before it.
   return Stack(
     children: [
       Positioned(
-        left: (cursor.x - cursor.hotspotX) * x,
-        top: (cursor.y - cursor.hotspotY) * y,
-        width: cursor.width * x,
-        height: cursor.height * y,
+        left: cursor.x * x - cursor.hotspotX * cursorX,
+        top: cursor.y * y - cursor.hotspotY * cursorY,
+        width: cursor.width * cursorX,
+        height: cursor.height * cursorY,
         child: RawImage(
           image: image,
           fit: BoxFit.fill,

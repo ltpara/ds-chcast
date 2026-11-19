@@ -16,8 +16,10 @@ import 'package:chast_viewer/pages/home_page.dart';
 import 'package:chast_viewer/server_api.dart';
 import 'package:chast_viewer/server_identity.dart';
 import 'package:chast_viewer/server_settings.dart';
+import 'package:chast_viewer/target.dart';
 import 'package:chast_viewer/trust_store.dart';
 import 'package:chast_viewer/view_filter.dart';
+import 'package:chast_viewer/view_prefs.dart';
 
 class _MemoryDevices extends DeviceStore {
   _MemoryDevices(this.devices, {List<PendingDeletion>? pending})
@@ -330,6 +332,78 @@ class _FakeLanDiscovery extends LanDiscovery {
 String _savedCount(WidgetTester tester) =>
     tester.widget<Text>(find.byKey(const Key('saved-count'))).data ?? '';
 
+Future<void> _exerciseDefaultControlPreference(
+  WidgetTester tester, {
+  required Device device,
+  required ConnectTarget target,
+}) async {
+  tester.view.physicalSize = const Size(1600, 1000);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+  final Directory dir = Directory.systemTemp.createTempSync(
+    'chast-default-control-',
+  );
+  ViewPreferences.configPathOverride =
+      '${dir.path}${Platform.pathSeparator}ui.json';
+  addTearDown(() {
+    ViewPreferences.configPathOverride = null;
+    dir.deleteSync(recursive: true);
+  });
+
+  await tester.pumpWidget(
+    MaterialApp(
+      home: HomePage(
+        deviceStore: _MemoryDevices(<Device>[device]),
+        serverStore: _MemoryServers(
+          device.viaServer
+              ? ServerSettings(url: device.server)
+              : const ServerSettings(),
+        ),
+        identityStore: _MemoryIdentity(),
+        trustStore: _MemoryTrust(<String, String>{}),
+        accountStore: _MemoryAccount(),
+        lookupBatch: (ServerSettings server, List<String> ids) async =>
+            BatchLookupResult(
+              hosts: <String, HostInfo>{
+                for (final String id in ids) id: HostInfo(id: id, online: true),
+              },
+            ),
+      ),
+    ),
+  );
+  for (int i = 0; i < 6; ++i) {
+    await tester.pump(const Duration(milliseconds: 20));
+  }
+
+  await tester.tap(find.byTooltip('设备操作'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('新会话默认控制方式…'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('连接后启用控制'));
+  await tester.tap(find.text('保存'));
+  await tester.pumpAndSettle();
+  final ViewPreferences explicit = ViewPreferences.load(
+    peerId: target.preferencesKey,
+  );
+  expect(explicit.defaultViewOnly, isFalse);
+  expect(explicit.defaultViewOnlyConfigured, isTrue);
+
+  await tester.tap(find.byTooltip('设备操作'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('新会话默认控制方式…'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('遵循管理策略（无策略时仅查看）'));
+  await tester.tap(find.text('保存'));
+  await tester.pumpAndSettle();
+  final ViewPreferences inherited = ViewPreferences.load(
+    peerId: target.preferencesKey,
+  );
+  expect(inherited.defaultViewOnly, isTrue);
+  expect(inherited.defaultViewOnlyConfigured, isFalse);
+  await tester.pumpWidget(const SizedBox());
+}
+
 void main() {
   for (final (lateUnauthorized, relogin) in [
     (false, false),
@@ -599,6 +673,32 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  testWidgets('device menu stores default control for managed targets', (
+    WidgetTester tester,
+  ) async {
+    const String server = 'http://127.0.0.1:8443';
+    await _exerciseDefaultControlPreference(
+      tester,
+      device: Device(
+        id: 'studio',
+        server: server,
+        saved: true,
+        addedAt: DateTime.now(),
+      ),
+      target: const ConnectTarget('', 0, server: server, hostId: 'studio'),
+    );
+  });
+
+  testWidgets('device menu stores default control for direct targets', (
+    WidgetTester tester,
+  ) async {
+    await _exerciseDefaultControlPreference(
+      tester,
+      device: Device(id: '10.0.0.2:4433', saved: true, addedAt: DateTime.now()),
+      target: const ConnectTarget('10.0.0.2', 4433),
+    );
+  });
 
   testWidgets('the files-only entry asks for an address before connecting', (
     WidgetTester tester,

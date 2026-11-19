@@ -27,6 +27,7 @@ ViewerLocalSettings _local({
   bool uploadRecordings = false,
   bool syncInitialClipboard = false,
   int viewFit = 0,
+  bool defaultViewOnly = true,
   bool configured = false,
 }) {
   return ViewerLocalSettings(
@@ -35,11 +36,13 @@ ViewerLocalSettings _local({
     uploadRecordings: uploadRecordings,
     syncInitialClipboard: syncInitialClipboard,
     viewFit: viewFit,
+    defaultViewOnly: defaultViewOnly,
     tunnelModeSet: configured,
     useWebSocketSet: configured,
     uploadRecordingsSet: configured,
     syncInitialClipboardSet: configured,
     viewFitSet: configured,
+    defaultViewOnlySet: configured,
   );
 }
 
@@ -63,6 +66,10 @@ void main() {
           value: true,
         ),
         viewerViewFitKey: const ViewerStrategySetting(mode: 'locked', value: 1),
+        viewerDefaultViewOnlyKey: const ViewerStrategySetting(
+          mode: 'locked',
+          value: false,
+        ),
       };
 
   test('locked values override explicit local viewer preferences', () {
@@ -75,6 +82,7 @@ void main() {
     expect(effective.uploadRecordings, isTrue);
     expect(effective.syncInitialClipboard, isTrue);
     expect(effective.viewFit, 1);
+    expect(effective.defaultViewOnly, isFalse);
   });
 
   test('default values apply only without an explicit local preference', () {
@@ -97,6 +105,7 @@ void main() {
     expect(unconfigured.uploadRecordings, isTrue);
     expect(unconfigured.syncInitialClipboard, isTrue);
     expect(unconfigured.viewFit, 1);
+    expect(unconfigured.defaultViewOnly, isFalse);
 
     final ViewerEffectiveSettings explicit = ViewerEffectiveSettings.resolve(
       _local(configured: true),
@@ -107,6 +116,7 @@ void main() {
     expect(explicit.uploadRecordings, isFalse);
     expect(explicit.syncInitialClipboard, isFalse);
     expect(explicit.viewFit, 0);
+    expect(explicit.defaultViewOnly, isTrue);
   });
 
   test('missing viewer keys preserve local values', () {
@@ -117,6 +127,7 @@ void main() {
         uploadRecordings: true,
         syncInitialClipboard: true,
         viewFit: 1,
+        defaultViewOnly: false,
       ),
       delivery: _snapshot(const <String, ViewerStrategySetting>{}),
     );
@@ -125,6 +136,7 @@ void main() {
     expect(effective.uploadRecordings, isTrue);
     expect(effective.syncInitialClipboard, isTrue);
     expect(effective.viewFit, 1);
+    expect(effective.defaultViewOnly, isFalse);
   });
 
   test('each supported key validates its type and range', () {
@@ -134,6 +146,7 @@ void main() {
       viewerUploadRecordingsKey: 'true',
       viewerSyncInitialClipboardKey: 0,
       viewerViewFitKey: 2,
+      viewerDefaultViewOnlyKey: 'false',
     }.entries) {
       expect(
         ViewerStrategySetting.fromJson(entry.key, <String, Object?>{
@@ -145,6 +158,69 @@ void main() {
       );
     }
   });
+
+  test(
+    'initial control waits for desktop readiness and host permission once',
+    () {
+      final ViewerInitialControlPolicy policy = ViewerInitialControlPolicy();
+      expect(
+        policy.resolve(
+          desktop: true,
+          sessionReady: false,
+          acceptsInput: true,
+          defaultViewOnly: false,
+        ),
+        isNull,
+      );
+      expect(
+        policy.resolve(
+          desktop: true,
+          sessionReady: true,
+          acceptsInput: false,
+          defaultViewOnly: false,
+        ),
+        isNull,
+      );
+      expect(
+        policy.resolve(
+          desktop: true,
+          sessionReady: true,
+          acceptsInput: true,
+          defaultViewOnly: false,
+        ),
+        isTrue,
+      );
+      expect(
+        policy.resolve(
+          desktop: true,
+          sessionReady: true,
+          acceptsInput: true,
+          defaultViewOnly: false,
+        ),
+        isNull,
+      );
+
+      policy.reset();
+      expect(
+        policy.resolve(
+          desktop: true,
+          sessionReady: true,
+          acceptsInput: false,
+          defaultViewOnly: true,
+        ),
+        isFalse,
+      );
+      expect(
+        policy.resolve(
+          desktop: true,
+          sessionReady: true,
+          acceptsInput: true,
+          defaultViewOnly: true,
+        ),
+        isNull,
+      );
+    },
+  );
 
   test('snapshot rejects a peer mismatch and duplicate parsed keys', () {
     expect(

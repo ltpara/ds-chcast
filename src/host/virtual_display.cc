@@ -1,4 +1,5 @@
 #include "chast/virtual_display.h"
+#include "chast/machine_state_security.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -483,10 +484,6 @@ constexpr DWORD kWriteAccessMask =
 enum class AclProfile {
     // %ProgramData%\chast and its record: SYSTEM or Administrators only.
     State,
-    // A record left by an older version: an elevated administrator's own SID
-    // is accepted once so the file can be re-owned instead of silently
-    // poisoning the hardened directory.
-    StateMigration,
     // Driver packages may live under Program Files (TrustedInstaller) or a
     // caller-supplied directory owned by the elevating user.
     Package,
@@ -561,11 +558,6 @@ bool acl_trusted(PSID owner, PACL acl, AclProfile profile) {
     if (current_process_user_sid(&user) && profile != AclProfile::State) {
         owners.insert(user);
         writers.insert(user);
-    }
-    if (profile == AclProfile::StateMigration) {
-        // Records written by the previous version inherited CREATOR OWNER
-        // from %ProgramData%; it resolves to the owner checked above.
-        writers.insert(kCreatorOwnerSid);
     }
     if (owners.find(owner_text) == owners.end()) {
         return false;
@@ -643,7 +635,7 @@ bool set_handle_security(HANDLE file, bool directory, std::string* error) {
         LocalFree(current);
     }
     const wchar_t* sddl =
-        directory ? L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)"
+        directory ? L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;GR;;;BU)"
                   : L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)";
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor,
@@ -745,6 +737,10 @@ void append_log(const std::wstring& path, const std::string& line) {
         if (CompareStringOrdinal(parent.c_str(), -1, state_dir.c_str(), -1, TRUE) !=
             CSTR_EQUAL) {
             CreateDirectoryW(parent.c_str(), nullptr);
+        } else if (!process_can_harden_machine_state() ||
+                   !machine_state_directory_trusted(state_dir, nullptr) ||
+                   !machine_state_file_trusted(path, nullptr)) {
+            return;
         }
     }
     HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
@@ -2091,67 +2087,7 @@ bool read_install_record(VirtualDisplayInstallRecord* record) {
 }
 
 bool harden_virtual_display_state_directory(std::string* error) {
-    const std::wstring dir = virtual_display_state_directory();
-    if (!CreateDirectoryW(dir.c_str(), nullptr) &&
-        GetLastError() != ERROR_ALREADY_EXISTS) {
-        if (error != nullptr) {
-            *error = "cannot create " + to_utf8(dir) + " (error " +
-                     std::to_string(GetLastError()) + ")";
-        }
-        return false;
-    }
-    enable_privilege(L"SeRestorePrivilege");
-    HANDLE directory = INVALID_HANDLE_VALUE;
-    std::string open_error;
-    if (!open_no_follow(dir,
-                        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_LIST_DIRECTORY |
-                            FILE_READ_ATTRIBUTES,
-                        FILE_SHARE_READ | FILE_SHARE_DELETE, true, &directory, &open_error)) {
-        if (error != nullptr) {
-            *error = open_error;
-        }
-        return false;
-    }
-    // Files created before the directory was protected may have been planted
-    // by another account. Anything whose owner/DACL is not at least
-    // administrator-controlled is removed instead of being silently adopted.
-    for (const std::wstring& path :
-         {virtual_display_state_path(), virtual_display_log_path()}) {
-        const DWORD attributes = GetFileAttributesW(path.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES) {
-            continue;
-        }
-        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-            DeleteFileW(path.c_str());
-            continue;
-        }
-        HANDLE file = INVALID_HANDLE_VALUE;
-        std::string ignored;
-        if (!open_no_follow(path,
-                            READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE | GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_DELETE, false, &file, &ignored)) {
-            continue;
-        }
-        if (!handle_acl_trusted(file, AclProfile::StateMigration, nullptr)) {
-            FILE_DISPOSITION_INFO disposition{};
-            disposition.DeleteFile = TRUE;
-            SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
-                                       sizeof(disposition));
-        } else {
-            std::string ignored_security;
-            set_handle_security(file, false, &ignored_security);
-        }
-        CloseHandle(file);
-    }
-    std::string acl_error;
-    const bool secured = set_handle_security(directory, true, &acl_error);
-    CloseHandle(directory);
-    if (!secured) {
-        if (error != nullptr) {
-            *error = acl_error;
-        }
-        return false;
-    }
+    if (!harden_machine_state_directory(virtual_display_state_directory(), error)) return false;
     if (!virtual_display_state_directory_trusted()) {
         if (error != nullptr) {
             *error = "the state directory still grants write access to another account";
@@ -2162,17 +2098,7 @@ bool harden_virtual_display_state_directory(std::string* error) {
 }
 
 bool virtual_display_state_directory_trusted() {
-    HANDLE directory = INVALID_HANDLE_VALUE;
-    std::string error;
-    if (!open_no_follow(virtual_display_state_directory(),
-                        READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, true,
-                        &directory, &error)) {
-        return false;
-    }
-    const bool trusted = handle_acl_trusted(directory, AclProfile::State, nullptr);
-    CloseHandle(directory);
-    return trusted;
+    return machine_state_directory_trusted(virtual_display_state_directory(), nullptr);
 }
 
 bool write_install_record(const VirtualDisplayInstallRecord& record, std::string* error) {

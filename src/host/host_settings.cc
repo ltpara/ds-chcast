@@ -17,6 +17,7 @@
 #include "chast/security.h"
 #include "chast/access_ticket.h"
 #include "chast/file_transfer.h"
+#include "chast/machine_state_security.h"
 
 namespace chast {
 
@@ -66,6 +67,14 @@ std::string known_folder(REFKNOWNFOLDERID id) {
 
 std::filesystem::path native_path(const std::string& utf8) {
     return std::filesystem::path(to_wide(utf8));
+}
+
+bool is_machine_settings_target(const std::filesystem::path& target) {
+    const std::string machine_path = machine_settings_path();
+    if (machine_path.empty()) return false;
+    const std::wstring left = target.lexically_normal().wstring();
+    const std::wstring right = native_path(machine_path).lexically_normal().wstring();
+    return _wcsicmp(left.c_str(), right.c_str()) == 0;
 }
 
 std::string trim(std::string_view text) {
@@ -768,6 +777,20 @@ std::string generate_tunnel_id() {
 }
 
 HostSettingsLoad load_host_settings(const std::string& path) {
+    if (is_machine_settings_target(native_path(path))) {
+        std::string security_error;
+        const auto directory = native_path(machine_settings_directory()).wstring();
+        if (!machine_state_directory_trusted(directory, &security_error) ||
+            !machine_state_file_trusted(native_path(path).wstring(), &security_error)) {
+            HostSettingsLoad rejected;
+            rejected.warning = "machine settings security check failed: " + security_error;
+            rejected.settings.audit_spool = audit_spool_path_for(path);
+            rejected.settings.policy_state = policy_state_path_for(path);
+            rejected.settings.policy_ack = policy_ack_path_for(path);
+            rejected.settings.wallpaper_state = wallpaper_state_path_for(path);
+            return rejected;
+        }
+    }
     std::ifstream in(native_path(path), std::ios::binary);
     if (!in) {
         HostSettingsLoad missing;
@@ -1552,7 +1575,20 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
     std::string data;
     if (!serialize_host_settings(path, settings, data, error)) return false;
     const std::filesystem::path target = native_path(path);
+    const bool machine_target = is_machine_settings_target(target);
     std::error_code ec;
+    if (machine_target) {
+        std::string security_error;
+        if (!machine_state_directory_trusted(target.parent_path().wstring(), &security_error) &&
+            !harden_machine_state_directory(target.parent_path().wstring(), &security_error)) {
+            if (error != nullptr) *error = "machine settings directory is not trusted: " + security_error;
+            return false;
+        }
+        if (!harden_machine_state_file(target.wstring(), &security_error)) {
+            if (error != nullptr) *error = "machine settings file is not trusted: " + security_error;
+            return false;
+        }
+    }
     if (target.has_parent_path()) {
         std::filesystem::create_directories(target.parent_path(), ec);
         if (ec) {
@@ -1562,6 +1598,13 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
     }
     std::filesystem::path temporary = target;
     temporary += L".tmp";
+    if (machine_target) {
+        std::string security_error;
+        if (!harden_machine_state_file(temporary.wstring(), &security_error)) {
+            if (error != nullptr) *error = "machine settings temporary file is not trusted: " + security_error;
+            return false;
+        }
+    }
     {
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -1579,6 +1622,13 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         std::filesystem::remove(temporary, ec);
         *error = "could not replace " + path + " (error " + std::to_string(GetLastError()) + ")";
         return false;
+    }
+    if (machine_target) {
+        std::string security_error;
+        if (!harden_machine_state_file(target.wstring(), &security_error)) {
+            if (error != nullptr) *error = "saved machine settings could not be secured: " + security_error;
+            return false;
+        }
     }
     return true;
 }

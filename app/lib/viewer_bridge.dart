@@ -2126,6 +2126,17 @@ class ViewerBridge {
 
   static Future<void> stop() => _channel.invokeMethod<void>('stop');
 
+  /// Keeps this Windows machine from sleeping while this viewer session is
+  /// active. Each session window owns one idempotent lease; the native process
+  /// releases the underlying request after the final session stops.
+  static Future<bool> setKeepAwake(bool enabled) async {
+    final bool? active = await _channel.invokeMethod<bool>(
+      'setKeepAwake',
+      enabled,
+    );
+    return active ?? false;
+  }
+
   static Future<ViewerStatus> status() async {
     final Object? result = await _channel.invokeMethod<Object?>('status');
     if (result is Map) {

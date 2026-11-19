@@ -501,10 +501,12 @@ bool make_legacy_keyboard_input(uint16_t virtual_key, bool down, INPUT& input) {
 std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* error,
     std::function<void(const INPUT&)> dry_run_observer,
     std::function<HKL()> keyboard_layout_provider,
-    std::function<bool()> ime_open_provider) {
+    std::function<bool()> ime_open_provider,
+    std::function<void(const char*)> release_trace_observer) {
     std::unique_ptr<InputInjector> injector(new InputInjector());
     injector->dry_run_ = dry_run;
     injector->dry_run_observer_ = std::move(dry_run_observer);
+    injector->release_trace_observer_ = std::move(release_trace_observer);
     injector->keyboard_layout_provider_ = std::move(keyboard_layout_provider);
     injector->ime_open_provider_ = std::move(ime_open_provider);
     try {
@@ -646,6 +648,9 @@ void InputInjector::release_held() {
         Pending pending;
         pending.release = true;
         queue_.push_back(pending);
+        if (dry_run_ && release_trace_observer_) {
+            release_trace_observer_("release_held_queued");
+        }
     }
     cv_.notify_one();
 }
@@ -686,7 +691,13 @@ void InputInjector::run() {
             for (const Pending& pending : batch) {
                 follow_input_desktop_if_due();
                 if (pending.release) {
+                    if (dry_run_ && release_trace_observer_) {
+                        release_trace_observer_("release_all_begin");
+                    }
                     release_all();
+                    if (dry_run_ && release_trace_observer_) {
+                        release_trace_observer_("release_all_end");
+                    }
                 } else if (pending.has_text) {
                     apply_text(pending.text);
                 } else {

@@ -50,7 +50,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   std::function<bool(const std::string&)> open_window;
   FlutterWindow::OpenDisplayWindow open_display;
   open_display = [&windows](std::shared_ptr<chast_viewer::SharedViewerSession> session, uint32_t stream,
-                            const std::string& peer_id, uint32_t display_index) {
+                            const std::string& peer_id, uint32_t display_index,
+                            RECT remote_display, RECT remote_desktop,
+                            uint32_t remote_display_count) {
     if (windows.size() >= kMaxSessionWindows) return false;
     flutter::DartProject display_project(L"data");
     display_project.set_dart_entrypoint_arguments(
@@ -61,8 +63,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     const std::filesystem::path layout = chast::DisplayLayoutPath();
     const std::optional<RECT> saved =
         chast::LoadDisplayBounds(layout, peer_id, display_index);
-    const bool created = saved
-        ? child->CreateAtPhysicalBounds(L"Chast - Display", *saved)
+    const std::optional<RECT> automatic = saved
+        ? std::nullopt
+        : chast::AutoDisplayBounds(remote_display, remote_desktop,
+                                   remote_display_count);
+    const std::optional<RECT> placement = saved ? saved : automatic;
+    child->SetDisplayTopologyHook(
+        [remote_display, remote_desktop, remote_display_count](HWND window) {
+          RECT current{};
+          if (!GetWindowRect(window, &current)) return false;
+          if (chast::DisplayBoundsHaveUsableVisibility(current)) return true;
+          const auto recovered = chast::AutoDisplayBounds(
+              remote_display, remote_desktop, remote_display_count);
+          if (!recovered) return false;
+          return SetWindowPos(window, nullptr, recovered->left, recovered->top,
+                              recovered->right - recovered->left,
+                              recovered->bottom - recovered->top,
+                              SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+        });
+    const bool created = placement
+        ? child->CreateAtPhysicalBounds(L"Chast - Display", *placement)
         : child->Create(L"Chast - Display",
                         Win32Window::Point(100 + offset, 80 + offset),
                         Win32Window::Size(1120, 720));

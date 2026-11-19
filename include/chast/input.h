@@ -84,7 +84,8 @@ public:
     static std::unique_ptr<InputInjector> create(bool dry_run, std::string* error,
         std::function<void(const INPUT&)> dry_run_observer = {},
         std::function<HKL()> keyboard_layout_provider = {},
-        std::function<bool()> ime_open_provider = {});
+        std::function<bool()> ime_open_provider = {},
+        std::function<void(const char*)> release_trace_observer = {});
 
     ~InputInjector();
     InputInjector(const InputInjector&) = delete;
@@ -170,6 +171,7 @@ private:
 
     bool dry_run_ = false;
     std::function<void(const INPUT&)> dry_run_observer_;
+    std::function<void(const char*)> release_trace_observer_;
     std::function<HKL()> keyboard_layout_provider_;
     std::function<bool()> ime_open_provider_;
     mutable std::mutex mutex_;

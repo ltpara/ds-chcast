@@ -51,8 +51,11 @@ public:
     // SessionWindowRequest. False means the caller should fall back to an
     // in-process page.
     std::function<bool(const std::string&)> open_session_window;
-    // peer_id and the host display index identify the window's saved layout.
-    std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t, const std::string&, uint32_t)> open_display_window;
+    // The peer and display identify saved placement; remote geometry supplies
+    // the default placement on the matching local desktop layout.
+    std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t,
+                       const std::string&, uint32_t, RECT, RECT, uint32_t)>
+        open_display_window;
 
 private:
     bool QueueInput(const chast::InputEvent& event);
@@ -181,6 +184,7 @@ private:
     // for real.
     bool window_close_handler_ = false;
     bool window_close_requested_ = false;
+    bool keep_awake_ = false;
 };
 
 }  // namespace chast_viewer

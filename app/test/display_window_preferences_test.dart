@@ -117,10 +117,20 @@ void main() {
     view.onCursorHint!(const Offset(100, 50));
     await tester.pump();
     expect(cursors, hasLength(1));
-    expect(cursors.single, {'x': -1180, 'y': -50, 'visible': true, 'pressed': false});
+    expect(cursors.single, {
+      'x': -1180,
+      'y': -50,
+      'visible': true,
+      'pressed': false,
+    });
     view.onCursorHintPress!(const Offset(100, 50));
     await tester.pump();
-    expect(cursors.last, {'x': -1180, 'y': -50, 'visible': true, 'pressed': true});
+    expect(cursors.last, {
+      'x': -1180,
+      'y': -50,
+      'visible': true,
+      'pressed': true,
+    });
     view.onCursorHintExit!();
     await tester.pump();
     expect(cursors.last, {'x': 0, 'y': 0, 'visible': false, 'pressed': false});
@@ -131,8 +141,11 @@ void main() {
       terminalFontSize: 19,
       stats: true,
     );
-    await tester.tap(find.byIcon(Icons.fit_screen));
-    await tester.pump();
+    await tester.tap(find.byTooltip('视图与光标缩放'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('自适应窗口'));
+    await tester.tap(find.text('应用'));
+    await tester.pumpAndSettle();
     expect(ViewPreferences.load(peerId: 'review-peer').fit, 0);
     tester
         .widget<KeyboardModeButton>(find.byType(KeyboardModeButton))

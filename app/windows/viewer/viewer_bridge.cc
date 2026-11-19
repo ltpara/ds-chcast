@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -30,6 +31,7 @@
 #include "chast/security.h"
 #include "gpu_frame_sink.h"
 #include "security_key.h"
+#include "viewer_awake_request.h"
 
 namespace chast_viewer {
 
@@ -280,6 +282,26 @@ bool write_text_file(const std::filesystem::path& path, const std::string& text,
 }
 
 std::filesystem::path ticket_seed_path() {
+    char* test_mode = nullptr;
+    size_t test_mode_size = 0;
+    char* test_directory = nullptr;
+    size_t test_directory_size = 0;
+    const bool isolated_test_directory =
+        _dupenv_s(&test_mode, &test_mode_size, "CHAST_NATIVE_TESTING") == 0 &&
+        test_mode != nullptr && std::string(test_mode) == "1" &&
+        _dupenv_s(&test_directory, &test_directory_size,
+                  "CHAST_NATIVE_TEST_TICKET_DIR") == 0 &&
+        test_directory != nullptr && test_directory[0] != '\0';
+    std::filesystem::path directory;
+    if (isolated_test_directory) {
+        directory = std::filesystem::path(test_directory);
+    }
+    std::free(test_directory);
+    std::free(test_mode);
+    if (isolated_test_directory) {
+        return directory.is_absolute() ? directory / L"access-ticket.key"
+                                       : std::filesystem::path();
+    }
     const std::filesystem::path dir = app_data_chast_dir();
     return dir.empty() ? std::filesystem::path() : dir / L"access-ticket.key";
 }
@@ -440,6 +462,10 @@ void ViewerBridge::Shutdown() {
         texture_sink_->SetOutput(nullptr);
         camera_sink_->SetOutput(nullptr);
     }
+    if (keep_awake_) {
+        ReleaseViewerAwakeRequest();
+        keep_awake_ = false;
+    }
     if (session_) {
         session_->Detach(this);
         if (display_stream_) {
@@ -529,13 +555,56 @@ void ViewerBridge::HandleMethodCall(
         }
         const auto stream = static_cast<uint32_t>(value);
         const uint32_t display_index = found->stream.display_index;
+        RECT remote_display{};
+        RECT remote_desktop{};
+        bool have_remote_display = false;
+        uint32_t remote_display_count = 0;
+        for (size_t index = 0; index < found->stream.info.displays.size(); ++index) {
+            const auto& display = found->stream.info.displays[index];
+            if (display.right <= display.left || display.bottom <= display.top) {
+                continue;
+            }
+            RECT bounds{display.left, display.top, display.right, display.bottom};
+            if (!have_remote_display) {
+                remote_desktop = bounds;
+                have_remote_display = true;
+            } else {
+                remote_desktop.left = std::min(remote_desktop.left, bounds.left);
+                remote_desktop.top = std::min(remote_desktop.top, bounds.top);
+                remote_desktop.right = std::max(remote_desktop.right, bounds.right);
+                remote_desktop.bottom = std::max(remote_desktop.bottom, bounds.bottom);
+            }
+            ++remote_display_count;
+            if (index == display_index) remote_display = bounds;
+        }
+        if (remote_display.right <= remote_display.left ||
+            remote_display.bottom <= remote_display.top) {
+            const auto& info = found->stream.info;
+            const uint32_t width = info.source_width > 0 ? info.source_width : info.width;
+            const uint32_t height = info.source_height > 0 ? info.source_height : info.height;
+            const int64_t right = static_cast<int64_t>(info.origin_x) + width;
+            const int64_t bottom = static_cast<int64_t>(info.origin_y) + height;
+            if (width == 0 || height == 0 ||
+                right > std::numeric_limits<LONG>::max() ||
+                bottom > std::numeric_limits<LONG>::max()) {
+                result->Success(flutter::EncodableValue(false)); return;
+            }
+            remote_display = RECT{info.origin_x, info.origin_y,
+                                  static_cast<LONG>(right),
+                                  static_cast<LONG>(bottom)};
+            remote_desktop = remote_display;
+            remote_display_count = 1;
+        }
         const auto it = session_->windows.find(stream);
         if (it != session_->windows.end() && IsWindow(it->second)) {
             ShowWindow(it->second, SW_RESTORE);
             SetForegroundWindow(it->second);
             result->Success(flutter::EncodableValue(true)); return;
         }
-        result->Success(flutter::EncodableValue(open_display_window && open_display_window(session_, stream, peer_id, display_index)));
+        result->Success(flutter::EncodableValue(open_display_window &&
+            open_display_window(session_, stream, peer_id, display_index,
+                                remote_display, remote_desktop,
+                                remote_display_count)));
         return;
     }
 
@@ -736,10 +805,30 @@ void ViewerBridge::HandleMethodCall(
         session_generation_ = session_->generation.load();
         cursor_revisions_.clear();
         viewer_->Stop();
+        if (keep_awake_) {
+            ReleaseViewerAwakeRequest();
+            keep_awake_ = false;
+        }
         // The plugin textures may be unregistered as soon as this returns.
         texture_sink_->SetOutput(nullptr);
         camera_sink_->SetOutput(nullptr);
         result->Success();
+        return;
+    }
+
+    if (method == "setKeepAwake") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setKeepAwake wants a bool");
+            return;
+        }
+        if (*enabled && !keep_awake_) {
+            keep_awake_ = AcquireViewerAwakeRequest();
+        } else if (!*enabled && keep_awake_) {
+            ReleaseViewerAwakeRequest();
+            keep_awake_ = false;
+        }
+        result->Success(flutter::EncodableValue(!*enabled || keep_awake_));
         return;
     }
 

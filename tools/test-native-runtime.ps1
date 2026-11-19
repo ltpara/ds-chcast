@@ -1,14 +1,20 @@
 # Opt-in, loopback-only Windows tray/tunnel acceptance. Requires an existing
 # CMake build tree and Go. Does not install a service or alter host profiles.
 [CmdletBinding()]
-param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter, [switch]$FileTransfer, [switch]$ViewerStrategy, [switch]$InputInjection)
+param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter, [switch]$MultiWindow, [switch]$FileTransfer, [switch]$ViewerStrategy, [switch]$InputInjection)
 
 $ErrorActionPreference = 'Stop'
-if ($Flutter -and -not $Browser -and -not $FileTransfer -and -not $ViewerStrategy -and -not $InputInjection) {
-    throw '-Flutter requires -Browser so the real Flutter session is disconnected through the management page.'
+if ($Flutter -and -not $Browser -and -not $MultiWindow -and -not $FileTransfer -and -not $ViewerStrategy -and -not $InputInjection) {
+    throw '-Flutter requires a browser, multi-window, file-transfer, viewer-strategy, or input-injection acceptance mode.'
 }
 if ($DualFlutter -and -not ($Flutter -and $Browser)) {
     throw '-DualFlutter requires both -Flutter and -Browser.'
+}
+if ($MultiWindow -and -not $Flutter) {
+    throw '-MultiWindow requires -Flutter.'
+}
+if ($MultiWindow -and ($Browser -or $DualFlutter -or $FileTransfer -or $ViewerStrategy -or $InputInjection)) {
+    throw '-MultiWindow runs as a dedicated Flutter-only acceptance; do not combine it with browser, dual-viewer, file-transfer, viewer-strategy, or input-injection modes.'
 }
 if ($FileTransfer -and -not $Flutter) {
     throw '-FileTransfer requires -Flutter.'
@@ -42,6 +48,7 @@ $oldBrowserUI = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_BROWSER_UI',
 $oldFlutterUI = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FLUTTER_UI', 'Process')
 $oldFlutterBin = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FLUTTER_BIN', 'Process')
 $oldDualFlutter = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_DUAL_FLUTTER', 'Process')
+$oldMultiWindow = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW', 'Process')
 $oldFileTransfer = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FILE_TRANSFER', 'Process')
 $oldViewerStrategy = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_VIEWER_STRATEGY', 'Process')
 $oldInputInjection = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_INPUT_INJECTION', 'Process')
@@ -52,8 +59,15 @@ try {
     if ($Flutter) {
         Push-Location (Join-Path $repoRoot 'app')
         try {
-            & flutter build windows --release *> (Join-Path $runRoot 'flutter-build.log')
-            if ($LASTEXITCODE -ne 0) { throw "Flutter Release build failed; see $runRoot\flutter-build.log" }
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & flutter build windows --release *> (Join-Path $runRoot 'flutter-build.log')
+                $flutterBuildExitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($flutterBuildExitCode -ne 0) { throw "Flutter Release build failed; see $runRoot\flutter-build.log" }
         } finally {
             Pop-Location
         }
@@ -63,6 +77,11 @@ try {
             $env:CHAST_NATIVE_DUAL_FLUTTER = '1'
         } else {
             Remove-Item Env:CHAST_NATIVE_DUAL_FLUTTER -ErrorAction SilentlyContinue
+        }
+        if ($MultiWindow) {
+            $env:CHAST_NATIVE_MULTIWINDOW = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_MULTIWINDOW -ErrorAction SilentlyContinue
         }
         if ($FileTransfer) {
             $env:CHAST_NATIVE_FILE_TRANSFER = '1'
@@ -83,6 +102,7 @@ try {
         Remove-Item Env:CHAST_NATIVE_FLUTTER_UI -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_FLUTTER_BIN -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_DUAL_FLUTTER -ErrorAction SilentlyContinue
+        Remove-Item Env:CHAST_NATIVE_MULTIWINDOW -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_FILE_TRANSFER -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_VIEWER_STRATEGY -ErrorAction SilentlyContinue
         Remove-Item Env:CHAST_NATIVE_INPUT_INJECTION -ErrorAction SilentlyContinue
@@ -107,6 +127,7 @@ try {
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FLUTTER_UI', $oldFlutterUI, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FLUTTER_BIN', $oldFlutterBin, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_DUAL_FLUTTER', $oldDualFlutter, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW', $oldMultiWindow, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FILE_TRANSFER', $oldFileTransfer, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_VIEWER_STRATEGY', $oldViewerStrategy, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_INPUT_INJECTION', $oldInputInjection, 'Process')

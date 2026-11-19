@@ -142,6 +142,7 @@ void main() {
     const MethodChannel channel = MethodChannel('chast/viewer');
     final Completer<void> starting = Completer<void>();
     final Completer<void> started = Completer<void>();
+    final List<bool> awakeCalls = <bool>[];
     int polls = 0;
     final Directory dir = Directory.systemTemp.createTempSync('chast-poll-');
     StreamPreferences.configPathOverride = '${dir.path}/preferences.json';
@@ -157,6 +158,9 @@ void main() {
         case 'status':
           ++polls;
           return <String, Object>{'state': 'idle'};
+        case 'setKeepAwake':
+          awakeCalls.add(call.arguments as bool);
+          return true;
         case 'loadPassword':
           return '';
         default:
@@ -197,11 +201,13 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 250));
     expect(polls, greaterThan(0));
+    expect(awakeCalls, <bool>[true]);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
     final int closedPolls = polls;
     await tester.pump(const Duration(seconds: 1));
     expect(polls, closedPolls);
+    expect(awakeCalls, <bool>[true, false]);
   });
 }

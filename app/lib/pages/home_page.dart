@@ -834,22 +834,7 @@ class _HomePageState extends State<HomePage> {
       setState(() => _error = tr('访问令牌过长，最多 128 字节'));
       return;
     }
-    final ConnectTarget? target;
-    if (device.viaServer) {
-      target = ConnectTarget(
-        '',
-        0,
-        token: token,
-        server: device.server,
-        hostId: device.id,
-        displayName: device.name,
-        mode: _server.mode,
-        serverKey: _server.key,
-        linkKey: _server.linkKey,
-      );
-    } else {
-      target = parseConnectTarget(device.id, token: token);
-    }
+    final ConnectTarget? target = _targetForDevice(device, token: token);
     if (target == null) {
       setState(
         () => _error = tr('设备地址无效：{p1}', <String, Object?>{'p1': device.id}),
@@ -863,6 +848,111 @@ class _HomePageState extends State<HomePage> {
       sessionMode: sessionMode,
       rdpPort: rdpPort,
     );
+  }
+
+  ConnectTarget? _targetForDevice(Device device, {String token = ''}) {
+    if (device.viaServer) {
+      return ConnectTarget(
+        '',
+        0,
+        token: token,
+        server: device.server,
+        hostId: device.id,
+        displayName: device.name,
+        mode: _server.mode,
+        serverKey: _server.key,
+        linkKey: _server.linkKey,
+      );
+    }
+    return parseConnectTarget(device.id, token: token);
+  }
+
+  Future<void> _editDefaultControl(Device device) async {
+    final ConnectTarget? target = _targetForDevice(device);
+    if (target == null) {
+      _showSnack(tr('设备地址无效：{p1}', <String, Object?>{'p1': device.id}));
+      return;
+    }
+    final ViewPreferences prefs = ViewPreferences.load(
+      peerId: target.preferencesKey,
+    );
+    _DefaultControlStart selected = !prefs.defaultViewOnlyConfigured
+        ? _DefaultControlStart.managed
+        : prefs.defaultViewOnly
+        ? _DefaultControlStart.viewOnly
+        : _DefaultControlStart.control;
+    final _DefaultControlStart? result = await showDialog<_DefaultControlStart>(
+      context: context,
+      builder: (BuildContext dialogContext) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setDialogState) =>
+            AlertDialog(
+              title: Text(tr('新会话默认控制方式')),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  RadioGroup<_DefaultControlStart>(
+                    groupValue: selected,
+                    onChanged: (_DefaultControlStart? value) {
+                      if (value != null) {
+                        setDialogState(() => selected = value);
+                      }
+                    },
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        RadioListTile<_DefaultControlStart>(
+                          value: _DefaultControlStart.viewOnly,
+                          title: Text(tr('仅查看')),
+                        ),
+                        RadioListTile<_DefaultControlStart>(
+                          value: _DefaultControlStart.control,
+                          title: Text(tr('连接后启用控制')),
+                        ),
+                        RadioListTile<_DefaultControlStart>(
+                          value: _DefaultControlStart.managed,
+                          title: Text(tr('遵循管理策略（无策略时仅查看）')),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      tr('启用控制仍要求主机开放输入权限。'),
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                ],
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: Text(tr('取消')),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, selected),
+                  child: Text(tr('保存')),
+                ),
+              ],
+            ),
+      ),
+    );
+    if (result == null) return;
+    switch (result) {
+      case _DefaultControlStart.viewOnly:
+        ViewPreferences.update(
+          peerId: target.preferencesKey,
+          defaultViewOnly: true,
+        );
+      case _DefaultControlStart.control:
+        ViewPreferences.update(
+          peerId: target.preferencesKey,
+          defaultViewOnly: false,
+        );
+      case _DefaultControlStart.managed:
+        ViewPreferences.clearDefaultViewOnly(peerId: target.preferencesKey);
+    }
+    _showSnack(tr('已保存新会话控制方式'));
   }
 
   /// Asks for the host's RDP port, then opens a port-forward session that
@@ -2926,6 +3016,7 @@ class _HomePageState extends State<HomePage> {
                             sessionMode: 'port_forward',
                           ),
                           onRdp: () => _connectRdp(device),
+                          onDefaultControl: () => _editDefaultControl(device),
                           onRename: () => _renameDevice(device),
                           onSave: () => _promote(device),
                           onRemove: () => _removeRecent(device),
@@ -3389,6 +3480,7 @@ class _HomePageState extends State<HomePage> {
       onCamera: () => _connectDevice(device, sessionMode: 'camera'),
       onPortForward: () => _connectDevice(device, sessionMode: 'port_forward'),
       onRdp: () => _connectRdp(device),
+      onDefaultControl: () => _editDefaultControl(device),
       onRename: () => _renameDevice(device),
       onFavorite: () => _toggleFavorite(device),
       onWake: () => _wakeDevice(device),
@@ -5000,6 +5092,8 @@ Future<void> _copyText(BuildContext context, String text, String done) async {
   );
 }
 
+enum _DefaultControlStart { viewOnly, control, managed }
+
 class _DeviceCard extends StatelessWidget {
   const _DeviceCard({
     required this.device,
@@ -5011,6 +5105,7 @@ class _DeviceCard extends StatelessWidget {
     required this.onCamera,
     required this.onPortForward,
     required this.onRdp,
+    required this.onDefaultControl,
     required this.onRename,
     required this.onFavorite,
     required this.onWake,
@@ -5034,6 +5129,7 @@ class _DeviceCard extends StatelessWidget {
   final VoidCallback onCamera;
   final VoidCallback onPortForward;
   final VoidCallback onRdp;
+  final VoidCallback onDefaultControl;
   final VoidCallback onRename;
   final VoidCallback onFavorite;
   final VoidCallback onWake;
@@ -5221,6 +5317,8 @@ class _DeviceCard extends StatelessWidget {
                       onPortForward();
                     } else if (value == 'rdp') {
                       onRdp();
+                    } else if (value == 'default-control') {
+                      onDefaultControl();
                     } else if (value == 'copy-id') {
                       unawaited(_copyId(context));
                     } else if (value == 'copy-server') {
@@ -5268,6 +5366,10 @@ class _DeviceCard extends StatelessWidget {
                         PopupMenuItem<String>(
                           value: 'rdp',
                           child: Text(tr('RDP')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'default-control',
+                          child: Text(tr('新会话默认控制方式…')),
                         ),
                         PopupMenuItem<String>(
                           value: 'copy-id',
@@ -5402,6 +5504,7 @@ class _RecentCard extends StatelessWidget {
     required this.onCamera,
     required this.onPortForward,
     required this.onRdp,
+    required this.onDefaultControl,
     required this.onRename,
     required this.onSave,
     required this.onRemove,
@@ -5415,6 +5518,7 @@ class _RecentCard extends StatelessWidget {
   final VoidCallback onCamera;
   final VoidCallback onPortForward;
   final VoidCallback onRdp;
+  final VoidCallback onDefaultControl;
   final VoidCallback onRename;
   final VoidCallback onSave;
   final VoidCallback onRemove;
@@ -5437,6 +5541,10 @@ class _RecentCard extends StatelessWidget {
         PopupMenuItem<String>(value: 'camera', child: Text(tr('主机摄像头'))),
         PopupMenuItem<String>(value: 'port-forward', child: Text(tr('端口转发'))),
         PopupMenuItem<String>(value: 'rdp', child: Text(tr('RDP'))),
+        PopupMenuItem<String>(
+          value: 'default-control',
+          child: Text(tr('新会话默认控制方式…')),
+        ),
         PopupMenuItem<String>(value: 'copy-id', child: Text(tr('复制 ID'))),
         PopupMenuItem<String>(value: 'rename', child: Text(tr('重命名'))),
         PopupMenuItem<String>(value: 'save', child: Text(tr('保存到我的设备'))),
@@ -5456,6 +5564,8 @@ class _RecentCard extends StatelessWidget {
       onPortForward();
     } else if (value == 'rdp') {
       onRdp();
+    } else if (value == 'default-control') {
+      onDefaultControl();
     } else if (value == 'copy-id') {
       await _copyDeviceId(context, device.id);
     } else if (value == 'rename') {

@@ -310,6 +310,7 @@ add_library(chast.host STATIC
     src/host/shared_loopback.cc
     src/host/host_security.cc
     src/host/host_settings.cc
+    src/host/machine_state_security.cc
     src/host/host_client_strategy.cc
     src/host/live_connection.cc
     src/host/host_server.cc
@@ -344,6 +345,9 @@ add_library(chast.host.tray STATIC
     host/i18n.cc
     host/i18n_en.cc
     host/platform.cc
+    host/firewall_com_rule.cc
+    host/firewall_transaction.cc
+    host/file_snapshot.cc
     host/elevation_handoff.cc
     host/tunnel.cc
     host/service.cc
@@ -355,7 +359,7 @@ add_library(chast.host.tray STATIC
 target_include_directories(chast.host.tray PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/host)
-target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi32 userenv)
+target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi32 userenv oleaut32)
 
 # Notification-area host application. It is product code, so it is built even
 # when the test tools are switched off.
@@ -553,6 +557,10 @@ if(CHAST_BUILD_TESTS)
     # Settings file round-trip: no GPU, no network, no certificate store.
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host.tray)
+    add_executable(chast-machine-state-security-test tests/machine_state_security_test.cc)
+    target_include_directories(chast-machine-state-security-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/host)
+    target_link_libraries(chast-machine-state-security-test PRIVATE chast.host)
     add_executable(chast-host-client-strategy-test tests/host_client_strategy_test.cc)
     target_link_libraries(chast-host-client-strategy-test PRIVATE chast.host)
     # Live connection control plane: runtime and connection id generation, the
@@ -561,10 +569,52 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-live-connection-test tests/host_live_connection_test.cc)
     target_link_libraries(chast-host-live-connection-test PRIVATE chast.host)
 
+    # Process-wide session leases are tested with callbacks; the test never
+    # creates a real Windows power request.
+    add_executable(chast-reference-counted-lease-test
+        tests/reference_counted_lease_test.cc)
+    target_include_directories(chast-reference-counted-lease-test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if(WIN32)
+        # Exercises the real, short-lived Windows execution-state request.
+        # The test never changes persistent power settings or starts a session.
+        add_executable(chast-viewer-awake-request-test
+            tests/viewer_awake_request_test.cc
+            app/windows/viewer/viewer_awake_request.cc)
+        target_include_directories(chast-viewer-awake-request-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer)
+        target_compile_definitions(chast-viewer-awake-request-test PRIVATE NOMINMAX)
+        target_compile_features(chast-viewer-awake-request-test PRIVATE cxx_std_20)
+        target_link_libraries(chast-viewer-awake-request-test PRIVATE PowrProf)
+    endif()
+
     # JSONL records for the service and worker: timestamp shape, escaping,
     # invalid-UTF-8 replacement, rotation and concurrent appends.
     add_executable(chast-service-log-test tests/service_log_test.cc)
     target_link_libraries(chast-service-log-test PRIVATE chast.host.tray)
+
+    # Hidden child-process exit and timeout handling; the test child is this
+    # executable itself and never invokes netsh or SCM.
+    add_executable(chast-platform-process-test tests/platform_process_test.cc)
+    target_link_libraries(chast-platform-process-test PRIVATE chast.host.tray)
+
+    # Pure ownership checks for fixed-name firewall rules; never accesses the
+    # local firewall policy.
+    add_executable(chast-firewall-rule-test tests/firewall_rule_test.cc)
+    target_link_libraries(chast-firewall-rule-test PRIVATE chast.host.tray)
+    add_executable(chast-firewall-transaction-test tests/firewall_transaction_test.cc)
+    target_link_libraries(chast-firewall-transaction-test PRIVATE chast.host.tray)
+    add_executable(chast-file-snapshot-test tests/file_snapshot_test.cc)
+    target_link_libraries(chast-file-snapshot-test PRIVATE chast.host.tray)
+    add_executable(chast-rollback-stack-test tests/rollback_stack_test.cc)
+    target_link_libraries(chast-rollback-stack-test PRIVATE chast.host.tray)
+    add_executable(chast-service-stop-test tests/service_stop_test.cc)
+    target_include_directories(chast-service-stop-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/host)
+    add_executable(chast-service-install-test tests/service_install_test.cc)
+    target_include_directories(chast-service-install-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/host)
+    add_executable(chast-service-uninstall-test tests/service_uninstall_test.cc)
+    target_include_directories(chast-service-uninstall-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/host)
 
     # Multi-viewer host over loopback QUIC: concurrent admission, the
     # connection cap, per-session audit records and the control lease. The
@@ -680,6 +730,17 @@ if(CHAST_BUILD_TESTS)
     target_include_directories(chast-display-privacy-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(chast-display-privacy-test PRIVATE chast.host)
 
+    # Remote monitor geometry and visibility recovery are tested without
+    # changing the machine's display configuration.
+    add_executable(chast-display-layout-test
+        tests/display_layout_test.cc
+        app/windows/runner/display_layout.cc)
+    target_include_directories(chast-display-layout-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/runner)
+    target_compile_definitions(chast-display-layout-test PRIVATE NOMINMAX)
+    target_compile_features(chast-display-layout-test PRIVATE cxx_std_20)
+    target_link_libraries(chast-display-layout-test PRIVATE shell32 ole32)
+
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
     add_executable(chast-host-security-test tests/host_security_test.cc)
@@ -794,7 +855,21 @@ if(CHAST_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/viewer_client_strategy.json")
     add_test(NAME host_live_connection COMMAND chast-host-live-connection-test)
     set_tests_properties(host_live_connection PROPERTIES TIMEOUT 120)
+    add_test(NAME reference_counted_lease
+        COMMAND chast-reference-counted-lease-test)
+    if(WIN32)
+        add_test(NAME viewer_awake_request COMMAND chast-viewer-awake-request-test)
+        set_tests_properties(viewer_awake_request PROPERTIES TIMEOUT 30)
+    endif()
     add_test(NAME service_log COMMAND chast-service-log-test)
+    add_test(NAME platform_process COMMAND chast-platform-process-test)
+    add_test(NAME firewall_rule COMMAND chast-firewall-rule-test)
+    add_test(NAME firewall_transaction COMMAND chast-firewall-transaction-test)
+    add_test(NAME file_snapshot COMMAND chast-file-snapshot-test)
+    add_test(NAME rollback_stack COMMAND chast-rollback-stack-test)
+    add_test(NAME service_stop COMMAND chast-service-stop-test)
+    add_test(NAME service_install COMMAND chast-service-install-test)
+    add_test(NAME service_uninstall COMMAND chast-service-uninstall-test)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_parity COMMAND chast-host-parity-test)
@@ -833,7 +908,14 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME multi_session COMMAND chast-multi-session-test)
     set_tests_properties(multi_session PROPERTIES TIMEOUT 180)
     add_test(NAME virtual_display COMMAND chast-virtual-display-test)
+    add_test(NAME machine_state_security COMMAND chast-machine-state-security-test)
+    set_tests_properties(machine_state_security PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    add_test(NAME machine_state_security_untrusted_owner
+        COMMAND chast-machine-state-security-test --untrusted-owner)
+    set_tests_properties(machine_state_security_untrusted_owner PROPERTIES
+        TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME display_privacy COMMAND chast-display-privacy-test)
+    add_test(NAME display_layout COMMAND chast-display-layout-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME access_ticket COMMAND chast-access-ticket-test)
     add_test(NAME managed_access COMMAND chast-managed-access-test)
@@ -939,6 +1021,11 @@ if(CHAST_BUILD_TESTS)
     # removed again.
     add_test(NAME viewer_folder_download COMMAND chast-viewer-probe)
     set_tests_properties(viewer_folder_download PROPERTIES TIMEOUT 180)
+    # Two independent viewer engines share one loopback host; their local
+    # audio-processing choices and recordings must remain session-scoped.
+    add_test(NAME viewer_session_isolation
+        COMMAND chast-viewer-probe --viewer-session-isolation)
+    set_tests_properties(viewer_session_isolation PROPERTIES TIMEOUT 120)
     # Protocol v32: a files-only request must reach streaming with no picture
     # size, no displays and zero frames, and the same shared folder must still
     # list, download and accept an upload. The refuser host (file transfer off)

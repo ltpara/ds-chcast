@@ -352,6 +352,64 @@ function Wait-Trace([scriptblock]$Predicate, [int]$TimeoutSeconds, [string]$Desc
     throw "Timed out waiting for native input trace: $Description ($TracePath)"
 }
 
+function Get-AReleaseSequence(
+    [object[]]$Items,
+    [int]$ReceivedBefore,
+    [int]$QueuedBefore,
+    [int]$ReleaseAllBefore
+) {
+    $received = @($Items | Where-Object {
+        $_.kind -eq 'release_control' -and $_.stage -eq 'input_release_received'
+    }).Count -gt $ReceivedBefore
+    $queued = @($Items | Where-Object {
+        $_.kind -eq 'release_control' -and $_.stage -eq 'release_held_queued'
+    }).Count -gt $QueuedBefore
+
+    $releaseAllIndex = -1
+    $releaseAllNumber = 0
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        if ($Items[$i].kind -eq 'release_control' -and
+            $Items[$i].stage -eq 'release_all_begin') {
+            $releaseAllNumber++
+            if ($releaseAllNumber -gt $ReleaseAllBefore) {
+                $releaseAllIndex = $i
+                break
+            }
+        }
+    }
+
+    $releaseAllEndIndex = -1
+    $aUpIndex = -1
+    if ($releaseAllIndex -ge 0) {
+        for ($i = $releaseAllIndex + 1; $i -lt $Items.Count; $i++) {
+            if ($Items[$i].kind -eq 'release_control' -and
+                $Items[$i].stage -eq 'release_all_end') {
+                $releaseAllEndIndex = $i
+                break
+            }
+            if ($Items[$i].kind -eq 'injected' -and
+                $Items[$i].input_type -eq 1 -and
+                $Items[$i].scan_code -eq 30 -and
+                ($Items[$i].flags -band 2) -ne 0 -and
+                $aUpIndex -lt 0) {
+                $aUpIndex = $i
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Received = $received
+        Queued = $queued
+        ReleaseAllStarted = $releaseAllIndex -ge 0
+        ReleaseAllCompleted = $releaseAllEndIndex -ge 0
+        InjectedAUp = $aUpIndex -ge 0 -and
+            $releaseAllEndIndex -gt $aUpIndex
+        ReleaseAllIndex = $releaseAllIndex
+        AUpIndex = $aUpIndex
+        ReleaseAllEndIndex = $releaseAllEndIndex
+    }
+}
+
 function Show-Toolbar(
     [IntPtr]$SessionWindow,
     [IntPtr]$ViewWindow,
@@ -425,6 +483,11 @@ $result = [ordered]@{
     control_off_verified = $false
     remote_a_up_before_physical_cleanup = $false
     physical_cleanup_has_no_key_a_event = $false
+    input_release_received = $false
+    release_held_queued = $false
+    release_all_started = $false
+    release_all_completed = $false
+    injected_a_up_before_physical_cleanup = $false
     session_handle = $sessionHandle.ToInt64()
     render_handle = $viewHandle.ToInt64()
     width = $width
@@ -487,6 +550,17 @@ try {
     $result.a_down_events = @($events | Where-Object { $_.kind -eq 'key' -and $_.hid_usage -eq 4 -and $_.action -eq 'down' }).Count
     Start-Sleep -Milliseconds 400
 
+    $traceBeforeControlOff = @(Read-TraceEvents $TracePath)
+    $releaseReceivedBefore = @($traceBeforeControlOff | Where-Object {
+        $_.kind -eq 'release_control' -and $_.stage -eq 'input_release_received'
+    }).Count
+    $releaseQueuedBefore = @($traceBeforeControlOff | Where-Object {
+        $_.kind -eq 'release_control' -and $_.stage -eq 'release_held_queued'
+    }).Count
+    $releaseAllBefore = @($traceBeforeControlOff | Where-Object {
+        $_.kind -eq 'release_control' -and $_.stage -eq 'release_all_begin'
+    }).Count
+
     Show-Toolbar $sessionHandle $viewHandle $width $ArtifactDirectory
     Send-Click $viewHandle $keyboardX $keyboardY
     $result.control_off_clicked = $true
@@ -500,7 +574,28 @@ try {
     $controlEnabled = $false
     $result.control_off_verified = $true
 
-    $events = @(Wait-Trace { param($items) @($items | Where-Object { $_.kind -eq 'key' -and $_.hid_usage -eq 4 -and $_.action -eq 'up' }).Count -gt 0 } 10 'remote A up before physical cleanup')
+    $releaseDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $events = @(Read-TraceEvents $TracePath)
+        $releaseSequence = Get-AReleaseSequence $events `
+            $releaseReceivedBefore $releaseQueuedBefore $releaseAllBefore
+        $result.input_release_received = $releaseSequence.Received
+        $result.release_held_queued = $releaseSequence.Queued
+        $result.release_all_started = $releaseSequence.ReleaseAllStarted
+        $result.release_all_completed = $releaseSequence.ReleaseAllCompleted
+        $result.injected_a_up_before_physical_cleanup = $releaseSequence.InjectedAUp
+        if ($result.input_release_received -and $result.release_held_queued -and
+            $result.release_all_started -and $result.release_all_completed -and
+            $result.injected_a_up_before_physical_cleanup) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $releaseDeadline)
+    if (-not $result.input_release_received -or -not $result.release_held_queued -or
+        -not $result.release_all_started -or -not $result.release_all_completed -or
+        -not $result.injected_a_up_before_physical_cleanup) {
+        throw "Timed out waiting for InputRelease/release_held/release_all A-up evidence: received=$($result.input_release_received), queued=$($result.release_held_queued), started=$($result.release_all_started), completed=$($result.release_all_completed), A-up=$($result.injected_a_up_before_physical_cleanup)."
+    }
     $beforeCleanupCount = $events.Count
     $result.remote_a_up_before_physical_cleanup = $true
     $result.trace_events_before_physical_cleanup = $beforeCleanupCount

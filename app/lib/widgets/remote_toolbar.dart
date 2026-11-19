@@ -7,6 +7,7 @@ import '../theme.dart';
 import '../viewer_bridge.dart';
 import 'remote_view.dart';
 import 'keyboard_mode_button.dart';
+import 'view_scale_controls.dart';
 import 'package:chast_viewer/l10n.dart';
 
 /// A system shortcut the toolbar can ask the host to inject. The key chords
@@ -26,6 +27,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.fullscreen,
     required this.statsVisible,
     required this.fit,
+    this.zoomPercent = 100,
+    this.cursorZoomPercent = 100,
     required this.controlEnabled,
     required this.inputAvailable,
     this.showMyCursor = false,
@@ -158,6 +161,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.onExpand,
     required this.onClose,
     required this.onFitChanged,
+    this.onZoomPercentChanged,
+    this.onCursorZoomPercentChanged,
   });
 
   final bool collapsed;
@@ -165,12 +170,16 @@ class RemoteToolbar extends StatelessWidget {
   final bool fullscreen;
   final bool statsVisible;
   final ViewFit fit;
+  final int zoomPercent;
+  final int cursorZoomPercent;
   final bool controlEnabled;
   final bool inputAvailable;
+
   /// Draws the viewer pointer on the host desktop. Draw-only, so it works
   /// with remote control off too.
   final bool showMyCursor;
   final VoidCallback? onToggleShowCursor;
+
   /// Freehand drawing is draw-only and remains available while remote control
   /// is off. Pointer input is suppressed while this mode is active.
   final bool annotationMode;
@@ -365,6 +374,8 @@ class RemoteToolbar extends StatelessWidget {
   final VoidCallback onExpand;
   final VoidCallback onClose;
   final ValueChanged<ViewFit> onFitChanged;
+  final ValueChanged<int>? onZoomPercentChanged;
+  final ValueChanged<int>? onCursorZoomPercentChanged;
 
   /// Lists the playback endpoints at the moment of the long press, so a
   /// device plugged in after the session started is offered too.
@@ -606,9 +617,7 @@ class RemoteToolbar extends StatelessWidget {
     if (!clipboardAvailable) {
       return tr('服务端未开放剪贴板');
     }
-    final String action = clipboardEnabled
-        ? tr('暂停剪贴板同步')
-        : tr('恢复剪贴板同步');
+    final String action = clipboardEnabled ? tr('暂停剪贴板同步') : tr('恢复剪贴板同步');
     final String direction = clipboardDirection == 1
         ? '\n${tr('仅主机 → 查看端（含文件剪贴板）')}'
         : clipboardDirection == 2
@@ -640,10 +649,7 @@ class RemoteToolbar extends StatelessWidget {
       color: const Color(0xFF24252B),
       elevation: 8,
       items: <PopupMenuEntry<Object>>[
-        _clipboardToggleItem(
-          tr('连接时同步本机剪贴板'),
-          tr('下次连接把本机当前剪贴板推送到主机'),
-        ),
+        _clipboardToggleItem(tr('连接时同步本机剪贴板'), tr('下次连接把本机当前剪贴板推送到主机')),
       ],
     );
     if (selected == 'initial-sync') {
@@ -777,7 +783,15 @@ class RemoteToolbar extends StatelessWidget {
                 active: pinned,
                 onTap: onTogglePin,
               ),
-              _FitButton(fit: fit, onChanged: onFitChanged),
+              ViewScaleControlsButton(
+                fit: fit,
+                zoomPercent: zoomPercent,
+                cursorZoomPercent: cursorZoomPercent,
+                onFitChanged: onFitChanged,
+                onZoomPercentChanged: onZoomPercentChanged ?? (_) {},
+                onCursorZoomPercentChanged:
+                    onCursorZoomPercentChanged ?? (_) {},
+              ),
               const _BarSeparator(),
               _DisplayButton(
                 displays: displays,
@@ -833,10 +847,10 @@ class RemoteToolbar extends StatelessWidget {
                 onTap: onToggleControl,
               ),
               _BarButton(
-                icon: showMyCursor ? Icons.near_me_rounded : Icons.near_me_outlined,
-                tooltip: showMyCursor
-                    ? tr('停止在主机上显示我的光标')
-                    : tr('在主机上显示我的光标'),
+                icon: showMyCursor
+                    ? Icons.near_me_rounded
+                    : Icons.near_me_outlined,
+                tooltip: showMyCursor ? tr('停止在主机上显示我的光标') : tr('在主机上显示我的光标'),
                 active: showMyCursor,
                 onTap: () => onToggleShowCursor?.call(),
               ),
@@ -863,7 +877,10 @@ class RemoteToolbar extends StatelessWidget {
                 onSelected: onSpecialAction,
               ),
               if (onKeyboardMode != null)
-                KeyboardModeButton(mode: keyboardMode, onChanged: onKeyboardMode),
+                KeyboardModeButton(
+                  mode: keyboardMode,
+                  onChanged: onKeyboardMode,
+                ),
               _BarButton(
                 icon: Icons.text_fields_rounded,
                 tooltip: specialKeysAvailable ? tr('发送文本') : tr('需要远程键鼠控制'),
@@ -1556,73 +1573,6 @@ class _BarButton extends StatelessWidget {
   }
 }
 
-class _FitButton extends StatelessWidget {
-  const _FitButton({required this.fit, required this.onChanged});
-
-  final ViewFit fit;
-  final ValueChanged<ViewFit> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: tr('画面适应方式'),
-      waitDuration: const Duration(milliseconds: 450),
-      child: PopupMenuButton<ViewFit>(
-        tooltip: '',
-        color: const Color(0xFF24252B),
-        elevation: 8,
-        padding: EdgeInsets.zero,
-        onSelected: onChanged,
-        itemBuilder: (BuildContext context) {
-          return <PopupMenuEntry<ViewFit>>[
-            _fitItem(ViewFit.adaptive, tr('自适应窗口'), Icons.fit_screen_rounded),
-            _fitItem(ViewFit.original, tr('原始大小'), Icons.crop_original_rounded),
-          ];
-        },
-        child: SizedBox(
-          width: 32,
-          height: 32,
-          child: Icon(
-            fit == ViewFit.original
-                ? Icons.crop_original_rounded
-                : Icons.fit_screen_rounded,
-            size: 18,
-            color: Colors.grey.shade300,
-          ),
-        ),
-      ),
-    );
-  }
-
-  PopupMenuItem<ViewFit> _fitItem(ViewFit value, String label, IconData icon) {
-    final bool selected = fit == value;
-    return PopupMenuItem<ViewFit>(
-      value: value,
-      height: 38,
-      child: Row(
-        children: <Widget>[
-          Icon(
-            icon,
-            size: 16,
-            color: selected ? kAccentBright : Colors.white54,
-          ),
-          const SizedBox(width: 10),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              color: selected ? kAccentBright : Colors.white70,
-            ),
-          ),
-          const Spacer(),
-          if (selected)
-            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
-        ],
-      ),
-    );
-  }
-}
-
 class _DisplayButton extends StatelessWidget {
   const _DisplayButton({
     required this.displays,
@@ -2098,7 +2048,8 @@ class _StreamOptionsButton extends StatelessWidget {
         },
         itemBuilder: (BuildContext context) {
           return <PopupMenuEntry<_StreamChoice>>[
-            if (actualFormat.isNotEmpty) _section(tr('实际格式：{format}', {'format': actualFormat})),
+            if (actualFormat.isNotEmpty)
+              _section(tr('实际格式：{format}', {'format': actualFormat})),
             _section(tr('画质')),
             _item(
               _QualityChoice(ViewerStreamQuality.high),
@@ -2197,10 +2148,20 @@ class _StreamOptionsButton extends StatelessWidget {
             ),
             if (onSelectFullColor != null) ...[
               _section(tr('色彩细节')),
-              _item(const _ColorChoice(false), tr('标准色彩 4:2:0'),
-                tr('兼顾性能与带宽'), Icons.speed_rounded, !fullColor),
-              _item(const _ColorChoice(true), tr('完整色彩 4:4:4'),
-                tr('使用 VP9；所有观看端支持时生效'), Icons.palette_outlined, fullColor),
+              _item(
+                const _ColorChoice(false),
+                tr('标准色彩 4:2:0'),
+                tr('兼顾性能与带宽'),
+                Icons.speed_rounded,
+                !fullColor,
+              ),
+              _item(
+                const _ColorChoice(true),
+                tr('完整色彩 4:4:4'),
+                tr('使用 VP9；所有观看端支持时生效'),
+                Icons.palette_outlined,
+                fullColor,
+              ),
             ],
           ];
         },

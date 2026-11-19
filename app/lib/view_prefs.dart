@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import 'prefs_store.dart';
+import 'view_scale.dart';
 
 /// View state the viewer remembers across launches: how the picture is fitted
 /// (RustDesk's view style), whether the stats overlay is shown, how the file
@@ -14,6 +15,8 @@ import 'prefs_store.dart';
 class ViewPreferences {
   const ViewPreferences({
     this.fit = 0,
+    this.zoomPercent = defaultViewZoomPercent,
+    this.cursorZoomPercent = defaultCursorZoomPercent,
     this.stats = false,
     this.fileSort = 0,
     this.fileSortAscending = true,
@@ -28,12 +31,16 @@ class ViewPreferences {
     this.showMyCursor = false,
     this.syncInitClipboard = false,
     this.askSessionNote = false,
+    this.defaultViewOnly = true,
     this.fitConfigured = false,
     this.syncInitClipboardConfigured = false,
+    this.defaultViewOnlyConfigured = false,
   });
 
   /// 0 = adaptive (fit the window), 1 = original pixels.
   final int fit;
+  final int zoomPercent;
+  final int cursorZoomPercent;
   final bool stats;
 
   /// 0 = name, 1 = size, 2 = modified (`FileBrowserSort` order).
@@ -82,13 +89,21 @@ class ViewPreferences {
   /// property of one device.
   final bool askSessionNote;
 
+  /// Initial input state for the next desktop session. The secure default is
+  /// view-only; an explicit per-peer choice may start control when the host
+  /// grants input. An unset value can inherit a managed recommendation.
+  final bool defaultViewOnly;
+
   /// Distinguishes a saved local choice from the built-in default. Managed
   /// Viewer settings in `default` mode use their recommendation only when no
   /// local choice exists yet.
   final bool fitConfigured;
   final bool syncInitClipboardConfigured;
+  final bool defaultViewOnlyConfigured;
 
   static const String _fitKey = 'view_fit';
+  static const String _zoomPercentKey = 'view_zoom_percent';
+  static const String _cursorZoomPercentKey = 'view_cursor_zoom_percent';
   static const String _statsKey = 'view_stats';
   static const String _fileSortKey = 'file_sort';
   static const String _fileSortAscendingKey = 'file_sort_asc';
@@ -103,6 +118,7 @@ class ViewPreferences {
   static const String _showMyCursorKey = 'view_show_my_cursor';
   static const String _syncInitClipboardKey = 'view_sync_init_clipboard';
   static const String _askSessionNoteKey = 'view_ask_session_note';
+  static const String _defaultViewOnlyKey = 'view_default_only';
 
   /// Kept here so existing tests can redirect the shared settings file.
   @visibleForTesting
@@ -117,6 +133,8 @@ class ViewPreferences {
   static ViewPreferences load({String peerId = ''}) {
     final Map<String, Object?> map = PrefsStore.readMerged(peerId);
     final Object? rawFit = map[_fitKey];
+    final Object? rawZoomPercent = map[_zoomPercentKey];
+    final Object? rawCursorZoomPercent = map[_cursorZoomPercentKey];
     final Object? rawStats = map[_statsKey];
     final Object? rawSort = map[_fileSortKey];
     final Object? rawAscending = map[_fileSortAscendingKey];
@@ -129,8 +147,19 @@ class ViewPreferences {
     final Object? rawShowMyCursor = map[_showMyCursorKey];
     final Object? rawSyncInitClipboard = map[_syncInitClipboardKey];
     final Object? rawAskSessionNote = map[_askSessionNoteKey];
+    final Object? rawDefaultViewOnly = map[_defaultViewOnlyKey];
     return ViewPreferences(
       fit: rawFit is int && (rawFit == 0 || rawFit == 1) ? rawFit : 0,
+      zoomPercent: normalizeScalePercent(
+        rawZoomPercent,
+        min: minViewZoomPercent,
+        max: maxViewZoomPercent,
+      ),
+      cursorZoomPercent: normalizeScalePercent(
+        rawCursorZoomPercent,
+        min: minCursorZoomPercent,
+        max: maxCursorZoomPercent,
+      ),
       stats: rawStats is bool ? rawStats : false,
       fileSort: rawSort is int && rawSort >= 0 && rawSort <= 2 ? rawSort : 0,
       fileSortAscending: rawAscending is bool ? rawAscending : true,
@@ -150,8 +179,10 @@ class ViewPreferences {
           ? rawSyncInitClipboard
           : false,
       askSessionNote: rawAskSessionNote is bool ? rawAskSessionNote : false,
+      defaultViewOnly: rawDefaultViewOnly is bool ? rawDefaultViewOnly : true,
       fitConfigured: rawFit is int && (rawFit == 0 || rawFit == 1),
       syncInitClipboardConfigured: rawSyncInitClipboard is bool,
+      defaultViewOnlyConfigured: rawDefaultViewOnly is bool,
     );
   }
 
@@ -186,6 +217,8 @@ class ViewPreferences {
     update(
       peerId: peerId,
       fit: prefs.fit,
+      zoomPercent: prefs.zoomPercent,
+      cursorZoomPercent: prefs.cursorZoomPercent,
       stats: prefs.stats,
       fileSort: prefs.fileSort,
       fileSortAscending: prefs.fileSortAscending,
@@ -200,6 +233,9 @@ class ViewPreferences {
       showMyCursor: prefs.showMyCursor,
       syncInitClipboard: prefs.syncInitClipboard,
       askSessionNote: prefs.askSessionNote,
+      defaultViewOnly: prefs.defaultViewOnlyConfigured
+          ? prefs.defaultViewOnly
+          : null,
     );
   }
 
@@ -208,6 +244,8 @@ class ViewPreferences {
   static void update({
     String peerId = '',
     int? fit,
+    int? zoomPercent,
+    int? cursorZoomPercent,
     bool? stats,
     int? fileSort,
     bool? fileSortAscending,
@@ -222,6 +260,7 @@ class ViewPreferences {
     bool? showMyCursor,
     bool? syncInitClipboard,
     bool? askSessionNote,
+    bool? defaultViewOnly,
   }) {
     final Map<String, Object?> shared = <String, Object?>{
       if (fileSort != null)
@@ -239,12 +278,23 @@ class ViewPreferences {
     };
     final Map<String, Object?> scoped = <String, Object?>{
       if (fit != null) _fitKey: fit == 1 ? 1 : 0,
+      if (zoomPercent != null)
+        _zoomPercentKey: zoomPercent.clamp(
+          minViewZoomPercent,
+          maxViewZoomPercent,
+        ),
+      if (cursorZoomPercent != null)
+        _cursorZoomPercentKey: cursorZoomPercent.clamp(
+          minCursorZoomPercent,
+          maxCursorZoomPercent,
+        ),
       _statsKey: ?stats,
       _reverseWheelKey: ?reverseWheel,
       _swapButtonsKey: ?swapButtons,
       _browserShowHiddenKey: ?browserShowHidden,
       _showMyCursorKey: ?showMyCursor,
       _syncInitClipboardKey: ?syncInitClipboard,
+      _defaultViewOnlyKey: ?defaultViewOnly,
       if (keyboardMode != null)
         _keyboardModeKey: _normalizeKeyboardMode(keyboardMode),
     };
@@ -260,6 +310,21 @@ class ViewPreferences {
       peerId,
       (Map<String, Object?> peer) => peer.addAll(scoped),
       shared: shared,
+    );
+  }
+
+  /// Clears this peer's local override so a managed default can apply. With
+  /// no managed value, the built-in secure default remains view-only.
+  static void clearDefaultViewOnly({String peerId = ''}) {
+    if (peerId.isEmpty) {
+      PrefsStore.update((Map<String, Object?> root) {
+        root.remove(_defaultViewOnlyKey);
+      });
+      return;
+    }
+    PrefsStore.updatePeer(
+      peerId,
+      (Map<String, Object?> peer) => peer.remove(_defaultViewOnlyKey),
     );
   }
 }

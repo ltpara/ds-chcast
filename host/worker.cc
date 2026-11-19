@@ -26,6 +26,7 @@
 #include "chast/host_client_strategy.h"
 #include "chast/identity.h"
 #include "chast/live_connection.h"
+#include "chast/machine_state_security.h"
 #include "chast/virtual_display.h"
 #include "platform.h"
 #include "service_log.h"
@@ -428,6 +429,12 @@ bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
 }  // namespace
 
 int run_worker(std::string* error) {
+    std::string state_error;
+    if (!machine_state_directory_trusted(widen(machine_settings_directory()), &state_error) ||
+        !machine_state_file_trusted(widen(machine_settings_path()), &state_error)) {
+        if (error != nullptr) *error = "机器状态目录或设置文件不可信：" + state_error;
+        return 1;
+    }
     WorkerContext context;
     g_worker = &context;
     context.log_path = service_log_path("worker.log");

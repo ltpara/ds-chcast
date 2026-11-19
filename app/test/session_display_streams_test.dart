@@ -24,8 +24,17 @@ void main() {
       const gpu = MethodChannel('flutter_gpu_texture_renderer');
       final messenger = tester.binding.defaultBinaryMessenger;
       final dir = Directory.systemTemp.createTempSync('chast-displays-');
+      final originalPhysicalSize = tester.view.physicalSize;
+      final originalDevicePixelRatio = tester.view.devicePixelRatio;
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(800, 600);
       StreamPreferences.configPathOverride = '${dir.path}/preferences.json';
       ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
+      ViewPreferences.update(
+        peerId: '127.0.0.1:1',
+        zoomPercent: 150,
+        cursorZoomPercent: 200,
+      );
       final started = Completer<void>();
       var starts = 0;
       var multi = false,
@@ -38,6 +47,7 @@ void main() {
       final captureSets = <List<int>>[];
       final events = <String>[];
       final inputs = <Map<Object?, Object?>>[];
+      final relativeMouseCalls = <Map<Object?, Object?>>[];
       final windowStreams = <int>[];
       final keyboardModes = <String>[];
       final descriptors = [
@@ -145,6 +155,10 @@ void main() {
           case 'sendInput':
             inputs.add(call.arguments as Map<Object?, Object?>);
             return true;
+          case 'setRelativeMouse':
+            final args = call.arguments as Map<Object?, Object?>;
+            relativeMouseCalls.add(args);
+            return args['enabled'] as bool;
           case 'stop':
             events.add('stop');
             return null;
@@ -157,6 +171,8 @@ void main() {
         }
       });
       addTearDown(() {
+        tester.view.devicePixelRatio = originalDevicePixelRatio;
+        tester.view.physicalSize = originalPhysicalSize;
         messenger.setMockMethodCallHandler(native, null);
         messenger.setMockMethodCallHandler(gpu, null);
         StreamPreferences.configPathOverride = null;
@@ -186,6 +202,26 @@ void main() {
       await poll();
       RemoteToolbar toolbar() =>
           tester.widget<RemoteToolbar>(find.byType(RemoteToolbar));
+      toolbar().onToggleControl();
+      await tester.pump();
+      toolbar().onToggleRelativeMouse!();
+      await tester.pump();
+      final initialRelativeCall = relativeMouseCalls.last;
+      expect(initialRelativeCall['enabled'], isTrue);
+      final int initialScaleMilli = initialRelativeCall['scaleMilli'] as int;
+      tester.view.devicePixelRatio = 2;
+      tester.view.physicalSize = const Size(1600, 1200);
+      await tester.pump();
+      await tester.pump();
+      expect(relativeMouseCalls.length, greaterThan(1));
+      expect(
+        relativeMouseCalls.last['scaleMilli'],
+        closeTo(initialScaleMilli * 2, 2),
+      );
+      toolbar().onToggleRelativeMouse!();
+      await tester.pump();
+      toolbar().onToggleControl();
+      await tester.pump();
       toolbar().onIndependentDisplays!();
       await poll();
       await poll();
@@ -195,6 +231,12 @@ void main() {
             .widgetList<RemoteView>(find.byType(RemoteView))
             .map((v) => v.textureId),
         [101, 102],
+      );
+      expect(
+        tester
+            .widgetList<RemoteView>(find.byType(RemoteView))
+            .map((view) => view.zoomPercent),
+        [150, 150],
       );
 
       final int subscriptionRequests = captureSets.length;
@@ -238,6 +280,17 @@ void main() {
       expect(toolbar().activeDisplay, kViewerDisplayAll);
       expect(find.byType(DisplayStreamView), findsNothing);
       expect(find.byType(RemoteView), findsNWidgets(2));
+      final desktopViews = tester.widgetList<RemoteView>(
+        find.byType(RemoteView),
+      );
+      expect(desktopViews.map((view) => view.zoomPercent), [100, 100]);
+      final desktopSizes = desktopViews
+          .map((view) => tester.getSize(find.byWidget(view)))
+          .toList();
+      expect(
+        desktopSizes,
+        unorderedEquals(<Size>[const Size(480, 360), const Size(720, 405)]),
+      );
       expect(starts, 1);
 
       toolbar().onIndependentDisplays!();

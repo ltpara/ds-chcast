@@ -3431,6 +3431,9 @@ struct QuicSession::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     ++input_releases;
                 }
+                if (server_config.input_release_trace) {
+                    server_config.input_release_trace("input_release_received");
+                }
                 if (injector) {
                     injector->release_held();
                 }
@@ -6217,7 +6220,9 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
         return nullptr;
     }
     if (config.allow_input && config.max_clients <= 1) {
-        impl.injector = InputInjector::create(config.dry_run_input, error);
+        impl.injector = InputInjector::create(
+            config.dry_run_input, error, config.dry_run_input_observer, {}, {},
+            config.input_release_trace);
         if (!impl.injector) {
             return nullptr;
         }
@@ -6243,7 +6248,9 @@ Error QuicSession::accept(std::unique_ptr<QuicSession>& client,
         if (client->impl_->server_config.allow_input) {
             std::string error;
             client->impl_->injector = InputInjector::create(
-                client->impl_->server_config.dry_run_input, &error);
+                client->impl_->server_config.dry_run_input, &error,
+                client->impl_->server_config.dry_run_input_observer, {}, {},
+                client->impl_->server_config.input_release_trace);
             if (!client->impl_->injector) {
                 client.reset();
                 return Error(Status::Unavailable, "input injector: " + error);

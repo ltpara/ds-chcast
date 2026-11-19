@@ -221,6 +221,9 @@ struct QuicServerConfig {
     // Walk the injection path without calling SendInput. Only for the
     // loopback check, which must not move the real pointer.
     bool dry_run_input = false;
+    // Optional dry-run evidence hooks. Leave empty outside isolated tests.
+    std::function<void(const INPUT&)> dry_run_input_observer;
+    std::function<void(const char*)> input_release_trace;
     // Called once per Hello by wait_for_client(). This is the policy hook:
     // password/2FA/trusted-device checks and the permission defaults live
     // here. When empty the legacy token gate below applies instead.

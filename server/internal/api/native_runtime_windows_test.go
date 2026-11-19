@@ -205,7 +205,10 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 		}
 		filtered = append(filtered, entry)
 	}
-	viewerEnv := append(filtered, "APPDATA="+profile)
+	viewerEnv := append(filtered,
+		"APPDATA="+profile,
+		"CHAST_NATIVE_TESTING=1",
+		"CHAST_NATIVE_TEST_TICKET_DIR="+chastDir)
 	if isolatedDownloads {
 		viewerEnv = append(viewerEnv,
 			"CHAST_NATIVE_TESTING=1",
@@ -222,7 +225,7 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 		return protectedNativeProfileFile(filepath.Join(chastDir, "server.json")) &&
 			protectedNativeProfileFile(filepath.Join(chastDir, "account.json"))
 	})
-	runNativeFlutterHomeConnect(t, proc.cmd.Process.Pid, peer, "native-runtime-viewer-token", dir)
+	runNativeFlutterHomeConnect(t, proc.cmd.Process.Pid, peer, "native-runtime-viewer-token", dir, 1, false)
 	return proc
 }
 
@@ -328,13 +331,18 @@ func assertFlutterStatsChanged(t *testing.T, paths []string) {
 	t.Logf("verified non-target Flutter stats region changed across %d/%d consecutive samples (%d PNGs)", changedPairs, comparisons, len(paths))
 }
 
-func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts string) {
+func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts string,
+	expectedSessions int, useExistingCredentials bool) {
 	t.Helper()
 	script := filepath.Join("..", "..", "..", "tools", "native-flutter-home-connect.ps1")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-		"-ExecutionPolicy", "Bypass", "-File", script, strconv.Itoa(pid), peer, artifacts)
+		"-ExecutionPolicy", "Bypass", "-File", script, strconv.Itoa(pid), peer, artifacts,
+		"-ExpectedSessionCount", strconv.Itoa(expectedSessions))
+	if useExistingCredentials {
+		cmd.Args = append(cmd.Args, "-UseExistingCredentials")
+	}
 	cmd.Stdin = strings.NewReader(token + "\n")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.CombinedOutput()
@@ -390,6 +398,7 @@ func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string)
 	if err != nil {
 		t.Fatalf("read Flutter input result: %v", err)
 	}
+	resultData = bytes.TrimPrefix(resultData, []byte{0xef, 0xbb, 0xbf})
 	var result struct {
 		ControlOnClicked                 bool `json:"control_on_clicked"`
 		ControlOnVerified                bool `json:"control_on_verified"`
@@ -397,6 +406,11 @@ func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string)
 		ControlOffVerified               bool `json:"control_off_verified"`
 		RemoteAUpBeforePhysicalCleanup   bool `json:"remote_a_up_before_physical_cleanup"`
 		PhysicalCleanupHasNoKeyAEvent    bool `json:"physical_cleanup_has_no_key_a_event"`
+		InputReleaseReceived             bool `json:"input_release_received"`
+		ReleaseHeldQueued                bool `json:"release_held_queued"`
+		ReleaseAllStarted                bool `json:"release_all_started"`
+		ReleaseAllCompleted              bool `json:"release_all_completed"`
+		InjectedAUpBeforePhysicalCleanup bool `json:"injected_a_up_before_physical_cleanup"`
 		TraceEventsBeforePhysicalCleanup int  `json:"trace_events_before_physical_cleanup"`
 		TraceEventsAfterPhysicalCleanup  int  `json:"trace_events_after_physical_cleanup"`
 	}
@@ -405,30 +419,39 @@ func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string)
 	}
 	if !result.ControlOnClicked || !result.ControlOnVerified ||
 		!result.ControlOffClicked || !result.ControlOffVerified ||
-		!result.RemoteAUpBeforePhysicalCleanup || !result.PhysicalCleanupHasNoKeyAEvent {
+		!result.RemoteAUpBeforePhysicalCleanup || !result.PhysicalCleanupHasNoKeyAEvent ||
+		!result.InputReleaseReceived || !result.ReleaseHeldQueued ||
+		!result.ReleaseAllStarted || !result.ReleaseAllCompleted ||
+		!result.InjectedAUpBeforePhysicalCleanup {
 		t.Fatalf("Flutter input UI did not verify the complete release sequence: %+v", result)
 	}
 	traceData, err := os.ReadFile(tracePath)
 	if err != nil {
 		t.Fatalf("read native input trace: %v", err)
 	}
+	type nativeInputTraceEvent struct {
+		Kind      string `json:"kind"`
+		Action    string `json:"action"`
+		HIDUsage  int    `json:"hid_usage"`
+		Stage     string `json:"stage"`
+		InputType uint32 `json:"input_type"`
+		ScanCode  uint32 `json:"scan_code"`
+		Flags     uint32 `json:"flags"`
+	}
 	var sawMouse bool
-	aDownIndex, aUpIndex := -1, -1
-	traceEvents := make([]struct {
-		Kind     string `json:"kind"`
-		Action   string `json:"action"`
-		HIDUsage int    `json:"hid_usage"`
-	}, 0)
+	aDownIndex := -1
+	releaseReceivedIndex := -1
+	releaseQueuedIndex := -1
+	releaseAllBeginIndex := -1
+	injectedAUpIndex := -1
+	releaseAllEndIndex := -1
+	traceEvents := make([]nativeInputTraceEvent, 0)
 	for _, line := range strings.Split(string(traceData), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		var event struct {
-			Kind     string `json:"kind"`
-			Action   string `json:"action"`
-			HIDUsage int    `json:"hid_usage"`
-		}
+		var event nativeInputTraceEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			t.Fatalf("parse native input trace line %q: %v", line, err)
 		}
@@ -440,15 +463,40 @@ func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string)
 		if event.Kind == "key" && event.HIDUsage == 0x04 && event.Action == "down" && aDownIndex == -1 {
 			aDownIndex = index
 		}
-		if event.Kind == "key" && event.HIDUsage == 0x04 && event.Action == "up" && aDownIndex >= 0 && aUpIndex == -1 {
-			aUpIndex = index
+		if event.Kind == "release_control" && event.Stage == "input_release_received" &&
+			aDownIndex >= 0 &&
+			releaseReceivedIndex == -1 {
+			releaseReceivedIndex = index
+		}
+		if event.Kind == "release_control" && event.Stage == "release_held_queued" &&
+			releaseReceivedIndex >= 0 && releaseQueuedIndex == -1 {
+			releaseQueuedIndex = index
+		}
+		if event.Kind == "release_control" && event.Stage == "release_all_begin" &&
+			releaseQueuedIndex >= 0 && releaseAllBeginIndex == -1 {
+			releaseAllBeginIndex = index
+		}
+		if event.Kind == "injected" && event.InputType == 1 && event.ScanCode == 0x1e &&
+			event.Flags&0x2 != 0 && releaseAllBeginIndex >= 0 && injectedAUpIndex == -1 {
+			injectedAUpIndex = index
+		}
+		if event.Kind == "release_control" && event.Stage == "release_all_end" &&
+			injectedAUpIndex >= 0 && releaseAllEndIndex == -1 {
+			releaseAllEndIndex = index
 		}
 	}
-	if !sawMouse || aDownIndex < 0 || aUpIndex < 0 {
-		t.Fatalf("native input trace missing mouse/A down/A up evidence: mouse=%t down=%d up=%d (%s)", sawMouse, aDownIndex, aUpIndex, tracePath)
+	if !sawMouse || aDownIndex < 0 || releaseReceivedIndex < 0 || releaseQueuedIndex < 0 ||
+		releaseAllBeginIndex < 0 || injectedAUpIndex < 0 || releaseAllEndIndex < 0 {
+		t.Fatalf("native input trace missing ordered release evidence: mouse=%t A-down=%d release-received=%d release-queued=%d release-all-begin=%d injected-A-up=%d release-all-end=%d (%s)",
+			sawMouse, aDownIndex, releaseReceivedIndex, releaseQueuedIndex,
+			releaseAllBeginIndex, injectedAUpIndex, releaseAllEndIndex, tracePath)
 	}
-	if aDownIndex >= aUpIndex {
-		t.Fatalf("native input trace has A up before A down: down=%d up=%d (%s)", aDownIndex, aUpIndex, tracePath)
+	if !(aDownIndex < releaseReceivedIndex && releaseReceivedIndex < releaseQueuedIndex &&
+		releaseQueuedIndex < releaseAllBeginIndex && releaseAllBeginIndex < injectedAUpIndex &&
+		injectedAUpIndex < releaseAllEndIndex) {
+		t.Fatalf("native input trace has an invalid release order: A-down=%d received=%d queued=%d begin=%d A-up=%d end=%d (%s)",
+			aDownIndex, releaseReceivedIndex, releaseQueuedIndex,
+			releaseAllBeginIndex, injectedAUpIndex, releaseAllEndIndex, tracePath)
 	}
 	if result.TraceEventsBeforePhysicalCleanup <= 0 || result.TraceEventsBeforePhysicalCleanup > len(traceEvents) {
 		t.Fatalf("invalid trace event count before physical cleanup: before=%d total=%d", result.TraceEventsBeforePhysicalCleanup, len(traceEvents))
@@ -456,15 +504,15 @@ func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string)
 	if result.TraceEventsAfterPhysicalCleanup < result.TraceEventsBeforePhysicalCleanup || result.TraceEventsAfterPhysicalCleanup > len(traceEvents) {
 		t.Fatalf("invalid trace event count after physical cleanup: before=%d after=%d total=%d", result.TraceEventsBeforePhysicalCleanup, result.TraceEventsAfterPhysicalCleanup, len(traceEvents))
 	}
-	if aUpIndex >= result.TraceEventsBeforePhysicalCleanup {
-		t.Fatalf("A up was not emitted before the physical cleanup boundary: up=%d boundary=%d", aUpIndex, result.TraceEventsBeforePhysicalCleanup)
+	if releaseAllEndIndex >= result.TraceEventsBeforePhysicalCleanup {
+		t.Fatalf("release_all did not complete before the physical cleanup boundary: end=%d boundary=%d", releaseAllEndIndex, result.TraceEventsBeforePhysicalCleanup)
 	}
 	for _, event := range traceEvents[result.TraceEventsBeforePhysicalCleanup:] {
 		if event.Kind == "key" && event.HIDUsage == 0x04 {
 			t.Fatalf("physical A cleanup emitted an unexpected trace event after the release boundary: %+v", event)
 		}
 	}
-	t.Logf("PASS: real Flutter control toggle forwarded mouse and A down/up; A up index=%d preceded physical cleanup boundary=%d and cleanup added no A event (%s)", aUpIndex, result.TraceEventsBeforePhysicalCleanup, tracePath)
+	t.Logf("PASS: Flutter sent mouse/A down, host received InputRelease, queued release_held, and release_all injected A-up at %d before cleanup boundary %d; physical cleanup added no remote A event (%s)", injectedAUpIndex, result.TraceEventsBeforePhysicalCleanup, tracePath)
 }
 
 func nativeFile(path string) bool { _, err := os.Stat(path); return err == nil }
@@ -497,14 +545,18 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	browserUI := os.Getenv("CHAST_NATIVE_BROWSER_UI") == "1"
 	flutterUI := os.Getenv("CHAST_NATIVE_FLUTTER_UI") == "1"
 	dualFlutter := os.Getenv("CHAST_NATIVE_DUAL_FLUTTER") == "1"
+	multiWindowUI := os.Getenv("CHAST_NATIVE_MULTIWINDOW") == "1"
 	fileTransferUI := os.Getenv("CHAST_NATIVE_FILE_TRANSFER") == "1"
 	viewerStrategyUI := os.Getenv("CHAST_NATIVE_VIEWER_STRATEGY") == "1"
 	inputInjectionUI := os.Getenv("CHAST_NATIVE_INPUT_INJECTION") == "1"
-	if flutterUI && !browserUI && !fileTransferUI && !viewerStrategyUI && !inputInjectionUI {
-		t.Fatal("Flutter UI acceptance requires browser, file-transfer, viewer-strategy, or input-injection mode")
+	if flutterUI && !browserUI && !multiWindowUI && !fileTransferUI && !viewerStrategyUI && !inputInjectionUI {
+		t.Fatal("Flutter UI acceptance requires browser, multi-window, file-transfer, viewer-strategy, or input-injection mode")
 	}
 	if dualFlutter && (!flutterUI || !browserUI) {
 		t.Fatal("dual Flutter acceptance requires CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_BROWSER_UI=1")
+	}
+	if multiWindowUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI || inputInjectionUI) {
+		t.Fatal("multi-window acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_MULTIWINDOW=1")
 	}
 	if fileTransferUI && !flutterUI {
 		t.Fatal("Flutter file transfer acceptance requires CHAST_NATIVE_FLUTTER_UI=1")
@@ -821,6 +873,10 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		first = rows[0]
 		return first.HostID == peer && first.RuntimeID != "" && first.State == "active"
 	})
+	if multiWindowUI {
+		runNativeFlutterHomeConnect(t, flutterViewer.cmd.Process.Pid, peer,
+			"native-runtime-viewer-token", dir, 2, true)
+	}
 	if inputInjectionUI {
 		runNativeFlutterInputUI(t, flutterViewer.cmd.Process.Pid, dir, inputTracePath)
 		verifyNativeFlutterInputEvidence(t, dir, inputTracePath)
@@ -965,7 +1021,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	if dualFlutter {
 		secondFlutterViewer = startNativeFlutterViewer(t, dir, "flutter-nontarget", flutterBin, front.URL, serverPublicKey,
 			peer, fingerprint, "native-acceptance", accountToken, false)
-	} else {
+	} else if !multiWindowUI {
 		_, secondDir = startViewer("viewer-b")
 	}
 	var second liveConnectionReply
@@ -1069,7 +1125,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		default:
 		}
 	}
-	if (!dualFlutter && nativeFile(filepath.Join(secondDir, "disconnected"))) || detail(second.ConnectionID).State != "active" {
+	if (!dualFlutter && !multiWindowUI && nativeFile(filepath.Join(secondDir, "disconnected"))) || detail(second.ConnectionID).State != "active" {
 		t.Fatal("non-target viewer disconnected")
 	}
 	if retry := disconnect(first.ConnectionID, command.RequestKey); retry.CommandID != command.CommandID {
@@ -1078,6 +1134,10 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	t.Logf("exact target runtime=%s connection=%s command=%s; other=%s remains active", first.RuntimeID, first.ConnectionID, command.CommandID, second.ConnectionID)
 	if dualFlutter {
 		t.Log("PASS: real management page disconnected one Flutter video session; the non-target Flutter viewer stayed active and its stats region continued updating during the operation")
+		return
+	}
+	if multiWindowUI {
+		t.Log("PASS: two independent session windows in one real Flutter process connected to the loopback host; exact disconnect closed one connection while the other remained active")
 		return
 	}
 

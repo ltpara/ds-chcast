@@ -42,7 +42,8 @@ bool service_running();
 // the file cannot be written; `settings` is filled either way. `warning`
 // receives non-fatal read problems and may be null.
 bool load_machine_settings(HostSettings& settings, std::string* path,
-                           std::string* warning, std::string* error);
+                           std::string* warning, std::string* error,
+                           bool persist_changes = true, bool* changed = nullptr);
 
 // Both require an elevated process. install() creates machine settings with a
 // fresh token/device identity when they are missing and starts the service;

@@ -72,6 +72,7 @@ void main() {
       final initialImage = texture.cursor;
       expect(initialImage, isNotNull);
       var focus = 0;
+      var cursorScale = 1.0;
       Future<void> draw() => tester.pumpWidget(
         MaterialApp(
           home: Center(
@@ -88,7 +89,11 @@ void main() {
                 onFocusRequested: () {
                   focus++;
                 },
-                overlayBuilder: (size) => displayCursorOverlay(texture, size),
+                overlayBuilder: (size) => displayCursorOverlay(
+                  texture,
+                  size,
+                  cursorScale: cursorScale,
+                ),
               ),
             ),
           ),
@@ -101,6 +106,15 @@ void main() {
         origin + const Offset(-3.75, 8.5),
       );
       expect(tester.getSize(find.byType(RawImage)), const Size(5, 5));
+      cursorScale = 2;
+      await draw();
+      expect(tester.getSize(find.byType(RawImage)), const Size(10, 10));
+      expect(
+        tester.getTopLeft(find.byType(RawImage)),
+        origin + const Offset(-5, 7),
+        reason: 'cursor zoom changes size without moving the hotspot',
+      );
+      cursorScale = 1;
       await tester.tapAt(origin + const Offset(1, 12));
       expect(
         focus,

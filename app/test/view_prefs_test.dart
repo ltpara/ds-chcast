@@ -61,6 +61,8 @@ void main() {
         peerId: a.preferencesKey,
         fit: 1,
         swapButtons: true,
+        zoomPercent: 165,
+        cursorZoomPercent: 135,
       );
       StreamPreferences.save(
         const StreamPreferences(codec: 3),
@@ -70,8 +72,18 @@ void main() {
         ViewPreferences.load(peerId: a.preferencesKey).swapButtons,
         isTrue,
       );
+      expect(ViewPreferences.load(peerId: a.preferencesKey).zoomPercent, 165);
+      expect(
+        ViewPreferences.load(peerId: a.preferencesKey).cursorZoomPercent,
+        135,
+      );
       expect(StreamPreferences.load(peerId: a.preferencesKey).codec, 3);
       expect(ViewPreferences.load(peerId: b.preferencesKey).fit, 0);
+      expect(ViewPreferences.load(peerId: b.preferencesKey).zoomPercent, 100);
+      expect(
+        ViewPreferences.load(peerId: b.preferencesKey).cursorZoomPercent,
+        100,
+      );
       expect(StreamPreferences.load(peerId: b.preferencesKey).codec, 0);
       expect(ViewPreferences.load(peerId: 'desk').keyboardMode, 'local');
     },
@@ -93,6 +105,8 @@ void main() {
     ViewPreferences.update(peerId: 'desk', fit: 0);
     final prefs = ViewPreferences.load(peerId: 'desk');
     expect(prefs.fit, 0);
+    expect(prefs.zoomPercent, 100);
+    expect(prefs.cursorZoomPercent, 100);
     expect(prefs.keyboardMode, 'local');
     expect(prefs.swapButtons, isTrue);
     expect(prefs.reverseWheel, isTrue);
@@ -134,6 +148,8 @@ void main() {
     ViewPreferences.save(
       const ViewPreferences(
         fit: 1,
+        zoomPercent: 175,
+        cursorZoomPercent: 150,
         stats: true,
         fileSort: 2,
         fileSortAscending: false,
@@ -152,6 +168,8 @@ void main() {
     );
     final ViewPreferences prefs = ViewPreferences.load();
     expect(prefs.fit, 1);
+    expect(prefs.zoomPercent, 175);
+    expect(prefs.cursorZoomPercent, 150);
     expect(prefs.stats, isTrue);
     expect(prefs.fileSort, 2);
     expect(prefs.fileSortAscending, isFalse);
@@ -168,6 +186,8 @@ void main() {
     expect(prefs.askSessionNote, isTrue);
     expect(readFile(), <String, Object?>{
       'view_fit': 1,
+      'view_zoom_percent': 175,
+      'view_cursor_zoom_percent': 150,
       'view_stats': true,
       'file_sort': 2,
       'file_sort_asc': false,
@@ -200,18 +220,42 @@ void main() {
     );
   });
 
-  test('connect-time clipboard sync follows the device and defaults to off', () {
-    expect(ViewPreferences.load().syncInitClipboard, isFalse);
-    ViewPreferences.update(peerId: 'desk', syncInitClipboard: true);
-    expect(ViewPreferences.load(peerId: 'desk').syncInitClipboard, isTrue);
-    expect(ViewPreferences.load(peerId: 'other').syncInitClipboard, isFalse);
-    expect(readFile().containsKey('view_sync_init_clipboard'), isFalse);
-    final Map<Object?, Object?> peers =
-        readFile()['peers'] as Map<Object?, Object?>;
+  test(
+    'connect-time clipboard sync follows the device and defaults to off',
+    () {
+      expect(ViewPreferences.load().syncInitClipboard, isFalse);
+      ViewPreferences.update(peerId: 'desk', syncInitClipboard: true);
+      expect(ViewPreferences.load(peerId: 'desk').syncInitClipboard, isTrue);
+      expect(ViewPreferences.load(peerId: 'other').syncInitClipboard, isFalse);
+      expect(readFile().containsKey('view_sync_init_clipboard'), isFalse);
+      final Map<Object?, Object?> peers =
+          readFile()['peers'] as Map<Object?, Object?>;
+      expect(
+        (peers['desk'] as Map<Object?, Object?>)['view_sync_init_clipboard'],
+        isTrue,
+      );
+    },
+  );
+
+  test('default control mode follows the device and defaults to view-only', () {
+    final ViewPreferences defaults = ViewPreferences.load(peerId: 'desk');
+    expect(defaults.defaultViewOnly, isTrue);
+    expect(defaults.defaultViewOnlyConfigured, isFalse);
+
+    ViewPreferences.update(peerId: 'desk', defaultViewOnly: false);
+    expect(ViewPreferences.load(peerId: 'desk').defaultViewOnly, isFalse);
     expect(
-      (peers['desk'] as Map<Object?, Object?>)[
-          'view_sync_init_clipboard'],
+      ViewPreferences.load(peerId: 'desk').defaultViewOnlyConfigured,
       isTrue,
+    );
+    expect(ViewPreferences.load(peerId: 'other').defaultViewOnly, isTrue);
+    expect(readFile().containsKey('view_default_only'), isFalse);
+
+    ViewPreferences.clearDefaultViewOnly(peerId: 'desk');
+    expect(ViewPreferences.load(peerId: 'desk').defaultViewOnly, isTrue);
+    expect(
+      ViewPreferences.load(peerId: 'desk').defaultViewOnlyConfigured,
+      isFalse,
     );
   });
 
@@ -299,6 +343,8 @@ void main() {
       'language': 'en',
       'stream_codec': 2,
       'view_fit': 0,
+      'view_zoom_percent': 100,
+      'view_cursor_zoom_percent': 100,
       'view_stats': true,
       'file_sort': 0,
       'file_sort_asc': false,

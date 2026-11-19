@@ -9,6 +9,8 @@
 
 #include "chast/desktop.h"
 #include "chast/host_settings.h"
+#include "chast/machine_state_security.h"
+#include "platform.h"
 #include "service.h"
 
 namespace {
@@ -18,7 +20,7 @@ void print_usage() {
         "chast-service — chast 主机服务\n\n"
         "  --install     创建并启动服务，写入机器设置和防火墙规则；登录后自动启动连接管理（需要管理员）\n"
         "  --uninstall   停止并删除服务，移除防火墙规则（需要管理员）\n"
-        "  --token       打印机器设置中的当前访问令牌\n"
+        "  --token       打印机器设置中的当前访问令牌（需要提升的管理员命令行）\n"
         "  --run         SCM 入口，由服务管理器调用\n"
         "  --worker      会话工作进程，由服务在用户会话中启动\n"
         "  --help        显示本帮助\n");
@@ -72,9 +74,22 @@ int wmain(int argc, wchar_t** argv) {
         return report(code, worker_error);
     }
     if (command == L"--token") {
+        if (!chast::process_is_elevated_administrator()) {
+            std::fprintf(stderr, "chast-service: --token requires an elevated administrator command prompt.\n");
+            return 1;
+        }
         const std::string path = chast::machine_settings_path();
         if (path.empty()) {
             std::fprintf(stderr, "chast-service: 无法确定机器设置的位置。\n");
+            return 1;
+        }
+        std::string security_error;
+        // Displaying a token is read-only; only installation may create or migrate state.
+        if (!chast::machine_state_directory_trusted(
+                chast::host::widen(chast::machine_settings_directory()), &security_error) ||
+            !chast::machine_state_file_trusted(chast::host::widen(path), &security_error)) {
+            std::fprintf(stderr, "chast-service: 机器状态目录不存在或不可信：%s\n",
+                         security_error.c_str());
             return 1;
         }
         const chast::HostSettingsLoad loaded = chast::load_host_settings(path);

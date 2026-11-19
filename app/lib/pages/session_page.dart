@@ -30,6 +30,7 @@ import '../annotation_stroke_controller.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
 import '../view_prefs.dart';
+import '../view_scale.dart';
 import '../viewer_bridge.dart';
 import '../viewer_strategy.dart';
 import '../widgets/camera_panel.dart';
@@ -338,8 +339,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _fullscreen = false;
   bool _reconnecting = false;
   bool _closing = false;
+  double? _relativeMouseScale;
+  bool _viewerAwakeLease = false;
   bool _allowPop = false;
   bool _controlEnabled = false;
+  bool _sessionDefaultViewOnly = true;
+  final ViewerInitialControlPolicy _initialControlPolicy =
+      ViewerInitialControlPolicy();
   bool _nativeKeyCapture = false;
   bool _localKeyboardUnavailable = false;
   ViewerKeyboardMode _keyboardMode = ViewerKeyboardMode.physical;
@@ -367,6 +373,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // The pointer currently drawing with the pen, or null when the pen is up.
   int? _penPointer;
   ViewFit _fit = ViewFit.adaptive;
+  int _zoomPercent = defaultViewZoomPercent;
+  int _cursorZoomPercent = defaultCursorZoomPercent;
   // What the next connection asks the server for. Kept across reconnects so
   // "重新连接" returns to the same output; kViewerDisplayAuto leaves the
   // choice to the server. An accepted in-session switch updates it too.
@@ -509,11 +517,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   String get _prefsPeerId => widget.target.preferencesKey;
 
-  /// Physical cursor pixels per captured pixel. The native side needs this to
-  /// size the host's sprite the way the frame is being drawn, so a stream
-  /// shown at half size gets a half-size pointer.
-  double get _cursorTargetScale =>
+  double get _viewPhysicalScale =>
       _viewScale * (MediaQuery.maybeDevicePixelRatioOf(context) ?? 1.0);
+
+  /// Physical cursor pixels per captured pixel, including the independent
+  /// cursor-size preference.
+  double get _cursorTargetScale =>
+      _viewPhysicalScale * _cursorZoomPercent / 100.0;
 
   @override
   void initState() {
@@ -553,6 +563,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _autoRecord = viewPrefs.autoRecord;
     _recordKeep = viewPrefs.recordKeep;
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+    _zoomPercent = viewPrefs.zoomPercent;
+    _cursorZoomPercent = viewPrefs.cursorZoomPercent;
     _statsVisible = viewPrefs.stats;
     _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
     _showMyCursor = viewPrefs.showMyCursor;
@@ -572,11 +584,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       uploadRecordings: widget.settings.uploadRecordings,
       syncInitialClipboard: viewPrefs.syncInitClipboard,
       viewFit: viewPrefs.fit,
+      defaultViewOnly: viewPrefs.defaultViewOnly,
       tunnelModeSet: widget.settings.modeConfigured,
       useWebSocketSet: widget.settings.useWebSocketConfigured,
       uploadRecordingsSet: widget.settings.uploadRecordingsConfigured,
       syncInitialClipboardSet: viewPrefs.syncInitClipboardConfigured,
       viewFitSet: viewPrefs.fitConfigured,
+      defaultViewOnlySet: viewPrefs.defaultViewOnlyConfigured,
     );
     _applyLocalViewerSettings();
     _starting = _start();
@@ -671,6 +685,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // still holds. Control stays on for when the window comes back.
     _releaseRemoteInput();
     _setKeyCapture(false);
+  }
+
+  @override
+  void didChangeMetrics() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _syncCursor();
+      if (_relativeMouse) _applyRelativeMouse(true);
+    });
   }
 
   Future<void> _reportFinishedSession(DateTime startedAt, String detail) async {
@@ -1096,6 +1119,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _start() async {
+    _initialControlPolicy.reset();
     for (int attempt = 0; ; ++attempt) {
       try {
         await _startOnce();
@@ -1183,6 +1207,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _sessionUseWebSocket = local.useWebSocket;
     _sessionUploadRecordings = local.uploadRecordings;
     _sessionSyncInitClipboard = local.syncInitialClipboard;
+    _sessionDefaultViewOnly = local.defaultViewOnly;
     _fit = local.viewFit == 1 ? ViewFit.original : ViewFit.adaptive;
   }
 
@@ -1221,14 +1246,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       uploadRecordings: widget.settings.uploadRecordings,
       syncInitialClipboard: viewPrefs.syncInitClipboard,
       viewFit: viewPrefs.fit,
+      defaultViewOnly: viewPrefs.defaultViewOnly,
       tunnelModeSet: widget.settings.modeConfigured,
       useWebSocketSet: widget.settings.useWebSocketConfigured,
       uploadRecordingsSet: widget.settings.uploadRecordingsConfigured,
       syncInitialClipboardSet: viewPrefs.syncInitClipboardConfigured,
       viewFitSet: viewPrefs.fitConfigured,
+      defaultViewOnlySet: viewPrefs.defaultViewOnlyConfigured,
     );
     _syncInitClipboard = viewPrefs.syncInitClipboard;
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+    _zoomPercent = viewPrefs.zoomPercent;
+    _cursorZoomPercent = viewPrefs.cursorZoomPercent;
     _applyLocalViewerSettings();
   }
 
@@ -1300,6 +1329,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _sessionUseWebSocket = effective.useWebSocket;
     _sessionUploadRecordings = effective.uploadRecordings;
     _sessionSyncInitClipboard = effective.syncInitialClipboard;
+    _sessionDefaultViewOnly = effective.defaultViewOnly;
     _fit = effective.viewFit == 1 ? ViewFit.original : ViewFit.adaptive;
   }
 
@@ -1648,6 +1678,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         accessTicket: accessTicket,
         syncInitClipboard: _sessionSyncInitClipboard,
       );
+      try {
+        _viewerAwakeLease = await ViewerBridge.setKeepAwake(true);
+      } on PlatformException {
+        // A power-request failure must not prevent the remote session.
+      } on MissingPluginException {
+        // Older native builds can still connect without the optional request.
+      }
       _startTicketRenewal(accessTicket);
       // The native session starts with clipboard sync on; reapply this page's
       // switch before the first poll can show it as enabled.
@@ -1730,6 +1767,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _textureId = -1;
     _cameraTextureId = -1;
     _cameraOpen = false;
+    if (_viewerAwakeLease) {
+      _viewerAwakeLease = false;
+      try {
+        await ViewerBridge.setKeepAwake(false);
+      } on MissingPluginException {
+        // Native bridge shutdown also releases an outstanding lease.
+      } on PlatformException {
+        // Native stop and bridge shutdown both perform idempotent cleanup.
+      }
+    }
     try {
       await ViewerBridge.stop();
       await displays?.close(sessionStopped: true);
@@ -2061,6 +2108,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         _isCredentialChallenge(status.denial);
     final bool nowOver = status.isOver && !challenge;
     final bool justOver = nowOver && !_over;
+    final bool? initialControl = _initialControlPolicy.resolve(
+      desktop:
+          !widget.fileTransferOnly &&
+          widget.sessionMode == 'desktop' &&
+          status.sessionMode == 'desktop' &&
+          !status.controlOnly &&
+          !status.filesOnly,
+      sessionReady: status.isLive && status.hasFrame,
+      acceptsInput: status.acceptsInput,
+      defaultViewOnly: _sessionDefaultViewOnly,
+    );
     if (!nowOver) {
       // Emit once for each new asynchronous failure while the session is
       // still live. The JSON includes the host codec/transport and local
@@ -2170,6 +2228,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    if (initialControl == true) {
+      _toggleControl();
+    }
     _maybeOpenControlPanel(status);
     if (streamSettled) {
       _saveStreamPreferences();
@@ -2793,14 +2854,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         }
         final double sx = drawn.width / width;
         final double sy = drawn.height / height;
+        final double cursorSx = sx * _cursorZoomPercent / 100.0;
+        final double cursorSy = sy * _cursorZoomPercent / 100.0;
         // x/y is the hotspot, so the sprite's top-left sits before it.
         return Stack(
           children: <Widget>[
             Positioned(
-              left: (cursor.x - cursor.hotspotX) * sx,
-              top: (cursor.y - cursor.hotspotY) * sy,
-              width: cursor.width * sx,
-              height: cursor.height * sy,
+              left: cursor.x * sx - cursor.hotspotX * cursorSx,
+              top: cursor.y * sy - cursor.hotspotY * cursorSy,
+              width: cursor.width * cursorSx,
+              height: cursor.height * cursorSy,
               child: RawImage(
                 image: image,
                 fit: BoxFit.fill,
@@ -2999,6 +3062,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       peerId: _prefsPeerId,
       fit: fit == ViewFit.original ? 1 : 0,
     );
+  }
+
+  void _setZoomPercent(int percent) {
+    setState(() => _zoomPercent = percent);
+    ViewPreferences.update(peerId: _prefsPeerId, zoomPercent: percent);
+  }
+
+  void _setCursorZoomPercent(int percent) {
+    setState(() => _cursorZoomPercent = percent);
+    ViewPreferences.update(peerId: _prefsPeerId, cursorZoomPercent: percent);
+    _syncCursor();
   }
 
   void _toggleReverseWheel() {
@@ -4432,7 +4506,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildDisplayRemoteView(DisplayTexture texture, {ViewFit? fit}) {
+  Widget _buildDisplayRemoteView(
+    DisplayTexture texture, {
+    ViewFit? fit,
+    int? zoomPercent,
+  }) {
     final stream = texture.stream;
     return ListenableBuilder(
       listenable: texture,
@@ -4444,13 +4522,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         sourceWidth: stream.sourceWidth,
         sourceHeight: stream.sourceHeight,
         fit: fit ?? _fit,
+        zoomPercent: zoomPercent ?? (fit == null ? _zoomPercent : 100),
         drawEnabled: _annotationMode,
         captureInput: _inputActive && !_annotationMode,
         hideCursor:
             texture.pointer?.visible == true &&
             texture.cursor != null &&
             texture.cursorShape == texture.pointer?.shapeId,
-        overlayBuilder: (size) => displayCursorOverlay(texture, size),
+        overlayBuilder: (size) => displayCursorOverlay(
+          texture,
+          size,
+          cursorScale: _cursorZoomPercent / 100.0,
+        ),
         onFocusRequested: () => _focusDisplay(stream.streamId),
         onHover: (p, b) => _onPointerHover(p, b, display: stream),
         onMove: (p, b) => _onPointerMove(p, b, display: stream),
@@ -4518,12 +4601,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       child: LayoutBuilder(
         builder: (context, constraints) {
           final available = constraints.biggest;
-          final double scale = _fit == ViewFit.adaptive
+          final double fitScale = _fit == ViewFit.adaptive
               ? math.min(
                   available.width / desktopWidth,
                   available.height / desktopHeight,
                 )
               : 1.0;
+          final double scale = fitScale * _zoomPercent / 100.0;
           final size = Size(desktopWidth * scale, desktopHeight * scale);
           final canvas = SizedBox.fromSize(
             size: size,
@@ -4555,8 +4639,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               ],
             ),
           );
-          if (_fit == ViewFit.adaptive) return Center(child: canvas);
-          if (_inputActive) {
+          if (_fit == ViewFit.adaptive && _zoomPercent == 100) {
+            return Center(child: canvas);
+          }
+          if (_inputActive && _zoomPercent == 100) {
             return ClipRect(
               child: OverflowBox(
                 alignment: Alignment.topLeft,
@@ -5970,12 +6056,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       final prefs = ViewPreferences.load(peerId: _prefsPeerId);
       setState(() {
         _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+        _zoomPercent = prefs.zoomPercent;
+        _cursorZoomPercent = prefs.cursorZoomPercent;
         _statsVisible = prefs.stats;
         _mouse = MouseMapping(
           reverseWheel: prefs.reverseWheel,
           swapButtons: prefs.swapButtons,
         );
       });
+      _syncCursor();
       final mode = viewerKeyboardModeFromName(prefs.keyboardMode);
       if (mode != _keyboardMode) {
         unawaited(_changeKeyboardMode(mode, persist: false));
@@ -6009,15 +6098,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _applyRelativeMouse(bool enable) {
-    unawaited(_requestRelativeMouse(enable));
+    final double scale = _viewPhysicalScale;
+    if (enable &&
+        _relativeMouseScale != null &&
+        (_relativeMouseScale! - scale).abs() < 0.001) {
+      return;
+    }
+    _relativeMouseScale = enable ? scale : null;
+    unawaited(_requestRelativeMouse(enable, scale));
   }
 
-  Future<bool> _requestRelativeMouse(bool enable) async {
+  Future<bool> _requestRelativeMouse(bool enable, double scale) async {
     bool active = false;
     try {
       active = await ViewerBridge.setRelativeMouse(
         enabled: enable,
-        scale: _cursorTargetScale,
+        scale: scale,
       );
     } on PlatformException {
       active = false;
@@ -6633,6 +6729,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       sourceWidth: _status.sourceWidth,
                       sourceHeight: _status.sourceHeight,
                       fit: _fit,
+                      zoomPercent: _zoomPercent,
                       drawEnabled: _annotationMode,
                       captureInput: _inputActive && !_annotationMode,
                       hideCursor:
@@ -6681,6 +6778,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fullscreen: _fullscreen,
                         statsVisible: _statsVisible,
                         fit: _fit,
+                        zoomPercent: _zoomPercent,
+                        cursorZoomPercent: _cursorZoomPercent,
                         controlEnabled: _controlEnabled,
                         inputAvailable: _status.acceptsInput,
                         showMyCursor: _showMyCursor,
@@ -6874,6 +6973,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onExpand: _expand,
                         onClose: _leave,
                         onFitChanged: _setFit,
+                        onZoomPercentChanged: _setZoomPercent,
+                        onCursorZoomPercentChanged: _setCursorZoomPercent,
                       ),
                     ),
                   ),

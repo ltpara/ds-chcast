@@ -34,6 +34,7 @@ ViewerStrategyDelivery _delivery({
   bool uploadRecordings = true,
   bool syncInitialClipboard = true,
   int viewFit = 1,
+  bool defaultViewOnly = true,
   int revision = 4,
   String digest = _digest,
   bool includeUnknown = true,
@@ -71,6 +72,10 @@ ViewerStrategyDelivery _delivery({
         viewerViewFitKey: ViewerStrategySetting(
           mode: settingMode,
           value: viewFit,
+        ),
+        viewerDefaultViewOnlyKey: ViewerStrategySetting(
+          mode: settingMode,
+          value: defaultViewOnly,
         ),
         if (includeUnknown)
           'viewer.future_setting': const ViewerStrategySetting(
@@ -226,6 +231,7 @@ void main() {
       final List<Map<Object?, Object?>> starts = <Map<Object?, Object?>>[];
       final List<String> uploads = <String>[];
       bool recordingLive = true;
+      bool inputEnabled = false;
       final Completer<void> receiptSent = Completer<void>();
       final messenger = tester.binding.defaultBinaryMessenger;
       messenger.setMockMethodCallHandler(gpu, (MethodCall call) async => 1);
@@ -248,7 +254,7 @@ void main() {
               'sourceWidth': 640,
               'sourceHeight': 480,
               'published': 1,
-              'inputEnabled': true,
+              'inputEnabled': inputEnabled,
               'elevationCode': 1,
               'serverFingerprint': _fingerprint,
             };
@@ -300,7 +306,7 @@ void main() {
                   expect(hostId, 'devbox');
                   expect(accountToken, 'alice-token');
                   expect(clientPublicKey, _clientKey);
-                  return _hostInfo(_delivery());
+                  return _hostInfo(_delivery(defaultViewOnly: false));
                 },
             tunnelStarter:
                 ({
@@ -362,6 +368,30 @@ void main() {
       expect(
         tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
         ViewFit.original,
+      );
+      expect(
+        tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+        isFalse,
+      );
+      inputEnabled = true;
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(
+        tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+        isTrue,
+      );
+      await tester.tap(find.byTooltip('关闭远程键鼠'));
+      await tester.pump();
+      expect(
+        tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+        isFalse,
+      );
+      inputEnabled = false;
+      await tester.pump(const Duration(milliseconds: 250));
+      inputEnabled = true;
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(
+        tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+        isFalse,
       );
       await receiptSent.future.timeout(const Duration(seconds: 2));
 
@@ -848,6 +878,7 @@ void main() {
                   uploadRecordings: !firstPolicy,
                   syncInitialClipboard: firstPolicy,
                   viewFit: firstPolicy ? 1 : 0,
+                  defaultViewOnly: !firstPolicy,
                   revision: firstPolicy ? 4 : 5,
                   digest: firstPolicy
                       ? _digest
@@ -901,6 +932,10 @@ void main() {
       tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
       ViewFit.original,
     );
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+      isTrue,
+    );
     await tester.pump(const Duration(milliseconds: 250));
     recordingLive = false;
     await tester.pump(const Duration(milliseconds: 250));
@@ -938,6 +973,10 @@ void main() {
       tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
       ViewFit.adaptive,
     );
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+      isFalse,
+    );
     await tester.pump(const Duration(milliseconds: 250));
     recordingLive = false;
     await tester.pump(const Duration(milliseconds: 250));
@@ -950,6 +989,7 @@ void main() {
       peerId: target.preferencesKey,
       fit: 1,
       syncInitClipboard: true,
+      defaultViewOnly: false,
     );
     recordingLive = true;
     await tester.pumpWidget(const SizedBox.shrink());
@@ -976,6 +1016,10 @@ void main() {
     expect(
       tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).fit,
       ViewFit.original,
+    );
+    expect(
+      tester.widget<RemoteToolbar>(find.byType(RemoteToolbar)).controlEnabled,
+      isTrue,
     );
     await tester.pump(const Duration(milliseconds: 250));
     recordingLive = false;

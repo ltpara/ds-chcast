@@ -45,6 +45,7 @@ add_executable(${BINARY_NAME} WIN32
   "utils.cpp"
   "win32_window.cpp"
   "${VIEWER_DIR}/viewer_bridge.cc"
+  "${VIEWER_DIR}/viewer_awake_request.cc"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
@@ -69,6 +70,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "imm32.lib" "comctl32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib" "ole32.lib" "comdlg32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "PowrProf.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE chast_viewer_core)
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(${BINARY_NAME} PRIVATE "${VIEWER_DIR}")
