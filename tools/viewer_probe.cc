@@ -17,9 +17,11 @@
 #include <wrl/client.h>
 #include <shlobj.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -35,6 +37,7 @@
 
 #include "chast/clipboard.h"
 #include "chast/clipboard_virtual.h"
+#include "chast/audio.h"
 #include "chast/error.h"
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
@@ -138,6 +141,75 @@ private:
     std::atomic<uint64_t> frames_{0};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+};
+
+struct MicrophoneMetrics {
+    void push(const chast::DecodedAudio& audio) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++packets;
+        frames += audio.samples.size() / audio.channels;
+        for (const int16_t sample : audio.samples) {
+            const int32_t wide = sample;
+            sum_squares += static_cast<uint64_t>(wide * wide);
+            peak_value = (std::max)(peak_value, static_cast<uint32_t>(std::abs(wide)));
+            ++samples;
+        }
+    }
+
+    chast::AudioPlayerStats stats() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        chast::AudioPlayerStats result;
+        result.packets = packets;
+        result.played_frames = frames;
+        return result;
+    }
+
+    double rms() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return samples == 0 ? 0.0 : std::sqrt(static_cast<double>(sum_squares) / samples);
+    }
+
+    uint32_t peak() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return peak_value;
+    }
+
+    mutable std::mutex mutex;
+    uint64_t packets = 0;
+    uint64_t frames = 0;
+    uint64_t samples = 0;
+    uint64_t sum_squares = 0;
+    uint32_t peak_value = 0;
+};
+
+// Receives the viewer's microphone uplink without playing or retaining PCM.
+class MicrophoneMetricsPlayer final : public chast::IAudioPlayer {
+public:
+    explicit MicrophoneMetricsPlayer(std::shared_ptr<MicrophoneMetrics> metrics)
+        : metrics_(std::move(metrics)) {}
+
+    chast::Error start() override { return chast::Error::success(); }
+    void stop() override {}
+
+    chast::Error push(const chast::DecodedAudio& audio) override {
+        if (audio.channels == 0 || audio.samples.size() % audio.channels != 0) {
+            return chast::Error(chast::Status::InvalidCall,
+                                "invalid decoded microphone block");
+        }
+        metrics_->push(audio);
+        return chast::Error::success();
+    }
+
+    void set_clock_offset(int64_t) override {}
+    void set_lead_ms(uint32_t) override {}
+    void set_mute(bool mute) override { muted_ = mute; }
+    bool muted() const override { return muted_; }
+    chast::AudioPlayerStats stats() const override { return metrics_->stats(); }
+    std::string error() const override { return {}; }
+
+private:
+    std::shared_ptr<MicrophoneMetrics> metrics_;
+    std::atomic<bool> muted_{false};
 };
 
 uint16_t pick_free_port() {
@@ -2381,6 +2453,172 @@ int host_recording_probe(bool viewer_session_isolation = false) {
     return ok ? 0 : 1;
 }
 
+int real_microphone_probe() {
+    HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize_com = SUCCEEDED(com_result);
+    if (FAILED(com_result) && com_result != RPC_E_CHANGED_MODE) {
+        std::fprintf(stderr, "real-microphone-probe: COM initialization failed\n");
+        return 1;
+    }
+
+    std::string error;
+    auto microphones = chast::list_microphones(&error);
+    if (microphones.empty()) {
+        std::fprintf(stderr, "real-microphone-probe: no active WASAPI microphone: %s\n",
+                     error.c_str());
+        if (uninitialize_com) CoUninitialize();
+        return 1;
+    }
+    const auto selected = std::find_if(microphones.begin(), microphones.end(),
+                                       [](const chast::MicrophoneDevice& device) {
+                                           return device.is_default;
+                                       });
+    const chast::MicrophoneDevice& device =
+        selected == microphones.end() ? microphones.front() : *selected;
+    std::printf("real-microphone-probe: endpoint=%s default=%s; audio remains in memory\n",
+                device.name.c_str(), device.is_default ? "yes" : "no");
+
+    ProbeSink sink;
+    std::unique_ptr<chast::HostServer> host;
+    std::unique_ptr<chast_viewer::ViewerEngine> viewer;
+    auto player = std::make_shared<MicrophoneMetrics>();
+    int result = 1;
+    try {
+        const auto require = [](bool condition, const std::string& message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        require(sink.create(&error), error);
+        const uint16_t port = pick_free_port();
+        require(port != 0, "no loopback port");
+        const std::string identity = chast::find_stored_identity_fingerprint(
+            chast::IdentityScope::CurrentUser, &error);
+        require(!identity.empty(),
+                "probe requires an existing current-user host identity: " + error);
+        auto configure = [player, identity](chast::HostServerConfig& config) {
+            config.settings.allow_microphone = true;
+            config.settings.allow_audio = false;
+            config.settings.allow_input = false;
+            config.settings.allow_clipboard = false;
+            config.settings.allow_terminal = false;
+            config.settings.allow_record = false;
+            config.expected_identity_fingerprint = identity;
+            config.microphone_player = [player](const chast::AudioPlayerConfig&,
+                                                std::string*) {
+                return std::make_unique<MicrophoneMetricsPlayer>(player);
+            };
+        };
+        host = start_host(utf8(fs::temp_directory_path()), port, &error, false, {}, {}, {},
+                          chast::ClipboardDirection::Disabled, {}, {}, std::move(configure));
+        require(host != nullptr, error);
+        viewer = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        viewer->SetClipboardSync(false);
+        require(viewer->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {}, kPassword),
+                "start microphone viewer");
+        require(wait_streaming(*viewer, 20s, &error), error);
+        require(wait_permission(*viewer, chast::kPermissionMicrophone, 5s),
+                "the host did not grant microphone permission");
+        require(viewer->SelectMicrophone(device.id), "select the enumerated microphone");
+        require(viewer->SetAudioProcessing(false, false),
+                "disable DSP for the initial capture sample");
+        require(viewer->SetMicrophone(true), "start WASAPI microphone capture");
+
+        const auto wait_for = [&](auto predicate, std::chrono::milliseconds timeout) {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                const auto status = viewer->Snapshot();
+                if (predicate(status)) return true;
+                if (status.state != chast_viewer::ViewerState::kStreaming) return false;
+                std::this_thread::sleep_for(20ms);
+            }
+            return predicate(viewer->Snapshot());
+        };
+        require(wait_for([](const chast_viewer::ViewerStatus& status) {
+                            return status.microphone_enabled &&
+                                   status.microphone_packets >= 10;
+                        }, 8s),
+                "WASAPI did not produce microphone packets");
+        std::this_thread::sleep_for(800ms);
+
+        const uint64_t before_noise = viewer->Snapshot().microphone_ns_frames;
+        require(viewer->SetAudioProcessing(false, true),
+                "enable noise suppression for the live microphone");
+        require(wait_for([&](const chast_viewer::ViewerStatus& status) {
+                            return status.microphone_ns_frames > before_noise;
+                        }, 5s),
+                "noise suppression did not process captured microphone frames");
+
+        const uint64_t before_aec = viewer->Snapshot().microphone_aec_frames;
+        const uint64_t before_aec_ns = viewer->Snapshot().microphone_ns_frames;
+        require(viewer->SetAudioProcessing(true, true),
+                "enable echo cancellation and noise suppression");
+        require(wait_for([&](const chast_viewer::ViewerStatus& status) {
+                            return status.microphone_aec_frames > before_aec &&
+                                   status.microphone_ns_frames > before_aec_ns;
+                        }, 5s),
+                "AEC/noise suppression did not process captured microphone frames");
+        std::this_thread::sleep_for(800ms);
+
+        auto captured = viewer->Snapshot();
+        const auto host_captured = host->status().stats;
+        require(captured.microphone_enabled && captured.microphone_errors == 0 &&
+                    captured.microphone_dropped == 0,
+                "microphone capture or uplink reported errors or dropped packets");
+        require(host_captured.microphone_packets > 0 &&
+                    host_captured.microphone_frames > 0 &&
+                    host_captured.microphone_errors == 0,
+                "the host did not decode the real microphone stream cleanly");
+        require(player->stats().played_frames > 0,
+                "the host's silent sink did not receive decoded microphone samples");
+
+        const auto viewers = host->viewers();
+        require(viewers.size() == 1, "expected one authenticated microphone viewer");
+        const uint64_t connection_id = viewers.front().id;
+        const chast::PermissionMask revoked_permissions =
+            viewers.front().permissions & ~chast::kPermissionMicrophone;
+        require(host->set_permissions(connection_id, revoked_permissions),
+                "revoke microphone permission");
+        require(wait_for([](const chast_viewer::ViewerStatus& status) {
+                            return !status.microphone_authorized &&
+                                   !status.microphone_enabled &&
+                                   (status.permissions & chast::kPermissionMicrophone) == 0;
+                        }, 5s),
+                "the viewer did not stop microphone capture after permission revocation");
+        require(!viewer->SetMicrophone(true),
+                "the viewer accepted a microphone start after permission revocation");
+        const uint64_t frames_before_revocation = viewer->Snapshot().received;
+        const uint64_t packets_after_revocation = host->status().stats.microphone_packets;
+        std::this_thread::sleep_for(500ms);
+        captured = viewer->Snapshot();
+        const auto host_after_revocation = host->status().stats;
+        require(captured.state == chast_viewer::ViewerState::kStreaming &&
+                    captured.received > frames_before_revocation,
+                "video did not continue after microphone permission revocation");
+        require(!host_after_revocation.microphone_active &&
+                    host_after_revocation.microphone_packets <= packets_after_revocation + 2,
+                "microphone packets continued after permission revocation");
+
+        std::printf("real-microphone-probe: sent=%llu decoded=%llu samples=%llu rms=%.1f "
+                    "peak=%u dsp-aec=%llu dsp-ns=%llu video-after-revoke=%llu\n",
+                    static_cast<unsigned long long>(captured.microphone_packets),
+                    static_cast<unsigned long long>(host_captured.microphone_packets),
+                    static_cast<unsigned long long>(player->stats().played_frames),
+                    player->rms(), player->peak(),
+                    static_cast<unsigned long long>(captured.microphone_aec_frames),
+                    static_cast<unsigned long long>(captured.microphone_ns_frames),
+                    static_cast<unsigned long long>(captured.received - frames_before_revocation));
+        std::puts("real-microphone-probe: PASS WASAPI capture, loopback uplink, DSP frame counters, "
+                  "permission revocation and continuing video; reused existing identity; "
+                  "no audio file created");
+        result = 0;
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "real-microphone-probe: FAIL %s\n", exception.what());
+    }
+    if (viewer) viewer->Stop();
+    if (host) host->stop();
+    if (uninitialize_com) CoUninitialize();
+    return result;
+}
+
 int elevation_probe() {
     using namespace chast;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -3813,6 +4051,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--elevation") return elevation_probe();
     if (argc == 2 && std::string(argv[1]) == "--clipboard-native") return native_clipboard_probe();
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
+    if (argc == 2 && std::string(argv[1]) == "--real-microphone")
+        return real_microphone_probe();
     if (argc == 2 && std::string(argv[1]) == "--viewer-session-isolation")
         return host_recording_probe(true);
     if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();

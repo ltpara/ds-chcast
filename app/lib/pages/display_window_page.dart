@@ -10,6 +10,7 @@ import '../remote_pointer.dart';
 import '../annotation_ink.dart';
 import '../annotation_stroke_controller.dart';
 import '../session_window.dart';
+import '../theme.dart';
 import '../viewer_bridge.dart';
 import '../view_prefs.dart';
 import '../view_scale.dart';
@@ -17,6 +18,8 @@ import '../widgets/keyboard_mode_button.dart';
 import '../widgets/display_stream_view.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/view_scale_controls.dart';
+
+enum _DisplayMicrophoneSetting { aec, noiseSuppression }
 
 /// The runner supplies the existing session. This engine owns only its texture
 /// and local input state; authentication and reconnect stay in the parent.
@@ -44,6 +47,13 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   ViewerStatus _status = const ViewerStatus();
   Timer? _timer;
   bool _polling = false, _closing = false;
+  bool _audioChanging = false;
+  bool _microphoneChanging = false;
+  bool _voiceChanging = false;
+  bool _recordingChanging = false;
+  bool _audioMenuChanging = false;
+  bool _microphoneMenuChanging = false;
+  String _recordErrorSeen = '';
   bool _control = false, _nativeKeys = false, _capture = false;
   int _captureGeneration = 0;
   bool _localKeyboardUnavailable = false;
@@ -123,6 +133,7 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     try {
       final status = await ViewerBridge.status();
       if (!mounted || _closing) return;
+      _watchMediaFailures(_status, status);
       _status = status;
       await _displays.refresh();
       if (!mounted || _closing) return;
@@ -153,6 +164,419 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     } on MissingPluginException {
       /* Engine has already detached. */
     }
+  }
+
+  void _showMediaFeedback(String message) {
+    if (!mounted || _closing || message.trim().isEmpty) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+    );
+  }
+
+  void _watchMediaFailures(ViewerStatus previous, ViewerStatus current) {
+    if (current.audioErrors > previous.audioErrors &&
+        current.audioError.isNotEmpty) {
+      _showMediaFeedback(tr('声音播放失败：{error}', {'error': current.audioError}));
+    }
+    if (current.microphoneErrors > previous.microphoneErrors &&
+        current.microphoneError.isNotEmpty) {
+      _showMediaFeedback(
+        tr('麦克风发送失败：{error}', {'error': current.microphoneError}),
+      );
+    }
+    if (current.voiceErrors > previous.voiceErrors &&
+        current.voiceError.isNotEmpty) {
+      _showMediaFeedback(tr('语音通话失败：{error}', {'error': current.voiceError}));
+    }
+    if (current.recordError.isEmpty) {
+      _recordErrorSeen = '';
+    } else if (current.recordError != previous.recordError &&
+        current.recordError != _recordErrorSeen) {
+      _recordErrorSeen = current.recordError;
+      _showMediaFeedback(tr('录制失败：{error}', {'error': current.recordError}));
+    }
+  }
+
+  Future<bool?> _runMediaCommand({
+    required bool changing,
+    required void Function(bool) setChanging,
+    required Future<bool> Function() command,
+    required String failure,
+  }) async {
+    if (_closing || changing) return null;
+    setState(() => setChanging(true));
+    try {
+      return await command();
+    } on PlatformException catch (error) {
+      _showMediaFeedback(error.message ?? failure);
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      if (mounted && !_closing) setState(() => setChanging(false));
+    }
+    return null;
+  }
+
+  Future<void> _toggleAudioMute() async {
+    if (!_status.acceptsAudio || _audioChanging) return;
+    final bool? applied = await _runMediaCommand(
+      changing: _audioChanging,
+      setChanging: (value) => _audioChanging = value,
+      command: () => ViewerBridge.setAudioMuted(!_status.audioMuted),
+      failure: tr('无法切换声音播放'),
+    );
+    if (applied == false) {
+      _showMediaFeedback(tr('当前会话没有可用的音频输出'));
+    }
+  }
+
+  Future<void> _toggleMicrophone() async {
+    final bool enable = !_status.microphoneEnabled;
+    if (_microphoneChanging ||
+        !_status.isLive ||
+        (enable && !_status.acceptsMicrophone)) {
+      if (enable && _status.isLive && !_status.acceptsMicrophone) {
+        _showMediaFeedback(tr('主机未授权麦克风，无法开启'));
+      }
+      return;
+    }
+    final bool? applied = await _runMediaCommand(
+      changing: _microphoneChanging,
+      setChanging: (value) => _microphoneChanging = value,
+      command: () => ViewerBridge.setMicrophone(enable),
+      failure: tr('无法切换麦克风'),
+    );
+    if (enable && applied == false) {
+      _showMediaFeedback(tr('主机未授权麦克风，无法开启'));
+    }
+  }
+
+  Future<void> _toggleVoiceCall() async {
+    final bool enable = !_status.voiceEnabled;
+    if (_voiceChanging ||
+        _status.voicePending ||
+        !_status.isLive ||
+        (enable && !_status.acceptsVoiceCall)) {
+      if (enable && _status.isLive && !_status.acceptsVoiceCall) {
+        _showMediaFeedback(tr('主机未授权麦克风，无法开启'));
+      }
+      return;
+    }
+    final bool? applied = await _runMediaCommand(
+      changing: _voiceChanging,
+      setChanging: (value) => _voiceChanging = value,
+      command: () => ViewerBridge.setVoiceCall(enable),
+      failure: tr('无法切换语音通话'),
+    );
+    if (enable && applied == false) {
+      _showMediaFeedback(tr('主机未授权麦克风，无法开启'));
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    final bool enable = !_status.recording;
+    final bool frameReady = _texture?.stream.ready == true;
+    if (_recordingChanging ||
+        !((!enable && _status.recording) ||
+            (enable && _status.acceptsRecording && frameReady))) {
+      if (enable && _status.isLive && !_status.acceptsRecording) {
+        _showMediaFeedback(tr('主机未开放录制'));
+      }
+      return;
+    }
+    setState(() => _recordingChanging = true);
+    try {
+      await ViewerBridge.setRecording(enable);
+    } on PlatformException catch (error) {
+      _showMediaFeedback(error.message ?? tr('无法切换本地录制'));
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      if (mounted && !_closing) setState(() => _recordingChanging = false);
+    }
+  }
+
+  Future<void> _openAudioOutputMenu(BuildContext buttonContext) async {
+    final List<ViewerAudioOutput> devices;
+    try {
+      devices = await ViewerBridge.listAudioOutputs();
+    } on PlatformException catch (error) {
+      _showMediaFeedback(error.message ?? tr('无法列出音频输出设备'));
+      return;
+    } on MissingPluginException {
+      return;
+    }
+    if (!buttonContext.mounted) return;
+    final RenderBox? box = buttonContext.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final Offset origin = box.localToGlobal(Offset.zero);
+    final String? selected = await showMenu<String>(
+      context: buttonContext,
+      position: RelativeRect.fromLTRB(
+        origin.dx,
+        origin.dy + box.size.height,
+        origin.dx + 300,
+        origin.dy + box.size.height,
+      ),
+      color: const Color(0xFF24252B),
+      elevation: 8,
+      items: <PopupMenuEntry<String>>[
+        _deviceMenuItem(
+          id: '',
+          title: tr('系统默认输出'),
+          detail: tr('跟随 Windows 默认设备'),
+          selected: _status.audioDevice.isEmpty,
+          icon: Icons.speaker_rounded,
+        ),
+        for (final ViewerAudioOutput device in devices)
+          _deviceMenuItem(
+            id: device.id,
+            title: device.label,
+            detail: device.isDefault ? tr('系统默认设备') : tr('输出设备'),
+            selected: device.id == _status.audioDevice,
+            icon: Icons.volume_up_rounded,
+          ),
+      ],
+    );
+    if (selected == null || !mounted || _closing) return;
+    setState(() => _audioMenuChanging = true);
+    try {
+      if (!await ViewerBridge.selectAudioOutput(selected)) {
+        _showMediaFeedback(tr('当前会话无法切换输出设备'));
+      }
+    } on PlatformException catch (error) {
+      _showMediaFeedback(error.message ?? tr('无法切换音频输出'));
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      if (mounted && !_closing) setState(() => _audioMenuChanging = false);
+    }
+  }
+
+  Future<void> _openMicrophoneMenu(BuildContext buttonContext) async {
+    final List<ViewerMicrophoneDevice> devices;
+    try {
+      devices = await ViewerBridge.listMicrophones();
+    } on PlatformException catch (error) {
+      _showMediaFeedback(error.message ?? tr('无法列出麦克风设备'));
+      return;
+    } on MissingPluginException {
+      return;
+    }
+    if (!buttonContext.mounted) return;
+    final RenderBox? box = buttonContext.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final Offset origin = box.localToGlobal(Offset.zero);
+    final Object? selected = await showMenu<Object>(
+      context: buttonContext,
+      position: RelativeRect.fromLTRB(
+        origin.dx,
+        origin.dy + box.size.height,
+        origin.dx + 300,
+        origin.dy + box.size.height,
+      ),
+      color: const Color(0xFF24252B),
+      elevation: 8,
+      items: <PopupMenuEntry<Object>>[
+        _processingMenuItem(
+          _DisplayMicrophoneSetting.aec,
+          tr('回声消除'),
+          tr('用本机播放的系统声音作参考'),
+          _status.audioAec,
+        ),
+        _processingMenuItem(
+          _DisplayMicrophoneSetting.noiseSuppression,
+          tr('噪声抑制'),
+          tr('抑制平稳底噪，语音优先'),
+          _status.audioNoiseSuppression,
+        ),
+        const PopupMenuDivider(),
+        _deviceMenuItem(
+          id: '',
+          title: tr('系统默认麦克风'),
+          detail: tr('跟随默认通信设备'),
+          selected: _status.microphoneDevice.isEmpty,
+          icon: Icons.settings_voice_rounded,
+        ),
+        for (final ViewerMicrophoneDevice device in devices)
+          _deviceMenuItem(
+            id: device.id,
+            title: device.label,
+            detail: device.isDefault ? tr('系统默认设备') : tr('输入设备'),
+            selected: device.id == _status.microphoneDevice,
+            icon: Icons.mic_none_rounded,
+          ),
+      ],
+    );
+    if (selected == null || !mounted || _closing) return;
+    setState(() => _microphoneMenuChanging = true);
+    try {
+      if (selected is _DisplayMicrophoneSetting) {
+        final bool aec = selected == _DisplayMicrophoneSetting.aec
+            ? !_status.audioAec
+            : _status.audioAec;
+        final bool noiseSuppression =
+            selected == _DisplayMicrophoneSetting.noiseSuppression
+            ? !_status.audioNoiseSuppression
+            : _status.audioNoiseSuppression;
+        if (!await ViewerBridge.setAudioProcessing(
+          aec: aec,
+          noiseSuppression: noiseSuppression,
+        )) {
+          _showMediaFeedback(tr('当前会话无法修改麦克风处理'));
+        }
+      } else if (selected is String &&
+          selected != _status.microphoneDevice &&
+          !await ViewerBridge.selectMicrophone(selected)) {
+        _showMediaFeedback(tr('无法切换麦克风'));
+      }
+    } on PlatformException catch (error) {
+      _showMediaFeedback(
+        error.message ?? (selected is String ? tr('无法切换麦克风') : tr('无法修改麦克风处理')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      if (mounted && !_closing) setState(() => _microphoneMenuChanging = false);
+    }
+  }
+
+  PopupMenuItem<T> _deviceMenuItem<T extends Object>({
+    required T id,
+    required String title,
+    required String detail,
+    required bool selected,
+    required IconData icon,
+  }) => PopupMenuItem<T>(
+    value: id,
+    height: 46,
+    child: Row(
+      children: <Widget>[
+        Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: selected ? kAccentBright : Colors.white70,
+                ),
+              ),
+              Text(
+                detail,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 10, color: Colors.white38),
+              ),
+            ],
+          ),
+        ),
+        if (selected)
+          const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+      ],
+    ),
+  );
+
+  PopupMenuItem<Object> _processingMenuItem(
+    _DisplayMicrophoneSetting setting,
+    String title,
+    String detail,
+    bool enabled,
+  ) => PopupMenuItem<Object>(
+    value: setting,
+    height: 44,
+    child: Row(
+      children: <Widget>[
+        Icon(
+          enabled
+              ? Icons.check_box_rounded
+              : Icons.check_box_outline_blank_rounded,
+          size: 16,
+          color: enabled ? kAccentBright : Colors.white54,
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: enabled ? kAccentBright : Colors.white70,
+                ),
+              ),
+              Text(
+                detail,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 10, color: Colors.white38),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _mediaButton({
+    required String tooltip,
+    required IconData icon,
+    required bool active,
+    required bool disabled,
+    required bool changing,
+    required VoidCallback onPressed,
+    void Function(BuildContext context)? onLongPress,
+  }) {
+    final bool unavailable = disabled || changing || _closing;
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox(
+        width: 44,
+        height: 48,
+        child: Semantics(
+          button: true,
+          enabled: !unavailable,
+          toggled: active,
+          label: tooltip,
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(4),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(4),
+              onTap: unavailable ? null : onPressed,
+              onLongPress: unavailable || onLongPress == null
+                  ? null
+                  : () => onLongPress(context),
+              child: Center(
+                child: changing
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Icon(
+                        icon,
+                        color: disabled
+                            ? Colors.white24
+                            : active
+                            ? kAccentBright
+                            : Colors.grey.shade300,
+                      ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void _release() {
@@ -718,6 +1142,82 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
             ),
           ),
         ],
+      ),
+      bottomNavigationBar: BottomAppBar(
+        height: 52,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _mediaButton(
+              tooltip: !_status.acceptsAudio
+                  ? tr('服务端未启用声音')
+                  : _status.audioMuted
+                  ? tr('取消静音（长按选择输出设备）')
+                  : tr('静音（长按选择输出设备）'),
+              icon: _status.audioMuted
+                  ? Icons.volume_off_rounded
+                  : Icons.volume_up_rounded,
+              active: _status.acceptsAudio && !_status.audioMuted,
+              disabled: !_status.acceptsAudio,
+              changing: _audioChanging || _audioMenuChanging,
+              onPressed: () => unawaited(_toggleAudioMute()),
+              onLongPress: (context) =>
+                  unawaited(_openAudioOutputMenu(context)),
+            ),
+            _mediaButton(
+              tooltip: !_status.acceptsMicrophone && !_status.microphoneEnabled
+                  ? tr('服务端未开放麦克风')
+                  : _status.microphoneEnabled
+                  ? tr('关闭麦克风（长按选择设备）')
+                  : tr('开启麦克风（长按选择设备）'),
+              icon: _status.microphoneEnabled
+                  ? Icons.mic_rounded
+                  : Icons.mic_off_rounded,
+              active: _status.microphoneEnabled,
+              disabled:
+                  !_status.isLive ||
+                  (!_status.acceptsMicrophone && !_status.microphoneEnabled),
+              changing: _microphoneChanging || _microphoneMenuChanging,
+              onPressed: () => unawaited(_toggleMicrophone()),
+              onLongPress: (context) => unawaited(_openMicrophoneMenu(context)),
+            ),
+            _mediaButton(
+              tooltip: !_status.acceptsVoiceCall && !_status.voiceEnabled
+                  ? tr('服务端未开放语音通话')
+                  : _status.voicePending
+                  ? tr('正在接通主机麦克风…')
+                  : _status.voiceEnabled
+                  ? tr('结束语音通话')
+                  : tr('收听主机麦克风'),
+              icon: _status.voiceEnabled
+                  ? Icons.phone_in_talk_rounded
+                  : Icons.phone_outlined,
+              active: _status.voiceEnabled,
+              disabled:
+                  !_status.isLive ||
+                  (_status.voicePending) ||
+                  (!_status.acceptsVoiceCall && !_status.voiceEnabled),
+              changing: _voiceChanging,
+              onPressed: () => unawaited(_toggleVoiceCall()),
+            ),
+            _mediaButton(
+              tooltip: _status.recording
+                  ? tr('停止录制（保存为本地 MP4）')
+                  : !_status.acceptsRecording
+                  ? (_status.isLive ? tr('主机未开放录制') : tr('会话建立后可录制到本地'))
+                  : tr('录制到本地（保存为 MP4）'),
+              icon: _status.recording
+                  ? Icons.stop_circle_rounded
+                  : Icons.fiber_manual_record_rounded,
+              active: _status.recording,
+              disabled:
+                  !_status.recording &&
+                  (!_status.acceptsRecording || _texture?.stream.ready != true),
+              changing: _recordingChanging,
+              onPressed: () => unawaited(_toggleRecording()),
+            ),
+          ],
+        ),
       ),
     );
   }

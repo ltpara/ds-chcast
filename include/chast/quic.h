@@ -123,6 +123,11 @@ enum class IdentityScope {
     LocalMachine,
 };
 
+// Looks up the existing Chast server identity without creating a certificate
+// store, key, or certificate. Returns an empty string if none is available.
+std::string find_stored_identity_fingerprint(IdentityScope scope,
+                                             std::string* error = nullptr);
+
 struct QuicServerConfig {
     std::string bind_address = "127.0.0.1";
     uint16_t port = 4433;

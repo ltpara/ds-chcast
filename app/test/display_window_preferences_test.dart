@@ -9,6 +9,242 @@ import 'package:chast_viewer/widgets/remote_view.dart';
 import 'package:chast_viewer/widgets/keyboard_mode_button.dart';
 
 void main() {
+  testWidgets('display windows share media controls through session status', (
+    tester,
+  ) async {
+    bool audioMuted = false;
+    bool microphoneEnabled = false;
+    bool microphoneGranted = false;
+    bool voiceEnabled = false;
+    bool recording = false;
+    bool audioAec = true;
+    bool audioNoiseSuppression = true;
+    String audioDevice = '';
+    String microphoneDevice = '';
+    int permissions = ViewerPermission.microphone | ViewerPermission.record;
+    var nextTexture = 80;
+    final calls = <String, int>{};
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    final messenger = tester.binding.defaultBinaryMessenger;
+    const native = MethodChannel('chast/viewer');
+    const gpu = MethodChannel('flutter_gpu_texture_renderer');
+    messenger.setMockMethodCallHandler(gpu, (call) async {
+      if (call.method == 'registerTexture') return nextTexture++;
+      if (call.method == 'output') return 8800;
+      return 0;
+    });
+    messenger.setMockMethodCallHandler(native, (call) async {
+      switch (call.method) {
+        case 'status':
+          return {
+            'state': 'streaming',
+            'inputEnabled': true,
+            'permissions': permissions,
+            'audioEnabled': true,
+            'audioMuted': audioMuted,
+            'audioDevice': audioDevice,
+            'microphoneDevice': microphoneDevice,
+            'audioAec': audioAec,
+            'audioNoiseSuppression': audioNoiseSuppression,
+            'microphoneEnabled': microphoneEnabled,
+            'voiceEnabled': voiceEnabled,
+            'recording': recording,
+          };
+        case 'displayStreams':
+          return {
+            'active': true,
+            'focused': 7,
+            'streams': [
+              for (final id in [7, 8])
+                {
+                  'streamId': id,
+                  'displayIndex': id - 7,
+                  'width': 640,
+                  'height': 480,
+                  'sourceWidth': 640,
+                  'sourceHeight': 480,
+                  'originX': (id - 7) * 640,
+                  'originY': 0,
+                  'published': 2,
+                  'bound': true,
+                  'ready': true,
+                },
+            ],
+          };
+        case 'takeDisplayCursors':
+          return [];
+        case 'bindDisplayOutput':
+          return true;
+        case 'setKeyCapture':
+          return false;
+        case 'setAudioMuted':
+          audioMuted = call.arguments as bool;
+          calls.update(
+            'setAudioMuted',
+            (value) => value + 1,
+            ifAbsent: () => 1,
+          );
+          return true;
+        case 'listAudioOutputs':
+          return [
+            {'id': 'speaker-2', 'name': 'USB Headset', 'default': true},
+          ];
+        case 'selectAudioOutput':
+          audioDevice = call.arguments as String;
+          calls.update(
+            'selectAudioOutput',
+            (value) => value + 1,
+            ifAbsent: () => 1,
+          );
+          return true;
+        case 'listMicrophones':
+          return [
+            {'id': 'mic-2', 'name': 'USB Microphone'},
+          ];
+        case 'selectMicrophone':
+          microphoneDevice = call.arguments as String;
+          calls.update(
+            'selectMicrophone',
+            (value) => value + 1,
+            ifAbsent: () => 1,
+          );
+          return true;
+        case 'setAudioProcessing':
+          final args = call.arguments as Map<Object?, Object?>;
+          audioAec = args['aec'] as bool;
+          audioNoiseSuppression = args['noiseSuppression'] as bool;
+          calls.update(
+            'setAudioProcessing',
+            (value) => value + 1,
+            ifAbsent: () => 1,
+          );
+          return true;
+        case 'setMicrophone':
+          calls.update(
+            'setMicrophone',
+            (value) => value + 1,
+            ifAbsent: () => 1,
+          );
+          if (!microphoneGranted) return false;
+          microphoneEnabled = call.arguments as bool;
+          return true;
+        case 'setVoiceCall':
+          voiceEnabled = call.arguments as bool;
+          calls.update('setVoiceCall', (value) => value + 1, ifAbsent: () => 1);
+          return true;
+        case 'setRecording':
+          recording =
+              (call.arguments as Map<Object?, Object?>)['enabled'] as bool;
+          calls.update('setRecording', (value) => value + 1, ifAbsent: () => 1);
+          return null;
+        default:
+          return null;
+      }
+    });
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(native, null);
+      messenger.setMockMethodCallHandler(gpu, null);
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Row(
+          children: [
+            Expanded(child: DisplayWindowPage(streamId: 7)),
+            Expanded(child: DisplayWindowPage(streamId: 8)),
+          ],
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 220));
+    await tester.pump();
+
+    Future<void> nextPoll() async {
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump();
+    }
+
+    await tester.longPress(find.byTooltip('静音（长按选择输出设备）').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('USB Headset'));
+    await tester.pump();
+    expect(calls['selectAudioOutput'], 1);
+    await nextPoll();
+    expect(find.byTooltip('静音（长按选择输出设备）'), findsNWidgets(2));
+
+    await tester.tap(find.byTooltip('静音（长按选择输出设备）').first);
+    await tester.pump();
+    expect(calls['setAudioMuted'], 1);
+    await nextPoll();
+    expect(find.byTooltip('取消静音（长按选择输出设备）'), findsNWidgets(2));
+
+    await tester.tap(find.byTooltip('开启麦克风（长按选择设备）').first);
+    await tester.pump();
+    expect(calls['setMicrophone'], 1);
+    expect(find.text('主机未授权麦克风，无法开启'), findsWidgets);
+    ScaffoldMessenger.of(
+      tester.element(find.byType(Scaffold).first),
+    ).hideCurrentSnackBar();
+    await tester.pump();
+    microphoneGranted = true;
+    await tester.tap(find.byTooltip('开启麦克风（长按选择设备）').first);
+    await tester.pump();
+    await nextPoll();
+    expect(find.byTooltip('关闭麦克风（长按选择设备）'), findsNWidgets(2));
+
+    await tester.tap(find.byTooltip('收听主机麦克风').first);
+    await tester.pump();
+    await nextPoll();
+    expect(find.byTooltip('结束语音通话'), findsNWidgets(2));
+
+    await tester.tap(find.byTooltip('录制到本地（保存为 MP4）').first);
+    await tester.pump();
+    await nextPoll();
+    expect(calls['setRecording'], 1);
+    expect(find.byTooltip('停止录制（保存为本地 MP4）'), findsNWidgets(2));
+
+    await tester.longPress(find.byTooltip('关闭麦克风（长按选择设备）').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('USB Microphone'));
+    await tester.pump();
+    expect(calls['selectMicrophone'], 1);
+    await nextPoll();
+    await tester.longPress(find.byTooltip('关闭麦克风（长按选择设备）').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('噪声抑制'));
+    await tester.pump();
+    expect(calls['setAudioProcessing'], 1);
+    await nextPoll();
+
+    await tester.tap(find.byTooltip('关闭麦克风（长按选择设备）').first);
+    await tester.pump();
+    await nextPoll();
+    await tester.tap(find.byTooltip('结束语音通话').first);
+    await tester.pump();
+    await nextPoll();
+    await tester.tap(find.byTooltip('停止录制（保存为本地 MP4）').first);
+    await tester.pump();
+    await nextPoll();
+
+    permissions = 0;
+    await nextPoll();
+    expect(find.byTooltip('服务端未开放麦克风'), findsNWidgets(2));
+    expect(find.byTooltip('主机未开放录制'), findsNWidgets(2));
+    final disabledMicrophone = find.descendant(
+      of: find.byTooltip('服务端未开放麦克风').first,
+      matching: find.byType(InkWell),
+    );
+    expect(tester.widget<InkWell>(disabledMicrophone.first).onTap, isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('display child applies saved peer view and mouse preferences', (
     tester,
   ) async {

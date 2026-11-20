@@ -561,7 +561,7 @@ PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, const std::string& e
     // deny. Only fall back to letting CryptoAPI create a genuinely absent one.
     HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
                                      store_location | CERT_STORE_OPEN_EXISTING_FLAG, L"MY");
-    if (!store) {
+    if (!store && expected.empty()) {
         store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, store_location, L"MY");
     }
     if (!store) {
@@ -601,6 +601,35 @@ PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, const std::string& e
 }
 
 }  // namespace
+
+std::string find_stored_identity_fingerprint(IdentityScope scope, std::string* error) {
+    if (error) error->clear();
+    const DWORD store_location = scope == IdentityScope::LocalMachine
+                                     ? CERT_SYSTEM_STORE_LOCAL_MACHINE
+                                     : CERT_SYSTEM_STORE_CURRENT_USER;
+    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                                     store_location | CERT_STORE_OPEN_EXISTING_FLAG, L"MY");
+    if (!store) {
+        if (error) {
+            *error = std::string("cannot open the existing ") +
+                     (scope == IdentityScope::LocalMachine ? "machine" : "current user's") +
+                     " certificate store, GetLastError=" + std::to_string(GetLastError());
+        }
+        return {};
+    }
+    PCCERT_CONTEXT identity = find_stored_identity(store, {});
+    CertCloseStore(store, 0);
+    if (!identity) {
+        if (error) *error = "no existing Chast server identity was found";
+        return {};
+    }
+    std::string fingerprint = certificate_fingerprint(identity);
+    CertFreeCertificateContext(identity);
+    if (fingerprint.empty() && error) {
+        *error = "cannot fingerprint the existing Chast server identity";
+    }
+    return fingerprint;
+}
 
 struct QuicSession::Impl {
     enum class Role { Server, Client };

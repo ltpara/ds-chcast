@@ -3325,6 +3325,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // The first blocks include session setup; anchor once on the
                 // fastest of six so that delay does not stay for the session.
                 player_config.anchor_gather_blocks = 6;
+                // Grow a short playout lead when network delivery consistently
+                // misses its slot, then return it once arrivals settle.
+                player_config.adaptive_jitter = true;
                 std::unique_ptr<chast::IAudioPlayer> player =
                     chast::create_audio_player(player_config, &setup_error);
                 std::string used = wanted;

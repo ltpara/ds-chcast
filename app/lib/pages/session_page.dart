@@ -244,6 +244,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _autoRecordAttempted = false;
   bool _autoRecordSuppressed = false;
   bool _wasLive = false;
+  bool _wasRecording = false;
   String _recordErrorSeen = '';
   // Session chat. The page owns the transcript and the native transport; the
   // panel is a modeless overlay. While its input holds focus, physical keys
@@ -902,7 +903,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (live && !_wasLive) {
       _autoRecordAttempted = false;
       _autoRecordSuppressed = false;
+      _wasRecording = status.recording;
+    } else if (_wasRecording && !status.recording) {
+      // A display child can stop this shared engine's recording. Mirror the
+      // main toolbar's manual-stop policy so auto-record does not restart it.
+      _autoRecordSuppressed = true;
     }
+    _wasRecording = status.recording;
     _wasLive = live;
     final String error = status.recordError.trim();
     if (error.isNotEmpty && error != _recordErrorSeen) {
