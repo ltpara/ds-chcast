@@ -1,12 +1,13 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
 //   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio [--audio-silence-gate-ms N]] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal] [--allow-camera]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--adaptive-jitter] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX] [--access-ticket B64URL --access-ticket-seed B64URL [--access-ticket-renewal B64URL ...]]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--audio-max-starved-ms N] [--audio-max-device-gap-ms N] [--audio-max-dropped-blocks N] [--audio-max-abs-av-skew-ms N] [--adaptive-jitter] [--audio-arrival-phase-correction] [--audio-render-buffer-ms N] [--audio-late-tolerance-ms N] [--audio-keep-late-blocks] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX] [--access-ticket B64URL --access-ticket-seed B64URL [--access-ticket-renewal B64URL ...]]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--file-browse] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
 //                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--idle-disconnect] [--annotation-overlay] [--encoder auto|vpl|ffmpeg]
-//                      [--netem [--audio [--audio-stream] [--play [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]]]]] [--record out.mp4]
-//                      [--netem-delay-ms N] [--netem-jitter-ms N] [--netem-loss-percent X] [--netem-rate-kbps N]
+//                      [--netem [--audio [--audio-stream] [--play [--audio-arrival-phase-correction] [--audio-render-buffer-ms N] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]]]]] [--record out.mp4]
+//                      [--netem-delay-ms N] [--netem-jitter-ms N] [--netem-loss-percent X] [--netem-rate-kbps N] [--audio-reorder-wait-ms N] [--audio-late-tolerance-ms N] [--audio-keep-late-blocks] [--audio-preserve-reanchor-queue]
+//                      [--audio-max-starved-ms N] [--audio-max-device-gap-ms N] [--audio-max-dropped-blocks N] [--audio-max-abs-av-skew-ms N]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -153,6 +154,8 @@
 #include "annexb.h"
 #include "chast/access_ticket.h"
 #include "chast/audio.h"
+#include "chast/audio_continuity.h"
+#include "chast/audio_reorder.h"
 #include "chast/capture.h"
 #include "chast/carrier.h"
 #include "chast/decoder.h"
@@ -999,9 +1002,24 @@ struct Options {
     // connect/verify: keep system audio on the reliable stream instead of the
     // v35 QUIC DATAGRAM transport, for A/B measurements on the same build.
     bool audio_stream = false;
+    chast::AudioContinuityBudget audio_continuity_budget;
     // Only with --play: grow the playout lead when arrivals miss their slots,
     // mirroring a jitter buffer that adapts to the observed link.
     bool adaptive_jitter = false;
+    // Keep the WASAPI path active in loopback playback probes without emitting
+    // their synthetic tone to the local speakers.
+    bool mute_playback = false;
+    int64_t audio_jitter_max_ms = 120;
+    int64_t audio_jitter_step_ms = 40;
+    int64_t audio_jitter_window_ms = 500;
+    uint32_t audio_late_tolerance_ms = 20;
+    // Probe-only control for isolating deadline drops from overflow and
+    // stall re-anchoring. It does not turn the player into a raw PCM FIFO.
+    bool audio_keep_late_blocks = false;
+    // Probe-only comparison for PCM already queued when a burst arrives.
+    bool audio_preserve_reanchor_queue = false;
+    uint32_t audio_reorder_wait_ms = 20;
+    bool audio_playout_trace = false;
     // Only with --play: schedule on the host capture timeline with a fixed
     // lead instead of anchoring on arrival, so the same build can A/B the
     // sender-time playout the status doc recommends against the adaptive one.
@@ -1011,6 +1029,8 @@ struct Options {
     // and the local timeline by moving the clock offset instead of the lead.
     // Implies capture anchoring; experimental and off by default.
     bool audio_drift_correction = false;
+    uint32_t audio_render_buffer_ms = 120;
+    bool audio_arrival_phase_correction = false;
     // Only with --play: skew the receiver's capture stamps by this many parts
     // per million to simulate a drifting host clock on a single machine. The
     // sign follows the timestamp: negative schedules blocks earlier over time,
@@ -1368,6 +1388,107 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.audio = true;
                 options.play = true;
                 options.adaptive_jitter = true;
+            } else if (arg == "--mute-playback") {
+                options.audio = true;
+                options.play = true;
+                options.mute_playback = true;
+            } else if (arg == "--audio-playout-trace") {
+                options.audio = true;
+                options.play = true;
+                options.audio_playout_trace = true;
+            } else if (arg == "--adaptive-jitter-max-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms > 1000) {
+                    std::fprintf(stderr, "--adaptive-jitter-max-ms wants 0..1000\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.adaptive_jitter = true;
+                options.audio_jitter_max_ms = static_cast<int64_t>(ms);
+            } else if (arg == "--adaptive-jitter-step-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms == 0 || ms > 500) {
+                    std::fprintf(stderr, "--adaptive-jitter-step-ms wants 1..500\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.adaptive_jitter = true;
+                options.audio_jitter_step_ms = static_cast<int64_t>(ms);
+            } else if (arg == "--adaptive-jitter-window-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms < 100 || ms > 2000) {
+                    std::fprintf(stderr, "--adaptive-jitter-window-ms wants 100..2000\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.adaptive_jitter = true;
+                options.audio_jitter_window_ms = static_cast<int64_t>(ms);
+            } else if (arg == "--audio-late-tolerance-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms > 100) {
+                    std::fprintf(stderr, "--audio-late-tolerance-ms wants 0..100\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_late_tolerance_ms = static_cast<uint32_t>(ms);
+            } else if (arg == "--audio-keep-late-blocks") {
+                options.audio = true;
+                options.play = true;
+                options.audio_keep_late_blocks = true;
+            } else if (arg == "--audio-preserve-reanchor-queue") {
+                options.audio = true;
+                options.play = true;
+                options.audio_preserve_reanchor_queue = true;
+            } else if (arg == "--audio-reorder-wait-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms > 200) {
+                    std::fprintf(stderr, "--audio-reorder-wait-ms wants 0..200\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_reorder_wait_ms = static_cast<uint32_t>(ms);
+            } else if (arg == "--audio-max-starved-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms > 60000) {
+                    std::fprintf(stderr, "--audio-max-starved-ms wants 0..60000\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_continuity_budget.max_starved_ms = ms;
+            } else if (arg == "--audio-max-device-gap-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms > 60000) {
+                    std::fprintf(stderr, "--audio-max-device-gap-ms wants 0..60000\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_continuity_budget.max_device_gap_ms = ms;
+            } else if (arg == "--audio-max-dropped-blocks" && i + 1 < argc) {
+                const unsigned long blocks = std::stoul(argv[++i]);
+                if (blocks > 1000000) {
+                    std::fprintf(stderr, "--audio-max-dropped-blocks wants 0..1000000\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_continuity_budget.max_dropped_blocks = blocks;
+            } else if (arg == "--audio-max-abs-av-skew-ms" && i + 1 < argc) {
+                const double ms = std::stod(argv[++i]);
+                if (!std::isfinite(ms) || ms < 0.0 || ms > 10000.0) {
+                    std::fprintf(stderr,
+                                 "--audio-max-abs-av-skew-ms wants 0..10000\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_continuity_budget.max_abs_av_skew_ms = ms;
             } else if (arg == "--audio-capture-anchor") {
                 options.audio = true;
                 options.play = true;
@@ -1387,6 +1508,19 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.play = true;
                 options.audio_capture_anchor = true;
                 options.audio_drift_correction = true;
+            } else if (arg == "--audio-arrival-phase-correction") {
+                options.audio = true;
+                options.play = true;
+                options.audio_arrival_phase_correction = true;
+            } else if (arg == "--audio-render-buffer-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms < 10 || ms > 500) {
+                    std::fprintf(stderr, "--audio-render-buffer-ms wants 10..500\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_render_buffer_ms = static_cast<uint32_t>(ms);
             } else if (arg == "--audio-drift-ppm" && i + 1 < argc) {
                 const long ppm = std::stol(argv[++i]);
                 if (ppm == 0 || ppm < -5000 || ppm > 5000) {
@@ -1948,7 +2082,16 @@ struct SenderStats {
     uint64_t audio_packets = 0;
     uint64_t audio_bytes = 0;
     uint64_t audio_dropped = 0;
+    uint64_t audio_capture_dropped = 0;
+    uint64_t audio_send_dropped = 0;
     uint64_t audio_stale_dropped = 0;
+    uint64_t audio_max_submit_gap_ms = 0;
+    uint64_t audio_max_capture_age_ms = 0;
+    uint64_t audio_datagrams_framed = 0;
+    uint64_t audio_datagram_submit_to_framed_us = 0;
+    uint64_t audio_datagram_max_submit_to_framed_us = 0;
+    uint64_t audio_datagram_submit_to_framed_over_100ms = 0;
+    size_t audio_datagrams_pending = 0;
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
@@ -2007,11 +2150,18 @@ struct SenderStats {
     uint64_t video_receipts = 0;
     double video_delivery_ms = 0.0;
     double video_pending_ms = 0.0;
+    chast::VideoIdrSendStats video_idr_send;
     double rtt_ms = 0.0;
     double send_kbps = 0.0;
     // SHA-256 identity the server presents (uppercase hex).
     std::string fingerprint;
     bool ok = false;
+};
+
+struct IdrArrivalSample {
+    uint64_t sequence = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t arrival_steady_us = 0;
 };
 
 struct ReceiverStats {
@@ -2195,9 +2345,35 @@ struct ReceiverStats {
     uint64_t audio_played = 0;
     uint64_t audio_underruns = 0;
     uint64_t audio_starved_ms = 0;
+    uint64_t audio_device_starved_ms = 0;
+    uint64_t audio_device_max_gap_ms = 0;
+    uint64_t audio_player_input_max_gap_ms = 0;
+    uint64_t audio_player_input_to_render_max_ms = 0;
+    uint64_t audio_render_wake_max_gap_ms = 0;
+    uint64_t audio_late_drops = 0;
+    uint64_t audio_tolerated_late_blocks = 0;
+    uint64_t audio_overflow_drops = 0;
+    uint64_t audio_reanchor_dropped_blocks = 0;
+    uint64_t audio_reanchor_dropped_ms = 0;
+    chast::AudioReceiveStats audio_receive;
+    uint64_t audio_poll_gap_max_us = 0;
+    uint64_t audio_decode_push_max_us = 0;
+    uint64_t video_decode_max_us = 0;
     uint64_t audio_player_drops = 0;
     uint64_t audio_player_recoveries = 0;
+    uint64_t audio_render_failures = 0;
+    uint64_t audio_stalled_recoveries = 0;
+    uint64_t audio_device_change_recoveries = 0;
+    chast::AudioRecoveryCause audio_last_recovery_cause = chast::AudioRecoveryCause::None;
+    int32_t audio_last_recovery_hresult = 0;
+    uint64_t audio_recovery_open_failures = 0;
+    std::vector<chast::AudioTimingEvent> audio_timing_events;
     uint32_t audio_buffer_ms = 0;
+    uint32_t audio_endpoint_buffer_ms = 0;
+    bool audio_shared_low_latency = false;
+    int32_t audio_shared_low_latency_result = 0;
+    uint32_t audio_engine_period_us = 0;
+    uint32_t audio_stream_latency_us = 0;
     // Earliest/latest (scheduled - arrival) seen by the player since its last
     // anchor. Positive maximum means the anchor carried avoidable delay.
     int64_t audio_slack_min_ms = 0;
@@ -2221,6 +2397,7 @@ struct ReceiverStats {
     // the viewer later than video captured at the same moment.
     double audio_playout_ms = -1.0;
     double av_skew_ms = -1.0;
+    bool av_skew_available = false;
     std::string audio_player_error;
     // Microphone uplink probe (verify --microphone): the host grant, the CMIC
     // stream the viewer opened and closed, and the packets it handed to the
@@ -2365,6 +2542,7 @@ struct ReceiverStats {
     // its bits allow, so this size explains the observed peak beside the fixed
     // acceptance ceiling.
     uint64_t max_keyframe_bytes = 0;
+    std::vector<IdrArrivalSample> idr_arrivals;
     // Bitrate and frame rate the last StreamInfo announced (the encoder's
     // target and ladder pick after ABR).
     uint32_t target_bitrate = 0;
@@ -2830,7 +3008,19 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.audio_packets = status.stats.audio_packets;
     stats.audio_bytes = status.stats.audio_bytes;
     stats.audio_dropped = status.stats.audio_dropped;
+    stats.audio_capture_dropped = status.stats.audio_capture_dropped;
+    stats.audio_send_dropped = status.stats.audio_send_dropped;
     stats.audio_stale_dropped = status.stats.audio_stale_dropped;
+    stats.audio_max_submit_gap_ms = status.stats.audio_max_submit_gap_ms;
+    stats.audio_max_capture_age_ms = status.stats.audio_max_capture_age_ms;
+    stats.audio_datagrams_framed = status.stats.audio_datagrams_framed;
+    stats.audio_datagram_submit_to_framed_us =
+        status.stats.audio_datagram_submit_to_framed_us;
+    stats.audio_datagram_max_submit_to_framed_us =
+        status.stats.audio_datagram_max_submit_to_framed_us;
+    stats.audio_datagram_submit_to_framed_over_100ms =
+        status.stats.audio_datagram_submit_to_framed_over_100ms;
+    stats.audio_datagrams_pending = status.stats.audio_datagrams_pending;
     stats.audio_errors = status.stats.audio_errors;
     stats.audio_capture_recoveries = status.stats.audio_capture_recoveries;
     stats.audio_gate_transitions = status.stats.audio_gate_transitions;
@@ -2879,6 +3069,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.video_receipts = status.stats.video_receipts;
     stats.video_delivery_ms = status.stats.video_delivery_ms;
     stats.video_pending_ms = status.stats.video_pending_ms;
+    stats.video_idr_send = status.stats.video_idr_send;
     stats.rtt_ms = status.stats.rtt_ms;
     stats.send_kbps = status.stats.send_kbps;
     stats.files_sent = status.stats.files_sent;
@@ -2935,7 +3126,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         }
         if (options.audio) {
             std::printf("sender: audio announced=%d active=%d %s %u Hz %u ch %u kbps "
-                        "packets=%llu bytes=%llu dropped=%llu stale=%llu errors=%llu "
+                        "packets=%llu bytes=%llu dropped=%llu capture-drops=%llu "
+                        "send-drops=%llu stale=%llu errors=%llu "
                         "recoveries=%llu gates=%llu recovering=%d\n",
                         stats.audio_announced ? 1 : 0, stats.audio_active ? 1 : 0,
                         audio_codec_name(stats.audio_info.codec),
@@ -2944,6 +3136,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         static_cast<unsigned long long>(stats.audio_packets),
                         static_cast<unsigned long long>(stats.audio_bytes),
                         static_cast<unsigned long long>(stats.audio_dropped),
+                        static_cast<unsigned long long>(stats.audio_capture_dropped),
+                        static_cast<unsigned long long>(stats.audio_send_dropped),
                         static_cast<unsigned long long>(stats.audio_stale_dropped),
                         static_cast<unsigned long long>(stats.audio_errors),
                         static_cast<unsigned long long>(stats.audio_capture_recoveries),
@@ -4973,7 +5167,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     };
 
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
+    std::mutex audio_decoder_mutex;
     auto ensure_audio_decoder = [&](const chast::AudioInfo& audio) -> bool {
+        std::lock_guard<std::mutex> lock(audio_decoder_mutex);
         if (!options.audio || !audio.enabled) {
             return true;
         }
@@ -5004,6 +5200,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     std::unique_ptr<chast::IAudioPlayer> audio_player;
     if (options.play) {
         chast::AudioPlayerConfig player_config;
+        player_config.collect_timing_events = options.audio_playout_trace;
+        player_config.late_tolerance_ms = options.audio_late_tolerance_ms;
+        player_config.render_buffer_ms = options.audio_render_buffer_ms;
         if (options.audio_capture_anchor) {
             // Sender-time scheduling: capture stamps plus a fixed lead, with
             // the host clock offset arriving from the first latency reply.
@@ -5013,10 +5212,28 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             // The viewer GUI plays system audio on arrival; mirror that here
             // so the CLI measurement exercises the same path.
             player_config.arrival_anchored = true;
+            player_config.arrival_phase_correction =
+                options.audio_arrival_phase_correction;
             player_config.lead_ms = 0;
+            player_config.late_tolerance_ms = options.audio_late_tolerance_ms;
             player_config.anchor_gather_blocks = 6;
         }
+        if (options.audio_keep_late_blocks) {
+            // About 49 days: effectively no deadline rejection during a probe,
+            // while retaining the player's normal queue and recovery policies.
+            player_config.late_tolerance_ms = UINT32_MAX;
+            std::printf("receiver: experimental late-block retention enabled "
+                        "(queue limit and stall re-anchoring remain active)\n");
+        }
+        player_config.preserve_queue_on_reanchor =
+            options.audio_preserve_reanchor_queue;
+        if (options.audio_preserve_reanchor_queue) {
+            std::printf("receiver: experimental re-anchor queue preservation enabled\n");
+        }
         player_config.adaptive_jitter = options.adaptive_jitter;
+        player_config.adaptive_jitter_config.max_lead_ms = options.audio_jitter_max_ms;
+        player_config.adaptive_jitter_config.raise_step_max_ms = options.audio_jitter_step_ms;
+        player_config.adaptive_jitter_config.window_ms = options.audio_jitter_window_ms;
         player_config.clock_drift_correction = options.audio_drift_correction;
         std::string player_error;
         audio_player = chast::create_audio_player(player_config, &player_error);
@@ -5026,6 +5243,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (chast::Error started = audio_player->start(); !started.ok()) {
             return fail("audio player start failed: " + started.to_string());
         }
+        audio_player->set_mute(options.mute_playback);
     }
 
     chast::DecoderConfig decoder_config;
@@ -5731,7 +5949,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     // later calls take whatever is already queued.
     chast::AudioHeader audio_header;
     std::vector<uint8_t> audio_payload;
-    uint64_t expected_audio_seq = 0;
+    chast::AudioPacketReorderBuffer audio_reorder(
+        std::chrono::milliseconds(options.audio_reorder_wait_ms));
+    std::atomic<bool> audio_finished{false};
+    std::atomic<uint64_t> audio_poll_gap_max_us{0};
+    std::atomic<uint64_t> audio_decode_push_max_us{0};
+    auto last_audio_poll = std::chrono::steady_clock::time_point{};
     auto count_audio = [&](const std::vector<chast::DecodedAudio>& blocks) {
         for (const chast::DecodedAudio& block : blocks) {
             const size_t channels = block.channels == 0 ? 1 : block.channels;
@@ -5777,21 +6000,97 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
         }
     };
+    auto process_audio_packet = [&](chast::AudioPacket& packet,
+                                    uint64_t missing_sequences) {
+        std::lock_guard<std::mutex> decoder_lock(audio_decoder_mutex);
+        const chast::AudioHeader& header = packet.header;
+        const std::vector<uint8_t>& payload = packet.payload;
+        if (missing_sequences > 0) {
+            ++stats.audio_gaps;
+            stats.audio_missing += missing_sequences;
+            if (audio_decoder) {
+                const uint32_t fill = static_cast<uint32_t>(
+                    (std::min<uint64_t>)(missing_sequences, 5));
+                for (uint32_t back = fill; back > 0; --back) {
+                    std::vector<chast::DecodedAudio> concealed_blocks;
+                    chast::Error concealed = audio_decoder->conceal(header, back,
+                                                                      concealed_blocks);
+                    if (!concealed.ok()) {
+                        break;
+                    }
+                    for (chast::DecodedAudio& block : concealed_blocks) {
+                        block.diagnostic_sequence = header.seq - back;
+                        block.diagnostic_received_steady_us = packet.received_steady_us;
+                        block.diagnostic_reordered_steady_us = packet.reordered_steady_us;
+                        block.diagnostic_revealed_by_sequence = header.seq;
+                        block.diagnostic_concealed = true;
+                    }
+                    if (!concealed_blocks.empty()) {
+                        ++stats.audio_concealed;
+                        count_audio(concealed_blocks);
+                        play_audio(concealed_blocks);
+                    }
+                }
+            }
+        }
+        if (!audio_decoder) {
+            return;
+        }
+        if (header.payload_size != payload.size() ||
+            chast::crc32(payload.data(), payload.size()) != header.payload_crc32) {
+            ++stats.audio_crc_errors;
+            return;
+        }
+        const auto decode_started = std::chrono::steady_clock::now();
+        std::vector<chast::DecodedAudio> blocks;
+        chast::Error decoded_audio = audio_decoder->decode(
+            header, payload.data(), payload.size(), blocks);
+        if (!decoded_audio.ok()) {
+            ++stats.audio_decode_errors;
+            if (stats.audio_decode_errors == 1) {
+                std::fprintf(stderr, "audio decode: %s\n",
+                             decoded_audio.to_string().c_str());
+            }
+            return;
+        }
+        for (chast::DecodedAudio& block : blocks) {
+            block.diagnostic_sequence = header.seq;
+            block.diagnostic_received_steady_us = packet.received_steady_us;
+            block.diagnostic_reordered_steady_us = packet.reordered_steady_us;
+        }
+        count_audio(blocks);
+        play_audio(blocks);
+        const auto decode_push_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - decode_started).count();
+        audio_decode_push_max_us.store((std::max)(
+            audio_decode_push_max_us.load(),
+            static_cast<uint64_t>((std::max)(int64_t{0}, decode_push_us))));
+    };
     auto drain_audio = [&](std::chrono::milliseconds wait) {
         if (!options.audio) {
             return;
         }
+        const auto poll_started = std::chrono::steady_clock::now();
+        if (last_audio_poll != std::chrono::steady_clock::time_point{}) {
+            const auto gap = std::chrono::duration_cast<std::chrono::microseconds>(
+                poll_started - last_audio_poll).count();
+            audio_poll_gap_max_us.store((std::max)(
+                audio_poll_gap_max_us.load(),
+                static_cast<uint64_t>((std::max)(int64_t{0}, gap))));
+        }
+        last_audio_poll = poll_started;
         // PLC sounds continuously stretched past a few frames; cap the fill
         // at 100 ms and let a longer outage stay silent.
-        constexpr uint32_t kMaxConcealedAudioFrames = 5;
         for (;;) {
-            chast::Error next = session->receive_audio(audio_header, audio_payload, wait);
+            uint64_t received_steady_us = 0;
+            chast::Error next = session->receive_audio(
+                audio_header, audio_payload, wait, &received_steady_us);
             wait = std::chrono::milliseconds(0);
             if (next.status() == chast::Status::WaitTimeout) {
                 break;
             }
             if (next.status() == chast::Status::Unavailable) {
-                stats.audio_finished = session->audio_finished();
+                audio_finished.store(session->audio_finished());
                 break;
             }
             if (!next.ok()) {
@@ -5803,60 +6102,40 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             ++stats.audio_received;
             stats.audio_bytes += audio_payload.size();
-            // Datagrams may arrive out of order, so only a forward jump is a
-            // loss; a packet behind the highest sequence seen is reordering.
-            if (audio_header.seq < expected_audio_seq) {
-                // Its slot already passed; playing it now would move the
-                // timeline backwards. The gap was concealed when the
-                // following packet arrived.
+            const bool reordered = audio_reorder.has_later_pending(audio_header.seq);
+            chast::AudioPacket packet;
+            packet.header = audio_header;
+            packet.payload = std::move(audio_payload);
+            packet.received_steady_us = received_steady_us;
+            if (!audio_reorder.push(std::move(packet))) {
                 ++stats.audio_reordered;
                 continue;
             }
-            if (audio_header.seq > expected_audio_seq) {
-                const uint32_t missing =
-                    static_cast<uint32_t>(audio_header.seq - expected_audio_seq);
-                ++stats.audio_gaps;
-                stats.audio_missing += missing;
-                if (audio_decoder) {
-                    const uint32_t fill = (std::min)(missing, kMaxConcealedAudioFrames);
-                    for (uint32_t back = fill; back > 0; --back) {
-                        std::vector<chast::DecodedAudio> concealed_blocks;
-                        chast::Error concealed =
-                            audio_decoder->conceal(audio_header, back, concealed_blocks);
-                        if (!concealed.ok()) {
-                            break;
-                        }
-                        if (!concealed_blocks.empty()) {
-                            ++stats.audio_concealed;
-                            count_audio(concealed_blocks);
-                            play_audio(concealed_blocks);
-                        }
-                    }
+            if (reordered) {
+                ++stats.audio_reordered;
+            }
+            chast::AudioPacket ready;
+            uint64_t missing_sequences = 0;
+            while (audio_reorder.pop_ready(
+                chast::AudioPacketReorderBuffer::Clock::now(), ready,
+                missing_sequences)) {
+                if (options.audio_playout_trace) {
+                    ready.reordered_steady_us =
+                        static_cast<uint64_t>(steady_clock_us());
                 }
+                process_audio_packet(ready, missing_sequences);
             }
-            expected_audio_seq = audio_header.seq + 1;
-            if (!audio_decoder) {
-                continue;
+        }
+        chast::AudioPacket ready;
+        uint64_t missing_sequences = 0;
+        while (audio_reorder.pop_ready(
+            chast::AudioPacketReorderBuffer::Clock::now(), ready,
+                missing_sequences, audio_finished.load())) {
+            if (options.audio_playout_trace) {
+                ready.reordered_steady_us =
+                    static_cast<uint64_t>(steady_clock_us());
             }
-            if (audio_header.payload_size != audio_payload.size() ||
-                chast::crc32(audio_payload.data(), audio_payload.size()) !=
-                    audio_header.payload_crc32) {
-                ++stats.audio_crc_errors;
-                continue;
-            }
-            std::vector<chast::DecodedAudio> blocks;
-            chast::Error decoded_audio = audio_decoder->decode(
-                audio_header, audio_payload.data(), audio_payload.size(), blocks);
-            if (!decoded_audio.ok()) {
-                ++stats.audio_decode_errors;
-                if (stats.audio_decode_errors == 1) {
-                    std::fprintf(stderr, "audio decode: %s\n",
-                                 decoded_audio.to_string().c_str());
-                }
-                continue;
-            }
-            count_audio(blocks);
-            play_audio(blocks);
+            process_audio_packet(ready, missing_sequences);
         }
     };
 
@@ -6334,6 +6613,15 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         return true;
     };
 
+    std::jthread audio_thread;
+    if (options.audio) {
+        audio_thread = std::jthread([&](std::stop_token stop_token) {
+            while (!stop_token.stop_requested() && !audio_finished.load()) {
+                drain_audio(std::chrono::milliseconds(10));
+            }
+        });
+    }
+
     while (std::chrono::steady_clock::now() < deadline) {
         if (next_access_ticket_renewal < options.access_ticket_renewals.size() &&
             std::chrono::steady_clock::now() >= access_ticket_renewal_at) {
@@ -6416,7 +6704,6 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!advance_file_list_probe()) {
             return fail(stats.error);
         }
-        drain_audio(std::chrono::milliseconds(0));
         if (options.microphone && !stats.microphone_started &&
             std::chrono::steady_clock::now() >= microphone_start_at) {
             if (chast::Error started = session->start_microphone(stats.microphone_info);
@@ -6480,6 +6767,37 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             const auto probe_now = std::chrono::steady_clock::now();
             if (probe_now - last_probe >= std::chrono::seconds(1)) {
                 last_probe = probe_now;
+                if (audio_player && options.audio_playout_trace) {
+                    const auto played = audio_player->stats();
+                    const auto queued = session->audio_receive_stats();
+                    const double latency = clock_synced ? chast::audio_playout_latency_ms(
+                        played.playout_capture_ms, played.playout_scheduled_ms, clock_offset_us) : -1;
+                    const double target = clock_synced ? chast::audio_playout_latency_ms(
+                        played.playout_capture_ms, played.playout_target_ms, clock_offset_us) : -1;
+                    std::printf("audio-trace: t=%.1f played=%llu starved=%llu device-starved=%llu "
+                                "device-max-gap=%llu late-accepted=%llu late-drop=%llu overflow=%llu stale-rx=%llu buffer=%u endpoint-buffer=%u jit=%u "
+                                "latency=%.1f target=%.1f frame-age=%.1f rx-peak=%zu rx-max=%.1f "
+                                "arrival-max-gap=%.1f arrival-gaps-over-100ms=%llu "
+                                "audio-poll-max=%.1f audio-decode-push-max=%.1f video-decode-max=%.1f ms\n",
+                                std::chrono::duration<double>(probe_now - start).count(),
+                                static_cast<unsigned long long>(played.played_frames),
+                                static_cast<unsigned long long>(played.starved_ms),
+                                static_cast<unsigned long long>(played.device_starved_ms),
+                                static_cast<unsigned long long>(played.device_max_gap_ms),
+                                static_cast<unsigned long long>(played.tolerated_late_blocks),
+                                static_cast<unsigned long long>(played.late_drops),
+                                static_cast<unsigned long long>(played.overflow_drops),
+                                static_cast<unsigned long long>(queued.stale_drops),
+                                played.buffer_ms, played.endpoint_buffer_ms,
+                                played.jitter_ms, latency, target,
+                                stats.last_frame_age_ms, queued.peak_queued,
+                                static_cast<double>(queued.max_residence_us) / 1000.0,
+                                static_cast<double>(queued.max_arrival_gap_us) / 1000.0,
+                                static_cast<unsigned long long>(queued.arrival_gaps_over_100ms),
+                                 static_cast<double>(audio_poll_gap_max_us.load()) / 1000.0,
+                                 static_cast<double>(audio_decode_push_max_us.load()) / 1000.0,
+                                static_cast<double>(stats.video_decode_max_us) / 1000.0);
+                }
                 ++stats.probes_sent;
                 if (chast::Error probed = session->send_latency_probe(); !probed.ok()) {
                     ++stats.probe_errors;
@@ -6512,7 +6830,6 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                                                   : std::chrono::milliseconds(250);
         chast::Error received = session->receive_frame(header, payload, receive_wait);
         // Drain audio right after every wait so it never queues behind a stall.
-        drain_audio(std::chrono::milliseconds(0));
         drain_microphone();
         drain_privacy_state();
         drain_sas_result();
@@ -6578,6 +6895,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         // diagnostic beside the worst frame age cannot understate the IDR.
         if (header.keyframe && payload.size() > stats.max_keyframe_bytes)
             stats.max_keyframe_bytes = payload.size();
+        if (header.idr) {
+            if (stats.idr_arrivals.size() >= 128) {
+                stats.idr_arrivals.erase(stats.idr_arrivals.begin());
+            }
+            stats.idr_arrivals.push_back({
+                header.seq, payload.size(), static_cast<uint64_t>(steady_clock_us())});
+        }
 
         if (header.capture_ms == 0) {
             ++stats.frames_without_capture;
@@ -6668,6 +6992,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             ++stats.keyframes;
         }
 
+        const auto video_decode_started = std::chrono::steady_clock::now();
         frames.clear();
         chast::Error decoded =
             decoder->decode(payload.data(), payload.size(), header.pts_ms, header.keyframe,
@@ -6709,7 +7034,29 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 }
             }
         }
+        const auto video_decode_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - video_decode_started).count();
+        stats.video_decode_max_us = (std::max)(
+            stats.video_decode_max_us,
+            static_cast<uint64_t>((std::max)(int64_t{0}, video_decode_us)));
     }
+
+    if (options.audio && !audio_finished.load()) {
+        const auto audio_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!audio_finished.load() && std::chrono::steady_clock::now() < audio_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    if (audio_thread.joinable()) {
+        if (!audio_finished.load()) {
+            audio_thread.request_stop();
+        }
+        audio_thread.join();
+    }
+    stats.audio_finished = audio_finished.load();
+    stats.audio_poll_gap_max_us = audio_poll_gap_max_us.load();
+    stats.audio_decode_push_max_us = audio_decode_push_max_us.load();
 
     std::vector<chast::DecodedFrame> tail;
     drain_clipboard();
@@ -6873,17 +7220,6 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
     }
     if (options.audio) {
-        // The server FINs the audio stream right after the video's; wait
-        // briefly for the tail and its closing packet before finishing.
-        const auto audio_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (!stats.audio_finished && std::chrono::steady_clock::now() < audio_deadline) {
-            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                audio_deadline - std::chrono::steady_clock::now());
-            if (left <= std::chrono::milliseconds(0)) {
-                break;
-            }
-            drain_audio((std::min)(left, std::chrono::milliseconds(200)));
-        }
         if (audio_decoder) {
             std::vector<chast::DecodedAudio> tail_audio;
             if (audio_decoder->flush(tail_audio).ok()) {
@@ -6899,9 +7235,32 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         stats.audio_played = played.played_frames;
         stats.audio_underruns = played.underruns;
         stats.audio_starved_ms = played.starved_ms;
+        stats.audio_device_starved_ms = played.device_starved_ms;
+        stats.audio_device_max_gap_ms = played.device_max_gap_ms;
+        stats.audio_player_input_max_gap_ms = played.input_max_gap_ms;
+        stats.audio_player_input_to_render_max_ms = played.input_to_render_max_ms;
+        stats.audio_render_wake_max_gap_ms = played.render_wake_max_gap_ms;
+        stats.audio_late_drops = played.late_drops;
+        stats.audio_tolerated_late_blocks = played.tolerated_late_blocks;
+        stats.audio_overflow_drops = played.overflow_drops;
+        stats.audio_reanchor_dropped_blocks = played.reanchor_dropped_blocks;
+        stats.audio_reanchor_dropped_ms = played.reanchor_dropped_ms;
+        stats.audio_receive = session->audio_receive_stats();
         stats.audio_player_drops = played.dropped;
         stats.audio_player_recoveries = played.recoveries;
+        stats.audio_render_failures = played.render_failures;
+        stats.audio_stalled_recoveries = played.stalled_recoveries;
+        stats.audio_device_change_recoveries = played.device_change_recoveries;
+        stats.audio_last_recovery_cause = played.last_recovery_cause;
+        stats.audio_last_recovery_hresult = played.last_recovery_hresult;
+        stats.audio_recovery_open_failures = played.recovery_open_failures;
+        stats.audio_timing_events = played.timing_events;
         stats.audio_buffer_ms = played.buffer_ms;
+        stats.audio_endpoint_buffer_ms = played.endpoint_buffer_ms;
+        stats.audio_shared_low_latency = played.shared_low_latency;
+        stats.audio_shared_low_latency_result = played.shared_low_latency_result;
+        stats.audio_engine_period_us = played.engine_period_us;
+        stats.audio_stream_latency_us = played.stream_latency_us;
         stats.audio_slack_min_ms = played.slack_min_ms;
         stats.audio_slack_max_ms = played.slack_max_ms;
         stats.audio_slack_avg_ms = played.slack_avg_ms;
@@ -6918,6 +7277,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 played.playout_capture_ms, played.playout_scheduled_ms, clock_offset_us);
             if (stats.audio_playout_ms >= 0.0 && stats.last_frame_age_ms >= 0.0) {
                 stats.av_skew_ms = stats.audio_playout_ms - stats.last_frame_age_ms;
+                stats.av_skew_available = true;
             }
         }
         if (stats.audio_player_error.empty() && !audio_player->error().empty()) {
@@ -7151,8 +7511,18 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             static_cast<unsigned long long>(stats.audio_samples),
                             stats.audio_seconds, stats.audio_rms);
                 if (options.play) {
+                    std::printf("receiver: audio-endpoint client3=%s result=0x%08x "
+                                "engine-period=%.3f ms stream-latency=%.3f ms\n",
+                                stats.audio_shared_low_latency ? "active" : "inactive",
+                                static_cast<unsigned>(stats.audio_shared_low_latency_result),
+                                static_cast<double>(stats.audio_engine_period_us) / 1000.0,
+                                static_cast<double>(stats.audio_stream_latency_us) / 1000.0);
                     std::printf("receiver: playback played=%llu frames underruns=%llu "
-                                "starved=%llu ms dropped=%llu recoveries=%llu buffer=%u ms "
+                                "starved=%llu ms dropped=%llu "
+                                "reanchor-dropped=%llu blocks/%llu ms recoveries=%llu "
+                                "last-recovery=%s hr=0x%08x render-failures=%llu "
+                                "stalled=%llu device-changes=%llu reopen-failures=%llu "
+                                "buffer=%u ms endpoint=%u ms "
                                 "slack=%+lld..%+lld avg=%+.1f ms early=%llu late=%llu "
                                 "jit=%u ms raises=%llu decays=%llu drift=%+lld ms "
                                 "steps=%llu anchor=%+lld ms%s%s\n",
@@ -7160,8 +7530,19 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                                 static_cast<unsigned long long>(stats.audio_underruns),
                                 static_cast<unsigned long long>(stats.audio_starved_ms),
                                 static_cast<unsigned long long>(stats.audio_player_drops),
+                                static_cast<unsigned long long>(
+                                    stats.audio_reanchor_dropped_blocks),
+                                static_cast<unsigned long long>(
+                                    stats.audio_reanchor_dropped_ms),
                                 static_cast<unsigned long long>(stats.audio_player_recoveries),
+                                chast::audio_recovery_cause_name(stats.audio_last_recovery_cause),
+                                static_cast<uint32_t>(stats.audio_last_recovery_hresult),
+                                static_cast<unsigned long long>(stats.audio_render_failures),
+                                static_cast<unsigned long long>(stats.audio_stalled_recoveries),
+                                static_cast<unsigned long long>(stats.audio_device_change_recoveries),
+                                static_cast<unsigned long long>(stats.audio_recovery_open_failures),
                                 stats.audio_buffer_ms,
+                                stats.audio_endpoint_buffer_ms,
                                 static_cast<long long>(stats.audio_slack_min_ms),
                                 static_cast<long long>(stats.audio_slack_max_ms),
                                 stats.audio_slack_avg_ms,
@@ -7175,6 +7556,29 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                                 static_cast<long long>(stats.audio_anchor_shift_ms),
                                 stats.audio_player_error.empty() ? "" : " error=",
                                 stats.audio_player_error.c_str());
+                     std::printf("receiver: audio-stages device-starved=%llu ms device-max-gap=%llu ms "
+                                 "player-input-max-gap=%llu ms input-to-render-max=%llu ms "
+                                 "render-wake-max-gap=%llu ms "
+                                "late-accepted=%llu late-drops=%llu overflow=%llu rx-overflow=%llu rx-stale=%llu rx-peak=%zu "
+                                "rx-max=%.1f ms rx-avg=%.1f ms arrival-max-gap=%.1f ms "
+                                "arrival-gaps-over-100ms=%llu\n",
+                                 static_cast<unsigned long long>(stats.audio_device_starved_ms),
+                                 static_cast<unsigned long long>(stats.audio_device_max_gap_ms),
+                                 static_cast<unsigned long long>(stats.audio_player_input_max_gap_ms),
+                                 static_cast<unsigned long long>(stats.audio_player_input_to_render_max_ms),
+                                 static_cast<unsigned long long>(stats.audio_render_wake_max_gap_ms),
+                                static_cast<unsigned long long>(stats.audio_tolerated_late_blocks),
+                                static_cast<unsigned long long>(stats.audio_late_drops),
+                                static_cast<unsigned long long>(stats.audio_overflow_drops),
+                                static_cast<unsigned long long>(stats.audio_receive.overflow_drops),
+                                static_cast<unsigned long long>(stats.audio_receive.stale_drops),
+                                stats.audio_receive.peak_queued,
+                                static_cast<double>(stats.audio_receive.max_residence_us) / 1000.0,
+                                stats.audio_receive.dequeued == 0 ? 0.0 :
+                                    static_cast<double>(stats.audio_receive.residence_us) /
+                                        stats.audio_receive.dequeued / 1000.0,
+                                static_cast<double>(stats.audio_receive.max_arrival_gap_us) / 1000.0,
+                                static_cast<unsigned long long>(stats.audio_receive.arrival_gaps_over_100ms));
                     if (stats.audio_playout_ms >= 0.0) {
                         if (stats.last_frame_age_ms >= 0.0) {
                             std::printf("receiver: av audio-latency=%.1f ms "
@@ -7236,6 +7640,26 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
     if (options.play) {
         stats.ok = stats.ok && stats.audio_player_error.empty() && stats.audio_played > 0;
+    }
+    if (options.audio_continuity_budget.enabled()) {
+        chast::AudioContinuityMetrics metrics;
+        metrics.starved_ms = stats.audio_starved_ms;
+        metrics.device_max_gap_ms = stats.audio_device_max_gap_ms;
+        metrics.dropped_blocks = stats.audio_player_drops;
+        metrics.av_skew_ms = stats.av_skew_ms;
+        metrics.av_skew_available = stats.av_skew_available;
+        const auto violations = chast::audio_continuity_violations(
+            options.audio_continuity_budget, metrics);
+        if (!violations.empty()) {
+            stats.ok = false;
+            std::string detail = "audio continuity budget failed: ";
+            for (size_t i = 0; i < violations.size(); ++i) {
+                if (i != 0) detail += "; ";
+                detail += violations[i];
+            }
+            if (stats.error.empty()) stats.error = std::move(detail);
+            else stats.error += "; " + detail;
+        }
     }
     if (options.microphone) {
         stats.ok = stats.ok && stats.microphone_announced && stats.microphone_started &&
@@ -11142,13 +11566,16 @@ int run_verify(const Options& options) {
             check(sent.audio_errors == 0 && sent.audio_dropped == 0,
                   "the host's audio path reported no errors or drops");
         }
-        if (sent.audio_dropped > 0 || sent.audio_stale_dropped > 0) {
-            std::printf("     audio counters: queue drops %llu, stale drops %llu, "
-                        "errors %llu\n",
-                        static_cast<unsigned long long>(sent.audio_dropped),
-                        static_cast<unsigned long long>(sent.audio_stale_dropped),
-                        static_cast<unsigned long long>(sent.audio_errors));
-        }
+        std::printf("     audio counters: queue drops %llu (capture %llu, send %llu), "
+                    "stale drops %llu, errors %llu, max submit gap %llu ms, "
+                    "max capture-to-submit age %llu ms\n",
+                    static_cast<unsigned long long>(sent.audio_dropped),
+                    static_cast<unsigned long long>(sent.audio_capture_dropped),
+                    static_cast<unsigned long long>(sent.audio_send_dropped),
+                    static_cast<unsigned long long>(sent.audio_stale_dropped),
+                    static_cast<unsigned long long>(sent.audio_errors),
+                    static_cast<unsigned long long>(sent.audio_max_submit_gap_ms),
+                    static_cast<unsigned long long>(sent.audio_max_capture_age_ms));
         if (local.audio_stream) {
             check(!received.audio_datagram,
                   "the viewer's opt-out kept system audio on the reliable stream");
@@ -11275,6 +11702,7 @@ int run_verify(const Options& options) {
 // clean again afterwards, and the checks require the session to stay intact
 // while the adaptive bitrate controller cuts and recovers.
 int run_weak_network(const Options& options) {
+    const int64_t probe_start_steady_us = steady_clock_us();
     // The documented profile: an 80 ms one-way path with 20 ms of jitter, 3%
     // loss and a 1 Mbps bottleneck, degraded for eight seconds and then clean.
     // A third of the 3 Mbps configured rate survives at the bottleneck, so the
@@ -11517,7 +11945,16 @@ int run_weak_network(const Options& options) {
 
     check(to_viewer.received > 0 && to_viewer.forwarded > 0,
           "video datagrams crossed the relay");
-    check(to_viewer.loss_drops > 0, "the relay dropped video datagrams while degraded");
+    const bool link_has_impairment = delay_ms > 0.0 || jitter_ms > 0.0 ||
+                                     loss_percent > 0.0 || rate_kbps > 0;
+    if (link_has_impairment) {
+        check(to_viewer.loss_drops + to_viewer.queue_drops > 0,
+              "the relay dropped video datagrams while the link was impaired");
+    } else {
+        check(to_viewer.loss_drops == 0 && to_viewer.queue_drops == 0 &&
+                  to_host.loss_drops == 0 && to_host.queue_drops == 0,
+              "an unimpeded relay did not drop datagrams");
+    }
     check(to_viewer.send_errors == 0 && to_host.send_errors == 0,
           "the relay forwarded without socket errors");
     check(to_host.received > 0, "the viewer's own traffic crossed the relay");
@@ -11539,6 +11976,7 @@ int run_weak_network(const Options& options) {
     check(replay.decoded > 0, "offline decode produced pictures");
 
     if (audio_probe) {
+        std::printf("     audio reorder wait: %u ms\n", local.audio_reorder_wait_ms);
         check(sent.audio_announced && received.audio_announced,
               "both ends announced system audio for the weak-link probe");
         if (local.audio_stream) {
@@ -11572,7 +12010,7 @@ int run_weak_network(const Options& options) {
                       static_cast<double>(sent.audio_packets);
         std::printf("     audio: transport=%s sent %llu, received %llu (%.2f%% loss), "
                     "gaps %llu, reordered %llu, missing %llu, concealed %llu, "
-                    "host drops %llu, stale %llu, decoded %.2f s\n",
+                    "host drops %llu (capture %llu, send %llu), stale %llu, decoded %.2f s\n",
                     received.audio_datagram ? "datagram" : "stream",
                     static_cast<unsigned long long>(sent.audio_packets),
                     static_cast<unsigned long long>(received.audio_received), lost_share,
@@ -11581,20 +12019,91 @@ int run_weak_network(const Options& options) {
                     static_cast<unsigned long long>(received.audio_missing),
                     static_cast<unsigned long long>(received.audio_concealed),
                     static_cast<unsigned long long>(sent.audio_dropped),
+                    static_cast<unsigned long long>(sent.audio_capture_dropped),
+                    static_cast<unsigned long long>(sent.audio_send_dropped),
                     static_cast<unsigned long long>(sent.audio_stale_dropped),
                     received.audio_seconds);
+        std::printf("     audio sender: max submit gap %llu ms, max capture-to-submit age %llu ms\n",
+                    static_cast<unsigned long long>(sent.audio_max_submit_gap_ms),
+                    static_cast<unsigned long long>(sent.audio_max_capture_age_ms));
+        std::printf("     audio MsQuic queue: framed %llu, submit-to-frame avg %.2f ms, "
+                    "max %.2f ms, over 100 ms %llu, pending %zu\n",
+                    static_cast<unsigned long long>(sent.audio_datagrams_framed),
+                    sent.audio_datagrams_framed == 0 ? 0.0 :
+                        static_cast<double>(sent.audio_datagram_submit_to_framed_us) /
+                            sent.audio_datagrams_framed / 1000.0,
+                    static_cast<double>(sent.audio_datagram_max_submit_to_framed_us) /
+                        1000.0,
+                    static_cast<unsigned long long>(
+                        sent.audio_datagram_submit_to_framed_over_100ms),
+                    sent.audio_datagrams_pending);
+        for (const auto& gap : received.audio_receive.recent_long_gaps) {
+            const double at_ms = static_cast<double>(
+                static_cast<int64_t>(gap.arrival_steady_us) - probe_start_steady_us) / 1000.0;
+            std::printf("     audio-gap: t=%.1f ms gap=%.1f ms seq=%llu->%llu capture=%llu\n",
+                        at_ms, static_cast<double>(gap.gap_us) / 1000.0,
+                        static_cast<unsigned long long>(gap.previous_sequence),
+                        static_cast<unsigned long long>(gap.sequence),
+                        static_cast<unsigned long long>(gap.capture_ms));
+        }
+        if (local.audio_playout_trace) {
+            const auto relative_ms = [&](uint64_t steady_us) {
+                if (steady_us == 0) return -1.0;
+                return static_cast<double>(
+                    static_cast<int64_t>(steady_us) - probe_start_steady_us) / 1000.0;
+            };
+            for (const chast::AudioTimingEvent& event : received.audio_timing_events) {
+                const char* kind = "unknown";
+                switch (event.kind) {
+                    case chast::AudioTimingEventKind::LateDrop: kind = "late-drop"; break;
+                    case chast::AudioTimingEventKind::FirstWrite: kind = "first-write"; break;
+                    case chast::AudioTimingEventKind::DeviceGap: kind = "device-gap"; break;
+                    case chast::AudioTimingEventKind::StallReanchor:
+                        kind = "stall-reanchor";
+                        break;
+                }
+                const double target_ms = event.target_steady_us == 0
+                    ? -1.0
+                    : static_cast<double>(event.target_steady_us - probe_start_steady_us) /
+                          1000.0;
+                std::printf("     audio-playout-event kind=%s seq=%llu capture=%llu "
+                            "revealed-by=%llu concealed=%u rx=%.1f reorder=%.1f "
+                            "queue=%.1f event=%.1f target=%.1f "
+                            "late=%.1f gap=%.1f shift=%+.1f pending=%llu ms/%llu blocks\n",
+                            kind, static_cast<unsigned long long>(event.sequence),
+                            static_cast<unsigned long long>(event.capture_ms),
+                            static_cast<unsigned long long>(event.revealed_by_sequence),
+                            event.concealed ? 1u : 0u,
+                            relative_ms(event.received_steady_us),
+                            relative_ms(event.reordered_steady_us),
+                            relative_ms(event.queued_steady_us),
+                            relative_ms(event.event_steady_us), target_ms,
+                            static_cast<double>(event.lateness_us) / 1000.0,
+                            static_cast<double>(event.endpoint_gap_us) / 1000.0,
+                            static_cast<double>(event.timeline_shift_us) / 1000.0,
+                            static_cast<unsigned long long>(event.queued_audio_ms),
+                            static_cast<unsigned long long>(event.queued_blocks));
+            }
+        }
         if (local.play) {
             check(received.audio_player_error.empty() && received.audio_played > 0,
                   "the WASAPI player rendered the weak-link audio");
             std::printf("     audio playback: played %llu, underruns %llu, "
-                        "starved %llu ms, dropped %llu, "
-                        "buffer %u ms, slack %+lld..%+lld avg %+.1f ms, "
+                        "starved %llu ms, late-accepted %llu, dropped %llu "
+                        "(re-anchor %llu blocks/%llu ms), "
+                        "buffer %u ms (endpoint %u ms), slack %+lld..%+lld avg %+.1f ms, "
                         "jit %u ms (+%llu/-%llu), av-skew %+.1f ms\n",
                         static_cast<unsigned long long>(received.audio_played),
                         static_cast<unsigned long long>(received.audio_underruns),
                         static_cast<unsigned long long>(received.audio_starved_ms),
+                        static_cast<unsigned long long>(received.audio_tolerated_late_blocks),
                         static_cast<unsigned long long>(received.audio_player_drops),
+                        static_cast<unsigned long long>(
+                            received.audio_reanchor_dropped_blocks),
+                        static_cast<unsigned long long>(
+                            received.audio_reanchor_dropped_ms),
                         received.audio_buffer_ms,
+                        received.audio_endpoint_buffer_ms,
                         static_cast<long long>(received.audio_slack_min_ms),
                         static_cast<long long>(received.audio_slack_max_ms),
                         received.audio_slack_avg_ms,
@@ -11602,6 +12111,14 @@ int run_weak_network(const Options& options) {
                         static_cast<unsigned long long>(received.audio_jitter_raises),
                         static_cast<unsigned long long>(received.audio_jitter_decays),
                         received.av_skew_ms);
+            std::printf("     audio arrival: max gap %.1f ms, gaps over 100 ms %llu, "
+                        "receive queue peak %zu, max residence %.1f ms, "
+                        "device max gap %llu ms\n",
+                        static_cast<double>(received.audio_receive.max_arrival_gap_us) / 1000.0,
+                        static_cast<unsigned long long>(received.audio_receive.arrival_gaps_over_100ms),
+                        received.audio_receive.peak_queued,
+                        static_cast<double>(received.audio_receive.max_residence_us) / 1000.0,
+                        static_cast<unsigned long long>(received.audio_device_max_gap_ms));
         }
     }
 
@@ -11630,6 +12147,36 @@ int run_weak_network(const Options& options) {
     std::printf("     video receipts: %llu, last delivery %.0f ms, pending %.0f ms\n",
                 static_cast<unsigned long long>(sent.video_receipts), sent.video_delivery_ms,
                 sent.video_pending_ms);
+    std::printf("     IDR StreamSendComplete: completed %llu, canceled %llu\n",
+                static_cast<unsigned long long>(sent.video_idr_send.completed),
+                static_cast<unsigned long long>(sent.video_idr_send.canceled));
+    for (const auto& sample : sent.video_idr_send.recent) {
+        const auto arrival = std::find_if(
+            received.idr_arrivals.begin(), received.idr_arrivals.end(),
+            [&](const IdrArrivalSample& candidate) {
+                return candidate.sequence == sample.sequence;
+            });
+        const double submit_ms = static_cast<double>(
+            static_cast<int64_t>(sample.submit_steady_us) - probe_start_steady_us) / 1000.0;
+        const double complete_ms = static_cast<double>(
+            static_cast<int64_t>(sample.complete_steady_us) - probe_start_steady_us) / 1000.0;
+        const double receive_ms = arrival == received.idr_arrivals.end()
+            ? -1.0
+            : static_cast<double>(static_cast<int64_t>(arrival->arrival_steady_us) -
+                                  probe_start_steady_us) / 1000.0;
+        const double submit_to_receive_ms = arrival == received.idr_arrivals.end()
+            ? -1.0
+            : static_cast<double>(static_cast<int64_t>(arrival->arrival_steady_us) -
+                                  static_cast<int64_t>(sample.submit_steady_us)) / 1000.0;
+        std::printf("     IDR: seq=%llu bytes=%llu submit=%.1f ms StreamSendComplete=%.1f ms "
+                    "(+%.1f ms) viewer-receive=%.1f ms submit-to-receive=%.1f ms\n",
+                    static_cast<unsigned long long>(sample.sequence),
+                    static_cast<unsigned long long>(sample.payload_bytes), submit_ms,
+                    complete_ms,
+                    static_cast<double>(sample.submit_to_complete_us) / 1000.0,
+                    receive_ms, submit_to_receive_ms);
+    }
+    std::printf("     event times use this single host's steady clock; not cross-machine comparable\n");
     std::printf("     relay: host->viewer rx=%llu fwd=%llu loss=%llu qdrop=%llu "
                 "maxq=%.0f ms | viewer->host rx=%llu loss=%llu qdrop=%llu\n",
                 static_cast<unsigned long long>(to_viewer.received),

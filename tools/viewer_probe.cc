@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -80,6 +81,9 @@ fs::path probe_scratch_root() {
 // does not depend on the picture, and a headless run has no window.
 class ProbeSink final : public chast_viewer::FrameSink {
 public:
+    explicit ProbeSink(std::chrono::milliseconds frame_delay = 0ms)
+        : frame_delay_(frame_delay) {}
+
     bool create(std::string* error) {
         const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         const HRESULT hr =
@@ -98,6 +102,9 @@ public:
 
     bool OnGpuFrame(ID3D11Texture2D*, uint32_t, uint32_t width, uint32_t height, uint32_t,
                     uint32_t, uint64_t) override {
+        if (frame_delay_ > 0ms) {
+            std::this_thread::sleep_for(frame_delay_);
+        }
         width_ = width;
         height_ = height;
         frames_.fetch_add(1, std::memory_order_relaxed);
@@ -138,9 +145,134 @@ public:
 private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
+    std::chrono::milliseconds frame_delay_;
     std::atomic<uint64_t> frames_{0};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+};
+
+struct SyntheticAudioMetrics {
+    std::atomic<uint64_t> capture_instances{0};
+    std::atomic<uint64_t> encoded_packets{0};
+    std::atomic<uint64_t> dropped_packets{0};
+};
+
+class SyntheticSilentLoopback final : public chast::ILoopbackCapture {
+public:
+    explicit SyntheticSilentLoopback(std::shared_ptr<SyntheticAudioMetrics> metrics)
+        : metrics_(std::move(metrics)) {
+        chast::AudioEncoderConfig config;
+        config.codec = chast::AudioCodec::Opus;
+        config.sample_rate = 48000;
+        config.channels = 2;
+        config.bitrate = 64000;
+        encoder_ = chast::create_opus_encoder(config, &error_);
+        if (!encoder_) {
+            failed_.store(true, std::memory_order_relaxed);
+            return;
+        }
+
+        info_.enabled = true;
+        info_.codec = chast::AudioCodec::Opus;
+        info_.sample_rate = encoder_->sample_rate();
+        info_.channels = encoder_->channels();
+        info_.bitrate = encoder_->bitrate();
+        info_.frame_samples = encoder_->frame_samples();
+        info_.extradata = encoder_->extradata();
+        metrics_->capture_instances.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ~SyntheticSilentLoopback() override { stop(); }
+
+    bool ready() const { return encoder_ != nullptr; }
+
+    void start() override {
+        if (!ready() || worker_.joinable()) return;
+        worker_ = std::jthread([this](std::stop_token stop) { capture(stop); });
+    }
+
+    void stop() override {
+        if (worker_.joinable()) {
+            worker_.request_stop();
+            worker_.join();
+        }
+    }
+
+    bool take_packet(chast::EncodedAudio& packet) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (packets_.empty()) return false;
+        packet = std::move(packets_.front());
+        packets_.pop_front();
+        return true;
+    }
+
+    bool failed() const override { return failed_.load(std::memory_order_relaxed); }
+
+    std::string error() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return error_;
+    }
+
+    chast::AudioInfo info() const override { return info_; }
+
+    chast::AudioCaptureStats stats() const override {
+        chast::AudioCaptureStats result;
+        result.packets = metrics_->encoded_packets.load(std::memory_order_relaxed);
+        result.dropped = metrics_->dropped_packets.load(std::memory_order_relaxed);
+        result.capture_errors = failed() ? 1 : 0;
+        return result;
+    }
+
+private:
+    void capture(std::stop_token stop) {
+        std::vector<int16_t> silence(chast::kOpusFrameSamples * info_.channels, 0);
+        auto deadline = std::chrono::steady_clock::now();
+        std::vector<chast::EncodedAudio> encoded;
+        while (!stop.stop_requested()) {
+            const auto capture_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            encoded.clear();
+            chast::Error result = encoder_->encode(silence.data(), chast::kOpusFrameSamples,
+                                                   capture_ms, encoded);
+            if (!result.ok()) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    error_ = result.to_string();
+                }
+                failed_.store(true, std::memory_order_relaxed);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (chast::EncodedAudio& packet : encoded) {
+                    if (packets_.size() >= kQueueLimit) {
+                        packets_.pop_front();
+                        metrics_->dropped_packets.fetch_add(1,
+                                                            std::memory_order_relaxed);
+                    }
+                    packets_.push_back(std::move(packet));
+                    metrics_->encoded_packets.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            deadline += 10ms;
+            std::this_thread::sleep_until(deadline);
+            if (deadline + 50ms < std::chrono::steady_clock::now()) {
+                deadline = std::chrono::steady_clock::now();
+            }
+        }
+    }
+
+    static constexpr size_t kQueueLimit = 256;
+    std::shared_ptr<SyntheticAudioMetrics> metrics_;
+    std::unique_ptr<chast::IAudioEncoder> encoder_;
+    chast::AudioInfo info_;
+    mutable std::mutex mutex_;
+    std::deque<chast::EncodedAudio> packets_;
+    std::string error_;
+    std::atomic<bool> failed_{false};
+    std::jthread worker_;
 };
 
 struct MicrophoneMetrics {
@@ -2619,6 +2751,157 @@ int real_microphone_probe() {
     return result;
 }
 
+int audio_video_isolation_probe() {
+    const HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize_com = SUCCEEDED(com_result);
+    if (FAILED(com_result) && com_result != RPC_E_CHANGED_MODE) {
+        std::fprintf(stderr, "audio-video-isolation: COM initialization failed\n");
+        return 1;
+    }
+
+    ProbeSink sink(150ms);
+    std::unique_ptr<chast::HostServer> host;
+    std::unique_ptr<chast_viewer::ViewerEngine> viewer;
+    auto metrics = std::make_shared<SyntheticAudioMetrics>();
+    int result = 1;
+    std::string error;
+    try {
+        const auto require = [](bool condition, const std::string& message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        require(sink.create(&error), error);
+        const uint16_t port = pick_free_port();
+        require(port != 0, "no loopback port");
+
+        auto configure = [metrics](chast::HostServerConfig& config) {
+            config.serve_once = false;
+            config.settings.allow_audio = true;
+            config.settings.allow_input = false;
+            config.settings.allow_clipboard = false;
+            config.settings.allow_terminal = false;
+            config.settings.allow_record = false;
+            config.settings.framerate = 5;
+            config.adaptive_fps = false;
+            config.audio_capture = [metrics](std::string* failure)
+                -> std::unique_ptr<chast::ILoopbackCapture> {
+                auto capture = std::make_unique<SyntheticSilentLoopback>(metrics);
+                if (!capture->ready()) {
+                    if (failure != nullptr) *failure = capture->error();
+                    return nullptr;
+                }
+                return capture;
+            };
+        };
+        host = start_host(utf8(fs::temp_directory_path()), port, &error, false, {}, {}, {},
+                          chast::ClipboardDirection::Disabled, {}, {},
+                          std::move(configure));
+        require(host != nullptr, error);
+
+        const auto connect = [&] {
+            auto next = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+            next->SetClipboardSync(false);
+            require(next->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
+                                kPassword),
+                    "start audio/video viewer");
+            require(wait_streaming(*next, 20s, &error), error);
+            return next;
+        };
+        const auto wait_audio = [&](chast_viewer::ViewerEngine& current,
+                                    uint64_t minimum_packets,
+                                    std::chrono::milliseconds timeout) {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                const chast_viewer::ViewerStatus status = current.Snapshot();
+                if (status.state != chast_viewer::ViewerState::kStreaming) return false;
+                if (status.audio_enabled && status.audio_received >= minimum_packets &&
+                    status.audio_decoded >= minimum_packets) {
+                    return true;
+                }
+                std::this_thread::sleep_for(10ms);
+            }
+            const chast_viewer::ViewerStatus status = current.Snapshot();
+            return status.audio_enabled && status.audio_received >= minimum_packets &&
+                   status.audio_decoded >= minimum_packets;
+        };
+
+        viewer = connect();
+        require(wait_audio(*viewer, 30, 10s),
+                "the viewer did not receive and decode the synthetic audio stream");
+        require(viewer->SetAudioMuted(true), "mute the synthetic silent stream");
+        const chast_viewer::ViewerStatus first_before = viewer->Snapshot();
+        const uint64_t first_video_before = sink.frames();
+        std::this_thread::sleep_for(2200ms);
+        const chast_viewer::ViewerStatus first_after = viewer->Snapshot();
+        const uint64_t first_video_after = sink.frames();
+        const chast::HostServerStats first_host = host->status().stats;
+        require(first_after.state == chast_viewer::ViewerState::kStreaming,
+                "the viewer stopped streaming during slow video delivery");
+        require(first_after.audio_errors == 0 && first_after.audio_received >
+                    first_before.audio_received && first_after.audio_decoded >
+                    first_before.audio_decoded,
+                "audio receive/decode stopped or reported an error during video delivery");
+        require(first_after.audio_decoded - first_before.audio_decoded >= 120,
+                "audio decode throughput fell behind during the 5 FPS video probe");
+        require(first_video_after >= first_video_before + 5,
+                "5 FPS video did not continue while audio was active");
+        require(first_after.framerate > 0 && first_after.framerate <= 5,
+                "the host did not retain the configured 5 FPS video rate");
+        require(first_host.audio_packets >= 150 && first_host.audio_errors == 0 &&
+                    first_host.audio_dropped == 0,
+                "the host audio source or send path reported errors or packet drops");
+        require(metrics->encoded_packets.load(std::memory_order_relaxed) >= 150 &&
+                    metrics->dropped_packets.load(std::memory_order_relaxed) == 0,
+                "the synthetic source failed or overflowed its bounded queue");
+
+        viewer->Stop();
+        viewer.reset();
+        const auto disconnect_deadline = std::chrono::steady_clock::now() + 10s;
+        while (!host->viewers().empty() &&
+               std::chrono::steady_clock::now() < disconnect_deadline) {
+            std::this_thread::sleep_for(10ms);
+        }
+        require(host->viewers().empty(), "the host did not release the first viewer");
+
+        const uint64_t packets_before_reconnect =
+            metrics->encoded_packets.load(std::memory_order_relaxed);
+        viewer = connect();
+        require(wait_audio(*viewer, 30, 10s),
+                "audio did not restart after the viewer reconnected");
+        require(viewer->SetAudioMuted(true), "mute the reconnected silent stream");
+        std::this_thread::sleep_for(700ms);
+        const chast_viewer::ViewerStatus reconnected = viewer->Snapshot();
+        require(reconnected.state == chast_viewer::ViewerState::kStreaming &&
+                    reconnected.audio_errors == 0 && reconnected.audio_received >= 60 &&
+                    reconnected.audio_decoded >= 60,
+                "the reconnected audio/video session did not remain healthy");
+        require(metrics->capture_instances.load(std::memory_order_relaxed) >= 2 &&
+                    metrics->encoded_packets.load(std::memory_order_relaxed) >
+                        packets_before_reconnect,
+                "a fresh audio source was not started after reconnect");
+
+        std::printf("audio-video-isolation: 5 FPS, delayed video callback, first audio=%llu/%llu "
+                    "decoded packets, reconnect audio=%llu/%llu, video=%llu, errors=%llu\n",
+                    static_cast<unsigned long long>(
+                        first_after.audio_received - first_before.audio_received),
+                    static_cast<unsigned long long>(
+                        first_after.audio_decoded - first_before.audio_decoded),
+                    static_cast<unsigned long long>(reconnected.audio_received),
+                    static_cast<unsigned long long>(reconnected.audio_decoded),
+                    static_cast<unsigned long long>(first_video_after - first_video_before),
+                    static_cast<unsigned long long>(first_after.audio_errors +
+                                                    reconnected.audio_errors));
+        std::puts("audio-video-isolation: PASS silent Opus receive/decode, video stalls, "
+                  "5 FPS pacing, viewer shutdown and reconnect");
+        result = 0;
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "audio-video-isolation: FAIL %s\n", exception.what());
+    }
+    if (viewer) viewer->Stop();
+    if (host) host->stop();
+    if (uninitialize_com) CoUninitialize();
+    return result;
+}
+
 int elevation_probe() {
     using namespace chast;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -4053,6 +4336,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
     if (argc == 2 && std::string(argv[1]) == "--real-microphone")
         return real_microphone_probe();
+    if (argc == 2 && std::string(argv[1]) == "--audio-video-isolation")
+        return audio_video_isolation_probe();
     if (argc == 2 && std::string(argv[1]) == "--viewer-session-isolation")
         return host_recording_probe(true);
     if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();

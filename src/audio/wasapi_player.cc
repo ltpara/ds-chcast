@@ -7,10 +7,10 @@
 // after their host capture time before they are handed to the endpoint, which
 // absorbs network jitter without letting latency grow. In arrival-anchored
 // mode each burst is anchored when it arrives and plays immediately; capture
-// stamps then only space the blocks inside the burst. Either way, blocks that
-// miss their slot are dropped rather than played late; a gap the network
-// cannot fill becomes silence (counted as an underrun) instead of a
-// permanently delayed stream.
+// stamps then only space blocks inside the burst. Expired blocks are dropped
+// rather than played arbitrarily late. Arrival-anchored callers may opt into
+// a small lateness budget; gaps the network cannot fill become silence instead
+// of a permanently delayed stream.
 //
 // If the endpoint disappears or the default output changes, the renderer
 // rebuilds itself on the new default and keeps decoding: only this thread
@@ -34,6 +34,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -66,10 +67,18 @@ constexpr int64_t kStartupConfirmationMs = 5000;
 // jitter. The gathered blocks never had a slot and are skipped, so playback
 // begins on the corrected timeline instead of replaying the startup backlog.
 constexpr int64_t kAnchorGatherMarginMs = 5;
+
+void update_max(std::atomic<uint64_t>& maximum, uint64_t value) {
+    uint64_t observed = maximum.load(std::memory_order_relaxed);
+    while (observed < value &&
+           !maximum.compare_exchange_weak(observed, value, std::memory_order_relaxed)) {
+    }
+}
 constexpr int64_t kAnchorGatherMaxWaitMs = 300;
 // The measured startup pessimism is 33-58 ms; a single unusually fast block
 // must not move the anchor further than that or later blocks miss their slots.
 constexpr int64_t kAnchorGatherMaxShiftMs = 60;
+constexpr std::array<size_t, 4> kAudioTimingEventKindLimits{256, 128, 128, 64};
 
 Error av_error(int code, const char* what) {
     char text[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -80,8 +89,18 @@ Error av_error(int code, const char* what) {
 
 class WasapiPlayer final : public IAudioPlayer {
 public:
-    explicit WasapiPlayer(AudioPlayerConfig config) : config_(config) {
+    explicit WasapiPlayer(AudioPlayerConfig config)
+        : config_(config), jitter_(config.adaptive_jitter_config) {
         lead_ms_.store(config.lead_ms);
+        if (config_.arrival_anchored && config_.arrival_phase_correction) {
+            PlayoutDriftController::Config phase_config;
+            phase_config.window_ms = 500;
+            phase_config.confirm_windows = 2;
+            phase_config.dead_band_ms = 20;
+            phase_config.max_step_ms = 20;
+            phase_config.warmup_windows = 1;
+            drift_ = PlayoutDriftController(phase_config);
+        }
     }
     ~WasapiPlayer() override { close(); }
 
@@ -106,6 +125,13 @@ private:
         size_t frames = 0;
         size_t written = 0;
         uint64_t host_capture_ms = 0;
+        int64_t queued_ms = 0;
+        uint64_t diagnostic_sequence = 0;
+        uint64_t diagnostic_received_steady_us = 0;
+        uint64_t diagnostic_reordered_steady_us = 0;
+        uint64_t diagnostic_revealed_by_sequence = 0;
+        bool diagnostic_concealed = false;
+        uint64_t queued_steady_us = 0;
         // Lead fixed when the block was queued. An adaptive raise must not
         // delay blocks that are already on their way to the endpoint, or a
         // partial block would hold half of its samples back and the endpoint
@@ -116,6 +142,7 @@ private:
         // it after ReleaseBuffer succeeds, never at push time.
         std::vector<int16_t> reference;
         uint16_t reference_channels = 0;
+        bool late_tolerance_counted = false;
     };
 
     void thread_main();
@@ -125,6 +152,9 @@ private:
     bool render_loop_start();
     void render_loop();
     bool render();
+    void record_recovery(AudioRecoveryCause cause, HRESULT hr,
+                         bool render_failure = false);
+    void record_timing_event(const AudioTimingEvent& event);
     Error convert(const DecodedAudio& audio, std::vector<uint8_t>& pcm, size_t& frames);
     void apply_fade(uint8_t* data, size_t frames);
     void fail(const std::string& message);
@@ -153,6 +183,10 @@ private:
     HANDLE event_ = nullptr;
 
     mutable std::mutex mutex_;
+    mutable std::mutex timing_events_mutex_;
+    std::vector<AudioTimingEvent> timing_events_;
+    std::array<size_t, kAudioTimingEventKindLimits.size()> timing_event_counts_{};
+    uint64_t next_timing_event_id_ = 1;
     std::condition_variable cv_;
     bool ready_ = false;
     bool start_requested_ = false;
@@ -192,11 +226,15 @@ private:
     int64_t gather_first_latency_ms_ = 0;
     int64_t gather_first_arrival_ms_ = 0;
     int64_t gather_best_latency_ms_ = 0;
+    int64_t last_input_ms_ = 0;
+    int64_t last_active_render_ms_ = 0;
     int64_t last_end_local_ms_ = 0;
     // End of the audio handed to the endpoint on the playout timeline. Unlike
     // last_end_local_ms_ it survives underrun resets, so a dry stretch counts
     // once in starved_ms_ no matter how many render wake-ups it spans.
     int64_t played_end_ms_ = 0;
+    AudioRenderAccounting render_accounting_;
+    AudioStallReanchor stall_reanchor_;
     // Adaptive playout lead; only push() touches the controller, guarded by
     // mutex_, and the render thread reads the atomic copy.
     JitterLeadController jitter_;
@@ -215,11 +253,33 @@ private:
     std::atomic<uint64_t> played_frames_{0};
     std::atomic<uint64_t> underruns_{0};
     std::atomic<uint64_t> starved_ms_{0};
+    std::atomic<uint64_t> device_starved_ms_{0};
+    std::atomic<uint64_t> device_max_gap_ms_{0};
+    std::atomic<uint64_t> input_max_gap_ms_{0};
+    std::atomic<uint64_t> input_to_render_max_ms_{0};
+    std::atomic<uint64_t> render_wake_max_gap_ms_{0};
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> late_drops_{0};
+    std::atomic<uint64_t> tolerated_late_blocks_{0};
+    std::atomic<uint64_t> overflow_drops_{0};
+    std::atomic<uint64_t> reanchor_dropped_blocks_{0};
+    std::atomic<uint64_t> reanchor_dropped_ms_{0};
     std::atomic<uint64_t> recoveries_{0};
+    std::atomic<uint64_t> render_failures_{0};
+    std::atomic<uint64_t> stalled_recoveries_{0};
+    std::atomic<uint64_t> device_change_recoveries_{0};
+    std::atomic<AudioRecoveryCause> last_recovery_cause_{AudioRecoveryCause::None};
+    std::atomic<int32_t> last_recovery_hresult_{0};
+    std::atomic<uint64_t> recovery_open_failures_{0};
     std::atomic<uint32_t> buffer_ms_{0};
+    std::atomic<uint32_t> endpoint_buffer_ms_{0};
+    std::atomic<bool> shared_low_latency_{false};
+    std::atomic<int32_t> shared_low_latency_result_{0};
+    std::atomic<uint32_t> engine_period_us_{0};
+    std::atomic<uint32_t> stream_latency_us_{0};
     std::atomic<uint64_t> playout_capture_ms_{0};
     std::atomic<int64_t> playout_scheduled_ms_{0};
+    std::atomic<int64_t> playout_target_ms_{0};
     std::atomic<int64_t> slack_min_ms_{0};
     std::atomic<int64_t> slack_max_ms_{0};
     std::atomic<int64_t> slack_sum_ms_{0};
@@ -359,23 +419,70 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
         return false;
     }
 
-    // A deeper shared-mode buffer lets the renderer hold the jitter lead plus
-    // a whole AAC frame, so a block is never submitted only just in time.
-    // Shared mode may still clamp this to the engine period; GetBufferSize is
-    // authoritative. Falling back to the default keeps a device that refuses
-    // the size usable.
-    constexpr REFERENCE_TIME kBufferHns = 1200000;  // 120 ms
-    hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                            kBufferHns, 0, format.wave(), nullptr);
-    if (FAILED(hr)) {
+    bool initialized = false;
+    HRESULT low_latency_result = S_OK;
+    if (config_.render_buffer_ms < 120) {
+        ComPtr<IAudioClient3> client3 = com_query<IAudioClient3>(client);
+        low_latency_result = E_NOINTERFACE;
+        if (client3) {
+            UINT32 default_period = 0;
+            UINT32 fundamental_period = 0;
+            UINT32 minimum_period = 0;
+            UINT32 maximum_period = 0;
+            hr = client3->GetSharedModeEnginePeriod(
+                format.wave(), &default_period, &fundamental_period,
+                &minimum_period, &maximum_period);
+            low_latency_result = hr;
+            if (SUCCEEDED(hr) && fundamental_period > 0 &&
+                minimum_period <= maximum_period) {
+                const uint64_t requested_frames =
+                    static_cast<uint64_t>(format.sample_rate) *
+                    config_.render_buffer_ms / 1000;
+                uint64_t period_frames =
+                    requested_frames / fundamental_period * fundamental_period;
+                period_frames = (std::max)(period_frames,
+                                           static_cast<uint64_t>(minimum_period));
+                period_frames = (std::min)(period_frames,
+                                           static_cast<uint64_t>(maximum_period));
+                hr = client3->InitializeSharedAudioStream(
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    static_cast<UINT32>(period_frames), format.wave(), nullptr);
+                initialized = SUCCEEDED(hr);
+                low_latency_result = hr;
+            }
+        }
+    }
+    if (!initialized) {
+        const REFERENCE_TIME buffer_hns =
+            static_cast<REFERENCE_TIME>(config_.render_buffer_ms) * 10000;
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, format.wave(),
-                                nullptr);
+                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, buffer_hns, 0,
+                                format.wave(), nullptr);
+        if (FAILED(hr)) {
+            hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0,
+                                    format.wave(), nullptr);
+        }
     }
     if (FAILED(hr)) {
         *error = wasapi::error_from_hresult(hr, "IAudioClient::Initialize").to_string();
         return false;
     }
+    uint32_t engine_period_us = 0;
+    if (ComPtr<IAudioClient3> client3 = com_query<IAudioClient3>(client)) {
+        WAVEFORMATEX* current_mix = nullptr;
+        UINT32 current_period = 0;
+        if (SUCCEEDED(client3->GetCurrentSharedModeEnginePeriod(
+                &current_mix, &current_period)) && current_mix &&
+            current_mix->nSamplesPerSec > 0) {
+            engine_period_us = static_cast<uint32_t>(
+                static_cast<uint64_t>(current_period) * 1000000 /
+                current_mix->nSamplesPerSec);
+        }
+        CoTaskMemFree(current_mix);
+    }
+    REFERENCE_TIME stream_latency = 0;
+    client->GetStreamLatency(&stream_latency);
     hr = client->SetEventHandle(event_);
     if (FAILED(hr)) {
         *error = wasapi::error_from_hresult(hr, "SetEventHandle").to_string();
@@ -421,6 +528,13 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
         swr_input_channels_ = 0;
         format_ = std::move(format);
         buffer_frames_ = buffer_frames;
+        endpoint_buffer_ms_.store(static_cast<uint32_t>(
+            (static_cast<uint64_t>(buffer_frames_) * 1000 + format_.sample_rate - 1) /
+            format_.sample_rate));
+        shared_low_latency_.store(initialized);
+        shared_low_latency_result_.store(static_cast<int32_t>(low_latency_result));
+        engine_period_us_.store(engine_period_us);
+        stream_latency_us_.store(static_cast<uint32_t>(stream_latency / 10));
         fade_frames_ = (std::max)(size_t{1},
                                   static_cast<size_t>(format_.sample_rate) * 5 / 1000);
         fade_remaining_ = 0;
@@ -429,6 +543,7 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         queue_.clear();
+        last_active_render_ms_ = 0;
         queued_frames_ = 0;
         have_pushed_ = false;
         primed_ = false;
@@ -437,7 +552,9 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
         gather_first_arrival_ms_ = 0;
         gather_best_latency_ms_ = 0;
         last_end_local_ms_ = 0;
+        stall_reanchor_.reset();
         played_end_ms_ = 0;
+        render_accounting_.reopen();
         jitter_.reset();
         jitter_ms_.store(0);
         jitter_raises_.store(0);
@@ -448,6 +565,7 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
         buffer_ms_.store(0);
         playout_capture_ms_.store(0);
         playout_scheduled_ms_.store(0);
+        playout_target_ms_.store(0);
     }
     return true;
 }
@@ -468,20 +586,29 @@ void WasapiPlayer::close_endpoint() {
         swr_input_channels_ = 0;
         format_ = wasapi::MixFormat{};
         buffer_frames_ = 0;
+        endpoint_buffer_ms_.store(0);
+        shared_low_latency_.store(false);
+        shared_low_latency_result_.store(0);
+        engine_period_us_.store(0);
+        stream_latency_us_.store(0);
         fade_frames_ = 0;
         fade_remaining_ = 0;
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         queue_.clear();
+        last_active_render_ms_ = 0;
         queued_frames_ = 0;
         have_pushed_ = false;
         primed_ = false;
         last_end_local_ms_ = 0;
+        stall_reanchor_.reset();
         played_end_ms_ = 0;
+        render_accounting_.reopen();
         buffer_ms_.store(0);
         playout_capture_ms_.store(0);
         playout_scheduled_ms_.store(0);
+        playout_target_ms_.store(0);
     }
     render_.reset();
     volume_.reset();
@@ -512,6 +639,7 @@ bool WasapiPlayer::render_loop_start() {
     }
     const HRESULT hr = client_->Start();
     if (FAILED(hr)) {
+        record_recovery(AudioRecoveryCause::ClientStart, hr, true);
         return false;
     }
     client_started_ = true;
@@ -591,7 +719,8 @@ void WasapiPlayer::render_loop() {
         if (!endpoint_open) {
             if (wasapi::now_ms() >= next_retry) {
                 std::string open_error;
-                if (open_endpoint(&open_error) && render_loop_start()) {
+                const bool endpoint_ready = open_endpoint(&open_error);
+                if (endpoint_ready && render_loop_start()) {
                     endpoint_open = true;
                     recovering_.store(false);
                     recoveries_.fetch_add(1);
@@ -599,6 +728,11 @@ void WasapiPlayer::render_loop() {
                     last_progress = wasapi::now_ms();
                     last_played = played_frames_.load();
                 } else {
+                    if (!endpoint_ready) {
+                        recovery_open_failures_.fetch_add(1);
+                        std::fprintf(stderr, "audio-player: endpoint reopen failed: %s\n",
+                                     open_error.c_str());
+                    }
                     close_endpoint();
                     next_retry = wasapi::now_ms() + 1000;
                 }
@@ -610,6 +744,15 @@ void WasapiPlayer::render_loop() {
         const DWORD wait = WaitForSingleObject(event_, 100);
         if (stopping()) {
             break;
+        }
+        if (wait == WAIT_FAILED) {
+            record_recovery(AudioRecoveryCause::WaitForEvent,
+                            HRESULT_FROM_WIN32(GetLastError()), true);
+            close_endpoint();
+            endpoint_open = false;
+            recovering_.store(true);
+            next_retry = wasapi::now_ms() + 1000;
+            continue;
         }
         if (wait == WAIT_OBJECT_0 && !render()) {
             // A device removed mid-stream (or an engine reset) is routine:
@@ -623,6 +766,8 @@ void WasapiPlayer::render_loop() {
         if (wasapi::now_ms() >= next_check) {
             next_check = wasapi::now_ms() + 1000;
             if (default_device_changed()) {
+                record_recovery(AudioRecoveryCause::DefaultDeviceChanged, S_OK);
+                device_change_recoveries_.fetch_add(1);
                 close_endpoint();
                 endpoint_open = false;
                 recovering_.store(true);
@@ -650,6 +795,8 @@ void WasapiPlayer::render_loop() {
             // audio: queued or buffered audio that stays unwritten for the
             // whole window means the stream is not running. An idle endpoint
             // has no buffered audio and never trips this.
+            record_recovery(AudioRecoveryCause::ConsumptionStalled, S_OK);
+            stalled_recoveries_.fetch_add(1);
             close_endpoint();
             endpoint_open = false;
             recovering_.store(true);
@@ -663,10 +810,48 @@ void WasapiPlayer::render_loop() {
     recovering_.store(false);
 }
 
+void WasapiPlayer::record_recovery(AudioRecoveryCause cause, HRESULT hr,
+                                   bool render_failure) {
+    last_recovery_cause_.store(cause);
+    last_recovery_hresult_.store(static_cast<int32_t>(hr));
+    if (render_failure) {
+        render_failures_.fetch_add(1);
+    }
+}
+
+void WasapiPlayer::record_timing_event(const AudioTimingEvent& event) {
+    if (!config_.collect_timing_events) {
+        return;
+    }
+    if (event.kind == AudioTimingEventKind::LateDrop && event.lateness_us < 50000) {
+        return;
+    }
+    const size_t kind_index = static_cast<size_t>(event.kind);
+    if (kind_index >= kAudioTimingEventKindLimits.size()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(timing_events_mutex_);
+    size_t& kind_count = timing_event_counts_[kind_index];
+    if (kind_count >= kAudioTimingEventKindLimits[kind_index]) {
+        const auto oldest = std::find_if(
+            timing_events_.begin(), timing_events_.end(),
+            [&event](const AudioTimingEvent& recorded) {
+                return recorded.kind == event.kind;
+            });
+        if (oldest != timing_events_.end()) {
+            timing_events_.erase(oldest);
+            --kind_count;
+        }
+    }
+    timing_events_.push_back(event);
+    ++kind_count;
+}
+
 bool WasapiPlayer::render() {
     UINT32 padding = 0;
     HRESULT hr = client_->GetCurrentPadding(&padding);
     if (FAILED(hr)) {
+        record_recovery(AudioRecoveryCause::GetCurrentPadding, hr, true);
         return false;
     }
 
@@ -680,12 +865,23 @@ bool WasapiPlayer::render() {
         applied_mute_ = mute;
     }
 
-    const int64_t now = wasapi::now_ms();
+    const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t now = now_us / 1000;
     const int64_t device_rate = format_.sample_rate;
     const size_t frame_bytes = bytes_per_frame();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            last_active_render_ms_ = 0;
+        } else {
+            if (last_active_render_ms_ > 0 && now > last_active_render_ms_) {
+                update_max(render_wake_max_gap_ms_,
+                           static_cast<uint64_t>(now - last_active_render_ms_));
+            }
+            last_active_render_ms_ = now;
+        }
         if (have_pushed_ && !primed_) {
             // The lead only delays playback if the endpoint has something to
             // play while the queue waits. Prime it with silence once, up to
@@ -700,11 +896,13 @@ bool WasapiPlayer::render() {
                 BYTE* data = nullptr;
                 hr = render_->GetBuffer(frames, &data);
                 if (FAILED(hr)) {
+                    record_recovery(AudioRecoveryCause::PrimeGetBuffer, hr, true);
                     return false;
                 }
                 std::memset(data, 0, static_cast<size_t>(frames) * frame_bytes);
                 hr = render_->ReleaseBuffer(frames, 0);
                 if (FAILED(hr)) {
+                    record_recovery(AudioRecoveryCause::PrimeReleaseBuffer, hr, true);
                     return false;
                 }
                 padding += frames;
@@ -742,12 +940,31 @@ bool WasapiPlayer::render() {
                 head.play_lead_ms;
             const int64_t duration_ms =
                 static_cast<int64_t>(head.frames) * 1000 / device_rate;
-            if (play_local + duration_ms <= now) {
+            const AudioLateBlockDecision lateness = audio_late_block_decision(
+                now, play_local + duration_ms, config_.late_tolerance_ms);
+            if (lateness.drop && head.written == 0) {
+                record_timing_event({
+                    AudioTimingEventKind::LateDrop,
+                    head.diagnostic_sequence,
+                    head.host_capture_ms,
+                    head.diagnostic_received_steady_us,
+                    head.diagnostic_reordered_steady_us,
+                    head.queued_steady_us,
+                    static_cast<uint64_t>(now_us),
+                    (play_local + duration_ms) * 1000,
+                    lateness.late_ms * 1000,
+                    0,
+                    head.diagnostic_revealed_by_sequence,
+                    head.diagnostic_concealed,
+                });
                 queued_frames_ -= head.frames - head.written;
                 queue_.pop_front();
                 dropped_.fetch_add(1);
+                late_drops_.fetch_add(1);
                 continue;
             }
+            const bool tolerate_late =
+                lateness.late_ms > 0 && !head.late_tolerance_counted;
 
             const UINT32 available = buffer_frames_ > padding ? buffer_frames_ - padding : 0;
             if (available == 0) {
@@ -766,16 +983,14 @@ bool WasapiPlayer::render() {
 
             const size_t remaining = head.frames - head.written;
             const size_t write_frames = std::min<size_t>(remaining, available);
-            if (head.written == 0) {
-                // Report the block's scheduled start, not the chunk just
-                // written, so a partially rendered block does not move the
-                // playout latency forward on every render wake-up.
-                playout_capture_ms_.store(head.host_capture_ms);
-                playout_scheduled_ms_.store(play_local);
-            }
+            const int64_t written_ms =
+                static_cast<int64_t>(head.written) * 1000 / device_rate;
+            const int64_t audible_us = now_us +
+                static_cast<int64_t>(padding) * 1000000 / device_rate;
             BYTE* data = nullptr;
             hr = render_->GetBuffer(static_cast<UINT32>(write_frames), &data);
             if (FAILED(hr)) {
+                record_recovery(AudioRecoveryCause::GetBuffer, hr, true);
                 return false;
             }
             const size_t source_offset = head.written * frame_bytes;
@@ -790,9 +1005,45 @@ bool WasapiPlayer::render() {
             }
             hr = render_->ReleaseBuffer(static_cast<UINT32>(write_frames), 0);
             if (FAILED(hr)) {
+                record_recovery(AudioRecoveryCause::ReleaseBuffer, hr, true);
                 return false;
             }
+            if (head.written == 0 && head.queued_ms > 0 && now > head.queued_ms) {
+                update_max(input_to_render_max_ms_,
+                           static_cast<uint64_t>(now - head.queued_ms));
+            }
+            if (head.written == 0 && head.queued_steady_us > 0 && now_us > 0 &&
+                static_cast<uint64_t>(now_us) - head.queued_steady_us >= 100000) {
+                record_timing_event({
+                    AudioTimingEventKind::FirstWrite,
+                    head.diagnostic_sequence,
+                    head.host_capture_ms,
+                    head.diagnostic_received_steady_us,
+                    head.diagnostic_reordered_steady_us,
+                    head.queued_steady_us,
+                    static_cast<uint64_t>(now_us),
+                    play_local * 1000,
+                    0,
+                    0,
+                    head.diagnostic_revealed_by_sequence,
+                    head.diagnostic_concealed,
+                });
+            }
+            if (tolerate_late) {
+                head.late_tolerance_counted = true;
+                tolerated_late_blocks_.fetch_add(1);
+            }
 
+            // Publish only after ReleaseBuffer accepted the samples. Their
+            // audible time follows endpoint padding, not the requested slot.
+            playout_capture_ms_.store(head.host_capture_ms + written_ms);
+            playout_scheduled_ms_.store(audible_us / 1000);
+            playout_target_ms_.store(play_local + written_ms);
+            const int64_t previous_device_end_us = render_accounting_.end_us();
+            render_accounting_.write(
+                audible_us, static_cast<int64_t>(write_frames) * 1000000 / device_rate);
+            device_starved_ms_.store(render_accounting_.starved_ms());
+            device_max_gap_ms_.store(render_accounting_.max_gap_ms());
             const size_t reference_frames =
                 head.reference.empty() ? 0 : head.reference.size() / head.reference_channels;
             const size_t reference_offset = reference_frames == 0
@@ -806,10 +1057,7 @@ bool WasapiPlayer::render() {
                 reference_frames != 0) {
                 const size_t reference_end = (std::min)(
                     reference_frames, head.written * reference_frames / head.frames);
-                const int64_t audible_start =
-                    play_local +
-                    static_cast<int64_t>(head.written - write_frames) * 1000 /
-                        device_rate;
+                const int64_t audible_start = audible_us / 1000;
                 if (mute) {
                     reference_silence_.assign(
                         (reference_end - reference_offset) * head.reference_channels, 0);
@@ -825,6 +1073,23 @@ bool WasapiPlayer::render() {
             }
             const int64_t end_local =
                 play_local + static_cast<int64_t>(head.written) * 1000 / device_rate;
+            if (previous_device_end_us > 0 && audible_us > previous_device_end_us &&
+                audible_us - previous_device_end_us >= 20000) {
+                record_timing_event({
+                    AudioTimingEventKind::DeviceGap,
+                    head.diagnostic_sequence,
+                    head.host_capture_ms,
+                    head.diagnostic_received_steady_us,
+                    head.diagnostic_reordered_steady_us,
+                    head.queued_steady_us,
+                    static_cast<uint64_t>(audible_us),
+                    end_local * 1000,
+                    0,
+                    static_cast<uint64_t>(audible_us - previous_device_end_us),
+                    head.diagnostic_revealed_by_sequence,
+                    head.diagnostic_concealed,
+                });
+            }
             // Anything between the last written audio and this block's slot
             // plays as silence. Counting the timeline gap here charges a long
             // dry stretch once, whatever the render wake-up schedule was.
@@ -960,23 +1225,33 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             return Error(Status::Unavailable,
                          error_.empty() ? std::string("audio playback is stopping") : error_);
         }
+        const int64_t arrival_ms = wasapi::now_ms();
+        const uint64_t queued_steady_us = config_.collect_timing_events
+            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count())
+            : 0;
+        if (last_input_ms_ > 0 && arrival_ms > last_input_ms_) {
+            update_max(input_max_gap_ms_,
+                       static_cast<uint64_t>(arrival_ms - last_input_ms_));
+        }
+        last_input_ms_ = arrival_ms;
         const size_t gather_target =
             config_.arrival_anchored ? config_.anchor_gather_blocks : 0;
         if (!have_offset_.load() && gather_target > 0) {
-            const int64_t arrival = wasapi::now_ms();
-            const int64_t latency = arrival - static_cast<int64_t>(audio.capture_ms);
+            const int64_t latency = arrival_ms - static_cast<int64_t>(audio.capture_ms);
             if (gather_blocks_ == 0) {
                 gather_first_latency_ms_ = latency;
-                gather_first_arrival_ms_ = arrival;
+                gather_first_arrival_ms_ = arrival_ms;
             }
             if (gather_blocks_ == 0 || latency < gather_best_latency_ms_) {
                 gather_best_latency_ms_ = latency;
             }
             ++gather_blocks_;
             if (gather_blocks_ < gather_target &&
-                arrival - gather_first_arrival_ms_ < kAnchorGatherMaxWaitMs) {
+                arrival_ms - gather_first_arrival_ms_ < kAnchorGatherMaxWaitMs) {
                 // Skipping the gathered blocks keeps the startup backlog from
                 // becoming a permanent lead over the video.
+                stall_reanchor_.observe(arrival_ms);
                 return Error::success();
             }
             const int64_t margin = gather_blocks_ > 1 ? kAnchorGatherMarginMs : 0;
@@ -998,20 +1273,58 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             // No offset yet: anchor this block at its arrival, so playback
             // starts after the jitter buffer (default mode) or immediately
             // (arrival-anchored mode) instead of waiting for the first probe.
-            offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
+            offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - arrival_ms);
             have_offset_.store(true);
-        } else if (config_.arrival_anchored && last_end_local_ms_ > 0 &&
-                   wasapi::now_ms() > last_end_local_ms_ + 100) {
+            if (config_.arrival_anchored) {
+                stall_reanchor_.observe(arrival_ms);
+            }
+        } else if (config_.arrival_anchored && stall_reanchor_.observe(arrival_ms)) {
             // Arrival-anchored callers have no live clock offset (the mic
             // uplink has no LatencyReply, system audio plays on arrival).
-            // After a stall the old offset would place every queued block in
-            // the past; re-anchor the new burst at arrival and let the
-            // renderer drop what is left of the stale one.
-            offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
-            queue_.clear();
-            queued_frames_ = 0;
+            // After a stall the old offset can place the new burst in the
+            // past; anchor it at arrival and apply the caller's queue policy.
+            const int64_t previous_target_ms = static_cast<int64_t>(audio.capture_ms) -
+                                               effective_offset_ms() + playout_lead_ms();
+            const uint64_t queued_audio_ms = format_.sample_rate == 0
+                ? 0
+                : static_cast<uint64_t>(queued_frames_) * 1000 / format_.sample_rate;
+            if (config_.collect_timing_events) {
+                record_timing_event({
+                    AudioTimingEventKind::StallReanchor,
+                    audio.diagnostic_sequence,
+                    audio.capture_ms,
+                    audio.diagnostic_received_steady_us,
+                    audio.diagnostic_reordered_steady_us,
+                    queued_steady_us,
+                    queued_steady_us,
+                    previous_target_ms * 1000,
+                    0,
+                    0,
+                    audio.diagnostic_revealed_by_sequence,
+                    audio.diagnostic_concealed,
+                    (arrival_ms - previous_target_ms) * 1000,
+                    queued_audio_ms,
+                    static_cast<uint64_t>(queue_.size()),
+                });
+            }
+            offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - arrival_ms);
+            if (config_.arrival_phase_correction) {
+                drift_.reanchor();
+            } else {
+                drift_.reset();
+            }
+            drift_step_ms_.store(0);
+            if (!config_.preserve_queue_on_reanchor) {
+                reanchor_dropped_blocks_.fetch_add(queue_.size());
+                reanchor_dropped_ms_.fetch_add(queued_audio_ms);
+                dropped_.fetch_add(queue_.size());
+                queue_.clear();
+                queued_frames_ = 0;
+            }
+            last_active_render_ms_ = 0;
             playout_capture_ms_.store(0);
             playout_scheduled_ms_.store(0);
+            playout_target_ms_.store(0);
             slack_min_ms_.store(0);
             slack_max_ms_.store(0);
             slack_sum_ms_.store(0);
@@ -1022,11 +1335,10 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
                 // The stall broke the timeline the learned lead was measured
                 // against; start the new anchor at zero lead so playback
                 // resumes at the lowest latency. Session counters stay.
-                jitter_.release(wasapi::now_ms());
+                jitter_.release(arrival_ms);
                 jitter_ms_.store(0);
             }
         }
-        const int64_t arrival_ms = wasapi::now_ms();
         int64_t schedule_local = static_cast<int64_t>(audio.capture_ms) -
                                  effective_offset_ms() + playout_lead_ms();
         int64_t slack = schedule_local - arrival_ms;
@@ -1046,7 +1358,7 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
                 slack = schedule_local - arrival_ms;
             }
         }
-        if (config_.clock_drift_correction && !config_.arrival_anchored) {
+        if (config_.phase_correction_enabled()) {
             // The lead is removed so an adaptive raise cannot look like drift;
             // the offset (including earlier drift steps) still shows up in the
             // phase, which is what makes the controller converge.
@@ -1054,7 +1366,11 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
                 drift_.observe(slack - playout_lead_ms(), arrival_ms);
             if (step != 0) {
                 drift_step_ms_.fetch_add(step);
-                drift_corrections_.store(drift_.corrections());
+                if (config_.arrival_anchored) {
+                    drift_corrections_.fetch_add(1);
+                } else {
+                    drift_corrections_.store(drift_.corrections());
+                }
                 // The reporting block follows the corrected offset instead of
                 // reporting the departure that was just applied.
                 schedule_local = static_cast<int64_t>(audio.capture_ms) -
@@ -1079,6 +1395,15 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
         block.pcm = std::move(pcm);
         block.frames = frames;
         block.host_capture_ms = audio.capture_ms;
+        block.queued_ms = arrival_ms;
+        if (config_.collect_timing_events) {
+            block.diagnostic_sequence = audio.diagnostic_sequence;
+            block.diagnostic_received_steady_us = audio.diagnostic_received_steady_us;
+            block.diagnostic_reordered_steady_us = audio.diagnostic_reordered_steady_us;
+            block.diagnostic_revealed_by_sequence = audio.diagnostic_revealed_by_sequence;
+            block.diagnostic_concealed = audio.diagnostic_concealed;
+        }
+        block.queued_steady_us = queued_steady_us;
         block.play_lead_ms = playout_lead_ms();
         if (config_.render_sink && audio.sample_rate == 48000 && audio.channels >= 1 &&
             audio.channels <= 2 && !audio.samples.empty()) {
@@ -1097,6 +1422,7 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             queued_frames_ -= oldest.frames - oldest.written;
             queue_.pop_front();
             dropped_.fetch_add(1);
+            overflow_drops_.fetch_add(1);
         }
         // Signal under format_mutex_ so close() cannot free the handle first.
         if (event_) {
@@ -1147,13 +1473,39 @@ AudioPlayerStats WasapiPlayer::stats() const {
     stats.played_frames = played_frames_.load();
     stats.underruns = underruns_.load();
     stats.starved_ms = starved_ms_.load();
+    stats.device_starved_ms = device_starved_ms_.load();
+    stats.device_max_gap_ms = device_max_gap_ms_.load();
+    stats.input_max_gap_ms = input_max_gap_ms_.load();
+    stats.input_to_render_max_ms = input_to_render_max_ms_.load();
+    stats.render_wake_max_gap_ms = render_wake_max_gap_ms_.load();
+    if (config_.collect_timing_events) {
+        std::lock_guard<std::mutex> lock(timing_events_mutex_);
+        stats.timing_events = timing_events_;
+    }
     stats.dropped = dropped_.load();
+    stats.late_drops = late_drops_.load();
+    stats.tolerated_late_blocks = tolerated_late_blocks_.load();
+    stats.overflow_drops = overflow_drops_.load();
+    stats.reanchor_dropped_blocks = reanchor_dropped_blocks_.load();
+    stats.reanchor_dropped_ms = reanchor_dropped_ms_.load();
     stats.recoveries = recoveries_.load();
+    stats.render_failures = render_failures_.load();
+    stats.stalled_recoveries = stalled_recoveries_.load();
+    stats.device_change_recoveries = device_change_recoveries_.load();
+    stats.last_recovery_cause = last_recovery_cause_.load();
+    stats.last_recovery_hresult = last_recovery_hresult_.load();
+    stats.recovery_open_failures = recovery_open_failures_.load();
     stats.buffer_ms = buffer_ms_.load();
+    stats.endpoint_buffer_ms = endpoint_buffer_ms_.load();
+    stats.shared_low_latency = shared_low_latency_.load();
+    stats.shared_low_latency_result = shared_low_latency_result_.load();
+    stats.engine_period_us = engine_period_us_.load();
+    stats.stream_latency_us = stream_latency_us_.load();
     stats.lead_ms = lead_ms_.load();
     stats.recovering = recovering_.load();
     stats.playout_capture_ms = playout_capture_ms_.load();
     stats.playout_scheduled_ms = playout_scheduled_ms_.load();
+    stats.playout_target_ms = playout_target_ms_.load();
     stats.slack_min_ms = slack_min_ms_.load();
     stats.slack_max_ms = slack_max_ms_.load();
     const uint64_t slack_blocks = slack_blocks_.load();
@@ -1253,6 +1605,12 @@ std::vector<AudioOutputDevice> list_audio_outputs(std::string* error) {
 
 std::unique_ptr<IAudioPlayer> create_audio_player(const AudioPlayerConfig& config,
                                                   std::string* error) {
+    if (config.render_buffer_ms < 10 || config.render_buffer_ms > 500) {
+        if (error) {
+            *error = "the render buffer must be between 10 and 500 ms";
+        }
+        return nullptr;
+    }
     auto player = std::make_unique<WasapiPlayer>(config);
     if (!player->start_thread(error)) {
         return nullptr;

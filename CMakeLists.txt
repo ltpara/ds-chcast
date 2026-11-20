@@ -291,7 +291,7 @@ target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # user32 supplies SendInput/GetSystemMetrics for the injector; wtsapi32 the
 # session lock state behind the desktop tracker; shcore the per-monitor DPI
 # declaration that keeps those APIs in physical pixels.
-target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32 wtsapi32 shcore zstd::libzstd)
+target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32 wtsapi32 shcore imm32 zstd::libzstd)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -1026,6 +1026,12 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME viewer_session_isolation
         COMMAND chast-viewer-probe --viewer-session-isolation)
     set_tests_properties(viewer_session_isolation PROPERTIES TIMEOUT 120)
+    # A synthetic silent Opus source keeps the real viewer audio pipeline
+    # active while the video sink stalls at a configured 5 FPS; disconnecting
+    # and reconnecting checks that both session workers stop and restart.
+    add_test(NAME viewer_audio_video_isolation
+        COMMAND chast-viewer-probe --audio-video-isolation)
+    set_tests_properties(viewer_audio_video_isolation PROPERTIES TIMEOUT 120)
     # Protocol v32: a files-only request must reach streaming with no picture
     # size, no displays and zero frames, and the same shared folder must still
     # list, download and accept an upload. The refuser host (file transfer off)

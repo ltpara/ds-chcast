@@ -283,6 +283,60 @@ struct TransportStats {
     size_t queued_sends = 0;
 };
 
+// Client audio datagrams waiting for the media consumer. Residence time starts
+// in the receive callback, so it separates local consumer stalls from network
+// delay without requiring synchronized clocks.
+struct AudioReceiveStats {
+    uint64_t received = 0;
+    uint64_t dequeued = 0;
+    uint64_t overflow_drops = 0;
+    uint64_t stale_drops = 0;
+    size_t queued = 0;
+    size_t peak_queued = 0;
+    uint64_t residence_us = 0;
+    uint64_t max_residence_us = 0;
+    // Intervals between valid datagram receive callbacks, before the media
+    // consumer runs. Excludes the wait for the first packet and the final FIN.
+    uint64_t max_arrival_gap_us = 0;
+    uint64_t arrival_gaps_over_100ms = 0;
+    struct LongGap {
+        uint64_t arrival_steady_us = 0;
+        uint64_t gap_us = 0;
+        uint64_t previous_sequence = 0;
+        uint64_t sequence = 0;
+        uint64_t capture_ms = 0;
+    };
+    std::vector<LongGap> recent_long_gaps;
+};
+
+// Time from DatagramSend admission until MsQuic frames the DATAGRAM into a
+// packet. This is not the time the resulting UDP packet reaches the wire.
+struct AudioDatagramSendStats {
+    uint64_t framed = 0;
+    uint64_t submit_to_framed_us = 0;
+    uint64_t max_submit_to_framed_us = 0;
+    uint64_t submit_to_framed_over_100ms = 0;
+    size_t pending = 0;
+};
+
+// The application buffer completion is a local MsQuic event, not a peer
+// receipt. These samples retain only IDR frames for weak-link correlation.
+struct VideoIdrSendSample {
+    uint64_t sequence = 0;
+    uint64_t capture_ms = 0;
+    uint64_t pts_ms = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t submit_steady_us = 0;
+    uint64_t complete_steady_us = 0;
+    uint64_t submit_to_complete_us = 0;
+};
+
+struct VideoIdrSendStats {
+    uint64_t completed = 0;
+    uint64_t canceled = 0;
+    std::vector<VideoIdrSendSample> recent;
+};
+
 // The client's clock-sync result. offset_us maps a client steady-clock reading
 // to the host's: host_us = client_us + offset_us. `valid` stays false until
 // the first LatencyReply; values are raw samples, not smoothed.
@@ -808,8 +862,14 @@ public:
     // broken" without ending the video session. When audio_datagram() is
     // true the bytes come from QUIC DATAGRAM frames, so packets can be lost
     // or reordered and the header sequence number is the only ordering clue.
+    // The optional timestamp uses this process's steady clock; datagrams use
+    // their receive-callback time and stream packets use parser delivery time.
     Error receive_audio(AudioHeader& header, std::vector<uint8_t>& payload,
-                        std::chrono::milliseconds timeout);
+                        std::chrono::milliseconds timeout,
+                        uint64_t* received_steady_us = nullptr);
+    AudioReceiveStats audio_receive_stats() const;
+    AudioDatagramSendStats audio_datagram_send_stats() const;
+    VideoIdrSendStats video_idr_send_stats() const;
     // True when the host announced audio over QUIC DATAGRAM in HelloAck (v35).
     // Valid once the handshake completed; the audio stream is still open and
     // carries the FIN that ends the session's audio.

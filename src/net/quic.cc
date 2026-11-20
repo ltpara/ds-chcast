@@ -67,6 +67,7 @@ constexpr size_t kMinAudioDatagramBudget = kAudioHeaderSize + 512;
 // (several seconds of 10 ms packets) but stops a stalled consumer from
 // growing without limit.
 constexpr size_t kMaxAudioDatagramQueue = 256;
+constexpr auto kMaxAudioDatagramResidence = std::chrono::milliseconds(100);
 
 // Receive-side bounds for the protocol v16 streams. They are deliberately
 // larger than one legitimate item so a slow consumer is not punished, but
@@ -642,6 +643,9 @@ struct QuicSession::Impl {
         // the old value and must not touch the new counters.
         uint64_t generation = 0;
         bool screenshot = false;
+        bool video_idr = false;
+        VideoIdrSendSample idr_sample;
+        std::chrono::steady_clock::time_point submitted_at{};
     };
 
     Role role = Role::Server;
@@ -942,7 +946,16 @@ struct QuicSession::Impl {
     // Client: whole audio packets that arrived as QUIC DATAGRAM frames. They
     // are served before the stream parser so a reordered datagram can never
     // be spliced into a partially received stream packet.
-    std::deque<std::vector<uint8_t>> audio_datagrams;
+    struct AudioDatagram {
+        std::vector<uint8_t> bytes;
+        std::chrono::steady_clock::time_point arrived;
+    };
+    std::deque<AudioDatagram> audio_datagrams;
+    AudioReceiveStats audio_receive_stats;
+    std::chrono::steady_clock::time_point last_audio_datagram_arrival{};
+    uint64_t last_audio_datagram_sequence = 0;
+    mutable std::mutex video_idr_send_mutex;
+    VideoIdrSendStats video_idr_send_stats;
     // Client: first time receive_audio noticed the audio stream FIN while
     // datagram audio was active. Datagrams and the FIN travel separate paths,
     // so the last packets may still be in flight; the reader waits out a short
@@ -954,9 +967,12 @@ struct QuicSession::Impl {
     struct DatagramSend {
         std::vector<uint8_t> bytes;
         QUIC_BUFFER buffer{};
+        std::chrono::steady_clock::time_point submitted_at;
+        bool framed = false;
     };
     std::mutex datagram_mutex;
     std::vector<DatagramSend*> datagram_sends;
+    AudioDatagramSendStats audio_datagram_send_stats;
     ControlParser control_parser;
     FrameParser frame_parser;
     AudioParser audio_parser;
@@ -1449,6 +1465,7 @@ struct QuicSession::Impl {
                 if (role != Role::Client) {
                     break;
                 }
+                const auto arrived = std::chrono::steady_clock::now();
                 const QUIC_BUFFER* buffer = event.DATAGRAM_RECEIVED.Buffer;
                 if (!buffer || buffer->Length < kAudioHeaderSize ||
                     buffer->Length > kAudioHeaderSize + kMaxAudioPayload) {
@@ -1466,30 +1483,82 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    if (last_audio_datagram_arrival != std::chrono::steady_clock::time_point{}) {
+                        const auto gap = std::chrono::duration_cast<std::chrono::microseconds>(
+                            arrived - last_audio_datagram_arrival).count();
+                        const uint64_t gap_us = static_cast<uint64_t>((std::max)(int64_t{0}, gap));
+                        audio_receive_stats.max_arrival_gap_us = (std::max)(
+                            audio_receive_stats.max_arrival_gap_us, gap_us);
+                        if (gap_us > 100000) {
+                            ++audio_receive_stats.arrival_gaps_over_100ms;
+                            audio_receive_stats.recent_long_gaps.push_back({
+                                static_cast<uint64_t>(std::chrono::duration_cast<
+                                    std::chrono::microseconds>(arrived.time_since_epoch()).count()),
+                                gap_us, last_audio_datagram_sequence, header.seq,
+                                header.capture_ms});
+                            if (audio_receive_stats.recent_long_gaps.size() > 128) {
+                                audio_receive_stats.recent_long_gaps.erase(
+                                    audio_receive_stats.recent_long_gaps.begin());
+                            }
+                        }
+                    }
+                    last_audio_datagram_arrival = arrived;
+                    last_audio_datagram_sequence = header.seq;
                     if (audio_datagrams.size() >= kMaxAudioDatagramQueue) {
                         audio_datagrams.pop_front();
+                        ++audio_receive_stats.overflow_drops;
                     }
-                    audio_datagrams.emplace_back(buffer->Buffer,
-                                                 buffer->Buffer + buffer->Length);
+                    audio_datagrams.push_back({
+                        std::vector<uint8_t>(buffer->Buffer, buffer->Buffer + buffer->Length),
+                        arrived});
+                    ++audio_receive_stats.received;
+                    audio_receive_stats.peak_queued = (std::max)(
+                        audio_receive_stats.peak_queued, audio_datagrams.size());
                 }
                 cv.notify_all();
                 break;
             }
             case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED: {
                 void* context = event.DATAGRAM_SEND_STATE_CHANGED.ClientContext;
-                if (!context ||
-                    !QUIC_DATAGRAM_SEND_STATE_IS_FINAL(
-                        event.DATAGRAM_SEND_STATE_CHANGED.State)) {
+                if (!context) {
                     break;
                 }
                 auto* send = static_cast<DatagramSend*>(context);
+                const QUIC_DATAGRAM_SEND_STATE state =
+                    event.DATAGRAM_SEND_STATE_CHANGED.State;
+                const bool final = QUIC_DATAGRAM_SEND_STATE_IS_FINAL(state);
                 {
                     std::lock_guard<std::mutex> lock(datagram_mutex);
-                    datagram_sends.erase(
-                        std::remove(datagram_sends.begin(), datagram_sends.end(), send),
-                        datagram_sends.end());
+                    if (state == QUIC_DATAGRAM_SEND_SENT && !send->framed) {
+                        send->framed = true;
+                        if (audio_datagram_send_stats.pending > 0) {
+                            --audio_datagram_send_stats.pending;
+                        }
+                        const auto elapsed = std::chrono::duration_cast<
+                            std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                       send->submitted_at).count();
+                        const uint64_t elapsed_us = static_cast<uint64_t>(
+                            (std::max)(int64_t{0}, elapsed));
+                        ++audio_datagram_send_stats.framed;
+                        audio_datagram_send_stats.submit_to_framed_us += elapsed_us;
+                        audio_datagram_send_stats.max_submit_to_framed_us = (std::max)(
+                            audio_datagram_send_stats.max_submit_to_framed_us, elapsed_us);
+                        if (elapsed_us > 100000) {
+                            ++audio_datagram_send_stats.submit_to_framed_over_100ms;
+                        }
+                    }
+                    if (final) {
+                        datagram_sends.erase(
+                            std::remove(datagram_sends.begin(), datagram_sends.end(), send),
+                            datagram_sends.end());
+                        if (!send->framed && audio_datagram_send_stats.pending > 0) {
+                            --audio_datagram_send_stats.pending;
+                        }
+                    }
                 }
-                delete send;
+                if (final) {
+                    delete send;
+                }
                 break;
             }
             case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
@@ -2841,6 +2910,29 @@ struct QuicSession::Impl {
             case QUIC_STREAM_EVENT_SEND_COMPLETE: {
                 auto* pending = static_cast<PendingSend*>(event.SEND_COMPLETE.ClientContext);
                 if (pending) {
+                    if (pending->video_idr) {
+                        std::lock_guard<std::mutex> lock(video_idr_send_mutex);
+                        if (event.SEND_COMPLETE.Canceled) {
+                            ++video_idr_send_stats.canceled;
+                        } else {
+                            const auto completed_at = std::chrono::steady_clock::now();
+                            pending->idr_sample.submit_steady_us = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    pending->submitted_at.time_since_epoch()).count());
+                            pending->idr_sample.complete_steady_us = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    completed_at.time_since_epoch()).count());
+                            pending->idr_sample.submit_to_complete_us = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    completed_at - pending->submitted_at).count());
+                            ++video_idr_send_stats.completed;
+                            video_idr_send_stats.recent.push_back(pending->idr_sample);
+                            if (video_idr_send_stats.recent.size() > 128) {
+                                video_idr_send_stats.recent.erase(
+                                    video_idr_send_stats.recent.begin());
+                            }
+                        }
+                    }
                     release_send(pending->bytes.size(), pending->generation, pending->screenshot);
                     delete pending;
                 }
@@ -5384,18 +5476,24 @@ struct QuicSession::Impl {
         send->bytes = std::move(bytes);
         send->buffer.Buffer = send->bytes.data();
         send->buffer.Length = static_cast<uint32_t>(send->bytes.size());
+        send->submitted_at = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(datagram_mutex);
             datagram_sends.push_back(send);
+            ++audio_datagram_send_stats.pending;
         }
-        const QUIC_STATUS status =
-            api->DatagramSend(handle, &send->buffer, 1, QUIC_SEND_FLAG_NONE, send);
+        // Keep audio ahead of ordinary queued datagrams in MsQuic's send queue.
+        const QUIC_STATUS status = api->DatagramSend(
+            handle, &send->buffer, 1, QUIC_SEND_FLAG_DGRAM_PRIORITY, send);
         if (QUIC_FAILED(status)) {
             {
                 std::lock_guard<std::mutex> lock(datagram_mutex);
                 datagram_sends.erase(
                     std::remove(datagram_sends.begin(), datagram_sends.end(), send),
                     datagram_sends.end());
+                if (!send->framed && audio_datagram_send_stats.pending > 0) {
+                    --audio_datagram_send_stats.pending;
+                }
             }
             delete send;
             if (status == QUIC_STATUS_ABORTED || status == QUIC_STATUS_INVALID_STATE) {
@@ -5414,7 +5512,8 @@ struct QuicSession::Impl {
     Error send_bytes_impl(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags,
                           bool wait_for_capacity,
                           std::chrono::steady_clock::time_point deadline = kNoSendDeadline,
-                          bool screenshot = false) {
+                          bool screenshot = false,
+                          const VideoIdrSendSample* idr_sample = nullptr) {
         if (!stream) {
             return Error(Status::Unavailable, "no stream is open");
         }
@@ -5455,6 +5554,11 @@ struct QuicSession::Impl {
         pending->bytes = std::move(bytes);
         pending->generation = generation;
         pending->screenshot = screenshot;
+        pending->video_idr = idr_sample != nullptr;
+        if (idr_sample) {
+            pending->idr_sample = *idr_sample;
+            pending->submitted_at = std::chrono::steady_clock::now();
+        }
         pending->buffer.Buffer = pending->bytes.data();
         pending->buffer.Length = static_cast<uint32_t>(pending->bytes.size());
         const QUIC_STATUS status =
@@ -5662,6 +5766,9 @@ struct QuicSession::Impl {
         {
             std::lock_guard<std::mutex> lock(datagram_mutex);
             for (DatagramSend* send : datagram_sends) {
+                if (!send->framed && audio_datagram_send_stats.pending > 0) {
+                    --audio_datagram_send_stats.pending;
+                }
                 delete send;
             }
             datagram_sends.clear();
@@ -5831,7 +5938,14 @@ struct QuicSession::Impl {
             received.clear();
             audio_received.clear();
             audio_datagrams.clear();
+            audio_receive_stats = AudioReceiveStats{};
+            last_audio_datagram_arrival = std::chrono::steady_clock::time_point{};
+            last_audio_datagram_sequence = 0;
             audio_datagram_drain_until = std::chrono::steady_clock::time_point{};
+            {
+                std::lock_guard<std::mutex> video_lock(video_idr_send_mutex);
+                video_idr_send_stats = VideoIdrSendStats{};
+            }
             control_parser.reset();
             frame_parser.reset();
             audio_parser.reset();
@@ -6091,6 +6205,9 @@ struct QuicSession::Impl {
         {
             std::lock_guard<std::mutex> lock(datagram_mutex);
             for (DatagramSend* send : datagram_sends) {
+                if (!send->framed && audio_datagram_send_stats.pending > 0) {
+                    --audio_datagram_send_stats.pending;
+                }
                 delete send;
             }
             datagram_sends.clear();
@@ -8149,6 +8266,15 @@ Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, s
     std::vector<uint8_t> bytes(kFrameHeaderSize + size);
     encode_frame_header(header, bytes.data());
     std::memcpy(bytes.data() + kFrameHeaderSize, payload, size);
+    VideoIdrSendSample idr_sample;
+    const VideoIdrSendSample* idr_sample_ptr = nullptr;
+    if (header.idr) {
+        idr_sample.sequence = header.seq;
+        idr_sample.capture_ms = header.capture_ms;
+        idr_sample.pts_ms = header.pts_ms;
+        idr_sample.payload_bytes = size;
+        idr_sample_ptr = &idr_sample;
+    }
     if (track) {
         std::lock_guard<std::mutex> lock(impl.mutex);
         const auto now = steady_us();
@@ -8156,7 +8282,8 @@ Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, s
         impl.pending_video.push_back({header.seq, now, captured, bytes.size()});
         impl.pending_video_bytes += bytes.size();
     }
-    auto sent = impl.send_bytes_impl(video, std::move(bytes), QUIC_SEND_FLAG_NONE, wait);
+    auto sent = impl.send_bytes_impl(video, std::move(bytes), QUIC_SEND_FLAG_NONE, wait,
+                                     kNoSendDeadline, false, idr_sample_ptr);
     if (sent.ok()) {
         ++impl.next_seq;
     } else if (track) {
@@ -8715,7 +8842,8 @@ Error QuicSession::receive_frame(FrameHeader& header, std::vector<uint8_t>& payl
 }
 
 Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payload,
-                                 std::chrono::milliseconds timeout) {
+                                 std::chrono::milliseconds timeout,
+                                 uint64_t* received_steady_us) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "receive_audio is a client operation");
@@ -8727,8 +8855,22 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
         // parser. Serving them first also keeps the stream parser's buffer
         // contiguous when the host falls back to the stream.
         while (impl.peer_info.audio_datagram && !impl.audio_datagrams.empty()) {
-            std::vector<uint8_t> packet = std::move(impl.audio_datagrams.front());
+            auto queued = std::move(impl.audio_datagrams.front());
             impl.audio_datagrams.pop_front();
+            const auto residence = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - queued.arrived).count();
+            const uint64_t residence_us = static_cast<uint64_t>((std::max)(int64_t{0}, residence));
+            impl.audio_receive_stats.max_residence_us = (std::max)(
+                impl.audio_receive_stats.max_residence_us, residence_us);
+            if (residence_us > static_cast<uint64_t>(
+                                   std::chrono::duration_cast<std::chrono::microseconds>(
+                                       kMaxAudioDatagramResidence).count())) {
+                ++impl.audio_receive_stats.stale_drops;
+                continue;
+            }
+            ++impl.audio_receive_stats.dequeued;
+            impl.audio_receive_stats.residence_us += residence_us;
+            std::vector<uint8_t>& packet = queued.bytes;
             AudioHeader datagram_header;
             std::string datagram_error;
             if (!decode_audio_header(packet.data(), packet.size(), datagram_header,
@@ -8739,6 +8881,11 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
             }
             header = datagram_header;
             payload.assign(packet.data() + kAudioHeaderSize, packet.data() + packet.size());
+            if (received_steady_us) {
+                *received_steady_us = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        queued.arrived.time_since_epoch()).count());
+            }
             return Error::success();
         }
         while (!impl.audio_received.empty()) {
@@ -8759,6 +8906,11 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
             case AudioParser::Status::Packet: {
                 payload.assign(audio_payload, audio_payload + header.payload_size);
                 impl.audio_parser.consume();
+                if (received_steady_us) {
+                    *received_steady_us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                }
                 return Error::success();
             }
             case AudioParser::Status::Error:
@@ -8805,6 +8957,23 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
         }
         impl.cv.wait_until(lock, deadline);
     }
+}
+
+AudioReceiveStats QuicSession::audio_receive_stats() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    AudioReceiveStats stats = impl_->audio_receive_stats;
+    stats.queued = impl_->audio_datagrams.size();
+    return stats;
+}
+
+AudioDatagramSendStats QuicSession::audio_datagram_send_stats() const {
+    std::lock_guard<std::mutex> lock(impl_->datagram_mutex);
+    return impl_->audio_datagram_send_stats;
+}
+
+VideoIdrSendStats QuicSession::video_idr_send_stats() const {
+    std::lock_guard<std::mutex> lock(impl_->video_idr_send_mutex);
+    return impl_->video_idr_send_stats;
 }
 
 Error QuicSession::receive_microphone(AudioHeader& header, std::vector<uint8_t>& payload,

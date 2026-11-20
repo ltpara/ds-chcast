@@ -2305,6 +2305,14 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
     }
     stats.input_stats = session_->input_stats();
     stats.input_releases = session_->input_release_requests();
+    const auto audio_send = session_->audio_datagram_send_stats();
+    stats.audio_datagrams_framed = audio_send.framed;
+    stats.audio_datagram_submit_to_framed_us = audio_send.submit_to_framed_us;
+    stats.audio_datagram_max_submit_to_framed_us = audio_send.max_submit_to_framed_us;
+    stats.audio_datagram_submit_to_framed_over_100ms =
+        audio_send.submit_to_framed_over_100ms;
+    stats.audio_datagrams_pending = audio_send.pending;
+    stats.video_idr_send = session_->video_idr_send_stats();
     publish_stats(stats);
 
     if (ok && !stopping_.load()) {
@@ -3473,9 +3481,9 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         log("audio stopped: " + reason);
     };
 
-    uint64_t audio_send_drops = 0;
     uint64_t audio_recoveries_logged = 0;
     uint64_t audio_dsp_resets_logged = 0;
+    uint64_t last_audio_submit_ms = 0;
     bool audio_recovering_logged = false;
     const uint64_t audio_base_ms = capture_clock_ms(start);
     auto drain_audio = [&] {
@@ -3495,6 +3503,17 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if ((session_->permissions() & kPermissionAudio) == 0) {
                 continue;
             }
+            const uint64_t submitted_ms = capture_clock_ms(Clock::now());
+            if (last_audio_submit_ms != 0 && submitted_ms >= last_audio_submit_ms) {
+                stats.audio_max_submit_gap_ms = (std::max)(
+                    stats.audio_max_submit_gap_ms, submitted_ms - last_audio_submit_ms);
+            }
+            last_audio_submit_ms = submitted_ms;
+            const uint64_t captured_ms = packet.capture_ms & 0xFFFFFFFFFFFFull;
+            if (submitted_ms >= captured_ms) {
+                stats.audio_max_capture_age_ms = (std::max)(
+                    stats.audio_max_capture_age_ms, submitted_ms - captured_ms);
+            }
             Error sent = session_->send_audio(header, packet.data.data(), packet.data.size());
             if (!sent.ok()) {
                 if (sent.status() == Status::PermissionDenied) {
@@ -3507,7 +3526,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                     // queue, or a datagram that exceeds the current path
                     // budget); video owns the path and this packet is a short
                     // gap, not a reason to stop audio.
-                    ++audio_send_drops;
+                    ++stats.audio_send_dropped;
+                    if (stats.audio_send_dropped <= 3) {
+                        log("audio packet dropped at send: " + sent.to_string());
+                    }
                     continue;
                 }
                 ++stats.audio_errors;
@@ -3519,7 +3541,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             stats.audio_bytes += packet.data.size();
         }
         const AudioCaptureStats captured = audio_capture->stats();
-        stats.audio_dropped = audio_send_drops + captured.dropped;
+        stats.audio_capture_dropped = captured.dropped;
+        stats.audio_dropped = stats.audio_send_dropped + stats.audio_capture_dropped;
         stats.audio_stale_dropped = captured.stale_dropped;
         stats.audio_capture_recoveries = captured.recoveries;
         stats.audio_gate_transitions = captured.gate_transitions;
@@ -4193,8 +4216,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if (!sent.ok()) {
                 if (sent.status() == Status::WaitTimeout) {
                     // The compressed reference chain may now have a hole.
-                    // Resume this subscription with an IDR once it can send.
-                    video_needs_resync = true;
+                    // A refinement can be retried without a new source frame.
+                    video_needs_resync = !refine;
                     return true;
                 }
                 if (sent.status() == Status::Unavailable) {
@@ -5334,6 +5357,14 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             stats.rtt_ms = static_cast<double>(transport.rtt_us) / 1000;
             stats.min_rtt_ms = static_cast<double>(transport.min_rtt_us) / 1000;
         }
+        const auto audio_send = session_->audio_datagram_send_stats();
+        stats.audio_datagrams_framed = audio_send.framed;
+        stats.audio_datagram_submit_to_framed_us = audio_send.submit_to_framed_us;
+        stats.audio_datagram_max_submit_to_framed_us =
+            audio_send.max_submit_to_framed_us;
+        stats.audio_datagram_submit_to_framed_over_100ms =
+            audio_send.submit_to_framed_over_100ms;
+        stats.audio_datagrams_pending = audio_send.pending;
         const auto latency = session_->latency();
         stats.application_rtt_ms = static_cast<double>(latency.rtt_us) / 1000;
         stats.qos_probe_replies = latency.replies;
@@ -5341,6 +5372,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         stats.video_pending_ms = static_cast<double>(latency.video_pending_us) / 1000;
         stats.video_receipts = latency.video_replies;
         stats.video_pending_frames = latency.video_pending_frames;
+        stats.video_idr_send = session_->video_idr_send_stats();
         // Do not keep an old video delay alive on a static desktop. A fresh
         // receipt or outstanding frame participates alongside the probe.
         const auto video_delay = latency.video_replies != video_replies ? latency.video_delay_us : 0;

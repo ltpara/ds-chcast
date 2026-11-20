@@ -18,6 +18,7 @@
 
 #include "chast/access_ticket.h"
 #include "chast/audio.h"
+#include "chast/audio_reorder.h"
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/clipboard_listener.h"
@@ -2472,9 +2473,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         }
     };
     uint64_t cursor_updates = 0;
-    bool audio_announced = false;
-    bool audio_finished = false;
-    bool audio_broken = false;
+    std::atomic<bool> audio_announced{false};
+    std::atomic<bool> audio_finished{false};
+    std::atomic<bool> audio_broken{false};
     bool audio_enabled = false;
     bool audio_muted_applied = false;
     chast::PermissionMask permissions = 0;
@@ -2609,12 +2610,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     // them so the UI can explain why the session is not on UDP.
     std::string active_transport;
     std::string transport_error;
+    std::mutex audio_pipeline_mutex;
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
     std::unique_ptr<chast::IAudioPlayer> audio_player;
-    // Datagram audio needs its own ordering: a forward jump is a loss to
-    // conceal, a packet behind the highest sequence is too late to play.
-    uint64_t expected_audio_seq = 0;
-    bool have_audio_seq = false;
+    chast::AudioPacketReorderBuffer audio_reorder;
     // One reference per session: system-audio PCM feeds it while the player is
     // audible, and the microphone capture cancels against the same ring. It
     // stays inactive until a player actually starts.
@@ -2738,25 +2737,62 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             std::chrono::duration<double>(now - window_start).count();
         double fps = 0.0;
         double kbps = 0.0;
-        if (audio_player) {
-            const chast::AudioPlayerStats audio_stats = audio_player->stats();
-            audio_buffer_ms = audio_stats.buffer_ms;
-            audio_underruns = audio_stats.underruns;
-            audio_starved_ms = audio_stats.starved_ms;
-            audio_dropped = audio_stats.dropped;
-            audio_recoveries = audio_stats.recoveries;
-            audio_recovering = audio_stats.recovering;
-            if (clock_synced) {
-                audio_latency_ms = chast::audio_playout_latency_ms(
-                    audio_stats.playout_capture_ms, audio_stats.playout_scheduled_ms,
-                    clock_offset_us);
-                av_skew_ms = audio_latency_ms >= 0.0 && frame_age_valid
-                                 ? audio_latency_ms - latency_ms
-                                 : -1.0;
+        bool audio_announced_snapshot = false;
+        bool audio_enabled_snapshot = false;
+        uint32_t audio_sample_rate_snapshot = 0;
+        uint32_t audio_channels_snapshot = 0;
+        uint32_t audio_bitrate_snapshot = 0;
+        uint64_t audio_received_snapshot = 0;
+        uint64_t audio_decoded_snapshot = 0;
+        uint64_t audio_errors_snapshot = 0;
+        uint64_t audio_underruns_snapshot = 0;
+        uint64_t audio_starved_ms_snapshot = 0;
+        uint64_t audio_dropped_snapshot = 0;
+        uint64_t audio_recoveries_snapshot = 0;
+        bool audio_recovering_snapshot = false;
+        uint32_t audio_buffer_ms_snapshot = 0;
+        std::string audio_error_snapshot;
+        std::string audio_device_snapshot;
+        std::string audio_device_name_snapshot;
+        {
+            std::lock_guard<std::mutex> audio_lock(audio_pipeline_mutex);
+            if (audio_player) {
+                const chast::AudioPlayerStats audio_stats = audio_player->stats();
+                audio_buffer_ms = audio_stats.buffer_ms;
+                audio_underruns = audio_stats.underruns;
+                audio_starved_ms = audio_stats.starved_ms;
+                audio_dropped = audio_stats.dropped;
+                audio_recoveries = audio_stats.recoveries;
+                audio_recovering = audio_stats.recovering;
+                if (clock_synced) {
+                    audio_latency_ms = chast::audio_playout_latency_ms(
+                        audio_stats.playout_capture_ms, audio_stats.playout_scheduled_ms,
+                        clock_offset_us);
+                    av_skew_ms = audio_latency_ms >= 0.0 && frame_age_valid
+                                     ? audio_latency_ms - latency_ms
+                                     : -1.0;
+                }
+            } else {
+                audio_latency_ms = -1.0;
+                av_skew_ms = -1.0;
             }
-        } else {
-            audio_latency_ms = -1.0;
-            av_skew_ms = -1.0;
+            audio_announced_snapshot = audio_announced;
+            audio_enabled_snapshot = audio_enabled;
+            audio_sample_rate_snapshot = audio_sample_rate;
+            audio_channels_snapshot = audio_channels;
+            audio_bitrate_snapshot = audio_bitrate;
+            audio_received_snapshot = audio_received;
+            audio_decoded_snapshot = audio_decoded;
+            audio_errors_snapshot = audio_errors;
+            audio_underruns_snapshot = audio_underruns;
+            audio_starved_ms_snapshot = audio_starved_ms;
+            audio_dropped_snapshot = audio_dropped;
+            audio_recoveries_snapshot = audio_recoveries;
+            audio_recovering_snapshot = audio_recovering;
+            audio_buffer_ms_snapshot = audio_buffer_ms;
+            audio_error_snapshot = audio_error;
+            audio_device_snapshot = audio_device;
+            audio_device_name_snapshot = audio_device_name;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2898,26 +2934,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 }
             }
             status_.cursor_updates = cursor_updates;
-            status_.audio_announced = audio_announced;
-            status_.audio_enabled = audio_enabled;
+            status_.audio_announced = audio_announced_snapshot;
+            status_.audio_enabled = audio_enabled_snapshot;
             status_.audio_muted = audio_muted_.load(std::memory_order_relaxed);
-            status_.audio_sample_rate = audio_sample_rate;
-            status_.audio_channels = audio_channels;
-            status_.audio_bitrate = audio_bitrate;
-            status_.audio_received = audio_received;
-            status_.audio_decoded = audio_decoded;
-            status_.audio_errors = audio_errors;
-            status_.audio_underruns = audio_underruns;
-            status_.audio_starved_ms = audio_starved_ms;
-            status_.audio_dropped = audio_dropped;
-            status_.audio_recoveries = audio_recoveries;
-            status_.audio_recovering = audio_recovering;
-            status_.audio_buffer_ms = audio_buffer_ms;
+            status_.audio_sample_rate = audio_sample_rate_snapshot;
+            status_.audio_channels = audio_channels_snapshot;
+            status_.audio_bitrate = audio_bitrate_snapshot;
+            status_.audio_received = audio_received_snapshot;
+            status_.audio_decoded = audio_decoded_snapshot;
+            status_.audio_errors = audio_errors_snapshot;
+            status_.audio_underruns = audio_underruns_snapshot;
+            status_.audio_starved_ms = audio_starved_ms_snapshot;
+            status_.audio_dropped = audio_dropped_snapshot;
+            status_.audio_recoveries = audio_recoveries_snapshot;
+            status_.audio_recovering = audio_recovering_snapshot;
+            status_.audio_buffer_ms = audio_buffer_ms_snapshot;
             status_.audio_latency_ms = audio_latency_ms;
             status_.av_skew_ms = av_skew_ms;
-            status_.audio_error = audio_error;
-            status_.audio_device = audio_device;
-            status_.audio_device_name = audio_device_name;
+            status_.audio_error = audio_error_snapshot;
+            status_.audio_device = audio_device_snapshot;
+            status_.audio_device_name = audio_device_name_snapshot;
             status_.audio_aec = microphone_aec_.load(std::memory_order_relaxed);
             status_.audio_noise_suppression =
                 microphone_noise_.load(std::memory_order_relaxed);
@@ -3278,6 +3314,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             // decoder that cannot start leaves video untouched and reports
             // why through audio_error.
             auto stop_audio_pipeline = [&] {
+                std::lock_guard<std::mutex> audio_lock(audio_pipeline_mutex);
                 if (audio_player) {
                     const chast::AudioPlayerStats stats = audio_player->stats();
                     audio_buffer_ms = stats.buffer_ms;
@@ -3321,7 +3358,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // blocks inside a burst; the stale drop and queue cap bound
                 // the delay after a stall.
                 player_config.arrival_anchored = true;
+                player_config.arrival_phase_correction = true;
+                // A new arrival burst may still have fresh PCM queued on the
+                // old timeline. Keep it and let the normal bounded deadline
+                // handling discard only blocks that are no longer playable.
+                player_config.preserve_queue_on_reanchor = true;
+                player_config.render_buffer_ms = 10;
                 player_config.lead_ms = 0;
+                player_config.late_tolerance_ms = 20;
                 // The first blocks include session setup; anchor once on the
                 // fastest of six so that delay does not stay for the session.
                 player_config.anchor_gather_blocks = 6;
@@ -3364,6 +3408,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 return true;
             };
             auto start_audio = [&](const chast::AudioInfo& audio) {
+                std::lock_guard<std::mutex> audio_lock(audio_pipeline_mutex);
+                audio_reorder.reset();
                 audio_announced = audio.enabled;
                 audio_finished = false;
                 audio_broken = false;
@@ -6590,17 +6636,95 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
-                // Drains every complete audio packet that arrived since the
-                // last poll. Audio never fails the session: a malformed packet
-                // or a dead render endpoint stops local playback and video
-                // keeps running.
-                auto drain_audio = [&] {
-                    if (!audio_announced || audio_finished || audio_broken) {
+                auto process_audio_packet = [&](chast::AudioPacket& packet,
+                                                uint64_t missing_sequences) {
+                    const chast::AudioHeader& audio_header = packet.header;
+                    const std::vector<uint8_t>& audio_payload = packet.payload;
+                    if (missing_sequences > 0 && audio_player && audio_decoder) {
+                        const uint32_t fill = static_cast<uint32_t>(
+                            std::min<uint64_t>(missing_sequences, 5));
+                        for (uint32_t back = fill; back > 0; --back) {
+                            std::vector<chast::DecodedAudio> concealed_blocks;
+                            chast::Error concealed = audio_decoder->conceal(
+                                audio_header, back, concealed_blocks);
+                            if (!concealed.ok()) {
+                                break;
+                            }
+                            for (const chast::DecodedAudio& block : concealed_blocks) {
+                                chast::Error pushed = audio_player->push(block);
+                                if (!pushed.ok()) {
+                                    ++audio_errors;
+                                    break;
+                                }
+                                if (!audio_muted_applied && block.channels >= 1 &&
+                                    block.channels <= 2 && !block.samples.empty()) {
+                                    audio_reference->push(
+                                        block.samples.data(),
+                                        block.samples.size() / block.channels,
+                                        block.channels);
+                                }
+                            }
+                        }
+                    }
+                    if (!audio_player || !audio_decoder) {
                         return;
+                    }
+                    if (audio_header.payload_size != audio_payload.size() ||
+                        chast::crc32(audio_payload.data(), audio_payload.size()) !=
+                            audio_header.payload_crc32) {
+                        ++audio_errors;
+                        return;
+                    }
+                    std::vector<chast::DecodedAudio> audio_blocks;
+                    chast::Error audio_decode = audio_decoder->decode(
+                        audio_header, audio_payload.data(), audio_payload.size(),
+                        audio_blocks);
+                    if (!audio_decode.ok()) {
+                        ++audio_errors;
+                        if (audio_errors <= 3) {
+                            std::fprintf(stderr, "viewer: audio decode: %s\n",
+                                         audio_decode.to_string().c_str());
+                        }
+                        return;
+                    }
+                    ++audio_decoded;
+                    for (const chast::DecodedAudio& block : audio_blocks) {
+                        chast::Error pushed = audio_player->push(block);
+                        if (!pushed.ok()) {
+                            ++audio_errors;
+                            if (audio_errors <= 3) {
+                                std::fprintf(stderr, "viewer: audio push: %s\n",
+                                             pushed.to_string().c_str());
+                            }
+                            break;
+                        }
+                        // Feed the same PCM the player renders to the echo
+                        // reference. Muted output is silence and must not
+                        // train the canceller.
+                        if (!audio_muted_applied && block.channels >= 1 &&
+                            block.channels <= 2 && !block.samples.empty()) {
+                            audio_reference->push(
+                                block.samples.data(),
+                                block.samples.size() / block.channels,
+                                block.channels);
+                        }
+                    }
+                };
+
+                // Decode and queue a bounded packet batch independently of
+                // video receive and decode work. Delay a forward gap briefly
+                // so a reordered datagram can fill it before Opus PLC runs.
+                auto drain_audio_packets = [&] {
+                    std::lock_guard<std::mutex> audio_lock(audio_pipeline_mutex);
+                    if (!audio_announced || audio_finished || audio_broken) {
+                        return false;
                     }
                     chast::AudioHeader audio_header;
                     std::vector<uint8_t> audio_payload;
-                    for (;;) {
+                    bool received_packet = false;
+                    constexpr size_t kAudioBatchLimit = 32;
+                    for (size_t packet_index = 0; packet_index < kAudioBatchLimit;
+                         ++packet_index) {
                         chast::Error next = session->receive_audio(
                             audio_header, audio_payload, std::chrono::milliseconds(0));
                         if (next.status() == chast::Status::WaitTimeout) {
@@ -6612,153 +6736,106 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             break;
                         }
                         if (!next.ok()) {
-                            // The parser cannot resynchronise after a bad
-                            // header, so stop consuming rather than spin on
-                            // the same error.
                             ++audio_errors;
                             audio_broken = true;
                             audio_error = "protocol: " + next.to_string();
                             std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
                             break;
                         }
+                        received_packet = true;
                         ++audio_received;
-                        if (!have_audio_seq) {
-                            have_audio_seq = true;
-                            expected_audio_seq = audio_header.seq;
-                        }
-                        if (audio_header.seq < expected_audio_seq) {
-                            // Too late to play; a newer packet already
-                            // covered this slot, with concealment if needed.
-                            continue;
-                        }
-                        if (audio_header.seq > expected_audio_seq && audio_player &&
-                            audio_decoder) {
-                            const uint32_t missing = static_cast<uint32_t>(
-                                audio_header.seq - expected_audio_seq);
-                            const uint32_t fill = std::min<uint32_t>(missing, 5);
-                            for (uint32_t back = fill; back > 0; --back) {
-                                std::vector<chast::DecodedAudio> concealed_blocks;
-                                chast::Error concealed = audio_decoder->conceal(
-                                    audio_header, back, concealed_blocks);
-                                if (!concealed.ok()) {
-                                    break;
-                                }
-                                for (const chast::DecodedAudio& block : concealed_blocks) {
-                                    chast::Error pushed = audio_player->push(block);
-                                    if (!pushed.ok()) {
-                                        ++audio_errors;
-                                        break;
-                                    }
-                                    if (!audio_muted_applied && block.channels >= 1 &&
-                                        block.channels <= 2 && !block.samples.empty()) {
-                                        audio_reference->push(
-                                            block.samples.data(),
-                                            block.samples.size() / block.channels,
-                                            block.channels);
-                                    }
-                                }
-                            }
-                        }
-                        expected_audio_seq = audio_header.seq + 1;
-                        if (!audio_player || !audio_decoder) {
-                            // Local playback is unavailable; keep consuming so
-                            // the transport queue cannot grow.
-                            continue;
-                        }
-                        if (audio_header.payload_size != audio_payload.size() ||
-                            chast::crc32(audio_payload.data(), audio_payload.size()) !=
-                                audio_header.payload_crc32) {
-                            ++audio_errors;
-                            continue;
-                        }
-                        std::vector<chast::DecodedAudio> audio_blocks;
-                        chast::Error audio_decode = audio_decoder->decode(
-                            audio_header, audio_payload.data(), audio_payload.size(),
-                            audio_blocks);
-                        if (!audio_decode.ok()) {
-                            ++audio_errors;
-                            if (audio_errors <= 3) {
-                                std::fprintf(stderr, "viewer: audio decode: %s\n",
-                                             audio_decode.to_string().c_str());
-                            }
-                            continue;
-                        }
-                        ++audio_decoded;
-                        for (const chast::DecodedAudio& block : audio_blocks) {
-                            chast::Error pushed = audio_player->push(block);
-                            if (!pushed.ok()) {
-                                ++audio_errors;
-                                if (audio_errors <= 3) {
-                                    std::fprintf(stderr, "viewer: audio push: %s\n",
-                                                 pushed.to_string().c_str());
-                                }
+                        chast::AudioPacket packet;
+                        packet.header = audio_header;
+                        packet.payload = std::move(audio_payload);
+                        audio_reorder.push(std::move(packet));
+                        chast::AudioPacket ready;
+                        uint64_t missing_sequences = 0;
+                        while (audio_reorder.pop_ready(
+                            chast::AudioPacketReorderBuffer::Clock::now(), ready,
+                            missing_sequences)) {
+                            process_audio_packet(ready, missing_sequences);
+                            if (audio_player && !audio_player->error().empty()) {
                                 break;
                             }
-                            // Feed the same PCM the player renders to the echo
-                            // reference. Muted output is silence and must not
-                            // train the canceller.
-                            if (!audio_muted_applied && block.channels >= 1 &&
-                                block.channels <= 2 && !block.samples.empty()) {
-                                audio_reference->push(
-                                    block.samples.data(),
-                                    block.samples.size() / block.channels,
-                                    block.channels);
-                            }
                         }
-                        if (!audio_player->error().empty()) {
+                        if (audio_player && !audio_player->error().empty()) {
                             break;
                         }
                     }
-                    if (audio_player) {
-                        const bool muted = audio_muted_.load(std::memory_order_relaxed);
-                        if (muted != audio_muted_applied) {
-                            audio_player->set_mute(muted);
-                            audio_muted_applied = muted;
-                            audio_reference->set_active(!muted);
-                        }
-                        // The picker may have moved the speaker. Rebuild only
-                        // the player: the decoder, the timeline and the last
-                        // clock offset stay, and a failed id falls back to the
-                        // default instead of ending audio.
-                        std::string wanted_output;
-                        {
-                            std::lock_guard<std::mutex> lock(audio_output_mutex_);
-                            wanted_output = audio_output_device_id_;
-                        }
-                        if (wanted_output != audio_output_requested) {
-                            audio_output_requested = wanted_output;
-                            audio_player->stop();
-                            audio_player.reset();
-                            audio_reference->set_active(false);
-                            std::string note;
-                            if (open_audio_player(wanted_output, &note)) {
-                                audio_enabled = true;
-                                audio_error = note;
-                                std::fprintf(stderr,
-                                             "viewer: audio output is now %s\n",
-                                             audio_device_name.empty()
-                                                 ? "the system default"
-                                                 : audio_device_name.c_str());
-                            } else {
-                                audio_enabled = false;
-                                audio_device = wanted_output;
-                                audio_device_name.clear();
-                                audio_error = "playback: " + note;
-                            }
-                            if (!note.empty()) {
-                                std::fprintf(stderr, "viewer: audio %s\n", note.c_str());
-                            }
-                        } else {
-                            const std::string player_error = audio_player->error();
-                            if (!player_error.empty()) {
-                                audio_error = "playback: " + player_error;
-                                std::fprintf(stderr, "viewer: audio stopped: %s\n",
-                                             player_error.c_str());
-                                stop_audio_pipeline();
-                            }
+                    bool processed_packet = false;
+                    chast::AudioPacket ready;
+                    uint64_t missing_sequences = 0;
+                    while (audio_reorder.pop_ready(
+                        chast::AudioPacketReorderBuffer::Clock::now(), ready,
+                        missing_sequences, audio_finished)) {
+                        processed_packet = true;
+                        process_audio_packet(ready, missing_sequences);
+                        if (audio_player && !audio_player->error().empty()) {
+                            break;
                         }
                     }
-                    if ((audio_finished || audio_broken) && (audio_player || audio_decoder)) {
+                    return received_packet || processed_packet;
+                };
+
+                auto drain_audio_playout = [&] {
+                    bool stop_pipeline = false;
+                    {
+                        std::lock_guard<std::mutex> audio_lock(audio_pipeline_mutex);
+                        if (audio_player) {
+                            const bool muted = audio_muted_.load(std::memory_order_relaxed);
+                            if (muted != audio_muted_applied) {
+                                audio_player->set_mute(muted);
+                                audio_muted_applied = muted;
+                                audio_reference->set_active(!muted);
+                            }
+                            // The picker may have moved the speaker. Rebuild only
+                            // the player: the decoder, the timeline and the last
+                            // clock offset stay, and a failed id falls back to the
+                            // default instead of ending audio.
+                            std::string wanted_output;
+                            {
+                                std::lock_guard<std::mutex> lock(audio_output_mutex_);
+                                wanted_output = audio_output_device_id_;
+                            }
+                            if (wanted_output != audio_output_requested) {
+                                audio_output_requested = wanted_output;
+                                audio_player->stop();
+                                audio_player.reset();
+                                audio_reference->set_active(false);
+                                std::string note;
+                                if (open_audio_player(wanted_output, &note)) {
+                                    audio_enabled = true;
+                                    audio_error = note;
+                                    std::fprintf(stderr,
+                                                 "viewer: audio output is now %s\n",
+                                                 audio_device_name.empty()
+                                                     ? "the system default"
+                                                     : audio_device_name.c_str());
+                                } else {
+                                    audio_enabled = false;
+                                    audio_device = wanted_output;
+                                    audio_device_name.clear();
+                                    audio_error = "playback: " + note;
+                                }
+                                if (!note.empty()) {
+                                    std::fprintf(stderr, "viewer: audio %s\n", note.c_str());
+                                }
+                            } else {
+                                const std::string player_error = audio_player->error();
+                                if (!player_error.empty()) {
+                                    audio_error = "playback: " + player_error;
+                                    std::fprintf(stderr, "viewer: audio stopped: %s\n",
+                                                 player_error.c_str());
+                                    stop_pipeline = true;
+                                }
+                            }
+                        }
+                        if ((audio_finished || audio_broken) &&
+                            (audio_player || audio_decoder)) {
+                            stop_pipeline = true;
+                        }
+                    }
+                    if (stop_pipeline) {
                         stop_audio_pipeline();
                     }
                 };
@@ -8832,9 +8909,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         display_source_width = info.source_width;
                         display_source_height = info.source_height;
                         if (!info.audio.enabled) {
-                            if (audio_announced || audio_player || audio_decoder) {
+                            bool had_audio_pipeline = false;
+                            {
+                                std::lock_guard<std::mutex> audio_lock(
+                                    audio_pipeline_mutex);
+                                had_audio_pipeline = audio_announced || audio_player ||
+                                                     audio_decoder;
                                 audio_announced = false;
                                 audio_finished = true;
+                            }
+                            if (had_audio_pipeline) {
                                 stop_audio_pipeline();
                                 std::fprintf(stderr, "viewer: the host stopped audio\n");
                             }
@@ -8922,6 +9006,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                std::jthread audio_thread([&](std::stop_token stop_token) {
+                    while (!stop_token.stop_requested()) {
+                        if (!drain_audio_packets()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        }
+                    }
+                });
+
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     drain_ticket_renew();
                     if (!poll_displays()) break;
@@ -9001,7 +9093,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_download_cancels();
                     step_folder_download();
                     receive_cursor();
-                    drain_audio();
+                    drain_audio_playout();
                     drain_microphone();
                     drain_voice();
                     receive_voice();
@@ -9019,7 +9111,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     const bool fast_media_poll =
                         (permissions & (chast::kPermissionInput |
                                         chast::kPermissionClipboard)) != 0 ||
-                        file_active || audio_announced || microphone_enabled ||
+                        file_active || microphone_enabled ||
                         microphone_wanted_.load(std::memory_order_relaxed) ||
                         voice_wanted_.load(std::memory_order_relaxed) || voice_active ||
                         voice_pending || !forwards.empty() || terminals_active() ||
@@ -9043,10 +9135,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         received_frame = session->receive_frame(
                             header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
                     }
-                    // Audio and microphone packets arrive on their own streams
-                    // and never wake receive_frame(), so drain them as soon as
-                    // the wait ends.
-                    drain_audio();
+                    // The audio worker consumes its stream independently;
+                    // microphone packets still need the session-loop poll.
                     drain_microphone();
                     drain_voice();
                     receive_voice();
@@ -9268,6 +9358,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         SaveScreenshotFromSink(sink_, directory);
                     });
                 }
+                audio_thread.request_stop();
+                audio_thread.join();
+
                 // A clipboard file list cannot finish on a closed session;
                 // files that never landed are removed from the staging folder.
                 if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {

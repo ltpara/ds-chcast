@@ -15,8 +15,10 @@
 // The viewer's system-sound player plays decoded audio as it arrives: there is
 // no fixed lead and no A/V scheduling, so audio cannot trail the video by a
 // jitter buffer it does not need. Each burst anchors at its arrival, and the
-// capture stamps only space the blocks inside that burst; blocks that miss
-// their slot are dropped, and the queue cap bounds the delay after a stall.
+// capture stamps only space the blocks inside that burst. Datagram gaps wait
+// briefly for reordering, and a small playback lateness budget tolerates a
+// block that just missed its slot; older blocks are dropped and the queue cap
+// bounds the delay after a stall.
 // With `adaptive_jitter` a windowed controller adds a bounded lead only while
 // arrivals miss their slots, so a degraded link trades some latency for
 // continuity while a healthy one keeps the zero-lead relationship to the
@@ -113,6 +115,11 @@ struct DecodedAudio {
     uint64_t capture_ms = 0;
     uint32_t sample_rate = 0;
     uint16_t channels = 0;
+    uint64_t diagnostic_sequence = 0;
+    uint64_t diagnostic_received_steady_us = 0;
+    uint64_t diagnostic_reordered_steady_us = 0;
+    uint64_t diagnostic_revealed_by_sequence = 0;
+    bool diagnostic_concealed = false;
 };
 
 class IAudioDecoder {
@@ -542,10 +549,8 @@ private:
 // host/local offset and are capped per window; a departure must repeat for
 // `confirm_windows` windows so one jittery window cannot move the timeline.
 // Callers should subtract any intentional lead from slack first, so a lead
-// change is not mistaken for drift. The first closed window after a start or
-// re-anchor is skipped: it can contain the arrival anchor's transient, which
-// says nothing about the path. Only used with a live clock offset, never with
-// the arrival anchor, and disabled by default.
+// change is not mistaken for drift. Arrival-anchored callers must explicitly
+// opt in because a re-anchor can itself move the measured phase.
 class PlayoutDriftController {
 public:
     struct Config {
@@ -638,6 +643,19 @@ public:
         corrections_ = 0;
     }
 
+    // A timeline re-anchor invalidates its partial window, not the learned
+    // path reference. Keeping the reference lets recovery drain delay instead
+    // of treating a delayed re-anchor as the new normal.
+    void reanchor() {
+        window_open_ = false;
+        window_has_sample_ = false;
+        window_start_ms_ = 0;
+        window_best_ms_ = 0;
+        pending_ = 0;
+        pending_sign_ = 0;
+        correction_ms_ = 0;
+    }
+
 private:
     void open(int64_t now_ms) {
         window_open_ = true;
@@ -669,16 +687,70 @@ private:
     int64_t windows_skipped_ = 0;
 };
 
+// Accounts for gaps in PCM actually submitted to an endpoint. Target slots
+// can move when the jitter lead changes; only endpoint padding determines
+// when submitted samples are expected to be audible. Keep sub-millisecond
+// precision so repeated short writes do not accumulate rounding error.
+class AudioRenderAccounting {
+public:
+    void write(int64_t audible_us, int64_t duration_us) {
+        if (duration_us <= 0) return;
+        if (end_us_ != 0 && audible_us > end_us_) {
+            const int64_t gap = audible_us - end_us_;
+            starved_us_ += static_cast<uint64_t>(gap);
+            max_gap_us_ = (std::max)(max_gap_us_, static_cast<uint64_t>(gap));
+        }
+        end_us_ = (std::max)(end_us_, audible_us + duration_us);
+    }
+    // A reopened endpoint starts a new timeline, but session totals survive.
+    void reopen() { end_us_ = 0; }
+    uint64_t starved_ms() const { return starved_us_ / 1000; }
+    uint64_t max_gap_ms() const { return max_gap_us_ / 1000; }
+    int64_t end_us() const { return end_us_; }
+
+private:
+    int64_t end_us_ = 0;
+    uint64_t starved_us_ = 0;
+    uint64_t max_gap_us_ = 0;
+};
+
+// Detects a broken arrival-anchored run from packet arrival times. Render
+// underrun detection may clear its own end timestamp, so it cannot also be
+// the authority for deciding when the next packet needs a fresh anchor.
+class AudioStallReanchor {
+public:
+    bool observe(int64_t arrival_ms) {
+        const bool stalled = last_arrival_ms_ != 0 &&
+                             arrival_ms - last_arrival_ms_ > kStallMs;
+        last_arrival_ms_ = arrival_ms;
+        return stalled;
+    }
+    void reset() { last_arrival_ms_ = 0; }
+
+private:
+    static constexpr int64_t kStallMs = 100;
+    int64_t last_arrival_ms_ = 0;
+};
+
 struct AudioPlayerConfig {
     // Empty follows the default render endpoint. A non-empty id pins that
     // device; when it disappears the player keeps retrying the same id and
     // reports `recovering` instead of silently moving to another endpoint.
     std::string device_id;
+    // Collect a bounded recent history of packet-to-render events for probes.
+    // Product players leave this off.
+    bool collect_timing_events = false;
+    // Requested WASAPI shared-mode render buffer. The endpoint may clamp this
+    // to its engine period; `AudioPlayerStats` reports the actual size.
+    uint32_t render_buffer_ms = 120;
     // How far behind the sender timeline playback runs. For a caller that
     // knows the host clock this is the jitter buffer; 80 ms covers typical
     // network jitter. The viewer's system audio sets this to 0 and anchors on
     // arrival instead, so it carries no fixed lead over the video.
     uint32_t lead_ms = 80;
+    // A block whose target has just passed may still play to avoid a brief
+    // network jitter burst becoming a click. Older blocks are discarded.
+    uint32_t late_tolerance_ms = 0;
     // Queued audio beyond this is dropped oldest-first, which keeps a network
     // burst from building an ever-growing delay.
     uint32_t queue_ms = 500;
@@ -689,6 +761,10 @@ struct AudioPlayerConfig {
     // re-anchors instead of replaying the stale timeline. `set_clock_offset`
     // is ignored in this mode.
     bool arrival_anchored = false;
+    // Track sustained phase changes on an arrival-anchored timeline. This is
+    // separate from clock drift correction because arrival paths include
+    // network delay changes; disabled for voice playback unless requested.
+    bool arrival_phase_correction = false;
     // Collect this many blocks before setting the first arrival anchor, then
     // anchor on the fastest one plus a small safety margin. The gathered
     // blocks are skipped, so playback starts on the corrected timeline
@@ -708,6 +784,11 @@ struct AudioPlayerConfig {
     // it adds up to its ceiling on top of `lead_ms`. The microphone uplink
     // keeps its fixed lead.
     bool adaptive_jitter = false;
+    JitterLeadController::Config adaptive_jitter_config;
+    // Preserve queued PCM when an arrival-anchored timeline re-anchors. The
+    // generic default keeps the old flush behavior; the system-audio viewer
+    // opts in after weak-link comparison.
+    bool preserve_queue_on_reanchor = false;
     // Correct long-session clock drift on a capture-anchored timeline. The
     // controller learns the best-case arrival phase of the first window and
     // slowly moves the host/local offset when it departs, so the configured
@@ -715,6 +796,81 @@ struct AudioPlayerConfig {
     // drift). Needs a live clock offset from LatencyReply; ignored with
     // `arrival_anchored`. Experimental and off by default.
     bool clock_drift_correction = false;
+
+    bool phase_correction_enabled() const noexcept {
+        return arrival_anchored ? arrival_phase_correction : clock_drift_correction;
+    }
+};
+
+struct AudioLateBlockDecision {
+    bool drop = false;
+    uint64_t late_ms = 0;
+};
+
+inline AudioLateBlockDecision audio_late_block_decision(
+    int64_t now_ms, int64_t slot_end_ms, uint32_t tolerance_ms) {
+    if (now_ms < slot_end_ms) {
+        return {};
+    }
+    const uint64_t late_ms = static_cast<uint64_t>(now_ms - slot_end_ms);
+    if (tolerance_ms == 0 || late_ms > tolerance_ms) {
+        return {true, late_ms};
+    }
+    return {false, late_ms};
+}
+
+enum class AudioRecoveryCause : uint8_t {
+    None = 0,
+    GetCurrentPadding,
+    PrimeGetBuffer,
+    PrimeReleaseBuffer,
+    GetBuffer,
+    ReleaseBuffer,
+    WaitForEvent,
+    ClientStart,
+    DefaultDeviceChanged,
+    ConsumptionStalled,
+};
+
+inline const char* audio_recovery_cause_name(AudioRecoveryCause cause) {
+    switch (cause) {
+        case AudioRecoveryCause::GetCurrentPadding: return "GetCurrentPadding";
+        case AudioRecoveryCause::PrimeGetBuffer: return "prime GetBuffer";
+        case AudioRecoveryCause::PrimeReleaseBuffer: return "prime ReleaseBuffer";
+        case AudioRecoveryCause::GetBuffer: return "GetBuffer";
+        case AudioRecoveryCause::ReleaseBuffer: return "ReleaseBuffer";
+        case AudioRecoveryCause::WaitForEvent: return "render event wait";
+        case AudioRecoveryCause::ClientStart: return "IAudioClient::Start";
+        case AudioRecoveryCause::DefaultDeviceChanged: return "default device changed";
+        case AudioRecoveryCause::ConsumptionStalled: return "endpoint consumption stalled";
+        case AudioRecoveryCause::None: return "none";
+    }
+    return "unknown";
+}
+
+enum class AudioTimingEventKind : uint8_t {
+    LateDrop,
+    FirstWrite,
+    DeviceGap,
+    StallReanchor,
+};
+
+struct AudioTimingEvent {
+    AudioTimingEventKind kind = AudioTimingEventKind::LateDrop;
+    uint64_t sequence = 0;
+    uint64_t capture_ms = 0;
+    uint64_t received_steady_us = 0;
+    uint64_t reordered_steady_us = 0;
+    uint64_t queued_steady_us = 0;
+    uint64_t event_steady_us = 0;
+    int64_t target_steady_us = 0;
+    uint64_t lateness_us = 0;
+    uint64_t endpoint_gap_us = 0;
+    uint64_t revealed_by_sequence = 0;
+    bool concealed = false;
+    int64_t timeline_shift_us = 0;
+    uint64_t queued_audio_ms = 0;
+    uint64_t queued_blocks = 0;
 };
 
 struct AudioPlayerStats {
@@ -726,9 +882,33 @@ struct AudioPlayerStats {
     // dropping blocks; this is the actual dry time on the playout timeline,
     // and the metric to compare playout strategies with.
     uint64_t starved_ms = 0;
-    uint64_t dropped = 0;        // stale or over-capacity blocks discarded
+    // Gaps between endpoint submissions, measured from current padding rather
+    // than target slots. A moved target alone cannot increase these counters.
+    uint64_t device_starved_ms = 0;
+    uint64_t device_max_gap_ms = 0;
+    uint64_t input_max_gap_ms = 0;
+    uint64_t input_to_render_max_ms = 0;
+    uint64_t render_wake_max_gap_ms = 0;
+    std::vector<AudioTimingEvent> timing_events;
+    uint64_t dropped = 0;        // stale, over-capacity or re-anchor blocks discarded
+    uint64_t late_drops = 0;
+    uint64_t tolerated_late_blocks = 0;
+    uint64_t overflow_drops = 0;
+    uint64_t reanchor_dropped_blocks = 0;
+    uint64_t reanchor_dropped_ms = 0;
     uint64_t recoveries = 0;     // render endpoint reopened after a device change
+    uint64_t render_failures = 0;
+    uint64_t stalled_recoveries = 0;
+    uint64_t device_change_recoveries = 0;
+    AudioRecoveryCause last_recovery_cause = AudioRecoveryCause::None;
+    int32_t last_recovery_hresult = 0;
+    uint64_t recovery_open_failures = 0;
     uint32_t buffer_ms = 0;      // queued audio plus endpoint padding
+    uint32_t endpoint_buffer_ms = 0;
+    bool shared_low_latency = false;
+    int32_t shared_low_latency_result = 0;
+    uint32_t engine_period_us = 0;  // zero if the current period query is unavailable
+    uint32_t stream_latency_us = 0;
     uint32_t lead_ms = 0;
     // Extra lead the adaptive controller added on top of `lead_ms`, and how
     // often it raised or returned part of it.
@@ -747,6 +927,9 @@ struct AudioPlayerStats {
     // playout latency it can compare with frame age.
     uint64_t playout_capture_ms = 0;
     int64_t playout_scheduled_ms = 0;
+    // Desired slot of the most recent submitted chunk, for comparison with
+    // its padding-derived playout_scheduled_ms estimate.
+    int64_t playout_target_ms = 0;
     // Range of (scheduled local play time - arrival local time) over the
     // blocks queued since the last anchor or startup gather. A consistently
     // positive average means the anchor implies more delay than the blocks

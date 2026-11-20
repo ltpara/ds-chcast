@@ -126,6 +126,7 @@ struct HostServerStats {
     // keyframe backoff. A high count means a viewer that keeps asking for
     // keyframes instead of draining what it already has.
     uint64_t video_resync_backoffs = 0;
+    VideoIdrSendStats video_idr_send;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
     bool client_connected = false;  // at least one viewer got through
     bool peer_left = false;         // the last session ended with the peer gone
@@ -169,7 +170,16 @@ struct HostServerStats {
     uint64_t audio_packets = 0;
     uint64_t audio_bytes = 0;
     uint64_t audio_dropped = 0;
+    uint64_t audio_capture_dropped = 0;
+    uint64_t audio_send_dropped = 0;
     uint64_t audio_stale_dropped = 0;  // discarded by the shared queue age budget
+    uint64_t audio_max_submit_gap_ms = 0;  // gap between packets handed to QUIC
+    uint64_t audio_max_capture_age_ms = 0; // oldest capture-to-submit delay
+    uint64_t audio_datagrams_framed = 0;
+    uint64_t audio_datagram_submit_to_framed_us = 0;
+    uint64_t audio_datagram_max_submit_to_framed_us = 0;
+    uint64_t audio_datagram_submit_to_framed_over_100ms = 0;
+    size_t audio_datagrams_pending = 0;
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
