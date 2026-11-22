@@ -35,31 +35,82 @@ void main() {
   });
 
   test('recording needs a live session and the host consent bit', () {
-    ViewerStatus status(Map<String, Object?> fields) =>
-        ViewerStatus.fromMap(<Object?, Object?>{
-          'state': 'streaming',
-          ...fields,
-        });
+    ViewerStatus status(Map<String, Object?> fields) => ViewerStatus.fromMap(
+      <Object?, Object?>{'state': 'streaming', ...fields},
+    );
     expect(
-        status(<String, Object?>{'permissions': ViewerPermission.record})
-            .acceptsRecording,
-        isTrue);
+      status(<String, Object?>{
+        'permissions': ViewerPermission.record,
+      }).acceptsRecording,
+      isTrue,
+    );
     expect(
-        status(<String, Object?>{'permissions': 0}).acceptsRecording, isFalse);
+      status(<String, Object?>{'permissions': 0}).acceptsRecording,
+      isFalse,
+    );
     expect(
-        ViewerStatus.fromMap(<Object?, Object?>{
-          'state': 'ended',
-          'permissions': ViewerPermission.record,
-        }).acceptsRecording,
-        isFalse);
-    // Revoking consent does not stop a running recording, but no new one can
-    // start.
+      ViewerStatus.fromMap(<Object?, Object?>{
+        'state': 'ended',
+        'permissions': ViewerPermission.record,
+      }).acceptsRecording,
+      isFalse,
+    );
+    // Native revocation finalizes the recorder; the UI must not offer another
+    // start. The native loopback test verifies the actual recorder lifecycle.
     final ViewerStatus revoked = status(<String, Object?>{
       'permissions': 0,
-      'recording': true,
+      'recording': false,
     });
-    expect(revoked.recording, isTrue);
+    expect(revoked.recording, isFalse);
     expect(revoked.acceptsRecording, isFalse);
+  });
+
+  test('permission revocation is separate from recording failures', () {
+    ViewerStatus snapshot(Map<String, Object?> fields) =>
+        ViewerStatus.fromMap(<Object?, Object?>{
+          'state': 'streaming',
+          'permissions': ViewerPermission.record,
+          ...fields,
+        });
+    final ViewerStatus recording = snapshot(<String, Object?>{
+      'recording': true,
+      'recordError': '',
+    });
+    final ViewerStatus revoked = snapshot(<String, Object?>{
+      'permissions': 0,
+      'recording': false,
+      'recordError': '',
+    });
+    expect(recordingPermissionWasRevoked(recording, revoked), isTrue);
+    expect(
+      recordingPermissionWasRevoked(
+        recording,
+        snapshot(<String, Object?>{
+          'permissions': 0,
+          'recording': false,
+          'recordError': 'disk full',
+        }),
+      ),
+      isFalse,
+    );
+    expect(
+      recordingPermissionWasRevoked(
+        recording,
+        snapshot(<String, Object?>{
+          'permissions': 0,
+          'recording': false,
+          'recordError': 'the host revoked recording',
+        }),
+      ),
+      isTrue,
+    );
+    expect(
+      recordingPermissionWasRevoked(
+        snapshot(<String, Object?>{'recording': false}),
+        revoked,
+      ),
+      isFalse,
+    );
   });
 
   test('a failed recording keeps its reason for the toolbar', () {

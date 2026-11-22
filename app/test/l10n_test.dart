@@ -65,6 +65,10 @@ void main() {
         tr('显示器 {p1}', <String, Object?>{'p1': 2}),
         'Display 2',
       );
+      expect(
+        tr('主机已撤销录制权限，录制已停止'),
+        'The host revoked recording permission. Recording has stopped.',
+      );
     });
 
     test('falls back to Chinese for an unknown key', () {

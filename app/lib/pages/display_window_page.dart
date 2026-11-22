@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -7,13 +8,16 @@ import 'package:flutter/services.dart';
 import '../display_stream_controller.dart';
 import '../l10n.dart';
 import '../remote_pointer.dart';
+import '../recording_upload_queue.dart';
 import '../annotation_ink.dart';
 import '../annotation_stroke_controller.dart';
 import '../session_window.dart';
 import '../theme.dart';
+import '../trackpad_speed.dart';
 import '../viewer_bridge.dart';
 import '../view_prefs.dart';
 import '../view_scale.dart';
+import '../view_scroll.dart';
 import '../widgets/keyboard_mode_button.dart';
 import '../widgets/display_stream_view.dart';
 import '../widgets/remote_view.dart';
@@ -28,12 +32,16 @@ class DisplayWindowPage extends StatefulWidget {
     super.key,
     required this.streamId,
     this.peerId = '',
+    this.recordingUploadContext,
+    this.recordingUploadQueue,
   });
   final int streamId;
 
   /// Owner's per-device preference key, passed by the window that opened this
   /// one so input handling matches the main session.
   final String peerId;
+  final RecordingUploadContext? recordingUploadContext;
+  final RecordingUploadQueueStore? recordingUploadQueue;
 
   @override
   State<DisplayWindowPage> createState() => _DisplayWindowPageState();
@@ -44,6 +52,8 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   final _displays = DisplayStreamController();
   final _focus = FocusNode();
   final _contacts = RemoteContactTracker();
+  late final RecordingUploadQueueStore _recordingUploadQueue =
+      widget.recordingUploadQueue ?? RecordingUploadQueueStore();
   ViewerStatus _status = const ViewerStatus();
   Timer? _timer;
   bool _polling = false, _closing = false;
@@ -63,6 +73,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   ViewFit _fit = ViewFit.adaptive;
   int _zoomPercent = defaultViewZoomPercent;
   int _cursorZoomPercent = defaultCursorZoomPercent;
+  int _trackpadSpeedPercent = kDefaultTrackpadSpeedPercent;
+  ViewScrollStyle _scrollStyle = defaultViewScrollStyle;
+  int _scrollEdge = defaultViewScrollEdge;
   MouseMapping _mouseMapping = const MouseMapping();
   // Same per-device preference as the session window: the hint is draw-only,
   // so it keeps working while remote control is off.
@@ -103,6 +116,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _zoomPercent = prefs.zoomPercent;
     _cursorZoomPercent = prefs.cursorZoomPercent;
+    _trackpadSpeedPercent = prefs.trackpadSpeedPercent;
+    _scrollStyle = prefs.scrollStyle;
+    _scrollEdge = prefs.scrollEdge;
     _mouseMapping = MouseMapping(
       reverseWheel: prefs.reverseWheel,
       swapButtons: prefs.swapButtons,
@@ -174,6 +190,13 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
   }
 
   void _watchMediaFailures(ViewerStatus previous, ViewerStatus current) {
+    final bool recordingPermissionRevoked = recordingPermissionWasRevoked(
+      previous,
+      current,
+    );
+    if (recordingPermissionRevoked) {
+      _showMediaFeedback(tr('主机已撤销录制权限，录制已停止'));
+    }
     if (current.audioErrors > previous.audioErrors &&
         current.audioError.isNotEmpty) {
       _showMediaFeedback(tr('声音播放失败：{error}', {'error': current.audioError}));
@@ -193,7 +216,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     } else if (current.recordError != previous.recordError &&
         current.recordError != _recordErrorSeen) {
       _recordErrorSeen = current.recordError;
-      _showMediaFeedback(tr('录制失败：{error}', {'error': current.recordError}));
+      if (!recordingPermissionRevoked) {
+        _showMediaFeedback(tr('录制失败：{error}', {'error': current.recordError}));
+      }
     }
   }
 
@@ -285,14 +310,74 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
       return;
     }
     setState(() => _recordingChanging = true);
+    String basePath = '';
     try {
-      await ViewerBridge.setRecording(enable);
+      if (enable) basePath = await _prepareRecordingBasePath();
+      await ViewerBridge.setRecording(enable, basePath: basePath);
     } on PlatformException catch (error) {
+      if (basePath.isNotEmpty) await _discardIntentIfFileMissing(basePath);
       _showMediaFeedback(error.message ?? tr('无法切换本地录制'));
     } on MissingPluginException {
+      if (basePath.isNotEmpty) await _discardIntentIfFileMissing(basePath);
       // The native viewer is going away.
+    } catch (error) {
+      if (basePath.isNotEmpty) await _discardIntentIfFileMissing(basePath);
+      _showMediaFeedback(
+        tr('录制上传失败：{error}', <String, Object?>{'error': '$error'}),
+      );
     } finally {
       if (mounted && !_closing) setState(() => _recordingChanging = false);
+    }
+  }
+
+  Future<String> _prepareRecordingBasePath() async {
+    final RecordingUploadContext? upload = widget.recordingUploadContext;
+    if (upload == null) return '';
+    final DateTime startedAt = DateTime.now().toUtc();
+    final String? profile = Platform.environment['USERPROFILE'];
+    final Directory directory = Directory(
+      profile == null || profile.isEmpty
+          ? Directory.current.path
+          : '$profile${Platform.pathSeparator}Videos',
+    );
+    for (int attempt = 0; attempt < 8; attempt++) {
+      final String id = newRecordingUploadJobId();
+      final String stamp =
+          '${startedAt.year.toString().padLeft(4, '0')}'
+          '${startedAt.month.toString().padLeft(2, '0')}'
+          '${startedAt.day.toString().padLeft(2, '0')}-'
+          '${startedAt.hour.toString().padLeft(2, '0')}'
+          '${startedAt.minute.toString().padLeft(2, '0')}'
+          '${startedAt.second.toString().padLeft(2, '0')}';
+      final String path =
+          '${directory.path}${Platform.pathSeparator}chast-$stamp-${id.substring(0, 8)}.mp4';
+      if (await File(path).exists()) continue;
+      await _recordingUploadQueue.persistIntent(
+        RecordingUploadIntent(
+          id: id,
+          path: path,
+          server: upload.server,
+          username: upload.username,
+          hostId: upload.hostId,
+          peerId: upload.peerId,
+          startedAtMs: startedAt.millisecondsSinceEpoch,
+        ),
+      );
+      return path;
+    }
+    throw const FileSystemException('could not reserve a recording file path');
+  }
+
+  Future<void> _discardIntentIfFileMissing(String path) async {
+    try {
+      if (await File(path).exists()) return;
+      final RecordingUploadIntent? intent = await _recordingUploadQueue
+          .findIntentForPath(path);
+      if (intent != null) {
+        await _recordingUploadQueue.removeIntent(intent.id);
+      }
+    } catch (_) {
+      // Keep the intent if the queue cannot be safely inspected.
     }
   }
 
@@ -614,6 +699,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
       _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
       _zoomPercent = prefs.zoomPercent;
       _cursorZoomPercent = prefs.cursorZoomPercent;
+      _trackpadSpeedPercent = prefs.trackpadSpeedPercent;
+      _scrollStyle = prefs.scrollStyle;
+      _scrollEdge = prefs.scrollEdge;
       _mouseMapping = MouseMapping(
         reverseWheel: prefs.reverseWheel,
         swapButtons: prefs.swapButtons,
@@ -631,6 +719,18 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
     ViewPreferences.update(
       peerId: widget.peerId,
       fit: fit == ViewFit.original ? 1 : 0,
+    );
+  }
+
+  void _setScrollStyle(ViewScrollStyle style, int edge) {
+    setState(() {
+      _scrollStyle = style;
+      _scrollEdge = edge;
+    });
+    ViewPreferences.update(
+      peerId: widget.peerId,
+      scrollStyle: style,
+      scrollEdge: edge,
     );
   }
 
@@ -1058,9 +1158,12 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
             fit: _fit,
             zoomPercent: _zoomPercent,
             cursorZoomPercent: _cursorZoomPercent,
+            scrollStyle: _scrollStyle,
+            scrollEdge: _scrollEdge,
             onFitChanged: _setFit,
             onZoomPercentChanged: _setZoomPercent,
             onCursorZoomPercentChanged: _setCursorZoomPercent,
+            onScrollChanged: _setScrollStyle,
           ),
           IconButton(
             tooltip: tr('全屏'),
@@ -1105,6 +1208,9 @@ class _DisplayWindowPageState extends State<DisplayWindowPage>
                           sourceHeight: s.sourceHeight,
                           fit: _fit,
                           zoomPercent: _zoomPercent,
+                          trackpadSpeedPercent: _trackpadSpeedPercent,
+                          scrollStyle: _scrollStyle,
+                          scrollEdge: _scrollEdge,
                           drawEnabled: _annotationMode,
                           captureInput: _input && !_annotationMode,
                           hideCursor:

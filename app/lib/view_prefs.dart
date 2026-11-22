@@ -1,7 +1,10 @@
 import 'package:flutter/foundation.dart';
 
 import 'prefs_store.dart';
+import 'trackpad_speed.dart';
 import 'view_scale.dart';
+import 'view_scroll.dart';
+import 'remote_shortcuts.dart';
 
 /// View state the viewer remembers across launches: how the picture is fitted
 /// (RustDesk's view style), whether the stats overlay is shown, how the file
@@ -17,6 +20,8 @@ class ViewPreferences {
     this.fit = 0,
     this.zoomPercent = defaultViewZoomPercent,
     this.cursorZoomPercent = defaultCursorZoomPercent,
+    this.scrollStyle = defaultViewScrollStyle,
+    this.scrollEdge = defaultViewScrollEdge,
     this.stats = false,
     this.fileSort = 0,
     this.fileSortAscending = true,
@@ -25,6 +30,7 @@ class ViewPreferences {
     this.terminalFontSize = 13,
     this.reverseWheel = false,
     this.swapButtons = false,
+    this.trackpadSpeedPercent = kDefaultTrackpadSpeedPercent,
     this.keyboardMode = 'physical',
     this.autoRecord = false,
     this.recordKeep = 0,
@@ -32,6 +38,7 @@ class ViewPreferences {
     this.syncInitClipboard = false,
     this.askSessionNote = false,
     this.defaultViewOnly = true,
+    this.remoteShortcuts = const <RemoteShortcutBinding>[],
     this.fitConfigured = false,
     this.syncInitClipboardConfigured = false,
     this.defaultViewOnlyConfigured = false,
@@ -41,6 +48,8 @@ class ViewPreferences {
   final int fit;
   final int zoomPercent;
   final int cursorZoomPercent;
+  final ViewScrollStyle scrollStyle;
+  final int scrollEdge;
   final bool stats;
 
   /// 0 = name, 1 = size, 2 = modified (`FileBrowserSort` order).
@@ -60,6 +69,7 @@ class ViewPreferences {
   /// buttons exchanged before events reach the host.
   final bool reverseWheel;
   final bool swapButtons;
+  final int trackpadSpeedPercent;
   final String keyboardMode;
 
   /// Start a local MP4 recording whenever a session begins and the host
@@ -93,6 +103,7 @@ class ViewPreferences {
   /// view-only; an explicit per-peer choice may start control when the host
   /// grants input. An unset value can inherit a managed recommendation.
   final bool defaultViewOnly;
+  final List<RemoteShortcutBinding> remoteShortcuts;
 
   /// Distinguishes a saved local choice from the built-in default. Managed
   /// Viewer settings in `default` mode use their recommendation only when no
@@ -104,6 +115,8 @@ class ViewPreferences {
   static const String _fitKey = 'view_fit';
   static const String _zoomPercentKey = 'view_zoom_percent';
   static const String _cursorZoomPercentKey = 'view_cursor_zoom_percent';
+  static const String _scrollStyleKey = 'view_scroll_style';
+  static const String _scrollEdgeKey = 'view_scroll_edge';
   static const String _statsKey = 'view_stats';
   static const String _fileSortKey = 'file_sort';
   static const String _fileSortAscendingKey = 'file_sort_asc';
@@ -112,6 +125,7 @@ class ViewPreferences {
   static const String _terminalFontSizeKey = 'terminal_font_size';
   static const String _reverseWheelKey = 'view_reverse_wheel';
   static const String _swapButtonsKey = 'view_swap_buttons';
+  static const String _trackpadSpeedKey = 'view_trackpad_speed_percent';
   static const String _keyboardModeKey = 'view_keyboard_mode';
   static const String _autoRecordKey = 'view_auto_record';
   static const String _recordKeepKey = 'view_record_keep';
@@ -119,6 +133,7 @@ class ViewPreferences {
   static const String _syncInitClipboardKey = 'view_sync_init_clipboard';
   static const String _askSessionNoteKey = 'view_ask_session_note';
   static const String _defaultViewOnlyKey = 'view_default_only';
+  static const String _remoteShortcutsKey = 'view_remote_shortcuts';
 
   /// Kept here so existing tests can redirect the shared settings file.
   @visibleForTesting
@@ -160,6 +175,8 @@ class ViewPreferences {
         min: minCursorZoomPercent,
         max: maxCursorZoomPercent,
       ),
+      scrollStyle: parseViewScrollStyle(map[_scrollStyleKey]),
+      scrollEdge: normalizeViewScrollEdge(map[_scrollEdgeKey]),
       stats: rawStats is bool ? rawStats : false,
       fileSort: rawSort is int && rawSort >= 0 && rawSort <= 2 ? rawSort : 0,
       fileSortAscending: rawAscending is bool ? rawAscending : true,
@@ -171,6 +188,9 @@ class ViewPreferences {
           : 13,
       reverseWheel: rawReverseWheel is bool ? rawReverseWheel : false,
       swapButtons: rawSwapButtons is bool ? rawSwapButtons : false,
+      trackpadSpeedPercent: normalizeTrackpadSpeedPercent(
+        map[_trackpadSpeedKey],
+      ),
       keyboardMode: _normalizeKeyboardMode(map[_keyboardModeKey]),
       autoRecord: rawAutoRecord is bool ? rawAutoRecord : false,
       recordKeep: _normalizeRecordKeep(rawRecordKeep),
@@ -180,6 +200,9 @@ class ViewPreferences {
           : false,
       askSessionNote: rawAskSessionNote is bool ? rawAskSessionNote : false,
       defaultViewOnly: rawDefaultViewOnly is bool ? rawDefaultViewOnly : true,
+      remoteShortcuts: RemoteShortcutBinding.parseList(
+        map[_remoteShortcutsKey],
+      ),
       fitConfigured: rawFit is int && (rawFit == 0 || rawFit == 1),
       syncInitClipboardConfigured: rawSyncInitClipboard is bool,
       defaultViewOnlyConfigured: rawDefaultViewOnly is bool,
@@ -219,6 +242,8 @@ class ViewPreferences {
       fit: prefs.fit,
       zoomPercent: prefs.zoomPercent,
       cursorZoomPercent: prefs.cursorZoomPercent,
+      scrollStyle: prefs.scrollStyle,
+      scrollEdge: prefs.scrollEdge,
       stats: prefs.stats,
       fileSort: prefs.fileSort,
       fileSortAscending: prefs.fileSortAscending,
@@ -227,6 +252,7 @@ class ViewPreferences {
       terminalFontSize: prefs.terminalFontSize,
       reverseWheel: prefs.reverseWheel,
       swapButtons: prefs.swapButtons,
+      trackpadSpeedPercent: prefs.trackpadSpeedPercent,
       keyboardMode: prefs.keyboardMode,
       autoRecord: prefs.autoRecord,
       recordKeep: prefs.recordKeep,
@@ -236,6 +262,7 @@ class ViewPreferences {
       defaultViewOnly: prefs.defaultViewOnlyConfigured
           ? prefs.defaultViewOnly
           : null,
+      remoteShortcuts: prefs.remoteShortcuts,
     );
   }
 
@@ -246,6 +273,8 @@ class ViewPreferences {
     int? fit,
     int? zoomPercent,
     int? cursorZoomPercent,
+    ViewScrollStyle? scrollStyle,
+    int? scrollEdge,
     bool? stats,
     int? fileSort,
     bool? fileSortAscending,
@@ -254,6 +283,7 @@ class ViewPreferences {
     int? terminalFontSize,
     bool? reverseWheel,
     bool? swapButtons,
+    int? trackpadSpeedPercent,
     String? keyboardMode,
     bool? autoRecord,
     int? recordKeep,
@@ -261,6 +291,7 @@ class ViewPreferences {
     bool? syncInitClipboard,
     bool? askSessionNote,
     bool? defaultViewOnly,
+    List<RemoteShortcutBinding>? remoteShortcuts,
   }) {
     final Map<String, Object?> shared = <String, Object?>{
       if (fileSort != null)
@@ -288,15 +319,24 @@ class ViewPreferences {
           minCursorZoomPercent,
           maxCursorZoomPercent,
         ),
+      if (scrollStyle != null) _scrollStyleKey: scrollStyle.name,
+      if (scrollEdge != null)
+        _scrollEdgeKey: normalizeViewScrollEdge(scrollEdge),
       _statsKey: ?stats,
       _reverseWheelKey: ?reverseWheel,
       _swapButtonsKey: ?swapButtons,
+      if (trackpadSpeedPercent != null)
+        _trackpadSpeedKey: normalizeTrackpadSpeedPercent(trackpadSpeedPercent),
       _browserShowHiddenKey: ?browserShowHidden,
       _showMyCursorKey: ?showMyCursor,
       _syncInitClipboardKey: ?syncInitClipboard,
       _defaultViewOnlyKey: ?defaultViewOnly,
       if (keyboardMode != null)
         _keyboardModeKey: _normalizeKeyboardMode(keyboardMode),
+      if (remoteShortcuts != null)
+        _remoteShortcutsKey: RemoteShortcutBinding.parseList(
+          remoteShortcuts.map((RemoteShortcutBinding binding) => binding.toStorage()),
+        ).map((RemoteShortcutBinding binding) => binding.toStorage()).toList(),
     };
     if (peerId.isEmpty) {
       PrefsStore.update(

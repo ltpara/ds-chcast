@@ -3834,6 +3834,176 @@ void main() {
     expect(recorded.name, '会话录制.mp4');
   });
 
+  test('uploadRecording resumes a persisted server session', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-resume-persisted-upload-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
+    final List<int> bytes = List<int>.generate(10, (int index) => index + 1);
+    await file.writeAsBytes(bytes);
+
+    const String uploadId = 'abababababababababababababababab';
+    const String jobId = 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd';
+    final List<String> requests = <String>[];
+    final List<int> sentOffsets = <int>[];
+    final List<String> persistedIds = <String>[];
+    server.listen((HttpRequest request) async {
+      final String path = request.uri.path;
+      requests.add('${request.method} $path');
+      request.response.headers.contentType = ContentType.json;
+      if (request.method == 'GET' &&
+          path == '/v1/account/recordings/uploads/$uploadId') {
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'upload': <String, Object?>{
+              'id': uploadId,
+              'offset': 4,
+              'size': bytes.length,
+              'idempotency_key': jobId,
+            },
+          }),
+        );
+        await request.response.close();
+        return;
+      }
+      if (request.method == 'PATCH') {
+        final int offset = int.parse(request.headers.value('X-Upload-Offset')!);
+        sentOffsets.add(offset);
+        expect(offset, 4);
+        expect(
+          await request.fold<List<int>>(
+            <int>[],
+            (List<int> all, List<int> part) => all..addAll(part),
+          ),
+          bytes.sublist(4),
+        );
+        request.response.statusCode = HttpStatus.accepted;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'upload': <String, Object?>{
+              'id': uploadId,
+              'offset': bytes.length,
+              'size': bytes.length,
+              'idempotency_key': jobId,
+            },
+          }),
+        );
+        await request.response.close();
+        return;
+      }
+      if (request.method == 'POST' && path.endsWith('/complete')) {
+        request.response.statusCode = HttpStatus.created;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'recording': <String, Object?>{
+              'id': 'ef' * 16,
+              'name': 'rec.mp4',
+              'peer_id': 'devbox',
+              'size': bytes.length,
+              'sha256': sha256.convert(bytes).toString(),
+              'duration_ms': 5000,
+              'started_at_ms': 1761400000000,
+              'created_at_ms': DateTime.now().millisecondsSinceEpoch,
+            },
+          }),
+        );
+        await request.response.close();
+        return;
+      }
+      if (request.method == 'DELETE') {
+        request.response.statusCode = HttpStatus.noContent;
+        await request.response.close();
+        return;
+      }
+      request.response.statusCode = HttpStatus.notFound;
+      await request.response.close();
+    });
+
+    final RemoteRecording recorded = await ServerApi.uploadRecording(
+      settings,
+      'account-token',
+      file: file,
+      name: 'rec.mp4',
+      peerId: 'devbox',
+      startedAtMs: 1761400000000,
+      durationMs: 5000,
+      uploadId: uploadId,
+      idempotencyKey: jobId,
+      onUploadId: (String id) async => persistedIds.add(id),
+      chunkSize: 16,
+    );
+
+    expect(requests.first, 'GET /v1/account/recordings/uploads/$uploadId');
+    expect(
+      requests.where((String request) => request.startsWith('POST ')),
+      contains('POST /v1/account/recordings/uploads/$uploadId/complete'),
+    );
+    expect(requests, isNot(contains('POST /v1/account/recordings/uploads')));
+    expect(sentOffsets, <int>[4]);
+    expect(persistedIds, <String>[uploadId]);
+    expect(recorded.id, 'ef' * 16);
+  });
+
+  test(
+    'uploadRecording resolves a completed idempotency key without reupload',
+    () async {
+      final Directory dir = await Directory.systemTemp.createTemp(
+        'chast-completed-idempotent-upload-',
+      );
+      addTearDown(() => dir.delete(recursive: true));
+      final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
+      await file.writeAsBytes(<int>[1, 2, 3, 4]);
+      const String jobId = '12121212121212121212121212121212';
+      int beginCalls = 0;
+      int patchCalls = 0;
+      server.listen((HttpRequest request) async {
+        if (request.method == 'POST' &&
+            request.uri.path == '/v1/account/recordings/uploads') {
+          beginCalls++;
+          final Map<String, Object?> body =
+              jsonDecode(await utf8.decoder.bind(request).join())
+                  as Map<String, Object?>;
+          expect(body['idempotency_key'], jobId);
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'recording': <String, Object?>{
+                'id': '34' * 16,
+                'name': 'rec.mp4',
+                'peer_id': 'devbox',
+                'size': 4,
+                'sha256': sha256.convert(<int>[1, 2, 3, 4]).toString(),
+                'duration_ms': 5000,
+                'started_at_ms': 1761400000000,
+                'created_at_ms': DateTime.now().millisecondsSinceEpoch,
+              },
+            }),
+          );
+          await request.response.close();
+          return;
+        }
+        if (request.method == 'PATCH') patchCalls++;
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+      });
+
+      final RemoteRecording recorded = await ServerApi.uploadRecording(
+        settings,
+        'account-token',
+        file: file,
+        peerId: 'devbox',
+        startedAtMs: 1761400000000,
+        durationMs: 5000,
+        idempotencyKey: jobId,
+      );
+      expect(recorded.id, '34' * 16);
+      expect(beginCalls, 1);
+      expect(patchCalls, 0);
+    },
+  );
+
   test(
     'uploadRecording resumes from the durable offset after a lost chunk response',
     () async {

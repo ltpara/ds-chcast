@@ -50,21 +50,50 @@ chast::InputEvent legacy_key(uint16_t vk, bool down, uint16_t modifiers = 0) {
 }
 
 int main() {
+    using chast_viewer::valid_remote_shortcut;
+    check(valid_remote_shortcut(0x3a, 1), "Ctrl+F1 binding is valid");
+    check(!valid_remote_shortcut(0xe3, 1) && !valid_remote_shortcut(0x29, 1),
+          "GUI and Escape keys cannot be bound");
+    check(!valid_remote_shortcut(0x2b, 2) && !valid_remote_shortcut(0x3d, 2),
+          "Alt+Tab and Alt+F4 are reserved by Windows");
+    check(!valid_remote_shortcut(0x29, 5) && !valid_remote_shortcut(0x2b, 3),
+          "task-manager and Windows switcher chords are reserved");
+    check(!valid_remote_shortcut(0x04, 0) && !valid_remote_shortcut(0x04, 8),
+          "shortcut modifiers must be in range");
     chast_viewer::KeyboardState state;
     chast::InputEvent event;
     bool escape = false;
+    int shortcut_action = chast_viewer::kNoShortcutMatched;
     auto key = [&](DWORD vk, DWORD scan, bool down, DWORD flags = 0, bool relative = false) {
         KBDLLHOOKSTRUCT data{};
         data.vkCode = vk;
         data.scanCode = scan;
         data.flags = flags;
-        return state.Handle(data, down, 0, relative, event, escape);
+        return state.Handle(data, down, 0, relative, event, escape, shortcut_action);
     };
     check(key('A', 0x1E, true) && event.key.hid_usage == 4, "A maps physically");
     check(key('A', 0x1E, true) && event.kind == chast::InputKind::Key &&
           event.key.action == chast::KeyAction::Down, "ordinary repeats are forwarded");
     check(key('A', 0x1E, false) && event.key.action == chast::KeyAction::Up,
           "repeat sequence ends with one release");
+
+    state.Reset();
+    state.SetShortcuts({{chast_viewer::RemoteShortcutAction::kToggleFullscreen,
+                         0x3a, 1}});
+    key(VK_LCONTROL, 0x1d, true);
+    check(key(VK_F1, 0x3b, true) &&
+              shortcut_action == static_cast<int>(
+                  chast_viewer::RemoteShortcutAction::kToggleFullscreen),
+          "configured Ctrl+F1 triggers its session action");
+    check(key(VK_F1, 0x3b, true) &&
+              shortcut_action == chast_viewer::kShortcutKeySuppressed,
+          "configured shortcut repeats remain suppressed");
+    check(key(VK_F1, 0x3b, false) &&
+              shortcut_action == chast_viewer::kShortcutKeySuppressed,
+          "configured shortcut release remains local");
+    key(VK_LCONTROL, 0x1d, false);
+    check(key(VK_F1, 0x3b, true) && event.key.hid_usage == 0x3a,
+          "the bound key passes through when its modifier is absent");
 
     state.Reset();
     check(key(VK_LCONTROL, 0x21D, true) && event.kind != chast::InputKind::Key &&
@@ -147,8 +176,11 @@ int main() {
         auto local_key = [&](DWORD vk, DWORD scan, bool down, bool composing = false, DWORD flags = 0) {
             KBDLLHOOKSTRUCT data{};
             data.vkCode = vk; data.scanCode = scan; data.flags = flags;
-            return translated.Handle(data, down, 0, false, event, escape, true, composing);
+            return translated.Handle(data, down, 0, false, event, escape,
+                                     shortcut_action, true, composing);
         };
+        translated.SetShortcuts({
+            {chast_viewer::RemoteShortcutAction::kToggleControl, 0x14, 2}});
         check(!local_key('A', 0x1e, true) && event.kind != chast::InputKind::Key,
               "local layout owns printable key down");
         check(!local_key('A', 0x1e, false) && event.kind != chast::InputKind::Key,
@@ -174,12 +206,23 @@ int main() {
         local_key(VK_SPACE, 0x39, false); local_key(VK_LCONTROL, 0x1d, false);
         check(!local_key(VK_LCONTROL, 0x21d, true), "synthetic AltGr Ctrl reaches the local layout");
         local_key(VK_RMENU, 0x38, true, false, LLKHF_EXTENDED);
-        check(!local_key('Q', 0x10, true), "AltGr character remains local text");
+        check(!local_key('Q', 0x10, true) &&
+                  shortcut_action == chast_viewer::kNoShortcutMatched,
+              "AltGr character remains local text and does not trigger a shortcut");
     }
     const HKL us_layout = LoadKeyboardLayoutW(L"00000409", KLF_NOTELLSHELL);
     const HKL german_layout = LoadKeyboardLayoutW(L"00000407", KLF_NOTELLSHELL);
     check(us_layout != nullptr && german_layout != nullptr,
           "US and German layouts load for deterministic mapping checks");
+    for (const HKL layout : {us_layout, german_layout}) {
+        for (const bool down : {true, false}) {
+            check(chast::make_keyboard_input(0x53, down, input, layout) &&
+                  input.ki.wVk == VK_NUMLOCK && input.ki.wScan == 0x45 &&
+                  (input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0 &&
+                  ((input.ki.dwFlags & KEYEVENTF_KEYUP) == 0) == down,
+                  "Num Lock press/release keeps its VK and extended flag across layouts");
+        }
+    }
     check(chast::make_keyboard_input(0x1C, true, input, german_layout) &&
           input.ki.wVk == 'Z' && input.ki.wScan == 0x15 &&
           (input.ki.dwFlags & KEYEVENTF_SCANCODE) == 0,

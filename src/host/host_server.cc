@@ -19,6 +19,7 @@
 #include "chast/audio.h"
 #include "chast/annotation_overlay.h"
 #include "chast/audit_spool.h"
+#include "chast/host_recording_upload.h"
 #include "chast/camera_relay.h"
 #include "chast/clipboard_listener.h"
 #include "chast/capture.h"
@@ -31,6 +32,7 @@
 #include "host/display_selection.h"
 #include "host/display_topology.h"
 #include "host/shared_loopback.h"
+#include "host/audio_forwarder.h"
 #include "chast/display_mode.h"
 #include "chast/display_privacy.h"
 #include "chast/file_transfer.h"
@@ -65,6 +67,22 @@ private:
     HANDLE previous_ = nullptr;
     bool changed_ = false, ok_ = false;
 };
+
+HostRecordingOptions make_recording_options(
+    const HostSettings& settings,
+    const std::function<void(const std::string&)>& log) {
+    HostRecordingOptions options{settings.record_incoming, settings.record_directory, log};
+    if (settings.upload_recordings) {
+        const std::string queue = settings.recording_upload_queue;
+        options.segment_finalized = [queue, log](const HostRecordingSegment& segment) {
+            std::string error;
+            if (!enqueue_host_recording_upload(queue, segment, &error) && log) {
+                log("host recording archive queue failed for " + segment.path + ": " + error);
+            }
+        };
+    }
+    return options;
+}
 }
 
 // Defined here, where the audio pipeline types are complete: the header only
@@ -2876,7 +2894,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return streams.subscribe(key, [&](std::string* out) {
             return config_.capture_factory(display, cfg, out);
         }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
-           {settings_.record_incoming, settings_.record_directory, config_.log},
+           make_recording_options(settings_, config_.log),
            cfg.capture_cursor ? config_.cursor_sampler : DesktopStreamPool::CursorSampler{});
     };
     auto subscribe_merged = [&](const std::vector<DisplayInfo>& displays,
@@ -2892,7 +2910,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return streams.subscribe(key, [&](std::string* out) {
             return create_merged_capturer(displays, cfg, out);
         }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
-           {settings_.record_incoming, settings_.record_directory, config_.log},
+           make_recording_options(settings_, config_.log),
            cfg.capture_cursor ? config_.cursor_sampler : DesktopStreamPool::CursorSampler{});
     };
 
@@ -3107,6 +3125,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // before the announcement so AudioInfo describes what will actually be
     // encoded, and a machine without a usable endpoint simply streams video.
     std::unique_ptr<ILoopbackCapture> audio_capture;
+    AudioForwarder audio_forwarder;
     AudioInfo audio_info;
     const PermissionMask granted_permissions = session_->permissions();
 
@@ -3463,6 +3482,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // Audio degrades on its own: a failed endpoint or encoder turns the
     // stream off with a StreamInfo and leaves video running.
     auto disable_audio = [&](const std::string& reason) {
+        audio_forwarder.stop();
         audio_capture->stop();
         audio_capture.reset();
         audio_info = AudioInfo{};
@@ -3483,63 +3503,33 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
 
     uint64_t audio_recoveries_logged = 0;
     uint64_t audio_dsp_resets_logged = 0;
-    uint64_t last_audio_submit_ms = 0;
+    uint64_t observed_audio_send_errors = 0;
+    size_t audio_failures_logged = 0;
     bool audio_recovering_logged = false;
     const uint64_t audio_base_ms = capture_clock_ms(start);
-    auto drain_audio = [&] {
-        if (!audio_capture) {
-            return;
+    auto drain_audio = [&](bool start_forwarder = true) {
+        if (audio_capture && start_forwarder) {
+            audio_forwarder.start(*audio_capture, audio_info, audio_base_ms,
+                [this](AudioHeader header, const uint8_t* bytes, size_t size) {
+                    // send_audio rechecks the grant as it submits the packet.
+                    if ((session_->permissions() & kPermissionAudio) == 0)
+                        return Error(Status::PermissionDenied, "audio revoked");
+                    return session_->send_audio(header, bytes, size);
+                });
         }
-        EncodedAudio packet;
-        while (audio_capture->take_packet(packet)) {
-            const uint64_t host_ms = packet.capture_ms & 0xFFFFFFFFFFFFull;
-            AudioHeader header;
-            header.pts_ms = host_ms >= audio_base_ms ? host_ms - audio_base_ms : 0;
-            header.capture_ms = host_ms;
-            header.sample_rate = audio_info.sample_rate;
-            header.frame_samples = audio_info.frame_samples;
-            header.channels = audio_info.channels;
-            header.codec = audio_info.codec;
-            if ((session_->permissions() & kPermissionAudio) == 0) {
-                continue;
-            }
-            const uint64_t submitted_ms = capture_clock_ms(Clock::now());
-            if (last_audio_submit_ms != 0 && submitted_ms >= last_audio_submit_ms) {
-                stats.audio_max_submit_gap_ms = (std::max)(
-                    stats.audio_max_submit_gap_ms, submitted_ms - last_audio_submit_ms);
-            }
-            last_audio_submit_ms = submitted_ms;
-            const uint64_t captured_ms = packet.capture_ms & 0xFFFFFFFFFFFFull;
-            if (submitted_ms >= captured_ms) {
-                stats.audio_max_capture_age_ms = (std::max)(
-                    stats.audio_max_capture_age_ms, submitted_ms - captured_ms);
-            }
-            Error sent = session_->send_audio(header, packet.data.data(), packet.data.size());
-            if (!sent.ok()) {
-                if (sent.status() == Status::PermissionDenied) {
-                    // The operator revoked audio between the check above and
-                    // the send; the next tick sees the new mask.
-                    continue;
-                }
-                if (sent.status() == Status::WaitTimeout) {
-                    // No room on the transport right now (a full shared send
-                    // queue, or a datagram that exceeds the current path
-                    // budget); video owns the path and this packet is a short
-                    // gap, not a reason to stop audio.
-                    ++stats.audio_send_dropped;
-                    if (stats.audio_send_dropped <= 3) {
-                        log("audio packet dropped at send: " + sent.to_string());
-                    }
-                    continue;
-                }
-                ++stats.audio_errors;
-                log("audio send failed: " + sent.to_string());
-                // Other viewers still own independent audio streams.
-                continue;
-            }
-            ++stats.audio_packets;
-            stats.audio_bytes += packet.data.size();
+        const auto forwarded = audio_forwarder.stats();
+        stats.audio_packets = forwarded.packets;
+        stats.audio_bytes = forwarded.bytes;
+        stats.audio_send_dropped = forwarded.dropped;
+        stats.audio_dropped = stats.audio_send_dropped + stats.audio_capture_dropped;
+        stats.audio_errors += forwarded.errors - observed_audio_send_errors;
+        observed_audio_send_errors = forwarded.errors;
+        stats.audio_max_submit_gap_ms = forwarded.max_submit_gap_ms;
+        stats.audio_max_capture_age_ms = forwarded.max_capture_age_ms;
+        while (audio_failures_logged < forwarded.failures.size()) {
+            log("audio send failed: " + forwarded.failures[audio_failures_logged++]);
         }
+        if (!audio_capture) return;
         const AudioCaptureStats captured = audio_capture->stats();
         stats.audio_capture_dropped = captured.dropped;
         stats.audio_dropped = stats.audio_send_dropped + stats.audio_capture_dropped;
@@ -3581,6 +3571,17 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             disable_audio(reason.empty() ? "capture failed" : reason);
         }
     };
+
+    // Join before publishing final session statistics, including early exits.
+    // The capture object and the session transport still exist at this point.
+    struct AudioForwardingEnd {
+        std::function<void()> finish;
+        ~AudioForwardingEnd() { finish(); }
+    } audio_forwarding_end{[&] {
+        audio_forwarder.stop();
+        drain_audio(false);
+    }};
+    drain_audio();
 
     // The viewer microphone pipeline lives in the members implemented by
     // drain_microphone(), shared with the other session modes.
@@ -4216,8 +4217,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             if (!sent.ok()) {
                 if (sent.status() == Status::WaitTimeout) {
                     // The compressed reference chain may now have a hole.
-                    // A refinement can be retried without a new source frame.
-                    video_needs_resync = !refine;
+                    // Refinements also advance the encoder's reference chain;
+                    // the shared subscription has already consumed this packet.
+                    // Resume with an IDR even when the desktop did not change.
+                    video_needs_resync = true;
                     return true;
                 }
                 if (sent.status() == Status::Unavailable) {
@@ -5373,6 +5376,31 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         stats.video_receipts = latency.video_replies;
         stats.video_pending_frames = latency.video_pending_frames;
         stats.video_idr_send = session_->video_idr_send_stats();
+        if (config_.media_timing_trace) {
+            UINT actual_rate = 0, actual_fps = 0;
+            DesktopStreamPool::RateRequest request;
+            const bool rate_available = encoder &&
+                DesktopStreamPool::read_rate(*encoder, actual_rate, actual_fps, &request);
+            log("media-link: target=" + std::to_string(stats.target_bitrate / 1000) +
+                " kbps fps=" + std::to_string(stats.framerate) +
+                " rate-available=" + std::to_string(rate_available) +
+                " requested=" + std::to_string(request.bitrate / 1000) +
+                "/" + std::to_string(request.fps) +
+                " actual=" + std::to_string(actual_rate / 1000) +
+                "/" + std::to_string(actual_fps) +
+                " ratio=" + std::to_string(request.ratio) +
+                " sent=" + std::to_string(transport.send_bytes) +
+                " packets=" + std::to_string(transport.sent_packets) +
+                " lost=" + std::to_string(transport.lost_packets) +
+                " cwnd=" + std::to_string(transport.congestion_window) +
+                " rtt-us=" + std::to_string(transport.rtt_us) +
+                " send-queue=" + std::to_string(transport.queued_bytes) +
+                " video-pending=" + std::to_string(latency.video_pending_frames) +
+                "/" + std::to_string(latency.video_pending_bytes) +
+                " pending-us=" + std::to_string(latency.video_pending_us) +
+                " delivery-us=" + std::to_string(latency.video_delay_us) +
+                " audio-pending=" + std::to_string(audio_send.pending));
+        }
         // Do not keep an old video delay alive on a static desktop. A fresh
         // receipt or outstanding frame participates alongside the probe.
         const auto video_delay = latency.video_replies != video_replies ? latency.video_delay_us : 0;
@@ -5558,7 +5586,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 const std::wstring& key, CameraRelay::CaptureFactory capture, std::string* failure) {
             return CameraRelay::Subscription{{}, streams.subscribe(key, std::move(capture),
                 config_.encoder_factory, failure, {}, decoders, peer,
-                {settings_.record_incoming, settings_.record_directory, config_.log})};
+                make_recording_options(settings_, config_.log))};
         });
 
     auto pump_video = [&]() -> bool {
@@ -8458,7 +8486,7 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
             };
             result.capture = streams.subscribe(key, std::move(capture), config_.encoder_factory,
                 failure, {}, decoders, std::move(peer),
-                {settings_.record_incoming, settings_.record_directory, config_.log});
+                make_recording_options(settings_, config_.log));
             return result;
         });
 

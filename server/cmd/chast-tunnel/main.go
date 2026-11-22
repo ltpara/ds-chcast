@@ -69,6 +69,8 @@ func runHost(args []string) error {
 	local := fs.String("local", "127.0.0.1:4433", "chast-host QUIC listener")
 	carrierAddr := fs.String("carrier", "", "chast-host TCP carrier listener (127.0.0.1:P+1); empty disables the relay's TCP fallback")
 	auditSpool := fs.String("audit-spool", "", "chast-host JSONL audit spool; the agent signs and forwards it")
+	recordingQueue := fs.String("recording-queue", "", "directory of durable host MP4 upload task manifests")
+	uploadRecordings := fs.Bool("upload-recordings", false, "explicitly upload host recordings; disabled by default")
 	policyState := fs.String("policy-state", "", "machine file that caches the server device policy; shared with chast-host as its managed marker")
 	policyAck := fs.String("policy-ack", "", "machine file chast-host writes after accepting a policy version; the agent signs the server receipt from it")
 	liveState := fs.String("live-state", "", "machine file chast-host writes with active viewer connections and disconnect receipts; the agent signs snapshots and keeps commands in <file>.commands")
@@ -153,6 +155,8 @@ func runHost(args []string) error {
 		LocalAddr:                 *local,
 		CarrierAddr:               *carrierAddr,
 		AuditSpool:                *auditSpool,
+		RecordingQueue:            *recordingQueue,
+		UploadRecordings:          *uploadRecordings,
 		PolicyState:               *policyState,
 		PolicyAck:                 *policyAck,
 		LiveState:                 *liveState,

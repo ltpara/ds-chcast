@@ -56,6 +56,29 @@ func TestHostDenialSignatureBindsTimestamp(t *testing.T) {
 	}
 }
 
+func TestHostRecordingUploadSignatureBindsOperationAndOffset(t *testing.T) {
+	priv := PrivateKeyFromSecret("host-secret")
+	pub := priv.Public().(ed25519.PublicKey)
+	message := HostRecordingUploadMessage("devbox", "PATCH", "upload-1", 1700000000,
+		4096, 8192, "chunk-sha256")
+	signature := Sign(priv, message)
+	if !Verify(pub, message, signature) {
+		t.Fatal("valid recording upload signature rejected")
+	}
+	for _, changed := range [][]byte{
+		HostRecordingUploadMessage("other", "PATCH", "upload-1", 1700000000, 4096, 8192, "chunk-sha256"),
+		HostRecordingUploadMessage("devbox", "POST", "upload-1", 1700000000, 4096, 8192, "chunk-sha256"),
+		HostRecordingUploadMessage("devbox", "PATCH", "upload-1", 1700000000, 8192, 8192, "chunk-sha256"),
+		HostRecordingUploadMessage("devbox", "PATCH", "upload-1", 1700000001, 4096, 8192, "chunk-sha256"),
+		HostRecordingUploadMessage("devbox", "PATCH", "upload-1", 1700000000, 4096, 8192, "different"),
+		HostAuditFileMessage("devbox", "upload-1", "incoming", "recording.mp4", 8192, 1700000000000, true, ""),
+	} {
+		if Verify(pub, changed, signature) {
+			t.Fatal("signature accepted a changed upload request")
+		}
+	}
+}
+
 func TestMigrateSignatureBindsBothIDs(t *testing.T) {
 	priv := PrivateKeyFromSecret("host-secret")
 	pub := priv.Public().(ed25519.PublicKey)

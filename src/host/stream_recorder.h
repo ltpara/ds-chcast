@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chast/encoder.h"
+#include "chast/host_recording_upload.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -13,6 +14,9 @@ struct HostRecordingOptions {
     std::string directory;
     // Value-owned callback; must remain valid until the shared source stops.
     std::function<void(const std::string&)> log;
+    // Called on the disk worker after an MP4 trailer and file close succeed.
+    // The path names a complete local segment; consumers must preserve it.
+    std::function<void(const HostRecordingSegment&)> segment_finalized;
 };
 
 // One bounded disk worker per shared source. Only compressed bytes are copied;

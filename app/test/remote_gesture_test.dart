@@ -4,13 +4,21 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/viewer_bridge.dart';
+import 'package:chast_viewer/view_scroll.dart';
 import 'package:chast_viewer/widgets/remote_view.dart';
 
 typedef GestureSample = (Offset, bool, int, int);
 
 void main() {
   final gestures = <GestureSample>[];
-  Widget view({bool enabled = true}) => MaterialApp(
+  final hoverPositions = <Offset>[];
+  final scrollDeltas = <Offset>[];
+  Widget view({
+    bool enabled = true,
+    int trackpadSpeedPercent = 100,
+    ViewFit fit = ViewFit.adaptive,
+    ViewScrollStyle scrollStyle = ViewScrollStyle.scrollbar,
+  }) => MaterialApp(
     home: Center(
       child: SizedBox(
         width: 400,
@@ -21,15 +29,72 @@ void main() {
           videoHeight: 600,
           sourceWidth: 1600,
           sourceHeight: 1200,
-          fit: ViewFit.adaptive,
+          fit: fit,
           captureInput: enabled,
+          trackpadSpeedPercent: trackpadSpeedPercent,
+          scrollStyle: scrollStyle,
           onGesture: (p, z, x, y) => gestures.add((p, z, x, y)),
+          onHover: (p, _) => hoverPositions.add(p),
+          onScroll: (p, delta) => scrollDeltas.add(delta),
         ),
       ),
     ),
   );
 
   setUp(gestures.clear);
+  setUp(hoverPositions.clear);
+  setUp(scrollDeltas.clear);
+
+  testWidgets('wheel remains a remote gesture in edge mode', (tester) async {
+    await tester.pumpWidget(
+      view(fit: ViewFit.original, scrollStyle: ViewScrollStyle.edge),
+    );
+    final rect = tester.getRect(find.byType(RemoteView));
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.moveTo(rect.center);
+    await tester.pump();
+    await tester.sendEventToBinding(
+      PointerScrollEvent(
+        device: 1,
+        position: rect.center,
+        scrollDelta: const Offset(0, 120),
+      ),
+    );
+    await tester.pump();
+    expect(scrollDeltas, <Offset>[const Offset(0, 120)]);
+  });
+
+  testWidgets('auto scrolling reprojects hover into the moved frame', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      view(fit: ViewFit.original, scrollStyle: ViewScrollStyle.auto),
+    );
+    final rect = tester.getRect(find.byType(RemoteView));
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.moveTo(rect.center);
+    await tester.pump();
+    expect(hoverPositions, isNotEmpty);
+    expect(hoverPositions.last.dx, greaterThan(400));
+  });
+
+  testWidgets(
+    'edge scrolling moves the frame while the pointer is held still',
+    (tester) async {
+      await tester.pumpWidget(
+        view(fit: ViewFit.original, scrollStyle: ViewScrollStyle.edge),
+      );
+      final rect = tester.getRect(find.byType(RemoteView));
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.moveTo(Offset(rect.right - 15, rect.center.dy));
+      await tester.pump();
+      for (var i = 0; i < 12; i++) {
+        await tester.pump(const Duration(milliseconds: 20));
+      }
+      expect(hoverPositions, isNotEmpty);
+      expect(hoverPositions.last.dx, greaterThan(800));
+    },
+  );
 
   testWidgets(
     'trackpad pan preserves both axes and captured desktop coordinates',
@@ -45,6 +110,37 @@ void main() {
       await trackpad.panZoomEnd();
     },
   );
+
+  testWidgets('trackpad speed scales pan but leaves pinch zoom unchanged', (
+    tester,
+  ) async {
+    await tester.pumpWidget(view(trackpadSpeedPercent: 200));
+    final anchor = tester.getCenter(find.byType(Texture));
+    final trackpad = await tester.createGesture(
+      kind: PointerDeviceKind.trackpad,
+    );
+    await trackpad.panZoomStart(anchor);
+    await trackpad.panZoomUpdate(anchor, pan: const Offset(53, -53));
+    expect(gestures, [(const Offset(800, 600), false, -240, -240)]);
+
+    await trackpad.panZoomUpdate(anchor, scale: 1.12);
+    expect(gestures.last, (const Offset(800, 600), true, 0, 120));
+    await trackpad.panZoomEnd();
+  });
+
+  testWidgets('trackpad speed scales fractional movement before rounding', (
+    tester,
+  ) async {
+    await tester.pumpWidget(view(trackpadSpeedPercent: 50));
+    final anchor = tester.getCenter(find.byType(Texture));
+    final trackpad = await tester.createGesture(
+      kind: PointerDeviceKind.trackpad,
+    );
+    await trackpad.panZoomStart(anchor);
+    await trackpad.panZoomUpdate(anchor, pan: const Offset(53, 0));
+    expect(gestures, [(const Offset(800, 600), false, -60, 0)]);
+    await trackpad.panZoomEnd();
+  });
 
   testWidgets('pinch accumulates small updates and stops after gesture end', (
     tester,

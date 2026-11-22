@@ -6,6 +6,38 @@
 
 #include "viewer_awake_request.h"
 
+namespace {
+
+bool test_request_policy() {
+    using chast_viewer::ViewerAwakeRequestAction;
+    using chast_viewer::viewer_awake_request_action;
+    int failures = 0;
+    const auto check = [&](bool passed, const char* message) {
+        if (!passed) {
+            std::fprintf(stderr, "FAIL %s\n", message);
+            ++failures;
+        }
+    };
+    check(viewer_awake_request_action(true, false, true) ==
+              ViewerAwakeRequestAction::Acquire,
+          "an active session can acquire its first lease");
+    check(viewer_awake_request_action(true, false, false) ==
+              ViewerAwakeRequestAction::Reject,
+          "a late request cannot acquire after its session ended");
+    check(viewer_awake_request_action(true, true, false) ==
+              ViewerAwakeRequestAction::Noop,
+          "an existing lease is not double-counted");
+    check(viewer_awake_request_action(false, true, false) ==
+              ViewerAwakeRequestAction::Release,
+          "an ended session can still release its held lease");
+    check(viewer_awake_request_action(false, false, true) ==
+              ViewerAwakeRequestAction::Noop,
+          "a release without a held lease is a no-op");
+    return failures == 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     int hold_ms = 0;
     if (argc != 1) {
@@ -21,6 +53,8 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+
+    if (!test_request_policy()) return 1;
 
     if (!chast_viewer::AcquireViewerAwakeRequest()) {
         std::fprintf(stderr, "could not acquire the Windows awake request\n");

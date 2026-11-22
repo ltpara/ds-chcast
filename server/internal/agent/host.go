@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,10 @@ type HostConfig struct {
 	// posts it, so the spool works while the server is unreachable. Empty
 	// disables forwarding.
 	AuditSpool string
+	// UploadRecordings explicitly enables consumption of immutable, atomically
+	// written MP4 task manifests. Empty/disabled never scans the queue.
+	UploadRecordings bool
+	RecordingQueue   string
 	// UPnP maps the public UDP socket on the local Internet Gateway Device and
 	// reports that external port to the rendezvous service. It is opt-in
 	// because it changes router state.
@@ -299,6 +304,12 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	if cfg.AutoUpdate && cfg.ServerPublicKey == "" {
 		return nil, fmt.Errorf("--auto-update needs --server-pubkey so the update notice can be verified")
 	}
+	if cfg.UploadRecordings && strings.TrimSpace(cfg.RecordingQueue) == "" {
+		return nil, fmt.Errorf("--upload-recordings needs --recording-queue")
+	}
+	if cfg.UploadRecordings && !filepath.IsAbs(cfg.RecordingQueue) {
+		return nil, fmt.Errorf("--recording-queue must be an absolute directory")
+	}
 	if cfg.PublisherPublicKey != "" {
 		if _, err := identity.ParsePublicKey(cfg.PublisherPublicKey); err != nil {
 			return nil, fmt.Errorf("--publisher-pubkey: %w", err)
@@ -449,6 +460,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	}
 	if cfg.AuditSpool != "" {
 		go h.auditSpoolLoop(cfg.AuditSpool)
+	}
+	if cfg.UploadRecordings {
+		go h.hostRecordingUploadLoop(cfg.RecordingQueue)
 	}
 
 	h.log.Info("host agent listening", "on", conn.LocalAddr().String(), "forwarding_to", local.String(), "relay", reg.Relay)

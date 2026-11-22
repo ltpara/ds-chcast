@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -37,6 +39,31 @@ void check_text(const std::string& text, const std::string& wanted, const char* 
 
 bool contains(const std::wstring& text, const std::wstring& part) {
     return text.find(part) != std::wstring::npos;
+}
+
+std::string utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                        nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(),
+                        size, nullptr, nullptr);
+    return result;
+}
+
+std::wstring environment(const wchar_t* name) {
+    const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed <= 1) return {};
+    std::wstring value(needed, L'\0');
+    const DWORD length = GetEnvironmentVariableW(name, value.data(), needed);
+    if (length == 0 || length >= needed) return {};
+    value.resize(length);
+    return value;
+}
+
+std::string environment_utf8(const wchar_t* name) {
+    return utf8(environment(name));
 }
 
 std::wstring own_executable() {
@@ -190,6 +217,7 @@ void test_command_line() {
     chast::HostSettings settings = valid_settings();
     settings.server_key = "server secret";
     settings.proxy = "socks5://proxy-user:proxy-secret@127.0.0.1:10808";
+    settings.tls_ca = "D:\\证书\\relay ca.pem";
     settings.tunnel_old_id = "devbox.home";
     const std::wstring command = chast::host::tunnel_command_line(
         L"C:\\Program Files\\chast\\chast-tunnel.exe", settings, 4433, "AA:BB:CC");
@@ -221,6 +249,8 @@ void test_command_line() {
           "without a host key the management key is sent for registration");
     check(contains(command, L"--proxy-stdin") && !contains(command, L"proxy-secret"),
           "proxy credentials travel over stdin, never argv");
+    check(contains(command, L"--tls-ca \"D:\\证书\\relay ca.pem\""),
+          "the configured private CA path is passed as a quoted argument");
 
     settings.host_key = "host register secret";
     const std::wstring with_host_key = chast::host::tunnel_command_line(
@@ -234,11 +264,14 @@ void test_command_line() {
 
     settings.server_key.clear();
     settings.proxy.clear();
+    settings.tls_ca.clear();
     const std::wstring without_optional =
         chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
     check(!contains(without_optional, L"--server-key"),
           "an empty server key leaves out the flag");
     check(!contains(without_optional, L"--proxy"), "an empty proxy leaves out the flag");
+    check(!contains(without_optional, L"--tls-ca"),
+          "an empty private CA path leaves system trust in effect");
     check(!contains(without_optional, L"--fingerprint"),
           "an empty fingerprint leaves out the flag");
     check(!contains(without_optional, L"--audit-spool"),
@@ -249,6 +282,9 @@ void test_command_line() {
           "an empty policy acknowledgement leaves out the flag");
     check(!contains(without_optional, L"--live-state"),
           "an unmanaged host publishes no live connection snapshot");
+    check(!contains(without_optional, L"--upload-recordings") &&
+              !contains(without_optional, L"--recording-queue"),
+          "host recording uploads stay disabled unless explicitly opted in");
 
     settings.audit_spool = "C:\\ProgramData\\chast\\host.audit.jsonl";
     const std::wstring with_spool =
@@ -271,6 +307,15 @@ void test_command_line() {
     check(contains(with_ack, L"--policy-ack C:\\ProgramData\\chast\\host.policy-ack.json"),
           "the acknowledgement path is passed to the agent");
 
+    settings.upload_recordings = true;
+    settings.recording_upload_queue = "C:\\ProgramData\\chast\\host.recording-queue";
+    const std::wstring with_recording_upload = chast::host::tunnel_command_line(
+        L"chast-tunnel.exe", settings, 4433, "");
+    check(contains(with_recording_upload, L"--upload-recordings") &&
+              contains(with_recording_upload,
+                       L"--recording-queue C:\\ProgramData\\chast\\host.recording-queue"),
+          "the explicit archive opt-in passes its durable task directory");
+
     const std::wstring quote_test = chast::host::tunnel_command_line(
         L"chast-tunnel.exe", settings, 4433, "a\"b");
     check(contains(quote_test, L"--fingerprint \"a\\\"b\""),
@@ -287,6 +332,11 @@ void test_validation() {
     settings.tunnel_listen.clear();
     check(chast::host::validate_tunnel_settings(settings, &error),
           "a disabled tunnel ignores the service fields");
+
+    settings.upload_recordings = true;
+    check(!chast::host::validate_tunnel_settings(settings, &error) &&
+              error.find("隧道") != std::string::npos,
+          "host recording archive cannot be enabled without its tunnel");
 
     settings = valid_settings();
     settings.server_url.clear();
@@ -341,6 +391,30 @@ void test_validation() {
           "a socks5 proxy validates");
 
     settings = valid_settings();
+    settings.tls_ca = "relative-ca.pem";
+    error.clear();
+    check(!chast::host::validate_tunnel_settings(settings, &error) &&
+              error.find("绝对路径") != std::string::npos,
+          "a relative private CA path is rejected");
+
+    settings = valid_settings();
+    const auto ca_path = std::filesystem::temp_directory_path() /
+                         (L"chast-tunnel-ca-" + std::to_wstring(GetCurrentProcessId()) + L".pem");
+    {
+        std::ofstream ca_file(ca_path, std::ios::binary | std::ios::trunc);
+        ca_file << "test";
+    }
+    settings.tls_ca = utf8(ca_path.wstring());
+    error.clear();
+    check(chast::host::validate_tunnel_settings(settings, &error) && error.empty(),
+          "an existing absolute private CA file validates");
+    std::error_code remove_error;
+    std::filesystem::remove(ca_path, remove_error);
+    settings.tls_ca += ".missing";
+    check(!chast::host::validate_tunnel_settings(settings, &error),
+          "a missing private CA file is rejected when the tunnel is enabled");
+
+    settings = valid_settings();
     settings.tunnel_listen = "127.0.0.1:0";
     error.clear();
     check(!chast::host::validate_tunnel_settings(settings, &error),
@@ -357,6 +431,15 @@ void test_validation() {
     error.clear();
     check(chast::host::validate_tunnel_settings(settings, &error) && error.empty(),
           "a complete service configuration validates");
+
+    settings.upload_recordings = true;
+    settings.recording_upload_queue = "C:\\ProgramData\\chast\\host.recording-queue";
+    error.clear();
+    check(chast::host::validate_tunnel_settings(settings, &error) && error.empty(),
+          "an explicitly configured recording queue validates");
+    settings.recording_upload_queue = "relative-queue";
+    check(!chast::host::validate_tunnel_settings(settings, &error),
+          "an enabled archive rejects a relative queue path");
 }
 
 int fake_agent() {
@@ -482,6 +565,77 @@ void test_process_lifecycle() {
     SetEnvironmentVariableW(L"CHAST_TUNNEL", nullptr);
 }
 
+int run_parent_host() {
+    const std::wstring tunnel_executable = environment(L"CHAST_PARENT_TUNNEL_EXE");
+    if (tunnel_executable.empty() ||
+        !SetEnvironmentVariableW(L"CHAST_TUNNEL", tunnel_executable.c_str())) {
+        std::fputs("missing or invalid CHAST_PARENT_TUNNEL_EXE\n", stderr);
+        return 2;
+    }
+
+    chast::HostSettings settings = valid_settings();
+    settings.server_url = environment_utf8(L"CHAST_PARENT_SERVER");
+    settings.server_key = environment_utf8(L"CHAST_PARENT_SERVER_KEY");
+    settings.carrier = false;
+    settings.tunnel_key = "cpp-parent-device-secret";
+    settings.tunnel_id = "cpp-parent-host";
+    settings.tunnel_listen = environment_utf8(L"CHAST_PARENT_LISTEN");
+    settings.proxy = environment_utf8(L"CHAST_PARENT_PROXY");
+    settings.tls_ca = environment_utf8(L"CHAST_PARENT_CA");
+    settings.recording_upload_queue = environment_utf8(L"CHAST_PARENT_QUEUE");
+    settings.upload_recordings = true;
+
+    struct State {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false;
+        bool exited = false;
+        uint32_t exit_code = 0;
+    } state;
+    chast::host::TunnelProcess process;
+    std::string error;
+    if (!process.start(
+            settings, 4433, "",
+            [&state](const chast::host::TunnelEvent& event) {
+                if (event.event != "ready") return;
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.ready = true;
+                state.changed.notify_all();
+            },
+            [](const std::string& line) {
+                std::fprintf(stderr, "%s\n", line.c_str());
+                std::fflush(stderr);
+            },
+            [&state](uint32_t code) {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.exited = true;
+                state.exit_code = code;
+                state.changed.notify_all();
+            },
+            &error)) {
+        std::fprintf(stderr, "TunnelProcess.start failed: %s\n", error.c_str());
+        return 3;
+    }
+    std::fprintf(stderr, "CHAST_TUNNEL_PID=%u\n", process.process_id());
+    std::fflush(stderr);
+
+    std::unique_lock<std::mutex> lock(state.mutex);
+    const bool signaled = state.changed.wait_for(lock, std::chrono::seconds(20), [&state] {
+        return state.ready || state.exited;
+    });
+    if (!signaled || !state.ready) {
+        const uint32_t code = state.exit_code;
+        lock.unlock();
+        process.stop();
+        std::fprintf(stderr, "tunnel child did not become ready (exit code %u)\n", code);
+        return 4;
+    }
+    std::fputs("{\"event\":\"ready\"}\n", stdout);
+    std::fflush(stdout);
+    state.changed.wait(lock, [&state] { return state.exited; });
+    return state.exit_code == 0 ? 0 : 5;
+}
+
 }  // namespace
 
 int main() {
@@ -491,6 +645,10 @@ int main() {
     if (argv != nullptr && argc > 1 && std::wstring(argv[1]) == L"host") {
         LocalFree(argv);
         return fake_agent();
+    }
+    if (argv != nullptr && argc > 1 && std::wstring(argv[1]) == L"--parent-host") {
+        LocalFree(argv);
+        return run_parent_host();
     }
     LocalFree(argv);
 

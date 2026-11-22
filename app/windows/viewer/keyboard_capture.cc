@@ -27,6 +27,7 @@ void KeyboardState::Reset(uint16_t modifiers) {
     held_.fill(false);
     legacy_held_.fill(false);
     forwarded_.fill(false);
+    shortcut_suppressed_.fill(false);
     modifiers_ = modifiers & chast::kModifierMask;
     for (unsigned i = 0; i < 8; ++i) held_[0xE0 + i] = (modifiers_ & (1u << i)) != 0;
     escape_held_ = false;
@@ -34,8 +35,10 @@ void KeyboardState::Reset(uint16_t modifiers) {
 
 bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks,
                            bool relative, chast::InputEvent& event, bool& escape,
+                           int& shortcut_action,
                            bool translated, bool composing) {
     escape = false;
+    shortcut_action = kNoShortcutMatched;
     event = chast::InputEvent{};
     // The hook sees the special 0x21D provenance which Flutter HID events
     // discard. Do not infer AltGr from a real Ctrl+RightAlt combination.
@@ -46,6 +49,15 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
     // Legacy mode forwards named virtual keys the HID table does not carry
     // (media, OEM and IME keys); Map mode has nothing to send for them.
     if (legacy_ ? (key.vkCode == 0 || key.vkCode > 0xFF) : (usage == 0)) return false;
+    if (usage < shortcut_suppressed_.size() && shortcut_suppressed_[usage]) {
+        if (!down) {
+            shortcut_suppressed_[usage] = false;
+            held_[usage] = false;
+            if (legacy_) legacy_held_[key.vkCode & 0xFF] = false;
+        }
+        shortcut_action = kShortcutKeySuppressed;
+        return true;
+    }
     const bool repeat = legacy_
         ? (down && legacy_held_[key.vkCode & 0xFF])
         : (down && held_[usage]);
@@ -69,6 +81,27 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
             escape_held_ = true;
             escape = true;
             return true;
+        }
+    }
+    if (down && !repeat && modifier == 0 && !composing) {
+        const bool right_alt = (modifiers_ & chast::kModifierRightAlt) != 0;
+        const bool win = (modifiers_ & (chast::kModifierLeftGui | chast::kModifierRightGui)) != 0;
+        const bool ctrl =
+            (modifiers_ & (chast::kModifierLeftCtrl | chast::kModifierRightCtrl)) != 0;
+        const bool alt = (modifiers_ & chast::kModifierLeftAlt) != 0;
+        const bool shift =
+            (modifiers_ & (chast::kModifierLeftShift | chast::kModifierRightShift)) != 0;
+        const uint8_t active_modifiers = static_cast<uint8_t>(
+            (ctrl ? 1 : 0) | (alt ? 2 : 0) | (shift ? 4 : 0));
+        if (!right_alt && !win && valid_remote_shortcut(usage, active_modifiers)) {
+            for (const RemoteShortcutBinding& binding : shortcuts_) {
+                if (binding.key_usage == usage &&
+                    binding.modifiers == active_modifiers) {
+                    shortcut_suppressed_[usage] = true;
+                    shortcut_action = static_cast<int>(binding.action);
+                    return true;
+                }
+            }
         }
     }
     if (translated) {
@@ -119,9 +152,11 @@ bool KeyboardState::Handle(const KBDLLHOOKSTRUCT& key, bool down, uint16_t locks
 
 KeyboardCapture::KeyboardCapture(HWND window,
     std::function<bool(const chast::InputEvent&)> send,
-    std::function<void()> release, std::function<void()> escape, LocalDispatch local_dispatch)
+    std::function<void()> release, std::function<void()> escape,
+    LocalDispatch local_dispatch, ShortcutDispatch shortcut_dispatch)
     : window_(window), send_(std::move(send)), release_(std::move(release)),
-      escape_(std::move(escape)), local_dispatch_(std::move(local_dispatch)) {
+      escape_(std::move(escape)), local_dispatch_(std::move(local_dispatch)),
+      shortcut_dispatch_(std::move(shortcut_dispatch)) {
     locks_ = lock_bits();
     physical_modifiers_ = physical_modifiers();
     for (const int key : {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL}) {
@@ -158,6 +193,15 @@ bool KeyboardCapture::Enable(bool enabled) {
     return true;
 }
 
+bool KeyboardCapture::EnableShortcuts(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (enabled && !hooked_) return false;
+    shortcut_capture_enabled_ = enabled;
+    if (!enabled_) state_.Reset(enabled ? physical_modifiers_ : 0);
+    was_foreground_ = GetForegroundWindow() == GetAncestor(window_, GA_ROOT);
+    return shortcut_capture_enabled_;
+}
+
 void KeyboardCapture::Run() {
     capture_on_thread = this;
     MSG message{};
@@ -186,12 +230,12 @@ void KeyboardCapture::Run() {
 }
 
 void KeyboardCapture::UpdateForeground(bool foreground) {
-    if (enabled_ && foreground != was_foreground_) {
+    if ((enabled_ || shortcut_capture_enabled_) && foreground != was_foreground_) {
         if (foreground) {
             state_.Reset(physical_modifiers_);
         } else {
             state_.Reset();
-            release_();
+            if (enabled_) release_();
         }
     }
     was_foreground_ = foreground;
@@ -205,6 +249,11 @@ bool KeyboardCapture::available() const {
 bool KeyboardCapture::enabled() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return enabled_;
+}
+
+bool KeyboardCapture::shortcuts_enabled() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shortcut_capture_enabled_;
 }
 
 void KeyboardCapture::set_relative(bool enabled) {
@@ -230,6 +279,13 @@ void KeyboardCapture::SetLegacy(bool enabled) {
 void KeyboardCapture::SetComposing(bool composing) {
     std::lock_guard lock(mutex_);
     composing_ = composing;
+}
+
+void KeyboardCapture::SetShortcuts(std::vector<RemoteShortcutBinding> shortcuts,
+                                   uint32_t revision) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    state_.SetShortcuts(std::move(shortcuts));
+    shortcut_revision_ = revision;
 }
 
 uint16_t KeyboardCapture::InputState() const {
@@ -280,15 +336,37 @@ bool KeyboardCapture::Handle(WPARAM message, const KBDLLHOOKSTRUCT& key) {
         local_held_[key.vkCode] = down;
     }
     const bool owns = enabled_ && foreground;
-    if (!owns) {
+    const bool owns_shortcuts = shortcut_capture_enabled_ && foreground;
+    if (usage < shortcut_held_.size() && shortcut_held_[usage]) {
+        if (!down) {
+            shortcut_held_[usage] = false;
+            chast::InputEvent unused_event;
+            bool unused_escape = false;
+            int unused_action = kNoShortcutMatched;
+            state_.Handle(key, false, locks_, relative_, unused_event,
+                          unused_escape, unused_action, translated_, composing_);
+        }
+        return foreground;
+    }
+    if (!owns && !owns_shortcuts) {
         // Another session's hook must see its releases. An inactive window
         // must never consume input intended for the foreground owner.
         return false;
     }
     chast::InputEvent event;
     bool escape = false;
+    int shortcut_action = kNoShortcutMatched;
     bool consume = state_.Handle(key, down, locks_, relative_, event, escape,
-                                 translated_, composing_);
+                                 shortcut_action, translated_, composing_);
+    if (shortcut_action != kNoShortcutMatched) {
+        if (shortcut_action >= 0 && shortcut_dispatch_) {
+            shortcut_held_[usage] = true;
+            shortcut_dispatch_(static_cast<RemoteShortcutAction>(shortcut_action),
+                               shortcut_revision_);
+        }
+        return true;
+    }
+    if (!owns) return false;
     if (translated_ && local_dispatch_ && consume && event.kind == chast::InputKind::Key) {
         // Ordinary keys go through IMM before the window decides whether they
         // belong to composition. A fast Enter can precede STARTCOMPOSITION on

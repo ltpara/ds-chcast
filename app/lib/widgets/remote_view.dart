@@ -2,9 +2,12 @@ import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
 import '../annotation_ink.dart';
+import '../trackpad_speed.dart';
+import '../view_scroll.dart';
 import '../viewer_bridge.dart';
 
 enum ViewFit { adaptive, original }
@@ -77,6 +80,10 @@ class RemoteView extends StatefulWidget {
     this.sourceHeight = 0,
     required this.fit,
     this.zoomPercent = 100,
+    this.trackpadSpeedPercent = kDefaultTrackpadSpeedPercent,
+    this.scrollStyle = defaultViewScrollStyle,
+    this.scrollEdge = defaultViewScrollEdge,
+    this.pointerPanEnabled = true,
     this.captureInput = false,
     this.drawEnabled = false,
     this.hideCursor = false,
@@ -114,6 +121,10 @@ class RemoteView extends StatefulWidget {
   final int sourceHeight;
   final ViewFit fit;
   final int zoomPercent;
+  final int trackpadSpeedPercent;
+  final ViewScrollStyle scrollStyle;
+  final int scrollEdge;
+  final bool pointerPanEnabled;
 
   int get _pointerWidth => sourceWidth > 0 ? sourceWidth : videoWidth;
   int get _pointerHeight => sourceHeight > 0 ? sourceHeight : videoHeight;
@@ -176,9 +187,30 @@ class RemoteView extends StatefulWidget {
   State<RemoteView> createState() => _RemoteViewState();
 }
 
-class _RemoteViewState extends State<RemoteView> {
-  final ScrollController _vertical = ScrollController();
-  final ScrollController _horizontal = ScrollController();
+class _RemoteViewState extends State<RemoteView>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  final ScrollController _vertical = ScrollController(keepScrollOffset: false);
+  final ScrollController _horizontal = ScrollController(
+    keepScrollOffset: false,
+  );
+  final GlobalKey _frameKey = GlobalKey();
+  final GlobalKey _viewportKey = GlobalKey();
+  late final Ticker _edgeTicker;
+  Offset? _panPointer;
+  Duration _lastTick = Duration.zero;
+  bool _panReportQueued = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _edgeTicker = createTicker(_tickEdge);
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) _stopPointerPan();
+  }
 
   /// Buttons currently down on the local side. Pointer events carry the whole
   /// state, while the protocol wants one button per message, so down/up are
@@ -197,6 +229,8 @@ class _RemoteViewState extends State<RemoteView> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _edgeTicker.dispose();
     _releaseButtons();
     if (_drawPointer != null) {
       widget.onDrawEnd?.call(_lastDrawFrame);
@@ -231,6 +265,17 @@ class _RemoteViewState extends State<RemoteView> {
   @override
   void didUpdateWidget(covariant RemoteView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.scrollStyle != widget.scrollStyle ||
+        oldWidget.scrollEdge != widget.scrollEdge ||
+        oldWidget.pointerPanEnabled != widget.pointerPanEnabled ||
+        oldWidget.drawEnabled != widget.drawEnabled ||
+        oldWidget.captureInput != widget.captureInput ||
+        oldWidget.fit != widget.fit ||
+        oldWidget.zoomPercent != widget.zoomPercent ||
+        oldWidget.videoWidth != widget.videoWidth ||
+        oldWidget.videoHeight != widget.videoHeight) {
+      _stopPointerPan();
+    }
     if (oldWidget.captureInput && !widget.captureInput) {
       _releaseButtons();
       _panZoomPointer = null;
@@ -270,28 +315,170 @@ class _RemoteViewState extends State<RemoteView> {
     }
   }
 
+  // A pressed pointer keeps the hit-test transform from its down event.
+  // Reproject through the current frame when a local scroll moved the image.
+  Offset _eventFrame(PointerEvent event, Size box) {
+    final frame = _frameKey.currentContext?.findRenderObject();
+    return _toFrame(
+      frame is RenderBox
+          ? frame.globalToLocal(event.position)
+          : event.localPosition,
+      box,
+    );
+  }
+
+  double _scrollRange(ScrollController controller) =>
+      controller.hasClients && controller.position.hasContentDimensions
+      ? controller.position.maxScrollExtent
+      : 0;
+
+  bool _panTo(ScrollController controller, double target) {
+    final range = _scrollRange(controller);
+    if (range <= 0) return false;
+    final value = target.clamp(0.0, range);
+    if ((controller.offset - value).abs() < 0.01) return false;
+    controller.jumpTo(value);
+    return true;
+  }
+
+  bool _panBy(ScrollController controller, double delta) =>
+      controller.hasClients &&
+      delta != 0 &&
+      _panTo(controller, controller.offset + delta);
+
   void _handlePointerSignal(PointerSignalEvent event, Size box) {
     if (event is! PointerScrollEvent) return;
-    if (widget.zoomPercent > 100 &&
-        widget.captureInput &&
-        HardwareKeyboard.instance.isShiftPressed) {
-      return;
-    }
-    if (widget.zoomPercent != 100 && widget.captureInput) {
-      GestureBinding.instance.pointerSignalResolver.register(event, (resolved) {
-        if (resolved is PointerScrollEvent) {
-          widget.onScroll?.call(
-            _toFrame(resolved.localPosition, box),
-            resolved.scrollDelta,
-          );
-        }
-      });
-      return;
-    }
-    widget.onScroll?.call(
-      _toFrame(event.localPosition, box),
-      event.scrollDelta,
+    final shift = HardwareKeyboard.instance.isShiftPressed;
+    final overflow =
+        _scrollRange(_horizontal) > 0 || _scrollRange(_vertical) > 0;
+    if ((!widget.captureInput || widget.drawEnabled) && !overflow) return;
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+      if (widget.captureInput && !widget.drawEnabled && !(shift && overflow)) {
+        widget.onScroll?.call(_eventFrame(event, box), event.scrollDelta);
+        return;
+      }
+      _stopPointerPan();
+      final delta = event.scrollDelta;
+      if (shift && delta.dx == 0 && _scrollRange(_horizontal) > 0) {
+        _panBy(_horizontal, delta.dy);
+      } else {
+        _panBy(_horizontal, delta.dx);
+        _panBy(_vertical, delta.dy);
+      }
+    });
+  }
+
+  void _stopPointerPan() {
+    _panPointer = null;
+    if (_edgeTicker.isActive) _edgeTicker.stop();
+    _lastTick = Duration.zero;
+  }
+
+  (Offset, Size)? _pointerInViewport(Offset global) {
+    final viewport = _viewportKey.currentContext?.findRenderObject();
+    if (viewport is! RenderBox || !viewport.hasSize) return null;
+    final local = viewport.globalToLocal(global);
+    return (Offset.zero & viewport.size).contains(local)
+        ? (local, viewport.size)
+        : null;
+  }
+
+  double _edgeVelocity(double point, double extent) {
+    final zone = math.min(
+      normalizeViewScrollEdge(widget.scrollEdge).toDouble(),
+      extent / 3,
     );
+    if (point < zone) return -900 * (1 - point / zone);
+    if (point > extent - zone) return 900 * (1 - (extent - point) / zone);
+    return 0;
+  }
+
+  bool _canPan(ScrollController controller, double velocity) {
+    final range = _scrollRange(controller);
+    if (range <= 0) return false;
+    return velocity < 0 && controller.offset > 0 ||
+        velocity > 0 && controller.offset < range;
+  }
+
+  void _tickEdge(Duration elapsed) {
+    final global = _panPointer;
+    final sample = global == null ? null : _pointerInViewport(global);
+    if (sample == null) {
+      _stopPointerPan();
+      return;
+    }
+    final (point, viewport) = sample;
+    final dx = _edgeVelocity(point.dx, viewport.width);
+    final dy = _edgeVelocity(point.dy, viewport.height);
+    if (!_canPan(_horizontal, dx) && !_canPan(_vertical, dy)) {
+      _stopPointerPan();
+      return;
+    }
+    final seconds = (elapsed - _lastTick).inMicroseconds.clamp(0, 40000) / 1e6;
+    _lastTick = elapsed;
+    final x = _panBy(_horizontal, dx * seconds);
+    final y = _panBy(_vertical, dy * seconds);
+    if (x || y) _queuePanHover();
+  }
+
+  void _queuePanHover() {
+    if (_panReportQueued) return;
+    _panReportQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _panReportQueued = false;
+      final global = _panPointer;
+      final frame = _frameKey.currentContext?.findRenderObject();
+      if (!mounted || global == null || frame is! RenderBox || !frame.hasSize) {
+        return;
+      }
+      final position = _toFrame(frame.globalToLocal(global), frame.size);
+      _reportHover(position, 0);
+    });
+  }
+
+  void _reportHover(Offset position, int buttons) {
+    if (widget.captureInput && !widget.drawEnabled) {
+      _syncButtons(buttons, position);
+      widget.onHover?.call(position, buttons);
+    }
+    widget.onCursorHint?.call(position);
+  }
+
+  void _handleHover(PointerHoverEvent event, Size box) {
+    if (_isDevicePointer(event)) return;
+    if (widget.pointerPanEnabled &&
+        !widget.drawEnabled &&
+        event.buttons == 0 &&
+        widget.scrollStyle != ViewScrollStyle.scrollbar) {
+      final sample = _pointerInViewport(event.position);
+      if (sample != null) {
+        final (point, viewport) = sample;
+        _panPointer = event.position;
+        if (widget.scrollStyle == ViewScrollStyle.auto) {
+          final x = _panTo(
+            _horizontal,
+            _scrollRange(_horizontal) * point.dx / viewport.width,
+          );
+          final y = _panTo(
+            _vertical,
+            _scrollRange(_vertical) * point.dy / viewport.height,
+          );
+          if (x || y) {
+            _queuePanHover();
+            return;
+          }
+        } else {
+          final x = _edgeVelocity(point.dx, viewport.width);
+          final y = _edgeVelocity(point.dy, viewport.height);
+          if (_canPan(_horizontal, x) || _canPan(_vertical, y)) {
+            if (!_edgeTicker.isActive) _edgeTicker.start();
+          } else {
+            _stopPointerPan();
+          }
+        }
+      }
+    }
+    _reportHover(_eventFrame(event, box), event.buttons);
   }
 
   /// Reconciles the buttons this view believes are down with the bitmask the
@@ -343,8 +530,12 @@ class _RemoteViewState extends State<RemoteView> {
       return;
     }
     // Direct manipulation follows the fingers, the opposite of scrollDelta.
-    _gestureX -= pan.dx * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
-    _gestureY += pan.dy * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
+    final double speed =
+        normalizeTrackpadSpeedPercent(widget.trackpadSpeedPercent) / 100.0;
+    _gestureX -=
+        pan.dx * speed * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
+    _gestureY +=
+        pan.dy * speed * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
     final int x = _gestureX.truncate();
     final int y = _gestureY.truncate();
     _gestureX -= x;
@@ -416,18 +607,18 @@ class _RemoteViewState extends State<RemoteView> {
               return;
             }
             _drawPointer = event.pointer;
-            _lastDrawFrame = _toFrame(event.localPosition, box);
+            _lastDrawFrame = _eventFrame(event, box);
             widget.onDrawStart?.call(_lastDrawFrame);
           },
           onPointerMove: (PointerMoveEvent event) {
             if (_drawPointer != event.pointer) return;
-            _lastDrawFrame = _toFrame(event.localPosition, box);
+            _lastDrawFrame = _eventFrame(event, box);
             widget.onDrawMove?.call(_lastDrawFrame);
             widget.onCursorHint?.call(_lastDrawFrame);
           },
           onPointerUp: (PointerUpEvent event) {
             if (_drawPointer != event.pointer) return;
-            _lastDrawFrame = _toFrame(event.localPosition, box);
+            _lastDrawFrame = _eventFrame(event, box);
             widget.onDrawMove?.call(_lastDrawFrame);
             widget.onDrawEnd?.call(_lastDrawFrame);
             _drawPointer = null;
@@ -438,38 +629,35 @@ class _RemoteViewState extends State<RemoteView> {
             widget.onDrawCancel?.call();
           },
           onPointerHover: (PointerHoverEvent event) {
-            widget.onCursorHint?.call(_toFrame(event.localPosition, box));
+            widget.onCursorHint?.call(_eventFrame(event, box));
           },
+          onPointerSignal: (event) => _handlePointerSignal(event, box),
           child: texture,
         ),
       );
     }
     if (!widget.captureInput) {
-      if (widget.onCursorHint == null) {
-        return Listener(
-          onPointerDown: (_) => widget.onFocusRequested?.call(),
-          child: texture,
-        );
-      }
       // The host-side pointer hint keeps working while control is off, so the
       // picture still needs hover tracking even though no button, scroll or
       // key event may reach the host in this mode.
       return MouseRegion(
-        onExit: (_) => widget.onCursorHintExit?.call(),
+        onExit: (_) {
+          _stopPointerPan();
+          widget.onCursorHintExit?.call();
+        },
         child: Listener(
           behavior: HitTestBehavior.opaque,
           onPointerDown: (PointerDownEvent event) {
+            _stopPointerPan();
             widget.onFocusRequested?.call();
             if (event.buttons & kPrimaryMouseButton != 0) {
-              widget.onCursorHintPress?.call(
-                _toFrame(event.localPosition, box),
-              );
+              widget.onCursorHintPress?.call(_eventFrame(event, box));
             }
           },
           onPointerMove: (PointerMoveEvent event) =>
-              widget.onCursorHint?.call(_toFrame(event.localPosition, box)),
-          onPointerHover: (PointerHoverEvent event) =>
-              widget.onCursorHint?.call(_toFrame(event.localPosition, box)),
+              widget.onCursorHint?.call(_eventFrame(event, box)),
+          onPointerHover: (event) => _handleHover(event, box),
+          onPointerSignal: (event) => _handlePointerSignal(event, box),
           child: texture,
         ),
       );
@@ -477,14 +665,16 @@ class _RemoteViewState extends State<RemoteView> {
     return MouseRegion(
       cursor: widget.hideCursor ? SystemMouseCursors.none : MouseCursor.defer,
       onExit: (_) {
+        _stopPointerPan();
         widget.onCursorHintExit?.call();
         _releaseButtons();
       },
       child: Listener(
         behavior: HitTestBehavior.opaque,
         onPointerDown: (PointerDownEvent event) {
+          _stopPointerPan();
           widget.onFocusRequested?.call();
-          final Offset position = _toFrame(event.localPosition, box);
+          final Offset position = _eventFrame(event, box);
           if (_isDevicePointer(event)) {
             widget.onDevicePointer?.call(event, position);
             return;
@@ -495,7 +685,7 @@ class _RemoteViewState extends State<RemoteView> {
           _syncButtons(event.buttons, position);
         },
         onPointerUp: (PointerUpEvent event) {
-          final Offset position = _toFrame(event.localPosition, box);
+          final Offset position = _eventFrame(event, box);
           if (_isDevicePointer(event)) {
             widget.onDevicePointer?.call(event, position);
             return;
@@ -503,7 +693,7 @@ class _RemoteViewState extends State<RemoteView> {
           _syncButtons(event.buttons, position);
         },
         onPointerMove: (PointerMoveEvent event) {
-          final Offset position = _toFrame(event.localPosition, box);
+          final Offset position = _eventFrame(event, box);
           if (_isDevicePointer(event)) {
             widget.onDevicePointer?.call(event, position);
             return;
@@ -512,19 +702,9 @@ class _RemoteViewState extends State<RemoteView> {
           widget.onCursorHint?.call(position);
           widget.onMove?.call(position, event.buttons);
         },
-        onPointerHover: (PointerHoverEvent event) {
-          // A hovering stylus has no contact to inject; only the mouse moves
-          // the host pointer without a button.
-          if (_isDevicePointer(event)) {
-            return;
-          }
-          final Offset position = _toFrame(event.localPosition, box);
-          _syncButtons(event.buttons, position);
-          widget.onCursorHint?.call(position);
-          widget.onHover?.call(position, event.buttons);
-        },
+        onPointerHover: (event) => _handleHover(event, box),
         onPointerCancel: (PointerCancelEvent event) {
-          final Offset position = _toFrame(event.localPosition, box);
+          final Offset position = _eventFrame(event, box);
           if (_isDevicePointer(event)) {
             widget.onDeviceCancel?.call(event, position);
             return;
@@ -532,6 +712,7 @@ class _RemoteViewState extends State<RemoteView> {
           _syncButtons(0, position);
         },
         onPointerPanZoomStart: (PointerPanZoomStartEvent event) {
+          _stopPointerPan();
           widget.onFocusRequested?.call();
           _releaseButtons();
           _panZoomPointer = event.pointer;
@@ -544,7 +725,7 @@ class _RemoteViewState extends State<RemoteView> {
             return;
           }
           _gesture(
-            _toFrame(event.localPosition, box),
+            _eventFrame(event, box),
             event.localPanDelta,
             event.scale / _panZoomScale,
           );
@@ -573,106 +754,102 @@ class _RemoteViewState extends State<RemoteView> {
       widget.videoHeight.toDouble(),
     );
 
-    if (widget.zoomPercent != 100) {
-      return LayoutBuilder(
-        builder: (BuildContext context, BoxConstraints constraints) {
-          Size available = constraints.biggest;
-          if (!available.isFinite ||
-              available.width <= 0 ||
-              available.height <= 0) {
-            available = videoSize;
-          }
-          final double fitScale = widget.fit == ViewFit.adaptive
-              ? math.min(
-                  available.width / videoSize.width,
-                  available.height / videoSize.height,
-                )
-              : 1.0;
-          final double scale = fitScale * widget.zoomPercent / 100.0;
-          final Size drawn = Size(
-            videoSize.width * scale,
-            videoSize.height * scale,
-          );
-          return _scrollableView(drawn, available);
-        },
-      );
-    }
-
-    if (widget.fit == ViewFit.adaptive) {
-      return LayoutBuilder(
-        builder: (BuildContext context, BoxConstraints constraints) {
-          Size available = constraints.biggest;
-          if (!available.isFinite ||
-              available.width <= 0 ||
-              available.height <= 0) {
-            available = videoSize;
-          }
-          final double scale = math.min(
-            available.width / videoSize.width,
-            available.height / videoSize.height,
-          );
-          final Size fitted = Size(
-            videoSize.width * scale,
-            videoSize.height * scale,
-          );
-          return Center(
-            child: SizedBox(
-              width: fitted.width,
-              height: fitted.height,
-              child: _layer(fitted),
-            ),
-          );
-        },
-      );
-    }
-
-    if (widget.captureInput || widget.drawEnabled) {
-      // Remote control owns the wheel, so the canvas must not also scroll
-      // itself. A window smaller than the frame clips instead.
-      return ClipRect(
-        child: OverflowBox(
-          minWidth: videoSize.width,
-          maxWidth: videoSize.width,
-          minHeight: videoSize.height,
-          maxHeight: videoSize.height,
-          child: _layer(videoSize),
-        ),
-      );
-    }
-
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
-        return _scrollableView(videoSize, constraints.biggest);
+        Size available = constraints.biggest;
+        if (!available.isFinite) available = constraints.constrain(videoSize);
+        if (available.isEmpty) return const SizedBox.shrink();
+        final fitScale = widget.fit == ViewFit.adaptive
+            ? math.min(
+                available.width / videoSize.width,
+                available.height / videoSize.height,
+              )
+            : 1.0;
+        final scale = fitScale * widget.zoomPercent / 100.0;
+        final drawn = videoSize * scale;
+        final image = SizedBox(
+          key: _frameKey,
+          width: drawn.width,
+          height: drawn.height,
+          child: _layer(drawn),
+        );
+        if (drawn.width <= available.width + 0.01 &&
+            drawn.height <= available.height + 0.01) {
+          return Center(child: image);
+        }
+        return _scrollableView(drawn, available, image);
       },
     );
   }
 
-  Widget _scrollableView(Size drawn, Size viewport) {
-    return Scrollbar(
-      controller: _vertical,
+  Widget _scrollableView(Size drawn, Size available, Widget image) {
+    final showBars = widget.scrollStyle == ViewScrollStyle.scrollbar;
+    // Keep thumb/track presses outside the input surface, even in control mode.
+    final gutter = math.min(12.0, available.shortestSide / 4);
+    final vertical =
+        showBars &&
+        (drawn.height > available.height ||
+            drawn.height > available.height - gutter &&
+                drawn.width > available.width);
+    final horizontal =
+        showBars && drawn.width > available.width - (vertical ? gutter : 0);
+    final viewport = Size(
+      available.width - (vertical ? gutter : 0),
+      available.height - (horizontal ? gutter : 0),
+    );
+    final physics = widget.captureInput || widget.drawEnabled
+        ? const NeverScrollableScrollPhysics()
+        : const ClampingScrollPhysics();
+    Widget canvas = SizedBox.fromSize(
+      key: _viewportKey,
+      size: viewport,
       child: SingleChildScrollView(
         controller: _vertical,
-        child: Scrollbar(
+        physics: physics,
+        child: SingleChildScrollView(
           controller: _horizontal,
-          child: SingleChildScrollView(
-            controller: _horizontal,
-            scrollDirection: Axis.horizontal,
-            child: ConstrainedBox(
-              constraints: BoxConstraints(
-                minWidth: viewport.width,
-                minHeight: viewport.height,
-              ),
-              child: Center(
-                child: SizedBox(
-                  width: drawn.width,
-                  height: drawn.height,
-                  child: _layer(drawn),
-                ),
-              ),
+          physics: physics,
+          scrollDirection: Axis.horizontal,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minWidth: viewport.width,
+              minHeight: viewport.height,
             ),
+            child: Center(child: image),
           ),
         ),
       ),
+    );
+    canvas = Padding(
+      padding: EdgeInsets.only(
+        right: vertical ? gutter : 0,
+        bottom: horizontal ? gutter : 0,
+      ),
+      child: canvas,
+    );
+    if (horizontal) {
+      canvas = Scrollbar(
+        controller: _horizontal,
+        thumbVisibility: true,
+        interactive: true,
+        notificationPredicate: (notification) =>
+            notification.metrics.axis == Axis.horizontal,
+        child: canvas,
+      );
+    }
+    if (vertical) {
+      canvas = Scrollbar(
+        controller: _vertical,
+        thumbVisibility: true,
+        interactive: true,
+        notificationPredicate: (notification) =>
+            notification.metrics.axis == Axis.vertical,
+        child: canvas,
+      );
+    }
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: canvas,
     );
   }
 }

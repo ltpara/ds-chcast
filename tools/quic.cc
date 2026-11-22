@@ -2829,9 +2829,11 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.keyframe_interval_ms = options.keyframe_ms;
     config.resolution_probe_percent = static_cast<uint16_t>(options.resolution);
     config.first_client_timeout_ms = static_cast<uint32_t>(options.wait_seconds * 1000.0);
-    if (!options.quiet) {
+    config.media_timing_trace = options.audio_playout_trace;
+    if (!options.quiet || config.media_timing_trace) {
         const auto log_start = std::chrono::steady_clock::now();
-        config.log = [log_start](const std::string& message) {
+        config.log = [log_start, quiet = options.quiet](const std::string& message) {
+            if (quiet && message.rfind("media-link:", 0) != 0) return;
             const double elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - log_start)
                     .count();
@@ -3166,7 +3168,15 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
 
 ReceiverStats run_receiver(const Options& options, std::shared_future<ServerReady> server_ready) {
     ReceiverStats stats;
+    // The worker remains scoped below the objects it uses, so exception
+    // unwinding joins it before destroying them. Early returns must also join
+    // before fail() copies stats, not merely when the worker is destroyed.
+    std::jthread* audio_worker = nullptr;
     auto fail = [&](std::string message) {
+        if (audio_worker && audio_worker->joinable()) {
+            audio_worker->request_stop();
+            audio_worker->join();
+        }
         stats.error = std::move(message);
         stats.ok = false;
         return stats;
@@ -6614,6 +6624,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     };
 
     std::jthread audio_thread;
+    audio_worker = &audio_thread;
     if (options.audio) {
         audio_thread = std::jthread([&](std::stop_token stop_token) {
             while (!stop_token.stop_requested() && !audio_finished.load()) {
@@ -7650,6 +7661,15 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         metrics.av_skew_available = stats.av_skew_available;
         const auto violations = chast::audio_continuity_violations(
             options.audio_continuity_budget, metrics);
+        // Keep gate evidence visible with --quiet; otherwise a failed budget
+        // hides the measured value needed to compare repeated runs.
+        std::printf("audio-continuity: starved=%llu ms device-max-gap=%llu ms "
+                    "dropped=%llu av-skew=%+.1f ms available=%d budget=%s\n",
+                    static_cast<unsigned long long>(metrics.starved_ms),
+                    static_cast<unsigned long long>(metrics.device_max_gap_ms),
+                    static_cast<unsigned long long>(metrics.dropped_blocks),
+                    metrics.av_skew_ms, metrics.av_skew_available ? 1 : 0,
+                    violations.empty() ? "PASS" : "FAIL");
         if (!violations.empty()) {
             stats.ok = false;
             std::string detail = "audio continuity budget failed: ";

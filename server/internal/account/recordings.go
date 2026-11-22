@@ -13,6 +13,7 @@ import (
 var ErrUnknownRecording = errors.New("unknown recording")
 
 var ErrRecordingQuota = errors.New("account recording quota is exhausted")
+var ErrHostRecordingOwnerConflict = errors.New("host recording upload is bound to a different account")
 
 var recordingIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -30,6 +31,7 @@ type Recording struct {
 	DurationMS  int64  `json:"duration_ms"`
 	StartedAtMS int64  `json:"started_at_ms"`
 	CreatedAtMS int64  `json:"created_at_ms"`
+	UploadKey   string `json:"-"`
 	// Seq is the row id used as the operator page cursor; it never leaves the
 	// server as part of a recording.
 	Seq int64 `json:"-"`
@@ -73,13 +75,14 @@ func (s *Store) AddRecordingWithQuota(rec Recording, quota int64) (Recording, er
 	defer s.mu.Unlock()
 	result, err := s.db.Exec(
 		`INSERT INTO recordings (id, user_id, name, peer_id, size, sha256,
-			duration_ms, started_at, created_at)
-		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+			duration_ms, started_at, created_at, client_upload_key)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		 WHERE CAST(? AS BIGINT) = 0 OR
 			COALESCE((SELECT SUM(size) FROM recordings WHERE user_id = ?), 0) <=
 			CAST(? AS BIGINT) - CAST(? AS BIGINT)`,
 		rec.ID, rec.UserID, rec.Name, strings.TrimSpace(rec.PeerID), rec.Size,
 		rec.SHA256, rec.DurationMS, rec.StartedAtMS, rec.CreatedAtMS,
+		strings.TrimSpace(rec.UploadKey),
 		quota, rec.UserID, quota, rec.Size,
 	)
 	if err != nil {
@@ -91,6 +94,66 @@ func (s *Store) AddRecordingWithQuota(rec Recording, quota int64) (Recording, er
 		return Recording{}, ErrRecordingQuota
 	}
 	return rec, nil
+}
+
+// RecordingByUploadKey returns an account-owned archive entry created by a
+// stable client upload job key. Empty keys are never indexed.
+func (s *Store) RecordingByUploadKey(userID, key string) (Recording, error) {
+	userID = strings.TrimSpace(userID)
+	key = strings.TrimSpace(key)
+	if userID == "" || key == "" {
+		return Recording{}, ErrUnknownRecording
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row := s.db.QueryRow(
+		`SELECT id, user_id, name, peer_id, size, sha256, duration_ms,
+			started_at, created_at, client_upload_key
+		 FROM recordings WHERE user_id = ? AND client_upload_key = ?`,
+		userID, key,
+	)
+	var rec Recording
+	if err := row.Scan(
+		&rec.ID, &rec.UserID, &rec.Name, &rec.PeerID, &rec.Size, &rec.SHA256,
+		&rec.DurationMS, &rec.StartedAtMS, &rec.CreatedAtMS, &rec.UploadKey,
+	); errors.Is(err, sql.ErrNoRows) {
+		return Recording{}, ErrUnknownRecording
+	} else if err != nil {
+		return Recording{}, fmt.Errorf("account store %s: read recording upload key: %w", s.path, err)
+	}
+	return rec, nil
+}
+
+// BindHostRecordingUploadOwner pins one host's durable recording job key to
+// the account that owned the host when the job first began. The primary key
+// makes the binding immutable across retries and concurrent service instances.
+func (s *Store) BindHostRecordingUploadOwner(hostID, key, userID string) error {
+	hostID = strings.TrimSpace(hostID)
+	key = strings.TrimSpace(key)
+	userID = strings.TrimSpace(userID)
+	if hostID == "" || key == "" || userID == "" {
+		return errors.New("host recording upload owner binding is incomplete")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO host_recording_upload_owners
+		(host_id, idempotency_key, user_id, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (host_id, idempotency_key) DO NOTHING`,
+		hostID, key, userID, s.now().UTC().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("account store %s: bind host recording upload owner: %w", s.path, err)
+	}
+	var boundUserID string
+	if err := s.db.QueryRow(`SELECT user_id FROM host_recording_upload_owners
+		WHERE host_id = ? AND idempotency_key = ?`, hostID, key).Scan(&boundUserID); err != nil {
+		return fmt.Errorf("account store %s: read host recording upload owner: %w", s.path, err)
+	}
+	if boundUserID != userID {
+		return ErrHostRecordingOwnerConflict
+	}
+	return nil
 }
 
 // Recordings lists one account's recordings, newest first.

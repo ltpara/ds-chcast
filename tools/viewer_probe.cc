@@ -314,6 +314,66 @@ struct MicrophoneMetrics {
     uint32_t peak_value = 0;
 };
 
+struct ViewerPlaybackMetrics {
+    std::atomic<bool> muted{false};
+    std::atomic<uint64_t> pushed_blocks{0};
+    std::atomic<uint64_t> muted_blocks{0};
+    std::atomic<uint64_t> unmuted_blocks{0};
+    std::atomic<uint64_t> unmuted_frames{0};
+};
+
+class ViewerMetricsPlayer final : public chast::IAudioPlayer {
+public:
+    explicit ViewerMetricsPlayer(std::shared_ptr<ViewerPlaybackMetrics> metrics)
+        : metrics_(std::move(metrics)) {}
+
+    chast::Error start() override {
+        running_.store(true, std::memory_order_relaxed);
+        return chast::Error::success();
+    }
+
+    void stop() override { running_.store(false, std::memory_order_relaxed); }
+
+    chast::Error push(const chast::DecodedAudio& audio) override {
+        if (!running_.load(std::memory_order_relaxed) || audio.channels == 0 ||
+            audio.samples.size() % audio.channels != 0) {
+            return chast::Error(chast::Status::InvalidCall,
+                                "invalid synthetic viewer playback block");
+        }
+        metrics_->pushed_blocks.fetch_add(1, std::memory_order_relaxed);
+        if (muted()) {
+            metrics_->muted_blocks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            metrics_->unmuted_blocks.fetch_add(1, std::memory_order_relaxed);
+            metrics_->unmuted_frames.fetch_add(audio.samples.size() / audio.channels,
+                                                std::memory_order_relaxed);
+        }
+        return chast::Error::success();
+    }
+
+    void set_clock_offset(int64_t) override {}
+    void set_lead_ms(uint32_t) override {}
+    void set_mute(bool mute) override {
+        metrics_->muted.store(mute, std::memory_order_relaxed);
+    }
+    bool muted() const override {
+        return metrics_->muted.load(std::memory_order_relaxed);
+    }
+
+    chast::AudioPlayerStats stats() const override {
+        chast::AudioPlayerStats result;
+        result.packets = metrics_->pushed_blocks.load(std::memory_order_relaxed);
+        result.played_frames = metrics_->unmuted_frames.load(std::memory_order_relaxed);
+        return result;
+    }
+
+    std::string error() const override { return {}; }
+
+private:
+    std::shared_ptr<ViewerPlaybackMetrics> metrics_;
+    std::atomic<bool> running_{false};
+};
+
 // Receives the viewer's microphone uplink without playing or retaining PCM.
 class MicrophoneMetricsPlayer final : public chast::IAudioPlayer {
 public:
@@ -2294,6 +2354,7 @@ int native_clipboard_probe() {
     {
         const UINT png_format = RegisterClipboardFormatW(L"PNG");
         const UINT png_mime_format = RegisterClipboardFormatW(L"image/png");
+        const UINT svg_format = RegisterClipboardFormatW(L"image/svg+xml");
         const uint8_t png_pixels[16] = {
             0, 0, 255, 255, 0, 255, 0, 255,
             255, 0, 0, 255, 255, 255, 255, 0};
@@ -2331,6 +2392,66 @@ int native_clipboard_probe() {
                                png_readback.find(chast::ClipboardFormat::Png) != nullptr &&
                                png_readback.find(chast::ClipboardFormat::Png)->data == png,
                            "read back PNG through clipboard API");
+        }
+
+        const std::string svg_markup =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle cx=\"5\" cy=\"5\" "
+            "r=\"4\" fill=\"#36c\"/></svg>";
+        chast::ClipboardContent svg_content;
+        chast::ClipboardFormatData svg_entry;
+        svg_entry.format = chast::ClipboardFormat::Svg;
+        svg_entry.data.assign(svg_markup.begin(), svg_markup.end());
+        svg_content.formats.push_back(std::move(svg_entry));
+        if (raw_ok) {
+            raw_ok = stage(svg_format != 0 && chast::write_clipboard(svg_content, &error),
+                           "write SVG through clipboard API");
+        }
+        chast::ClipboardContent svg_readback;
+        if (raw_ok) {
+            raw_ok = stage(chast::read_clipboard(svg_readback, &error) &&
+                               svg_readback.formats.size() == 1 &&
+                               svg_readback.find(chast::ClipboardFormat::Svg) != nullptr &&
+                               svg_readback.find(chast::ClipboardFormat::Svg)->data ==
+                                   svg_content.formats.front().data,
+                           "read back SVG through clipboard API");
+        }
+        const std::string active_svg =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+        const std::vector<uint8_t> hostile_svg(active_svg.begin(), active_svg.end());
+        if (raw_ok) {
+            raw_ok = stage(publish_raw_clipboard({
+                               {svg_format, hostile_svg}}, &error),
+                           "publish active SVG");
+        }
+        chast::ClipboardContent hostile_readback;
+        if (raw_ok) {
+            raw_ok = stage(chast::read_clipboard_state(hostile_readback, &error) ==
+                                   chast::ClipboardReadState::Failed &&
+                               hostile_readback.formats.empty(),
+                           "reject active SVG from native clipboard");
+        }
+
+        const wchar_t fallback_text[] = L"fallback";
+        const auto* text_bytes = reinterpret_cast<const uint8_t*>(fallback_text);
+        const std::vector<uint8_t> raw_text(text_bytes, text_bytes + sizeof(fallback_text));
+        const std::vector<uint8_t> expected_text{'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'};
+        if (raw_ok) {
+            raw_ok = stage(publish_raw_clipboard({{svg_format, hostile_svg},
+                                                  {CF_UNICODETEXT, raw_text},
+                                                  {png_format, png}},
+                                                 &error),
+                           "publish active SVG with text and PNG");
+        }
+        chast::ClipboardContent mixed_readback;
+        if (raw_ok) {
+            raw_ok = stage(chast::read_clipboard_state(mixed_readback, &error) ==
+                                   chast::ClipboardReadState::Content &&
+                               mixed_readback.formats.size() == 2 &&
+                               mixed_readback.formats[0].format == chast::ClipboardFormat::Text &&
+                               mixed_readback.formats[0].data == expected_text &&
+                               mixed_readback.formats[1].format == chast::ClipboardFormat::Png &&
+                               mixed_readback.formats[1].data == png,
+                           "retain text and PNG when SVG is rejected");
         }
 
         constexpr uint32_t kLargeWidth = 4096;
@@ -2373,12 +2494,12 @@ int native_clipboard_probe() {
         }
         if (!raw_ok) {
             std::fprintf(stderr,
-                         "viewer-probe: native PNG clipboard contract failed at %s: %s\n",
+                         "viewer-probe: native image clipboard contract failed at %s: %s\n",
                          failed_stage.c_str(), error.c_str());
         } else {
-            std::puts("viewer-probe: private native clipboard: independent PNG and "
-                      "image/png handles, oversized DIB to PNG, and broken-PNG DIB "
-                      "fallback passed");
+            std::puts("viewer-probe: private native clipboard: PNG aliases, safe SVG "
+                      "round-trip, active SVG rejection and mixed-format fallback, "
+                      "oversized DIB conversion, and broken-PNG DIB fallback passed");
         }
 
         chast::VirtualClipboard owner;
@@ -2434,7 +2555,8 @@ int native_clipboard_probe() {
     return result;
 }
 
-int host_recording_probe(bool viewer_session_isolation = false) {
+int host_recording_probe(bool viewer_session_isolation = false,
+                         bool recording_revocation = false) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const std::string probe_name =
         (viewer_session_isolation ? "chast-viewer-session-isolation-probe-"
@@ -2475,6 +2597,9 @@ int host_recording_probe(bool viewer_session_isolation = false) {
             return viewer;
         };
         first = connect(first_sink);
+        const auto first_host_viewers = host->viewers();
+        require(first_host_viewers.size() == 1, "first viewer has a unique host connection");
+        const auto first_host_viewer = first_host_viewers.front();
         second = connect(second_sink);
         if (viewer_session_isolation) {
             require(wait_permission(*first, chast::kPermissionRecord, 5s) &&
@@ -2515,7 +2640,13 @@ int host_recording_probe(bool viewer_session_isolation = false) {
             require(first->Snapshot().recording && second->Snapshot().recording,
                     "both session-local recorders become active");
             std::this_thread::sleep_for(1200ms);
-            require(first->SetRecording(false), "the first viewer stops only its recorder");
+            if (recording_revocation) {
+                require(host->set_permissions(first_host_viewer.id,
+                            first_host_viewer.permissions & ~chast::kPermissionRecord),
+                        "host revokes recording only for the first viewer");
+            } else {
+                require(first->SetRecording(false), "the first viewer stops only its recorder");
+            }
             const auto stop_deadline = std::chrono::steady_clock::now() + 5s;
             while (std::chrono::steady_clock::now() < stop_deadline &&
                    first->Snapshot().recording) {
@@ -2523,7 +2654,24 @@ int host_recording_probe(bool viewer_session_isolation = false) {
             }
             require(!first->Snapshot().recording && second->Snapshot().recording &&
                         second->Snapshot().state == chast_viewer::ViewerState::kStreaming,
-                    "stopping one viewer leaves the other stream and recorder active");
+                    recording_revocation
+                        ? "revocation must stop the first recorder and preserve the second"
+                        : "stopping one viewer leaves the other stream and recorder active");
+            if (recording_revocation) {
+                require((first->Snapshot().permissions & chast::kPermissionRecord) == 0 &&
+                            !first->SetRecording(true),
+                        "revoked viewer cannot restart recording");
+                const auto first_before = first->Snapshot().received;
+                const auto second_before = second->Snapshot().received;
+                require(wait_frames(*first, first_before) && wait_frames(*second, second_before),
+                        "both videos continue after recording revocation");
+                require(host->set_permissions(first_host_viewer.id, first_host_viewer.permissions) &&
+                            wait_permission(*first, chast::kPermissionRecord, 5s),
+                        "recording permission can be restored");
+                require(wait_frames(*first, first->Snapshot().received) &&
+                            !first->Snapshot().recording && second->Snapshot().recording,
+                        "restoring permission cannot resume recording automatically");
+            }
         } else {
             require(!first->Snapshot().recording && !second->Snapshot().recording,
                     "viewer-side recorders remain off");
@@ -2571,6 +2719,8 @@ int host_recording_probe(bool viewer_session_isolation = false) {
             verify_viewer_recording(first_viewer_recordings, "viewer-a");
             verify_viewer_recording(second_viewer_recordings, "viewer-b");
             std::puts("viewer-session-isolation: PASS two loopback sessions kept audio preferences and local recordings separate");
+            if (recording_revocation)
+                std::puts("viewer-recording-revocation: PASS stop, reject restart, preserve video and other recorder, no auto-resume, playable MP4");
         } else {
             std::puts("host-recording-probe: PASS real QUIC + Auto encoder, two viewers, publisher departure, final save and Unicode folder");
         }
@@ -2751,6 +2901,193 @@ int real_microphone_probe() {
     return result;
 }
 
+// Long-lived, loopback-only fixture for exercising the actual Flutter windows.
+// Only synthetic silence is captured. This test fixture approves local viewers
+// without an interactive password flow; it must never bind beyond loopback.
+class AliasedDisplayCapturer final : public chast::IDxgiCapturer {
+public:
+    AliasedDisplayCapturer(std::unique_ptr<chast::IDxgiCapturer> capture,
+                           chast::DisplayInfo display)
+        : capture_(std::move(capture)), display_(std::move(display)) {}
+
+    chast::CaptureResult capture(std::chrono::milliseconds timeout) override {
+        return capture_->capture(timeout);
+    }
+    const chast::FrameInfo& frame() const override { return capture_->frame(); }
+    const chast::CursorInfo& cursor() const override { return capture_->cursor(); }
+    const chast::DisplayInfo& display() const override { return display_; }
+    chast::AdapterDevice adapter_device() const override {
+        return capture_->adapter_device();
+    }
+    UINT max_framerate() const override { return capture_->max_framerate(); }
+    chast::Error reinitialize() override { return capture_->reinitialize(); }
+    chast::Error set_nv12_scale(UINT percent) override {
+        return capture_->set_nv12_scale(percent);
+    }
+    bool merged() const override { return capture_->merged(); }
+    size_t merged_display_count() const override {
+        return capture_->merged_display_count();
+    }
+    UINT nv12_scale_percent() const override {
+        return capture_->nv12_scale_percent();
+    }
+    const chast::Error& last_error() const override {
+        return capture_->last_error();
+    }
+
+private:
+    std::unique_ptr<chast::IDxgiCapturer> capture_;
+    chast::DisplayInfo display_;
+};
+
+int media_window_host(const fs::path& directory, bool multi_display = false) {
+    const HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize_com = SUCCEEDED(com_result);
+    std::unique_ptr<chast::HostServer> host;
+    int result = 1;
+    try {
+        const auto require = [](bool condition, const std::string& message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        require(SUCCEEDED(com_result) || com_result == RPC_E_CHANGED_MODE,
+                "COM initialization failed");
+        require(directory.is_absolute() && fs::create_directory(directory),
+                "media fixture requires a new absolute scratch directory");
+        std::string error;
+        const std::string identity = chast::find_stored_identity_fingerprint(
+            chast::IdentityScope::CurrentUser, &error);
+        require(!identity.empty(), "an existing current-user host identity is required: " + error);
+        const uint16_t port = pick_free_port();
+        require(port != 0, "no loopback port");
+        auto metrics = std::make_shared<SyntheticAudioMetrics>();
+        std::vector<chast::DisplayInfo> logical_displays;
+        chast::DisplayInfo physical_display;
+        if (multi_display) {
+            logical_displays = chast::enumerate_displays();
+            require(!logical_displays.empty(),
+                    "the synthetic display fixture needs one attached physical display");
+            const auto primary = std::find_if(logical_displays.begin(),
+                logical_displays.end(), [](const chast::DisplayInfo& item) {
+                    return item.primary;
+                });
+            physical_display = primary == logical_displays.end()
+                ? logical_displays.front() : *primary;
+            logical_displays = {physical_display};
+            auto second = physical_display;
+            second.device_name = L"CHAST_TEST_DISPLAY_2";
+            second.primary = false;
+            second.rect.left = physical_display.rect.right;
+            second.rect.top = physical_display.rect.top;
+            second.rect.right = second.rect.left + static_cast<LONG>(second.width);
+            second.rect.bottom = second.rect.top + static_cast<LONG>(second.height);
+            logical_displays.push_back(std::move(second));
+        }
+        auto configure = [metrics, identity, multi_display, logical_displays,
+                          physical_display](chast::HostServerConfig& config) {
+            config.settings.bind_address = "127.0.0.1";
+            config.serve_once = false;
+            config.first_client_timeout_ms = 600000;
+            config.settings.max_viewers = 2;
+            config.settings.auth_mode = chast::HostAuthMode::Click;
+            config.settings.token_auth = false;
+            config.settings.password_hash.clear();
+            config.approve_client = [](const chast::ClientRequest& request) {
+                return chast::ClientApproval{true, request.permissions};
+            };
+            config.settings.allow_audio = !multi_display;
+            config.settings.allow_microphone = false;
+            config.settings.allow_input = false;
+            config.settings.allow_clipboard = false;
+            config.settings.allow_terminal = false;
+            config.settings.allow_file_transfer = false;
+            config.settings.allow_record = !multi_display;
+            config.settings.record_incoming = false;
+            config.expected_identity_fingerprint = identity;
+            config.log = {}; // No connection credentials in the fixture log.
+            if (multi_display) {
+                config.displays = [logical_displays] { return logical_displays; };
+                config.capture_factory = [physical_display](
+                    const chast::DisplayInfo& logical,
+                    const chast::CaptureConfig& capture_config,
+                    std::string* failure) -> std::unique_ptr<chast::IDxgiCapturer> {
+                    auto capture = chast::create_shared_capturer(
+                        physical_display, capture_config, failure);
+                    if (!capture) return nullptr;
+                    return std::make_unique<AliasedDisplayCapturer>(
+                        std::move(capture), logical);
+                };
+            } else {
+                config.audio_capture = [metrics](std::string* failure)
+                    -> std::unique_ptr<chast::ILoopbackCapture> {
+                    auto capture = std::make_unique<SyntheticSilentLoopback>(metrics);
+                    if (!capture->ready()) {
+                        if (failure) *failure = capture->error();
+                        return nullptr;
+                    }
+                    return capture;
+                };
+            }
+        };
+        host = start_host(utf8(directory), port, &error, false, {}, {}, {},
+                          chast::ClipboardDirection::Disabled, {}, {}, std::move(configure));
+        require(host != nullptr, error);
+        require(host->status().fingerprint == identity, "fixture host identity changed");
+        const auto temporary_endpoint = directory / "endpoint.pending";
+        std::ofstream endpoint(temporary_endpoint);
+        endpoint << "{\"port\":" << port << ",\"fingerprint\":\"" << identity
+                 << "\"}\n";
+        endpoint.close();
+        require(endpoint.good(), "cannot write fixture endpoint");
+        fs::rename(temporary_endpoint, directory / "endpoint.json");
+        std::puts(multi_display
+            ? "media-window-host: ready; loopback approval; two logical displays alias one local capture; input/audio/files disabled"
+            : "media-window-host: ready; loopback test approval; synthetic silence; input/microphone/files disabled");
+        std::fflush(stdout);
+        bool record_revoked = false;
+        const auto deadline = std::chrono::steady_clock::now() + 10min;
+        while (host->running() && std::chrono::steady_clock::now() < deadline &&
+               !fs::exists(directory / "stop")) {
+            const auto disconnect_marker = directory / "disconnect-one";
+            const auto disconnect_first_marker = directory / "disconnect-first";
+            if (fs::exists(disconnect_marker) ||
+                fs::exists(disconnect_first_marker)) {
+                const auto viewers = host->viewers();
+                if (!viewers.empty() && host->disconnect_viewer(viewers.front().id)) {
+                    std::error_code ignored;
+                    fs::remove(disconnect_marker, ignored);
+                    fs::remove(disconnect_first_marker, ignored);
+                    std::puts("media-window-host: disconnected the oldest viewer by test command");
+                    std::fflush(stdout);
+                }
+            }
+            const bool revoke = fs::exists(directory / "revoke-recording");
+            // Reconcile every live viewer, including connections admitted after
+            // the marker changed. A disconnect may race this best-effort update.
+            for (const auto& viewer : host->viewers()) {
+                const auto permissions = static_cast<chast::PermissionMask>(revoke
+                    ? viewer.permissions & ~chast::kPermissionRecord
+                    : viewer.permissions | chast::kPermissionRecord);
+                if (permissions != viewer.permissions)
+                    host->set_permissions(viewer.id, permissions);
+            }
+            if (revoke != record_revoked) {
+                record_revoked = revoke;
+                std::printf("media-window-host: recording permission %s\n", revoke ? "revoked" : "restored");
+                std::fflush(stdout);
+            }
+            std::this_thread::sleep_for(100ms);
+        }
+        require(host->status().state != chast::HostState::Failed, host->status().error);
+        std::puts("media-window-host: stopped; UI checks must be recorded separately");
+        result = 0;
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "media-window-host: FAIL %s\n", exception.what());
+    }
+    if (host) host->stop();
+    if (uninitialize_com) CoUninitialize();
+    return result;
+}
+
 int audio_video_isolation_probe() {
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize_com = SUCCEEDED(com_result);
@@ -2759,17 +3096,19 @@ int audio_video_isolation_probe() {
         return 1;
     }
 
-    ProbeSink sink(150ms);
+    ProbeSink first_sink(150ms), second_sink(150ms);
     std::unique_ptr<chast::HostServer> host;
-    std::unique_ptr<chast_viewer::ViewerEngine> viewer;
+    std::unique_ptr<chast_viewer::ViewerEngine> first, second;
     auto metrics = std::make_shared<SyntheticAudioMetrics>();
+    auto first_playback = std::make_shared<ViewerPlaybackMetrics>();
+    auto second_playback = std::make_shared<ViewerPlaybackMetrics>();
     int result = 1;
     std::string error;
     try {
         const auto require = [](bool condition, const std::string& message) {
             if (!condition) throw std::runtime_error(message);
         };
-        require(sink.create(&error), error);
+        require(first_sink.create(&error) && second_sink.create(&error), error);
         const uint16_t port = pick_free_port();
         require(port != 0, "no loopback port");
 
@@ -2797,12 +3136,19 @@ int audio_video_isolation_probe() {
                           std::move(configure));
         require(host != nullptr, error);
 
-        const auto connect = [&] {
-            auto next = std::make_unique<chast_viewer::ViewerEngine>(&sink);
+        const auto connect = [&](ProbeSink& sink,
+                                 std::shared_ptr<ViewerPlaybackMetrics> playback) {
+            chast_viewer::ViewerEngine::AudioPlayerFactory player_factory =
+                [playback = std::move(playback)](const chast::AudioPlayerConfig&,
+                                                  std::string*) {
+                    return std::make_unique<ViewerMetricsPlayer>(playback);
+                };
+            auto next = std::make_unique<chast_viewer::ViewerEngine>(
+                &sink, nullptr, chast::create_decoder, std::move(player_factory));
             next->SetClipboardSync(false);
             require(next->Start("127.0.0.1", port, chast::kDisplayAuto, {}, true, {},
                                 kPassword),
-                    "start audio/video viewer");
+                    "start synthetic-audio viewer session");
             require(wait_streaming(*next, 20s, &error), error);
             return next;
         };
@@ -2823,53 +3169,148 @@ int audio_video_isolation_probe() {
             return status.audio_enabled && status.audio_received >= minimum_packets &&
                    status.audio_decoded >= minimum_packets;
         };
+        const auto wait_mute = [&](chast_viewer::ViewerEngine& current,
+                                   const std::shared_ptr<ViewerPlaybackMetrics>& playback,
+                                   bool expected) {
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (current.Snapshot().audio_muted == expected &&
+                    playback->muted.load(std::memory_order_relaxed) == expected) {
+                    return true;
+                }
+                std::this_thread::sleep_for(10ms);
+            }
+            return current.Snapshot().audio_muted == expected &&
+                   playback->muted.load(std::memory_order_relaxed) == expected;
+        };
 
-        viewer = connect();
-        require(wait_audio(*viewer, 30, 10s),
-                "the viewer did not receive and decode the synthetic audio stream");
-        require(viewer->SetAudioMuted(true), "mute the synthetic silent stream");
-        const chast_viewer::ViewerStatus first_before = viewer->Snapshot();
-        const uint64_t first_video_before = sink.frames();
+        first = connect(first_sink, first_playback);
+        second = connect(second_sink, second_playback);
+        require(wait_audio(*first, 30, 10s) && wait_audio(*second, 30, 10s),
+                "both viewers must receive and decode the synthetic audio stream");
+        require(!first->Snapshot().audio_muted && !second->Snapshot().audio_muted,
+                "each synthetic playback session must start unmuted");
+        require(first->SetAudioMuted(true), "mute synthetic playback session A");
+        require(wait_mute(*first, first_playback, true) &&
+                    wait_mute(*second, second_playback, false),
+                "muting session A must not mute session B");
+
+        const chast_viewer::ViewerStatus first_before = first->Snapshot();
+        const chast_viewer::ViewerStatus second_before = second->Snapshot();
+        const uint64_t first_muted_before =
+            first_playback->muted_blocks.load(std::memory_order_relaxed);
+        const uint64_t first_unmuted_before =
+            first_playback->unmuted_blocks.load(std::memory_order_relaxed);
+        const uint64_t second_muted_before =
+            second_playback->muted_blocks.load(std::memory_order_relaxed);
+        const uint64_t second_unmuted_before =
+            second_playback->unmuted_blocks.load(std::memory_order_relaxed);
+        const uint64_t first_video_before = first_sink.frames();
+        const uint64_t second_video_before = second_sink.frames();
         std::this_thread::sleep_for(2200ms);
-        const chast_viewer::ViewerStatus first_after = viewer->Snapshot();
-        const uint64_t first_video_after = sink.frames();
-        const chast::HostServerStats first_host = host->status().stats;
-        require(first_after.state == chast_viewer::ViewerState::kStreaming,
-                "the viewer stopped streaming during slow video delivery");
-        require(first_after.audio_errors == 0 && first_after.audio_received >
-                    first_before.audio_received && first_after.audio_decoded >
-                    first_before.audio_decoded,
-                "audio receive/decode stopped or reported an error during video delivery");
-        require(first_after.audio_decoded - first_before.audio_decoded >= 120,
-                "audio decode throughput fell behind during the 5 FPS video probe");
-        require(first_video_after >= first_video_before + 5,
-                "5 FPS video did not continue while audio was active");
-        require(first_after.framerate > 0 && first_after.framerate <= 5,
-                "the host did not retain the configured 5 FPS video rate");
-        require(first_host.audio_packets >= 150 && first_host.audio_errors == 0 &&
-                    first_host.audio_dropped == 0,
-                "the host audio source or send path reported errors or packet drops");
+        const chast_viewer::ViewerStatus first_after = first->Snapshot();
+        const chast_viewer::ViewerStatus second_after = second->Snapshot();
+        const uint64_t first_video_after = first_sink.frames();
+        const uint64_t second_video_after = second_sink.frames();
+        const chast::HostServerStats host_stats = host->status().stats;
+        require(first_after.state == chast_viewer::ViewerState::kStreaming &&
+                    second_after.state == chast_viewer::ViewerState::kStreaming,
+                "one of the viewer sessions stopped during slow video delivery");
+        require(first_after.audio_errors == 0 && second_after.audio_errors == 0 &&
+                    first_after.audio_received > first_before.audio_received &&
+                    first_after.audio_decoded > first_before.audio_decoded &&
+                    second_after.audio_received > second_before.audio_received &&
+                    second_after.audio_decoded > second_before.audio_decoded,
+                "either session's audio receive/decode stopped or reported an error");
+        require(first_after.audio_decoded - first_before.audio_decoded >= 120 &&
+                    second_after.audio_decoded - second_before.audio_decoded >= 120,
+                "a session's audio decode throughput fell behind during the 5 FPS video probe");
+        require(first_video_after >= first_video_before + 5 &&
+                    second_video_after >= second_video_before + 5,
+                "5 FPS video did not continue for both sessions while audio was active");
+        require(first_after.framerate > 0 && first_after.framerate <= 5 &&
+                    second_after.framerate > 0 && second_after.framerate <= 5,
+                "the host did not retain the configured 5 FPS video rate for both sessions");
+        require(first_after.audio_muted && !second_after.audio_muted &&
+                    first_playback->muted_blocks.load(std::memory_order_relaxed) -
+                            first_muted_before >= 120 &&
+                    first_playback->unmuted_blocks.load(std::memory_order_relaxed) ==
+                            first_unmuted_before &&
+                    second_playback->unmuted_blocks.load(std::memory_order_relaxed) -
+                            second_unmuted_before >= 120 &&
+                    second_playback->muted_blocks.load(std::memory_order_relaxed) ==
+                            second_muted_before,
+                "session A mute changed session B's playback or failed to silence A");
+        require(host_stats.audio_packets >= 150 && host_stats.audio_errors == 0 &&
+                    host_stats.audio_dropped == 0,
+                "the synthetic host source or send path reported errors or packet drops");
         require(metrics->encoded_packets.load(std::memory_order_relaxed) >= 150 &&
                     metrics->dropped_packets.load(std::memory_order_relaxed) == 0,
                 "the synthetic source failed or overflowed its bounded queue");
 
-        viewer->Stop();
-        viewer.reset();
+        require(first->SetAudioMuted(false) && second->SetAudioMuted(true),
+                "reverse the per-session mute states");
+        require(wait_mute(*first, first_playback, false) &&
+                    wait_mute(*second, second_playback, true),
+                "unmuting A and muting B must remain session-scoped");
+        const uint64_t first_unmuted_reverse_before =
+            first_playback->unmuted_blocks.load(std::memory_order_relaxed);
+        const uint64_t first_muted_reverse_before =
+            first_playback->muted_blocks.load(std::memory_order_relaxed);
+        const uint64_t second_unmuted_reverse_before =
+            second_playback->unmuted_blocks.load(std::memory_order_relaxed);
+        const uint64_t second_muted_reverse_before =
+            second_playback->muted_blocks.load(std::memory_order_relaxed);
+        const uint64_t first_decoded_reverse_before = first->Snapshot().audio_decoded;
+        const uint64_t second_decoded_reverse_before = second->Snapshot().audio_decoded;
+        std::this_thread::sleep_for(1100ms);
+        const chast_viewer::ViewerStatus first_reversed = first->Snapshot();
+        const chast_viewer::ViewerStatus second_reversed = second->Snapshot();
+        require(!first_reversed.audio_muted && second_reversed.audio_muted &&
+                    first_reversed.audio_decoded - first_decoded_reverse_before >= 50 &&
+                    second_reversed.audio_decoded - second_decoded_reverse_before >= 50 &&
+                    first_playback->unmuted_blocks.load(std::memory_order_relaxed) -
+                            first_unmuted_reverse_before >= 50 &&
+                    first_playback->muted_blocks.load(std::memory_order_relaxed) ==
+                            first_muted_reverse_before &&
+                    second_playback->muted_blocks.load(std::memory_order_relaxed) -
+                            second_muted_reverse_before >= 50 &&
+                    second_playback->unmuted_blocks.load(std::memory_order_relaxed) ==
+                            second_unmuted_reverse_before,
+                "reversing mute states did not independently restore A and silence B");
+
+        first->Stop();
+        first.reset();
+        const auto sibling_deadline = std::chrono::steady_clock::now() + 10s;
+        while (host->viewers().size() != 1 &&
+               std::chrono::steady_clock::now() < sibling_deadline) {
+            std::this_thread::sleep_for(10ms);
+        }
+        require(host->viewers().size() == 1,
+                "the host did not release session A while preserving session B");
+        const uint64_t sibling_decoded_before = second->Snapshot().audio_decoded;
+        require(wait_audio(*second, sibling_decoded_before + 30, 5s) &&
+                    second->Snapshot().audio_muted,
+                "session B audio did not continue with its mute state after A disconnected");
+        second->Stop();
+        second.reset();
         const auto disconnect_deadline = std::chrono::steady_clock::now() + 10s;
         while (!host->viewers().empty() &&
                std::chrono::steady_clock::now() < disconnect_deadline) {
             std::this_thread::sleep_for(10ms);
         }
-        require(host->viewers().empty(), "the host did not release the first viewer");
+        require(host->viewers().empty(), "the host did not release both viewer sessions");
 
         const uint64_t packets_before_reconnect =
             metrics->encoded_packets.load(std::memory_order_relaxed);
-        viewer = connect();
-        require(wait_audio(*viewer, 30, 10s),
+        auto reconnect_playback = std::make_shared<ViewerPlaybackMetrics>();
+        first = connect(first_sink, reconnect_playback);
+        require(wait_audio(*first, 30, 10s),
                 "audio did not restart after the viewer reconnected");
-        require(viewer->SetAudioMuted(true), "mute the reconnected silent stream");
+        require(first->SetAudioMuted(true) && wait_mute(*first, reconnect_playback, true),
+                "the reconnected synthetic session could not mute its playback");
         std::this_thread::sleep_for(700ms);
-        const chast_viewer::ViewerStatus reconnected = viewer->Snapshot();
+        const chast_viewer::ViewerStatus reconnected = first->Snapshot();
         require(reconnected.state == chast_viewer::ViewerState::kStreaming &&
                     reconnected.audio_errors == 0 && reconnected.audio_received >= 60 &&
                     reconnected.audio_decoded >= 60,
@@ -2879,24 +3320,29 @@ int audio_video_isolation_probe() {
                         packets_before_reconnect,
                 "a fresh audio source was not started after reconnect");
 
-        std::printf("audio-video-isolation: 5 FPS, delayed video callback, first audio=%llu/%llu "
-                    "decoded packets, reconnect audio=%llu/%llu, video=%llu, errors=%llu\n",
-                    static_cast<unsigned long long>(
-                        first_after.audio_received - first_before.audio_received),
+        std::printf("audio-video-isolation: two sessions, synthetic mute A/B then B/A, "
+                    "audio decode A=%llu B=%llu packets, reconnect=%llu/%llu, "
+                    "video A/B=%llu/%llu, errors=%llu\n",
                     static_cast<unsigned long long>(
                         first_after.audio_decoded - first_before.audio_decoded),
+                    static_cast<unsigned long long>(
+                        second_after.audio_decoded - second_before.audio_decoded),
                     static_cast<unsigned long long>(reconnected.audio_received),
                     static_cast<unsigned long long>(reconnected.audio_decoded),
                     static_cast<unsigned long long>(first_video_after - first_video_before),
+                    static_cast<unsigned long long>(second_video_after - second_video_before),
                     static_cast<unsigned long long>(first_after.audio_errors +
+                                                    second_after.audio_errors +
                                                     reconnected.audio_errors));
-        std::puts("audio-video-isolation: PASS silent Opus receive/decode, video stalls, "
-                  "5 FPS pacing, viewer shutdown and reconnect");
+        std::puts("audio-video-isolation: PASS two isolated silent Opus playback states, "
+                  "decode while muted, 5 FPS video, sibling survival and reconnect; "
+                  "no physical audio output opened");
         result = 0;
     } catch (const std::exception& exception) {
         std::fprintf(stderr, "audio-video-isolation: FAIL %s\n", exception.what());
     }
-    if (viewer) viewer->Stop();
+    if (first) first->Stop();
+    if (second) second->Stop();
     if (host) host->stop();
     if (uninitialize_com) CoUninitialize();
     return result;
@@ -4331,6 +4777,10 @@ int keyboard_probe() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--media-window-host")
+        return media_window_host(from_utf8(argv[2]));
+    if (argc == 3 && std::string(argv[1]) == "--multi-display-window-host")
+        return media_window_host(from_utf8(argv[2]), true);
     if (argc == 2 && std::string(argv[1]) == "--elevation") return elevation_probe();
     if (argc == 2 && std::string(argv[1]) == "--clipboard-native") return native_clipboard_probe();
     if (argc == 2 && std::string(argv[1]) == "--host-recording") return host_recording_probe();
@@ -4340,6 +4790,8 @@ int main(int argc, char** argv) {
         return audio_video_isolation_probe();
     if (argc == 2 && std::string(argv[1]) == "--viewer-session-isolation")
         return host_recording_probe(true);
+    if (argc == 2 && std::string(argv[1]) == "--viewer-recording-revocation")
+        return host_recording_probe(true, true);
     if (argc == 2 && std::string(argv[1]) == "--multi-shares") return multi_share_probe();
     if (argc == 2 && std::string(argv[1]) == "--file-conflict") return file_conflict_probe();
     if (argc == 2 && std::string(argv[1]) == "--directory-upload") return directory_upload_probe();

@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1054,6 +1057,128 @@ void write_native_injected_input_trace(NativeInputTrace& trace, const INPUT& inp
     trace.stream.flush();
 }
 
+#ifdef CHAST_NATIVE_ACCEPTANCE_FIXTURES
+// CPU-only source for archive acceptance. Never opens a desktop or GPU.
+constexpr UINT kArchiveFixtureWidth = 160;
+constexpr UINT kArchiveFixtureHeight = 120;
+
+class ArchiveFixtureCapture final : public IDxgiCapturer {
+public:
+    explicit ArchiveFixtureCapture(const DisplayInfo& display) : display_(display) {}
+
+    CaptureResult capture(std::chrono::milliseconds timeout) override {
+        using namespace std::chrono;
+        using namespace std::chrono_literals;
+        const auto now = steady_clock::now();
+        if (now + timeout < next_) {
+            std::this_thread::sleep_for(timeout);
+            return CaptureResult::NoNewFrame;
+        }
+        std::this_thread::sleep_until(next_);
+        next_ = steady_clock::now() + 33ms;
+        auto pixels = std::make_shared<std::vector<uint8_t>>(display_.width * display_.height * 4u);
+        ++frame_.frame_number;
+        for (UINT y = 0; y < display_.height; ++y) {
+            for (UINT x = 0; x < display_.width; ++x) {
+                auto* pixel = pixels->data() + (y * display_.width + x) * 4u;
+                pixel[0] = static_cast<uint8_t>(x + frame_.frame_number * 3);
+                pixel[1] = static_cast<uint8_t>(y * 2);
+                pixel[2] = static_cast<uint8_t>((x ^ y) + frame_.frame_number);
+                pixel[3] = 255;
+            }
+        }
+        frame_.width = display_.width;
+        frame_.height = display_.height;
+        frame_.nv12_width = display_.width;
+        frame_.nv12_height = display_.height;
+        frame_.nv12_surface_width = display_.width;
+        frame_.nv12_surface_height = display_.height;
+        frame_.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        frame_.cpu_bgra = std::move(pixels);
+        return CaptureResult::Frame;
+    }
+
+    const FrameInfo& frame() const override { return frame_; }
+    const CursorInfo& cursor() const override { return cursor_; }
+    const DisplayInfo& display() const override { return display_; }
+    AdapterDevice adapter_device() const override { return {}; }
+    const char* implementation() const noexcept override { return "archive-test-pattern"; }
+    Error reinitialize() override { return Error::success(); }
+    Error set_nv12_scale(UINT) override { return Error::success(); }
+    const Error& last_error() const override { return error_; }
+
+private:
+    DisplayInfo display_;
+    FrameInfo frame_;
+    CursorInfo cursor_;
+    Error error_ = Error::success();
+    std::chrono::steady_clock::time_point next_{};
+};
+
+bool configure_archive_acceptance(HostServerConfig& config) {
+    const auto& settings = config.settings;
+    const char* archive_root_env = std::getenv("CHAST_NATIVE_ARCHIVE_ROOT");
+    if (!archive_root_env || !*archive_root_env) {
+        std::fputs("Archive acceptance needs an isolated test root.\n", stderr);
+        return false;
+    }
+    const std::filesystem::path archive_root(widen(archive_root_env));
+    const auto is_within_archive_root = [&archive_root](const std::filesystem::path& candidate) {
+        std::error_code error;
+        const auto root = std::filesystem::weakly_canonical(archive_root, error);
+        if (error) return false;
+        const auto path = std::filesystem::weakly_canonical(candidate, error);
+        if (error) return false;
+        const auto relative = path.lexically_relative(root);
+        if (relative.empty() || relative.is_absolute()) return false;
+        return std::none_of(relative.begin(), relative.end(), [](const auto& component) {
+            return component == L"..";
+        });
+    };
+    constexpr std::string_view server_prefix = "http://127.0.0.1:";
+    const bool loopback_server = settings.server_url.rfind(server_prefix, 0) == 0 &&
+        settings.server_url.size() > server_prefix.size() &&
+        settings.server_url.find_first_not_of("0123456789", server_prefix.size()) == std::string::npos;
+    if (!g_app->portable || g_app->elevated_child || g_app->config_path == host_settings_path() ||
+        !is_within_archive_root(g_app->config_path) ||
+        !is_within_archive_root(std::filesystem::path(widen(settings.record_directory))) ||
+        !is_within_archive_root(std::filesystem::path(widen(settings.recording_upload_queue))) ||
+        settings.bind_address != "127.0.0.1" ||
+        settings.tunnel_listen.rfind("127.0.0.1:", 0) != 0 ||
+        !loopback_server || !settings.proxy.empty() ||
+        settings.lan_discovery || settings.carrier || settings.keep_awake ||
+        settings.allow_input || settings.allow_clipboard || settings.allow_audio ||
+        settings.allow_microphone || settings.allow_camera || settings.allow_privacy_mode ||
+        settings.allow_file_transfer || settings.allow_terminal || settings.allow_port_forward ||
+        settings.allow_restart || settings.allow_os_login || settings.allow_remote_config ||
+        settings.lock_after_session_end || settings.codec != VideoCodec::Vp9) {
+        std::fputs("Archive acceptance requires isolated portable loopback settings.\n", stderr);
+        return false;
+    }
+    // Require a pre-existing identity rather than writing to the user's store.
+    config.expected_identity_fingerprint = find_stored_identity_fingerprint(IdentityScope::CurrentUser);
+    if (config.expected_identity_fingerprint.empty()) {
+        std::fputs("Archive acceptance needs an existing user certificate; no identity was created.\n", stderr);
+        return false;
+    }
+    config.displays = [] {
+        DisplayInfo display;
+        display.device_name = L"Synthetic archive test";
+        display.width = kArchiveFixtureWidth;
+        display.height = kArchiveFixtureHeight;
+        display.rect = {0, 0, kArchiveFixtureWidth, kArchiveFixtureHeight};
+        display.primary = true;
+        return std::vector<DisplayInfo>{display};
+    };
+    config.capture_factory = [](const DisplayInfo& display, const CaptureConfig&, std::string*) {
+        return std::make_unique<ArchiveFixtureCapture>(display);
+    };
+    config.encoder_backend = EncoderBackend::Software;
+    config.capture_cursor = false;
+    return true;
+}
+#endif
+
 void start_server() {
     if (g_app->server) {
         return;
@@ -1072,6 +1197,19 @@ void start_server() {
     // click modes and never called in password-only mode.
     config.approve_client = server_approve;
     config.log = server_log;
+#ifdef CHAST_NATIVE_ACCEPTANCE_FIXTURES
+    const char* archive_trace_path = std::getenv("CHAST_NATIVE_ARCHIVE_TRACE");
+    if (archive_trace_path && *archive_trace_path) {
+        const std::string path(archive_trace_path);
+        auto trace_mutex = std::make_shared<std::mutex>();
+        config.log = [path, trace_mutex](const std::string& message) {
+            server_log(message);
+            std::lock_guard<std::mutex> lock(*trace_mutex);
+            std::ofstream trace(path, std::ios::app);
+            if (trace) trace << message << '\n';
+        };
+    }
+#endif
     config.token_changed = server_token_changed;
     config.trusted_devices_changed = server_trusted_devices_changed;
     config.password_hash_changed = server_password_hash_changed;
@@ -1081,6 +1219,13 @@ void start_server() {
     // The native acceptance path records decoded input without ever calling
     // SendInput. Production hosts never set either test variable.
     const char* native_testing = std::getenv("CHAST_NATIVE_TESTING");
+#ifdef CHAST_NATIVE_ACCEPTANCE_FIXTURES
+    const char* archive_acceptance = std::getenv("CHAST_NATIVE_ARCHIVE_FIXTURE");
+    if (archive_acceptance && std::string_view(archive_acceptance) == "1" &&
+        (!native_testing || std::string_view(native_testing) != "1" || !configure_archive_acceptance(config))) {
+        return;
+    }
+#endif
     const char* native_input_dry_run = std::getenv("CHAST_NATIVE_INPUT_DRY_RUN");
     if (native_testing != nullptr && std::string(native_testing) == "1" &&
         native_input_dry_run != nullptr && std::string(native_input_dry_run) == "1") {
@@ -1871,6 +2016,7 @@ enum TunnelDialogId {
     kDialogKey,
     kDialogListen,
     kDialogProxy,
+    kDialogTlsCa,
     kDialogEnabled,
 };
 
@@ -1883,6 +2029,7 @@ struct TunnelDialogState {
     HWND key = nullptr;
     HWND listen = nullptr;
     HWND proxy = nullptr;
+    HWND tls_ca = nullptr;
     HWND enabled = nullptr;
     bool done = false;
     bool accepted = false;
@@ -1988,6 +2135,7 @@ bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, s
         }
         updated.proxy = normalized;
     }
+    updated.tls_ca = trim_ascii(narrow(control_text(dialog.tls_ca)));
     return validate_tunnel_settings(updated, &error);
 }
 
@@ -2123,10 +2271,17 @@ bool edit_tunnel_settings(HostSettings& result) {
         tr(L"\n隧道端口必须不同，例如 0.0.0.0:14434");
     add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 374, dialog_width - 20 - 276, 40, 0,
         nullptr);
-    add(L"STATIC", tr(L"出站代理（可选，http://、https://、socks5:// 或 socks5h://，含端口）"),
-        SS_LEFT, 0, 20, 414, tunnel_content, 20, 0, nullptr);
+    const int tunnel_column_gap = 16;
+    const int tunnel_column_width = (tunnel_content - tunnel_column_gap) / 2;
+    const int tls_ca_left = 20 + tunnel_column_width + tunnel_column_gap;
+    add(L"STATIC", tr(L"出站代理（HTTP/SOCKS5）"), SS_LEFT, 0, 20, 414,
+        tunnel_column_width, 20, 0, nullptr);
+    add(L"STATIC", tr(L"私有 CA PEM（空=系统根）"), SS_LEFT, 0, tls_ca_left, 414,
+        tunnel_column_width, 20, 0, nullptr);
     dialog.proxy = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 436,
-                       tunnel_content, 26, kDialogProxy, nullptr);
+                       tunnel_column_width, 26, kDialogProxy, nullptr);
+    dialog.tls_ca = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+                        tls_ca_left, 436, tunnel_column_width, 26, kDialogTlsCa, nullptr);
     const wchar_t* enable_text = tr(L"启用连接服务（注册到会合服务器）");
     dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 472,
                          std::max(400, check_px(enable_text)), 24, kDialogEnabled, nullptr);
@@ -2144,6 +2299,7 @@ bool edit_tunnel_settings(HostSettings& result) {
     set_text(dialog.key, widen(g_app->settings.tunnel_key));
     set_text(dialog.listen, widen(g_app->settings.tunnel_listen));
     set_text(dialog.proxy, widen(g_app->settings.proxy));
+    set_text(dialog.tls_ca, widen(g_app->settings.tls_ca));
     set_check(dialog.enabled, g_app->settings.tunnel);
 
     EnableWindow(g_app->window, FALSE);

@@ -96,9 +96,11 @@ public:
             PlayoutDriftController::Config phase_config;
             phase_config.window_ms = 500;
             phase_config.confirm_windows = 2;
-            phase_config.dead_band_ms = 20;
+            phase_config.dead_band_ms = 5;
             phase_config.max_step_ms = 20;
             phase_config.warmup_windows = 1;
+            phase_config.fixed_reference = true;
+            phase_config.reference_ms = kAnchorGatherMarginMs;
             drift_ = PlayoutDriftController(phase_config);
         }
     }
@@ -940,8 +942,11 @@ bool WasapiPlayer::render() {
                 head.play_lead_ms;
             const int64_t duration_ms =
                 static_cast<int64_t>(head.frames) * 1000 / device_rate;
-            const AudioLateBlockDecision lateness = audio_late_block_decision(
-                now, play_local + duration_ms, config_.late_tolerance_ms);
+            const int64_t device_padding_ms =
+                (static_cast<int64_t>(padding) * 1000 + device_rate - 1) / device_rate;
+            const AudioLateBlockDecision lateness = audio_render_late_block_decision(
+                now, device_padding_ms,
+                play_local + duration_ms, config_.late_tolerance_ms);
             if (lateness.drop && head.written == 0) {
                 record_timing_event({
                     AudioTimingEventKind::LateDrop,
@@ -1041,7 +1046,8 @@ bool WasapiPlayer::render() {
             playout_target_ms_.store(play_local + written_ms);
             const int64_t previous_device_end_us = render_accounting_.end_us();
             render_accounting_.write(
-                audible_us, static_cast<int64_t>(write_frames) * 1000000 / device_rate);
+                audible_us, static_cast<int64_t>(write_frames) * 1000000 / device_rate,
+                padding != 0);
             device_starved_ms_.store(render_accounting_.starved_ms());
             device_max_gap_ms_.store(render_accounting_.max_gap_ms());
             const size_t reference_frames =
@@ -1073,7 +1079,7 @@ bool WasapiPlayer::render() {
             }
             const int64_t end_local =
                 play_local + static_cast<int64_t>(head.written) * 1000 / device_rate;
-            if (previous_device_end_us > 0 && audible_us > previous_device_end_us &&
+            if (device_padding_ms == 0 && previous_device_end_us > 0 && audible_us > previous_device_end_us &&
                 audible_us - previous_device_end_us >= 20000) {
                 record_timing_event({
                     AudioTimingEventKind::DeviceGap,
@@ -1278,11 +1284,18 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             if (config_.arrival_anchored) {
                 stall_reanchor_.observe(arrival_ms);
             }
-        } else if (config_.arrival_anchored && stall_reanchor_.observe(arrival_ms)) {
+        } else if (config_.arrival_anchored && stall_reanchor_.observe(
+                       arrival_ms,
+                       config_.arrival_phase_correction ? render_accounting_.end_us() / 1000 : 0,
+                       audio_late_block_decision(arrival_ms,
+                           static_cast<int64_t>(audio.capture_ms) - effective_offset_ms() +
+                               playout_lead_ms() + static_cast<int64_t>(frames) * 1000 / format_.sample_rate,
+                           config_.late_tolerance_ms).drop)) {
             // Arrival-anchored callers have no live clock offset (the mic
             // uplink has no LatencyReply, system audio plays on arrival).
-            // After a stall the old offset can place the new burst in the
-            // past; anchor it at arrival and apply the caller's queue policy.
+            // After an arrival gap, or sustained silence while expired packets
+            // continue arriving, the old offset cannot resume playback. Anchor
+            // at arrival and apply the caller's queue policy.
             const int64_t previous_target_ms = static_cast<int64_t>(audio.capture_ms) -
                                                effective_offset_ms() + playout_lead_ms();
             const uint64_t queued_audio_ms = format_.sample_rate == 0

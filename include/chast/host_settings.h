@@ -298,6 +298,9 @@ struct HostSettings {
     // Accepted schemes: http, https, socks5 and socks5h with an explicit
     // port. UDP direct/relay paths are unaffected.
     std::string proxy;
+    // Optional PEM roots appended to the system roots for HTTPS rendezvous.
+    // Empty uses the operating system trust store.
+    std::string tls_ca;
     // Public-facing UDP socket of chast-tunnel host. It must differ from the
     // QUIC port above because both are UDP listeners.
     std::string tunnel_listen = "0.0.0.0:14434";
@@ -307,6 +310,10 @@ struct HostSettings {
     // in automatically. The agent removes lines only after the service stored
     // them, so a short outage loses nothing.
     std::string audit_spool;
+    // Opt in to uploading sealed host-side MP4 segments through chast-tunnel.
+    // The queue is derived from the settings file path and is not serialized.
+    bool upload_recordings = false;
+    std::string recording_upload_queue;
     // Machine file chast-tunnel uses to cache the server's device policy and
     // the host reads as its managed marker. Derived from the settings path as
     // <stem>.policy.json; it is not stored in host.ini.
@@ -417,6 +424,9 @@ bool tunnel_listen_port(const std::string& listen, uint16_t& port);
 // Spool next to a settings file: <dir>/<stem>.audit.jsonl. Empty for an empty
 // settings path.
 std::string audit_spool_path_for(const std::string& settings_path);
+// Durable host-recording task directory next to a settings file. Empty when
+// the settings path is empty.
+std::string recording_upload_queue_path_for(const std::string& settings_path);
 // Managed-policy cache next to a settings file: <dir>/<stem>.policy.json.
 // Shared by chast-tunnel (writer) and the host gate (reader); empty for an
 // empty settings path.

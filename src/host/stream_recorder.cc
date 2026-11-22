@@ -4,9 +4,11 @@
 #include "mp4_recorder.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -51,6 +53,9 @@ struct StreamRecorder::Impl {
     size_t queued_bytes = 0;
     bool stopping = false;
     uint64_t end_pts_ms = 0;
+    uint64_t clock_anchor_pts_ms = 0;
+    uint64_t clock_anchor_unix_ms = 0;
+    bool clock_anchor_set = false;
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> dropped{0};
     std::string pending_error;
@@ -100,6 +105,41 @@ struct StreamRecorder::Impl {
     }
     void run() noexcept {
         std::unique_ptr<chast_tools::Mp4Recorder> recorder;
+        size_t published_segments = 0;
+        const auto publish_completed_segments = [&] {
+            if (!recorder) return;
+            const auto& completed = recorder->completed_segment_info();
+            while (published_segments < completed.size()) {
+                const auto& info = completed[published_segments++];
+                const auto& path = info.path;
+                if (!options.segment_finalized) continue;
+                uint64_t started_at_ms = 0;
+                {
+                    std::lock_guard lock(mutex);
+                    if (clock_anchor_set) {
+                        if (info.start_pts_ms >= clock_anchor_pts_ms) {
+                            const uint64_t delta = info.start_pts_ms - clock_anchor_pts_ms;
+                            started_at_ms = delta >
+                                    std::numeric_limits<uint64_t>::max() - clock_anchor_unix_ms
+                                ? std::numeric_limits<uint64_t>::max()
+                                : clock_anchor_unix_ms + delta;
+                        } else {
+                            const uint64_t delta = clock_anchor_pts_ms - info.start_pts_ms;
+                            started_at_ms = clock_anchor_unix_ms > delta
+                                ? clock_anchor_unix_ms - delta : 1;
+                        }
+                    }
+                }
+                const HostRecordingSegment segment{path, started_at_ms, info.duration_ms};
+                try {
+                    options.segment_finalized(segment);
+                } catch (const std::exception& error) {
+                    log("ERROR: segment completion callback failed for " + path + ": " + error.what());
+                } catch (...) {
+                    log("ERROR: segment completion callback failed for " + path);
+                }
+            }
+        };
         try {
             fs::path directory;
             unsigned part = 0;
@@ -119,9 +159,13 @@ struct StreamRecorder::Impl {
             const auto close = [&](uint64_t end) {
                 if (!recorder) return;
                 recorder->close(end);
+                publish_completed_segments();
                 if (recorder->failed()) throw std::runtime_error(recorder->error());
-                for (const auto& path : recorder->segments()) log("saved " + path);
+                for (const auto& path : recorder->segments()) {
+                    log("saved " + path);
+                }
                 recorder.reset();
+                published_segments = 0;
             };
             for (;;) {
                 Frame frame;
@@ -163,6 +207,7 @@ struct StreamRecorder::Impl {
                         std::string error;
                         if (!recorder->open(path, frame.codec, frame.width, frame.height, &error))
                             throw std::runtime_error(error);
+                        published_segments = 0;
                         active_generation = frame.generation; active_epoch = frame.epoch;
                         codec = frame.codec; width = frame.width; height = frame.height;
                         log("started " + path);
@@ -171,6 +216,7 @@ struct StreamRecorder::Impl {
                     header.codec = frame.codec; header.chroma = frame.chroma; header.width = frame.width; header.height = frame.height;
                     header.pts_ms = packet.pts_ms; header.keyframe = packet.keyframe;
                     recorder->write(header, packet.data.data(), packet.data.size());
+                    publish_completed_segments();
                     if (recorder->failed()) throw std::runtime_error(recorder->error());
                 }
             }
@@ -178,10 +224,16 @@ struct StreamRecorder::Impl {
             close(end_pts_ms);
         } catch (const std::exception& error) {
             // Still try to write a trailer for any already accepted samples.
-            if (recorder) recorder->close();
+            if (recorder) {
+                recorder->close();
+                publish_completed_segments();
+            }
             fail(error.what());
         } catch (...) {
-            if (recorder) recorder->close();
+            if (recorder) {
+                recorder->close();
+                publish_completed_segments();
+            }
             fail("unexpected recording failure");
         }
     }
@@ -207,6 +259,15 @@ void StreamRecorder::submit(VideoCodec codec, uint32_t width, uint32_t height, u
         state.failed = true;
         state.wake.notify_one();
         return;
+    }
+    if (!state.clock_anchor_set) {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        if (unix_ms > 0) {
+            state.clock_anchor_pts_ms = packets.front().pts_ms;
+            state.clock_anchor_unix_ms = static_cast<uint64_t>(unix_ms);
+            state.clock_anchor_set = true;
+        }
     }
     if (state.generation != generation) {
         state.generation = generation;

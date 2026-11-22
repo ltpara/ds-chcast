@@ -5,7 +5,9 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <numeric>
+#include <string_view>
 
 #include <zstd.h>
 
@@ -14,6 +16,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <xmllite.h>
 #endif
 
 #include "chast/protocol.h"
@@ -26,7 +29,7 @@ namespace {
 constexpr size_t kMaxFormats = kMaxClipboardFormats;
 
 bool valid_format_id(uint8_t raw, ClipboardFormat& format) {
-    if (raw > static_cast<uint8_t>(ClipboardFormat::Png)) {
+    if (raw > static_cast<uint8_t>(ClipboardFormat::Svg)) {
         return false;
     }
     format = static_cast<ClipboardFormat>(raw);
@@ -44,6 +47,8 @@ uint32_t format_limit(ClipboardFormat format) {
             return kMaxClipboardImageBytes;
         case ClipboardFormat::Png:
             return kMaxClipboardPngBytes;
+        case ClipboardFormat::Svg:
+            return kMaxClipboardSvgBytes;
         case ClipboardFormat::FileList:
             return kMaxClipboardFileListBytes;
     }
@@ -84,6 +89,205 @@ bool valid_markup(const std::vector<uint8_t>& data, ClipboardFormat format,
         return false;
     }
     return true;
+}
+
+bool svg_is_space(wchar_t value) {
+    return value == L' ' || value == L'\t' || value == L'\r' || value == L'\n';
+}
+
+bool svg_local_fragment(std::wstring_view value) {
+    while (!value.empty() && svg_is_space(value.front())) value.remove_prefix(1);
+    while (!value.empty() && svg_is_space(value.back())) value.remove_suffix(1);
+    if (value.size() < 2 || value.front() != L'#') return false;
+    for (const wchar_t ch : value.substr(1)) {
+        const bool valid = (ch >= L'a' && ch <= L'z') ||
+                           (ch >= L'A' && ch <= L'Z') ||
+                           (ch >= L'0' && ch <= L'9') || ch == L'_' ||
+                           ch == L'-' || ch == L'.' || ch == L':';
+        if (!valid) return false;
+    }
+    return true;
+}
+
+bool svg_attribute_is_safe(std::wstring_view name, std::wstring_view value) {
+    std::wstring lower_name(name);
+    for (wchar_t& ch : lower_name) {
+        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
+    }
+    if (lower_name == L"style" || lower_name == L"base" ||
+        (lower_name.size() >= 2 && lower_name[0] == L'o' && lower_name[1] == L'n')) {
+        return false;
+    }
+    if (lower_name == L"href") return svg_local_fragment(value);
+    if (value.find(L'\\') != std::wstring_view::npos) return false;
+
+    std::wstring lower_value(value);
+    for (wchar_t& ch : lower_value) {
+        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
+    }
+    size_t cursor = 0;
+    while ((cursor = lower_value.find(L"url", cursor)) != std::wstring::npos) {
+        size_t open = cursor + 3;
+        while (open < lower_value.size() && svg_is_space(lower_value[open])) ++open;
+        if (open == lower_value.size() || lower_value[open] != L'(') {
+            return false;
+        }
+        const size_t close = lower_value.find(L')', open + 1);
+        if (close == std::wstring::npos) return false;
+        std::wstring_view target(value.data() + open + 1, close - open - 1);
+        while (!target.empty() && svg_is_space(target.front())) target.remove_prefix(1);
+        while (!target.empty() && svg_is_space(target.back())) target.remove_suffix(1);
+        if (target.size() >= 2 &&
+            ((target.front() == L'\'' && target.back() == L'\'') ||
+             (target.front() == L'"' && target.back() == L'"'))) {
+            target = target.substr(1, target.size() - 2);
+        }
+        if (!svg_local_fragment(target)) return false;
+        cursor = close + 1;
+    }
+    return lower_value.find(L"javascript:") == std::wstring::npos;
+}
+
+bool valid_svg(const std::vector<uint8_t>& data, std::string* error) {
+    const auto fail = [error](const char* reason) {
+        if (error) *error = reason;
+        return false;
+    };
+    if (data.empty() || data.size() > kMaxClipboardSvgBytes ||
+        std::find(data.begin(), data.end(), uint8_t{0}) != data.end()) {
+        return fail("SVG clipboard data is empty, oversized, or contains a NUL");
+    }
+    const std::string utf8(data.begin(), data.end());
+    if (!valid_utf8(utf8)) return fail("SVG clipboard data is not valid UTF-8");
+
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, data.size());
+    if (!memory) return fail("SVG parser input allocation failed");
+    void* target = GlobalLock(memory);
+    if (!target) {
+        GlobalFree(memory);
+        return fail("SVG parser input could not be locked");
+    }
+    std::memcpy(target, data.data(), data.size());
+    GlobalUnlock(memory);
+
+    IStream* stream = nullptr;
+    HRESULT hr = CreateStreamOnHGlobal(memory, TRUE, &stream);
+    if (FAILED(hr)) {
+        GlobalFree(memory);
+        return fail("SVG parser input stream could not be created");
+    }
+    IXmlReader* reader = nullptr;
+    hr = CreateXmlReader(__uuidof(IXmlReader), reinterpret_cast<void**>(&reader), nullptr);
+    if (FAILED(hr) || reader == nullptr) {
+        stream->Release();
+        return fail("SVG XML reader could not be created");
+    }
+    const auto release = [&] {
+        reader->Release();
+        stream->Release();
+    };
+    if (FAILED(reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit)) ||
+        FAILED(reader->SetInput(stream))) {
+        release();
+        return fail("SVG XML reader could not be configured");
+    }
+
+    static constexpr std::wstring_view kSvgNamespace = L"http://www.w3.org/2000/svg";
+    static constexpr std::wstring_view kXmlNamespace = L"http://www.w3.org/XML/1998/namespace";
+    static constexpr std::wstring_view kXmlnsNamespace = L"http://www.w3.org/2000/xmlns/";
+    static constexpr std::wstring_view kXlinkNamespace = L"http://www.w3.org/1999/xlink";
+    static constexpr std::wstring_view kSafeElements[] = {
+        L"svg", L"g", L"defs", L"symbol", L"use", L"path", L"rect", L"circle",
+        L"ellipse", L"line", L"polyline", L"polygon", L"text", L"tspan", L"textPath",
+        L"title", L"desc", L"metadata", L"a", L"image", L"switch", L"view", L"clipPath",
+        L"mask", L"linearGradient", L"radialGradient", L"stop", L"pattern", L"marker",
+        L"filter", L"feBlend", L"feColorMatrix", L"feComponentTransfer", L"feFuncA",
+        L"feFuncB", L"feFuncG", L"feFuncR", L"feGaussianBlur", L"feOffset", L"feFlood",
+        L"feComposite", L"feMerge", L"feMergeNode", L"feMorphology", L"feTurbulence",
+        L"feDisplacementMap", L"feDiffuseLighting", L"feSpecularLighting", L"feDistantLight",
+        L"fePointLight", L"feSpotLight", L"feConvolveMatrix", L"feTile", L"feDropShadow",
+    };
+    bool root_seen = false;
+    uint32_t nodes = 0;
+    XmlNodeType node = XmlNodeType_None;
+    while ((hr = reader->Read(&node)) == S_OK) {
+        if (++nodes > 200000) {
+            release();
+            return fail("SVG XML has too many nodes");
+        }
+        if (node == XmlNodeType_DocumentType || node == XmlNodeType_ProcessingInstruction) {
+            release();
+            return fail("SVG XML contains a prohibited document feature");
+        }
+        if (node != XmlNodeType_Element) continue;
+
+        const WCHAR* local_ptr = nullptr;
+        UINT local_length = 0;
+        const WCHAR* namespace_ptr = nullptr;
+        UINT namespace_length = 0;
+        if (FAILED(reader->GetLocalName(&local_ptr, &local_length)) ||
+            FAILED(reader->GetNamespaceUri(&namespace_ptr, &namespace_length))) {
+            release();
+            return fail("SVG XML contains an unreadable element");
+        }
+        const std::wstring_view local(local_ptr, local_length);
+        const std::wstring_view element_namespace(namespace_ptr ? namespace_ptr : L"",
+                                                  namespace_length);
+        UINT depth = 0;
+        reader->GetDepth(&depth);
+        if (depth > 64 || element_namespace != kSvgNamespace ||
+            std::find(std::begin(kSafeElements), std::end(kSafeElements), local) ==
+                std::end(kSafeElements) || (depth == 0 && (root_seen || local != L"svg"))) {
+            release();
+            return fail("SVG XML contains an unsupported or active element");
+        }
+        if (depth == 0) root_seen = true;
+
+        UINT attribute_count = 0;
+        if (FAILED(reader->GetAttributeCount(&attribute_count)) || attribute_count > 256) {
+            release();
+            return fail("SVG XML has too many attributes");
+        }
+        if (attribute_count > 0) {
+            hr = reader->MoveToFirstAttribute();
+            while (hr == S_OK) {
+                const WCHAR* attribute_ptr = nullptr;
+                UINT attribute_length = 0;
+                const WCHAR* attribute_namespace_ptr = nullptr;
+                UINT attribute_namespace_length = 0;
+                const WCHAR* value_ptr = nullptr;
+                UINT value_length = 0;
+                if (FAILED(reader->GetLocalName(&attribute_ptr, &attribute_length)) ||
+                    FAILED(reader->GetNamespaceUri(&attribute_namespace_ptr,
+                                                   &attribute_namespace_length)) ||
+                    FAILED(reader->GetValue(&value_ptr, &value_length))) {
+                    release();
+                    return fail("SVG XML contains an unreadable attribute");
+                }
+                const std::wstring_view attribute(attribute_ptr, attribute_length);
+                const std::wstring_view attribute_namespace(
+                    attribute_namespace_ptr ? attribute_namespace_ptr : L"",
+                    attribute_namespace_length);
+                const std::wstring_view value(value_ptr ? value_ptr : L"", value_length);
+                const bool allowed_namespace = attribute_namespace.empty() ||
+                    attribute_namespace == kXmlNamespace ||
+                    attribute_namespace == kXmlnsNamespace ||
+                    attribute_namespace == kXlinkNamespace;
+                if (!allowed_namespace ||
+                    !svg_attribute_is_safe(attribute, value)) {
+                    release();
+                    return fail("SVG XML contains an active or external attribute");
+                }
+                hr = reader->MoveToNextAttribute();
+            }
+            if (FAILED(hr) || FAILED(reader->MoveToElement())) {
+                release();
+                return fail("SVG XML attributes are malformed");
+            }
+        }
+    }
+    release();
+    return hr == S_FALSE && root_seen ? true : fail("SVG XML is not a complete SVG document");
 }
 
 uint32_t read_u32(const uint8_t* data) {
@@ -872,6 +1076,11 @@ bool valid_clipboard_content(const ClipboardContent& content, std::string* error
                 break;
             case ClipboardFormat::Png:
                 if (!valid_png(entry.data, error)) {
+                    return false;
+                }
+                break;
+            case ClipboardFormat::Svg:
+                if (!valid_svg(entry.data, error)) {
                     return false;
                 }
                 break;

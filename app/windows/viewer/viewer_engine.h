@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include "chast/audio.h"
 #include "chast/encoder.h"
 #include "chast/file_transfer.h"
 #include "chast/protocol.h"
@@ -705,12 +706,16 @@ struct ViewerStatus {
 
 class ViewerEngine {
 public:
+    using AudioPlayerFactory = std::function<std::unique_ptr<chast::IAudioPlayer>(
+        const chast::AudioPlayerConfig&, std::string*)>;
+
     // `sink` publishes the desktop picture; `camera_sink`, when present,
     // publishes the shared camera. The camera decodes on its own sink because
     // it is an independent stream with its own size and timeline, and both
     // sinks may render at the same time.
     explicit ViewerEngine(FrameSink* sink, FrameSink* camera_sink = nullptr,
-                          DisplayVideoReceiver::DecoderFactory decoder_factory = chast::create_decoder);
+                          DisplayVideoReceiver::DecoderFactory decoder_factory = chast::create_decoder,
+                          AudioPlayerFactory audio_player_factory = {});
     ~ViewerEngine();
 
     ViewerEngine(const ViewerEngine&) = delete;
@@ -1004,13 +1009,15 @@ public:
 
     // Starts or stops a local, lossless recording of the received stream. The
     // host is never told and nothing is uploaded. `directory` is used when the
-    // recording starts (empty means the user's Videos folder); the file name is
-    // chosen by the viewer and rolls to a new segment when the picture size
+    // recording starts (empty means the user's Videos folder); `base_path`, if
+    // supplied, is the reserved first segment path. Later segments roll from
+    // that path when the picture size
     // changes. Recording begins on the next key frame, so a switch that finds
     // no key frame yet keeps waiting. Returns false when no session is
     // streaming. Progress and failures arrive through ViewerStatus::recording
     // / record_path / record_error.
-    bool SetRecording(bool enabled, std::string directory = {});
+    bool SetRecording(bool enabled, std::string directory = {},
+                      std::string base_path = {});
 
     // Queues a screenshot of the current remote picture. The session thread
     // reads the newest decoded frame back from the GPU and writes a PNG into
@@ -1211,6 +1218,7 @@ private:
     // camera can be started (the command-line tools only display the desktop).
     FrameSink* camera_sink_;
     DisplayVideoReceiver::DecoderFactory decoder_factory_;
+    AudioPlayerFactory audio_player_factory_;
     // Kept alive for the whole session because QuicClientConfig borrows it.
     std::shared_ptr<chast::DeviceIdentity> device_identity_;
     mutable std::mutex mutex_;
@@ -1241,8 +1249,8 @@ private:
     std::atomic<bool> microphone_noise_{true};
 
     // Viewer-side recording. The switch crosses to the session thread, which
-    // owns the muxer; `record_dir_` is read when a recording starts, so a new
-    // folder applies to the next file instead of interrupting one in flight.
+    // owns the muxer; the directory and optional reserved base path are read
+    // when a file starts, so changes never interrupt one in flight.
     std::atomic<bool> record_wanted_{false};
     // The muxer can only open its first segment on a key frame, and an idle
     // host sends one only when asked; enabling recording sets this flag so the
@@ -1250,6 +1258,7 @@ private:
     std::atomic<bool> keyframe_wanted_{false};
     mutable std::mutex record_mutex_;
     std::string record_dir_;
+    std::string record_base_path_;
     std::optional<uint32_t> record_stream_;
     std::optional<uint32_t> pending_record_keyframe_;
 

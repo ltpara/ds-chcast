@@ -262,7 +262,7 @@ add_library(chast.clipboard STATIC
     src/clipboard/clipboard_listener.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chast.clipboard PUBLIC chast.base chast.security chast.png user32 shell32 ole32 uuid shlwapi zstd::libzstd)
+target_link_libraries(chast.clipboard PUBLIC chast.base chast.security chast.png user32 shell32 ole32 uuid shlwapi xmllite zstd::libzstd)
 
 # Receive-side file handling: name sanitizing, resumable .part files, digest
 # verification. The receiver side only; the viewer hashes what it sends through
@@ -305,6 +305,7 @@ add_library(chast.host STATIC
     src/host/display_privacy.cc
     src/host/desktop_stream.cc
     src/host/stream_recorder.cc
+    src/host/recording_upload_queue.cc
     src/host/recording_disk.cc
     src/host/video_qos.cc
     src/host/shared_loopback.cc
@@ -416,6 +417,7 @@ if(GO_EXECUTABLE)
 endif()
 
 if(CHAST_BUILD_TESTS)
+    target_compile_definitions(chast-host PRIVATE CHAST_NATIVE_ACCEPTANCE_FIXTURES)
     # Opt-in process acceptance uses the actual tray/tunnel executables and
     # separate files-only viewers. No desktop capture or UI automation.
     add_executable(chast-live-viewer-probe tools/live_viewer_probe.cc)
@@ -557,6 +559,9 @@ if(CHAST_BUILD_TESTS)
     # Settings file round-trip: no GPU, no network, no certificate store.
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host.tray)
+    add_executable(chast-recording-upload-queue-test
+        tests/recording_upload_queue_test.cc)
+    target_link_libraries(chast-recording-upload-queue-test PRIVATE chast.host)
     add_executable(chast-machine-state-security-test tests/machine_state_security_test.cc)
     target_include_directories(chast-machine-state-security-test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/host)
@@ -573,9 +578,29 @@ if(CHAST_BUILD_TESTS)
     # creates a real Windows power request.
     add_executable(chast-reference-counted-lease-test
         tests/reference_counted_lease_test.cc)
+    add_executable(chast-display-window-access-test tests/display_window_access_test.cc)
+    add_executable(chast-session-tab-model-test tests/session_tab_model_test.cc)
+    target_include_directories(chast-session-tab-model-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/runner)
+    target_include_directories(chast-display-window-access-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer)
     target_include_directories(chast-reference-counted-lease-test
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     if(WIN32)
+        add_executable(chast-window-focus-test tests/window_focus_test.cc)
+        target_include_directories(chast-window-focus-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer)
+        target_compile_features(chast-window-focus-test PRIVATE cxx_std_17)
+        target_link_libraries(chast-window-focus-test PRIVATE user32)
+
+        add_executable(chast-session-tab-visibility-test
+            tests/session_tab_visibility_test.cc
+            app/windows/runner/session_tab_visibility.cpp)
+        target_include_directories(chast-session-tab-visibility-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/runner)
+        target_compile_features(chast-session-tab-visibility-test PRIVATE cxx_std_17)
+        target_link_libraries(chast-session-tab-visibility-test PRIVATE user32)
+
         # Exercises the real, short-lived Windows execution-state request.
         # The test never changes persistent power settings or starts a session.
         add_executable(chast-viewer-awake-request-test
@@ -765,6 +790,9 @@ if(CHAST_BUILD_TESTS)
 
     # AAC encode/decode round trip: no device, no network.
     add_executable(chast-audio-codec-test tests/audio_codec_test.cc)
+    add_executable(chast-audio-forwarder-test tests/audio_forwarder_test.cc)
+    target_include_directories(chast-audio-forwarder-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-audio-forwarder-test PRIVATE chast.audio)
     target_link_libraries(chast-audio-codec-test PRIVATE chast.audio)
 
     # Echo cancellation and noise suppression against synthetic far/near
@@ -844,12 +872,20 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME cursor_hint COMMAND chast-cursor-hint-test)
     add_test(NAME annotation_paint COMMAND chast-annotation-paint-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME display_window_access COMMAND chast-display-window-access-test)
+    add_test(NAME session_tab_model COMMAND chast-session-tab-model-test)
+    if(WIN32)
+        add_test(NAME window_focus COMMAND chast-window-focus-test)
+        add_test(NAME session_tab_visibility
+            COMMAND chast-session-tab-visibility-test)
+    endif()
     add_test(NAME keyboard COMMAND chast-keyboard-test)
     add_test(NAME protocol_fuzz COMMAND chast-protocol-fuzz-test)
     set_tests_properties(protocol_fuzz PROPERTIES TIMEOUT 300)
     add_test(NAME desktop COMMAND chast-desktop-test)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
+    add_test(NAME recording_upload_queue COMMAND chast-recording-upload-queue-test)
     add_test(NAME host_client_strategy COMMAND chast-host-client-strategy-test
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/host_client_strategy.json"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/viewer_client_strategy.json")
@@ -924,6 +960,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
+    add_test(NAME audio_forwarder COMMAND chast-audio-forwarder-test)
     add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
     add_test(NAME audio_playout COMMAND chast-audio-playout-test)
     add_test(NAME shared_loopback COMMAND chast-shared-loopback-test)
@@ -1026,9 +1063,13 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME viewer_session_isolation
         COMMAND chast-viewer-probe --viewer-session-isolation)
     set_tests_properties(viewer_session_isolation PROPERTIES TIMEOUT 120)
-    # A synthetic silent Opus source keeps the real viewer audio pipeline
-    # active while the video sink stalls at a configured 5 FPS; disconnecting
-    # and reconnecting checks that both session workers stop and restart.
+    add_test(NAME viewer_recording_revocation
+        COMMAND chast-viewer-probe --viewer-recording-revocation)
+    set_tests_properties(viewer_recording_revocation PROPERTIES TIMEOUT 120)
+    # Two ViewerEngine sessions receive synthetic silent Opus through
+    # in-memory players; opposite mute states, continued decode during mute,
+    # slow 5 FPS video, sibling survival and reconnect are checked without
+    # opening a physical audio output.
     add_test(NAME viewer_audio_video_isolation
         COMMAND chast-viewer-probe --audio-video-isolation)
     set_tests_properties(viewer_audio_video_isolation PROPERTIES TIMEOUT 120)

@@ -171,6 +171,31 @@ int main() {
         check(near(delivery_ratio, 0.276f),
               "normal bounded bitrate recovery follows the urgent cut");
 
+        // The encoder reports video bytes after reserving audio bandwidth.
+        // Its measured rate can be below the nominal emergency floor. A
+        // congestion floor must never turn another reduction into an increase.
+        VideoQos audio_reserved(30, 0.67f);
+        audio_reserved.open(1, 0);
+        audio_reserved.display(10, 1, 2859, true, 0);
+        audio_reserved.delay(1, 10, 1100);
+        audio_reserved.pending(1, 500, 1600);
+        const float congested_ratio = audio_reserved.state(1600).ratio;
+        audio_reserved.display(10, 1, 698, true, 1700);
+        audio_reserved.pending(1, 1000, 2100);
+        audio_reserved.pending(1, 2000, 3100);
+        audio_reserved.pending(1, 3500, 4600);
+        check(audio_reserved.state(4600).ratio <= congested_ratio,
+              "persistent congestion cannot raise a rate already below the audio-reserved floor");
+        audio_reserved.delay(1, 1500, 4700);
+        audio_reserved.delay(1, 1400, 5700);
+        audio_reserved.delay(1, 1300, 7700);
+        check(audio_reserved.state(7700).ratio <= congested_ratio,
+              "late receipts cannot lift the emergency rate to the normal floor");
+        warm(audio_reserved, 1, 7800, 12);
+        audio_reserved.display(10, 10, 698, true, 11000);
+        check(audio_reserved.state(11000).ratio > congested_ratio,
+              "clean dynamic traffic can recover the audio-reserved rate");
+
         // RustDesk feeds its periodic adjustment once a second. An elevated
         // but unconfirmed delay must not clear the dynamic counter on every
         // tick, or a moving screen loses the evidence needed to recover.

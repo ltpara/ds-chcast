@@ -2,8 +2,10 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:chast_viewer/l10n.dart';
+import 'package:chast_viewer/remote_shortcuts.dart';
 import 'package:chast_viewer/stream_prefs.dart';
 import 'package:chast_viewer/view_prefs.dart';
+import 'package:chast_viewer/view_scroll.dart';
 import 'package:chast_viewer/target.dart';
 import 'package:chast_viewer/viewer_bridge.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -63,6 +65,7 @@ void main() {
         swapButtons: true,
         zoomPercent: 165,
         cursorZoomPercent: 135,
+        trackpadSpeedPercent: 250,
       );
       StreamPreferences.save(
         const StreamPreferences(codec: 3),
@@ -77,11 +80,19 @@ void main() {
         ViewPreferences.load(peerId: a.preferencesKey).cursorZoomPercent,
         135,
       );
+      expect(
+        ViewPreferences.load(peerId: a.preferencesKey).trackpadSpeedPercent,
+        250,
+      );
       expect(StreamPreferences.load(peerId: a.preferencesKey).codec, 3);
       expect(ViewPreferences.load(peerId: b.preferencesKey).fit, 0);
       expect(ViewPreferences.load(peerId: b.preferencesKey).zoomPercent, 100);
       expect(
         ViewPreferences.load(peerId: b.preferencesKey).cursorZoomPercent,
+        100,
+      );
+      expect(
+        ViewPreferences.load(peerId: b.preferencesKey).trackpadSpeedPercent,
         100,
       );
       expect(StreamPreferences.load(peerId: b.preferencesKey).codec, 0);
@@ -110,6 +121,7 @@ void main() {
     expect(prefs.keyboardMode, 'local');
     expect(prefs.swapButtons, isTrue);
     expect(prefs.reverseWheel, isTrue);
+    expect(prefs.trackpadSpeedPercent, 100);
     expect(prefs.browserShowHidden, isTrue);
     expect(ViewPreferences.load(peerId: 'other').browserShowHidden, isFalse);
     expect(prefs.terminalFontSize, 18);
@@ -125,6 +137,39 @@ void main() {
     expect(viewerKeyboardModeFromName('local'), ViewerKeyboardMode.local);
     expect(viewerKeyboardModeFromName(null), ViewerKeyboardMode.physical);
   });
+
+  test(
+    'remote shortcuts persist per peer and reject conflicts/reserved keys',
+    () {
+      const RemoteShortcutBinding binding = RemoteShortcutBinding(
+        action: RemoteShortcutAction.toggleStats,
+        keyUsage: 0x3a,
+        modifiers: 1,
+        keyLabel: 'F1',
+      );
+      ViewPreferences.update(peerId: 'desk', remoteShortcuts: const [binding]);
+      expect(ViewPreferences.load(peerId: 'desk').remoteShortcuts, const [
+        binding,
+      ]);
+      expect(ViewPreferences.load(peerId: 'other').remoteShortcuts, isEmpty);
+      final parsed = RemoteShortcutBinding.parseList([
+        binding.toStorage(),
+        const RemoteShortcutBinding(
+          action: RemoteShortcutAction.leaveSession,
+          keyUsage: 0x3a,
+          modifiers: 1,
+          keyLabel: 'F1',
+        ).toStorage(),
+        const RemoteShortcutBinding(
+          action: RemoteShortcutAction.toggleControl,
+          keyUsage: 0x3d,
+          modifiers: 2,
+          keyLabel: 'F4',
+        ).toStorage(),
+      ]);
+      expect(parsed, const [binding]);
+    },
+  );
 
   test('a missing file keeps the session defaults', () {
     final ViewPreferences prefs = ViewPreferences.load();
@@ -150,6 +195,8 @@ void main() {
         fit: 1,
         zoomPercent: 175,
         cursorZoomPercent: 150,
+        scrollStyle: ViewScrollStyle.edge,
+        scrollEdge: 75,
         stats: true,
         fileSort: 2,
         fileSortAscending: false,
@@ -158,6 +205,7 @@ void main() {
         terminalFontSize: 17,
         reverseWheel: true,
         swapButtons: true,
+        trackpadSpeedPercent: 275,
         keyboardMode: 'local',
         autoRecord: true,
         recordKeep: 10,
@@ -170,6 +218,8 @@ void main() {
     expect(prefs.fit, 1);
     expect(prefs.zoomPercent, 175);
     expect(prefs.cursorZoomPercent, 150);
+    expect(prefs.scrollStyle, ViewScrollStyle.edge);
+    expect(prefs.scrollEdge, 75);
     expect(prefs.stats, isTrue);
     expect(prefs.fileSort, 2);
     expect(prefs.fileSortAscending, isFalse);
@@ -178,6 +228,7 @@ void main() {
     expect(prefs.terminalFontSize, 17);
     expect(prefs.reverseWheel, isTrue);
     expect(prefs.swapButtons, isTrue);
+    expect(prefs.trackpadSpeedPercent, 275);
     expect(prefs.keyboardMode, 'local');
     expect(prefs.autoRecord, isTrue);
     expect(prefs.recordKeep, 10);
@@ -188,6 +239,8 @@ void main() {
       'view_fit': 1,
       'view_zoom_percent': 175,
       'view_cursor_zoom_percent': 150,
+      'view_scroll_style': 'edge',
+      'view_scroll_edge': 75,
       'view_stats': true,
       'file_sort': 2,
       'file_sort_asc': false,
@@ -196,7 +249,9 @@ void main() {
       'terminal_font_size': 17,
       'view_reverse_wheel': true,
       'view_swap_buttons': true,
+      'view_trackpad_speed_percent': 275,
       'view_keyboard_mode': 'local',
+      'view_remote_shortcuts': <Object?>[],
       'view_auto_record': true,
       'view_record_keep': 10,
       'view_show_my_cursor': true,
@@ -299,6 +354,9 @@ void main() {
         'terminal_font_size': 99,
         'view_reverse_wheel': 'yes',
         'view_swap_buttons': 1,
+        'view_trackpad_speed_percent': 1001,
+        'view_scroll_style': 'unknown',
+        'view_scroll_edge': 151,
       }),
     );
     final ViewPreferences prefs = ViewPreferences.load();
@@ -310,6 +368,9 @@ void main() {
     expect(prefs.terminalFontSize, 13);
     expect(prefs.reverseWheel, isFalse);
     expect(prefs.swapButtons, isFalse);
+    expect(prefs.trackpadSpeedPercent, 100);
+    expect(prefs.scrollStyle, ViewScrollStyle.scrollbar);
+    expect(prefs.scrollEdge, defaultViewScrollEdge);
   });
 
   test('browser directory keeps only real path segments', () {
@@ -345,6 +406,8 @@ void main() {
       'view_fit': 0,
       'view_zoom_percent': 100,
       'view_cursor_zoom_percent': 100,
+      'view_scroll_style': 'scrollbar',
+      'view_scroll_edge': 100,
       'view_stats': true,
       'file_sort': 0,
       'file_sort_asc': false,
@@ -353,7 +416,9 @@ void main() {
       'terminal_font_size': 13,
       'view_reverse_wheel': false,
       'view_swap_buttons': false,
+      'view_trackpad_speed_percent': 100,
       'view_keyboard_mode': 'physical',
+      'view_remote_shortcuts': <Object?>[],
       'view_auto_record': false,
       'view_record_keep': 0,
       'view_show_my_cursor': false,
@@ -459,6 +524,38 @@ void main() {
     expect(second.terminalFontSize, 17);
     // A device choice must not become every other host's default.
     expect(readFile().containsKey('view_fit'), isFalse);
+    expect(
+      (readFile()['peers']
+          as Map<String, dynamic>)['111111111']['view_trackpad_speed_percent'],
+      100,
+    );
+    expect(
+      (readFile()['peers']
+          as Map<String, dynamic>)['222222222']['view_trackpad_speed_percent'],
+      100,
+    );
+  });
+
+  test('scroll style and edge width follow the connection target', () {
+    ViewPreferences.update(
+      peerId: 'desk',
+      scrollStyle: ViewScrollStyle.edge,
+      scrollEdge: 75,
+    );
+    expect(
+      ViewPreferences.load(peerId: 'desk').scrollStyle,
+      ViewScrollStyle.edge,
+    );
+    expect(ViewPreferences.load(peerId: 'desk').scrollEdge, 75);
+    expect(
+      ViewPreferences.load(peerId: 'other').scrollStyle,
+      ViewScrollStyle.scrollbar,
+    );
+    expect(
+      ViewPreferences.load(peerId: 'other').scrollEdge,
+      defaultViewScrollEdge,
+    );
+    expect(readFile().containsKey('view_scroll_style'), isFalse);
   });
 
   test('device overrides stay independent of each other', () {

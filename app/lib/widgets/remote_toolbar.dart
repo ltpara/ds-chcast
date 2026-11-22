@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../theme.dart';
+import '../trackpad_speed.dart';
+import '../view_scroll.dart';
 import '../viewer_bridge.dart';
 import 'remote_view.dart';
 import 'keyboard_mode_button.dart';
@@ -29,6 +31,9 @@ class RemoteToolbar extends StatelessWidget {
     required this.fit,
     this.zoomPercent = 100,
     this.cursorZoomPercent = 100,
+    this.scrollStyle = defaultViewScrollStyle,
+    this.scrollEdge = defaultViewScrollEdge,
+    this.onScrollChanged,
     required this.controlEnabled,
     required this.inputAvailable,
     this.showMyCursor = false,
@@ -119,10 +124,13 @@ class RemoteToolbar extends StatelessWidget {
     this.swapButtons = false,
     this.onToggleReverseWheel,
     this.onToggleSwapButtons,
+    this.trackpadSpeedPercent = kDefaultTrackpadSpeedPercent,
+    this.onEditTrackpadSpeed,
     this.relativeMouse = false,
     this.onToggleRelativeMouse,
     required this.specialKeysAvailable,
     required this.onSpecialAction,
+    this.onEditShortcuts,
     required this.onSendText,
     this.screenshotAvailable = false,
     this.onScreenshot,
@@ -172,6 +180,9 @@ class RemoteToolbar extends StatelessWidget {
   final ViewFit fit;
   final int zoomPercent;
   final int cursorZoomPercent;
+  final ViewScrollStyle scrollStyle;
+  final int scrollEdge;
+  final void Function(ViewScrollStyle, int)? onScrollChanged;
   final bool controlEnabled;
   final bool inputAvailable;
 
@@ -309,6 +320,8 @@ class RemoteToolbar extends StatelessWidget {
   final bool swapButtons;
   final VoidCallback? onToggleReverseWheel;
   final VoidCallback? onToggleSwapButtons;
+  final int trackpadSpeedPercent;
+  final VoidCallback? onEditTrackpadSpeed;
 
   /// Locks the local pointer and sends relative movement. Session-only: it is
   /// never restored, because a fresh session must not start with a locked
@@ -320,6 +333,7 @@ class RemoteToolbar extends StatelessWidget {
   /// host. The button stays visible but disabled otherwise.
   final bool specialKeysAvailable;
   final ValueChanged<RemoteSpecialAction> onSpecialAction;
+  final VoidCallback? onEditShortcuts;
   final VoidCallback onSendText;
   final ViewerKeyboardMode keyboardMode;
   final ValueChanged<ViewerKeyboardMode>? onKeyboardMode;
@@ -787,6 +801,9 @@ class RemoteToolbar extends StatelessWidget {
                 fit: fit,
                 zoomPercent: zoomPercent,
                 cursorZoomPercent: cursorZoomPercent,
+                scrollStyle: scrollStyle,
+                scrollEdge: scrollEdge,
+                onScrollChanged: onScrollChanged,
                 onFitChanged: onFitChanged,
                 onZoomPercentChanged: onZoomPercentChanged ?? (_) {},
                 onCursorZoomPercentChanged:
@@ -831,6 +848,8 @@ class RemoteToolbar extends StatelessWidget {
                 swapButtons: swapButtons,
                 onToggleReverseWheel: onToggleReverseWheel,
                 onToggleSwapButtons: onToggleSwapButtons,
+                trackpadSpeedPercent: trackpadSpeedPercent,
+                onEditTrackpadSpeed: onEditTrackpadSpeed,
                 relativeMouse: relativeMouse,
                 controlEnabled: controlEnabled,
                 onToggleRelativeMouse: onToggleRelativeMouse,
@@ -875,6 +894,7 @@ class RemoteToolbar extends StatelessWidget {
               _SpecialKeysButton(
                 available: specialKeysAvailable,
                 onSelected: onSpecialAction,
+                onEditShortcuts: onEditShortcuts,
               ),
               if (onKeyboardMode != null)
                 KeyboardModeButton(
@@ -1285,10 +1305,15 @@ class _CollapsedBar extends StatelessWidget {
 /// service capability does not have to be known up front; a refusal from the
 /// host explains itself in the session page.
 class _SpecialKeysButton extends StatelessWidget {
-  const _SpecialKeysButton({required this.available, required this.onSelected});
+  const _SpecialKeysButton({
+    required this.available,
+    required this.onSelected,
+    this.onEditShortcuts,
+  });
 
   final bool available;
   final ValueChanged<RemoteSpecialAction> onSelected;
+  final VoidCallback? onEditShortcuts;
 
   Future<void> _open(BuildContext context) async {
     final RenderBox? box = context.findRenderObject() as RenderBox?;
@@ -1296,7 +1321,7 @@ class _SpecialKeysButton extends StatelessWidget {
       return;
     }
     final Offset origin = box.localToGlobal(Offset.zero);
-    final RemoteSpecialAction? selected = await showMenu<RemoteSpecialAction>(
+    final int? selected = await showMenu<int>(
       context: context,
       position: RelativeRect.fromLTRB(
         origin.dx,
@@ -1306,21 +1331,30 @@ class _SpecialKeysButton extends StatelessWidget {
       ),
       color: const Color(0xFF24252B),
       elevation: 8,
-      items: <PopupMenuEntry<RemoteSpecialAction>>[
-        _item(RemoteSpecialAction.win, Icons.window_rounded, 'Win', tr('开始菜单')),
+      items: <PopupMenuEntry<int>>[
         _item(
+          0,
+          RemoteSpecialAction.win,
+          Icons.window_rounded,
+          'Win',
+          tr('开始菜单'),
+        ),
+        _item(
+          1,
           RemoteSpecialAction.altTab,
           Icons.swap_horiz_rounded,
           'Alt+Tab',
           tr('切换窗口'),
         ),
         _item(
+          2,
           RemoteSpecialAction.altF4,
           Icons.close_rounded,
           'Alt+F4',
           tr('关闭当前窗口'),
         ),
         _item(
+          3,
           RemoteSpecialAction.taskManager,
           Icons.task_alt_rounded,
           'Ctrl+Shift+Esc',
@@ -1328,26 +1362,52 @@ class _SpecialKeysButton extends StatelessWidget {
         ),
         const PopupMenuDivider(),
         _item(
+          4,
           RemoteSpecialAction.sas,
           Icons.lock_reset_rounded,
           'Ctrl+Alt+Del',
           tr('安全注意序列（需主机以服务方式运行）'),
         ),
+        if (onEditShortcuts != null) ...<PopupMenuEntry<int>>[
+          const PopupMenuDivider(),
+          PopupMenuItem<int>(
+            value: 5,
+            height: 42,
+            child: Row(
+              children: <Widget>[
+                Icon(
+                  Icons.keyboard_alt_outlined,
+                  size: 16,
+                  color: Colors.white54,
+                ),
+                SizedBox(width: 10),
+                Text(tr('会话快捷键')),
+              ],
+            ),
+          ),
+        ],
       ],
     );
-    if (selected != null) {
-      onSelected(selected);
+    if (selected != null && selected == 5) {
+      onEditShortcuts?.call();
+    } else if (selected != null &&
+        selected >= 0 &&
+        selected <= 4 &&
+        available) {
+      onSelected(RemoteSpecialAction.values[selected]);
     }
   }
 
-  PopupMenuItem<RemoteSpecialAction> _item(
+  PopupMenuItem<int> _item(
+    int index,
     RemoteSpecialAction action,
     IconData icon,
     String title,
     String detail,
   ) {
-    return PopupMenuItem<RemoteSpecialAction>(
-      value: action,
+    return PopupMenuItem<int>(
+      value: index,
+      enabled: available,
       height: 44,
       child: Row(
         children: <Widget>[
@@ -1381,8 +1441,7 @@ class _SpecialKeysButton extends StatelessWidget {
     return Builder(
       builder: (BuildContext buttonContext) => _BarButton(
         icon: Icons.keyboard_command_key_rounded,
-        tooltip: available ? tr('特殊按键') : tr('先开启远程键鼠'),
-        disabled: !available,
+        tooltip: tr('特殊按键与快捷键设置'),
         onTap: () => unawaited(_open(buttonContext)),
       ),
     );
@@ -1552,20 +1611,26 @@ class _BarButton extends StatelessWidget {
     return Tooltip(
       message: tooltip,
       waitDuration: const Duration(milliseconds: 450),
-      child: SizedBox(
-        width: 32,
-        height: 32,
-        child: Material(
-          color: Colors.transparent,
-          borderRadius: BorderRadius.circular(4),
-          child: InkWell(
+      child: Semantics(
+        button: true,
+        enabled: !disabled,
+        toggled: active,
+        label: tooltip,
+        child: SizedBox(
+          width: 32,
+          height: 32,
+          child: Material(
+            color: Colors.transparent,
             borderRadius: BorderRadius.circular(4),
-            hoverColor: Colors.white.withValues(alpha: 0.08),
-            onTap: disabled ? null : onTap,
-            onLongPress: disabled || onLongPress == null
-                ? null
-                : () => onLongPress!(context),
-            child: Icon(icon, size: 18, color: color),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(4),
+              hoverColor: Colors.white.withValues(alpha: 0.08),
+              onTap: disabled ? null : onTap,
+              onLongPress: disabled || onLongPress == null
+                  ? null
+                  : () => onLongPress!(context),
+              child: Icon(icon, size: 18, color: color),
+            ),
           ),
         ),
       ),
@@ -2405,6 +2470,8 @@ class _MouseOptionsButton extends StatelessWidget {
     required this.swapButtons,
     required this.onToggleReverseWheel,
     required this.onToggleSwapButtons,
+    required this.trackpadSpeedPercent,
+    required this.onEditTrackpadSpeed,
     required this.relativeMouse,
     required this.controlEnabled,
     required this.onToggleRelativeMouse,
@@ -2414,6 +2481,8 @@ class _MouseOptionsButton extends StatelessWidget {
   final bool swapButtons;
   final VoidCallback? onToggleReverseWheel;
   final VoidCallback? onToggleSwapButtons;
+  final int trackpadSpeedPercent;
+  final VoidCallback? onEditTrackpadSpeed;
   final bool relativeMouse;
   final bool controlEnabled;
   final VoidCallback? onToggleRelativeMouse;
@@ -2421,7 +2490,7 @@ class _MouseOptionsButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: tr('鼠标：反向滚轮、左右键互换、相对鼠标'),
+      message: tr('鼠标：反向滚轮、左右键互换、触控板速度、相对鼠标'),
       waitDuration: const Duration(milliseconds: 450),
       child: PopupMenuButton<int>(
         tooltip: '',
@@ -2436,6 +2505,8 @@ class _MouseOptionsButton extends StatelessWidget {
             onToggleSwapButtons?.call();
           } else if (index == 2) {
             onToggleRelativeMouse?.call();
+          } else if (index == 3) {
+            onEditTrackpadSpeed?.call();
           }
         },
         itemBuilder: (BuildContext context) {
@@ -2465,6 +2536,55 @@ class _MouseOptionsButton extends StatelessWidget {
               tr('左键触发右键，右键触发左键'),
               Icons.swap_horiz_rounded,
               swapButtons,
+            ),
+            PopupMenuItem<int>(
+              value: 3,
+              height: 42,
+              enabled: onEditTrackpadSpeed != null,
+              child: Row(
+                children: <Widget>[
+                  const Icon(
+                    Icons.speed_rounded,
+                    size: 16,
+                    color: Colors.white54,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Text(
+                          tr('触控板速度'),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white70,
+                          ),
+                        ),
+                        Text(
+                          tr('调整双指平移速度，不影响缩放'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 10,
+                            color: Colors.white38,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Text(
+                    '$trackpadSpeedPercent%',
+                    style: const TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                  const SizedBox(width: 5),
+                  const Icon(
+                    Icons.edit_rounded,
+                    size: 14,
+                    color: Colors.white54,
+                  ),
+                ],
+              ),
             ),
             _toggle(
               2,

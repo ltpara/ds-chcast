@@ -1,4 +1,5 @@
 #include "viewer_bridge.h"
+#include "../runner/runner_lifecycle_trace.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -10,6 +11,7 @@
 #include <flutter/standard_method_codec.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <set>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -30,8 +33,10 @@
 #include "chast/protocol.h"
 #include "chast/security.h"
 #include "gpu_frame_sink.h"
+#include "display_window_access.h"
 #include "security_key.h"
 #include "viewer_awake_request.h"
+#include "window_focus.h"
 
 namespace chast_viewer {
 
@@ -44,6 +49,7 @@ constexpr UINT_PTR kWindowSubclassId = 2;
 constexpr UINT kSecurityKeyDoneMessage = WM_APP + 0x51;
 constexpr UINT kKeyboardEscapeMessage = WM_APP + 0x52;
 constexpr UINT kLocalKeyMessage = WM_APP + 0x53;
+constexpr UINT kKeyboardShortcutMessage = WM_APP + 0x54;
 // The Dart side uses a server URL or host:port as the password-store key.
 constexpr size_t kMaxTrustKeyLength = 512;
 // Binds account-token ciphertext to its purpose, so a blob lifted from another
@@ -55,6 +61,34 @@ constexpr char kTicketSeedEntropy[] = "chast.access-ticket.v1";
 constexpr size_t kMaxProtectPlaintext = 64 * 1024;
 constexpr size_t kMaxProtectedText = 128 * 1024;
 constexpr size_t kMaxTicketText = 2048;
+
+void trace_viewer_awake_request(const char* event, ViewerEngine* viewer,
+                                bool held) {
+    char* testing = nullptr;
+    char* path = nullptr;
+    size_t testing_size = 0;
+    size_t path_size = 0;
+    const bool enabled = _dupenv_s(&testing, &testing_size,
+                                   "CHAST_NATIVE_TESTING") == 0 &&
+        testing != nullptr && std::string(testing) == "1" &&
+        _dupenv_s(&path, &path_size, "CHAST_NATIVE_TEST_AWAKE_TRACE") == 0 &&
+        path != nullptr && *path != '\0';
+    std::free(testing);
+    if (!enabled) {
+        std::free(path);
+        return;
+    }
+    const ViewerStatus status = viewer != nullptr ? viewer->Snapshot() : ViewerStatus{};
+    if (!status.audit_ref.empty()) {
+        std::ofstream output(path, std::ios::app);
+        if (output) {
+            output << event << '\t' << status.audit_ref << '\t'
+                   << static_cast<unsigned>(status.state) << '\t'
+                   << (held ? 1 : 0) << '\n';
+        }
+    }
+    std::free(path);
+}
 
 // A finished Windows Hello ceremony waiting for the platform thread. Both the
 // worker and the platform handler hold it through a shared_ptr, and `answered`
@@ -78,6 +112,11 @@ void complete_security_key(const std::shared_ptr<SecurityKeyCompletion>& complet
         completion->result->Error(completion->error_code, completion->error);
     }
 }
+
+constexpr std::array kRemoteShortcutIds = {
+    "toggleControl", "toggleFullscreen", "toggleRelativeMouse", "toggleStats", "leaveSession"};
+static_assert(kRemoteShortcutIds.size() ==
+              static_cast<size_t>(RemoteShortcutAction::kLeaveSession) + 1);
 
 const char* state_name(ViewerState state) {
     switch (state) {
@@ -396,6 +435,10 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window,
         [this] { PostMessageW(window_, kKeyboardEscapeMessage, 0, 0); },
         [this](const KBDLLHOOKSTRUCT& key, bool down, const chast::InputEvent& event, bool consumed) {
             return QueueLocalKey(key, down, event, consumed);
+        },
+        [this](RemoteShortcutAction action, uint32_t revision) {
+            PostMessageW(window_, kKeyboardShortcutMessage,
+                         static_cast<WPARAM>(action), static_cast<LPARAM>(revision));
         });
     channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
         engine_->messenger(), "chast/viewer", &flutter::StandardMethodCodec::GetInstance());
@@ -438,6 +481,7 @@ void ViewerBridge::Shutdown() {
     // A prompt still open will find its completion message dropped and reset
     // the flag itself; clearing it here covers the window already being gone.
     security_key_busy_->store(false);
+    SetKeyboardShortcutCapture(false);
     SetKeyCapture(false);
     local_text_input_.reset();
     keyboard_capture_.reset();
@@ -465,6 +509,7 @@ void ViewerBridge::Shutdown() {
     if (keep_awake_) {
         ReleaseViewerAwakeRequest();
         keep_awake_ = false;
+        trace_viewer_awake_request("shutdown", viewer_, keep_awake_);
     }
     if (session_) {
         session_->Detach(this);
@@ -478,6 +523,21 @@ void ViewerBridge::Shutdown() {
     camera_sink_ = nullptr;
     session_.reset();
     channel_.reset();
+}
+
+void ViewerBridge::SetTabActive(bool active) {
+    if (display_stream_ || shutting_down_) return;
+    const bool previous = tab_active_.exchange(active, std::memory_order_relaxed);
+    if (previous == active) return;
+    if (!active) {
+        if (local_text_input_) local_text_input_->Cancel();
+        SetRelativeMouse(false, 1.0);
+        SetKeyboardShortcutCapture(false);
+        SetKeyCapture(false);
+        ClearCursor();
+    } else if (channel_) {
+        channel_->InvokeMethod("sessionTabActivated", nullptr);
+    }
 }
 
 void ViewerBridge::EnsureIdentity() {
@@ -511,20 +571,13 @@ void ViewerBridge::HandleMethodCall(
     const std::string& method = call.method_name();
 
     if (display_stream_) {
-        // Child engines can only render and control their assigned stream.
-        // In particular they cannot stop, authenticate or reconfigure the session.
-        if (method != "displayStreams" && method != "bindDisplayOutput" &&
-            method != "takeDisplayCursors" && method != "focusDisplay" &&
-            method != "status" && method != "sendInput" && method != "releaseInput" &&
-            method != "setKeyCapture" && method != "keyboardState" &&
-            method != "setKeyboardMode" &&
-            method != "setFullscreen" && method != "closeSessionWindow") {
+        const auto access = display_window_access(
+            method, session_generation_.load() == session_->generation.load());
+        if (access == DisplayWindowAccess::Unsupported) {
             result->Error("display_window", "This window shares its parent session");
             return;
         }
-        if (session_generation_.load() != session_->generation.load() &&
-            method != "bindDisplayOutput" && method != "releaseInput" &&
-            method != "setKeyCapture" && method != "closeSessionWindow") {
+        if (access == DisplayWindowAccess::SessionEnded) {
             PostMessageW(window_, WM_CLOSE, 0, 0);
             result->Error("session_ended", "The parent session has ended");
             return;
@@ -535,10 +588,18 @@ void ViewerBridge::HandleMethodCall(
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         int64_t value = -1;
         std::string peer_id;
+        std::string recording_upload_context;
         if (args != nullptr) {
             map_int(*args, "stream", &value);
             if (map_string(*args, "peerId", &peer_id) && peer_id.size() > 256) {
                 result->Error("peer_id", "The peer ID is too long");
+                return;
+            }
+            if (map_string(*args, "recordingUploadContext",
+                           &recording_upload_context) &&
+                recording_upload_context.size() > 16384) {
+                result->Error("recording_upload_context",
+                              "The recording upload context is too long");
                 return;
             }
         }
@@ -602,15 +663,23 @@ void ViewerBridge::HandleMethodCall(
             result->Success(flutter::EncodableValue(true)); return;
         }
         result->Success(flutter::EncodableValue(open_display_window &&
-            open_display_window(session_, stream, peer_id, display_index,
+            open_display_window(session_, stream, peer_id,
+                                recording_upload_context, display_index,
                                 remote_display, remote_desktop,
                                 remote_display_count)));
         return;
     }
 
     if (method == "openSessionWindow") {
-        const auto* payload = std::get_if<std::string>(call.arguments());
-        if (!payload || !open_session_window || !open_session_window(*payload)) {
+        std::string request;
+        std::string label;
+        if (const auto* args = std::get_if<flutter::EncodableMap>(call.arguments())) {
+            map_string(*args, "request", &request);
+            map_string(*args, "label", &label);
+        }
+        if (request.empty() || request.size() > 1024 * 1024 ||
+            label.size() > 1024 || !open_session_window ||
+            !open_session_window(request, label)) {
             result->Error("window_open_failed",
                           "Could not open a session window (limit 16)");
         } else {
@@ -621,11 +690,14 @@ void ViewerBridge::HandleMethodCall(
     if (method == "setWindowCloseHandler") {
         const auto* enabled = std::get_if<bool>(call.arguments());
         window_close_handler_ = enabled != nullptr && *enabled;
+        TraceRunnerLifecycle("set-window-close-handler", window_, 0,
+                             window_close_handler_ ? 1 : 0);
         result->Success();
         return;
     }
     if (method == "closeSessionWindow") {
         window_close_handler_ = false;
+        TraceRunnerLifecycle("close-session-window", window_, WM_CLOSE, 0);
         result->Success();
         PostMessageW(window_, WM_CLOSE, 0, 0);
         return;
@@ -808,6 +880,7 @@ void ViewerBridge::HandleMethodCall(
         if (keep_awake_) {
             ReleaseViewerAwakeRequest();
             keep_awake_ = false;
+            trace_viewer_awake_request("stop", viewer_, keep_awake_);
         }
         // The plugin textures may be unregistered as soon as this returns.
         texture_sink_->SetOutput(nullptr);
@@ -822,12 +895,25 @@ void ViewerBridge::HandleMethodCall(
             result->Error("bad_args", "setKeepAwake wants a bool");
             return;
         }
-        if (*enabled && !keep_awake_) {
-            keep_awake_ = AcquireViewerAwakeRequest();
-        } else if (!*enabled && keep_awake_) {
-            ReleaseViewerAwakeRequest();
-            keep_awake_ = false;
+        const ViewerState state = viewer_->Snapshot().state;
+        const bool session_active = state == ViewerState::kConnecting ||
+            state == ViewerState::kHandshaking || state == ViewerState::kStreaming;
+        switch (viewer_awake_request_action(*enabled, keep_awake_, session_active)) {
+            case ViewerAwakeRequestAction::Acquire:
+                keep_awake_ = AcquireViewerAwakeRequest();
+                break;
+            case ViewerAwakeRequestAction::Release:
+                ReleaseViewerAwakeRequest();
+                keep_awake_ = false;
+                break;
+            case ViewerAwakeRequestAction::Reject:
+                trace_viewer_awake_request("set", viewer_, keep_awake_);
+                result->Success(flutter::EncodableValue(false));
+                return;
+            case ViewerAwakeRequestAction::Noop:
+                break;
         }
+        trace_viewer_awake_request("set", viewer_, keep_awake_);
         result->Success(flutter::EncodableValue(!*enabled || keep_awake_));
         return;
     }
@@ -1586,6 +1672,59 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setKeyboardShortcutCapture") {
+        const auto* enable = std::get_if<bool>(call.arguments());
+        if (enable == nullptr) {
+            result->Error("bad_args", "setKeyboardShortcutCapture wants a bool");
+            return;
+        }
+        SetKeyboardShortcutCapture(*enable);
+        result->Success(flutter::EncodableValue(
+            keyboard_shortcut_capture_.load(std::memory_order_relaxed)));
+        return;
+    }
+
+    if (method == "setKeyboardShortcuts") {
+        const auto* items = std::get_if<flutter::EncodableList>(call.arguments());
+        if (!items || items->size() > kRemoteShortcutIds.size()) {
+            result->Error("bad_args", "Invalid session shortcut list");
+            return;
+        }
+        std::vector<RemoteShortcutBinding> bindings;
+        for (const auto& item : *items) {
+            const auto* fields = std::get_if<flutter::EncodableMap>(&item);
+            std::string id;
+            int64_t usage = 0;
+            int64_t modifiers = 0;
+            if (!fields || !map_string(*fields, "action", &id) ||
+                !map_int(*fields, "keyUsage", &usage) ||
+                !map_int(*fields, "modifiers", &modifiers) ||
+                !valid_remote_shortcut(usage, modifiers)) {
+                result->Error("bad_args", "Invalid session shortcut binding");
+                return;
+            }
+            const auto found = std::find(kRemoteShortcutIds.begin(), kRemoteShortcutIds.end(), id);
+            if (found == kRemoteShortcutIds.end()) {
+                result->Error("bad_args", "Unknown session shortcut action");
+                return;
+            }
+            const auto action = static_cast<RemoteShortcutAction>(found - kRemoteShortcutIds.begin());
+            if (std::any_of(bindings.begin(), bindings.end(), [&](const RemoteShortcutBinding& existing) {
+                    return existing.action == action ||
+                        (existing.key_usage == usage && existing.modifiers == modifiers);
+                })) {
+                result->Error("bad_args", "Conflicting session shortcut binding");
+                return;
+            }
+            bindings.push_back({action, static_cast<uint16_t>(usage), static_cast<uint8_t>(modifiers)});
+        }
+        if (keyboard_capture_) {
+            keyboard_capture_->SetShortcuts(std::move(bindings), ++keyboard_shortcut_revision_);
+        }
+        result->Success();
+        return;
+    }
+
     if (method == "setRelativeMouse") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         bool enable = false;
@@ -1830,10 +1969,17 @@ void ViewerBridge::HandleMethodCall(
             }
         }
         std::string directory;
+        std::string base_path;
         if (const auto it = args->find(flutter::EncodableValue("directory"));
             it != args->end()) {
             if (const auto* value = std::get_if<std::string>(&it->second)) {
                 directory = *value;
+            }
+        }
+        if (const auto it = args->find(flutter::EncodableValue("basePath"));
+            it != args->end()) {
+            if (const auto* value = std::get_if<std::string>(&it->second)) {
+                base_path = *value;
             }
         }
         if (viewer_ == nullptr) {
@@ -1842,7 +1988,7 @@ void ViewerBridge::HandleMethodCall(
         }
         // Starting needs a streaming session; stopping must always be possible
         // so a teardown can turn the recorder off.
-        if (!viewer_->SetRecording(enabled, directory) && enabled) {
+        if (!viewer_->SetRecording(enabled, directory, base_path) && enabled) {
             result->Error("unavailable", "recording needs a live session with the host's consent");
             return;
         }
@@ -3054,9 +3200,27 @@ LRESULT CALLBACK ViewerBridge::WindowSubclassProc(HWND window, UINT message, WPA
                                                   LPARAM lparam, UINT_PTR id,
                                                   DWORD_PTR ref_data) {
     auto* bridge = reinterpret_cast<ViewerBridge*>(ref_data);
+    if (message == WM_CLOSE) {
+        const intptr_t state = bridge == nullptr ? -1 :
+            (bridge->window_close_handler_ ? 1 : 0) |
+            (bridge->shutting_down_ ? 2 : 0) |
+            (bridge->display_stream_ ? 4 : 0);
+        TraceRunnerLifecycle("viewer-bridge-close", window, message, state);
+    }
     if (message == kKeyboardEscapeMessage && bridge != nullptr && !bridge->shutting_down_) {
         bridge->SetRelativeMouse(false, 1.0);
         bridge->channel_->InvokeMethod("keyboardEscape", nullptr);
+        return 0;
+    }
+    if (message == kKeyboardShortcutMessage) {
+        if (bridge && !bridge->shutting_down_ && bridge->channel_ &&
+            bridge->tab_active_.load(std::memory_order_relaxed) &&
+            bridge->keyboard_shortcut_capture_.load(std::memory_order_relaxed) &&
+            bridge->keyboard_shortcut_revision_ == static_cast<uint32_t>(lparam) &&
+            wparam < kRemoteShortcutIds.size() && active_view_has_focus(window)) {
+            bridge->channel_->InvokeMethod("keyboardShortcut",
+                std::make_unique<flutter::EncodableValue>(std::string(kRemoteShortcutIds[wparam])));
+        }
         return 0;
     }
     if (message == kLocalKeyMessage && bridge != nullptr) {
@@ -3356,6 +3520,7 @@ bool ViewerBridge::SetKeyboardMode(const std::string& mode) {
 }
 
 void ViewerBridge::SetKeyCapture(bool enable) {
+    if (enable && !tab_active_.load(std::memory_order_relaxed)) enable = false;
     if (enable && display_stream_ && session_generation_.load() != session_->generation.load()) enable = false;
     if (keyboard_capture_) {
         const bool captured = keyboard_capture_->Enable(enable);
@@ -3385,6 +3550,14 @@ void ViewerBridge::SetKeyCapture(bool enable) {
             saved_himc_ = nullptr;
         }
     }
+}
+
+void ViewerBridge::SetKeyboardShortcutCapture(bool enable) {
+    if (enable && (!tab_active_.load(std::memory_order_relaxed) || shutting_down_)) {
+        enable = false;
+    }
+    const bool active = keyboard_capture_ && keyboard_capture_->EnableShortcuts(enable);
+    keyboard_shortcut_capture_.store(active, std::memory_order_relaxed);
 }
 
 void ViewerBridge::SetRelativeMouse(bool enable, double scale) {

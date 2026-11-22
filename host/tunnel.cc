@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <vector>
 
@@ -364,10 +365,17 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     if (!settings.proxy.empty()) {
         command += L" --proxy-stdin";
     }
+    if (!settings.tls_ca.empty()) {
+        add(L"--tls-ca", widen(settings.tls_ca));
+    }
     if (!settings.audit_spool.empty()) {
         // The agent signs and forwards the host's inbound audit records from
         // this spool; the path is shared with the host process, not a secret.
         add(L"--audit-spool", widen(settings.audit_spool));
+    }
+    if (settings.upload_recordings) {
+        command += L" --upload-recordings";
+        add(L"--recording-queue", widen(settings.recording_upload_queue));
     }
     if (!settings.policy_state.empty()) {
         // The agent caches the server's device policy there; the host reads
@@ -396,8 +404,37 @@ bool validate_tunnel_settings(const HostSettings& settings, std::string* error) 
         }
         return false;
     };
+    if (settings.upload_recordings && !settings.tunnel) {
+        return fail("主机录制归档需要启用服务端隧道");
+    }
+    if (settings.upload_recordings &&
+        (settings.recording_upload_queue.empty() ||
+         !std::filesystem::path(settings.recording_upload_queue).is_absolute())) {
+        return fail("主机录制归档队列路径无效");
+    }
+    std::filesystem::path ca_path;
+    if (!settings.tls_ca.empty()) {
+        if (settings.tls_ca.find_first_of("\r\n") != std::string::npos ||
+            settings.tls_ca.find('\0') != std::string::npos) {
+            return fail("私有 CA PEM 路径无效");
+        }
+        ca_path = std::filesystem::path(widen(settings.tls_ca));
+        if (!ca_path.is_absolute()) {
+            return fail("私有 CA PEM 路径必须是绝对路径");
+        }
+    }
     if (!settings.tunnel) {
         return true;
+    }
+    if (!settings.tls_ca.empty()) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(ca_path, ec) || ec) {
+            return fail("私有 CA PEM 文件不存在或不可读取");
+        }
+        std::ifstream ca_file(ca_path, std::ios::binary);
+        if (!ca_file) {
+            return fail("私有 CA PEM 文件不存在或不可读取");
+        }
     }
     if (settings.server_url.empty()) {
         return fail("尚未填写服务器地址");
@@ -683,6 +720,10 @@ bool TunnelProcess::running() const {
 
 uint32_t TunnelProcess::exit_code() const {
     return exit_code_;
+}
+
+uint32_t TunnelProcess::process_id() const {
+    return process_ == nullptr ? 0 : GetProcessId(process_);
 }
 
 DWORD WINAPI TunnelProcess::stdout_entry(void* self) {

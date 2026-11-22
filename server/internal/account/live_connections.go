@@ -194,8 +194,8 @@ func (s *Store) ApplyLiveSnapshot(hostID string, snapshot liveconn.Snapshot) (li
 				return liveconn.Snapshot{}, ErrLiveSequenceConflict
 			}
 			if now > previousHeartbeat {
-				if _, err := tx.Exec(`UPDATE host_runtimes SET last_heartbeat_at = ?
-					WHERE host_id = ? AND runtime_id = ?`, now, hostID, normalized.RuntimeID); err != nil {
+				if err := touchLiveRuntimeHeartbeatTx(tx, hostID, normalized.RuntimeID,
+					previousSequence, previousDigest, previousHeartbeat, terminal, now); err != nil {
 					return liveconn.Snapshot{}, err
 				}
 				if _, err := tx.Exec(`UPDATE live_connections SET last_seen_at = ?
@@ -212,21 +212,14 @@ func (s *Store) ApplyLiveSnapshot(hostID string, snapshot liveconn.Snapshot) (li
 	}
 
 	if missing {
-		_, err = tx.Exec(`INSERT INTO host_runtimes
-			(host_id, runtime_id, last_sequence, snapshot_digest, first_seen_at,
-			 last_heartbeat_at, terminal, terminal_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			hostID, normalized.RuntimeID, normalized.Sequence, digest, now, now,
-			normalized.Terminal, terminalAt(normalized.Terminal, now))
+		if err := insertLiveRuntimeTx(tx, hostID, normalized, digest, now); err != nil {
+			return liveconn.Snapshot{}, fmt.Errorf("write live runtime: %w", err)
+		}
 	} else {
-		_, err = tx.Exec(`UPDATE host_runtimes SET last_sequence = ?, snapshot_digest = ?,
-			last_heartbeat_at = ?, terminal = ?, terminal_at = ?
-			WHERE host_id = ? AND runtime_id = ?`,
-			normalized.Sequence, digest, now, normalized.Terminal,
-			terminalAt(normalized.Terminal, now), hostID, normalized.RuntimeID)
-	}
-	if err != nil {
-		return liveconn.Snapshot{}, fmt.Errorf("write live runtime: %w", err)
+		if err := updateLiveRuntimeTx(tx, hostID, normalized, digest, now,
+			previousSequence, previousDigest, previousHeartbeat, terminal); err != nil {
+			return liveconn.Snapshot{}, fmt.Errorf("write live runtime: %w", err)
+		}
 	}
 
 	for _, item := range normalized.Connections {
@@ -305,6 +298,61 @@ func (s *Store) ApplyLiveSnapshot(hostID string, snapshot liveconn.Snapshot) (li
 		return liveconn.Snapshot{}, err
 	}
 	return normalized, nil
+}
+
+func insertLiveRuntimeTx(tx *sql.Tx, hostID string, snapshot liveconn.Snapshot,
+	digest string, now int64) error {
+	result, err := tx.Exec(`INSERT INTO host_runtimes
+			(host_id, runtime_id, last_sequence, snapshot_digest, first_seen_at,
+			 last_heartbeat_at, terminal, terminal_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(host_id, runtime_id) DO NOTHING`,
+		hostID, snapshot.RuntimeID, snapshot.Sequence, digest, now, now,
+		snapshot.Terminal, terminalAt(snapshot.Terminal, now))
+	if err != nil {
+		return err
+	}
+	return requireLiveRuntimeWrite(result)
+}
+
+func updateLiveRuntimeTx(tx *sql.Tx, hostID string, snapshot liveconn.Snapshot,
+	digest string, now, previousSequence int64, previousDigest string,
+	previousHeartbeat int64, previousTerminal bool) error {
+	result, err := tx.Exec(`UPDATE host_runtimes SET last_sequence = ?, snapshot_digest = ?,
+		last_heartbeat_at = ?, terminal = ?, terminal_at = ?
+		WHERE host_id = ? AND runtime_id = ? AND last_sequence = ?
+			AND snapshot_digest = ? AND last_heartbeat_at = ? AND terminal = ?`,
+		snapshot.Sequence, digest, now, snapshot.Terminal,
+		terminalAt(snapshot.Terminal, now), hostID, snapshot.RuntimeID,
+		previousSequence, previousDigest, previousHeartbeat, previousTerminal)
+	if err != nil {
+		return err
+	}
+	return requireLiveRuntimeWrite(result)
+}
+
+func touchLiveRuntimeHeartbeatTx(tx *sql.Tx, hostID, runtimeID string,
+	sequence int64, digest string, previousHeartbeat int64,
+	terminal bool, now int64) error {
+	result, err := tx.Exec(`UPDATE host_runtimes SET last_heartbeat_at = ?
+		WHERE host_id = ? AND runtime_id = ? AND last_sequence = ?
+			AND snapshot_digest = ? AND last_heartbeat_at = ? AND terminal = ?`,
+		now, hostID, runtimeID, sequence, digest, previousHeartbeat, terminal)
+	if err != nil {
+		return err
+	}
+	return requireLiveRuntimeWrite(result)
+}
+
+func requireLiveRuntimeWrite(result sql.Result) error {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return ErrLiveSequenceConflict
+	}
+	return nil
 }
 
 func terminalAt(terminal bool, now int64) int64 {

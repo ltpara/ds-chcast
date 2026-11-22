@@ -1,7 +1,8 @@
 # chast 与 RustDesk 功能对照（2026-11-15）
 
 本文件是 2026-11-15 的功能差异入口，用本机 RustDesk 1.5.1 源码重新核对
-发射端、查看端、服务端和产品面。协议基线为工作区 **v77**。历史矩阵中与本文
+发射端、查看端、服务端和产品面。RustDesk 依据与本轮产品盘点日期固定在
+2026-11-15；当前 chast 实现状态更新至 2026-11-22，协议基线为 **v78**。历史矩阵中与本文
 冲突的行以本文为准：[全产品对照](rustdesk-full-parity-2026-11-07.md) 保留
 C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-module-comparison-2026-11-08.md)
 保留宿主逐模块记录。
@@ -10,7 +11,7 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
 
 | 项目 | 本轮口径 |
 | --- | --- |
-| 我方 | `D:/ds-chcast`，分支 `codex/pending-features-2026-11-14` 的工作区，协议 **v77** |
+| 我方 | `D:/ds-chcast`，分支 `codex/complete-workspace-2026-11-20` 的当前工作区，协议 **v78** |
 | RustDesk | 本机 `D:/rustdesk`，HEAD `55786aa`（2026-11-03），`Cargo.toml` 版本 **1.5.1**；浅克隆只有 1 个提交，不能用提交区间推断引入时间 |
 | 旧参照 | 多份旧文档固定 `7423dce`；`55786aa` 已补 Windows HDR 归一化、`static_refresh.rs`、QoS 重写和音频管道，旧文档中“参照没有 HDR/静止刷新”等判断已过期 |
 | 方法 | 两侧源码阅读；RustDesk 侧只取行为与字段语义，不引入其代码或依赖；我方证据来自既有构建/测试记录，本轮未重跑完整原生 ctest |
@@ -21,8 +22,10 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
 
 ## 2. 结论
 
-1. **没有发现新的 P0/P1 代码缺陷**。Windows 主机主链路（准入、采集、编码、
-   QUIC、输入、剪贴板、文件、终端、音频、录制、多屏、隐私）完整。
+1. 本表是功能差异盘点，不替代发布阻断审核。2026-11-22 已复现 C03：关闭一个
+   标签后 Flutter 查看端进程退出，退出来源未定位；按约束关闭路径未改，当前
+   生命周期/失败回滚验收未通过。Windows 主机主链路的其它通过范围仍以当前
+   状态文档及对应原始验收为准。
 2. 发射端在上一个审计基线 `55786aa` 之后的差距主要是**平台覆盖、分发工程
    和验收环境**，不是 Windows 单机主链路功能缺失。
 3. **v76 自由手写标注关闭了旧文档反复出现的“白板自由标注未实现”**。需要
@@ -32,11 +35,11 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
    因此这一项应从“缺口”改为“我方超出基线”，但真实双机等边界仍待验收。
    v77 进一步把 `Undo` 收紧为携带目标 `stroke_id`，多个查看窗口交错绘制时各自
    只撤销自己的笔画，不再误删其他窗口的最新笔迹。
-4. 查看端仍有若干 RustDesk 有、我方没有的**体验型 P3**：会话期间保持本机
-   唤醒、多连接标签页、用本机全部显示器铺满画面、视图缩放百分比、光标缩放、
-   “把剪贴板作为按键发送”、虚拟屏自定义分辨率（依赖 PLAT-01）、触控板速度/边缘滚动、
-   本地仅查看、SVG 剪贴板、忽略局域网发现、采集后端/低延迟开关、可配置快捷键。
-   其中会话结束备注已于 2026-11-15 落地（见 X13、X19），不再计入缺口。
+4. X01、X02、X04–X06、X08、X10、X16 此后已在当前工作区实现，证据状态分别更新在
+   下表；仍缺“跨本机多显示器铺满单画面”、查看端本地仅查看和忽略局域网发现等能力。
+   X16 可配置快捷键已于 2026-11-22 完成并通过 Windows Release loopback；触控板、SVG
+   应用互通和标签关闭仍有真实设备/运行验收边界。
+   会话结束备注已于 2026-11-15 落地（见 X13、X19）。
 5. 已决策暂缓/不做：远程打印、Switch Sides、AV1 4:4:4（及软件 AV1/VP8），
    理由见 [G19 决策](g19-decision-2026-11-14.md)；不应把它们混入“待修 bug”。
 6. 真实双机、跨网 NAT、真实 UAC/锁屏、物理摄像头/麦克风、Explorer/Office
@@ -73,22 +76,22 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
 
 | ID | 能力 | RustDesk 依据 | chast 现状 | 等级/优先级 |
 | --- | --- | --- | --- | --- |
-| X01 | 出站会话期间保持本机唤醒 | `kOptionKeepAwakeDuringOutgoingSessions`（`flutter/lib/consts.dart:232`） | 主机侧有按连接的 `keep_awake`；查看端无本地唤醒请求 | 缺失，P3 |
-| X02 | 多连接标签页 | `kOptionOpenNewConnInTabs`（`consts.dart:89`、`desktop_setting_page.dart:551`） | 每个会话独立 Flutter engine/窗口（最多 16），无标签页 | 缺失，P3 |
+| X01 | 出站会话期间保持本机唤醒 | `kOptionKeepAwakeDuringOutgoingSessions`（`flutter/lib/consts.dart:232`） | Windows 查看端共享进程级 PowerRequest，双 Flutter Release loopback 验证首连接结束保留兄弟租约、末连接结束后归零；真实 OS 电源行为待验收 | 已实现；单机通过、实机待验 |
+| X02 | 多连接标签页 | `kOptionOpenNewConnInTabs`（`consts.dart:89`、`desktop_setting_page.dart:551`） | 同一容器托管独立 Flutter engine；切换、输入释放/后台拒绝、媒体隔离、子窗口归属和父连接结束已有 loopback 证据；关闭单个标签会导致进程退出，来源未定位 | 部分；关闭生命周期为阻断项 |
 | X03 | 用本机全部显示器铺满远控画面 | `use_all_my_displays_for_the_remote_session`（`consts.dart:259`、`src/client.rs:3127`） | 支持逐远端显示独立窗口/全部远端显示；无“跨本机多显示器拼接单画面” | 缺失，P3 |
-| X04 | 自定义视图缩放百分比 | 工具栏 `Scale custom`（`remote_toolbar.dart:828`） | 仅适配/原始比例两种（`ViewFit`） | 缺失，P3 |
-| X05 | 光标缩放倍率 | 工具栏 `Zoom cursor`（`remote_toolbar.dart:1040`） | 光标按主机 DPI/辅助功能档位派生，无用户倍率 | 缺失，P3 |
-| X06 | 把剪贴板作为按键发送 | 工具栏 `Send clipboard keystrokes`（`remote_toolbar.dart:506`） | 只有“发送文本”输入框，无逐字符按键注入 | 缺失，P3 |
-| X07 | 每显示器自定义分辨率列表 | `PeerConfig::custom_resolutions`（`config.rs:383`）与重连重放 `try_change_init_resolution`（`ui_session_interface.rs:1589`），但条目只由虚拟屏切换路径写入（`handle_peer_switch_display`→`set_custom_resolution`，`ui_session_interface.rs:1546`），桌面端自由宽高输入也只对 RustDesk 虚拟屏出现（`isVirtualDisplayResolution`，`remote_toolbar.dart:2277`） | 物理输出两侧都只列主机枚举模式（我方 v77 `ListDisplayModes`/`SetDisplayMode`）；我方虚拟屏已接受 WxH 输入但会吸附到 `usbmmidd_default_modes()` 的 15 个固定尺寸（`virtual_display.cc:1456`），任意宽高随 PLAT-01 驱动解阻 | 部分；自定义尺寸依赖 PLAT-01（P3） |
-| X08 | 触控板速度、边缘滚动、滚动样式 | `trackpad-speed`（`flutter/lib/models/input_model.dart:446`）、`kOptionScrollStyle`/`kOptionEdgeScrollEdgeThickness`（`consts.dart:86-87`） | 有触控板 pan/zoom 手势、反向滚轮、左右键互换；无速度倍率/边缘滚动/样式 | 缺失，P3 |
+| X04 | 自定义视图缩放百分比 | 工具栏 `Scale custom`（`remote_toolbar.dart:828`） | 按设备保存自适应/原始大小基准及 5–1000% 缩放 | 已实现；真实 DPI/全屏场景待验 |
+| X05 | 光标缩放倍率 | 工具栏 `Zoom cursor`（`remote_toolbar.dart:1040`） | 独立光标倍率按设备保存，支持 25–400% | 已实现；真实 DPI/全屏场景待验 |
+| X06 | 把剪贴板作为按键发送 | 工具栏 `Send clipboard keystrokes`（`remote_toolbar.dart:506`） | 用户显式读取本地纯文本，预览/编辑并确认后调用现有 Unicode 键入及两端权限校验 | 已实现；真实 Windows 剪贴板/输入法待验 |
+| X07 | 每显示器自定义分辨率列表 | `PeerConfig::custom_resolutions`（`config.rs:383`）与重连重放 `try_change_init_resolution`（`ui_session_interface.rs:1589`），但条目只由虚拟屏切换路径写入（`handle_peer_switch_display`→`set_custom_resolution`，`ui_session_interface.rs:1546`），桌面端自由宽高输入也只对 RustDesk 虚拟屏出现（`isVirtualDisplayResolution`，`remote_toolbar.dart:2277`） | 物理输出两侧都只列主机枚举模式（我方 v78 `ListDisplayModes`/`SetDisplayMode`）；我方虚拟屏已接受 WxH 输入但会吸附到 `usbmmidd_default_modes()` 的 15 个固定尺寸（`virtual_display.cc:1456`），任意宽高随 PLAT-01 驱动解阻 | 部分；自定义尺寸依赖 PLAT-01（P3） |
+| X08 | 触控板速度、边缘滚动、滚动样式 | `trackpad-speed`（`flutter/lib/models/input_model.dart:446`）、`kOptionScrollStyle`/`kOptionEdgeScrollEdgeThickness`（`consts.dart:86-87`） | 平移速度倍率、滚动条/自动/边缘模式、感应距离和坐标重映射均已实现并有 Flutter 回归 | 已实现；触摸/触控板、混合 DPI 手感待实机验收 |
 | X09 | 查看端本地“仅查看” | `view_only`（`src/client.rs:3289`、`io_loop.rs:518`） | 有主机权限和工具栏输入开关；无查看端本地仅查看偏好 | 缺失，P3 |
-| X10 | SVG 剪贴板格式 | `ImageSvg = 23`（`libs/base/protos/message.proto:344`） | CCLB v4 无 SVG 格式（文本/HTML/RTF/DIB/PNG/文件列表） | 缺失，P3 |
+| X10 | SVG 剪贴板格式 | `ImageSvg = 23`（`libs/base/protos/message.proto:344`） | CCLB v5 / 协议 v78；`image/svg+xml` 原生读写、活动内容拒绝、16 MiB 上限、QUIC 双向往返和坏 SVG 下文本/PNG 回退均有本机证据 | 已实现；实际应用互通待验 |
 | X11 | 忽略局域网发现 | `Deny LAN discovery`（`desktop_setting_page.dart:1458`） | 主机 `--lan-discovery` 默认开启；查看端无忽略开关 | 缺失，P3 |
 | X12 | 采集后端与低延迟模式开关 | `DirectX capture`（`desktop_setting_page.dart:614`）、`Optimize reaction time`（`remote_toolbar.dart:859`） | DXGI/GDI 自动回退、QoS 自动；无用户开关 | 取舍，P3 |
 | X13 | 会话结束备注 | 断开时弹窗，向审计服务 `PUT /api/audit` 补写 `{guid, note}`，前提是本地选项 `allow-ask-for-note`、本会话已被服务器审计、审计 GUID 存在且尚无备注（`dialog.dart:1602`–`1720`） | 2026-11-15 已补：查看端侧栏「会话备注」开关（共享偏好 `view_ask_session_note`，**默认关闭**）→ 关闭会话时弹窗，备注随同一次 `POST /v1/account/connections` 落库（`session_page.dart:561`、`573`）；服务端 `connection_events.note` 列（schema v19，`migrate.go`），按 audit 引用只写一次，主机回执合并不覆盖（`connection.go:310`）；管理台连接审计显示并可按备注包含匹配过滤（`app.js:3021`、`index.html:496`），CSV 导出含 `note` 列 | 已具备（自动化通过；真实主机待人工） |
 | X14 | 插入锁屏热键（Win+L） | 工具栏 `Insert Lock`（`remote_toolbar.dart:671`）→ `sessionLockScreen` → 主机 `lock_screen()`；两侧都是直接锁屏，**不注入 Win+L** | 主机动作菜单 `ViewerHostAction.lockScreen` → `LockWorkStation()`，受主机“锁定屏幕”权限约束 | 已具备（入口在主机动作菜单） |
 | X15 | 共享地址簿密码 | `shared_password`（`src/client.rs:2883`、`4711`） | 密码仅本机 DPAPI；S20 端到端设计已写，未获产品确认，未改协议/DB/UI | 缺失，P2（待决策） |
-| X16 | 可配置快捷键 | `shortcut_model.dart`、`src/keyboard/shortcuts.rs` | 固定快捷键集合 | 缺失，P3 |
+| X16 | 可配置快捷键 | `shortcut_model.dart`、`src/keyboard/shortcuts.rs` | 支持切换远控、全屏、相对鼠标、统计面板和结束会话；可录制/清除，具有原生 hook 与 Flutter 回退 | 已实现；Release loopback 通过，物理键盘/IME 待验 |
 | X17 | 便携提权保存 OS 密码并自动输入 | `os-password`（`src/client.rs:3042`）、`input_os_password`（`4424`） | UAC 交接 + 手动 OS 登录输入；不保存凭据 | 部分/取舍，P3（安全边界） |
 | X18 | 查看端自动更新 | `kOptionAllowAutoUpdate`（`consts.dart:174`、`desktop_setting_page.dart:607`） | 有签名更新包，但需用户触发，由 `chast-tunnel apply-update` 替换重启；主机侧有自动更新 | 部分，P3（工程项） |
 | X19 | 初始剪贴板同步开关 | `sync_init_clipboard`（`config.rs:351`、`io_loop.rs:1811`），默认取 `UserDefaultConfig`，缺省关闭 | 2026-11-15 已补：剪贴板按钮长按 →「连接时同步本机剪贴板」，设备级偏好，**默认关闭**；开启后下次连接把本机当前剪贴板作为首个变更推送 | 已具备（自动化通过；真实主机待人工） |
@@ -96,8 +99,8 @@ C01–C51/S01–S27 的审查快照，[发射端模块对比](host-rustdesk-modu
 
 ### 4.2 说明
 
-- X01–X09、X16 是“RustDesk 有、我方没有”的用户可见选项；都可在现有
-  协议/本地偏好上增量实现，不需要重做媒体链路。X14 是此前误判：RustDesk 的
+- X03、X09、X11 与 X16 仍需按产品范围实现或决定；其它已交付行的真实设备验收
+  不应误报为能力缺失。X14 是此前误判：RustDesk 的
   `Insert Lock` 同样只是请求主机锁屏，我方已有等价主机动作。
 - X07 复核：RustDesk 的自由宽高输入只对虚拟屏开放（`isVirtualDisplayResolution`），`custom_resolutions` 由虚拟屏切换路径写入并在重连时重放（`try_change_init_resolution`）。物理输出的分辨率菜单两侧一样只列主机枚举模式，因此我方不做“物理屏任意分辨率”，该能力随 PLAT-01 虚拟屏驱动一起验收。
 - X13 已落地（2026-11-15）：RustDesk 用断开时的 `PUT /api/audit` 按 audit GUID 补写备注，我方没有独立的按行更新接口，而是把备注挂在会话结束时的那一次 `POST /v1/account/connections` 上——审计行本来就是查看端在这一刻创建的，所以“只写一次”自然成立：主机回执合并时 `mergeConnectionNote` 保留首个非空值（`connection.go:310`），同一 audit 引用的重复上报也不会覆盖。备注上限 240 字符，服务端 v19 迁移加 `connection_events.note`，管理台按包含匹配过滤（`LIKE ... ESCAPE` 同时兼容 SQLite 与 PostgreSQL），CSV 导出多一列。查看端开关是共享偏好且**默认关闭**，只有本次会话确实被账号服务器审计时才弹窗。

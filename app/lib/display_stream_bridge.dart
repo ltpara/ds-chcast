@@ -1,4 +1,8 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
+
+import 'session_window.dart';
 
 class DisplayVideoStream {
   const DisplayVideoStream({
@@ -94,10 +98,16 @@ class DisplayPointer {
 /// identify decoder lifetimes; display indices are only selection arguments.
 class DisplayStreamBridge {
   static const MethodChannel _channel = MethodChannel('chast/viewer');
-  static Future<bool> openWindow(int streamId, {String peerId = ''}) async =>
+  static Future<bool> openWindow(
+    int streamId, {
+    String peerId = '',
+    RecordingUploadContext? recordingUploadContext,
+  }) async =>
       await _channel.invokeMethod<bool>('openDisplayWindow', <String, Object>{
         'stream': streamId,
         'peerId': peerId,
+        if (recordingUploadContext != null)
+          'recordingUploadContext': jsonEncode(recordingUploadContext.toJson()),
       }) ??
       false;
 

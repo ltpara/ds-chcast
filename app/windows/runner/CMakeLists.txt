@@ -42,6 +42,8 @@ add_executable(${BINARY_NAME} WIN32
   "display_layout.cc"
   "flutter_window.cpp"
   "main.cpp"
+  "session_tab_host.cpp"
+  "session_tab_visibility.cpp"
   "utils.cpp"
   "win32_window.cpp"
   "${VIEWER_DIR}/viewer_bridge.cc"
@@ -54,6 +56,7 @@ add_executable(${BINARY_NAME} WIN32
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+target_compile_options(${BINARY_NAME} PRIVATE /utf-8)
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")
@@ -68,6 +71,16 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
+
+# Opt-in real-embedder regression. Requires the existing Flutter Release data;
+# excluded from product builds and run by test-flutter-window-initialization.ps1.
+add_executable(chast-flutter-view-initialization-test EXCLUDE_FROM_ALL
+  "${CHAST_ROOT}/tests/flutter_view_initialization_test.cc")
+target_include_directories(chast-flutter-view-initialization-test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(chast-flutter-view-initialization-test PRIVATE cxx_std_17)
+target_link_libraries(chast-flutter-view-initialization-test PRIVATE
+  flutter user32 ole32 comctl32)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "imm32.lib" "comctl32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib" "ole32.lib" "comdlg32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "PowrProf.lib")

@@ -1,4 +1,5 @@
 #include "flutter_window.h"
+#include "flutter_view_initialization.h"
 
 #include <optional>
 
@@ -11,12 +12,16 @@ constexpr UINT kMaxDisplayTopologyRetries = 40;
 #include "flutter/generated_plugin_registrant.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project,
-                             std::function<bool(const std::string&)> open_window,
+                             OpenSessionWindow open_window,
                              OpenDisplayWindow open_display,
                              std::shared_ptr<chast_viewer::SharedViewerSession> session,
-                             std::optional<uint32_t> stream)
+                             std::optional<uint32_t> stream,
+                             bool tab_child,
+                             bool managed_visibility)
     : project_(project), open_window_(std::move(open_window)),
-      open_display_(std::move(open_display)), session_(std::move(session)), stream_(stream) {}
+      open_display_(std::move(open_display)), session_(std::move(session)),
+      stream_(stream), tab_child_(tab_child),
+      managed_visibility_(managed_visibility) {}
 
 FlutterWindow::~FlutterWindow() {
   // Tearing the engine down from WM_DESTROY crashes flutter_windows.dll when
@@ -38,8 +43,12 @@ bool FlutterWindow::OnCreate() {
 
   // The size here must match the window dimensions to avoid unnecessary surface
   // creation / destruction in the startup path.
-  flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
-      frame.right - frame.left, frame.bottom - frame.top, project_);
+  {
+    ScopedFlutterViewInitialization initialization;
+    if (!initialization.ready()) return false;
+    flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
+        frame.right - frame.left, frame.bottom - frame.top, project_);
+  }
   // Ensure that basic setup of the controller was successful.
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {
     return false;
@@ -52,8 +61,8 @@ bool FlutterWindow::OnCreate() {
   viewer_bridge_->open_session_window = open_window_;
   viewer_bridge_->open_display_window = open_display_;
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
+  flutter_controller_->engine()->SetNextFrameCallback([this]() {
+    if (!tab_child_ && !managed_visibility_) this->Show();
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -74,6 +83,21 @@ void FlutterWindow::SetCloseHook(std::function<void(HWND)> hook) {
 
 void FlutterWindow::SetDisplayTopologyHook(std::function<bool(HWND)> hook) {
   display_topology_hook_ = std::move(hook);
+}
+
+void FlutterWindow::SetTabVisible(bool visible) {
+  if (!tab_child_) return;
+  if (viewer_bridge_) viewer_bridge_->SetTabActive(visible);
+  SetVisible(visible);
+  if (visible) FocusChildContent();
+}
+
+void FlutterWindow::SetTabInputActive(bool active) {
+  if (viewer_bridge_) viewer_bridge_->SetTabActive(active);
+}
+
+const void* FlutterWindow::session_identity() const {
+  return viewer_bridge_ ? viewer_bridge_->session_identity() : nullptr;
 }
 
 LRESULT

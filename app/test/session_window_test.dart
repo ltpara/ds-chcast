@@ -108,7 +108,10 @@ void main() {
     mock((MethodCall call) async => true);
     expect(await request().open(), isTrue);
     expect(calls.single.method, 'openSessionWindow');
-    expect(calls.single.arguments, request().encode());
+    expect(calls.single.arguments, <String, Object?>{
+      'request': request().encode(),
+      'label': 'Desk',
+    });
   });
 
   test('open falls back when no runner answers', () async {

@@ -59,6 +59,7 @@ bool merge_service_settings(const HostSettings& original, const HostSettings& ed
         }
     } else {
         APPLY(tunnel); APPLY(server_url); APPLY(server_key); APPLY(host_key); APPLY(proxy);
+        APPLY(tls_ca);
         APPLY(tunnel_id); APPLY(tunnel_old_id); APPLY(tunnel_key); APPLY(tunnel_listen);
     }
 #undef APPLY

@@ -139,6 +139,61 @@ func TestLiveConnectionSequenceAndIdentityConflicts(t *testing.T) {
 	}
 }
 
+func TestLiveConnectionSnapshotRejectsStaleWriterAcrossStores(t *testing.T) {
+	first := openGroupStore(t)
+	second, err := Open(first.path)
+	if err != nil {
+		t.Fatalf("open second store: %v", err)
+	}
+	defer second.Close()
+
+	now := time.Date(2026, 11, 16, 5, 0, 0, 0, time.UTC)
+	first.SetClock(func() time.Time { return now })
+	second.SetClock(func() time.Time { return now.Add(time.Second) })
+	mustLiveSnapshot(t, first, testLiveSnapshot(liveRuntimeA, 1, false, liveConnA))
+
+	var previousSequence, previousHeartbeat int64
+	var previousDigest string
+	var previousTerminal bool
+	if err := first.db.QueryRow(`SELECT last_sequence, snapshot_digest,
+		last_heartbeat_at, terminal FROM host_runtimes
+		WHERE host_id = ? AND runtime_id = ?`, "devbox", liveRuntimeA).Scan(
+		&previousSequence, &previousDigest, &previousHeartbeat, &previousTerminal); err != nil {
+		t.Fatal(err)
+	}
+
+	staleSnapshot, err := testLiveSnapshot(liveRuntimeA, 2, false, liveConnB).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleDigest, err := liveconn.Digest(staleSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustLiveSnapshot(t, second, testLiveSnapshot(liveRuntimeA, 3, false, liveConnC))
+
+	tx, err := first.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = updateLiveRuntimeTx(tx, "devbox", staleSnapshot, staleDigest,
+		now.Add(2*time.Second).UnixMilli(), previousSequence, previousDigest,
+		previousHeartbeat, previousTerminal)
+	if !errors.Is(err, ErrLiveSequenceConflict) {
+		t.Fatalf("stale cross-store writer error = %v, want sequence conflict", err)
+	}
+	_ = tx.Rollback()
+
+	var storedSequence int64
+	if err := first.db.QueryRow(`SELECT last_sequence FROM host_runtimes
+		WHERE host_id = ? AND runtime_id = ?`, "devbox", liveRuntimeA).Scan(&storedSequence); err != nil {
+		t.Fatal(err)
+	}
+	if storedSequence != 3 {
+		t.Fatalf("stored sequence = %d, want 3", storedSequence)
+	}
+}
+
 func TestLiveDisconnectIdempotencyReceiptAndExactTarget(t *testing.T) {
 	store := openGroupStore(t)
 	now := time.Date(2026, 11, 16, 4, 0, 0, 0, time.UTC)

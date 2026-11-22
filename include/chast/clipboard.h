@@ -2,7 +2,7 @@
 
 // Multi-format clipboard content, its wire container, and the Win32 backend.
 //
-// A copied item carries whichever of text, HTML, RTF, DIB and PNG the source
+// A copied item carries whichever of text, HTML, RTF, DIB, PNG and SVG the source
 // application published. One CCLB stream carries the whole set; the receiver
 // writes every format back to its own clipboard in one ownership change, so a
 // paste target can pick the richest one it understands.
@@ -32,9 +32,10 @@ enum class ClipboardFormat : uint8_t {
     Dib = 3,       // CF_DIB bytes: BITMAPINFOHEADER + palette + pixels
     FileList = 4,  // cf. ClipboardFileEntry below; never carries bytes
     Png = 5,       // Complete PNG file; v75, preferred for large images
+    Svg = 6,       // Static image/svg+xml; v78, no active or external content
 };
 
-inline constexpr uint8_t kMaxClipboardFormats = 6;
+inline constexpr uint8_t kMaxClipboardFormats = 7;
 // Text travels on the CCLB stream outside the control queue, so the legacy
 // 256 KiB ClipboardUpdate limit (kMaxClipboardBytes) no longer applies to a
 // rich item; text gets the same budget as HTML/RTF.
@@ -47,19 +48,21 @@ inline constexpr uint32_t kMaxClipboardImageBytes = 32u * 1024u * 1024u;
 // enters the stream. It is never sent at this size.
 inline constexpr uint32_t kMaxClipboardDibSourceBytes = 160u * 1024u * 1024u;
 inline constexpr uint32_t kMaxClipboardPngBytes = 64u * 1024u * 1024u;
+inline constexpr uint32_t kMaxClipboardSvgBytes = 16u * 1024u * 1024u;
 inline constexpr uint32_t kMaxClipboardPngDimension = 16384;
 inline constexpr uint64_t kMaxClipboardPngPixels = 64ull * 1024ull * 1024ull;
-// Text (4), HTML (4), RTF (4), DIB (32), PNG (64) and FileList (64 KiB).
+// Text (4), HTML (4), RTF (4), DIB (32), PNG (64), SVG (16) and FileList (64 KiB).
 // Keep room for every valid format even when an item carries both images.
-inline constexpr uint32_t kMaxClipboardTotalBytes = 112u * 1024u * 1024u;
+inline constexpr uint32_t kMaxClipboardTotalBytes = 128u * 1024u * 1024u;
 inline constexpr uint32_t kMaxClipboardFileListBytes = 64u * 1024u;
 inline constexpr uint16_t kMaxClipboardFileEntries = 256;
 
 inline constexpr char kClipboardStreamMagic[4] = {'C', 'C', 'L', 'B'};
-// v4 (protocol v75): adds ClipboardFormat::Png. Per-entry zstd compression was
-// introduced in stream v3. The Hello version gate makes old CCLB versions
+// v5 (protocol v78): adds ClipboardFormat::Svg. v4 added PNG (protocol v75).
+// Per-entry zstd compression was introduced in stream v3. The Hello version
+// gate makes old CCLB versions
 // unreachable, so the stream codec has no down-version fallback.
-inline constexpr uint8_t kClipboardStreamVersion = 4;
+inline constexpr uint8_t kClipboardStreamVersion = 5;
 // magic (4) + version (1) + format count (1) + reserved (2) + hash (8) +
 // total raw payload length (8) + sender generation (8, v59).
 inline constexpr size_t kClipboardStreamHeaderSize = 32;

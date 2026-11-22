@@ -170,6 +170,7 @@ struct DesktopStreamPool::Source {
     struct Metadata {
         std::shared_ptr<const CursorInfo> cursor;
         UINT width = 0, height = 0, bitrate = 0, fps = 0;
+        RateRequest rate_request;
         VideoCodec codec = VideoCodec::H264;
         VideoChroma chroma = VideoChroma::Yuv420;
         bool encoder_recovery_pending = false;
@@ -189,6 +190,7 @@ struct DesktopStreamPool::Source {
             next.codec = encoder->codec();
             next.chroma = encoder->chroma();
             next.bitrate = encoder->bitrate(); next.fps = encoder->framerate();
+            next.rate_request = {requested_rate, requested_fps, policy_ratio};
         }
         std::lock_guard lock(metadata_mutex);
         metadata = std::move(next);
@@ -1728,13 +1730,15 @@ UINT DesktopStreamPool::configured_bitrate(const IDxgiCapturer& capturer) {
     return capture.source->call([&] { return capture.source->initial_bitrate; });
 }
 
-bool DesktopStreamPool::read_rate(const IVideoEncoder& encoder, UINT& bitrate, UINT& fps) {
+bool DesktopStreamPool::read_rate(const IVideoEncoder& encoder, UINT& bitrate, UINT& fps,
+                                 RateRequest* request) {
     const auto& adapter = dynamic_cast<const Encoder&>(encoder);
     const auto state = adapter.source->read_metadata();
     if (!state.width || state.width != adapter.width() || state.height != adapter.height() ||
         state.codec != adapter.codec() || state.chroma != adapter.chroma()) return false;
     bitrate = state.bitrate;
     fps = state.fps;
+    if (request) *request = state.rate_request;
     return true;
 }
 

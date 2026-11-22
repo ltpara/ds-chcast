@@ -46,6 +46,26 @@ const Map<String, String> kEnglishSession = <String, String>{
   'Ctrl+Alt+Del 未发送：{detail}': 'Ctrl+Alt+Del not sent: {detail}',
   'Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪':
       'Ctrl+Alt+Del could not be queued: remote input is not ready',
+  '会话快捷键': 'Session shortcuts',
+  '特殊按键与快捷键设置': 'Special keys and shortcut settings',
+  '切换远程控制': 'Toggle remote control',
+  '切换全屏': 'Toggle fullscreen',
+  '切换相对鼠标': 'Toggle relative mouse',
+  '切换统计面板': 'Toggle statistics',
+  '结束会话': 'End session',
+  '未设置': 'Not set',
+  '正在录制…': 'Recording…',
+  '录制快捷键': 'Record shortcut',
+  '取消录制': 'Cancel recording',
+  '清除快捷键': 'Clear shortcut',
+  '按下 Ctrl、Alt 或 Shift 加一个按键；Esc 取消录制':
+      'Press Ctrl, Alt, or Shift plus a key; Esc cancels recording',
+  '快捷键至少需要 Ctrl、Alt 或 Shift':
+      'A shortcut must include Ctrl, Alt, or Shift',
+  '此组合保留给系统或相对鼠标退出':
+      'This combination is reserved by Windows or relative-mouse exit',
+  '此快捷键已分配给其他操作':
+      'This shortcut is already assigned to another action',
   '{denial}\n\n服务端说明：{reason}': '{denial}\n\nHost message: {reason}',
   '主机不允许隐私模式': 'The host does not allow privacy mode',
   '主机不支持发送 Ctrl+Alt+Del（托盘主机需改用服务运行）':
@@ -284,6 +304,8 @@ const Map<String, String> kEnglishSession = <String, String>{
   '保留最近 10 个录制': 'Keep the last 10 recordings',
   '保留最近 30 个录制': 'Keep the last 30 recordings',
   '录制失败：{error}': 'Recording failed: {error}',
+  '主机已撤销录制权限，录制已停止':
+      'The host revoked recording permission. Recording has stopped.',
   '恢复剪贴板同步': 'Resume clipboard sync',
   '抑制平稳底噪，语音优先': 'Suppress steady noise, prioritize voice',
   '截图失败': 'Screenshot failed',
@@ -416,6 +438,9 @@ const Map<String, String> kEnglishSession = <String, String>{
   '文本过长：{bytes} / {kMaxTextInputBytes} 字节':
       'Text too long: {bytes} / {kMaxTextInputBytes} bytes',
   '输入要在这台主机上键入的文本': 'Enter the text to type on the host',
+  '从本地剪贴板取文本': 'Load text from the local clipboard',
+  '剪贴板没有纯文本': 'The clipboard has no plain text',
+  '无法读取本地剪贴板': 'Could not read the local clipboard',
   '需要远程键鼠控制': 'Turn on remote input first',
   '我': 'Me',
   '收 {p1} · 发 {p2}': 'Rx {p1} · Tx {p2}',
@@ -698,7 +723,16 @@ const Map<String, String> kEnglishSession = <String, String>{
   '已启动远程桌面：127.0.0.1:{port}': 'Opened Remote Desktop at 127.0.0.1:{port}',
   '无法启动远程桌面：{error}': 'Could not open Remote Desktop: {error}',
   '鼠标': 'Mouse',
-  '鼠标：反向滚轮、左右键互换、相对鼠标': 'Mouse: reverse wheel, swap buttons, relative mouse',
+  '鼠标：反向滚轮、左右键互换、触控板速度、相对鼠标':
+      'Mouse: reverse wheel, swap buttons, trackpad speed, relative mouse',
+  '触控板速度': 'Trackpad speed',
+  '画布滚动方式': 'Canvas scrolling',
+  '滚动条': 'Scrollbars',
+  '自动滚动': 'Auto scroll',
+  '边缘滚动': 'Edge scroll',
+  '边缘感应范围': 'Edge zone',
+  '调整双指平移速度，不影响缩放': 'Adjust two-finger pan speed; zoom is unchanged',
+  '触控板速度倍率': 'Trackpad speed multiplier',
   '反向滚轮': 'Reverse wheel',
   '滚轮方向与主机相反': 'Flip the wheel direction',
   '交换左右键': 'Swap left and right buttons',

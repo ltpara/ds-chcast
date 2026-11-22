@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -5205,6 +5206,14 @@ void test_clipboard_container() {
           "the clipboard PNG fixture is encoded");
     content.formats.push_back(png);
 
+    chast::ClipboardFormatData svg;
+    svg.format = chast::ClipboardFormat::Svg;
+    const std::string svg_markup =
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\">"
+        "<path fill=\"#fff\" d=\"M0 0h2v2H0z\"/></svg>";
+    svg.data.assign(svg_markup.begin(), svg_markup.end());
+    content.formats.push_back(svg);
+
     const uint64_t hash = chast::clipboard_content_hash(content);
     check(hash != 0, "clipboard content hashes to a non-zero value");
     chast::ClipboardContent reordered = content;
@@ -5220,16 +5229,17 @@ void test_clipboard_container() {
     chast::ClipboardContent decoded;
     check(chast::decode_clipboard_stream(stream.data(), stream.size(), decoded, &error),
           "CCLB stream round-trips");
-    check(decoded.seq == content.seq && decoded.hash == hash && decoded.formats.size() == 5 &&
+    check(decoded.seq == content.seq && decoded.hash == hash && decoded.formats.size() == 6 &&
               decoded.formats[0].format == chast::ClipboardFormat::Text &&
               decoded.formats[1].format == chast::ClipboardFormat::Html &&
               decoded.formats[2].format == chast::ClipboardFormat::Rtf &&
               decoded.formats[3].format == chast::ClipboardFormat::Dib &&
               decoded.formats[4].format == chast::ClipboardFormat::Png &&
+              decoded.formats[5].format == chast::ClipboardFormat::Svg &&
               decoded.formats[0].data == text.data &&
               decoded.formats[1].data == html.data &&
               decoded.formats[3].data == dib.data &&
-              decoded.formats[4].data == png.data,
+              decoded.formats[4].data == png.data && decoded.formats[5].data == svg.data,
           "CCLB stream keeps every format and byte");
 
     auto alters = [&](size_t at, uint8_t value, const char* what) {
@@ -5240,7 +5250,7 @@ void test_clipboard_container() {
               what);
     };
     alters(8, static_cast<uint8_t>(stream[8] ^ 0xFF), "a CCLB with a wrong hash is rejected");
-    alters(4, 2, "a v2 CCLB is rejected by the v4 decoder");
+    alters(4, 4, "a v4 CCLB is rejected by the v5 decoder");
     alters(5, 9, "a CCLB with too many formats is rejected");
     chast::ClipboardContent dropped;
     check(!chast::decode_clipboard_stream(stream.data(), stream.size() - 1, dropped, &error),
@@ -5333,6 +5343,29 @@ void test_clipboard_container() {
                                  wide_png, &error),
           "an oversized PNG fixture is encoded");
     rejects_png(std::move(wide_png), "a PNG wider than the dimension cap is rejected");
+
+    auto rejects_svg = [&](std::string markup, const char* what) {
+        chast::ClipboardContent candidate;
+        chast::ClipboardFormatData entry;
+        entry.format = chast::ClipboardFormat::Svg;
+        entry.data.assign(markup.begin(), markup.end());
+        candidate.formats.push_back(std::move(entry));
+        check(!chast::valid_clipboard_content(candidate, &error), what);
+    };
+    rejects_svg("<svg>", "an SVG with an unclosed root is rejected");
+    rejects_svg("<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///secret'>]>"
+                "<svg xmlns='http://www.w3.org/2000/svg'>&x;</svg>",
+                "SVG external entities and DTDs are rejected");
+    rejects_svg("<svg xmlns='http://www.w3.org/2000/svg'>"
+                "<script>alert(1)</script></svg>",
+                "SVG scripts are rejected");
+    rejects_svg("<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>",
+                "SVG event handlers are rejected");
+    rejects_svg("<svg xmlns='http://www.w3.org/2000/svg'>"
+                "<image href='https://example.invalid/pixel.svg'/></svg>",
+                "SVG external image resources are rejected");
+    rejects_svg("<svg xmlns='http://www.w3.org/2000/svg'><style>*{fill:red}</style></svg>",
+                "SVG stylesheet elements are rejected");
 
     // A rich item's text rides the CCLB stream, not the legacy control
     // message, so it must not inherit that message's 256 KiB limit.
@@ -5466,14 +5499,29 @@ void test_clipboard_container() {
         packed_png.data = build_png(chast::kMaxClipboardPngBytes);
         packed.formats.push_back(std::move(packed_png));
 
+        chast::ClipboardFormatData packed_svg;
+        packed_svg.format = chast::ClipboardFormat::Svg;
+        const std::string svg_start = "<svg xmlns=\"http://www.w3.org/2000/svg\">";
+        const std::string svg_end = "</svg>";
+        std::string svg_payload = svg_start;
+        svg_payload.append(chast::kMaxClipboardSvgBytes - svg_start.size() - svg_end.size(), ' ');
+        svg_payload += svg_end;
+        packed_svg.data.assign(svg_payload.begin(), svg_payload.end());
+        packed.formats.push_back(std::move(packed_svg));
+
         check(chast::valid_clipboard_content(packed, &error),
               "a two-image clipboard at the format limits validates");
         const std::vector<uint8_t> packed_stream = chast::encode_clipboard_stream(packed);
         check(!packed_stream.empty() &&
                   packed_stream.size() <= chast::kMaxClipboardTotalBytes + 64u * 1024u,
               "a two-image clipboard fits the transport stream bound");
-        check(packed_stream.size() > 96u * 1024u * 1024u,
-              "the two-image item outgrows the 96 MiB receive budget it once hit");
+        const uint64_t packed_raw_bytes = std::accumulate(
+            packed.formats.begin(), packed.formats.end(), uint64_t{0},
+            [](uint64_t total, const chast::ClipboardFormatData& entry) {
+                return total + entry.data.size();
+            });
+        check(packed_raw_bytes > 112u * 1024u * 1024u,
+              "the SVG and two-image raw item exceeds the previous 112 MiB budget");
     }
 }
 

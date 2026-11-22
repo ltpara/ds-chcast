@@ -4,6 +4,7 @@
 #include <flutter_windows.h>
 
 #include "resource.h"
+#include "runner_lifecycle_trace.h"
 
 namespace {
 
@@ -141,17 +142,25 @@ bool Win32Window::CreateAtPhysicalBounds(const std::wstring& title,
                     bounds.bottom - bounds.top);
 }
 
+bool Win32Window::CreateChild(const std::wstring& title, HWND parent,
+                              const RECT& bounds) {
+  if (parent == nullptr || !IsWindow(parent)) return false;
+  return CreateImpl(title, bounds.left, bounds.top, bounds.right - bounds.left,
+                    bounds.bottom - bounds.top,
+                    WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, parent);
+}
+
 bool Win32Window::CreateImpl(const std::wstring& title, int x, int y, int width,
-                             int height) {
+                             int height, DWORD style, HWND parent) {
   Destroy();
 
   const wchar_t* window_class =
       WindowClassRegistrar::GetInstance()->GetWindowClass();
 
   HWND window = CreateWindow(
-      window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
+      window_class, title.c_str(), style,
       x, y, width, height,
-      nullptr, nullptr, GetModuleHandle(nullptr), this);
+      parent, nullptr, GetModuleHandle(nullptr), this);
 
   if (!window) {
     return false;
@@ -166,11 +175,26 @@ bool Win32Window::Show() {
   return ShowWindow(window_handle_, SW_SHOWNORMAL);
 }
 
+void Win32Window::SetVisible(bool visible) {
+  if (window_handle_ != nullptr)
+    ShowWindow(window_handle_, visible ? SW_SHOW : SW_HIDE);
+}
+
+void Win32Window::FocusChildContent() {
+  if (child_content_ != nullptr && IsWindowVisible(child_content_))
+    SetFocus(child_content_);
+}
+
 // static
 LRESULT CALLBACK Win32Window::WndProc(HWND const window,
                                       UINT const message,
                                       WPARAM const wparam,
                                       LPARAM const lparam) noexcept {
+  if (message == WM_CLOSE || message == WM_DESTROY ||
+      message == WM_NCDESTROY) {
+    TraceRunnerLifecycle("window-message", window, message,
+                         static_cast<intptr_t>(wparam));
+  }
   if (message == WM_NCCREATE) {
     auto window_struct = reinterpret_cast<CREATESTRUCT*>(lparam);
     SetWindowLongPtr(window, GWLP_USERDATA,

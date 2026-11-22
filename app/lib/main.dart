@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -26,7 +27,8 @@ void main(List<String> args) {
 
 /// Display windows add the peer ID after the stream so the child engine can
 /// read the same per-device preferences as the session that opened it.
-({int stream, String peerId})? _displayWindowLaunch(List<String> args) {
+({int stream, String peerId, RecordingUploadContext? uploadContext})?
+_displayWindowLaunch(List<String> args) {
   if (args.length < 2 || args.first != '--display-window') {
     return null;
   }
@@ -34,13 +36,30 @@ void main(List<String> args) {
   if (stream == null) {
     return null;
   }
-  if (args.length == 2) {
-    return (stream: stream, peerId: '');
+  String peerId = '';
+  RecordingUploadContext? uploadContext;
+  int index = 2;
+  while (index < args.length) {
+    if (index + 1 >= args.length) return null;
+    switch (args[index]) {
+      case '--peer-id':
+        peerId = args[index + 1];
+        break;
+      case '--recording-upload':
+        try {
+          uploadContext = RecordingUploadContext.fromJson(
+            jsonDecode(args[index + 1]),
+          );
+        } on FormatException {
+          return null;
+        }
+        break;
+      default:
+        return null;
+    }
+    index += 2;
   }
-  if (args.length == 4 && args[2] == '--peer-id') {
-    return (stream: stream, peerId: args[3]);
-  }
-  return null;
+  return (stream: stream, peerId: peerId, uploadContext: uploadContext);
 }
 
 /// The update helper keeps the previous executable until this marker exists.
@@ -69,7 +88,8 @@ class ChastApp extends StatelessWidget {
     this.sessionWindow,
     this.displayWindow,
   });
-  final ({int stream, String peerId})? displayWindow;
+  final ({int stream, String peerId, RecordingUploadContext? uploadContext})?
+  displayWindow;
 
   final DeepLinkRequest? initialConnection;
 
@@ -99,6 +119,7 @@ class ChastApp extends StatelessWidget {
               ? DisplayWindowPage(
                   streamId: displayWindow!.stream,
                   peerId: displayWindow!.peerId,
+                  recordingUploadContext: displayWindow!.uploadContext,
                 )
               : sessionWindow != null
               ? SessionPage(

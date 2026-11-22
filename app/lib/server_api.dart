@@ -1237,18 +1237,28 @@ class ServerApiException implements Exception {
 
 class _RecordingUploadSession {
   const _RecordingUploadSession({
-    required this.id,
-    required this.offset,
-    required this.size,
+    this.id = '',
+    this.offset = 0,
+    this.size = 0,
+    this.idempotencyKey = '',
+    this.completedRecording,
   });
 
   final String id;
   final int offset;
   final int size;
+  final String idempotencyKey;
+  final RemoteRecording? completedRecording;
 
   static _RecordingUploadSession? fromJson(Object? value) {
     if (value is! Map) {
       return null;
+    }
+    final RemoteRecording? completed = RemoteRecording.fromJson(
+      value['recording'],
+    );
+    if (completed != null) {
+      return _RecordingUploadSession(completedRecording: completed);
     }
     final Object? rawUpload = value['upload'];
     final Map upload = rawUpload is Map ? rawUpload : value;
@@ -1263,7 +1273,12 @@ class _RecordingUploadSession {
     if (offset < 0 || size <= 0 || offset > size) {
       return null;
     }
-    return _RecordingUploadSession(id: id, offset: offset, size: size);
+    return _RecordingUploadSession(
+      id: id,
+      offset: offset,
+      size: size,
+      idempotencyKey: upload['idempotency_key']?.toString().trim() ?? '',
+    );
   }
 }
 
@@ -4352,6 +4367,9 @@ class ServerApi {
     int startedAtMs = 0,
     int durationMs = 0,
     void Function(int sent, int total)? onProgress,
+    String idempotencyKey = '',
+    String uploadId = '',
+    Future<void> Function(String uploadId)? onUploadId,
     Duration timeout = const Duration(minutes: 10),
     int chunkSize = 8 << 20,
     bool resumable = true,
@@ -4383,40 +4401,71 @@ class ServerApi {
         : chunkSize.clamp(1, 32 << 20).toInt();
     final DateTime uploadStartedAt = DateTime.now().toUtc();
     _RecordingUploadSession? upload;
+    bool preserveUpload = false;
     try {
-      try {
-        upload = await _beginRecordingUpload(
-          settings,
-          accountToken,
-          fileName: fileName,
-          peerId: peerId,
-          startedAtMs: startedAtMs,
-          durationMs: durationMs,
-          size: total,
-          timeout: timeout,
-        );
-      } on ServerApiException catch (error) {
-        if (error.statusCode == HttpStatus.notFound ||
-            error.statusCode == HttpStatus.methodNotAllowed) {
-          return await _uploadRecordingLegacy(
+      if (uploadId.trim().isNotEmpty) {
+        try {
+          upload = await _recordingUploadStatus(
             settings,
             accountToken,
-            file: file,
+            uploadId.trim(),
+            timeout: timeout,
+          );
+        } on ServerApiException catch (error) {
+          if (error.statusCode != HttpStatus.notFound) rethrow;
+        }
+      }
+      if (upload == null) {
+        try {
+          upload = await _beginRecordingUpload(
+            settings,
+            accountToken,
             fileName: fileName,
             peerId: peerId,
             startedAtMs: startedAtMs,
             durationMs: durationMs,
-            total: total,
-            onProgress: onProgress,
+            size: total,
+            idempotencyKey: idempotencyKey,
             timeout: timeout,
           );
+        } on ServerApiException catch (error) {
+          if (error.statusCode == HttpStatus.notFound ||
+              error.statusCode == HttpStatus.methodNotAllowed) {
+            return await _uploadRecordingLegacy(
+              settings,
+              accountToken,
+              file: file,
+              fileName: fileName,
+              peerId: peerId,
+              startedAtMs: startedAtMs,
+              durationMs: durationMs,
+              total: total,
+              onProgress: onProgress,
+              timeout: timeout,
+            );
+          }
+          rethrow;
         }
-        rethrow;
       }
-      if (upload.size != total) {
+      final _RecordingUploadSession started = upload;
+      final RemoteRecording? completed = started.completedRecording;
+      if (completed != null) {
+        upload = null;
+        return completed;
+      }
+      if (started.idempotencyKey.isNotEmpty &&
+          idempotencyKey.isNotEmpty &&
+          started.idempotencyKey != idempotencyKey) {
+        throw ServerApiException(
+          tr('连接服务返回了无效数据'),
+          statusCode: HttpStatus.conflict,
+        );
+      }
+      if (started.size != total) {
         throw ServerApiException(tr('连接服务返回了无效数据'));
       }
-      _RecordingUploadSession session = upload;
+      await onUploadId?.call(started.id);
+      _RecordingUploadSession session = started;
       onProgress?.call(session.offset, total);
       int recoveryAttempts = 0;
       while (session.offset < total) {
@@ -4486,7 +4535,14 @@ class ServerApi {
       );
       onProgress?.call(total, total);
       return recording;
-    } on ServerApiException {
+    } on ServerApiException catch (error) {
+      preserveUpload =
+          error.retryable ||
+          error.statusCode == null ||
+          error.statusCode == 0 ||
+          error.statusCode == HttpStatus.unauthorized ||
+          error.statusCode == HttpStatus.requestTimeout ||
+          error.statusCode == HttpStatus.tooManyRequests;
       rethrow;
     } on FileSystemException catch (error) {
       throw ServerApiException(
@@ -4497,7 +4553,7 @@ class ServerApi {
         tr('连接服务请求失败：{error}', <String, Object?>{'error': error}),
       );
     } finally {
-      if (upload != null) {
+      if (upload != null && !preserveUpload) {
         // A terminal local or protocol failure must not leave a session holding
         // the account's upload quota. Completion already removed the session,
         // so this best-effort delete is then a harmless 404.
@@ -4514,6 +4570,7 @@ class ServerApi {
     required int startedAtMs,
     required int durationMs,
     required int size,
+    required String idempotencyKey,
     required Duration timeout,
   }) async {
     final Uri uri;
@@ -4527,13 +4584,14 @@ class ServerApi {
       uri,
       timeout,
       accountToken: accountToken,
-      success: const <int>{HttpStatus.created},
+      success: const <int>{HttpStatus.ok, HttpStatus.created},
       body: <String, Object?>{
         'name': fileName,
         'peer_id': peerId.trim(),
         'size': size,
         'started_at_ms': startedAtMs > 0 ? startedAtMs : 0,
         'duration_ms': durationMs > 0 ? durationMs : 0,
+        if (idempotencyKey.isNotEmpty) 'idempotency_key': idempotencyKey,
       },
       unauthorized: tr('账号登录已失效，请重新登录'),
       unavailable: tr('连接服务未启用录制归档'),

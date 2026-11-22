@@ -77,6 +77,8 @@ struct Clipboard {
     std::vector<std::string> written;
     std::vector<uint8_t> png;
     std::vector<std::vector<uint8_t>> written_png;
+    std::vector<uint8_t> svg;
+    std::vector<std::vector<uint8_t>> written_svg;
     bool read(chast::ClipboardContent& content) {
         std::unique_lock lock(mutex);
         ++reads;
@@ -88,6 +90,7 @@ struct Clipboard {
         if (!text.empty()) content.formats.push_back({chast::ClipboardFormat::Text,
                                                      {text.begin(), text.end()}});
         if (!png.empty()) content.formats.push_back({chast::ClipboardFormat::Png, png});
+        if (!svg.empty()) content.formats.push_back({chast::ClipboardFormat::Svg, svg});
         return true;
     }
     bool write(const chast::ClipboardContent& content) {
@@ -101,17 +104,27 @@ struct Clipboard {
         written.push_back(text);
         const auto* image = content.find(chast::ClipboardFormat::Png);
         written_png.push_back(image ? image->data : std::vector<uint8_t>{});
+        const auto* vector_image = content.find(chast::ClipboardFormat::Svg);
+        written_svg.push_back(vector_image ? vector_image->data : std::vector<uint8_t>{});
         return true;
     }
     void set(std::string value) {
         std::lock_guard lock(mutex);
         text = std::move(value);
         png.clear();
+        svg.clear();
     }
     void set_png(std::vector<uint8_t> value) {
         std::lock_guard lock(mutex);
         text.clear();
         png = std::move(value);
+        svg.clear();
+    }
+    void set_svg(std::vector<uint8_t> value) {
+        std::lock_guard lock(mutex);
+        text.clear();
+        png.clear();
+        svg = std::move(value);
     }
     void hold(bool value) { std::lock_guard lock(mutex); held = value; cv.notify_all(); }
     bool blocked() { std::lock_guard lock(mutex); return held && reading; }
@@ -126,6 +139,10 @@ struct Clipboard {
     bool has_png(const std::vector<uint8_t>& value) {
         std::lock_guard lock(mutex);
         return !written_png.empty() && written_png.back() == value;
+    }
+    bool has_svg(const std::vector<uint8_t>& value) {
+        std::lock_guard lock(mutex);
+        return !written_svg.empty() && written_svg.back() == value;
     }
     void refuse(int count) { std::lock_guard lock(mutex); fail_writes = count; }
 };
@@ -294,6 +311,21 @@ int main() {
     remote->set_png(viewer_png);
     check(wait_for([&] { return local->has_png(viewer_png); }, 10s),
           "viewer-to-host clipboard carries PNG bytes");
+
+    const std::string svg_markup =
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">"
+        "<circle cx=\"5\" cy=\"5\" r=\"4\" fill=\"#36c\"/></svg>";
+    const std::vector<uint8_t> host_svg(svg_markup.begin(), svg_markup.end());
+    local->set_svg(host_svg);
+    check(wait_for([&] { return remote->has_svg(host_svg); }, 10s),
+          "host-to-viewer clipboard carries SVG bytes");
+    const std::string viewer_svg_markup =
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M0 0h4v4z\"/></svg>";
+    const std::vector<uint8_t> viewer_svg(viewer_svg_markup.begin(),
+                                          viewer_svg_markup.end());
+    remote->set_svg(viewer_svg);
+    check(wait_for([&] { return local->has_svg(viewer_svg); }, 10s),
+          "viewer-to-host clipboard carries SVG bytes");
 
     // A confirmed empty baseline must not swallow the first subsequent copy.
     viewer->SetClipboardSync(false);

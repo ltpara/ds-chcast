@@ -15,14 +15,15 @@ import (
 )
 
 type resumableUpload struct {
-	ID          string `json:"id"`
-	Offset      int64  `json:"offset"`
-	Size        int64  `json:"size"`
-	Name        string `json:"name"`
-	PeerID      string `json:"peer_id"`
-	StartedAtMS int64  `json:"started_at_ms"`
-	DurationMS  int64  `json:"duration_ms"`
-	CreatedAtMS int64  `json:"created_at_ms"`
+	ID             string `json:"id"`
+	Offset         int64  `json:"offset"`
+	Size           int64  `json:"size"`
+	Name           string `json:"name"`
+	PeerID         string `json:"peer_id"`
+	StartedAtMS    int64  `json:"started_at_ms"`
+	DurationMS     int64  `json:"duration_ms"`
+	CreatedAtMS    int64  `json:"created_at_ms"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type resumableUploadReply struct {
@@ -30,18 +31,85 @@ type resumableUploadReply struct {
 }
 
 func beginRecordingUpload(t *testing.T, base, token, name string, size, startedAtMS, durationMS int64) (int, []byte) {
+	return beginRecordingUploadWithKey(t, base, token, name, size, startedAtMS, durationMS, "")
+}
+
+func beginRecordingUploadWithKey(t *testing.T, base, token, name string, size, startedAtMS, durationMS int64, key string) (int, []byte) {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
-		"name":          name,
-		"peer_id":       "devbox",
-		"size":          size,
-		"started_at_ms": startedAtMS,
-		"duration_ms":   durationMS,
+		"name":            name,
+		"peer_id":         "devbox",
+		"size":            size,
+		"started_at_ms":   startedAtMS,
+		"duration_ms":     durationMS,
+		"idempotency_key": key,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return request(t, http.MethodPost, base+"/v1/account/recordings/uploads", string(body), token)
+}
+
+func TestRecordingUploadBeginIsIdempotentAcrossCompletion(t *testing.T) {
+	s := testutil.StartWith(t, testutil.Options{RecordingsDir: t.TempDir()})
+	alice, err := s.Accounts.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	aliceSession := login(t, s.URL, "alice", "correct horse")
+	bobSession := login(t, s.URL, "bob", "correct horse")
+	const key = "0123456789abcdef0123456789abcdef"
+	body := []byte("stable recording bytes")
+	name := "stable.mp4"
+	startedAt := int64(1700000000000)
+	duration := int64(5000)
+
+	status, data := beginRecordingUploadWithKey(t, s.URL, aliceSession.Token, name, int64(len(body)), startedAt, duration, key)
+	if status != http.StatusCreated {
+		t.Fatalf("begin: %d %s", status, data)
+	}
+	first := decodeResumableUpload(t, data)
+	if first.IdempotencyKey != key {
+		t.Fatalf("begin key = %q", first.IdempotencyKey)
+	}
+	status, data = beginRecordingUploadWithKey(t, s.URL, aliceSession.Token, name, int64(len(body)), startedAt, duration, key)
+	if status != http.StatusCreated || decodeResumableUpload(t, data).ID != first.ID {
+		t.Fatalf("active retry: %d %s", status, data)
+	}
+	if status, data = appendRecordingUpload(t, s.URL, aliceSession.Token, first.ID, 0, body); status != http.StatusAccepted {
+		t.Fatalf("append: %d %s", status, data)
+	}
+	status, data = completeRecordingUpload(t, s.URL, aliceSession.Token, first.ID)
+	if status != http.StatusCreated {
+		t.Fatalf("complete: %d %s", status, data)
+	}
+	var complete struct {
+		Recording account.Recording `json:"recording"`
+	}
+	if err := json.Unmarshal(data, &complete); err != nil || complete.Recording.ID == "" {
+		t.Fatalf("complete response: %+v %v", complete, err)
+	}
+
+	status, data = beginRecordingUploadWithKey(t, s.URL, aliceSession.Token, name, int64(len(body)), startedAt, duration, key)
+	if status != http.StatusOK {
+		t.Fatalf("completed retry: %d %s", status, data)
+	}
+	var retry struct {
+		Recording account.Recording `json:"recording"`
+	}
+	if err := json.Unmarshal(data, &retry); err != nil || retry.Recording.ID != complete.Recording.ID {
+		t.Fatalf("idempotent response: %+v %v", retry, err)
+	}
+	if _, count, err := s.Accounts.RecordingUsage(alice.ID); err != nil || count != 1 {
+		t.Fatalf("alice archive count: %d %v", count, err)
+	}
+	status, data = beginRecordingUploadWithKey(t, s.URL, bobSession.Token, name, int64(len(body)), startedAt, duration, key)
+	if status != http.StatusCreated {
+		t.Fatalf("other account begin: %d %s", status, data)
+	}
 }
 
 func appendRecordingUpload(t *testing.T, base, token, id string, offset int64, body []byte) (int, []byte) {

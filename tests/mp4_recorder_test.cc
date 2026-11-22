@@ -285,7 +285,8 @@ bool check_host_recorder() {
     std::mutex mutex;
     std::condition_variable wake;
     bool started = false, resume = false;
-    std::vector<std::string> saved, errors;
+    std::vector<std::string> saved, finalized, errors;
+    std::vector<HostRecordingSegment> finalized_metadata;
     HostRecordingOptions options{true, folder.string(), [&](const std::string& line) {
         std::unique_lock lock(mutex);
         const auto found = line.find(": saved ");
@@ -295,6 +296,9 @@ bool check_host_recorder() {
             started = true; wake.notify_one();
             wake.wait_for(lock, 10s, [&] { return resume; });
         }
+    }, [&](const HostRecordingSegment& segment) {
+        finalized.push_back(segment.path);
+        finalized_metadata.push_back(segment);
     }};
     const std::vector<uint8_t> key(std::begin(kKeyAccessUnit), std::end(kKeyAccessUnit));
     const std::vector<uint8_t> delta(std::begin(kDeltaAccessUnit), std::end(kDeltaAccessUnit));
@@ -328,7 +332,11 @@ bool check_host_recorder() {
     wake.notify_one();
     recorder.finish(608000);
     if (!requested_idr || !bounded || !periodic || !no_periodic_idr ||
-        !errors.empty() || saved.size() != 4) return false;
+        !errors.empty() || saved.size() != 4 || finalized != saved ||
+        finalized_metadata.size() != saved.size()) return false;
+    for (const HostRecordingSegment& segment : finalized_metadata) {
+        if (segment.started_at_ms == 0 || segment.duration_ms == 0) return false;
+    }
     if (!check_segment(saved[0], VideoCodec::H264, {0}, 1) ||
         !check_segment(saved[1], VideoCodec::H264, {0, 33}, 1) ||
         !check_segment(saved[2], VideoCodec::H264, {0}, 1) ||
@@ -341,14 +349,90 @@ bool check_host_recorder() {
     StreamRecorder reconnect(options, L"display:test");
     reconnect.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 100, true, true}});
     reconnect.finish(200);
-    if (saved.size() != 5 || fs::path(saved[0]).parent_path() == fs::path(saved[4]).parent_path()) return false;
+    if (saved.size() != 5 || finalized != saved ||
+        fs::path(saved[0]).parent_path() == fs::path(saved[4]).parent_path()) return false;
     // A file in place of the output directory is a real I/O failure. It must
     // report an error, then stop requesting frames from the video source.
     options.directory = saved[0];
     StreamRecorder broken(options, L"display:test");
     broken.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 100, true, true}});
     broken.finish(200);
-    if (errors.size() != 1 || broken.needs_keyframe(999999)) return false;
+    if (errors.size() != 1 || broken.needs_keyframe(999999) || finalized != saved) return false;
+    std::string callback_path;
+    bool callback_saw_complete_file = false;
+    HostRecordingOptions callback_failure{true, (folder / "callback-failure").string(), {},
+        [&](const HostRecordingSegment& segment) {
+            callback_path = segment.path;
+            StreamInfo complete;
+            std::string callback_error;
+            callback_saw_complete_file = inspect(segment.path, &complete, &callback_error);
+            throw std::runtime_error("simulated durable queue failure");
+        }};
+    StreamRecorder queue_failure(callback_failure, L"display:test");
+    queue_failure.submit(VideoCodec::H264, 2560, 1440, 1, {{key, 100, true, true}});
+    queue_failure.finish(200);
+    if (!callback_saw_complete_file || callback_path.empty() ||
+        !fs::is_regular_file(fs::path(callback_path))) return false;
+
+    std::mutex progressive_mutex;
+    std::condition_variable progressive_wake;
+    std::vector<std::string> progressive_segments;
+    HostRecordingOptions progressive_options{true, (folder / "progressive").string(), {},
+        [&](const HostRecordingSegment& segment) {
+            std::lock_guard lock(progressive_mutex);
+            progressive_segments.push_back(segment.path);
+            progressive_wake.notify_one();
+        }};
+    StreamRecorder progressive(progressive_options, L"display:progressive");
+    progressive.submit(VideoCodec::Vp9, 16, 16, 1,
+        {{std::vector<uint8_t>(std::begin(kVp9Key420), std::end(kVp9Key420)), 1000, true, true}},
+        VideoChroma::Yuv420);
+    progressive.submit(VideoCodec::Vp9, 16, 16, 1,
+        {{std::vector<uint8_t>(std::begin(kVp9Key444), std::end(kVp9Key444)), 1033, true, true}},
+        VideoChroma::Yuv444);
+    {
+        std::unique_lock lock(progressive_mutex);
+        if (!progressive_wake.wait_for(lock, 5s, [&] { return progressive_segments.size() == 1; }))
+            return false;
+    }
+    progressive.finish(1066);
+    if (progressive_segments.size() != 2 ||
+        !check_segment(progressive_segments[0], VideoCodec::Vp9, {0}, 1) ||
+        !check_segment(progressive_segments[1], VideoCodec::Vp9, {0}, 1)) return false;
+
+    const std::string archive_queue = (folder / "archive-queue").string();
+    std::vector<HostRecordingSegment> archive_tasks;
+    std::vector<std::string> archive_errors;
+    HostRecordingOptions archive_options{true, (folder / "archive-recordings").string(), {},
+        [&](const HostRecordingSegment& segment) {
+            std::string queue_error;
+            if (!enqueue_host_recording_upload(archive_queue, segment, &queue_error)) {
+                archive_errors.push_back(queue_error);
+                return;
+            }
+            archive_tasks.push_back(segment);
+        }};
+    StreamRecorder archive_recorder(archive_options, L"display:archive");
+    archive_recorder.submit(VideoCodec::H264, 2560, 1440, 1,
+                            {{key, 1000, true, true}});
+    archive_recorder.submit(VideoCodec::H264, 2560, 1440, 1,
+                            {{delta, 1033, false, false}});
+    archive_recorder.finish(1066);
+    size_t archive_manifest_count = 0;
+    if (fs::is_directory(archive_queue)) {
+        for (const auto& entry : fs::directory_iterator(archive_queue)) {
+            if (entry.is_regular_file() && entry.path().extension() == L".json") {
+                ++archive_manifest_count;
+            }
+        }
+    }
+    if (!archive_errors.empty() || archive_tasks.size() != 1 ||
+        archive_manifest_count != 1 || archive_tasks[0].started_at_ms == 0 ||
+        archive_tasks[0].duration_ms != 66 ||
+        !fs::is_regular_file(fs::path(archive_tasks[0].path))) {
+        std::fprintf(stderr, "FAIL a finalized MP4 did not become a durable timed upload task\n");
+        return false;
+    }
     fs::remove_all(folder);
     std::puts("ok   async host recording: bounded backlog, IDR recovery, rebuild, rotation, still duration, reconnect and I/O failure");
     return true;
@@ -500,6 +584,17 @@ int main() {
                          recorder.error().c_str());
             return 1;
         }
+        if (std::string(write.what) == "second key frame" && recorder.completed_segments().size() != 1) {
+            std::fprintf(stderr, "FAIL the first segment was not complete at rollover\n");
+            return 1;
+        }
+        if (std::string(write.what) == "second key frame" &&
+            (recorder.completed_segment_info().size() != 1 ||
+             recorder.completed_segment_info()[0].start_pts_ms != 5000 ||
+             recorder.completed_segment_info()[0].duration_ms != 100)) {
+            std::fprintf(stderr, "FAIL the first segment timing metadata is incorrect\n");
+            return 1;
+        }
     }
     recorder.close();
 
@@ -515,7 +610,11 @@ int main() {
         return 1;
     }
     const std::vector<std::string>& segments = recorder.segments();
-    if (segments.size() != 2 || segments[0] != base || segments[1] != second) {
+    if (segments.size() != 2 || segments[0] != base || segments[1] != second ||
+        recorder.completed_segments() != segments ||
+        recorder.completed_segment_info().size() != 2 ||
+        recorder.completed_segment_info()[1].start_pts_ms != 5100 ||
+        recorder.completed_segment_info()[1].duration_ms != 66) {
         std::fprintf(stderr, "FAIL the size change did not roll the recording over\n");
         return 1;
     }

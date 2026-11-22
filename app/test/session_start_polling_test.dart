@@ -212,101 +212,116 @@ void main() {
     expect(awakeCalls, <bool>[true, false]);
   });
 
-  testWidgets('a display child stop suppresses session auto-record restart', (
-    tester,
-  ) async {
-    const MethodChannel native = MethodChannel('chast/viewer');
-    const MethodChannel gpu = MethodChannel('flutter_gpu_texture_renderer');
-    const ConnectTarget target = ConnectTarget('127.0.0.1', 1);
-    final String pin = List<String>.filled(64, 'A').join();
-    final Directory dir = Directory.systemTemp.createTempSync(
-      'chast-recording-window-',
-    );
-    final File trustFile = File('${dir.path}/trust.json')
-      ..writeAsStringSync(jsonEncode(<String, String>{target.trustKey: pin}));
-    StreamPreferences.configPathOverride = '${dir.path}/preferences.json';
-    ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
-    ViewPreferences.update(autoRecord: true);
-    bool recording = true;
-    int starts = 0;
-    int statusReads = 0;
-    final List<bool> recordingCommands = <bool>[];
-    final messenger = tester.binding.defaultBinaryMessenger;
-    messenger.setMockMethodCallHandler(gpu, (call) async => 1);
-    messenger.setMockMethodCallHandler(native, (call) async {
-      switch (call.method) {
-        case 'start':
-          starts++;
-          return null;
-        case 'loadPassword':
-          return '';
-        case 'status':
-          statusReads++;
-          return <String, Object?>{
-            'state': 'streaming',
-            'width': 640,
-            'height': 480,
-            'published': 1,
-            'inputEnabled': true,
-            'permissions': ViewerPermission.record,
-            'serverFingerprint': pin,
-            'recording': recording,
-            'recordPath': recording ? '${dir.path}/session.mp4' : '',
-          };
-        case 'setKeepAwake':
-          return true;
-        case 'setRecording':
-          final bool enabled =
-              (call.arguments as Map<Object?, Object?>)['enabled'] as bool;
-          recordingCommands.add(enabled);
-          recording = enabled;
-          return null;
-        case 'takeCompletedFiles':
-          return <Object?>[];
-        case 'refreshRemoteCursor':
-          return false;
-        default:
-          return null;
-      }
-    });
-    addTearDown(() {
-      messenger.setMockMethodCallHandler(native, null);
-      messenger.setMockMethodCallHandler(gpu, null);
-      StreamPreferences.configPathOverride = null;
-      ViewPreferences.configPathOverride = null;
-      dir.deleteSync(recursive: true);
-    });
-
-    await tester.pumpWidget(
-      MaterialApp(
-        home: SessionPage(
-          target: target,
-          trustStore: TrustStore(file: trustFile),
-        ),
-      ),
-    );
-    for (int i = 0; i < 100 && starts == 0; ++i) {
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+  testWidgets(
+    'a display child stop suppresses restart and revocation is reported correctly',
+    (tester) async {
+      const MethodChannel native = MethodChannel('chast/viewer');
+      const MethodChannel gpu = MethodChannel('flutter_gpu_texture_renderer');
+      const ConnectTarget target = ConnectTarget('127.0.0.1', 1);
+      final String pin = List<String>.filled(64, 'A').join();
+      final Directory dir = Directory.systemTemp.createTempSync(
+        'chast-recording-window-',
       );
+      final File trustFile = File('${dir.path}/trust.json')
+        ..writeAsStringSync(jsonEncode(<String, String>{target.trustKey: pin}));
+      StreamPreferences.configPathOverride = '${dir.path}/preferences.json';
+      ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
+      ViewPreferences.update(autoRecord: true);
+      bool recording = true;
+      int permissions = ViewerPermission.record;
+      String recordError = '';
+      int starts = 0;
+      int statusReads = 0;
+      final List<bool> recordingCommands = <bool>[];
+      final messenger = tester.binding.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(gpu, (call) async => 1);
+      messenger.setMockMethodCallHandler(native, (call) async {
+        switch (call.method) {
+          case 'start':
+            starts++;
+            return null;
+          case 'loadPassword':
+            return '';
+          case 'status':
+            statusReads++;
+            return <String, Object?>{
+              'state': 'streaming',
+              'width': 640,
+              'height': 480,
+              'published': 1,
+              'inputEnabled': true,
+              'permissions': permissions,
+              'serverFingerprint': pin,
+              'recording': recording,
+              'recordError': recordError,
+              'recordPath': recording ? '${dir.path}/session.mp4' : '',
+            };
+          case 'setKeepAwake':
+            return true;
+          case 'setRecording':
+            final bool enabled =
+                (call.arguments as Map<Object?, Object?>)['enabled'] as bool;
+            recordingCommands.add(enabled);
+            recording = enabled;
+            return null;
+          case 'takeCompletedFiles':
+            return <Object?>[];
+          case 'refreshRemoteCursor':
+            return false;
+          default:
+            return null;
+        }
+      });
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(native, null);
+        messenger.setMockMethodCallHandler(gpu, null);
+        StreamPreferences.configPathOverride = null;
+        ViewPreferences.configPathOverride = null;
+        dir.deleteSync(recursive: true);
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionPage(
+            target: target,
+            trustStore: TrustStore(file: trustFile),
+          ),
+        ),
+      );
+      for (int i = 0; i < 100 && starts == 0; ++i) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      expect(starts, 1);
+      await tester.pump(const Duration(milliseconds: 250));
       await tester.pump();
-    }
-    expect(starts, 1);
-    await tester.pump(const Duration(milliseconds: 250));
-    await tester.pump();
-    expect(statusReads, greaterThan(0));
+      expect(statusReads, greaterThan(0));
 
-    // The display child changed the shared engine's state. The owner page
-    // must treat that transition like its own manual Stop action.
-    recording = false;
-    await tester.pump(const Duration(milliseconds: 220));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 220));
-    await tester.pump();
-    expect(recordingCommands, isEmpty);
+      // The display child changed the shared engine's state. The owner page
+      // must treat that transition like its own manual Stop action.
+      recording = false;
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump();
+      expect(recordingCommands, isEmpty);
 
-    await tester.pumpWidget(const SizedBox.shrink());
-    await tester.pump();
-    expect(tester.takeException(), isNull);
-  });
+      recording = true;
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump();
+      permissions = 0;
+      recording = false;
+      recordError = 'the host revoked recording';
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump();
+      expect(find.text('主机已撤销录制权限，录制已停止'), findsOneWidget);
+      expect(find.textContaining('录制失败'), findsNothing);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+    },
+  );
 }

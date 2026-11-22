@@ -57,6 +57,10 @@ const (
 	// file. The host key that owns the id signs the canonical fields, so a
 	// leaked server key alone cannot fabricate host-side records.
 	DomainHostAudit = "chast-host-audit-v1"
+	// DomainHostRecordingUpload covers device-authenticated requests to archive
+	// a finalized host recording. It is separate from audit reports and account
+	// uploads so neither credential can be replayed as an archive operation.
+	DomainHostRecordingUpload = "chast-host-recording-upload-v1"
 	// DomainDevicePolicy covers a host acknowledging the policy version it
 	// applied. The signature binds the receipt to the host id, so another
 	// machine holding the shared host key cannot report on its behalf.
@@ -182,6 +186,20 @@ func HostAuditDenialMessage(hostID, address string, denial, occurredAt int64,
 	return fieldsMessage(DomainHostAudit, "denial", hostID, address,
 		strconv.FormatInt(denial, 10), strconv.FormatInt(occurredAt, 10), detail,
 		strconv.FormatInt(timestamp, 10))
+}
+
+// HostRecordingUploadMessage binds a resumable archive request to the device,
+// HTTP operation, upload id, request timestamp, offset, declared size and
+// operation-specific metadata. The transport must use TLS for non-loopback
+// servers; chunk bytes are protected in transit by TLS and verified as a whole
+// when the archive is completed.
+func HostRecordingUploadMessage(hostID, method, uploadID string, timestamp,
+	offset, size int64, metadata ...string) []byte {
+	fields := []string{"upload", hostID, method, uploadID,
+		strconv.FormatInt(timestamp, 10), strconv.FormatInt(offset, 10),
+		strconv.FormatInt(size, 10)}
+	fields = append(fields, metadata...)
+	return fieldsMessage(DomainHostRecordingUpload, fields...)
 }
 
 // HostDevicePolicyReceiptMessage binds the exact version a host applied. The

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../l10n.dart';
 import '../view_scale.dart';
+import '../view_scroll.dart';
 import 'remote_view.dart';
 
 class ViewScaleControlsButton extends StatelessWidget {
@@ -13,6 +14,9 @@ class ViewScaleControlsButton extends StatelessWidget {
     required this.onFitChanged,
     required this.onZoomPercentChanged,
     required this.onCursorZoomPercentChanged,
+    this.scrollStyle = defaultViewScrollStyle,
+    this.scrollEdge = defaultViewScrollEdge,
+    this.onScrollChanged,
   });
 
   final ViewFit fit;
@@ -21,6 +25,9 @@ class ViewScaleControlsButton extends StatelessWidget {
   final ValueChanged<ViewFit> onFitChanged;
   final ValueChanged<int> onZoomPercentChanged;
   final ValueChanged<int> onCursorZoomPercentChanged;
+  final ViewScrollStyle scrollStyle;
+  final int scrollEdge;
+  final void Function(ViewScrollStyle, int)? onScrollChanged;
 
   Future<void> _open(BuildContext context) async {
     final _ViewScaleSelection? selection =
@@ -30,6 +37,9 @@ class ViewScaleControlsButton extends StatelessWidget {
             fit: fit,
             zoomPercent: zoomPercent,
             cursorZoomPercent: cursorZoomPercent,
+            scrollStyle: scrollStyle,
+            scrollEdge: scrollEdge,
+            showScrollControls: onScrollChanged != null,
           ),
         );
     if (!context.mounted || selection == null) return;
@@ -39,6 +49,10 @@ class ViewScaleControlsButton extends StatelessWidget {
     }
     if (selection.cursorZoomPercent != cursorZoomPercent) {
       onCursorZoomPercentChanged(selection.cursorZoomPercent);
+    }
+    if (selection.scrollStyle != scrollStyle ||
+        selection.scrollEdge != scrollEdge) {
+      onScrollChanged?.call(selection.scrollStyle, selection.scrollEdge);
     }
   }
 
@@ -67,11 +81,15 @@ class _ViewScaleSelection {
     required this.fit,
     required this.zoomPercent,
     required this.cursorZoomPercent,
+    required this.scrollStyle,
+    required this.scrollEdge,
   });
 
   final ViewFit fit;
   final int zoomPercent;
   final int cursorZoomPercent;
+  final ViewScrollStyle scrollStyle;
+  final int scrollEdge;
 }
 
 class _ViewScaleControlsDialog extends StatefulWidget {
@@ -79,11 +97,17 @@ class _ViewScaleControlsDialog extends StatefulWidget {
     required this.fit,
     required this.zoomPercent,
     required this.cursorZoomPercent,
+    required this.scrollStyle,
+    required this.scrollEdge,
+    required this.showScrollControls,
   });
 
   final ViewFit fit;
   final int zoomPercent;
   final int cursorZoomPercent;
+  final ViewScrollStyle scrollStyle;
+  final int scrollEdge;
+  final bool showScrollControls;
 
   @override
   State<_ViewScaleControlsDialog> createState() =>
@@ -94,18 +118,23 @@ class _ViewScaleControlsDialogState extends State<_ViewScaleControlsDialog> {
   late ViewFit _fit = widget.fit;
   late int _zoomPercent = widget.zoomPercent;
   late int _cursorZoomPercent = widget.cursorZoomPercent;
+  late ViewScrollStyle _scrollStyle = widget.scrollStyle;
+  late int _scrollEdge = widget.scrollEdge;
 
   void _reset() {
     setState(() {
       _fit = ViewFit.adaptive;
       _zoomPercent = defaultViewZoomPercent;
       _cursorZoomPercent = defaultCursorZoomPercent;
+      _scrollStyle = defaultViewScrollStyle;
+      _scrollEdge = defaultViewScrollEdge;
     });
   }
 
   @override
   Widget build(BuildContext context) => AlertDialog(
     title: Text(tr('视图与光标缩放')),
+    scrollable: true,
     content: SizedBox(
       width: 380,
       child: Column(
@@ -152,6 +181,51 @@ class _ViewScaleControlsDialogState extends State<_ViewScaleControlsDialog> {
             onChanged: (int value) =>
                 setState(() => _cursorZoomPercent = value),
           ),
+          if (widget.showScrollControls) ...<Widget>[
+            const SizedBox(height: 12),
+            Text(tr('画布滚动方式')),
+            SegmentedButton<ViewScrollStyle>(
+              style: const ButtonStyle(
+                padding: WidgetStatePropertyAll(
+                  EdgeInsets.symmetric(horizontal: 8),
+                ),
+              ),
+              segments: <ButtonSegment<ViewScrollStyle>>[
+                ButtonSegment(
+                  value: ViewScrollStyle.scrollbar,
+                  label: Text(tr('滚动条')),
+                ),
+                ButtonSegment(
+                  value: ViewScrollStyle.auto,
+                  label: Text(tr('自动滚动')),
+                ),
+                ButtonSegment(
+                  value: ViewScrollStyle.edge,
+                  label: Text(tr('边缘滚动')),
+                ),
+              ],
+              selected: <ViewScrollStyle>{_scrollStyle},
+              showSelectedIcon: false,
+              onSelectionChanged: (value) =>
+                  setState(() => _scrollStyle = value.single),
+            ),
+            if (_scrollStyle == ViewScrollStyle.edge) ...<Widget>[
+              Row(
+                children: <Widget>[
+                  Expanded(child: Text(tr('边缘感应范围'))),
+                  Text('$_scrollEdge px'),
+                ],
+              ),
+              Slider(
+                value: _scrollEdge.toDouble(),
+                min: minViewScrollEdge.toDouble(),
+                max: maxViewScrollEdge.toDouble(),
+                divisions: maxViewScrollEdge - minViewScrollEdge,
+                onChanged: (value) =>
+                    setState(() => _scrollEdge = value.round()),
+              ),
+            ],
+          ],
         ],
       ),
     ),
@@ -167,6 +241,8 @@ class _ViewScaleControlsDialogState extends State<_ViewScaleControlsDialog> {
             fit: _fit,
             zoomPercent: _zoomPercent,
             cursorZoomPercent: _cursorZoomPercent,
+            scrollStyle: _scrollStyle,
+            scrollEdge: _scrollEdge,
           ),
         ),
         child: Text(tr('应用')),

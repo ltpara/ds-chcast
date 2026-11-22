@@ -382,6 +382,12 @@ bool layout_uses_altgr(HKL layout) {
 }
 
 bool hid_usage_to_virtual_key(uint16_t usage, HKL layout, WORD& virtual_key) {
+    // Num Lock needs EXTENDEDKEY when injected, but E0 45 has no layout
+    // mapping on Windows. Its named virtual key is independent of layout.
+    if (usage == 0x53) {
+        virtual_key = VK_NUMLOCK;
+        return true;
+    }
     if (usage == 0x48) {
         virtual_key = VK_PAUSE;
         return true;

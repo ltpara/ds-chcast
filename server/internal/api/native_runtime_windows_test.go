@@ -2,7 +2,8 @@ package api_test
 
 // Opt-in acceptance against the actual Windows tray and tunnel processes.
 // Default QUIC viewers use files-only mode. Opt-in Flutter modes use isolated
-// profiles; the host still disables input and no service is installed.
+// profiles; input runs only with the explicit dry-run acceptance flag, and no
+// service is installed.
 
 import (
 	"bytes"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -94,6 +96,33 @@ func (p *nativeProcess) stop(t *testing.T) {
 	}
 }
 
+func (p *nativeProcess) exitStatus(wait time.Duration) string {
+	select {
+	case <-p.done:
+	case <-time.After(wait):
+	}
+	select {
+	case <-p.done:
+		if p.cmd.ProcessState == nil {
+			return fmt.Sprintf("exited: wait=%v", p.err)
+		}
+		exitCode := p.cmd.ProcessState.ExitCode()
+		return fmt.Sprintf("exited: exit_code=%d (0x%08X), wait=%v",
+			exitCode, uint32(exitCode), p.err)
+	default:
+		return "still running"
+	}
+}
+
+func TestNativeProcessExitStatusIncludesCode(t *testing.T) {
+	process := startNativeProcess(t, t.TempDir(), "exit-code", "cmd.exe", "",
+		"/D", "/C", "exit 37")
+	status := process.exitStatus(2 * time.Second)
+	if !strings.Contains(status, "exit_code=37") || !strings.Contains(status, "0x00000025") {
+		t.Fatalf("native process status = %q, want decimal and hexadecimal exit code", status)
+	}
+}
+
 func nativeWait(t *testing.T, what string, timeout time.Duration, predicate func() bool) {
 	t.Helper()
 	until := time.Now().Add(timeout)
@@ -136,15 +165,20 @@ func protectedNativeProfileFile(path string) bool {
 }
 
 func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, serverPublicKey,
-	peer, fingerprint, username, accountToken string, isolatedDownloads bool) *nativeProcess {
+	peer, fingerprint, username, accountToken string, isolatedDownloads bool,
+	statusDirectory string, shortcutAcceptance ...bool) *nativeProcess {
 	t.Helper()
 	profile := filepath.Join(dir, name+"-profile")
 	downloadDir := filepath.Join(profile, "downloads")
+	recordingDir := filepath.Join(profile, "Videos")
 	chastDir := filepath.Join(profile, "chast")
 	if err := os.MkdirAll(chastDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(downloadDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(recordingDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 	// Remove only this test-owned profile, after the viewer process has stopped.
@@ -154,6 +188,27 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 		t.Fatalf("decode test server identity: %v", err)
 	}
 	serverFingerprint := fmt.Sprintf("%X", sha256.Sum256(publicKey))
+	peerPreferences := map[string]any{
+		"view_stats": statusDirectory == "" &&
+			!(len(shortcutAcceptance) > 0 && shortcutAcceptance[0]),
+	}
+	if len(shortcutAcceptance) > 0 && shortcutAcceptance[0] {
+		peerPreferences["view_default_only"] = true
+		peerPreferences["view_remote_shortcuts"] = []map[string]any{
+			{
+				"action":    "toggleControl",
+				"keyUsage":  0x40, // F7
+				"modifiers": 1,    // Ctrl
+				"keyLabel":  "F7",
+			},
+			{
+				"action":    "toggleStats",
+				"keyUsage":  0x41, // F8
+				"modifiers": 1,    // Ctrl
+				"keyLabel":  "F8",
+			},
+		}
+	}
 	profileFiles := map[string]any{
 		"server.json": map[string]any{
 			"url":      serverURL,
@@ -179,9 +234,7 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 		},
 		"ui.json": map[string]any{
 			"peers": map[string]any{
-				fmt.Sprintf("server:v1:%x/%s", sha256.Sum256([]byte(serverURL)), peer): map[string]any{
-					"view_stats": true,
-				},
+				fmt.Sprintf("server:v1:%x/%s", sha256.Sum256([]byte(serverURL)), peer): peerPreferences,
 			},
 		},
 	}
@@ -198,7 +251,8 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 	filtered := env[:0]
 	for _, entry := range env {
 		key := strings.SplitN(entry, "=", 2)[0]
-		if strings.EqualFold(key, "APPDATA") || strings.EqualFold(key, "CHAST_NATIVE_TESTING") ||
+		if strings.EqualFold(key, "APPDATA") || strings.EqualFold(key, "USERPROFILE") || strings.EqualFold(key, "CHAST_NATIVE_TESTING") ||
+			strings.EqualFold(key, "CHAST_NATIVE_TEST_STATUS_DIR") ||
 			strings.EqualFold(key, "CHAST_NATIVE_TEST_DOWNLOAD_DIR") ||
 			strings.EqualFold(key, "CHAST_NATIVE_TEST_UPLOAD_DIR") {
 			continue
@@ -207,8 +261,13 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 	}
 	viewerEnv := append(filtered,
 		"APPDATA="+profile,
+		"USERPROFILE="+profile,
 		"CHAST_NATIVE_TESTING=1",
-		"CHAST_NATIVE_TEST_TICKET_DIR="+chastDir)
+		"CHAST_NATIVE_TEST_TICKET_DIR="+chastDir,
+		"CHAST_NATIVE_TEST_TABS_TRACE="+filepath.Join(dir, "session-tabs.tsv"))
+	if statusDirectory != "" {
+		viewerEnv = append(viewerEnv, "CHAST_NATIVE_TEST_STATUS_DIR="+statusDirectory)
+	}
 	if isolatedDownloads {
 		viewerEnv = append(viewerEnv,
 			"CHAST_NATIVE_TESTING=1",
@@ -343,11 +402,34 @@ func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts s
 	if useExistingCredentials {
 		cmd.Args = append(cmd.Args, "-UseExistingCredentials")
 	}
+	if token == "" {
+		cmd.Args = append(cmd.Args, "-AllowEmptyToken")
+	}
 	cmd.Stdin = strings.NewReader(token + "\n")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("could not start Flutter viewer session: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func runNativeFlutterCloseSelectedTab(t *testing.T, viewer *nativeProcess, peer, token, artifacts string,
+	expectedSessions int) {
+	t.Helper()
+	pid := viewer.cmd.Process.Pid
+	script := filepath.Join("..", "..", "..", "tools", "native-flutter-home-connect.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass", "-File", script, strconv.Itoa(pid), peer, artifacts,
+		"-ExpectedSessionCount", strconv.Itoa(expectedSessions), "-UseExistingCredentials", "-CloseSelectedTab")
+	cmd.Stdin = strings.NewReader(token + "\n")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		processState := viewer.exitStatus(2 * time.Second)
+		t.Fatalf("could not close the selected Flutter session tab: %v; viewer %s\n%s", err, processState, output)
 	}
 	t.Log(strings.TrimSpace(string(output)))
 }
@@ -373,7 +455,8 @@ func runNativeFlutterFileTransferUI(t *testing.T, pid int, artifacts, phase, upl
 	t.Log(strings.TrimSpace(string(output)))
 }
 
-func runNativeFlutterInputUI(t *testing.T, pid int, artifacts, tracePath string) {
+func runNativeFlutterInputUI(t *testing.T, pid int, artifacts, tracePath string,
+	multiSessionTabs bool, backgroundStatusPath string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -384,12 +467,537 @@ func runNativeFlutterInputUI(t *testing.T, pid int, artifacts, tracePath string)
 	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
 		"-ExecutionPolicy", "Bypass", "-File", script,
 		"-ProcessId", strconv.Itoa(pid), "-ArtifactDirectory", artifacts, "-TracePath", tracePath)
+	if multiSessionTabs {
+		cmd.Args = append(cmd.Args, "-MultiSessionTabs")
+	}
+	if backgroundStatusPath != "" {
+		cmd.Args = append(cmd.Args, "-HoldBackgroundSession", "-BackgroundStatusPath", backgroundStatusPath)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Flutter keyboard/mouse input acceptance failed: %v\n%s", err, output)
 	}
 	t.Log(strings.TrimSpace(string(output)))
+}
+
+func runNativeFlutterShortcutUI(t *testing.T, pid int, artifacts, tracePath,
+	preferencesPath, peerPreferencesKey string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "tools", "native-flutter-input.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass", "-File", script,
+		"-ProcessId", strconv.Itoa(pid),
+		"-ArtifactDirectory", artifacts,
+		"-TracePath", tracePath,
+		"-VerifyKeyboardShortcuts",
+		"-PreferencesPath", preferencesPath,
+		"-PeerPreferencesKey", peerPreferencesKey)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Flutter keyboard shortcut acceptance failed: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func verifyNativeFlutterShortcutEvidence(t *testing.T, artifacts, tracePath string) {
+	t.Helper()
+	resultData, err := os.ReadFile(filepath.Join(artifacts, "flutter-input-results.json"))
+	if err != nil {
+		t.Fatalf("read Flutter shortcut result: %v", err)
+	}
+	resultData = bytes.TrimPrefix(resultData, []byte{0xef, 0xbb, 0xbf})
+	var result struct {
+		ShortcutPreferenceLoaded          bool `json:"shortcut_preference_loaded"`
+		ControlEnabledByShortcutVerified  bool `json:"control_enabled_by_shortcut_verified"`
+		StatsShortcutWithCaptureVerified  bool `json:"stats_shortcut_with_capture_verified"`
+		ControlDisabledByShortcutVerified bool `json:"control_disabled_by_shortcut_verified"`
+		RemoteInputBlockedAfterControlOff bool `json:"remote_input_blocked_after_control_disabled"`
+		StatsShortcutAfterControlDisabled bool `json:"stats_shortcut_after_control_disabled_verified"`
+		FunctionKeysNotForwardedToHost    bool `json:"function_keys_not_forwarded_to_host"`
+	}
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		t.Fatalf("parse Flutter shortcut result: %v", err)
+	}
+	if !result.ShortcutPreferenceLoaded || !result.ControlEnabledByShortcutVerified ||
+		!result.StatsShortcutWithCaptureVerified || !result.ControlDisabledByShortcutVerified ||
+		!result.RemoteInputBlockedAfterControlOff || !result.StatsShortcutAfterControlDisabled ||
+		!result.FunctionKeysNotForwardedToHost {
+		t.Fatalf("Flutter shortcut UI did not verify the expected local action paths: %+v", result)
+	}
+	traceData, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read shortcut host input trace: %v", err)
+	}
+	for _, line := range strings.Split(string(traceData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Kind     string `json:"kind"`
+			HIDUsage int    `json:"hid_usage"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("parse shortcut host input trace line %q: %v", line, err)
+		}
+		if event.Kind == "key" && (event.HIDUsage == 0x40 || event.HIDUsage == 0x41) {
+			t.Fatalf("a configured F7/F8 shortcut reached the loopback host: %s", line)
+		}
+	}
+	t.Log("PASS: Ctrl+F7 toggled remote control, Ctrl+F8 toggled only the local stats preference, and unbound input stopped after control was disabled")
+}
+
+func runNativeFlutterAudioIsolationUI(t *testing.T, pid int, artifacts,
+	statusPathA, statusPathB string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "tools", "native-flutter-input.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass", "-File", script,
+		"-ProcessId", strconv.Itoa(pid),
+		"-ArtifactDirectory", artifacts,
+		"-TracePath", filepath.Join(artifacts, "audio-tabs-input-events.jsonl"),
+		"-MultiSessionTabs", "-VerifyAudioIsolation",
+		"-AudioStatusPathA", statusPathA,
+		"-AudioStatusPathB", statusPathB)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Flutter tab audio isolation acceptance failed: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func runNativeFlutterDisplayWindowLifecycleUI(t *testing.T, pid int, artifacts,
+	disconnectMarker string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "tools", "native-flutter-input.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+		"-ExecutionPolicy", "Bypass", "-File", script,
+		"-ProcessId", strconv.Itoa(pid),
+		"-ArtifactDirectory", artifacts,
+		"-TracePath", filepath.Join(artifacts, "display-window-lifecycle-input.jsonl"),
+		"-MultiSessionTabs", "-VerifyDisplayWindowLifecycle",
+		"-DisplayDisconnectMarkerPath", disconnectMarker)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Flutter display-window lifecycle acceptance failed: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func enableNativeFlutterAutoRecordForNextSession(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "flutter-target-profile", "chast", "ui.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read isolated Flutter preferences: %v", err)
+	}
+	var prefs map[string]any
+	if err := json.Unmarshal(data, &prefs); err != nil {
+		t.Fatalf("parse isolated Flutter preferences: %v", err)
+	}
+	prefs["view_auto_record"] = true
+	data, err = json.Marshal(prefs)
+	if err != nil {
+		t.Fatalf("encode isolated Flutter preferences: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("enable auto-record for the second session only: %v", err)
+	}
+}
+
+func waitNativeFlutterStatusPaths(t *testing.T, directory string, count int) []string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(directory)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read isolated viewer status directory: %v", err)
+		}
+		files := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".tsv") {
+				files = append(files, filepath.Join(directory, entry.Name()))
+			}
+		}
+		if len(files) >= count {
+			sort.Strings(files)
+			return files
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("expected %d per-session status snapshots in %s", count, directory)
+	return nil
+}
+
+type nativeViewerStatusSnapshot struct {
+	auditRef      string
+	state         uint64
+	received      uint64
+	decoded       uint64
+	published     uint64
+	recording     bool
+	recordSamples uint64
+	recordPath    string
+	audioEnabled  bool
+	audioMuted    bool
+	audioReceived uint64
+	audioDecoded  uint64
+}
+
+type nativeAwakeLeaseSnapshot struct {
+	Event    string `json:"event"`
+	AuditRef string `json:"audit_ref"`
+	State    uint64 `json:"state"`
+	Held     bool   `json:"held"`
+}
+
+func readNativeAwakeLeaseSnapshots(path string) (map[string]nativeAwakeLeaseSnapshot, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	latest := make(map[string]nativeAwakeLeaseSnapshot)
+	for _, line := range lines {
+		fields := strings.Split(strings.TrimRight(line, "\r"), "\t")
+		if len(fields) != 4 || fields[1] == "" {
+			return nil, false
+		}
+		state, err := strconv.ParseUint(fields[2], 10, 64)
+		if err != nil || state > 5 {
+			return nil, false
+		}
+		held, err := strconv.ParseUint(fields[3], 10, 64)
+		if err != nil || held > 1 {
+			return nil, false
+		}
+		latest[fields[1]] = nativeAwakeLeaseSnapshot{
+			Event: fields[0], AuditRef: fields[1], State: state, Held: held == 1,
+		}
+	}
+	return latest, len(latest) > 0
+}
+
+func readNativeViewerStatusSnapshot(path string) (nativeViewerStatusSnapshot, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nativeViewerStatusSnapshot{}, false
+	}
+	fields := strings.SplitN(strings.TrimRight(string(data), "\r\n"), "\t", 12)
+	if len(fields) != 8 && len(fields) != 12 {
+		return nativeViewerStatusSnapshot{}, false
+	}
+	values := make([]uint64, 6)
+	for i, fieldIndex := range []int{0, 2, 3, 4, 5, 6} {
+		value, err := strconv.ParseUint(fields[fieldIndex], 10, 64)
+		if err != nil {
+			return nativeViewerStatusSnapshot{}, false
+		}
+		values[i] = value
+	}
+	if values[4] > 1 {
+		return nativeViewerStatusSnapshot{}, false
+	}
+	snapshot := nativeViewerStatusSnapshot{
+		auditRef:      fields[1],
+		state:         values[0],
+		received:      values[1],
+		decoded:       values[2],
+		published:     values[3],
+		recording:     values[4] == 1,
+		recordSamples: values[5],
+		recordPath:    fields[7],
+	}
+	if len(fields) == 12 {
+		audioEnabled, err := strconv.ParseUint(fields[8], 10, 64)
+		if err != nil || audioEnabled > 1 {
+			return nativeViewerStatusSnapshot{}, false
+		}
+		audioMuted, err := strconv.ParseUint(fields[9], 10, 64)
+		if err != nil || audioMuted > 1 {
+			return nativeViewerStatusSnapshot{}, false
+		}
+		snapshot.audioEnabled = audioEnabled == 1
+		snapshot.audioMuted = audioMuted == 1
+		if snapshot.audioReceived, err = strconv.ParseUint(fields[10], 10, 64); err != nil {
+			return nativeViewerStatusSnapshot{}, false
+		}
+		if snapshot.audioDecoded, err = strconv.ParseUint(fields[11], 10, 64); err != nil {
+			return nativeViewerStatusSnapshot{}, false
+		}
+	}
+	return snapshot, true
+}
+
+func waitNativeFlutterRecordingStatusPath(t *testing.T, directory, recordingDirectory string) string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, path := range waitNativeFlutterStatusPaths(t, directory, 2) {
+			snapshot, ok := readNativeViewerStatusSnapshot(path)
+			if !ok || snapshot.state != 3 || !snapshot.recording || snapshot.recordSamples == 0 || snapshot.recordPath == "" {
+				continue
+			}
+			relative, err := filepath.Rel(recordingDirectory, snapshot.recordPath)
+			if err == nil && relative != "." && relative != ".." &&
+				!strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return path
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("no streaming, recording session snapshot points into %s", recordingDirectory)
+	return ""
+}
+
+func waitNativeFlutterNonRecordingStatusPath(t *testing.T, directory string) string {
+	t.Helper()
+	paths := waitNativeFlutterStatusPaths(t, directory, 1)
+	path := paths[0]
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, ok := readNativeViewerStatusSnapshot(path)
+		if ok && snapshot.auditRef != "" && snapshot.state == 3 &&
+			!snapshot.recording && snapshot.recordSamples == 0 && snapshot.recordPath == "" {
+			return path
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	snapshot, _ := readNativeViewerStatusSnapshot(path)
+	t.Fatalf("initial Flutter session did not reach streaming without recording: %+v", snapshot)
+	return ""
+}
+
+func verifyNativeFlutterTabRecordingIsolation(t *testing.T, artifacts, firstStatusPath,
+	secondStatusPath, recordingDirectory string) {
+	t.Helper()
+	if firstStatusPath == secondStatusPath {
+		t.Fatalf("session A and B share one status snapshot: %s", firstStatusPath)
+	}
+	data, err := os.ReadFile(filepath.Join(artifacts, "flutter-input-results.json"))
+	if err != nil {
+		t.Fatalf("read Flutter tab recording result: %v", err)
+	}
+	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
+	var result struct {
+		BackgroundRecordingBefore     bool   `json:"background_recording_before"`
+		BackgroundRecordingAfter      bool   `json:"background_recording_after"`
+		BackgroundRecordSamplesBefore uint64 `json:"background_record_samples_before"`
+		BackgroundRecordSamplesAfter  uint64 `json:"background_record_samples_after"`
+		BackgroundRecordingPath       string `json:"background_recording_path"`
+		SessionARecordingButtonOK     bool   `json:"session_a_recording_button_verified"`
+		SessionARecordingButtonName   string `json:"session_a_recording_button_name"`
+		SessionARecordingButtonPixels int    `json:"session_a_recording_button_accent_pixels"`
+		SessionARecordingScreenshot   string `json:"session_a_recording_screenshot"`
+		SessionBRecordingButtonOK     bool   `json:"session_b_recording_button_verified"`
+		SessionBRecordingButtonName   string `json:"session_b_recording_button_name"`
+		SessionBRecordingButtonPixels int    `json:"session_b_recording_button_accent_pixels"`
+		SessionBRecordingScreenshot   string `json:"session_b_recording_screenshot"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("parse Flutter tab recording result: %v", err)
+	}
+	if !result.BackgroundRecordingBefore || !result.BackgroundRecordingAfter ||
+		result.BackgroundRecordSamplesAfter <= result.BackgroundRecordSamplesBefore ||
+		!result.SessionARecordingButtonOK || result.SessionARecordingButtonPixels > 4 ||
+		!result.SessionBRecordingButtonOK || result.SessionBRecordingButtonPixels < 20 ||
+		result.BackgroundRecordingPath == "" || result.SessionARecordingScreenshot == "" ||
+		result.SessionBRecordingScreenshot == "" {
+		t.Fatalf("session B did not keep recording and advance samples: %+v", result)
+	}
+	for _, screenshot := range []string{result.SessionARecordingScreenshot, result.SessionBRecordingScreenshot} {
+		if info, err := os.Stat(screenshot); err != nil || info.Size() == 0 {
+			t.Fatalf("recording toolbar screenshot is missing or empty: %s (err=%v)", screenshot, err)
+		}
+	}
+	relative, err := filepath.Rel(recordingDirectory, result.BackgroundRecordingPath)
+	if err != nil || relative == "." || relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		t.Fatalf("session B recording path %q is outside %s", result.BackgroundRecordingPath, recordingDirectory)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	var first, second nativeViewerStatusSnapshot
+	for time.Now().Before(deadline) {
+		var firstOK, secondOK bool
+		first, firstOK = readNativeViewerStatusSnapshot(firstStatusPath)
+		second, secondOK = readNativeViewerStatusSnapshot(secondStatusPath)
+		if firstOK && secondOK && first.auditRef != "" && second.auditRef != "" &&
+			first.auditRef != second.auditRef && first.state == 3 && !first.recording &&
+			first.recordSamples == 0 && first.recordPath == "" && second.state == 3 &&
+			second.recording && second.recordSamples >= result.BackgroundRecordSamplesAfter &&
+			second.recordPath == result.BackgroundRecordingPath {
+			isolation := map[string]any{
+				"session_a_audit_ref":                      first.auditRef,
+				"session_a_state":                          first.state,
+				"session_a_recording":                      first.recording,
+				"session_a_record_samples":                 first.recordSamples,
+				"session_a_recording_button_verified":      result.SessionARecordingButtonOK,
+				"session_a_recording_button_name":          result.SessionARecordingButtonName,
+				"session_a_recording_button_accent_pixels": result.SessionARecordingButtonPixels,
+				"session_a_recording_screenshot":           result.SessionARecordingScreenshot,
+				"session_b_audit_ref":                      second.auditRef,
+				"session_b_state":                          second.state,
+				"session_b_recording":                      second.recording,
+				"session_b_record_samples":                 second.recordSamples,
+				"session_b_recording_button_verified":      result.SessionBRecordingButtonOK,
+				"session_b_recording_button_name":          result.SessionBRecordingButtonName,
+				"session_b_recording_button_accent_pixels": result.SessionBRecordingButtonPixels,
+				"session_b_recording_screenshot":           result.SessionBRecordingScreenshot,
+				"recording_button_verification":            "toolbar screenshot accent pixels; UI Automation unavailable for Flutter controls",
+				"samples_before_hidden_hold":               result.BackgroundRecordSamplesBefore,
+				"samples_after_hidden_hold":                result.BackgroundRecordSamplesAfter,
+				"recording_path":                           second.recordPath,
+			}
+			encoded, err := json.MarshalIndent(isolation, "", "  ")
+			if err != nil {
+				t.Fatalf("encode Flutter tab recording isolation evidence: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(artifacts, "flutter-tab-recording-isolation.json"), encoded, 0600); err != nil {
+				t.Fatalf("write Flutter tab recording isolation evidence: %v", err)
+			}
+			t.Logf("PASS: session A remains streaming without recording while session B records; toolbar accent pixels A=%d, B=%d; evidence: %s", result.SessionARecordingButtonPixels, result.SessionBRecordingButtonPixels, filepath.Join(artifacts, "flutter-tab-recording-isolation.json"))
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("per-session recording state was not isolated: A=%+v B=%+v; expected A streaming/not recording and B streaming/recording with samples >= %d", first, second, result.BackgroundRecordSamplesAfter)
+}
+
+func verifyNativeFlutterTabInputEvidence(t *testing.T, artifacts, tracePath string) {
+	t.Helper()
+	resultData, err := os.ReadFile(filepath.Join(artifacts, "flutter-input-results.json"))
+	if err != nil {
+		t.Fatalf("read Flutter multi-session input result: %v", err)
+	}
+	resultData = bytes.TrimPrefix(resultData, []byte{0xef, 0xbb, 0xbf})
+	var result struct {
+		ControlOnVerified                  bool   `json:"control_on_verified"`
+		TabSwitchReleasedRemoteA           bool   `json:"tab_switch_released_remote_a"`
+		BackgroundPointerInjectionRejected bool   `json:"background_pointer_injection_rejected"`
+		InputReleaseReceived               bool   `json:"input_release_received"`
+		ReleaseHeldQueued                  bool   `json:"release_held_queued"`
+		ReleaseAllStarted                  bool   `json:"release_all_started"`
+		ReleaseAllCompleted                bool   `json:"release_all_completed"`
+		InjectedAUpBeforePhysicalCleanup   bool   `json:"injected_a_up_before_physical_cleanup"`
+		BackgroundMouseEventsBefore        int    `json:"background_mouse_events_before"`
+		BackgroundMouseEventsAfter         int    `json:"background_mouse_events_after"`
+		TraceEventsBeforeBackgroundInput   int    `json:"trace_events_before_background_input"`
+		TraceEventsAfterBackgroundInput    int    `json:"trace_events_after_background_input"`
+		BackgroundSessionReturnedToA       bool   `json:"background_session_returned_to_a"`
+		BackgroundSessionHoldMS            int    `json:"background_session_hold_ms"`
+		BackgroundStreamingBefore          bool   `json:"background_streaming_before"`
+		BackgroundStreamingAfter           bool   `json:"background_streaming_after"`
+		BackgroundReceivedBefore           uint64 `json:"background_received_before"`
+		BackgroundReceivedAfter            uint64 `json:"background_received_after"`
+		BackgroundDecodedBefore            uint64 `json:"background_decoded_before"`
+		BackgroundDecodedAfter             uint64 `json:"background_decoded_after"`
+		BackgroundPublishedBefore          uint64 `json:"background_published_before"`
+		BackgroundPublishedAfter           uint64 `json:"background_published_after"`
+		BackgroundRecordingBefore          bool   `json:"background_recording_before"`
+		BackgroundRecordingAfter           bool   `json:"background_recording_after"`
+		BackgroundRecordSamplesBefore      uint64 `json:"background_record_samples_before"`
+		BackgroundRecordSamplesAfter       uint64 `json:"background_record_samples_after"`
+		BackgroundRecordingPath            string `json:"background_recording_path"`
+	}
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		t.Fatalf("parse Flutter multi-session input result: %v", err)
+	}
+	if !result.ControlOnVerified || !result.TabSwitchReleasedRemoteA ||
+		!result.BackgroundPointerInjectionRejected || !result.InputReleaseReceived ||
+		!result.ReleaseHeldQueued || !result.ReleaseAllStarted ||
+		!result.ReleaseAllCompleted || !result.InjectedAUpBeforePhysicalCleanup ||
+		result.BackgroundMouseEventsBefore != result.BackgroundMouseEventsAfter ||
+		result.TraceEventsBeforeBackgroundInput <= 0 ||
+		result.TraceEventsAfterBackgroundInput < result.TraceEventsBeforeBackgroundInput ||
+		!result.BackgroundSessionReturnedToA || result.BackgroundSessionHoldMS < 1800 ||
+		!result.BackgroundStreamingBefore || !result.BackgroundStreamingAfter ||
+		result.BackgroundReceivedAfter <= result.BackgroundReceivedBefore ||
+		result.BackgroundDecodedAfter <= result.BackgroundDecodedBefore ||
+		result.BackgroundPublishedAfter <= result.BackgroundPublishedBefore ||
+		!result.BackgroundRecordingBefore || !result.BackgroundRecordingAfter ||
+		result.BackgroundRecordSamplesAfter <= result.BackgroundRecordSamplesBefore {
+		t.Fatalf("Flutter tab input acceptance did not prove switch release and background rejection: %+v", result)
+	}
+	traceData, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read multi-session native input trace: %v", err)
+	}
+	type traceEvent struct {
+		Kind      string `json:"kind"`
+		Action    string `json:"action"`
+		HIDUsage  int    `json:"hid_usage"`
+		Stage     string `json:"stage"`
+		InputType uint32 `json:"input_type"`
+		ScanCode  uint32 `json:"scan_code"`
+		Flags     uint32 `json:"flags"`
+	}
+	events := make([]traceEvent, 0)
+	for _, line := range strings.Split(string(traceData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var event traceEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("parse multi-session input trace line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	if result.TraceEventsBeforeBackgroundInput > len(events) {
+		t.Fatalf("background input trace boundary exceeds trace: boundary=%d total=%d", result.TraceEventsBeforeBackgroundInput, len(events))
+	}
+	for _, event := range events[result.TraceEventsBeforeBackgroundInput:] {
+		if event.Kind == "mouse" {
+			t.Fatalf("hidden Flutter view emitted a remote mouse event after tab switch: %+v", event)
+		}
+	}
+	aDown, received, queued, releaseBegin, aUp, releaseEnd := -1, -1, -1, -1, -1, -1
+	for i, event := range events {
+		if event.Kind == "key" && event.HIDUsage == 0x04 && event.Action == "down" && aDown < 0 {
+			aDown = i
+		}
+		if event.Kind == "release_control" && event.Stage == "input_release_received" && aDown >= 0 && received < 0 {
+			received = i
+		}
+		if event.Kind == "release_control" && event.Stage == "release_held_queued" && received >= 0 && queued < 0 {
+			queued = i
+		}
+		if event.Kind == "release_control" && event.Stage == "release_all_begin" && queued >= 0 && releaseBegin < 0 {
+			releaseBegin = i
+		}
+		if event.Kind == "injected" && event.InputType == 1 && event.ScanCode == 0x1e &&
+			event.Flags&0x2 != 0 && releaseBegin >= 0 && aUp < 0 {
+			aUp = i
+		}
+		if event.Kind == "release_control" && event.Stage == "release_all_end" && aUp >= 0 && releaseEnd < 0 {
+			releaseEnd = i
+		}
+	}
+	if !(aDown >= 0 && aDown < received && received < queued && queued < releaseBegin &&
+		releaseBegin < aUp && aUp < releaseEnd && releaseEnd < result.TraceEventsBeforeBackgroundInput) {
+		t.Fatalf("tab switch release trace order is incomplete: down=%d received=%d queued=%d begin=%d up=%d end=%d boundary=%d", aDown, received, queued, releaseBegin, aUp, releaseEnd, result.TraceEventsBeforeBackgroundInput)
+	}
+	t.Logf("PASS: tab switch released held remote A before hidden-view input probe; hidden pointer produced no host input (%s)", tracePath)
 }
 
 func verifyNativeFlutterInputEvidence(t *testing.T, artifacts, tracePath string) {
@@ -546,17 +1154,22 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	flutterUI := os.Getenv("CHAST_NATIVE_FLUTTER_UI") == "1"
 	dualFlutter := os.Getenv("CHAST_NATIVE_DUAL_FLUTTER") == "1"
 	multiWindowUI := os.Getenv("CHAST_NATIVE_MULTIWINDOW") == "1"
+	multiWindowInputUI := os.Getenv("CHAST_NATIVE_MULTIWINDOW_INPUT") == "1"
 	fileTransferUI := os.Getenv("CHAST_NATIVE_FILE_TRANSFER") == "1"
 	viewerStrategyUI := os.Getenv("CHAST_NATIVE_VIEWER_STRATEGY") == "1"
 	inputInjectionUI := os.Getenv("CHAST_NATIVE_INPUT_INJECTION") == "1"
-	if flutterUI && !browserUI && !multiWindowUI && !fileTransferUI && !viewerStrategyUI && !inputInjectionUI {
-		t.Fatal("Flutter UI acceptance requires browser, multi-window, file-transfer, viewer-strategy, or input-injection mode")
+	keyboardShortcutsUI := os.Getenv("CHAST_NATIVE_KEYBOARD_SHORTCUTS") == "1"
+	if flutterUI && !browserUI && !multiWindowUI && !fileTransferUI && !viewerStrategyUI && !inputInjectionUI && !keyboardShortcutsUI {
+		t.Fatal("Flutter UI acceptance requires browser, multi-window, file-transfer, viewer-strategy, input-injection, or keyboard-shortcut mode")
 	}
 	if dualFlutter && (!flutterUI || !browserUI) {
 		t.Fatal("dual Flutter acceptance requires CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_BROWSER_UI=1")
 	}
-	if multiWindowUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI || inputInjectionUI) {
+	if multiWindowUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI || inputInjectionUI || keyboardShortcutsUI) {
 		t.Fatal("multi-window acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_MULTIWINDOW=1")
+	}
+	if multiWindowInputUI && (!multiWindowUI || !flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI || inputInjectionUI || keyboardShortcutsUI) {
+		t.Fatal("multi-window input acceptance requires Flutter multi-window mode only")
 	}
 	if fileTransferUI && !flutterUI {
 		t.Fatal("Flutter file transfer acceptance requires CHAST_NATIVE_FLUTTER_UI=1")
@@ -564,8 +1177,11 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	if viewerStrategyUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI) {
 		t.Fatal("viewer strategy acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_VIEWER_STRATEGY=1")
 	}
-	if inputInjectionUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI) {
+	if inputInjectionUI && (!flutterUI || browserUI || dualFlutter || fileTransferUI || viewerStrategyUI || keyboardShortcutsUI) {
 		t.Fatal("input injection acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_INPUT_INJECTION=1")
+	}
+	if keyboardShortcutsUI && (!flutterUI || browserUI || dualFlutter || multiWindowUI || fileTransferUI || viewerStrategyUI || inputInjectionUI) {
+		t.Fatal("keyboard shortcut acceptance requires only CHAST_NATIVE_FLUTTER_UI=1 and CHAST_NATIVE_KEYBOARD_SHORTCUTS=1")
 	}
 	for _, name := range []string{"chast-host.exe", "chast-tunnel.exe", "chast-live-viewer-probe.exe"} {
 		if !nativeFile(filepath.Join(bin, name)) {
@@ -715,16 +1331,23 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		t.Fatalf("create isolated host receive directory: %v", err)
 	}
 	inputTracePath := filepath.Join(dir, "input-events.jsonl")
+	viewerStatusDirectory := ""
+	if multiWindowInputUI {
+		viewerStatusDirectory = filepath.Join(dir, "viewer-status")
+		if err := os.MkdirAll(viewerStatusDirectory, 0700); err != nil {
+			t.Fatalf("create isolated viewer status directory: %v", err)
+		}
+	}
 	config := fmt.Sprintf("bind=127.0.0.1\nport=%d\ncarrier=false\nlan_discovery=false\nmax_viewers=2\nkeep_awake=false\nlock_after_session_end=false\nauto_disconnect_minutes=0\ninput=false\nclipboard=false\naudio=false\nfile_transfer=true\nterminal=false\nallow_remote_config=false\nrestart=false\nblock_input=false\nprivacy_mode=false\nmicrophone=false\ncamera=false\nrecord_incoming=false\nautostart=false\nauth_mode=password\ntoken_auth=true\ntoken_mode=reusable\ntoken=%s\ntunnel=true\nserver_url=%s\nhost_key=%s\ntunnel_id=%s\ntunnel_key=%s\ntunnel_listen=%s\naccess_issuer=%s\naccess_key=%s:%s\nfile_receive_dir=%s\n",
 		port, token, front.URL, testutil.ServerKey, peer, deviceKey, tunnelListen, issuer.Name(), issuer.KeyID(), issuer.PublicKeyText(), receiveDirectory)
-	if inputInjectionUI {
+	if inputInjectionUI || multiWindowInputUI || keyboardShortcutsUI {
 		config = strings.Replace(config, "input=false", "input=true", 1)
 	}
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
 	startHost := func(name string) *nativeProcess {
-		if inputInjectionUI {
+		if inputInjectionUI || multiWindowInputUI || keyboardShortcutsUI {
 			env := append(os.Environ(),
 				"CHAST_NATIVE_TESTING=1",
 				"CHAST_NATIVE_INPUT_DRY_RUN=1",
@@ -849,7 +1472,8 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	var flutterViewer *nativeProcess
 	if flutterUI {
 		flutterViewer = startNativeFlutterViewer(t, dir, "flutter-target", flutterBin, front.URL, serverPublicKey,
-			peer, fingerprint, "native-acceptance", accountToken, fileTransferUI)
+			peer, fingerprint, "native-acceptance", accountToken, fileTransferUI, viewerStatusDirectory,
+			keyboardShortcutsUI)
 	} else {
 		_, firstDir = startViewer("viewer-a")
 	}
@@ -873,13 +1497,50 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		first = rows[0]
 		return first.HostID == peer && first.RuntimeID != "" && first.State == "active"
 	})
+	firstViewerStatusPath := ""
+	if multiWindowInputUI {
+		firstViewerStatusPath = waitNativeFlutterNonRecordingStatusPath(t, viewerStatusDirectory)
+	}
 	if multiWindowUI {
+		if multiWindowInputUI {
+			enableNativeFlutterAutoRecordForNextSession(t, dir)
+		}
 		runNativeFlutterHomeConnect(t, flutterViewer.cmd.Process.Pid, peer,
 			"native-runtime-viewer-token", dir, 2, true)
 	}
 	if inputInjectionUI {
-		runNativeFlutterInputUI(t, flutterViewer.cmd.Process.Pid, dir, inputTracePath)
+		runNativeFlutterInputUI(t, flutterViewer.cmd.Process.Pid, dir, inputTracePath, false, "")
 		verifyNativeFlutterInputEvidence(t, dir, inputTracePath)
+		return
+	}
+	if keyboardShortcutsUI {
+		nativeWait(t, "loopback host grants input to the controlled Flutter session", 10*time.Second, func() bool {
+			data, err := os.ReadFile(livePath)
+			if err != nil {
+				return false
+			}
+			var snapshot struct {
+				Connections []struct {
+					ConnectionID string `json:"connection_id"`
+					Permissions  uint32 `json:"permissions"`
+					Controller   bool   `json:"controller"`
+				} `json:"connections"`
+			}
+			if json.Unmarshal(data, &snapshot) != nil {
+				return false
+			}
+			for _, connection := range snapshot.Connections {
+				if connection.ConnectionID == first.ConnectionID {
+					return connection.Controller && connection.Permissions&0x0001 != 0
+				}
+			}
+			return false
+		})
+		peerPreferencesKey := fmt.Sprintf("server:v1:%x/%s", sha256.Sum256([]byte(front.URL)), peer)
+		preferencesPath := filepath.Join(dir, "flutter-target-profile", "chast", "ui.json")
+		runNativeFlutterShortcutUI(t, flutterViewer.cmd.Process.Pid, dir, inputTracePath,
+			preferencesPath, peerPreferencesKey)
+		verifyNativeFlutterShortcutEvidence(t, dir, inputTracePath)
 		return
 	}
 	if viewerStrategyUI {
@@ -947,7 +1608,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		}
 		capturedViewerDelivery.Store(nil)
 		updatedViewer := startNativeFlutterViewer(t, dir, "flutter-viewer-strategy-updated", flutterBin, front.URL, serverPublicKey,
-			peer, fingerprint, "native-acceptance", accountToken, false)
+			peer, fingerprint, "native-acceptance", accountToken, false, "")
 		nativeWait(t, "updated Flutter session connects while the first session stays active", 90*time.Second, func() bool {
 			select {
 			case <-updatedViewer.done:
@@ -991,7 +1652,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		})
 		capturedViewerDelivery.Store(nil)
 		withdrawnViewer := startNativeFlutterViewer(t, dir, "flutter-viewer-strategy-withdrawn", flutterBin, front.URL, serverPublicKey,
-			peer, fingerprint, "native-acceptance", accountToken, false)
+			peer, fingerprint, "native-acceptance", accountToken, false, "")
 		nativeWait(t, "withdrawn-strategy Flutter session connects", 90*time.Second, func() bool {
 			select {
 			case <-withdrawnViewer.done:
@@ -1020,7 +1681,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 	var secondFlutterViewer *nativeProcess
 	if dualFlutter {
 		secondFlutterViewer = startNativeFlutterViewer(t, dir, "flutter-nontarget", flutterBin, front.URL, serverPublicKey,
-			peer, fingerprint, "native-acceptance", accountToken, false)
+			peer, fingerprint, "native-acceptance", accountToken, false, "")
 	} else if !multiWindowUI {
 		_, secondDir = startViewer("viewer-b")
 	}
@@ -1037,6 +1698,83 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		}
 		return second.State == "active"
 	})
+	if multiWindowUI {
+		if multiWindowInputUI {
+			statusPath := waitNativeFlutterRecordingStatusPath(t, viewerStatusDirectory,
+				filepath.Join(dir, "flutter-target-profile", "Videos"))
+			if statusPath == firstViewerStatusPath {
+				t.Fatalf("new recording session reused the initial session status path: %s", statusPath)
+			}
+			runNativeFlutterInputUI(t, flutterViewer.cmd.Process.Pid, dir,
+				inputTracePath, true, statusPath)
+			verifyNativeFlutterTabInputEvidence(t, dir, inputTracePath)
+			verifyNativeFlutterTabRecordingIsolation(t, dir, firstViewerStatusPath, statusPath,
+				filepath.Join(dir, "flutter-target-profile", "Videos"))
+			return
+		}
+		closeCycles := 3
+		if raw := strings.TrimSpace(os.Getenv("CHAST_NATIVE_MULTIWINDOW_CLOSE_CYCLES")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 20 {
+				t.Fatalf("CHAST_NATIVE_MULTIWINDOW_CLOSE_CYCLES must be between 1 and 20, got %q", raw)
+			}
+			closeCycles = parsed
+		}
+		t.Logf("running %d selected-tab close/reconnect cycles", closeCycles)
+		for closeCycle := 1; closeCycle <= closeCycles; closeCycle++ {
+			oldFirst, oldSecond := first, second
+			runNativeFlutterCloseSelectedTab(t, flutterViewer, peer,
+				"native-runtime-viewer-token", dir, 2)
+			var survivor liveConnectionReply
+			nativeWait(t, fmt.Sprintf("close cycle %d leaves the other tab active", closeCycle), 30*time.Second, func() bool {
+				rows := list()
+				if len(rows) != 1 || rows[0].State != "active" {
+					return false
+				}
+				survivor = rows[0]
+				return survivor.ConnectionID == oldFirst.ConnectionID || survivor.ConnectionID == oldSecond.ConnectionID
+			})
+			closedID := oldFirst.ConnectionID
+			if survivor.ConnectionID == oldFirst.ConnectionID {
+				closedID = oldSecond.ConnectionID
+			}
+			nativeWait(t, "closed tab connection reaches a terminal state", 20*time.Second, func() bool {
+				return detail(closedID).State == "closed"
+			})
+			if detail(survivor.ConnectionID).State != "active" {
+				t.Fatalf("surviving connection %s stopped while its sibling tab closed", survivor.ConnectionID)
+			}
+
+			runNativeFlutterHomeConnect(t, flutterViewer.cmd.Process.Pid, peer,
+				"native-runtime-viewer-token", dir, 2, true)
+			var reconnected liveConnectionReply
+			nativeWait(t, fmt.Sprintf("close cycle %d reconnect preserves the surviving tab", closeCycle), 45*time.Second, func() bool {
+				rows := list()
+				if len(rows) != 2 {
+					return false
+				}
+				foundSurvivor := false
+				foundReconnect := false
+				for _, row := range rows {
+					if row.ConnectionID == survivor.ConnectionID && row.State == "active" {
+						foundSurvivor = true
+					} else if row.ConnectionID != closedID && row.State == "active" {
+						reconnected = row
+						foundReconnect = true
+					}
+				}
+				return foundSurvivor && foundReconnect
+			})
+			first, second = reconnected, survivor
+			select {
+			case <-flutterViewer.done:
+				t.Fatalf("Flutter viewer exited during close/reconnect cycle %d: %v", closeCycle, flutterViewer.err)
+			default:
+			}
+			t.Logf("verified close/reconnect cycle %d: closed=%s reconnected=%s; sibling=%s remained active",
+				closeCycle, closedID, first.ConnectionID, second.ConnectionID)
+		}
+	}
 	if fileTransferUI {
 		fixtureName := "native-flutter-file-transfer.bin"
 		fixturePath := filepath.Join(dir, fixtureName)
@@ -1137,7 +1875,7 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		return
 	}
 	if multiWindowUI {
-		t.Log("PASS: two independent session windows in one real Flutter process connected to the loopback host; exact disconnect closed one connection while the other remained active")
+		t.Log("PASS: two session tabs in one real Flutter process connected to the loopback host; exact disconnect closed one connection while the other remained active")
 		return
 	}
 
@@ -1373,4 +2111,434 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 		t.Fatalf("the rejected third viewer changed the two local sessions: %+v", active)
 	}
 	t.Log("PASS: exact QUIC target, outage/recovery, runtime isolation, managed 3-viewer cap and local 2-viewer cap after withdrawal")
+}
+
+func TestWindowsNativeFlutterTabAudioAcceptance(t *testing.T) {
+	if os.Getenv("CHAST_NATIVE_MULTIWINDOW_AUDIO") != "1" {
+		t.Skip("set CHAST_NATIVE_MULTIWINDOW_AUDIO=1 for isolated real Flutter UI acceptance")
+	}
+	bin := os.Getenv("CHAST_NATIVE_BIN_DIR")
+	if bin == "" {
+		t.Fatal("CHAST_NATIVE_BIN_DIR is required")
+	}
+	bin, err := filepath.Abs(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flutterBin := os.Getenv("CHAST_NATIVE_FLUTTER_BIN")
+	for _, path := range []string{filepath.Join(bin, "chast-viewer-probe.exe"), flutterBin} {
+		if !nativeFile(path) {
+			t.Fatalf("missing required test executable: %s", path)
+		}
+	}
+	root := os.Getenv("CHAST_NATIVE_ARTIFACT_DIR")
+	dir := t.TempDir()
+	if root != "" {
+		dir, err = os.MkdirTemp(root, "flutter-tab-audio-")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("artifacts: %s", dir)
+
+	fixtureDir := filepath.Join(dir, "synthetic-audio-host")
+	host := startNativeProcess(t, dir, "synthetic-audio-host",
+		filepath.Join(bin, "chast-viewer-probe.exe"), "", "--media-window-host", fixtureDir)
+	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(fixtureDir, "stop"), nil, 0600)
+	})
+	var endpoint struct {
+		Port        uint16
+		Fingerprint string
+	}
+	nativeWait(t, "loopback fixture publishes its synthetic-audio endpoint", 20*time.Second, func() bool {
+		select {
+		case <-host.done:
+			t.Fatalf("synthetic media fixture exited: %v (see synthetic-audio-host.log)", host.err)
+		default:
+		}
+		data, err := os.ReadFile(filepath.Join(fixtureDir, "endpoint.json"))
+		if err != nil {
+			return false
+		}
+		return json.Unmarshal(data, &endpoint) == nil &&
+			endpoint.Port != 0 && endpoint.Fingerprint != ""
+	})
+	peer := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(endpoint.Port)))
+	statusDir := filepath.Join(dir, "viewer-status")
+	if err := os.Mkdir(statusDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profile := filepath.Join(dir, "flutter-audio-profile")
+	chastDir := filepath.Join(profile, "chast")
+	if err := os.MkdirAll(chastDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	trust, err := json.Marshal(map[string]string{peer: endpoint.Fingerprint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(chastDir, "trust.json"), trust, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(profile) })
+
+	awakeTracePath := filepath.Join(dir, "awake-leases.tsv")
+	env := make([]string, 0, len(os.Environ())+7)
+	for _, entry := range os.Environ() {
+		key := strings.SplitN(entry, "=", 2)[0]
+		switch strings.ToUpper(key) {
+		case "APPDATA", "USERPROFILE", "CHAST_NATIVE_TESTING",
+			"CHAST_NATIVE_TEST_STATUS_DIR", "CHAST_NATIVE_TEST_AUDIO_SINK",
+			"CHAST_NATIVE_TEST_TABS_TRACE", "CHAST_NATIVE_TEST_AWAKE_TRACE":
+			continue
+		}
+		env = append(env, entry)
+	}
+	env = append(env,
+		"APPDATA="+profile,
+		"USERPROFILE="+profile,
+		"CHAST_NATIVE_TESTING=1",
+		"CHAST_NATIVE_TEST_AUDIO_SINK=1",
+		"CHAST_NATIVE_TEST_STATUS_DIR="+statusDir,
+		"CHAST_NATIVE_TEST_TABS_TRACE="+filepath.Join(dir, "session-tabs.tsv"),
+		"CHAST_NATIVE_TEST_AWAKE_TRACE="+awakeTracePath)
+	viewer := startNativeProcessWithEnv(t, dir, "flutter-audio-viewer",
+		flutterBin, "", env, true)
+	runNativeFlutterHomeConnect(t, viewer.cmd.Process.Pid, peer, "", dir, 1, false)
+	paths := waitNativeFlutterStatusPaths(t, statusDir, 1)
+	statusAPath := paths[0]
+	waitAudioReady := func(path, label string) nativeViewerStatusSnapshot {
+		t.Helper()
+		var snapshot nativeViewerStatusSnapshot
+		nativeWait(t, label+" streams and decodes synthetic audio", 30*time.Second, func() bool {
+			var ok bool
+			snapshot, ok = readNativeViewerStatusSnapshot(path)
+			return ok && snapshot.state == 3 && snapshot.audioEnabled &&
+				!snapshot.audioMuted && snapshot.audioReceived >= 30 &&
+				snapshot.audioDecoded >= 30
+		})
+		return snapshot
+	}
+	beforeA := waitAudioReady(statusAPath, "session A")
+
+	runNativeFlutterHomeConnect(t, viewer.cmd.Process.Pid, peer, "", dir, 2, true)
+	paths = waitNativeFlutterStatusPaths(t, statusDir, 2)
+	var statusBPath string
+	for _, path := range paths {
+		if path != statusAPath {
+			statusBPath = path
+			break
+		}
+	}
+	if statusBPath == "" {
+		t.Fatal("second Flutter tab did not create an independent native status file")
+	}
+	beforeB := waitAudioReady(statusBPath, "session B")
+	runNativeFlutterAudioIsolationUI(t, viewer.cmd.Process.Pid, dir, statusAPath, statusBPath)
+
+	resultData, err := os.ReadFile(filepath.Join(dir, "flutter-input-results.json"))
+	if err != nil {
+		t.Fatalf("read Flutter audio UI evidence: %v", err)
+	}
+	var uiResult map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimPrefix(resultData, []byte{0xef, 0xbb, 0xbf}), &uiResult); err != nil {
+		t.Fatalf("parse Flutter audio UI evidence: %v", err)
+	}
+	result := make(map[string]bool, 7)
+	for _, key := range []string{
+		"session_a_audio_muted_after_toggle",
+		"session_b_audio_unchanged_after_a_toggle",
+		"session_b_audio_muted_after_toggle",
+		"session_a_audio_unchanged_after_b_toggle",
+		"session_a_audio_unmuted_after_toggle",
+		"session_b_audio_state_preserved_after_switch",
+		"audio_isolation_verified",
+	} {
+		var passed bool
+		if err := json.Unmarshal(uiResult[key], &passed); err != nil || !passed {
+			t.Fatalf("Flutter toolbar audio routing assertion %s failed: %v", key, result)
+		}
+		result[key] = passed
+	}
+	afterA, okA := readNativeViewerStatusSnapshot(statusAPath)
+	afterB, okB := readNativeViewerStatusSnapshot(statusBPath)
+	if !okA || !okB || afterA.state != 3 || afterB.state != 3 ||
+		!afterA.audioEnabled || !afterB.audioEnabled || afterA.audioMuted ||
+		!afterB.audioMuted || afterA.audioDecoded <= beforeA.audioDecoded ||
+		afterB.audioDecoded <= beforeB.audioDecoded {
+		t.Fatalf("final per-tab audio state/counters are invalid: A=%+v B=%+v", afterA, afterB)
+	}
+	evidence, err := json.MarshalIndent(map[string]any{
+		"scope": "same-process Windows Release Flutter tabs; loopback-only synthetic silence; test player discards output",
+		"session_a": map[string]any{
+			"audit_ref": afterA.auditRef, "muted_final": afterA.audioMuted,
+			"decoded_before": beforeA.audioDecoded, "decoded_after": afterA.audioDecoded,
+		},
+		"session_b": map[string]any{
+			"audit_ref": afterB.auditRef, "muted_final": afterB.audioMuted,
+			"decoded_before": beforeB.audioDecoded, "decoded_after": afterB.audioDecoded,
+		},
+		"transitions": result,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "flutter-tab-audio-isolation.json"), evidence, 0600); err != nil {
+		t.Fatalf("write Flutter audio isolation evidence: %v", err)
+	}
+
+	readAwakeStates := func() (map[string]nativeAwakeLeaseSnapshot, bool) {
+		return readNativeAwakeLeaseSnapshots(awakeTracePath)
+	}
+	var awakeInitial map[string]nativeAwakeLeaseSnapshot
+	nativeWait(t, "both Flutter sessions hold an awake lease", 10*time.Second, func() bool {
+		states, ok := readAwakeStates()
+		if !ok || len(states) != 2 {
+			return false
+		}
+		for _, status := range states {
+			if !status.Held {
+				return false
+			}
+		}
+		awakeInitial = states
+		return true
+	})
+	if awakeInitial[afterA.auditRef].AuditRef == "" || awakeInitial[afterB.auditRef].AuditRef == "" {
+		t.Fatalf("awake leases do not match the two Flutter session identities: %+v", awakeInitial)
+	}
+	disconnectOne := func() {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(fixtureDir, "disconnect-one"), nil, 0600); err != nil {
+			t.Fatalf("request one isolated viewer disconnect: %v", err)
+		}
+	}
+	disconnectOne()
+	var awakeAfterOne map[string]nativeAwakeLeaseSnapshot
+	nativeWait(t, "one ended Flutter session releases while its sibling remains awake", 20*time.Second, func() bool {
+		select {
+		case <-viewer.done:
+			t.Fatal("Flutter viewer exited after disconnecting only one session")
+		default:
+		}
+		states, ok := readAwakeStates()
+		if !ok || len(states) != 2 {
+			return false
+		}
+		heldCount, endedCount := 0, 0
+		for _, status := range states {
+			if status.Held {
+				heldCount++
+			} else if status.State == 4 || status.State == 5 {
+				endedCount++
+			}
+		}
+		if heldCount != 1 || endedCount != 1 {
+			return false
+		}
+		awakeAfterOne = states
+		return true
+	})
+	disconnectOne()
+	var awakeAfterAll map[string]nativeAwakeLeaseSnapshot
+	nativeWait(t, "the last ended Flutter session releases the final awake lease", 20*time.Second, func() bool {
+		states, ok := readAwakeStates()
+		if !ok || len(states) != 2 {
+			return false
+		}
+		for _, status := range states {
+			if status.Held || (status.State != 4 && status.State != 5) {
+				return false
+			}
+		}
+		awakeAfterAll = states
+		return true
+	})
+	awakeEvidence, err := json.MarshalIndent(map[string]any{
+		"scope":   "two real Flutter Release session tabs; loopback synthetic host; transient process-scoped Windows power request only",
+		"initial": awakeInitial, "after_first_disconnect": awakeAfterOne,
+		"after_last_disconnect": awakeAfterAll,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "flutter-tab-awake-lease-isolation.json"), awakeEvidence, 0600); err != nil {
+		t.Fatalf("write Flutter awake lease evidence: %v", err)
+	}
+	t.Logf("PASS: Flutter tab mute actions remained session-scoped; evidence: %s",
+		filepath.Join(dir, "flutter-tab-audio-isolation.json"))
+	t.Logf("PASS: first viewer disconnect retained its sibling awake lease and the final disconnect released both; evidence: %s",
+		filepath.Join(dir, "flutter-tab-awake-lease-isolation.json"))
+}
+
+func TestWindowsNativeFlutterDisplayWindowLifecycleAcceptance(t *testing.T) {
+	if os.Getenv("CHAST_NATIVE_MULTIWINDOW_DISPLAY") != "1" {
+		t.Skip("set CHAST_NATIVE_MULTIWINDOW_DISPLAY=1 for isolated display-window lifecycle acceptance")
+	}
+	bin := os.Getenv("CHAST_NATIVE_BIN_DIR")
+	if bin == "" {
+		t.Fatal("CHAST_NATIVE_BIN_DIR is required")
+	}
+	bin, err := filepath.Abs(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flutterBin := os.Getenv("CHAST_NATIVE_FLUTTER_BIN")
+	for _, path := range []string{filepath.Join(bin, "chast-viewer-probe.exe"), flutterBin} {
+		if !nativeFile(path) {
+			t.Fatalf("missing required test executable: %s", path)
+		}
+	}
+	root := os.Getenv("CHAST_NATIVE_ARTIFACT_DIR")
+	dir := t.TempDir()
+	if root != "" {
+		dir, err = os.MkdirTemp(root, "flutter-display-window-")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("artifacts: %s", dir)
+
+	fixtureDir := filepath.Join(dir, "synthetic-display-host")
+	host := startNativeProcess(t, dir, "synthetic-display-host",
+		filepath.Join(bin, "chast-viewer-probe.exe"), "",
+		"--multi-display-window-host", fixtureDir)
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(fixtureDir, "stop"), nil, 0600) })
+	var endpoint struct {
+		Port        uint16 `json:"port"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	nativeWait(t, "loopback fixture publishes its two-display endpoint", 20*time.Second, func() bool {
+		select {
+		case <-host.done:
+			log, _ := os.ReadFile(filepath.Join(dir, "synthetic-display-host.log"))
+			t.Fatalf("synthetic display fixture exited: %v\n%s", host.err, log)
+		default:
+		}
+		data, err := os.ReadFile(filepath.Join(fixtureDir, "endpoint.json"))
+		return err == nil && json.Unmarshal(data, &endpoint) == nil &&
+			endpoint.Port != 0 && endpoint.Fingerprint != ""
+	})
+	peer := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(endpoint.Port)))
+	statusDir := filepath.Join(dir, "viewer-status")
+	if err := os.Mkdir(statusDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profile := filepath.Join(dir, "flutter-display-profile")
+	chastDir := filepath.Join(profile, "chast")
+	if err := os.MkdirAll(chastDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	trust, err := json.Marshal(map[string]string{peer: endpoint.Fingerprint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(chastDir, "trust.json"), trust, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(profile) })
+
+	env := make([]string, 0, len(os.Environ())+5)
+	for _, entry := range os.Environ() {
+		key := strings.SplitN(entry, "=", 2)[0]
+		switch strings.ToUpper(key) {
+		case "APPDATA", "USERPROFILE", "CHAST_NATIVE_TESTING",
+			"CHAST_NATIVE_TEST_STATUS_DIR", "CHAST_NATIVE_TEST_TABS_TRACE":
+			continue
+		}
+		env = append(env, entry)
+	}
+	env = append(env,
+		"APPDATA="+profile,
+		"USERPROFILE="+profile,
+		"CHAST_NATIVE_TESTING=1",
+		"CHAST_NATIVE_TEST_STATUS_DIR="+statusDir,
+		"CHAST_NATIVE_TEST_TABS_TRACE="+filepath.Join(dir, "session-tabs.tsv"))
+	viewer := startNativeProcessWithEnv(t, dir, "flutter-display-viewer",
+		flutterBin, "", env, true)
+	runNativeFlutterHomeConnect(t, viewer.cmd.Process.Pid, peer, "", dir, 1, false)
+	paths := waitNativeFlutterStatusPaths(t, statusDir, 1)
+	statusAPath := paths[0]
+	var beforeA nativeViewerStatusSnapshot
+	nativeWait(t, "display session A streams and decodes video", 40*time.Second, func() bool {
+		var ok bool
+		beforeA, ok = readNativeViewerStatusSnapshot(statusAPath)
+		return ok && beforeA.state == 3 && beforeA.received > 0 && beforeA.decoded > 0
+	})
+
+	runNativeFlutterHomeConnect(t, viewer.cmd.Process.Pid, peer, "", dir, 2, true)
+	paths = waitNativeFlutterStatusPaths(t, statusDir, 2)
+	var statusBPath string
+	for _, path := range paths {
+		if path != statusAPath {
+			statusBPath = path
+			break
+		}
+	}
+	if statusBPath == "" {
+		t.Fatal("second Flutter tab did not create an independent native status file")
+	}
+	var beforeB nativeViewerStatusSnapshot
+	nativeWait(t, "display session B streams and decodes video", 40*time.Second, func() bool {
+		var ok bool
+		beforeB, ok = readNativeViewerStatusSnapshot(statusBPath)
+		return ok && beforeB.state == 3 && beforeB.received > 0 && beforeB.decoded > 0
+	})
+
+	disconnectMarker := filepath.Join(fixtureDir, "disconnect-first")
+	runNativeFlutterDisplayWindowLifecycleUI(t, viewer.cmd.Process.Pid, dir, disconnectMarker)
+	resultData, err := os.ReadFile(filepath.Join(dir, "flutter-input-results.json"))
+	if err != nil {
+		t.Fatalf("read Flutter display-window evidence: %v", err)
+	}
+	var uiResult struct {
+		DisplayAVisibleWhenASelected        bool  `json:"display_a_visible_when_a_selected"`
+		DisplayBVisibleWhenBSelected        bool  `json:"display_b_visible_when_b_selected"`
+		DisplayWindowsFollowParentTabs      bool  `json:"display_windows_follow_parent_tabs"`
+		DisplayAClosedAfterParentDisconnect bool  `json:"display_a_closed_after_parent_disconnect"`
+		DisplayBSurvivedParentDisconnect    bool  `json:"display_b_survived_parent_disconnect"`
+		SiblingTabSurvivedParentDisconnect  bool  `json:"sibling_tab_survived_parent_disconnect"`
+		LifecycleVerified                   bool  `json:"display_window_lifecycle_verified"`
+		DisplayAHandle                      int64 `json:"display_a_window_handle"`
+		DisplayBHandle                      int64 `json:"display_b_window_handle"`
+	}
+	if err := json.Unmarshal(bytes.TrimPrefix(resultData, []byte{0xef, 0xbb, 0xbf}), &uiResult); err != nil {
+		t.Fatalf("parse Flutter display-window evidence: %v", err)
+	}
+	if !uiResult.LifecycleVerified || !uiResult.DisplayAVisibleWhenASelected ||
+		!uiResult.DisplayBVisibleWhenBSelected || !uiResult.DisplayWindowsFollowParentTabs ||
+		!uiResult.DisplayAClosedAfterParentDisconnect ||
+		!uiResult.DisplayBSurvivedParentDisconnect ||
+		!uiResult.SiblingTabSurvivedParentDisconnect ||
+		uiResult.DisplayAHandle == 0 || uiResult.DisplayBHandle == 0 {
+		t.Fatalf("Flutter display-window lifecycle assertions failed: %+v", uiResult)
+	}
+
+	var afterA, afterB nativeViewerStatusSnapshot
+	nativeWait(t, "parent A ends while sibling B remains streaming", 15*time.Second, func() bool {
+		var okA, okB bool
+		afterA, okA = readNativeViewerStatusSnapshot(statusAPath)
+		afterB, okB = readNativeViewerStatusSnapshot(statusBPath)
+		return okA && okB && (afterA.state == 4 || afterA.state == 5) &&
+			afterB.state == 3 && afterB.decoded > beforeB.decoded
+	})
+	evidence, err := json.MarshalIndent(map[string]any{
+		"scope":                            "same-process Windows Release Flutter tabs; loopback synthetic two-display topology; both logical displays alias one read-only local capture",
+		"session_a_audit_ref":              beforeA.auditRef,
+		"session_b_audit_ref":              beforeB.auditRef,
+		"session_a_state_after_disconnect": afterA.state,
+		"session_b_state_after_disconnect": afterB.state,
+		"session_b_decoded_before":         beforeB.decoded,
+		"session_b_decoded_after":          afterB.decoded,
+		"ui":                               uiResult,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "flutter-display-window-lifecycle.json"), evidence, 0600); err != nil {
+		t.Fatalf("write display-window lifecycle evidence: %v", err)
+	}
+	t.Logf("PASS: display windows followed their tabs; disconnecting A closed only A's window while B remained visible and streaming; evidence: %s",
+		filepath.Join(dir, "flutter-display-window-lifecycle.json"))
 }

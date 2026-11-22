@@ -52,6 +52,11 @@ UINT png_mime_format() {
     return format;
 }
 
+UINT svg_mime_format() {
+    static const UINT format = RegisterClipboardFormatW(L"image/svg+xml");
+    return format;
+}
+
 bool wide_to_utf8(const wchar_t* data, size_t length, std::string& text) {
     if (length == 0 || length > static_cast<size_t>(INT_MAX)) {
         return false;
@@ -156,6 +161,8 @@ UINT win32_format(ClipboardFormat format) {
             return CF_DIB;
         case ClipboardFormat::Png:
             return png_format();
+        case ClipboardFormat::Svg:
+            return svg_mime_format();
         case ClipboardFormat::FileList:
             return 0;  // travels through read/write_clipboard_files
     }
@@ -241,10 +248,12 @@ ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* 
                                (png_mime_format() != 0 &&
                                 IsClipboardFormatAvailable(png_mime_format()));
     const bool dib_available = IsClipboardFormatAvailable(CF_DIB);
+    const bool svg_available = svg_mime_format() != 0 &&
+                               IsClipboardFormatAvailable(svg_mime_format());
     if (!IsClipboardFormatAvailable(CF_UNICODETEXT) &&
         !IsClipboardFormatAvailable(html_format()) &&
         !IsClipboardFormatAvailable(rtf_format()) &&
-        !dib_available && !png_available) {
+        !dib_available && !png_available && !svg_available) {
         return ClipboardReadState::Empty;
     }
 
@@ -311,8 +320,8 @@ ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* 
         }
     }
 
-    // Images are alternative representations. A broken PNG must not hide a
-    // usable DIB, nor a large DIB that converted successfully. Append in
+    // Images are alternative representations. Readable formats survive an
+    // invalid image, including a rejected SVG in a rich item. Append in
     // format-id order because the CCLB container requires ascending ids.
     if (have_dib && dib_data.size() <= kMaxClipboardImageBytes &&
         !accepts(content, ClipboardFormat::Dib, std::move(dib_data))) {
@@ -321,17 +330,23 @@ ClipboardReadState read_clipboard_state(ClipboardContent& content, std::string* 
     if (have_png && !accepts(content, ClipboardFormat::Png, std::move(png_data))) {
         have_png = false;
     }
-    // A partially rendered item is not a valid baseline either: otherwise a
-    // format that becomes readable later would look like a new local copy.
+    if (svg_available) {
+        std::vector<uint8_t> svg_data;
+        if (read_bytes(svg_mime_format(), kMaxClipboardSvgBytes, true, svg_data)) {
+            accepts(content, ClipboardFormat::Svg, std::move(svg_data));
+        }
+    }
+    // A partially rendered text or markup item is not a valid baseline:
+    // later rendering could otherwise look like a new local copy.
     if (failed) {
         content = {};
         if (error) *error = "a clipboard format could not be read";
         return ClipboardReadState::Failed;
     }
     if (content.formats.empty()) {
-        if (dib_available || png_available) {
+        if (dib_available || png_available || svg_available) {
             if (error && error->empty()) {
-                *error = "the clipboard image could not be decoded";
+                *error = "no clipboard image format could be read and validated";
             }
             return ClipboardReadState::Failed;
         }

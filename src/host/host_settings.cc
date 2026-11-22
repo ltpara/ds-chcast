@@ -416,6 +416,17 @@ std::string audit_spool_path_for(const std::string& settings_path) {
     return to_utf8(path.wstring());
 }
 
+std::string recording_upload_queue_path_for(const std::string& settings_path) {
+    if (settings_path.empty()) {
+        return {};
+    }
+    std::filesystem::path path = native_path(settings_path);
+    std::filesystem::path name = path.stem();
+    name += L".recording-queue";
+    path.replace_filename(name);
+    return to_utf8(path.wstring());
+}
+
 std::string policy_state_path_for(const std::string& settings_path) {
     if (settings_path.empty()) {
         return {};
@@ -785,6 +796,7 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             HostSettingsLoad rejected;
             rejected.warning = "machine settings security check failed: " + security_error;
             rejected.settings.audit_spool = audit_spool_path_for(path);
+            rejected.settings.recording_upload_queue = recording_upload_queue_path_for(path);
             rejected.settings.policy_state = policy_state_path_for(path);
             rejected.settings.policy_ack = policy_ack_path_for(path);
             rejected.settings.wallpaper_state = wallpaper_state_path_for(path);
@@ -795,6 +807,7 @@ HostSettingsLoad load_host_settings(const std::string& path) {
     if (!in) {
         HostSettingsLoad missing;
         missing.settings.audit_spool = audit_spool_path_for(path);
+        missing.settings.recording_upload_queue = recording_upload_queue_path_for(path);
         missing.settings.policy_state = policy_state_path_for(path);
         missing.settings.policy_ack = policy_ack_path_for(path);
         missing.settings.wallpaper_state = wallpaper_state_path_for(path);
@@ -840,6 +853,7 @@ bool host_preference_is_explicit(const HostSettings& settings, HostPreference pr
 HostSettingsLoad parse_host_settings(const std::string& contents, const std::string& path) {
     HostSettingsLoad result;
     result.settings.audit_spool = audit_spool_path_for(path);
+    result.settings.recording_upload_queue = recording_upload_queue_path_for(path);
     result.settings.policy_state = policy_state_path_for(path);
     result.settings.policy_ack = policy_ack_path_for(path);
     result.settings.wallpaper_state = wallpaper_state_path_for(path);
@@ -966,6 +980,11 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
             }
         } else if (key == "record_directory") {
             settings.record_directory = value;
+        } else if (key == "upload_recordings") {
+            if (!parse_bool(value, settings.upload_recordings)) {
+                settings.upload_recordings = false;
+                warn(result.warning, "upload_recordings must be a boolean");
+            }
         } else if (key == "audio") {
             if (!parse_bool(value, settings.allow_audio)) {
                 warn(result.warning, "audio '" + value + "' is not a boolean");
@@ -1275,6 +1294,14 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
             } else {
                 settings.proxy = normalized;
             }
+        } else if (key == "tls_ca") {
+            settings.tls_ca = value;
+            if (!value.empty() &&
+                (value.find('\0') != std::string::npos ||
+                 value.find_first_of("\r\n") != std::string::npos ||
+                 !native_path(value).is_absolute())) {
+                warn(result.warning, "tls_ca must be an absolute file path without line breaks");
+            }
         } else if (key == "tunnel_id") {
             if (value.empty()) {
                 settings.tunnel_id.clear();
@@ -1394,6 +1421,13 @@ HostSettingsLoad parse_host_settings(const std::string& contents, const std::str
         settings.record_incoming = false;
         warn(result.warning, "record_incoming disabled: choose an absolute record_directory");
     }
+    if (settings.upload_recordings &&
+        (settings.recording_upload_queue.empty() ||
+         !native_path(settings.recording_upload_queue).is_absolute())) {
+        settings.upload_recordings = false;
+        warn(result.warning,
+             "upload_recordings disabled: the settings file must have an absolute path");
+    }
     if (auth_mode_seen) {
         settings.require_approval = settings.auth_mode != HostAuthMode::Password;
     } else {
@@ -1433,6 +1467,20 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
         settings.record_directory.find('\0') != std::string::npos ||
         (settings.record_incoming && !native_path(settings.record_directory).is_absolute())) {
         if (error) *error = "Host recording requires an absolute directory without line breaks.";
+        return false;
+    }
+    if (!settings.tls_ca.empty() &&
+        (settings.tls_ca.find_first_of("\r\n") != std::string::npos ||
+         settings.tls_ca.find('\0') != std::string::npos ||
+         !native_path(settings.tls_ca).is_absolute())) {
+        if (error) *error = "The private TLS CA must be an absolute path without line breaks.";
+        return false;
+    }
+    if (settings.upload_recordings &&
+        !native_path(recording_upload_queue_path_for(path)).is_absolute()) {
+        if (error) {
+            *error = "Host recording uploads require an absolute settings-file path.";
+        }
         return false;
     }
     if (settings.file_share_roots.size() > kMaxFileShares) {
@@ -1508,6 +1556,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "record=" << (settings.allow_record ? 1 : 0) << "\n"
          << "record_incoming=" << (settings.record_incoming ? 1 : 0) << "\n"
          << "record_directory=" << settings.record_directory << "\n"
+         << "upload_recordings=" << (settings.upload_recordings ? 1 : 0) << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "file_share_roots=" << share_roots << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
@@ -1549,6 +1598,7 @@ bool serialize_host_settings(const std::string& path, const HostSettings& settin
          << "server_key=" << settings.server_key << "\n"
          << "host_key=" << settings.host_key << "\n"
          << "proxy=" << settings.proxy << "\n"
+         << "tls_ca=" << settings.tls_ca << "\n"
          << "tunnel_id=" << settings.tunnel_id << "\n"
          << "tunnel_old_id=" << settings.tunnel_old_id << "\n"
          << "tunnel_key=" << settings.tunnel_key << "\n"

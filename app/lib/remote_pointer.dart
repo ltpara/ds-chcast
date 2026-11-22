@@ -82,10 +82,14 @@ int windowsPointerPressure(double pressure, double min, double max) {
     return (0, 0);
   }
   final double degrees = tilt * 180 / math.pi;
-  final int x =
-      (degrees * math.sin(orientation)).round().clamp(-90, 90).toInt();
-  final int y =
-      (-degrees * math.cos(orientation)).round().clamp(-90, 90).toInt();
+  final int x = (degrees * math.sin(orientation))
+      .round()
+      .clamp(-90, 90)
+      .toInt();
+  final int y = (-degrees * math.cos(orientation))
+      .round()
+      .clamp(-90, 90)
+      .toInt();
   return (x, y);
 }
 

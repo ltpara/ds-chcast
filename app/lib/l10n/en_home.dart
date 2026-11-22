@@ -1,5 +1,9 @@
 /// English for the home page, connection form, address book and account UI.
 const Map<String, String> kEnglishHome = <String, String>{
+  '有 {count} 个录制文件尚未封口。文件和恢复记录会保留在本机，不会上传或自动删除；封口后会重新检查。':
+      '{count} recording file(s) are not finalized. The files and recovery records stay on this device; they are not uploaded or automatically deleted. They will be checked again once finalized.',
+  '无法检查未完成的录制文件。录制文件不会被自动删除。':
+      'Could not check for unfinished recordings. Recording files will not be automatically deleted.',
   ' · {onlineCount} 台在线': ' · {onlineCount} online',
   '8 位数字': '8 digits',
   'Chast {chastVersion}\n\nWindows 桌面采集、Intel 硬件编码、MsQuic 直连显示与键鼠控制。远端需以 chast-quic serve --input 启动才会接受输入；设备 ID 经 chast-server 解析，直连失败时自动回退中继。':

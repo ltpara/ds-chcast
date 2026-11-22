@@ -94,7 +94,12 @@ public:
     static UINT configured_bitrate(const IDxgiCapturer& capture);
     // Read a rate only for the format this connection has announced. A source
     // rebuild must be announced with its new picture before its new rate.
-    static bool read_rate(const IVideoEncoder& encoder, UINT& bitrate, UINT& fps);
+    struct RateRequest {
+        UINT bitrate = 0, fps = 0;
+        float ratio = 0;
+    };
+    static bool read_rate(const IVideoEncoder& encoder, UINT& bitrate, UINT& fps,
+                          RateRequest* request = nullptr);
     // A failed Auto encoder is awaiting a compatible software codec. Keep the
     // session alive while votes/decoder capabilities can still change.
     static bool encoder_recovery_pending(const IDxgiCapturer& capture);

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -23,24 +24,31 @@ import '../receiver_status_events.dart';
 import '../reconnect_policy.dart';
 import '../rdp.dart';
 import '../recording_retention.dart';
+import '../recording_upload_queue.dart';
+import '../recording_upload_worker.dart';
 import '../remote_key_sequence.dart';
 import '../remote_pointer.dart';
+import '../remote_shortcuts.dart';
 import '../annotation_ink.dart';
 import '../annotation_stroke_controller.dart';
 import '../trust_store.dart';
+import '../trackpad_speed.dart';
 import '../tunnel_agent.dart';
 import '../view_prefs.dart';
 import '../view_scale.dart';
+import '../view_scroll.dart';
 import '../viewer_bridge.dart';
 import '../viewer_strategy.dart';
 import '../widgets/camera_panel.dart';
 import '../widgets/display_stream_view.dart';
 import '../widgets/chat_panel.dart';
 import '../widgets/file_browser_panel.dart';
+import '../widgets/remote_shortcut_dialog.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/send_text_dialog.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
+import '../widgets/trackpad_speed_dialog.dart';
 import '../widgets/terminal_tabs.dart';
 import 'package:chast_viewer/l10n.dart';
 
@@ -105,6 +113,7 @@ class SessionPage extends StatefulWidget {
     this.connectionReporter,
     this.accountResolver,
     this.recordingUploader,
+    this.recordingUploadQueue,
     this.hostLookup,
     this.serverIdentityLoader,
     this.viewerStrategyReceiptReporter,
@@ -153,6 +162,7 @@ class SessionPage extends StatefulWidget {
     DateTime endedAt,
   )?
   recordingUploader;
+  final RecordingUploadQueueStore? recordingUploadQueue;
   final SessionHostLookup? hostLookup;
   final SessionServerIdentityLoader? serverIdentityLoader;
   final SessionViewerStrategyReceiptReporter? viewerStrategyReceiptReporter;
@@ -229,8 +239,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // path from a previous session out of the queue.
   final Set<String> _recordedPaths = <String>{};
   final Map<String, DateTime> _recordStartedAt = <String, DateTime>{};
-  final List<_FinishedRecording> _recordingUploads = <_FinishedRecording>[];
+  final Map<String, AccountSession?> _recordAccountByPath =
+      <String, AccountSession?>{};
+  final Map<String, RecordingUploadJob> _pendingRecordingJobs =
+      <String, RecordingUploadJob>{};
+  final Map<String, RecordingUploadIntent> _recordingIntentByPath =
+      <String, RecordingUploadIntent>{};
+  final Map<String, RecordingUploadWorkerLease> _recordingIntentLeases =
+      <String, RecordingUploadWorkerLease>{};
+  Future<void> _recordingTrackTail = Future<void>.value();
+  final Set<String> _recordingPersistenceFailures = <String>{};
+  late final RecordingUploadQueueStore _recordingUploadQueue =
+      widget.recordingUploadQueue ?? RecordingUploadQueueStore();
+  late final RecordingUploadWorker _recordingUploadWorker =
+      RecordingUploadWorker(queue: _recordingUploadQueue);
   bool _uploadingRecordings = false;
+  bool _recordingDrainRequested = false;
   Timer? _recordingRetryTimer;
   String _recordingUploadError = '';
   // An upload holds its file open, so retention must not delete it.
@@ -245,6 +269,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _autoRecordSuppressed = false;
   bool _wasLive = false;
   bool _wasRecording = false;
+  ViewerStatus _lastRecordingStatus = const ViewerStatus();
   String _recordErrorSeen = '';
   // Session chat. The page owns the transcript and the native transport; the
   // panel is a modeless overlay. While its input holds focus, physical keys
@@ -348,10 +373,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   final ViewerInitialControlPolicy _initialControlPolicy =
       ViewerInitialControlPolicy();
   bool _nativeKeyCapture = false;
+  bool _nativeShortcutCapture = false;
   bool _localKeyboardUnavailable = false;
   ViewerKeyboardMode _keyboardMode = ViewerKeyboardMode.physical;
   bool _keyboardChanging = false;
   int _keyCaptureGeneration = 0;
+  int _shortcutCaptureGeneration = 0;
+  List<RemoteShortcutBinding> _remoteShortcuts =
+      const <RemoteShortcutBinding>[];
+  final Set<int> _shortcutKeysHeldLocally = <int>{};
+  bool _editingShortcuts = false;
   // Relative mode pins the local pointer to the window and sends host motion
   // itself; it is session-only and starts off.
   bool _relativeMouse = false;
@@ -376,6 +407,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   ViewFit _fit = ViewFit.adaptive;
   int _zoomPercent = defaultViewZoomPercent;
   int _cursorZoomPercent = defaultCursorZoomPercent;
+  int _trackpadSpeedPercent = kDefaultTrackpadSpeedPercent;
+  ViewScrollStyle _scrollStyle = defaultViewScrollStyle;
+  int _scrollEdge = defaultViewScrollEdge;
   // What the next connection asks the server for. Kept across reconnects so
   // "重新连接" returns to the same output; kViewerDisplayAuto leaves the
   // choice to the server. An accepted in-session switch updates it too.
@@ -538,6 +572,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     ViewerBridge.setKeyboardEscapeHandler(() {
       if (mounted && _relativeMouse) setState(_disableRelativeMouse);
     });
+    ViewerBridge.setKeyboardShortcutHandler(_invokeShortcut);
     ViewerBridge.setDropHandler(_sendDroppedFiles);
     if (widget.windowSession) {
       unawaited(ViewerBridge.setWindowCloseHandler(_closeNativeWindow));
@@ -557,15 +592,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         ).showSnackBar(SnackBar(content: Text(tr('文字未发送，请检查控制权限或连接状态'))));
       }
     });
+    ViewerBridge.setSessionTabActivationHandler(_onSessionTabActivated);
     final ViewPreferences viewPrefs = ViewPreferences.load(
       peerId: _prefsPeerId,
     );
     _keyboardMode = viewerKeyboardModeFromName(viewPrefs.keyboardMode);
+    _loadShortcuts(viewPrefs.remoteShortcuts);
     _autoRecord = viewPrefs.autoRecord;
     _recordKeep = viewPrefs.recordKeep;
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _zoomPercent = viewPrefs.zoomPercent;
     _cursorZoomPercent = viewPrefs.cursorZoomPercent;
+    _trackpadSpeedPercent = viewPrefs.trackpadSpeedPercent;
+    _scrollStyle = viewPrefs.scrollStyle;
+    _scrollEdge = viewPrefs.scrollEdge;
     _statsVisible = viewPrefs.stats;
     _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
     _showMyCursor = viewPrefs.showMyCursor;
@@ -635,10 +675,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
+    _shortcutKeysHeldLocally.clear();
     _recordingRetryTimer?.cancel();
     ViewerBridge.setDropHandler(null);
     ViewerBridge.setKeyboardEscapeHandler(null);
+    ViewerBridge.setKeyboardShortcutHandler(null);
     ViewerBridge.setKeyboardTextRejectedHandler(null);
+    ViewerBridge.setSessionTabActivationHandler(null);
     if (widget.windowSession) {
       unawaited(ViewerBridge.setWindowCloseHandler(null));
     }
@@ -655,6 +698,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _terminalFocus.dispose();
     _focus.removeListener(_onKeyboardFocusChanged);
     _setKeyCapture(false);
+    _loadShortcuts(const <RemoteShortcutBinding>[]);
     _focus.dispose();
     _portForwardRules.dispose();
     _clearCursor();
@@ -678,6 +722,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _onKeyboardFocusChanged();
       return;
     }
+    _setKeyboardShortcutCapture();
     if (!_controlEnabled) {
       return;
     }
@@ -843,11 +888,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// Watches the engine's recording path. A path leaves the tracked set when
   /// recording stops or when the engine rolls to a new segment, and only then
   /// is it a complete MP4.
-  void _trackRecording(ViewerStatus status) {
+  Future<void> _trackRecording(ViewerStatus status) {
+    final Future<void> operation = _recordingTrackTail.then(
+      (_) => _trackRecordingNow(status),
+    );
+    _recordingTrackTail = operation.catchError((Object _) {});
+    return _recordingTrackTail;
+  }
+
+  Future<void> _trackRecordingNow(ViewerStatus status) async {
     final String current = status.recordPath.trim();
     if (status.recording && current.isNotEmpty) {
       _recordedPaths.add(current);
-      _recordStartedAt.putIfAbsent(current, () => DateTime.now());
+      final RecordingUploadIntent? intent = await _ensureRecordingIntent(
+        current,
+        _account,
+        DateTime.now(),
+      );
+      _recordStartedAt.putIfAbsent(
+        current,
+        () => intent == null
+            ? DateTime.now()
+            : DateTime.fromMillisecondsSinceEpoch(intent.startedAtMs),
+      );
+      _recordAccountByPath.putIfAbsent(current, () => _account);
     }
     final List<String> finished = <String>[
       for (final String path in _recordedPaths)
@@ -855,10 +919,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     ];
     for (final String path in finished) {
       _recordedPaths.remove(path);
-      _queueRecordingUpload(path, _recordStartedAt.remove(path));
+      if (status.recordError.trim().isNotEmpty) {
+        _recordingPersistenceFailures.add(path);
+        await _releaseRecordingIntentLease(path);
+        continue;
+      }
+      final DateTime? startedAt = _recordStartedAt.remove(path);
+      final AccountSession? account = _recordAccountByPath.remove(path);
+      await _queueRecordingUpload(path, startedAt, account);
     }
     if (finished.isNotEmpty && !status.recording && _recordKeep > 0) {
-      unawaited(_pruneRecordings(finished.last));
+      await _pruneRecordings(finished.last);
     }
   }
 
@@ -877,10 +948,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final String directory = normalized.substring(0, slash);
     final Set<String> protect = <String>{
       ..._recordedPaths,
-      for (final _FinishedRecording job in _recordingUploads) job.path,
+      ..._pendingRecordingJobs.values.map((RecordingUploadJob job) => job.path),
+      ..._recordingPersistenceFailures,
       if (_activeUploadPath.isNotEmpty) _activeUploadPath,
     };
     try {
+      protect.addAll(await _recordingUploadQueue.protectedPaths());
       final int removed = await pruneRecordings(
         directory,
         _recordKeep,
@@ -900,6 +973,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// and only with the host's recording consent.
   void _watchRecording(ViewerStatus status) {
     final bool live = status.isLive;
+    final bool permissionRevoked = recordingPermissionWasRevoked(
+      _lastRecordingStatus,
+      status,
+    );
+    if (permissionRevoked && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('主机已撤销录制权限，录制已停止')),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    }
+    _lastRecordingStatus = status;
     if (live && !_wasLive) {
       _autoRecordAttempted = false;
       _autoRecordSuppressed = false;
@@ -914,7 +1000,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final String error = status.recordError.trim();
     if (error.isNotEmpty && error != _recordErrorSeen) {
       _recordErrorSeen = error;
-      if (mounted) {
+      if (mounted && !permissionRevoked) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -1003,19 +1089,208 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     ViewPreferences.update(recordKeep: keep);
   }
 
-  void _queueRecordingUpload(String path, DateTime? startedAt) {
-    final AccountSession? account = _account;
-    if (account == null || !_sessionUploadRecordings) {
+  Future<void> _queueRecordingUpload(
+    String path,
+    DateTime? startedAt,
+    AccountSession? recordingAccount,
+  ) async {
+    final RecordingUploadIntent? intent = _recordingIntentByPath[path];
+    final AccountSession? account = recordingAccount ?? _account;
+    if (intent == null && (!_sessionUploadRecordings || account == null)) {
       return;
     }
-    _recordingUploads.add(
-      _FinishedRecording(
-        path: path,
-        startedAt: startedAt,
-        endedAt: DateTime.now(),
-      ),
+    final DateTime endedAt = DateTime.now().toUtc();
+    final DateTime effectiveStartedAt = intent == null
+        ? (startedAt?.toUtc() ?? endedAt)
+        : DateTime.fromMillisecondsSinceEpoch(intent.startedAtMs, isUtc: true);
+    RecordingUploadJob? pendingJob;
+    try {
+      final File file = File(path);
+      final FileStat stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file || stat.size <= 0) {
+        throw FileSystemException('recording file is unavailable', path);
+      }
+      final String hostId = intent?.hostId ?? widget.target.hostId.trim();
+      final RecordingUploadJob job = RecordingUploadJob(
+        id: intent?.id ?? newRecordingUploadJobId(),
+        path: file.absolute.path,
+        server: intent?.server ?? normalizeServerUrl(account!.server),
+        username: intent?.username ?? account!.username.trim(),
+        hostId: hostId,
+        peerId:
+            intent?.peerId ??
+            (hostId.isNotEmpty ? hostId : widget.target.label.trim()),
+        startedAtMs: effectiveStartedAt.millisecondsSinceEpoch,
+        endedAtMs: endedAt.millisecondsSinceEpoch,
+        fileSize: stat.size,
+        fileModifiedAtMs: stat.modified.millisecondsSinceEpoch,
+      );
+      pendingJob = job;
+      await _recordingUploadQueue.enqueue(job);
+      await _finishRecordingIntent(path, intent);
+      _pendingRecordingJobs.remove(path);
+      _recordingPersistenceFailures.remove(path);
+      unawaited(_processRecordingUploads());
+    } catch (error) {
+      _recordingPersistenceFailures.add(path);
+      if (pendingJob != null) _pendingRecordingJobs[path] = pendingJob;
+      _retryRecordingUpload();
+      if (mounted && !_closing) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('录制上传失败：{error}', <String, Object?>{'error': '$error'}),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<RecordingUploadIntent?> _ensureRecordingIntent(
+    String path,
+    AccountSession? account,
+    DateTime startedAt,
+  ) async {
+    final RecordingUploadIntent? existing = _recordingIntentByPath[path];
+    if (existing != null || !_sessionUploadRecordings || account == null) {
+      return existing;
+    }
+    final RecordingUploadIntent? persisted = await _recordingUploadQueue
+        .findIntentForPath(path);
+    if (persisted != null) {
+      if (persisted.server != normalizeServerUrl(account.server) ||
+          persisted.username != account.username.trim()) {
+        _recordingPersistenceFailures.add(path);
+        return null;
+      }
+      final RecordingUploadWorkerLease? lease = await _recordingUploadQueue
+          .tryAcquireIntentLease(persisted.id);
+      if (lease == null) return null;
+      _recordingIntentByPath[path] = persisted;
+      _recordingIntentLeases[path] = lease;
+      return persisted;
+    }
+    final String hostId = widget.target.hostId.trim();
+    final RecordingUploadIntent intent = RecordingUploadIntent(
+      id: newRecordingUploadJobId(),
+      path: File(path).absolute.path,
+      server: normalizeServerUrl(account.server),
+      username: account.username.trim(),
+      hostId: hostId,
+      peerId: hostId.isNotEmpty ? hostId : widget.target.label.trim(),
+      startedAtMs: startedAt.toUtc().millisecondsSinceEpoch,
     );
-    unawaited(_processRecordingUploads());
+    try {
+      final RecordingUploadWorkerLease lease = await _recordingUploadQueue
+          .beginRecording(intent);
+      _recordingIntentByPath[path] = intent;
+      _recordingIntentLeases[path] = lease;
+      return intent;
+    } catch (error) {
+      _recordingPersistenceFailures.add(path);
+      if (mounted && !_closing) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('录制上传失败：{error}', <String, Object?>{'error': '$error'}),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+      return null;
+    }
+  }
+
+  Future<String> _prepareRecordingBasePath() async {
+    final AccountSession? account = await _activeAccount();
+    if (!_sessionUploadRecordings || account == null) return '';
+    final String? profile = Platform.environment['USERPROFILE'];
+    final Directory directory = Directory(
+      profile == null || profile.isEmpty
+          ? Directory.current.path
+          : '$profile${Platform.pathSeparator}Videos',
+    );
+    final DateTime startedAt = DateTime.now();
+    final String stamp =
+        '${startedAt.year.toString().padLeft(4, '0')}'
+        '${startedAt.month.toString().padLeft(2, '0')}'
+        '${startedAt.day.toString().padLeft(2, '0')}-'
+        '${startedAt.hour.toString().padLeft(2, '0')}'
+        '${startedAt.minute.toString().padLeft(2, '0')}'
+        '${startedAt.second.toString().padLeft(2, '0')}';
+    final String hostId = widget.target.hostId.trim();
+    for (int attempt = 0; attempt < 8; attempt++) {
+      final String id = newRecordingUploadJobId();
+      final String path =
+          '${directory.path}${Platform.pathSeparator}chast-$stamp-${id.substring(0, 8)}.mp4';
+      if (await File(path).exists()) continue;
+      final RecordingUploadIntent intent = RecordingUploadIntent(
+        id: id,
+        path: path,
+        server: normalizeServerUrl(account.server),
+        username: account.username.trim(),
+        hostId: hostId,
+        peerId: hostId.isNotEmpty ? hostId : widget.target.label.trim(),
+        startedAtMs: startedAt.toUtc().millisecondsSinceEpoch,
+      );
+      final RecordingUploadWorkerLease lease = await _recordingUploadQueue
+          .beginRecording(intent);
+      _recordingIntentByPath[path] = intent;
+      _recordingIntentLeases[path] = lease;
+      _recordStartedAt[path] = startedAt;
+      _recordAccountByPath[path] = account;
+      return path;
+    }
+    throw const FileSystemException('could not reserve a recording file path');
+  }
+
+  Future<void> _finishRecordingIntent(
+    String path,
+    RecordingUploadIntent? intent,
+  ) async {
+    if (intent == null) return;
+    await _recordingUploadQueue.removeIntent(intent.id);
+    _recordingIntentByPath.remove(path);
+    final RecordingUploadWorkerLease? lease = _recordingIntentLeases.remove(
+      path,
+    );
+    await lease?.release();
+  }
+
+  Future<void> _releaseRecordingIntentLease(String path) async {
+    _recordingIntentByPath.remove(path);
+    final RecordingUploadWorkerLease? lease = _recordingIntentLeases.remove(
+      path,
+    );
+    await lease?.release();
+  }
+
+  Future<void> _releaseRecordingIntentLeasesAfterStop() async {
+    for (final MapEntry<String, RecordingUploadIntent> entry
+        in _recordingIntentByPath.entries.toList()) {
+      final String path = entry.key;
+      final RecordingUploadWorkerLease? lease = _recordingIntentLeases.remove(
+        path,
+      );
+      try {
+        if (!await File(path).exists()) {
+          await _recordingUploadQueue.removeIntent(entry.value.id);
+          _recordingIntentByPath.remove(path);
+        }
+      } finally {
+        await lease?.release();
+      }
+    }
+  }
+
+  Future<void> _discardRecordingIntent(String path) async {
+    final RecordingUploadIntent? intent = _recordingIntentByPath[path];
+    if (intent != null) {
+      await _finishRecordingIntent(path, intent);
+    }
   }
 
   void _retryRecordingUpload() {
@@ -1027,102 +1302,169 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _processRecordingUploads() async {
-    if (_uploadingRecordings || _recordingRetryTimer != null) return;
+    if (_uploadingRecordings) {
+      _recordingDrainRequested = true;
+      return;
+    }
+    if (_recordingRetryTimer != null || !_sessionUploadRecordings || _closing) {
+      return;
+    }
     _uploadingRecordings = true;
     try {
-      while (_recordingUploads.isNotEmpty) {
-        // Keep the job protected from retention throughout renewal and retry.
-        final _FinishedRecording job = _recordingUploads.first;
-        _activeUploadPath = job.path;
-        try {
-          final AccountSession? account = await _activeAccount();
-          if (account == null || !account.isActiveAt(DateTime.now())) {
-            throw ServerApiException(tr('账号登录已过期，请重新登录'), statusCode: 401);
-          }
-          final File file = File(job.path);
-          if (!await file.exists() || await file.length() <= 0) {
-            _recordingUploads.removeAt(0);
-            continue;
-          }
-          final String name = _recordingFileName(job.path);
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(tr('正在上传录制：{name}', {'name': name})),
-                duration: const Duration(seconds: 2),
+      final RecordingUploadDrainResult result = await _recordingUploadWorker
+          .drain(
+            accountResolver: _activeAccount,
+            authorize: _authorizeQueuedRecordingUpload,
+            upload: _uploadQueuedRecording,
+            enabled: () => _sessionUploadRecordings,
+            shouldStop: () => !mounted || _closing,
+            beforeDrain: _persistPendingRecordingJobs,
+            onStarted: (RecordingUploadJob job) {
+              _activeUploadPath = job.path;
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      tr('正在上传录制：{name}', <String, Object?>{'name': job.name}),
+                    ),
+                    duration: const Duration(seconds: 2),
+                  ),
+                );
+              }
+            },
+            onFinished: (_) => _activeUploadPath = '',
+            onUploaded: (RecordingUploadJob job) async {
+              _recordingUploadError = '';
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      tr('录制已上传：{name}', <String, Object?>{'name': job.name}),
+                    ),
+                    duration: const Duration(seconds: 3),
+                  ),
+                );
+              }
+              if (_recordKeep > 0) unawaited(_pruneRecordings(job.path));
+            },
+            onJobFailed: (RecordingUploadJob job, Object error, bool _) {
+              _showRecordingUploadError(error);
+            },
+            onError: _showRecordingUploadError,
+          );
+      if (result.accountUnavailable) {
+        final AccountSession? identity = _account;
+        if (identity != null &&
+            (await _recordingUploadQueue.load()).any(
+              (RecordingUploadJob job) => job.belongsTo(
+                server: identity.server,
+                username: identity.username,
               ),
-            );
-          }
-          final DateTime startedAt = job.startedAt ?? job.endedAt;
-          final uploader = widget.recordingUploader;
-          if (uploader != null) {
-            await uploader(account, file, startedAt, job.endedAt);
-          } else {
-            await ServerApi.uploadRecording(
-              ServerSettings(url: account.server),
-              account.token,
-              file: file,
-              name: name,
-              peerId: widget.target.hostId.isNotEmpty
-                  ? widget.target.hostId
-                  : widget.target.label,
-              startedAtMs: startedAt.toUtc().millisecondsSinceEpoch,
-              durationMs: job.endedAt.difference(startedAt).inMilliseconds,
-            );
-          }
-          _recordingUploads.removeAt(0);
-          _recordingUploadError = '';
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(tr('录制已上传：{name}', {'name': name})),
-                duration: const Duration(seconds: 3),
-              ),
-            );
-          }
-        } catch (error) {
-          final String message = error is ServerApiException
-              ? error.message
-              : '$error';
+            )) {
+          final String message = tr('账号登录已过期，请重新登录');
           if (mounted && message != _recordingUploadError) {
             _recordingUploadError = message;
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(tr('录制上传失败：{error}', {'error': message})),
+                content: Text(message),
                 duration: const Duration(seconds: 4),
               ),
             );
           }
-          final bool retry =
-              error is! FileSystemException &&
-              (error is! ServerApiException ||
-                  error.statusCode == null ||
-                  error.statusCode == 0 ||
-                  error.statusCode == 401 ||
-                  error.statusCode == 408 ||
-                  error.statusCode == 429 ||
-                  (error.statusCode ?? 0) >= 500);
-          if (retry) {
-            _retryRecordingUpload();
-            return;
-          }
-          _recordingUploads.removeAt(0);
-        } finally {
-          _activeUploadPath = '';
+          _retryRecordingUpload();
         }
       }
+      if (result.retryRequired) _retryRecordingUpload();
     } finally {
       _uploadingRecordings = false;
+      if (_recordingDrainRequested) {
+        _recordingDrainRequested = false;
+        unawaited(_processRecordingUploads());
+      }
     }
   }
 
-  static String _recordingFileName(String path) {
-    final String normalized = path.replaceAll('\\', '/');
-    final int slash = normalized.lastIndexOf('/');
-    final String name = slash < 0
-        ? normalized
-        : normalized.substring(slash + 1);
-    return name.trim().isEmpty ? 'recording.mp4' : name.trim();
+  Future<bool> _authorizeQueuedRecordingUpload(
+    AccountSession account,
+    String hostId,
+  ) {
+    final ViewerStrategyDelivery? delivery = _viewerStrategyDelivery;
+    if (hostId.trim() == widget.target.hostId.trim() &&
+        _viewerStrategyResolved &&
+        (delivery == null || delivery.isActiveAt(DateTime.now()))) {
+      return Future<bool>.value(_sessionUploadRecordings);
+    }
+    return resolveViewerRecordingUploadPolicy(
+      settings: widget.settings,
+      account: account,
+      hostId: hostId,
+      localEnabled: _viewerLocalSettings.uploadRecordings,
+      localIsSet: _viewerLocalSettings.uploadRecordingsSet,
+      clientPublicKey: ViewerBridge.ticketIdentity,
+      lookup: widget.hostLookup,
+    );
+  }
+
+  Future<void> _uploadQueuedRecording(
+    AccountSession account,
+    RecordingUploadJob job,
+    File file,
+  ) async {
+    final DateTime startedAt = DateTime.fromMillisecondsSinceEpoch(
+      job.startedAtMs,
+      isUtc: true,
+    );
+    final DateTime endedAt = DateTime.fromMillisecondsSinceEpoch(
+      job.endedAtMs,
+      isUtc: true,
+    );
+    final uploader = widget.recordingUploader;
+    if (uploader != null) {
+      await uploader(account, file, startedAt, endedAt);
+      return;
+    }
+    await ServerApi.uploadRecording(
+      widget.settings.copyWith(url: job.server),
+      account.token,
+      file: file,
+      name: job.name,
+      peerId: job.peerId,
+      startedAtMs: job.startedAtMs,
+      durationMs: job.durationMs,
+      idempotencyKey: job.id,
+      uploadId: job.uploadId,
+      onUploadId: (String uploadId) =>
+          _recordingUploadQueue.updateUploadId(job.id, uploadId),
+    );
+  }
+
+  void _showRecordingUploadError(Object error) {
+    final String message = error is ServerApiException
+        ? error.message
+        : '$error';
+    if (!mounted || message == _recordingUploadError) return;
+    _recordingUploadError = message;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          tr('录制上传失败：{error}', <String, Object?>{'error': message}),
+        ),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  Future<void> _persistPendingRecordingJobs() async {
+    for (final MapEntry<String, RecordingUploadJob> entry
+        in _pendingRecordingJobs.entries.toList()) {
+      await _recordingUploadQueue.enqueue(entry.value);
+      await _finishRecordingIntent(
+        entry.key,
+        _recordingIntentByPath[entry.key],
+      );
+      _pendingRecordingJobs.remove(entry.key);
+      _recordingPersistenceFailures.remove(entry.key);
+    }
   }
 
   Future<void> _start() async {
@@ -1130,6 +1472,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     for (int attempt = 0; ; ++attempt) {
       try {
         await _startOnce();
+        if (_sessionUploadRecordings) {
+          unawaited(_processRecordingUploads());
+        }
         return;
       } on MissingPluginException {
         if (attempt > 0 || !mounted) {
@@ -1265,6 +1610,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
     _zoomPercent = viewPrefs.zoomPercent;
     _cursorZoomPercent = viewPrefs.cursorZoomPercent;
+    _trackpadSpeedPercent = viewPrefs.trackpadSpeedPercent;
+    _scrollStyle = viewPrefs.scrollStyle;
+    _scrollEdge = viewPrefs.scrollEdge;
+    _loadShortcuts(viewPrefs.remoteShortcuts);
     _applyLocalViewerSettings();
   }
 
@@ -1756,7 +2105,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _teardownSession() async {
     _stopPolling();
-    await _annotation.clear();
+    try {
+      await _recordingTrackTail;
+    } catch (_) {
+      // Preserve shutdown even if a prior status poll failed to record metadata.
+    }
+    try {
+      await _annotation.clear();
+    } catch (_) {
+      // Input cleanup must not prevent native stop from finalizing a recording.
+    }
     _ticketTimer?.cancel();
     _ticketTimer = null;
     final displays = _displayStreams;
@@ -1775,23 +2133,25 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _cameraTextureId = -1;
     _cameraOpen = false;
     if (_viewerAwakeLease) {
-      _viewerAwakeLease = false;
-      try {
-        await ViewerBridge.setKeepAwake(false);
-      } on MissingPluginException {
-        // Native bridge shutdown also releases an outstanding lease.
-      } on PlatformException {
-        // Native stop and bridge shutdown both perform idempotent cleanup.
-      }
+      await _releaseViewerAwakeLease();
+    }
+    try {
+      await _trackRecording(await ViewerBridge.status());
+    } on MissingPluginException {
+      // The engine may already be gone; there is no final path to collect.
+    } on PlatformException {
+      // The engine may already be stopping; continue with native teardown.
     }
     try {
       await ViewerBridge.stop();
+      await _trackRecording(await ViewerBridge.status());
       await displays?.close(sessionStopped: true);
     } on MissingPluginException {
       // Nothing to stop.
     } on PlatformException {
       // A stale session is better than a stuck one.
     }
+    await _releaseRecordingIntentLeasesAfterStop();
     if (cameraId >= 0) {
       await _gpuTexture.unregisterTexture(cameraId);
     }
@@ -1799,6 +2159,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       await _gpuTexture.unregisterTexture(id);
     }
     displays?.dispose();
+  }
+
+  Future<void> _releaseViewerAwakeLease() async {
+    if (!_viewerAwakeLease) return;
+    _viewerAwakeLease = false;
+    try {
+      await ViewerBridge.setKeepAwake(false);
+    } on MissingPluginException {
+      // Native bridge shutdown also releases an outstanding lease.
+    } on PlatformException {
+      // Native stop and bridge shutdown both perform idempotent cleanup.
+    }
   }
 
   void _stopPolling() {
@@ -2023,6 +2395,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       }
       _applyStatus(status);
+      unawaited(_trackRecording(status));
       if (_displayStreams == null &&
           _displaySelection != null &&
           status.isLive) {
@@ -2043,6 +2416,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _applyStatus(ViewerStatus status) {
+    final bool wasLive = _status.isLive;
     // Captured before the setState below replaces _status: the answer checks
     // further down need the snapshot this poll is being compared against.
     final ViewerStatus previous = _status;
@@ -2063,7 +2437,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _pinnedFingerprint = status.serverFingerprint;
       unawaited(_confirmFirstFingerprint(status.serverFingerprint));
     }
-    _trackRecording(status);
     _watchRecording(status);
     _watchFileConflict(status);
     _syncPortForwardRules(status.portForwardRules);
@@ -2149,6 +2522,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _hideTimer?.cancel();
       _pollTimer?.cancel();
       _collapsed = false;
+      // Keep the ended session card available for reconnect without holding
+      // a machine-awake request after the native viewer has stopped.
+      unawaited(_releaseViewerAwakeLease());
     }
     final bool droppedControl =
         (nowOver || !status.inputEnabled) && _controlEnabled;
@@ -2235,6 +2611,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    if (wasLive != status.isLive) {
+      _setKeyCapture(_inputActive && _focus.hasPrimaryFocus);
+    }
     if (initialControl == true) {
       _toggleControl();
     }
@@ -2924,11 +3303,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _applyRecording(bool enabled) async {
+    String basePath = '';
     try {
-      await ViewerBridge.setRecording(enabled);
-    } on PlatformException {
+      if (enabled) basePath = await _prepareRecordingBasePath();
+      await ViewerBridge.setRecording(enabled, basePath: basePath);
+    } on PlatformException catch (error) {
+      if (basePath.isNotEmpty && !await File(basePath).exists()) {
+        await _discardRecordingIntent(basePath);
+      }
+      if (mounted && enabled) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('录制失败：{error}', <String, Object?>{
+                'error': error.message ?? error.code,
+              }),
+            ),
+          ),
+        );
+      }
       // The session is going away; the next start reapplies the switch.
     } on MissingPluginException {
+      if (basePath.isNotEmpty && !await File(basePath).exists()) {
+        await _discardRecordingIntent(basePath);
+      }
       // Same.
     }
   }
@@ -3071,6 +3469,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     );
   }
 
+  void _setScrollStyle(ViewScrollStyle style, int edge) {
+    setState(() {
+      _scrollStyle = style;
+      _scrollEdge = edge;
+    });
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      scrollStyle: style,
+      scrollEdge: edge,
+    );
+  }
+
   void _setZoomPercent(int percent) {
     setState(() => _zoomPercent = percent);
     ViewPreferences.update(peerId: _prefsPeerId, zoomPercent: percent);
@@ -3080,6 +3490,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     setState(() => _cursorZoomPercent = percent);
     ViewPreferences.update(peerId: _prefsPeerId, cursorZoomPercent: percent);
     _syncCursor();
+  }
+
+  Future<void> _editTrackpadSpeed() async {
+    final int? selected = await showDialog<int>(
+      context: context,
+      builder: (BuildContext context) =>
+          TrackpadSpeedDialog(initialValue: _trackpadSpeedPercent),
+    );
+    if (selected == null || !mounted || _closing) return;
+    setState(() => _trackpadSpeedPercent = selected);
+    ViewPreferences.update(
+      peerId: _prefsPeerId,
+      trackpadSpeedPercent: selected,
+    );
   }
 
   void _toggleReverseWheel() {
@@ -4530,6 +4954,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         sourceHeight: stream.sourceHeight,
         fit: fit ?? _fit,
         zoomPercent: zoomPercent ?? (fit == null ? _zoomPercent : 100),
+        trackpadSpeedPercent: _trackpadSpeedPercent,
+        scrollStyle: _scrollStyle,
+        scrollEdge: _scrollEdge,
         drawEnabled: _annotationMode,
         captureInput: _inputActive && !_annotationMode,
         hideCursor:
@@ -4686,6 +5113,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     _openingDisplayWindow = true;
     try {
+      final AccountSession? account = _account;
+      final String hostId = widget.target.hostId.trim();
+      final RecordingUploadContext? uploadContext =
+          _sessionUploadRecordings && account != null
+          ? RecordingUploadContext(
+              server: normalizeServerUrl(account.server),
+              username: account.username.trim(),
+              hostId: hostId,
+              peerId: hostId.isNotEmpty ? hostId : widget.target.label.trim(),
+            )
+          : null;
       final selected =
           _displayStreams?.state.streams.map((s) => s.displayIndex).toSet() ??
           <int>{};
@@ -4719,6 +5157,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             await DisplayStreamBridge.openWindow(
               stream.streamId,
               peerId: _prefsPeerId,
+              recordingUploadContext: uploadContext,
             )) {
           return;
         }
@@ -5353,11 +5792,132 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     unawaited(_shutdown());
   }
 
+  void _loadShortcuts(List<RemoteShortcutBinding> bindings) {
+    if (listEquals(_remoteShortcuts, bindings)) return;
+    _remoteShortcuts = bindings;
+    unawaited(_publishShortcuts(bindings));
+    _setKeyboardShortcutCapture();
+  }
+
+  Future<void> _publishShortcuts(List<RemoteShortcutBinding> bindings) async {
+    try {
+      await ViewerBridge.setKeyboardShortcuts(bindings);
+    } on MissingPluginException {
+      // Flutter retains the fallback when there is no native hook.
+    } on PlatformException catch (error) {
+      debugPrint('Unable to configure session shortcuts: ${error.code}');
+    }
+  }
+
+  Future<void> _editShortcuts() async {
+    if (_editingShortcuts || _closing) return;
+    final String peerId = _prefsPeerId;
+    final int generation = _viewerGeneration;
+    _editingShortcuts = true;
+    _releaseRemoteInput();
+    _setKeyCapture(false);
+    try {
+      final List<RemoteShortcutBinding>? bindings =
+          await showDialog<List<RemoteShortcutBinding>>(
+            context: context,
+            builder: (_) => RemoteShortcutDialog(
+              initialBindings: ViewPreferences.load(
+                peerId: peerId,
+              ).remoteShortcuts,
+            ),
+          );
+      if (!mounted ||
+          _closing ||
+          generation != _viewerGeneration ||
+          bindings == null) {
+        return;
+      }
+      ViewPreferences.update(peerId: peerId, remoteShortcuts: bindings);
+      _loadShortcuts(bindings);
+    } finally {
+      _editingShortcuts = false;
+      if (mounted && !_closing) {
+        _focus.requestFocus();
+        _setKeyCapture(_inputActive);
+      }
+    }
+  }
+
+  bool _canUseShortcut(RemoteShortcutAction action) {
+    final AppLifecycleState? lifecycle = WidgetsBinding.instance.lifecycleState;
+    if (!mounted ||
+        _closing ||
+        _reconnecting ||
+        _editingShortcuts ||
+        !_status.isLive ||
+        !_focus.hasPrimaryFocus ||
+        _chatTyping ||
+        _terminalTyping ||
+        (lifecycle != null && lifecycle != AppLifecycleState.resumed)) {
+      return false;
+    }
+    return switch (action) {
+      RemoteShortcutAction.toggleControl =>
+        _status.acceptsInput && !_annotationMode && !_keyboardChanging,
+      RemoteShortcutAction.toggleRelativeMouse =>
+        _inputActive && !_independentDisplays && !_keyboardChanging,
+      _ => true,
+    };
+  }
+
+  void _invokeShortcut(RemoteShortcutAction action) {
+    if (!_canUseShortcut(action) ||
+        !_remoteShortcuts.any((binding) => binding.action == action)) {
+      return;
+    }
+    switch (action) {
+      case RemoteShortcutAction.toggleControl:
+        _toggleControl();
+      case RemoteShortcutAction.toggleFullscreen:
+        unawaited(_toggleFullscreen());
+      case RemoteShortcutAction.toggleRelativeMouse:
+        _toggleRelativeMouse();
+      case RemoteShortcutAction.toggleStats:
+        _toggleStats();
+      case RemoteShortcutAction.leaveSession:
+        unawaited(_leave());
+    }
+  }
+
+  bool _handleLocalShortcut(KeyEvent event) {
+    if (_nativeShortcutCapture) return false;
+    final int usage = remoteShortcutUsage(event);
+    if (usage == 0) return false;
+    if (event is KeyUpEvent) return _shortcutKeysHeldLocally.remove(usage);
+    if (event is KeyRepeatEvent) {
+      return _shortcutKeysHeldLocally.contains(usage);
+    }
+    if (event is! KeyDownEvent || event.synthesized) return false;
+    // If the release went to another focused widget, a fresh physical down
+    // starts a new chord rather than inheriting the old hold.
+    _shortcutKeysHeldLocally.remove(usage);
+    if ((_inputActive && _nativeKeyCapture) ||
+        (_keyboardMode == ViewerKeyboardMode.local && !_nativeKeyCapture)) {
+      return false;
+    }
+    final int modifiers = remoteShortcutModifiers(HardwareKeyboard.instance);
+    for (final RemoteShortcutBinding binding in _remoteShortcuts) {
+      if (_canUseShortcut(binding.action) &&
+          binding.matches(usage, modifiers)) {
+        _shortcutKeysHeldLocally.add(usage);
+        _invokeShortcut(binding.action);
+        return true;
+      }
+    }
+    return false;
+  }
+
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (_chatTyping || _terminalTyping || !_focus.hasPrimaryFocus) {
       // Local controls own their characters, shortcuts and IME composition.
       return KeyEventResult.ignored;
     }
+    if (_handleLocalShortcut(event)) return KeyEventResult.handled;
     if (_inputActive) {
       if (_nativeKeyCapture || _keyboardMode == ViewerKeyboardMode.local) {
         // Native capture already enqueues keys. Caps/Num are deliberately
@@ -5433,9 +5993,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     return KeyEventResult.ignored;
   }
 
-  /// Remote-control shortcuts: while control is on every key goes to the
-  /// host, including Esc and F11. Local exit and fullscreen stay on the
-  /// toolbar, which the pointer reveals at the top edge.
+  /// While control is on, unbound keys go to the host. Local actions stay
+  /// available through the toolbar or their explicitly configured chords.
   void _toggleControl() {
     if (!_status.acceptsInput) {
       return;
@@ -6017,10 +6576,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _setKeyCapture(bool enable) {
+    _setKeyboardShortcutCapture();
     final AppLifecycleState? lifecycle = WidgetsBinding.instance.lifecycleState;
     final bool wanted =
         enable &&
         _focus.hasPrimaryFocus &&
+        !_editingShortcuts &&
         !_chatTyping &&
         !_terminalTyping &&
         (lifecycle == null || lifecycle == AppLifecycleState.resumed);
@@ -6030,6 +6591,34 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final int generation = ++_keyCaptureGeneration;
     if (!wanted) _nativeKeyCapture = false;
     unawaited(_updateKeyCapture(wanted, generation));
+  }
+
+  void _setKeyboardShortcutCapture() {
+    final AppLifecycleState? lifecycle = WidgetsBinding.instance.lifecycleState;
+    final bool wanted =
+        mounted &&
+        !_closing &&
+        !_reconnecting &&
+        !_editingShortcuts &&
+        _status.isLive &&
+        _focus.hasPrimaryFocus &&
+        !_chatTyping &&
+        !_terminalTyping &&
+        _remoteShortcuts.isNotEmpty &&
+        (lifecycle == null || lifecycle == AppLifecycleState.resumed);
+    final int generation = ++_shortcutCaptureGeneration;
+    if (!wanted) _nativeShortcutCapture = false;
+    unawaited(_updateKeyboardShortcutCapture(wanted, generation));
+  }
+
+  Future<void> _updateKeyboardShortcutCapture(
+    bool enable,
+    int generation,
+  ) async {
+    final bool captured = await ViewerBridge.setKeyboardShortcutCapture(enable);
+    if (mounted && generation == _shortcutCaptureGeneration) {
+      _nativeShortcutCapture = enable && captured;
+    }
   }
 
   Future<void> _updateKeyCapture(bool enable, int generation) async {
@@ -6058,13 +6647,27 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  void _onSessionTabActivated() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _closing) return;
+      _loadShortcuts(
+        ViewPreferences.load(peerId: _prefsPeerId).remoteShortcuts,
+      );
+      _setKeyCapture(_inputActive && _focus.hasPrimaryFocus);
+    });
+  }
+
   void _onKeyboardFocusChanged() {
     if (_focus.hasPrimaryFocus && mounted && !_closing) {
       final prefs = ViewPreferences.load(peerId: _prefsPeerId);
+      _loadShortcuts(prefs.remoteShortcuts);
       setState(() {
         _fit = prefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
         _zoomPercent = prefs.zoomPercent;
         _cursorZoomPercent = prefs.cursorZoomPercent;
+        _trackpadSpeedPercent = prefs.trackpadSpeedPercent;
+        _scrollStyle = prefs.scrollStyle;
+        _scrollEdge = prefs.scrollEdge;
         _statsVisible = prefs.stats;
         _mouse = MouseMapping(
           reverseWheel: prefs.reverseWheel,
@@ -6737,6 +7340,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       sourceHeight: _status.sourceHeight,
                       fit: _fit,
                       zoomPercent: _zoomPercent,
+                      trackpadSpeedPercent: _trackpadSpeedPercent,
+                      scrollStyle: _scrollStyle,
+                      scrollEdge: _scrollEdge,
                       drawEnabled: _annotationMode,
                       captureInput: _inputActive && !_annotationMode,
                       hideCursor:
@@ -6787,6 +7393,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fit: _fit,
                         zoomPercent: _zoomPercent,
                         cursorZoomPercent: _cursorZoomPercent,
+                        scrollStyle: _scrollStyle,
+                        scrollEdge: _scrollEdge,
                         controlEnabled: _controlEnabled,
                         inputAvailable: _status.acceptsInput,
                         showMyCursor: _showMyCursor,
@@ -6911,8 +7519,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_changeKeyboardMode(mode)),
                         reverseWheel: _mouse.reverseWheel,
                         swapButtons: _mouse.swapButtons,
+                        trackpadSpeedPercent: _trackpadSpeedPercent,
                         onToggleReverseWheel: _toggleReverseWheel,
                         onToggleSwapButtons: _toggleSwapButtons,
+                        onEditTrackpadSpeed: _editTrackpadSpeed,
                         relativeMouse: _relativeMouse,
                         onToggleRelativeMouse: _independentDisplays
                             ? null
@@ -6920,6 +7530,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         specialKeysAvailable: _inputActive,
                         onSpecialAction: (RemoteSpecialAction action) =>
                             unawaited(_sendSpecialAction(action)),
+                        onEditShortcuts: () => unawaited(_editShortcuts()),
                         onSendText: () => unawaited(_openSendTextDialog()),
                         screenshotAvailable: _independentDisplays
                             ? _displayStreams?.selected?.stream.ready == true
@@ -6982,6 +7593,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onFitChanged: _setFit,
                         onZoomPercentChanged: _setZoomPercent,
                         onCursorZoomPercentChanged: _setCursorZoomPercent,
+                        onScrollChanged: _setScrollStyle,
                       ),
                     ),
                   ),
@@ -8925,18 +9537,6 @@ class _HostFingerprintDialog extends StatelessWidget {
       ],
     );
   }
-}
-
-class _FinishedRecording {
-  const _FinishedRecording({
-    required this.path,
-    this.startedAt,
-    required this.endedAt,
-  });
-
-  final String path;
-  final DateTime? startedAt;
-  final DateTime endedAt;
 }
 
 String _sessionListCodeText(int code) {

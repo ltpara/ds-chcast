@@ -46,15 +46,18 @@ public:
     // Must run on the platform thread before the Flutter controller is
     // destroyed.
     void Shutdown();
+    void SetTabActive(bool active);
+    const void* session_identity() const { return session_.get(); }
 
     // Set by the runner: starts another engine window for an encoded
     // SessionWindowRequest. False means the caller should fall back to an
     // in-process page.
-    std::function<bool(const std::string&)> open_session_window;
+    std::function<bool(const std::string&, const std::string&)> open_session_window;
     // The peer and display identify saved placement; remote geometry supplies
     // the default placement on the matching local desktop layout.
     std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t,
-                       const std::string&, uint32_t, RECT, RECT, uint32_t)>
+                       const std::string&, const std::string&, uint32_t,
+                       RECT, RECT, uint32_t)>
         open_display_window;
 
 private:
@@ -77,6 +80,7 @@ private:
     // VK_PROCESSKEY. Restored when control is dropped, which keeps the home
     // page's text fields working in Chinese.
     void SetKeyCapture(bool enable);
+    void SetKeyboardShortcutCapture(bool enable);
     // Pins the local pointer to the view and turns mouse motion into relative
     // moves for the host, so a drag never reaches a screen edge. [scale] is
     // physical window pixels per captured pixel on the host.
@@ -116,7 +120,10 @@ private:
     HWND window_ = nullptr;
     HWND view_ = nullptr;
     std::atomic<bool> key_capture_{false};
+    std::atomic<bool> keyboard_shortcut_capture_{false};
+    std::atomic<bool> tab_active_{true};
     std::unique_ptr<KeyboardCapture> keyboard_capture_;
+    uint32_t keyboard_shortcut_revision_ = 0;  // Platform thread only.
     std::unique_ptr<LocalTextInput> local_text_input_;
     std::atomic<bool> local_keyboard_{false};
     std::atomic<bool> legacy_keyboard_{false};

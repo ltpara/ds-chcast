@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 77.
+// The chast wire protocol, version 78.
 //
 // One QUIC connection carries:
 //
@@ -56,7 +56,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 77;
+inline constexpr uint16_t kProtocolVersion = 78;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.

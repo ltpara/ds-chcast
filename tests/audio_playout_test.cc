@@ -27,6 +27,15 @@ void check(bool condition, const char* what) {
 constexpr int64_t kBlockMs = 20;
 
 void test_endpoint_render_accounting() {
+    chast::AudioRenderAccounting queued;
+    queued.write(1000000, 10000);
+    queued.write(1012000, 10000, true);
+    queued.write(1024000, 10000, true);
+    check(queued.starved_ms() == 0,
+          "sampling jitter with audio still queued cannot accumulate false silence");
+    queued.write(1044000, 10000);
+    check(queued.starved_ms() == 10 && queued.max_gap_ms() == 10,
+          "an actually empty endpoint still reports its gap after queued writes");
     chast::AudioRenderAccounting timeline;
     timeline.write(1000000, 10000);
     timeline.write(1010000, 5000);
@@ -59,6 +68,41 @@ void test_stall_reanchor_survives_render_underrun() {
     check(!detector.observe(1211), "consecutive recovery packets keep the new timeline");
     detector.reset();
     check(!detector.observe(9000), "endpoint reopen establishes a fresh arrival history");
+}
+
+void test_continuous_late_arrivals_resume_playback() {
+    chast::AudioStallReanchor detector;
+    chast::AudioRenderAccounting endpoint;
+    detector.observe(1000);
+    endpoint.write(1000000, 10000);
+    int64_t path_delay = 0;
+    unsigned recoveries = 0, drops = 0;
+    // Delay grows 10 ms per packet without ever creating a 100 ms arrival gap.
+    // Once the path settles, the accepted packets must resume, not remain
+    // permanently late against the old anchor.
+    for (int64_t capture = 1010; capture <= 1800; capture += 10) {
+        const int64_t arrival = capture + (std::min)(capture - 1000, int64_t{200});
+        const bool expired = chast::audio_late_block_decision(
+            arrival, capture + path_delay + 10, 20).drop;
+        if (detector.observe(arrival, endpoint.end_us() / 1000, expired)) {
+            path_delay = arrival - capture;
+            ++recoveries;
+        }
+        if (chast::audio_late_block_decision(arrival, capture + path_delay + 10, 20).drop)
+            ++drops;
+        else endpoint.write(arrival * 1000, 10000);
+    }
+    check(recoveries > 0 && drops < 25 && endpoint.max_gap_ms() <= 120,
+          "continuous late arrivals recover within the existing silence threshold");
+    check(endpoint.end_us() == 2010000,
+          "playback continues after path delay stops growing");
+    chast::AudioStallReanchor pending;
+    pending.observe(1000);
+    check(!pending.observe(1080, 1000, true), "short render jitter does not re-anchor");
+    check(!pending.observe(1160, 1250, true), "queued device audio prevents silence recovery");
+    check(!pending.observe(1240, 1000, false), "future slots retain their intentional lead");
+    check(pending.observe(1320, 1000, true), "expired audio after actual silence re-anchors");
+    check(!pending.observe(1321, 1000, true), "a recovery burst cannot repeatedly re-anchor before rendering");
 }
 
 chast::AudioPacket audio_packet(uint64_t sequence) {
@@ -162,6 +206,12 @@ void test_audio_continuity_budgets() {
 }
 
 void test_late_audio_tolerance() {
+    check(!chast::audio_render_late_block_decision(110, 20, 110, 20).drop,
+          "a block whose audible start meets the tolerance can still play");
+    check(chast::audio_render_late_block_decision(111, 20, 110, 20).drop,
+          "endpoint padding cannot extend a block's lateness budget");
+    check(chast::audio_render_late_block_decision(131, 0, 110, 20).drop,
+          "an empty endpoint still enforces the original slot deadline");
     const auto timely = chast::audio_late_block_decision(100, 100, 20);
     check(!timely.drop && timely.late_ms == 0,
           "a block submitted exactly at its deadline remains playable");
@@ -543,6 +593,33 @@ void test_arrival_anchor_phase_tracks_path_recovery() {
           "phase tracking stops once the recovered path is back in its dead band");
 }
 
+void test_fixed_arrival_reference() {
+    chast::PlayoutDriftController::Config config;
+    config.window_ms = 500;
+    config.confirm_windows = 2;
+    config.dead_band_ms = 5;
+    config.fixed_reference = true;
+    config.reference_ms = 5;
+    chast::PlayoutDriftController controller(config);
+    controller.observe(45, 0);
+    controller.observe(45, 500);
+    controller.observe(45, 1000);
+    check(controller.correction_ms() == 20,
+          "arrival startup delay cannot become the desired phase");
+    controller.observe(25, 1500);
+    check(controller.correction_ms() == 40,
+          "arrival phase converges to the configured safety margin");
+    controller.observe(5, 2000);
+    check(controller.correction_ms() == 40,
+          "on-time arrivals need no additional correction");
+    controller.reset();
+    controller.observe(45, 2500);
+    controller.observe(45, 3000);
+    controller.observe(45, 3500);
+    check(controller.correction_ms() == 20,
+          "endpoint reopen keeps the configured arrival target");
+}
+
 void test_arrival_phase_correction_is_opt_in() {
     chast::AudioPlayerConfig config;
     check(config.render_buffer_ms == 120,
@@ -567,6 +644,7 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     test_endpoint_render_accounting();
     test_stall_reanchor_survives_render_underrun();
+    test_continuous_late_arrivals_resume_playback();
     test_audio_packet_reordering();
     test_audio_continuity_budgets();
     test_late_audio_tolerance();
@@ -592,6 +670,7 @@ int main() {
     test_drift_reanchor_preserves_path_reference();
     test_arrival_anchor_phase_tracks_path_recovery();
     test_arrival_phase_correction_is_opt_in();
+    test_fixed_arrival_reference();
 
     if (failures == 0) {
         std::printf("audio playout checks passed\n");

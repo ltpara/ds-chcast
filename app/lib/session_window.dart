@@ -6,6 +6,43 @@ import 'account_store.dart';
 import 'server_settings.dart';
 import 'target.dart';
 
+/// Non-secret recording ownership metadata passed to a display child engine.
+/// The account token remains in the normal local account store.
+class RecordingUploadContext {
+  const RecordingUploadContext({
+    required this.server,
+    required this.username,
+    required this.hostId,
+    required this.peerId,
+  });
+
+  final String server;
+  final String username;
+  final String hostId;
+  final String peerId;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'server': server,
+    'username': username,
+    'host_id': hostId,
+    'peer_id': peerId,
+  };
+
+  static RecordingUploadContext? fromJson(Object? value) {
+    if (value is! Map) return null;
+    String string(String key) => value[key]?.toString().trim() ?? '';
+    final String server = normalizeServerUrl(string('server'));
+    final String username = string('username');
+    if (server.isEmpty || username.isEmpty) return null;
+    return RecordingUploadContext(
+      server: server,
+      username: username,
+      hostId: string('host_id'),
+      peerId: string('peer_id'),
+    );
+  }
+}
+
 /// Passed directly between Flutter engines in this process. Credentials never
 /// appear in a process command line or a temporary launch file.
 class SessionWindowRequest {
@@ -45,6 +82,14 @@ class SessionWindowRequest {
     'display': display,
   });
 
+  String get tabLabel {
+    final String name = target.displayName.trim();
+    if (name.isNotEmpty) return name;
+    if (target.hostId.isNotEmpty) return target.hostId;
+    if (target.host.isNotEmpty) return '${target.host}:${target.port}';
+    return '会话';
+  }
+
   static SessionWindowRequest? fromArguments(List<String> args) {
     if (args.length != 2 || args.first != '--session-window') {
       return null;
@@ -78,7 +123,10 @@ class SessionWindowRequest {
 
   Future<bool> open() async {
     try {
-      return await _channel.invokeMethod<bool>('openSessionWindow', encode()) ??
+      return await _channel.invokeMethod<bool>(
+            'openSessionWindow',
+            <String, Object?>{'request': encode(), 'label': tabLabel},
+          ) ??
           false;
     } on MissingPluginException {
       return false;

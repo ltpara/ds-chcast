@@ -81,6 +81,58 @@ std::string local_stamp() {
     return stamp;
 }
 
+void write_native_test_status_snapshot(const ViewerStatus& status) {
+    char* testing = nullptr;
+    char* directory = nullptr;
+    size_t testing_size = 0;
+    size_t directory_size = 0;
+    const bool is_test = _dupenv_s(&testing, &testing_size,
+                                   "CHAST_NATIVE_TESTING") == 0 &&
+        testing != nullptr && std::string(testing) == "1";
+    const bool has_directory = _dupenv_s(&directory, &directory_size,
+        "CHAST_NATIVE_TEST_STATUS_DIR") == 0 && directory != nullptr &&
+        *directory != '\0';
+    if (!is_test || !has_directory || status.audit_ref.empty()) {
+        std::free(testing);
+        std::free(directory);
+        return;
+    }
+    const std::filesystem::path root(directory);
+    std::free(testing);
+    std::free(directory);
+    if (!std::all_of(status.audit_ref.begin(), status.audit_ref.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F');
+        })) {
+        return;
+    }
+
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (error) return;
+    std::ofstream output(root / (status.audit_ref + ".tsv"),
+                         std::ios::binary | std::ios::trunc);
+    if (!output) return;
+    output << static_cast<unsigned>(status.state) << '\t'
+           << status.audit_ref << '\t' << status.received << '\t'
+           << status.decoded << '\t' << status.published << '\t'
+           << (status.recording ? 1 : 0) << '\t' << status.record_samples << '\t'
+           << status.record_path;
+    char* audio_sink = nullptr;
+    size_t audio_sink_size = 0;
+    const bool include_audio = _dupenv_s(&audio_sink, &audio_sink_size,
+        "CHAST_NATIVE_TEST_AUDIO_SINK") == 0 && audio_sink != nullptr &&
+        std::string(audio_sink) == "1";
+    std::free(audio_sink);
+    if (include_audio) {
+        output << '\t' << (status.audio_enabled ? 1 : 0)
+               << '\t' << (status.audio_muted ? 1 : 0)
+               << '\t' << status.audio_received
+               << '\t' << status.audio_decoded;
+    }
+    output << '\n';
+}
+
 std::filesystem::path path_from_utf8(const std::string& path) {
     return std::filesystem::path(
         std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
@@ -482,8 +534,11 @@ constexpr size_t kMaxCompletedFiles = 512;
 }  // namespace
 
 ViewerEngine::ViewerEngine(FrameSink* sink, FrameSink* camera_sink,
-                           DisplayVideoReceiver::DecoderFactory decoder_factory)
-    : sink_(sink), camera_sink_(camera_sink), decoder_factory_(std::move(decoder_factory)) {}
+                           DisplayVideoReceiver::DecoderFactory decoder_factory,
+                           AudioPlayerFactory audio_player_factory)
+    : sink_(sink), camera_sink_(camera_sink),
+      decoder_factory_(std::move(decoder_factory)),
+      audio_player_factory_(std::move(audio_player_factory)) {}
 
 ViewerEngine::~ViewerEngine() {
     Stop();
@@ -1609,14 +1664,16 @@ bool ViewerEngine::SetAudioMuted(bool mute) {
     return true;
 }
 
-bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
+bool ViewerEngine::SetRecording(bool enabled, std::string directory,
+                                std::string base_path) {
+    // Serialize the permission check and request with live revocation. A start
+    // that passed the old mask must not re-arm the recorder after revocation.
+    std::lock_guard<std::mutex> state_lock(mutex_);
     std::optional<uint32_t> target;
     if (enabled) {
-        std::lock_guard<std::mutex> lock(mutex_);
         // The host grants recording explicitly; the stream itself is always
         // recordable locally, so this check is the consent gate, not a
-        // technical one. A recording already in progress keeps running if the
-        // host later revokes the permission, as in RustDesk.
+        // technical one. Live revocation also stops the current recorder.
         if (status_.state != ViewerState::kStreaming ||
             (status_.permissions & chast::kPermissionRecord) == 0) {
             return false;
@@ -1628,6 +1685,7 @@ bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
         std::lock_guard<std::mutex> lock(record_mutex_);
         record_stream_ = target;
         if (!directory.empty()) record_dir_ = std::move(directory);
+        record_base_path_ = std::move(base_path);
     }
     const bool was_wanted = record_wanted_.exchange(enabled, std::memory_order_relaxed);
     if (enabled && !was_wanted) {
@@ -2668,6 +2726,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool multiple_displays = false;
     uint64_t window_multi_published = 0;
 
+    auto next_test_status_write = started;
+
     std::string record_directory;
     auto next_record_space_check = Clock::now();
     auto record_picture = [&](const chast::FrameHeader& header, const std::vector<uint8_t>& payload,
@@ -2676,9 +2736,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             record_wanted_.load(std::memory_order_relaxed);
         if (record_wanted && !recorder) {
             std::string directory;
+            std::string base_path;
             {
                 std::lock_guard<std::mutex> lock(record_mutex_);
                 directory = record_dir_;
+                base_path = record_base_path_;
             }
             if (directory.empty()) {
                 directory = default_record_directory();
@@ -2692,7 +2754,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             } else {
                 std::string open_error;
                 auto fresh = std::make_unique<chast_tools::Mp4Recorder>();
-                if (!fresh->open(record_file_path(directory), picture_info.codec,
+                const std::string path = base_path.empty()
+                    ? record_file_path(directory)
+                    : base_path;
+                if (!fresh->open(path, picture_info.codec,
                                  picture_info.width, picture_info.height, &open_error)) {
                     record_error = open_error;
                     record_wanted_.store(false, std::memory_order_relaxed);
@@ -3059,6 +3124,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             window_bytes = 0;
             window_start = now;
         }
+        if (now >= next_test_status_write) {
+            next_test_status_write = now + std::chrono::milliseconds(250);
+            write_native_test_status_snapshot(Snapshot());
+        }
     };
 
     auto fail = [&](std::string message) {
@@ -3372,13 +3441,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // Grow a short playout lead when network delivery consistently
                 // misses its slot, then return it once arrivals settle.
                 player_config.adaptive_jitter = true;
-                std::unique_ptr<chast::IAudioPlayer> player =
-                    chast::create_audio_player(player_config, &setup_error);
+                std::unique_ptr<chast::IAudioPlayer> player = audio_player_factory_
+                    ? audio_player_factory_(player_config, &setup_error)
+                    : chast::create_audio_player(player_config, &setup_error);
                 std::string used = wanted;
                 if (!player && !wanted.empty()) {
                     player_config.device_id.clear();
                     std::string default_error;
-                    player = chast::create_audio_player(player_config, &default_error);
+                    player = audio_player_factory_
+                        ? audio_player_factory_(player_config, &default_error)
+                        : chast::create_audio_player(player_config, &default_error);
                     if (player) {
                         used.clear();
                         *note = "the selected output could not be opened: " +
@@ -3474,6 +3546,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 const bool terminal_allowed =
                     (mask & chast::kPermissionTerminal) != 0;
                 const bool camera_allowed = (mask & chast::kPermissionCamera) != 0;
+                const bool record_allowed = (mask & chast::kPermissionRecord) != 0;
+                bool recording_revoked = false;
                 const bool restart = (mask & chast::kPermissionRestart) != 0;
                 // Blocking the operator's own input needs both the input gate
                 // and the explicit block-input permission.
@@ -3527,9 +3601,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.os_login_supported = os_login;
                     status_.session_select_supported = session_select;
                     status_.remote_config_supported = remote_config;
+                    if (!record_allowed) {
+                        recording_revoked = record_wanted_.exchange(
+                            false, std::memory_order_relaxed);
+                    }
                     if (!block_input) {
                         status_.block_input_active = false;
                     }
+                }
+                if (!record_allowed && (recording_revoked || recorder)) {
+                    {
+                        std::lock_guard lock(record_mutex_);
+                        record_stream_.reset();
+                        pending_record_keyframe_.reset();
+                    }
+                    // Finalize on the muxer's owner thread even if no more
+                    // video arrives. Preserve the finished file and counters.
+                    close_recording();
+                    std::lock_guard lock(mutex_);
+                    status_.recording = false;
+                    status_.record_error = record_error;
                 }
                 // The transport aborts the stream on revocation; stopping here
                 // releases the microphone at once and tells the UI why.
@@ -7561,7 +7652,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         // 80 ms jitter buffer and recovers after a stall.
                         player_config.arrival_anchored = true;
                         player_config.device_id = audio_device;
-                        voice_player = chast::create_audio_player(player_config, &setup_error);
+                        voice_player = audio_player_factory_
+                            ? audio_player_factory_(player_config, &setup_error)
+                            : chast::create_audio_player(player_config, &setup_error);
                         if (!voice_player) {
                             ++voice_errors;
                             voice_error = "playback: " + setup_error;
@@ -9531,6 +9624,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     } else {
         SetState(ViewerState::kEnded);
     }
+    write_native_test_status_snapshot(Snapshot());
     running_.store(false, std::memory_order_release);
 }
 

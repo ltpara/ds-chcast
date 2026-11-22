@@ -451,7 +451,12 @@ void VideoQos::adjust_ratio(bool dynamic, uint64_t now) {
     const bool emergency = std::any_of(users_.begin(), users_.end(), [](const auto& entry) {
         return entry.second.delay.stall_ticks > 0;
     });
-    const auto minimum = min_ratio(emergency ? kEmergencyBitrateFloorKbps : 1000);
+    const auto nominal_minimum = min_ratio(emergency ? kEmergencyBitrateFloorKbps : 1000);
+    // The reported encoder rate already excludes audio reservation and may
+    // have been rounded by the driver. Being below a nominal floor is not
+    // evidence of spare bandwidth. Keep reductions monotonic; only a healthy
+    // path may restore the normal floor.
+    const auto minimum = reduction ? std::min(current, nominal_minimum) : nominal_minimum;
     const auto maximum = target;
     float next = current;
     if (reduction) {

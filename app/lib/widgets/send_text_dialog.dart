@@ -43,6 +43,7 @@ class SendTextDialog extends StatefulWidget {
 
 class _SendTextDialogState extends State<SendTextDialog> {
   final TextEditingController _text = TextEditingController();
+  bool _readingClipboard = false;
   bool _sending = false;
   String? _error;
 
@@ -52,8 +53,46 @@ class _SendTextDialogState extends State<SendTextDialog> {
     super.dispose();
   }
 
+  Future<void> _readClipboard() async {
+    if (_readingClipboard || _sending) {
+      return;
+    }
+    final TextEditingValue draft = _text.value;
+    setState(() {
+      _readingClipboard = true;
+      _error = null;
+    });
+    String? text;
+    String? error;
+    try {
+      text = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+      error = text == null || text.isEmpty
+          ? tr('剪贴板没有纯文本')
+          : SendTextDialog.validate(text);
+    } on PlatformException {
+      error = tr('无法读取本地剪贴板');
+    } on MissingPluginException {
+      error = tr('无法读取本地剪贴板');
+    }
+    if (!mounted) {
+      return;
+    }
+    // Preserve any edits or IME composition that started while reading.
+    final bool draftUnchanged = _text.value == draft;
+    if (draftUnchanged && error == null && text != null) {
+      _text.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      );
+    }
+    setState(() {
+      _readingClipboard = false;
+      _error = draftUnchanged ? error : null;
+    });
+  }
+
   Future<void> _submit() async {
-    if (_sending) {
+    if (_readingClipboard || _sending) {
       return;
     }
     final String text = _text.text;
@@ -114,6 +153,13 @@ class _SendTextDialogState extends State<SendTextDialog> {
                 hintText: tr('输入要在这台主机上键入的文本'),
                 border: const OutlineInputBorder(),
                 helperText: '$bytes / $kMaxTextInputBytes',
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.content_paste_rounded),
+                  tooltip: tr('从本地剪贴板取文本'),
+                  onPressed: _readingClipboard || _sending
+                      ? null
+                      : _readClipboard,
+                ),
               ),
             ),
             if (_error != null)
@@ -133,7 +179,7 @@ class _SendTextDialogState extends State<SendTextDialog> {
           child: Text(tr('取消')),
         ),
         FilledButton(
-          onPressed: _sending ? null : _submit,
+          onPressed: _readingClipboard || _sending ? null : _submit,
           child: Text(tr('发送')),
         ),
       ],

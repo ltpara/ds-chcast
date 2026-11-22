@@ -215,7 +215,7 @@ func testAdminRoleRevisionMigration(t *testing.T, db *sql.DB, open func() (*Stor
 		store.Close()
 	}
 	var tooNew *schemamig.TooNewError
-	if err := oldBinary(); !errors.As(err, &tooNew) || tooNew.Found != 26 || tooNew.Supported != 25 {
+	if err := oldBinary(); !errors.As(err, &tooNew) || tooNew.Found != accountSchemaVersion || tooNew.Supported != 25 {
 		t.Fatalf("old binary accepted upgraded DB: %v", err)
 	}
 }

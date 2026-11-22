@@ -433,6 +433,8 @@ struct HostServerConfig {
 
     // Human-readable progress, one line per event. May be empty.
     std::function<void(const std::string&)> log;
+    // Opt-in diagnostic sampling; no media contents or credentials are logged.
+    bool media_timing_trace = false;
     // Asked when the security policy wants the operator to decide. Returning
     // allow=false refuses the viewer and keeps listening. `request.permissions`
     // is the ceiling approval starts from; the returned mask may only reduce

@@ -137,10 +137,12 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.virtual_display_provider == b.virtual_display_provider &&
            a.tunnel == b.tunnel && a.server_url == b.server_url &&
            a.server_key == b.server_key && a.host_key == b.host_key &&
-           a.proxy == b.proxy && a.tunnel_id == b.tunnel_id &&
+           a.proxy == b.proxy && a.tls_ca == b.tls_ca && a.tunnel_id == b.tunnel_id &&
            a.tunnel_old_id == b.tunnel_old_id &&
            a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen &&
            a.audit_spool == b.audit_spool &&
+           a.upload_recordings == b.upload_recordings &&
+           a.recording_upload_queue == b.recording_upload_queue &&
            a.access_issuer == b.access_issuer && a.access_kid == b.access_kid &&
            a.access_public_key == b.access_public_key &&
            same_access_keys(a.access_keys, b.access_keys);
@@ -149,6 +151,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
 void test_round_trip(const std::filesystem::path& dir) {
     const std::string path = (dir / L"round-trip" / L"host.ini").string();
     chast::HostSettings settings;
+    settings.recording_upload_queue = chast::recording_upload_queue_path_for(path);
     settings.bind_address = "192.168.1.5";
     settings.port = 6100;
     settings.carrier = false;
@@ -222,6 +225,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.server_key = "server secret";
     settings.host_key = "host register secret";
     settings.proxy = "socks5://127.0.0.1:10808";
+    settings.tls_ca = "D:\\证书\\relay ca.pem";
     settings.tunnel_id = "devbox.office";
     settings.tunnel_old_id = "devbox.home";
     settings.tunnel_key = "host secret 123";
@@ -554,6 +558,66 @@ void test_audio_settings(const std::filesystem::path& dir) {
               pinned.settings.voice_microphone == "{0.0.1.00000000}.{unplugged-mic}" &&
               pinned.settings.audio_aec,
           "a device id that is not plugged in is preserved for the session");
+}
+
+void test_recording_upload_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / L"host-recording-upload.ini";
+    const std::string expected_queue = chast::recording_upload_queue_path_for(path.string());
+    const auto defaults = chast::parse_host_settings("", path.string());
+    check(!defaults.settings.upload_recordings &&
+              defaults.settings.recording_upload_queue == expected_queue,
+          "host recording archive is off by default with a path-derived queue");
+
+    write_text(path, "upload_recordings=1\n");
+    auto loaded = chast::load_host_settings(path.string());
+    check(loaded.warning.empty() && loaded.settings.upload_recordings &&
+              loaded.settings.recording_upload_queue == expected_queue,
+          "an explicit host archive opt-in keeps its derived queue path");
+
+    std::string serialized;
+    std::string error;
+    check(chast::serialize_host_settings(path.string(), loaded.settings, serialized, &error) &&
+              serialized.find("upload_recordings=1\n") != std::string::npos &&
+              serialized.find(expected_queue) == std::string::npos,
+          "the opt-in round-trips without pinning the derived queue path");
+    check(chast::save_host_settings(path.string(), loaded.settings, &error) &&
+              chast::load_host_settings(path.string()).settings.upload_recordings,
+          "the host archive opt-in survives an atomic settings save");
+
+    write_text(path, "upload_recordings=perhaps\n");
+    loaded = chast::load_host_settings(path.string());
+    check(!loaded.settings.upload_recordings &&
+              loaded.warning.find("upload_recordings") != std::string::npos,
+          "a malformed archive opt-in fails closed with a warning");
+
+    chast::HostSettings enabled;
+    enabled.upload_recordings = true;
+    check(!chast::serialize_host_settings("relative-host.ini", enabled, serialized, &error),
+          "host archive uploads reject a relative settings path");
+}
+
+void test_tls_ca_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / L"host-tls-ca.ini";
+    const std::string ca_path = narrow_utf8((dir / L"private ca.pem").wstring());
+    write_text(path, "tls_ca=" + ca_path + "\n");
+    auto loaded = chast::load_host_settings(path.string());
+    check(loaded.warning.empty() && loaded.settings.tls_ca == ca_path,
+          "a private TLS CA path loads without losing UTF-8 or spaces");
+
+    std::string serialized;
+    std::string error;
+    check(chast::serialize_host_settings(path.string(), loaded.settings, serialized, &error) &&
+              serialized.find("tls_ca=" + ca_path + "\n") != std::string::npos,
+          "a private TLS CA path serializes as a single INI value");
+
+    write_text(path, "tls_ca=relative-ca.pem\n");
+    loaded = chast::load_host_settings(path.string());
+    check(!loaded.warning.empty() && loaded.settings.tls_ca == "relative-ca.pem",
+          "a relative TLS CA path is retained with a warning so startup can fail closed");
+    chast::HostSettings invalid;
+    invalid.tls_ca = "relative-ca.pem";
+    check(!chast::serialize_host_settings(path.string(), invalid, serialized, &error),
+          "relative TLS CA paths cannot be saved");
 }
 
 // Only the backup bookkeeping is exercised here: every path that could touch
@@ -1151,10 +1215,12 @@ void test_service_settings_merge() {
 
     edited = original;
     edited.proxy = "socks5://127.0.0.1:10808";
+    edited.tls_ca = "D:\\certs\\private-ca.pem";
     current.allow_input = false;
     current.password_hash = "externally-changed-password";
     check(merge_service_settings(original, edited, current, ServiceSettingsPage::Connection, merged, &error) &&
-              merged.proxy == edited.proxy && !merged.allow_input && merged.password_hash == current.password_hash &&
+              merged.proxy == edited.proxy && merged.tls_ca == edited.tls_ca &&
+              !merged.allow_input && merged.password_hash == current.password_hash &&
               merged.access_token == current.access_token && same_devices(merged.trusted_devices, current.trusted_devices),
           "connection settings preserve concurrent security changes");
 
@@ -1339,6 +1405,8 @@ int main() {
     test_invalid_values(dir);
     test_file_share_roots(dir);
     test_audio_settings(dir);
+    test_recording_upload_settings(dir);
+    test_tls_ca_settings(dir);
     test_wallpaper_state(dir);
     test_idle_timeout_settings(dir);
     test_trusted_device_lifetime_settings(dir);

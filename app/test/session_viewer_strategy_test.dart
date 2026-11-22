@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
 import 'package:chast_viewer/pages/session_page.dart';
+import 'package:chast_viewer/recording_upload_queue.dart';
 import 'package:chast_viewer/server_api.dart';
 import 'package:chast_viewer/server_identity.dart';
 import 'package:chast_viewer/server_settings.dart';
@@ -21,6 +22,18 @@ import 'package:chast_viewer/widgets/remote_view.dart';
 
 const String _serverKey = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
 const String _clientKey = 'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg';
+
+List<int> _recordingFixtureBytes() => <int>[
+  ..._recordingFixtureBox('ftyp', <int>[0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0]),
+  ..._recordingFixtureBox('mdat', <int>[1, 2, 3]),
+  ..._recordingFixtureBox('moov', <int>[4, 5]),
+];
+
+List<int> _recordingFixtureBox(String type, List<int> payload) {
+  final ByteData size = ByteData(4)..setUint32(0, payload.length + 8);
+  return <int>[...size.buffer.asUint8List(), ...type.codeUnits, ...payload];
+}
+
 const String _fingerprint =
     '630DCD2966C4336691125448BBB25B4FF412A49C732DB2C8ABC1B8581BD710DD';
 const String _digest =
@@ -207,6 +220,10 @@ void main() {
       const String serverUrl = 'http://127.0.0.1:9';
       StreamPreferences.configPathOverride = '${dir.path}/prefs.json';
       ViewPreferences.configPathOverride = '${dir.path}/prefs.json';
+      final RecordingUploadQueueStore recordingUploadQueue =
+          RecordingUploadQueueStore(
+            file: File('${dir.path}/recording-uploads.json'),
+          );
       final ServerIdentity identity = ServerIdentity.parse(_serverKey)!;
       final ServerIdentityStore identities =
           _MemoryIdentity(<String, ServerIdentityPin>{
@@ -223,7 +240,7 @@ void main() {
         mode: TunnelMode.direct,
       );
       final File recording = File('${dir.path}/recording.mp4')
-        ..writeAsBytesSync(<int>[1, 2, 3]);
+        ..writeAsBytesSync(_recordingFixtureBytes());
       final AccountSession account = _account(
         server: serverUrl,
       ).copyWith(token: 'alice-token');
@@ -269,6 +286,8 @@ void main() {
         }
       });
       addTearDown(() async {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await _waitForUploadWorkerIdle(tester, recordingUploadQueue);
         messenger.setMockMethodCallHandler(native, null);
         messenger.setMockMethodCallHandler(gpu, null);
         StreamPreferences.configPathOverride = null;
@@ -286,6 +305,7 @@ void main() {
               useWebSocket: false,
               uploadRecordings: false,
             ),
+            recordingUploadQueue: recordingUploadQueue,
             identityStore: identities,
             trustStore: _MemoryTrust(<String, String>{
               viaServer.trustKey: _fingerprint,
@@ -769,6 +789,10 @@ void main() {
     final Directory dir = Directory.systemTemp.createTempSync(
       'chast-viewer-strategy-renew-',
     );
+    final RecordingUploadQueueStore recordingUploadQueue =
+        RecordingUploadQueueStore(
+          file: File('${dir.path}/recording-uploads.json'),
+        );
     StreamPreferences.configPathOverride = '${dir.path}/prefs.json';
     ViewPreferences.configPathOverride = '${dir.path}/prefs.json';
     final AccountSession account = _account(server: 'https://example.test');
@@ -797,7 +821,7 @@ void main() {
     final starts = <Map<Object?, Object?>>[];
     final uploads = <String>[];
     final File recording = File('${dir.path}/recording.mp4')
-      ..writeAsBytesSync(<int>[1, 2, 3]);
+      ..writeAsBytesSync(_recordingFixtureBytes());
     bool recordingLive = true;
     int stops = 0;
     int lookups = 0;
@@ -839,7 +863,9 @@ void main() {
           return null;
       }
     });
-    addTearDown(() {
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _waitForUploadWorkerIdle(tester, recordingUploadQueue);
       messenger.setMockMethodCallHandler(native, null);
       messenger.setMockMethodCallHandler(gpu, null);
       StreamPreferences.configPathOverride = null;
@@ -855,6 +881,7 @@ void main() {
         target: sessionTarget,
         account: account,
         settings: settings,
+        recordingUploadQueue: recordingUploadQueue,
         trustStore: TrustStore(file: File('${dir.path}/trust.json')),
         identityStore: identities,
         serverIdentityLoader: (_) async => identity,
@@ -1039,4 +1066,31 @@ Future<void> _waitFor(WidgetTester tester, bool Function() condition) async {
     await tester.pump(const Duration(milliseconds: 50));
   }
   expect(condition(), isTrue);
+}
+
+Future<void> _waitForUploadWorkerIdle(
+  WidgetTester tester,
+  RecordingUploadQueueStore queue,
+) async {
+  for (int i = 0; i < 120; i++) {
+    final _RecordingWorkerProbe? probe = await tester.runAsync(
+      () async => _RecordingWorkerProbe(await queue.tryAcquireWorker()),
+    );
+    final RecordingUploadWorkerLease? lease = probe?.lease;
+    if (lease != null) {
+      await tester.runAsync(lease.release);
+      return;
+    }
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 10)),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+  }
+  fail('recording upload worker did not release its lock');
+}
+
+class _RecordingWorkerProbe {
+  const _RecordingWorkerProbe(this.lease);
+
+  final RecordingUploadWorkerLease? lease;
 }

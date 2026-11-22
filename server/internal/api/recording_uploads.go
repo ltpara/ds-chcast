@@ -17,15 +17,17 @@ const (
 )
 
 type beginRecordingUploadRequest struct {
-	Name        string `json:"name"`
-	PeerID      string `json:"peer_id"`
-	Size        int64  `json:"size"`
-	StartedAtMS int64  `json:"started_at_ms"`
-	DurationMS  int64  `json:"duration_ms"`
+	Name           string `json:"name"`
+	PeerID         string `json:"peer_id"`
+	Size           int64  `json:"size"`
+	StartedAtMS    int64  `json:"started_at_ms"`
+	DurationMS     int64  `json:"duration_ms"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type recordingUploadView struct {
-	Upload recordings.Upload `json:"upload"`
+	Upload    *recordings.Upload `json:"upload,omitempty"`
+	Recording *account.Recording `json:"recording,omitempty"`
 }
 
 func (s *server) beginRecordingUpload(w http.ResponseWriter, r *http.Request) {
@@ -42,13 +44,17 @@ func (s *server) beginRecordingUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "recording upload metadata is invalid")
 		return
 	}
-	upload, err := archive.BeginUpload(user.ID, req.Name, req.PeerID,
-		req.StartedAtMS, req.DurationMS, req.Size)
+	upload, completed, err := archive.BeginUploadWithKey(user.ID, req.Name, req.PeerID,
+		req.StartedAtMS, req.DurationMS, req.Size, req.IdempotencyKey)
 	if err != nil {
 		s.recordingUploadError(w, user, "begin", err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, recordingUploadView{Upload: upload})
+	if completed != nil {
+		writeJSON(w, http.StatusOK, recordingUploadView{Recording: completed})
+		return
+	}
+	writeJSON(w, http.StatusCreated, recordingUploadView{Upload: &upload})
 }
 
 func (s *server) recordingUploadStatus(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +71,7 @@ func (s *server) recordingUploadStatus(w http.ResponseWriter, r *http.Request) {
 		s.recordingUploadError(w, user, "status", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, recordingUploadView{Upload: upload})
+	writeJSON(w, http.StatusOK, recordingUploadView{Upload: &upload})
 }
 
 func (s *server) appendRecordingUpload(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +109,7 @@ func (s *server) appendRecordingUpload(w http.ResponseWriter, r *http.Request) {
 		s.recordingUploadError(w, user, "append", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, recordingUploadView{Upload: upload})
+	writeJSON(w, http.StatusAccepted, recordingUploadView{Upload: &upload})
 }
 
 func (s *server) completeRecordingUpload(w http.ResponseWriter, r *http.Request) {
@@ -172,7 +178,7 @@ func (s *server) recordingUploadError(w http.ResponseWriter, user account.User, 
 			"error": "recording upload chunk was truncated",
 		})
 	case errors.Is(err, recordings.ErrEmpty), errors.Is(err, recordings.ErrUploadIncomplete),
-		errors.Is(err, recordings.ErrUploadSize):
+		errors.Is(err, recordings.ErrUploadSize), errors.Is(err, recordings.ErrUploadDigest):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, recordings.ErrTooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, "recording exceeds the upload limit")
@@ -180,6 +186,10 @@ func (s *server) recordingUploadError(w http.ResponseWriter, user account.User, 
 		writeError(w, http.StatusRequestEntityTooLarge, "account recording quota is exhausted")
 	case errors.Is(err, recordings.ErrUploadLimit):
 		writeError(w, http.StatusTooManyRequests, "too many active recording uploads")
+	case errors.Is(err, recordings.ErrUploadKeyInvalid):
+		writeError(w, http.StatusBadRequest, "recording upload idempotency key is invalid")
+	case errors.Is(err, recordings.ErrUploadKeyConflict):
+		writeError(w, http.StatusConflict, "recording upload idempotency key conflicts")
 	default:
 		s.cfg.Logger.Error("recording upload", "user", user.Username, "action", action, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not store the recording")

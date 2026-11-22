@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/account"
 )
 
 func TestResumableUploadReclaimsAbandonedSession(t *testing.T) {
@@ -38,6 +40,34 @@ func TestResumableUploadReclaimsAbandonedSession(t *testing.T) {
 	}
 	if _, err := os.Stat(part); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("idle part survived reclaim: %v", err)
+	}
+}
+
+func TestAppendUploadWithDigestRollsBackMismatch(t *testing.T) {
+	archive, _, user := openArchive(t, 0, 0)
+	const content = "abcdefgh"
+	contentHash := sha256.Sum256([]byte(content))
+	digest := hex.EncodeToString(contentHash[:])
+	upload, err := archive.BeginUpload(user.ID, "clip.mp4", "host", 0, 0, int64(len(content)))
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := archive.AppendUploadWithDigest(user.ID, upload.ID, 0, int64(len(content)),
+		strings.NewReader("ABCDEFGH"), digest); !errors.Is(err, ErrUploadDigest) {
+		t.Fatalf("mismatched digest = %v", err)
+	}
+	status, err := archive.UploadStatus(user.ID, upload.ID)
+	if err != nil || status.Offset != 0 {
+		t.Fatalf("status after mismatch = %+v, %v", status, err)
+	}
+	status, err = archive.AppendUploadWithDigest(user.ID, upload.ID, 0, int64(len(content)),
+		strings.NewReader(content), digest)
+	if err != nil || status.Offset != int64(len(content)) {
+		t.Fatalf("valid append = %+v, %v", status, err)
+	}
+	if _, err := archive.AppendUploadWithDigest(user.ID, upload.ID, int64(len(content)), 1,
+		strings.NewReader("x"), "not-a-digest"); !errors.Is(err, ErrUploadDigest) {
+		t.Fatalf("invalid digest = %v", err)
 	}
 }
 
@@ -153,6 +183,49 @@ func TestResumableUploadSurvivesArchiveRestart(t *testing.T) {
 	file.Close()
 	if _, err := restarted.UploadStatus(user.ID, upload.ID); !errors.Is(err, ErrUnknownUpload) {
 		t.Fatalf("completed session remains: %v", err)
+	}
+}
+
+func TestUploadIdempotencyResumesAndReturnsCompletedRecording(t *testing.T) {
+	archive, store, user := openArchive(t, 0, 0)
+	const key = "0123456789abcdef0123456789abcdef"
+	metadata := func(name string) (Upload, *account.Recording, error) {
+		return archive.BeginUploadWithKey(
+			user.ID, name, "devbox", 1700000000000, 5000, 4, key,
+		)
+	}
+	upload, completed, err := metadata("clip.mp4")
+	if err != nil || completed != nil || upload.IdempotencyKey != key {
+		t.Fatalf("begin = %+v, %+v, %v", upload, completed, err)
+	}
+	resumed, completed, err := metadata("clip.mp4")
+	if err != nil || completed != nil || resumed.ID != upload.ID || resumed.Offset != 0 {
+		t.Fatalf("duplicate begin = %+v, %+v, %v", resumed, completed, err)
+	}
+	if _, _, err := metadata("different.mp4"); !errors.Is(err, ErrUploadKeyConflict) {
+		t.Fatalf("conflicting begin = %v", err)
+	}
+	if _, err := archive.AppendUpload(user.ID, upload.ID, 0, 4, strings.NewReader("data")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	recording, err := archive.CompleteUpload(user.ID, upload.ID)
+	if err != nil || recording.UploadKey != key {
+		t.Fatalf("complete = %+v, %v", recording, err)
+	}
+	restarted, err := New(Config{Dir: archive.Dir(), Accounts: store})
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	newUpload, alreadyCompleted, err := restarted.BeginUploadWithKey(
+		user.ID, "clip.mp4", "devbox", 1700000000000, 5000, 4, key,
+	)
+	if err != nil || newUpload.ID != "" || alreadyCompleted == nil ||
+		alreadyCompleted.ID != recording.ID {
+		t.Fatalf("completed begin = %+v, %+v, %v", newUpload, alreadyCompleted, err)
+	}
+	_, count, err := store.RecordingUsage(user.ID)
+	if err != nil || count != 1 {
+		t.Fatalf("archive entries = %d, %v", count, err)
 	}
 }
 

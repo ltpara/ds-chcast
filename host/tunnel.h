@@ -101,6 +101,7 @@ public:
     void stop();
     bool running() const;
     uint32_t exit_code() const;
+    uint32_t process_id() const;
 
 private:
     static DWORD WINAPI stdout_entry(void* self);

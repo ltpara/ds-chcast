@@ -40,8 +40,36 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[23].Apply = applyNamedConsoleRoles
 	list[24].Apply = applyNamedConsoleRoles
 	list[25].Apply = applyAdminRoleRevisionsPostgres
+	list[26].Apply = applyRecordingUploadIdempotencyPostgres
+	list[27].Apply = applyHostRecordingUploadOwnersPostgres
 	return list
 }()
+
+func applyRecordingUploadIdempotencyPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`ALTER TABLE recordings ADD COLUMN IF NOT EXISTS client_upload_key TEXT NOT NULL DEFAULT ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS recordings_user_upload_key
+			ON recordings(user_id, client_upload_key) WHERE client_upload_key <> ''`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("migrate recording upload idempotency: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyHostRecordingUploadOwnersPostgres(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS host_recording_upload_owners (
+		host_id TEXT NOT NULL,
+		idempotency_key TEXT NOT NULL,
+		user_id TEXT NOT NULL,
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY (host_id, idempotency_key)
+	)`); err != nil {
+		return fmt.Errorf("create host recording upload owner bindings: %w", err)
+	}
+	return nil
+}
 
 // applyConnectionNotePostgres mirrors the SQLite connection note column.
 func applyConnectionNotePostgres(db *sql.DB) error {

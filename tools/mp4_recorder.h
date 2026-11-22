@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <io.h>
+#include <limits>
 #include <share.h>
 #include <string>
 #include <sys/stat.h>
@@ -45,6 +46,12 @@ namespace chast_tools {
 // H.264/HEVC use Annex B parameter sets; AV1 uses low-overhead OBUs.
 class Mp4Recorder {
 public:
+    struct CompletedSegmentInfo {
+        std::string path;
+        uint64_t start_pts_ms = 0;
+        uint64_t duration_ms = 0;
+    };
+
     ~Mp4Recorder() { close(); }
 
     Mp4Recorder(const Mp4Recorder&) = delete;
@@ -127,6 +134,11 @@ public:
     uint64_t skipped() const { return skipped_; }
     // Every file this recording produced, in order: base_path_, then -2, -3…
     const std::vector<std::string>& segments() const { return segments_; }
+    // Segments whose trailer was written and whose file handle closed cleanly.
+    const std::vector<std::string>& completed_segments() const { return completed_segments_; }
+    const std::vector<CompletedSegmentInfo>& completed_segment_info() const {
+        return completed_segment_info_;
+    }
     // The codec each segment was described with, parallel to segments().
     const std::vector<chast::VideoCodec>& segment_codecs() const { return segment_codecs_; }
     bool failed() const { return failed_; }
@@ -342,6 +354,7 @@ private:
         header_started_ = true;
         first_pts_ms_ = -1;
         last_pts_ms_ = -1;
+        last_sample_duration_ms_ = 0;
         write_packet(header, data, size);
         if (failed_) *error = error_;
         return !failed_;
@@ -353,6 +366,7 @@ private:
         if (!format_) {
             return;
         }
+        const bool can_complete = header_started_ && !failed_;
         if (header_started_) {
             flush_packet(end_pts_ms);
             const int result = av_write_trailer(format_);
@@ -366,6 +380,19 @@ private:
                 failed_ = true;
                 if (error_.empty()) error_ = "could not close the MP4 recording: " + base_path_;
             }
+        }
+        if (can_complete && !failed_) {
+            completed_segments_.push_back(segments_.back());
+            const uint64_t start_pts = first_pts_ms_ > 0
+                ? static_cast<uint64_t>(first_pts_ms_) : 0;
+            const uint64_t last_pts = last_pts_ms_ > 0
+                ? static_cast<uint64_t>(last_pts_ms_) : start_pts;
+            const uint64_t end_pts = last_sample_duration_ms_ >
+                    (std::numeric_limits<uint64_t>::max)() - last_pts
+                ? (std::numeric_limits<uint64_t>::max)()
+                : last_pts + last_sample_duration_ms_;
+            completed_segment_info_.push_back(
+                {segments_.back(), start_pts, end_pts > start_pts ? end_pts - start_pts : 0});
         }
         // The context owns the stream's codecpar (including extradata), so
         // freeing the context releases both.
@@ -433,6 +460,7 @@ private:
         // available for the one that has nothing following it.
         const int64_t spacing_ms =
             last_pts_ms_ >= 0 && pts_ms > last_pts_ms_ ? pts_ms - last_pts_ms_ : 33;
+        last_sample_duration_ms_ = static_cast<uint64_t>(spacing_ms);
         packet_->duration =
             av_rescale_q(spacing_ms, AVRational{1, 1000}, stream_->time_base);
         last_pts_ms_ = pts_ms;
@@ -443,7 +471,8 @@ private:
     void flush_packet(uint64_t end_pts_ms) {
         if (!packet_ || !packet_->size) return;
         if (end_pts_ms > static_cast<uint64_t>(last_pts_ms_)) {
-            packet_->duration = av_rescale_q(static_cast<int64_t>(end_pts_ms) - last_pts_ms_,
+            last_sample_duration_ms_ = end_pts_ms - static_cast<uint64_t>(last_pts_ms_);
+            packet_->duration = av_rescale_q(static_cast<int64_t>(last_sample_duration_ms_),
                                              AVRational{1, 1000}, stream_->time_base);
         }
         const bool keyframe = (packet_->flags & AV_PKT_FLAG_KEY) != 0;
@@ -827,6 +856,8 @@ private:
 
     std::string base_path_;
     std::vector<std::string> segments_;
+    std::vector<std::string> completed_segments_;
+    std::vector<CompletedSegmentInfo> completed_segment_info_;
     std::vector<chast::VideoCodec> segment_codecs_;
     chast::VideoCodec codec_ = chast::VideoCodec::H264;
     chast::VideoChroma chroma_ = chast::VideoChroma::Yuv420;
@@ -841,6 +872,7 @@ private:
     // Host timestamp of the previous picture, the spacing estimate for the
     // sample that ends the segment.
     int64_t last_pts_ms_ = -1;
+    uint64_t last_sample_duration_ms_ = 0;
     bool header_started_ = false;
     bool failed_ = false;
     std::string error_;

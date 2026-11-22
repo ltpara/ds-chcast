@@ -3,7 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:chast_viewer/pages/display_window_page.dart';
+import 'package:chast_viewer/recording_upload_queue.dart';
+import 'package:chast_viewer/session_window.dart';
 import 'package:chast_viewer/view_prefs.dart';
+import 'package:chast_viewer/view_scroll.dart';
 import 'package:chast_viewer/viewer_bridge.dart';
 import 'package:chast_viewer/widgets/remote_view.dart';
 import 'package:chast_viewer/widgets/keyboard_mode_button.dart';
@@ -17,6 +20,11 @@ void main() {
     bool microphoneGranted = false;
     bool voiceEnabled = false;
     bool recording = false;
+    String recordingPath = '';
+    List<RecordingUploadIntent> intentsAtRecordingStart =
+        <RecordingUploadIntent>[];
+    final _MemoryRecordingUploadQueue recordingQueue =
+        _MemoryRecordingUploadQueue();
     bool audioAec = true;
     bool audioNoiseSuppression = true;
     String audioDevice = '';
@@ -24,6 +32,7 @@ void main() {
     int permissions = ViewerPermission.microphone | ViewerPermission.record;
     var nextTexture = 80;
     final calls = <String, int>{};
+    String recordError = '';
     tester.view.physicalSize = const Size(1200, 800);
     tester.view.devicePixelRatio = 1;
     final messenger = tester.binding.defaultBinaryMessenger;
@@ -50,6 +59,8 @@ void main() {
             'microphoneEnabled': microphoneEnabled,
             'voiceEnabled': voiceEnabled,
             'recording': recording,
+            'recordPath': recordingPath,
+            'recordError': recordError,
           };
         case 'displayStreams':
           return {
@@ -134,8 +145,13 @@ void main() {
           calls.update('setVoiceCall', (value) => value + 1, ifAbsent: () => 1);
           return true;
         case 'setRecording':
-          recording =
-              (call.arguments as Map<Object?, Object?>)['enabled'] as bool;
+          final Map<Object?, Object?> args =
+              call.arguments as Map<Object?, Object?>;
+          recording = args['enabled'] as bool;
+          recordingPath = args['basePath'] as String? ?? '';
+          if (recording) {
+            intentsAtRecordingStart = await recordingQueue.loadIntents();
+          }
           calls.update('setRecording', (value) => value + 1, ifAbsent: () => 1);
           return null;
         default:
@@ -150,11 +166,22 @@ void main() {
     });
 
     await tester.pumpWidget(
-      const MaterialApp(
+      MaterialApp(
         home: Row(
           children: [
-            Expanded(child: DisplayWindowPage(streamId: 7)),
-            Expanded(child: DisplayWindowPage(streamId: 8)),
+            Expanded(
+              child: DisplayWindowPage(
+                streamId: 7,
+                recordingUploadContext: const RecordingUploadContext(
+                  server: 'https://records.example',
+                  username: 'viewer',
+                  hostId: 'host-7',
+                  peerId: 'host-7',
+                ),
+                recordingUploadQueue: recordingQueue,
+              ),
+            ),
+            const Expanded(child: DisplayWindowPage(streamId: 8)),
           ],
         ),
       ),
@@ -201,10 +228,27 @@ void main() {
     await nextPoll();
     expect(find.byTooltip('结束语音通话'), findsNWidgets(2));
 
+    final Finder recordButton = find.descendant(
+      of: find.byTooltip('录制到本地（保存为 MP4）').first,
+      matching: find.byType(InkWell),
+    );
+    expect(tester.widget<InkWell>(recordButton).onTap, isNotNull);
     await tester.tap(find.byTooltip('录制到本地（保存为 MP4）').first);
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
     await tester.pump();
     await nextPoll();
     expect(calls['setRecording'], 1);
+    expect(recordingPath, isNotEmpty);
+    expect(intentsAtRecordingStart, hasLength(1));
+    expect(
+      intentsAtRecordingStart.single.path,
+      File(recordingPath).absolute.path,
+    );
+    expect(intentsAtRecordingStart.single.server, 'https://records.example');
+    expect(intentsAtRecordingStart.single.username, 'viewer');
     expect(find.byTooltip('停止录制（保存为本地 MP4）'), findsNWidgets(2));
 
     await tester.longPress(find.byTooltip('关闭麦克风（长按选择设备）').first);
@@ -226,12 +270,12 @@ void main() {
     await tester.tap(find.byTooltip('结束语音通话').first);
     await tester.pump();
     await nextPoll();
-    await tester.tap(find.byTooltip('停止录制（保存为本地 MP4）').first);
-    await tester.pump();
-    await nextPoll();
-
+    recording = false;
+    recordError = 'the host revoked recording';
     permissions = 0;
     await nextPoll();
+    expect(find.text('主机已撤销录制权限，录制已停止'), findsWidgets);
+    expect(find.textContaining('录制失败'), findsNothing);
     expect(find.byTooltip('服务端未开放麦克风'), findsNWidgets(2));
     expect(find.byTooltip('主机未开放录制'), findsNWidgets(2));
     final disabledMicrophone = find.descendant(
@@ -380,9 +424,15 @@ void main() {
     await tester.tap(find.byTooltip('视图与光标缩放'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('自适应窗口'));
+    await tester.ensureVisible(find.text('边缘滚动'));
+    await tester.tap(find.text('边缘滚动'));
     await tester.tap(find.text('应用'));
     await tester.pumpAndSettle();
     expect(ViewPreferences.load(peerId: 'review-peer').fit, 0);
+    expect(
+      ViewPreferences.load(peerId: 'review-peer').scrollStyle,
+      ViewScrollStyle.edge,
+    );
     tester
         .widget<KeyboardModeButton>(find.byType(KeyboardModeButton))
         .onChanged!(ViewerKeyboardMode.local);
@@ -460,4 +510,21 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
   });
+}
+
+class _MemoryRecordingUploadQueue extends RecordingUploadQueueStore {
+  _MemoryRecordingUploadQueue()
+    : super(file: File('${Directory.systemTemp.path}/display-recordings.json'));
+
+  final List<RecordingUploadIntent> intents = <RecordingUploadIntent>[];
+
+  @override
+  Future<void> persistIntent(RecordingUploadIntent intent) async {
+    intents.removeWhere((item) => item.id == intent.id);
+    intents.add(intent);
+  }
+
+  @override
+  Future<List<RecordingUploadIntent>> loadIntents() async =>
+      List<RecordingUploadIntent>.of(intents);
 }

@@ -1,10 +1,63 @@
 #include "shared_viewer_session.h"
+#include "window_focus.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <string>
 
 namespace chast_viewer {
+namespace {
 
-SharedViewerSession::SharedViewerSession() : viewer(&primary, &camera) {}
+class TestAudioPlayer final : public chast::IAudioPlayer {
+public:
+    chast::Error start() override {
+        running_.store(true, std::memory_order_relaxed);
+        return chast::Error::success();
+    }
+    void stop() override { running_.store(false, std::memory_order_relaxed); }
+    chast::Error push(const chast::DecodedAudio&) override {
+        return running_.load(std::memory_order_relaxed)
+            ? chast::Error::success()
+            : chast::Error(chast::Status::InvalidCall, "test audio player is stopped");
+    }
+    void set_clock_offset(int64_t) override {}
+    void set_lead_ms(uint32_t) override {}
+    void set_mute(bool mute) override { muted_.store(mute, std::memory_order_relaxed); }
+    bool muted() const override { return muted_.load(std::memory_order_relaxed); }
+    chast::AudioPlayerStats stats() const override { return {}; }
+    std::string error() const override { return {}; }
+
+private:
+    std::atomic<bool> running_{false};
+    std::atomic<bool> muted_{false};
+};
+
+ViewerEngine::AudioPlayerFactory test_audio_player_factory() {
+    char* testing = nullptr;
+    char* enabled = nullptr;
+    size_t testing_size = 0;
+    size_t enabled_size = 0;
+    const bool is_test = _dupenv_s(&testing, &testing_size, "CHAST_NATIVE_TESTING") == 0 &&
+        testing != nullptr && std::string(testing) == "1";
+    const bool use_sink = _dupenv_s(&enabled, &enabled_size,
+                                    "CHAST_NATIVE_TEST_AUDIO_SINK") == 0 &&
+        enabled != nullptr && std::string(enabled) == "1";
+    std::free(testing);
+    std::free(enabled);
+    if (!is_test || !use_sink) {
+        return {};
+    }
+    return [](const chast::AudioPlayerConfig&, std::string*) {
+        return std::make_unique<TestAudioPlayer>();
+    };
+}
+
+}  // namespace
+
+SharedViewerSession::SharedViewerSession()
+    : viewer(&primary, &camera, chast::create_decoder,
+             test_audio_player_factory()) {}
 SharedViewerSession::~SharedViewerSession() { viewer.Stop(); }
 
 void SharedViewerSession::InvalidateWindows() {
@@ -55,7 +108,7 @@ void SharedViewerSession::Detach(const void* owner) {
 bool SharedViewerSession::SendInput(const void* owner, uint64_t epoch,
     std::optional<uint32_t> stream, HWND window, const chast::InputEvent& event) {
     std::lock_guard lock(input_mutex_);
-    if (epoch != generation.load() || GetForegroundWindow() != window) return false;
+    if (epoch != generation.load() || !active_view_has_focus(window)) return false;
     if (stream) {
         // Pointer coordinates already select the remote display. The child's
         // local focus must not change the parent's screenshot/recording source.
@@ -82,7 +135,7 @@ bool SharedViewerSession::ReleaseInput(const void* owner, uint64_t epoch) {
 bool SharedViewerSession::SendText(const void* owner, uint64_t epoch,
     std::optional<uint32_t> stream, HWND window, const std::string& text) {
     std::lock_guard lock(input_mutex_);
-    if (epoch != generation.load() || GetForegroundWindow() != window ||
+    if (epoch != generation.load() || !active_view_has_focus(window) ||
         !chast::valid_text_input(text)) return false;
     const auto status = viewer.Snapshot();
     if (status.state != ViewerState::kStreaming || !status.input_enabled) return false;

@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 26
+const accountSchemaVersion = 28
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -40,6 +40,36 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 24, Name: "named console roles and bindings", Apply: applyNamedConsoleRoles},
 	{Version: 25, Name: "independent emergency access permission", Apply: applyNamedConsoleRoles},
 	{Version: 26, Name: "admin role edit revisions", Apply: applyAdminRoleRevisions},
+	{Version: 27, Name: "recording upload idempotency", Apply: applyRecordingUploadIdempotency},
+	{Version: 28, Name: "host recording upload owner binding", Apply: applyHostRecordingUploadOwners},
+}
+
+func applyHostRecordingUploadOwners(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS host_recording_upload_owners (
+		host_id TEXT NOT NULL,
+		idempotency_key TEXT NOT NULL,
+		user_id TEXT NOT NULL,
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY (host_id, idempotency_key)
+	)`); err != nil {
+		return fmt.Errorf("create host recording upload owner bindings: %w", err)
+	}
+	return nil
+}
+
+func applyRecordingUploadIdempotency(db *sql.DB) error {
+	if err := applyRecordingArchive(db); err != nil {
+		return fmt.Errorf("ensure recording archive: %w", err)
+	}
+	if err := ensureColumn(db, "recordings", "client_upload_key",
+		"client_upload_key TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate recordings.client_upload_key: %w", err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS recordings_user_upload_key
+		ON recordings(user_id, client_upload_key) WHERE client_upload_key <> ''`); err != nil {
+		return fmt.Errorf("create recording upload idempotency index: %w", err)
+	}
+	return nil
 }
 
 // applyConnectionNote stores the viewer's end-of-session remark on the

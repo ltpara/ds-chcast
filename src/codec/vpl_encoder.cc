@@ -378,9 +378,12 @@ private:
     // the sequence header, which a continuous reset cannot hand to a decoder
     // that is not expecting one.
     mfxExtCodingOption sequence_options_{};
+    // The host owns the bandwidth floor. Older AVC runtimes otherwise raise
+    // low targets according to resolution/FPS, even during a congestion cut.
+    mfxExtCodingOption2 rate_options_{};
     // Owns the extension pointer list carried by params_ so it stays valid for
     // the whole session (a local array would dangle after initialize()).
-    mfxExtBuffer* extensions_[2] = {nullptr, nullptr};
+    mfxExtBuffer* extensions_[3] = {nullptr, nullptr, nullptr};
     mfxU16 extension_count_ = 1;
     mfxVideoParam params_{};
 
@@ -693,6 +696,7 @@ Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& t
     // stream needs neither for low-delay screen sharing.
     extension_count_ = 1;
     extensions_[1] = nullptr;
+    extensions_[2] = nullptr;
     if (codec_ == VideoCodec::H264) {
         sequence_options_ = {};
         sequence_options_.Header.BufferId = MFX_EXTBUFF_CODING_OPTION;
@@ -700,8 +704,19 @@ Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& t
         sequence_options_.NalHrdConformance = MFX_CODINGOPTION_OFF;
         sequence_options_.VuiNalHrdParameters = MFX_CODINGOPTION_OFF;
         sequence_options_.PicTimingSEI = MFX_CODINGOPTION_OFF;
+        rate_options_ = {};
+        rate_options_.Header.BufferId = MFX_EXTBUFF_CODING_OPTION2;
+        rate_options_.Header.BufferSz = sizeof(rate_options_);
+        // HRD signalling is already disabled above. Honor the host's target
+        // instead of imposing the runtime's raw-frame-size bitrate floor.
+#if defined(_MSC_VER)
+        // Deprecated by new runtimes, still required by the older AVC path.
+#pragma warning(suppress : 4996)
+#endif
+        rate_options_.BitrateLimit = MFX_CODINGOPTION_OFF;
         extensions_[1] = &sequence_options_.Header;
-        extension_count_ = 2;
+        extensions_[2] = &rate_options_.Header;
+        extension_count_ = 3;
     }
     params.ExtParam = extensions_;
     params.NumExtParam = extension_count_;
@@ -1097,13 +1112,15 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
         // mutate the configuration the live session is using.
         mfxExtVideoSignalInfo signal = signal_;
         mfxExtCodingOption sequence = sequence_options_;
+        mfxExtCodingOption2 rate_options = rate_options_;
         mfxExtEncoderResetOption option{};
         option.Header.BufferId = MFX_EXTBUFF_ENCODER_RESET_OPTION;
         option.Header.BufferSz = sizeof(option);
         option.StartNewSequence = MFX_CODINGOPTION_OFF;
-        mfxExtBuffer* buffers[3] = {&signal.Header, &sequence.Header, &option.Header};
+        mfxExtBuffer* buffers[4] = {
+            &signal.Header, &sequence.Header, &rate_options.Header, &option.Header};
         candidate.ExtParam = buffers;
-        candidate.NumExtParam = 3;
+        candidate.NumExtParam = 4;
         // Only the target rate and the declared cadence may move in a
         // continuous sequence. mfx-gen treats a changed CPB size, initial delay
         // or MaxKbps as a configuration change that needs StartNewSequence=ON,
@@ -1126,6 +1143,7 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_
                 params_.NumExtParam = extension_count_;
                 signal_ = signal;
                 sequence_options_ = sequence;
+                rate_options_ = rate_options;
                 bitrate_ = static_cast<UINT>(params_.mfx.TargetKbps) * 1000u;
                 framerate_ = static_cast<UINT>(params_.mfx.FrameInfo.FrameRateExtN);
                 if (keyframe_required) {

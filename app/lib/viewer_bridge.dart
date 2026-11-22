@@ -1,6 +1,8 @@
 import 'package:flutter/services.dart';
 import 'package:chast_viewer/l10n.dart';
 
+import 'remote_shortcuts.dart';
+
 enum ViewerState { idle, connecting, handshaking, streaming, ended, failed }
 
 enum ViewerKeyboardMode { physical, legacy, local }
@@ -1475,8 +1477,7 @@ class ViewerStatus {
       isLive && (permissions & ViewerPermission.portForward) != 0;
   // The terminal panel needs a live session and the host's terminal bit.
   bool get acceptsTerminal => isLive && terminalSupported;
-  // Recording needs a live session and the host's consent bit. A recording
-  // already in progress keeps running if the permission is revoked.
+  // Recording needs a live session and the host's consent bit.
   bool get acceptsRecording =>
       isLive && (permissions & ViewerPermission.record) != 0;
   // True while the host captures a secure desktop (lock screen, UAC) or no
@@ -1914,6 +1915,21 @@ class ViewerStatus {
         return ViewerState.idle;
     }
   }
+}
+
+// Older viewer engines expose consent withdrawal through recordError.
+const String _recordingPermissionRevokedError = 'the host revoked recording';
+
+bool recordingPermissionWasRevoked(
+  ViewerStatus previous,
+  ViewerStatus current,
+) {
+  final String error = current.recordError.trim().toLowerCase();
+  return previous.recording &&
+      previous.acceptsRecording &&
+      !current.recording &&
+      !current.acceptsRecording &&
+      (error.isEmpty || error == _recordingPermissionRevokedError);
 }
 
 /// The host pointer as the view-only page draws it. Positions are captured
@@ -2673,8 +2689,30 @@ class ViewerBridge {
     return active ?? false;
   }
 
+  /// Enables the native hook for configured local shortcuts without capturing
+  /// ordinary keys. False keeps Flutter's focus-based shortcut fallback.
+  static Future<bool> setKeyboardShortcutCapture(bool enable) async {
+    try {
+      return await _channel.invokeMethod<bool>(
+            'setKeyboardShortcutCapture',
+            enable,
+          ) ??
+          false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
   static Future<void> setKeyboardMode(ViewerKeyboardMode mode) =>
       _channel.invokeMethod<void>('setKeyboardMode', mode.name);
+
+  static Future<void> setKeyboardShortcuts(
+    List<RemoteShortcutBinding> bindings,
+  ) => _channel.invokeMethod<void>('setKeyboardShortcuts', <Object>[
+    for (final RemoteShortcutBinding binding in bindings) binding.toNative(),
+  ]);
 
   static Future<int> keyboardState({int fallback = 0}) async {
     try {
@@ -2713,14 +2751,20 @@ class ViewerBridge {
   /// to the host and nothing is uploaded: the engine muxes the host's
   /// already-encoded stream straight to an MP4. [directory] is used when the
   /// recording starts (empty means the engine's default, the user's Videos
-  /// folder). The engine waits for the next key frame and rolls into a new
-  /// file when the picture size changes. Progress and failures arrive through
+  /// folder). [basePath] reserves the first segment path for crash recovery;
+  /// later segments receive numbered suffixes. The engine waits for the next
+  /// key frame and rolls into a new file when the picture size changes. Progress and failures arrive through
   /// [ViewerStatus.recording], [ViewerStatus.recordPath] and
   /// [ViewerStatus.recordError].
-  static Future<void> setRecording(bool enabled, {String directory = ''}) {
+  static Future<void> setRecording(
+    bool enabled, {
+    String directory = '',
+    String basePath = '',
+  }) {
     return _channel.invokeMethod<void>('setRecording', <String, Object?>{
       'enabled': enabled,
       'directory': directory,
+      'basePath': basePath,
     });
   }
 
@@ -2984,8 +3028,20 @@ class ViewerBridge {
     _installMethodHandler();
   }
 
+  static void setKeyboardShortcutHandler(
+    void Function(RemoteShortcutAction)? handler,
+  ) {
+    _keyboardShortcutHandler = handler;
+    _installMethodHandler();
+  }
+
   static void setKeyboardTextRejectedHandler(void Function()? handler) {
     _keyboardTextRejectedHandler = handler;
+    _installMethodHandler();
+  }
+
+  static void setSessionTabActivationHandler(void Function()? handler) {
+    _sessionTabActivationHandler = handler;
     _installMethodHandler();
   }
 
@@ -3011,7 +3067,9 @@ class ViewerBridge {
     if (_dropHandler == null &&
         _windowCloseHandler == null &&
         _keyboardTextRejectedHandler == null &&
-        _keyboardEscapeHandler == null) {
+        _keyboardEscapeHandler == null &&
+        _keyboardShortcutHandler == null &&
+        _sessionTabActivationHandler == null) {
       _channel.setMethodCallHandler(null);
       return;
     }
@@ -3022,6 +3080,17 @@ class ViewerBridge {
       }
       if (call.method == 'keyboardEscape') {
         _keyboardEscapeHandler?.call();
+        return;
+      }
+      if (call.method == 'keyboardShortcut') {
+        final RemoteShortcutAction? action = RemoteShortcutAction.fromId(
+          call.arguments,
+        );
+        if (action != null) _keyboardShortcutHandler?.call(action);
+        return;
+      }
+      if (call.method == 'sessionTabActivated') {
+        _sessionTabActivationHandler?.call();
         return;
       }
       if (call.method == 'windowCloseRequested') {
@@ -3043,7 +3112,9 @@ class ViewerBridge {
   static void Function(List<String> paths)? _dropHandler;
   static Future<void> Function()? _windowCloseHandler;
   static void Function()? _keyboardEscapeHandler;
+  static void Function(RemoteShortcutAction)? _keyboardShortcutHandler;
   static void Function()? _keyboardTextRejectedHandler;
+  static void Function()? _sessionTabActivationHandler;
 
   /// Picks up whatever pointer state the host sent and installs it as this
   /// window's cursor while [enabled]. [scale] is the size the video is drawn

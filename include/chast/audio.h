@@ -8,8 +8,8 @@
 // over PCM and Opus consumes PCM. The threads and the timeline are therefore
 // the design surface. Capture and encode run on a dedicated thread at the
 // device's pace, so the video loop's 30 fps cadence never stretches an audio
-// frame; encoded packets land in a bounded queue that the host drains while it
-// is between video frames. On the viewer the same split exists: decode on the
+// frame; a dedicated host worker forwards the bounded encoded queue without
+// waiting for video/control work. On the viewer the same split exists: decode on the
 // packet thread, schedule and render on the audio thread.
 //
 // The viewer's system-sound player plays decoded audio as it arrives: there is
@@ -560,6 +560,11 @@ public:
         int64_t max_step_ms = 20;
         // Closed windows skipped before the reference is learned.
         int64_t warmup_windows = 1;
+        // Arrival scheduling has a desired best-case margin, unlike capture
+        // clock drift, which must learn its original phase. Keeping those
+        // modes separate prevents a delayed startup becoming permanent lead.
+        bool fixed_reference = false;
+        int64_t reference_ms = 0;
     };
 
     PlayoutDriftController() = default;
@@ -584,15 +589,15 @@ public:
         // window starts empty so one sample cannot count twice.
         open(now_ms);
         if (!have_reference_) {
-            if (windows_skipped_ < config_.warmup_windows) {
+            if (!config_.fixed_reference && windows_skipped_ < config_.warmup_windows) {
                 ++windows_skipped_;
                 pending_ = 0;
                 return 0;
             }
-            reference_ms_ = window_best;
+            reference_ms_ = config_.fixed_reference ? config_.reference_ms : window_best;
             have_reference_ = true;
             pending_ = 0;
-            return 0;
+            if (!config_.fixed_reference) return 0;
         }
         const int64_t deviation = window_best - reference_ms_;
         if (deviation >= -config_.dead_band_ms &&
@@ -693,9 +698,11 @@ private:
 // precision so repeated short writes do not accumulate rounding error.
 class AudioRenderAccounting {
 public:
-    void write(int64_t audible_us, int64_t duration_us) {
+    void write(int64_t audible_us, int64_t duration_us, bool queued_audio = false) {
         if (duration_us <= 0) return;
-        if (end_us_ != 0 && audible_us > end_us_) {
+        // GetCurrentPadding and the wall clock are sampled separately. If
+        // audio is still queued, their sampling jitter is not a device gap.
+        if (!queued_audio && end_us_ != 0 && audible_us > end_us_) {
             const int64_t gap = audible_us - end_us_;
             starved_us_ += static_cast<uint64_t>(gap);
             max_gap_us_ = (std::max)(max_gap_us_, static_cast<uint64_t>(gap));
@@ -714,22 +721,30 @@ private:
     uint64_t max_gap_us_ = 0;
 };
 
-// Detects a broken arrival-anchored run from packet arrival times. Render
-// underrun detection may clear its own end timestamp, so it cannot also be
-// the authority for deciding when the next packet needs a fresh anchor.
+// Detects broken arrival/playout runs. A congested path can keep delivering
+// expired packets frequently enough that an arrival-gap detector never fires.
+// The endpoint's committed audio end (not its resettable underrun marker)
+// then allows recovery after sustained actual silence.
 class AudioStallReanchor {
 public:
-    bool observe(int64_t arrival_ms) {
-        const bool stalled = last_arrival_ms_ != 0 &&
-                             arrival_ms - last_arrival_ms_ > kStallMs;
+    bool observe(int64_t arrival_ms, int64_t committed_end_ms = 0,
+                 bool expired_slot = false) {
+        const bool arrival_stalled = last_arrival_ms_ != 0 &&
+                                     arrival_ms - last_arrival_ms_ > kStallMs;
+        const bool playback_stalled = expired_slot && committed_end_ms > 0 &&
+            arrival_ms - committed_end_ms > kStallMs &&
+            (last_reanchor_ms_ == 0 || arrival_ms - last_reanchor_ms_ > kStallMs);
+        const bool stalled = arrival_stalled || playback_stalled;
         last_arrival_ms_ = arrival_ms;
+        if (stalled) last_reanchor_ms_ = arrival_ms;
         return stalled;
     }
-    void reset() { last_arrival_ms_ = 0; }
+    void reset() { last_arrival_ms_ = last_reanchor_ms_ = 0; }
 
 private:
     static constexpr int64_t kStallMs = 100;
     int64_t last_arrival_ms_ = 0;
+    int64_t last_reanchor_ms_ = 0;
 };
 
 struct AudioPlayerConfig {
@@ -817,6 +832,16 @@ inline AudioLateBlockDecision audio_late_block_decision(
         return {true, late_ms};
     }
     return {false, late_ms};
+}
+
+// A block cannot begin playing until the endpoint's queued samples finish.
+// Compare that audible start with its original end-of-slot deadline; checking
+// wall-clock time alone grants an extra endpoint buffer of recurring delay.
+inline AudioLateBlockDecision audio_render_late_block_decision(
+    int64_t now_ms, int64_t device_padding_ms,
+    int64_t slot_end_ms, uint32_t tolerance_ms) {
+    return audio_late_block_decision(
+        now_ms + device_padding_ms, slot_end_ms, tolerance_ms);
 }
 
 enum class AudioRecoveryCause : uint8_t {

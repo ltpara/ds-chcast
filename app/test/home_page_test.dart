@@ -13,6 +13,9 @@ import 'package:chast_viewer/device_store.dart';
 import 'package:chast_viewer/l10n.dart';
 import 'package:chast_viewer/lan_discovery.dart';
 import 'package:chast_viewer/pages/home_page.dart';
+import 'package:chast_viewer/pages/session_page.dart';
+import 'package:chast_viewer/recording_upload_queue.dart';
+import 'package:chast_viewer/recording_upload_worker.dart';
 import 'package:chast_viewer/server_api.dart';
 import 'package:chast_viewer/server_identity.dart';
 import 'package:chast_viewer/server_settings.dart';
@@ -801,8 +804,11 @@ void main() {
     final MethodCall openCall = calls.singleWhere(
       (MethodCall call) => call.method == 'openSessionWindow',
     );
+    final Map<Object?, Object?> arguments =
+        openCall.arguments as Map<Object?, Object?>;
+    expect(arguments['label'], '127.0.0.1:45443');
     final Map<String, dynamic> request =
-        jsonDecode(openCall.arguments as String) as Map<String, dynamic>;
+        jsonDecode(arguments['request'] as String) as Map<String, dynamic>;
     expect(request['host'], '127.0.0.1');
     expect(request['port'], 45443);
     expect(request['token'], 'one-time');
@@ -3586,6 +3592,241 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('home startup drains enabled uploads without opening a session', (
+    WidgetTester tester,
+  ) async {
+    final Directory dir = Directory.systemTemp.createTempSync(
+      'chast-home-upload-drain-',
+    );
+    addTearDown(() {
+      ViewFilter.configPathOverride = null;
+      ViewPreferences.configPathOverride = null;
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    });
+    ViewFilter.configPathOverride = '${dir.path}/filters.json';
+    ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
+
+    final AccountSession account = AccountSession(
+      server: 'https://archive.example.test',
+      username: 'alice',
+      token: 'access-token',
+      expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+    );
+    final _RecordingUploadWorkerProbe worker = _RecordingUploadWorkerProbe();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: _MemoryServers(
+            const ServerSettings(
+              url: 'https://archive.example.test',
+              uploadRecordings: true,
+              uploadRecordingsConfigured: true,
+            ),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(account),
+          recordingUploadWorker: worker,
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async =>
+                  const AddressBookSnapshot(
+                    revision: 0,
+                    peers: <AddressBookPeer>[],
+                  ),
+          lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+              const BatchLookupResult(hosts: <String, HostInfo>{}),
+        ),
+      ),
+    );
+    for (int i = 0; i < 10 && worker.calls == 0; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(worker.calls, 1);
+    expect(worker.account?.username, 'alice');
+    expect(worker.authorized, isTrue);
+    expect(find.byType(SessionPage), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+    'unfinished recordings are visible and retained on the home page',
+    (WidgetTester tester) async {
+      final Directory dir = Directory.systemTemp.createTempSync(
+        'chast-home-incomplete-recording-',
+      );
+      addTearDown(() {
+        ViewFilter.configPathOverride = null;
+        ViewPreferences.configPathOverride = null;
+        if (dir.existsSync()) dir.deleteSync(recursive: true);
+      });
+      ViewFilter.configPathOverride = '${dir.path}/filters.json';
+      ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
+
+      final AccountSession account = AccountSession(
+        server: 'https://archive.example.test',
+        username: 'alice',
+        token: 'access-token',
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+      final File incomplete = File('${dir.path}/unfinished.mp4')
+        ..writeAsBytesSync(<int>[
+          0,
+          0,
+          0,
+          16,
+          0x66,
+          0x74,
+          0x79,
+          0x70,
+          0x69,
+          0x73,
+          0x6f,
+          0x6d,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          11,
+          0x6d,
+          0x64,
+          0x61,
+          0x74,
+          1,
+          2,
+          3,
+        ]);
+      final RecordingUploadQueueStore queue = RecordingUploadQueueStore(
+        file: File('${dir.path}/recording-uploads.json'),
+      );
+      final RecordingUploadWorkerLease? lease = await tester.runAsync(
+        () => queue.beginRecording(
+          RecordingUploadIntent(
+            id: '7123456789abcdef0123456789abcdef',
+            path: incomplete.absolute.path,
+            server: account.server,
+            username: account.username,
+            hostId: '',
+            peerId: 'host-1',
+            startedAtMs: DateTime.now()
+                .subtract(const Duration(minutes: 1))
+                .millisecondsSinceEpoch,
+          ),
+        ),
+      );
+      await tester.runAsync(() => lease!.release());
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: HomePage(
+            deviceStore: _MemoryDevices(<Device>[]),
+            serverStore: _MemoryServers(
+              const ServerSettings(
+                url: 'https://archive.example.test',
+                uploadRecordings: true,
+                uploadRecordingsConfigured: true,
+              ),
+            ),
+            identityStore: _MemoryIdentity(),
+            trustStore: _MemoryTrust(<String, String>{}),
+            accountStore: _MemoryAccount(account),
+            recordingUploadQueue: queue,
+            recordingUploadWorker: _RecordingUploadWorkerProbe(),
+            addressBookFetcher:
+                (ServerSettings server, String token, int since) async =>
+                    const AddressBookSnapshot(
+                      revision: 0,
+                      peers: <AddressBookPeer>[],
+                    ),
+            lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+                const BatchLookupResult(hosts: <String, HostInfo>{}),
+          ),
+        ),
+      );
+      for (
+        int i = 0;
+        i < 30 &&
+            !tester.any(find.byKey(const Key('unfinalized-recording-notice')));
+        i++
+      ) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump(const Duration(milliseconds: 20));
+      }
+
+      expect(
+        find.byKey(const Key('unfinalized-recording-notice')),
+        findsOneWidget,
+      );
+      expect(find.textContaining('1 个录制文件尚未封口'), findsOneWidget);
+      expect(incomplete.existsSync(), isTrue);
+      expect(await tester.runAsync(queue.tryCountUnfinalizedMp4Segments), 1);
+      expect(await tester.runAsync(queue.loadIntents), hasLength(1));
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets('home startup leaves uploads queued when local policy is off', (
+    WidgetTester tester,
+  ) async {
+    final Directory dir = Directory.systemTemp.createTempSync(
+      'chast-home-upload-disabled-',
+    );
+    addTearDown(() {
+      ViewFilter.configPathOverride = null;
+      ViewPreferences.configPathOverride = null;
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    });
+    ViewFilter.configPathOverride = '${dir.path}/filters.json';
+    ViewPreferences.configPathOverride = '${dir.path}/preferences.json';
+
+    final AccountSession account = AccountSession(
+      server: 'https://archive.example.test',
+      username: 'alice',
+      token: 'access-token',
+      expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+    );
+    final _RecordingUploadWorkerProbe worker = _RecordingUploadWorkerProbe();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: _MemoryServers(
+            const ServerSettings(
+              url: 'https://archive.example.test',
+              uploadRecordings: false,
+              uploadRecordingsConfigured: true,
+            ),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(account),
+          recordingUploadWorker: worker,
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async =>
+                  const AddressBookSnapshot(
+                    revision: 0,
+                    peers: <AddressBookPeer>[],
+                  ),
+        ),
+      ),
+    );
+    for (int i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(worker.calls, 1);
+    expect(worker.account?.username, 'alice');
+    expect(worker.authorized, isFalse);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('the server dialog can force the WebSocket carrier', (
     WidgetTester tester,
   ) async {
@@ -5462,5 +5703,34 @@ class _PausedAccount extends _MemoryAccount {
     saving = true;
     await release.future;
     await super.save(value);
+  }
+}
+
+class _RecordingUploadWorkerProbe extends RecordingUploadWorker {
+  _RecordingUploadWorkerProbe() : super(queue: RecordingUploadQueueStore());
+
+  int calls = 0;
+  AccountSession? account;
+  bool? authorized;
+
+  @override
+  Future<RecordingUploadDrainResult> drain({
+    required Future<AccountSession?> Function() accountResolver,
+    required RecordingUploadAuthorization authorize,
+    required RecordingUploadTransport upload,
+    required bool Function() enabled,
+    required bool Function() shouldStop,
+    Future<void> Function()? beforeDrain,
+    void Function(RecordingUploadJob job)? onStarted,
+    void Function(RecordingUploadJob job)? onFinished,
+    Future<void> Function(RecordingUploadJob job)? onUploaded,
+    void Function(RecordingUploadJob job, Object error, bool retryable)?
+    onJobFailed,
+    void Function(Object error)? onError,
+  }) async {
+    calls++;
+    account = await accountResolver();
+    if (account != null) authorized = await authorize(account!, '');
+    return const RecordingUploadDrainResult();
   }
 }

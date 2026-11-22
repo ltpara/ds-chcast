@@ -11,6 +11,8 @@ import '../address_book_sync.dart';
 import '../app_info.dart';
 import '../device_store.dart';
 import '../lan_discovery.dart';
+import '../recording_upload_queue.dart';
+import '../recording_upload_worker.dart';
 import '../security_key.dart';
 import '../search_match.dart';
 import '../server_api.dart';
@@ -158,6 +160,10 @@ class HomePage extends StatefulWidget {
     this.accountOidcLogin,
     this.accountRefresh,
     this.accountLogout,
+    this.recordingUploadQueue,
+    this.recordingUploadWorker,
+    this.recordingUploader,
+    this.recordingHostLookup,
     this.addressBookFetcher,
     this.addressBookPeerWriter,
     this.addressBookPeerOrderWriter,
@@ -195,6 +201,10 @@ class HomePage extends StatefulWidget {
   final AccountOidcLogin? accountOidcLogin;
   final AccountRefresh? accountRefresh;
   final AccountLogout? accountLogout;
+  final RecordingUploadQueueStore? recordingUploadQueue;
+  final RecordingUploadWorker? recordingUploadWorker;
+  final RecordingUploadTransport? recordingUploader;
+  final RecordingUploadHostLookup? recordingHostLookup;
   final AddressBookFetcher? addressBookFetcher;
   final AddressBookPeerWriter? addressBookPeerWriter;
   final AddressBookPeerOrderWriter? addressBookPeerOrderWriter;
@@ -228,6 +238,11 @@ class _HomePageState extends State<HomePage> {
   late final TrustStore _trustStore;
   late final ServerIdentityStore _identityStore;
   late final AccountSessionStore _accountStore;
+  late final RecordingUploadQueueStore _recordingUploadQueue =
+      widget.recordingUploadQueue ?? RecordingUploadQueueStore();
+  late final RecordingUploadWorker _recordingUploadWorker =
+      widget.recordingUploadWorker ??
+      RecordingUploadWorker(queue: _recordingUploadQueue);
   late final HostLookup _lookupBatch;
   late final LabelsUpdater _updateLabels;
   late final AccountLogin _loginAccount;
@@ -313,7 +328,14 @@ class _HomePageState extends State<HomePage> {
   String? _softwareDismissed;
   Timer? _presenceTimer;
   Timer? _accountTimer;
+  Timer? _recordingIntentStatusTimer;
+  Timer? _recordingUploadRetryTimer;
+  int _unfinalizedRecordingCount = 0;
+  bool _recordingIntentStatusUnavailable = false;
+  bool _refreshingRecordingIntentStatus = false;
   bool _renewing = false;
+  bool _recordingUploadRunning = false;
+  bool _recordingUploadRequested = false;
   bool _presenceRunning = false;
   int _presenceGeneration = 0;
   bool _loading = true;
@@ -506,12 +528,18 @@ class _HomePageState extends State<HomePage> {
       const Duration(minutes: 1),
       (_) => unawaited(_renewAccountIfNeeded()),
     );
+    _recordingIntentStatusTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => unawaited(_refreshUnfinalizedRecordingStatus()),
+    );
   }
 
   @override
   void dispose() {
     _presenceTimer?.cancel();
     _accountTimer?.cancel();
+    _recordingIntentStatusTimer?.cancel();
+    _recordingUploadRetryTimer?.cancel();
     _address.dispose();
     _token.dispose();
     _deviceSearch.dispose();
@@ -569,6 +597,10 @@ class _HomePageState extends State<HomePage> {
     await _renewAccountIfNeeded();
     if (mounted && _account != null) {
       unawaited(_syncAddressBook(announce: false));
+    }
+    if (mounted) {
+      unawaited(_refreshUnfinalizedRecordingStatus());
+      unawaited(_drainRecordingUploads());
     }
     if (!_initialHandled && widget.initialTarget != null) {
       _initialHandled = true;
@@ -1710,6 +1742,7 @@ class _HomePageState extends State<HomePage> {
       });
       if (!await _persistAccount(_accountEpoch, session)) return;
       await _syncAddressBook();
+      unawaited(_drainRecordingUploads());
     } else if (result.logout) {
       await _signOutAccount();
     } else if (result.sync) {
@@ -2238,12 +2271,142 @@ class _HomePageState extends State<HomePage> {
     });
     if (urlChanged) await _persistAccount(_accountEpoch, null);
     unawaited(_refreshPresence());
+    if (!urlChanged) unawaited(_drainRecordingUploads());
   }
 
   Future<void> _setUploadRecordings(bool enabled) async {
     final ServerSettings updated = _server.copyWith(uploadRecordings: enabled);
     setState(() => _server = updated);
     await _serverStore.save(updated);
+    if (enabled) unawaited(_drainRecordingUploads());
+  }
+
+  Future<void> _drainRecordingUploads() async {
+    if (_recordingUploadRunning) {
+      _recordingUploadRequested = true;
+      return;
+    }
+    if (!mounted || _recordingUploadRetryTimer != null) return;
+    _recordingUploadRunning = true;
+    try {
+      final RecordingUploadDrainResult result = await _recordingUploadWorker
+          .drain(
+            accountResolver: _activeRecordingUploadAccount,
+            authorize: _authorizeRecordingUpload,
+            upload: _uploadRecordingJob,
+            enabled: () => mounted,
+            shouldStop: () => !mounted,
+            onStarted: (RecordingUploadJob job) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    tr('正在上传录制：{name}', <String, Object?>{'name': job.name}),
+                  ),
+                  duration: const Duration(seconds: 2),
+                ),
+              );
+            },
+            onUploaded: (RecordingUploadJob job) async {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    tr('录制已上传：{name}', <String, Object?>{'name': job.name}),
+                  ),
+                  duration: const Duration(seconds: 3),
+                ),
+              );
+            },
+            onJobFailed: (RecordingUploadJob job, Object error, bool _) =>
+                _showRecordingUploadError(error),
+            onError: _showRecordingUploadError,
+          );
+      final AccountSession? account = _account;
+      final bool refreshable = account?.canRefreshAt(DateTime.now()) ?? false;
+      if (result.retryRequired || (result.accountUnavailable && refreshable)) {
+        _retryRecordingUploads();
+      }
+    } finally {
+      _recordingUploadRunning = false;
+      unawaited(_refreshUnfinalizedRecordingStatus());
+      if (_recordingUploadRequested) {
+        _recordingUploadRequested = false;
+        unawaited(_drainRecordingUploads());
+      }
+    }
+  }
+
+  Future<AccountSession?> _activeRecordingUploadAccount() async {
+    await _renewAccountIfNeeded();
+    final AccountSession? account = _account;
+    if (account == null ||
+        account.server != _server.url ||
+        !account.isActiveAt(DateTime.now().toUtc())) {
+      return null;
+    }
+    return account;
+  }
+
+  Future<bool> _authorizeRecordingUpload(
+    AccountSession account,
+    String hostId,
+  ) => resolveViewerRecordingUploadPolicy(
+    settings: _server,
+    account: account,
+    hostId: hostId,
+    localEnabled: _server.uploadRecordings,
+    localIsSet: _server.uploadRecordingsConfigured,
+    clientPublicKey: ViewerBridge.ticketIdentity,
+    lookup: widget.recordingHostLookup,
+  );
+
+  Future<void> _uploadRecordingJob(
+    AccountSession account,
+    RecordingUploadJob job,
+    File file,
+  ) async {
+    final RecordingUploadTransport? uploader = widget.recordingUploader;
+    if (uploader != null) {
+      await uploader(account, job, file);
+      return;
+    }
+    await ServerApi.uploadRecording(
+      _server.copyWith(url: job.server),
+      account.token,
+      file: file,
+      name: job.name,
+      peerId: job.peerId,
+      startedAtMs: job.startedAtMs,
+      durationMs: job.durationMs,
+      idempotencyKey: job.id,
+      uploadId: job.uploadId,
+      onUploadId: (String uploadId) =>
+          _recordingUploadQueue.updateUploadId(job.id, uploadId),
+    );
+  }
+
+  void _retryRecordingUploads() {
+    if (!mounted) return;
+    _recordingUploadRetryTimer ??= Timer(const Duration(seconds: 10), () {
+      _recordingUploadRetryTimer = null;
+      unawaited(_drainRecordingUploads());
+    });
+  }
+
+  void _showRecordingUploadError(Object error) {
+    if (!mounted) return;
+    final String message = error is ServerApiException
+        ? error.message
+        : '$error';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          tr('录制上传失败：{error}', <String, Object?>{'error': message}),
+        ),
+        duration: const Duration(seconds: 4),
+      ),
+    );
   }
 
   Future<void> _showUpdate(SoftwareInfo update) async {
@@ -2581,6 +2744,11 @@ class _HomePageState extends State<HomePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
+                if (_recordingIntentStatusUnavailable ||
+                    _unfinalizedRecordingCount > 0) ...<Widget>[
+                  _buildUnfinalizedRecordingNotice(context),
+                  const SizedBox(height: 16),
+                ],
                 Center(
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 420),
@@ -3029,6 +3197,69 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+
+  Widget _buildUnfinalizedRecordingNotice(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final bool unavailable = _recordingIntentStatusUnavailable;
+    return Container(
+      key: const Key('unfinalized-recording-notice'),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(
+            unavailable ? Icons.warning_amber_rounded : Icons.pending_actions,
+            size: 20,
+            color: theme.colorScheme.onTertiaryContainer,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              tr(
+                unavailable
+                    ? '无法检查未完成的录制文件。录制文件不会被自动删除。'
+                    : '有 {count} 个录制文件尚未封口。文件和恢复记录会保留在本机，不会上传或自动删除；封口后会重新检查。',
+                <String, Object?>{'count': _unfinalizedRecordingCount},
+              ),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onTertiaryContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _refreshUnfinalizedRecordingStatus() async {
+    if (!mounted || _refreshingRecordingIntentStatus) return;
+    _refreshingRecordingIntentStatus = true;
+    try {
+      final int? count = await _recordingUploadQueue
+          .tryCountUnfinalizedMp4Segments();
+      if (!mounted) return;
+      if (count == null) {
+        if (!_recordingIntentStatusUnavailable) {
+          setState(() => _recordingIntentStatusUnavailable = true);
+        }
+      } else if (count != _unfinalizedRecordingCount ||
+          _recordingIntentStatusUnavailable) {
+        setState(() {
+          _unfinalizedRecordingCount = count;
+          _recordingIntentStatusUnavailable = false;
+        });
+      }
+    } catch (_) {
+      if (!mounted || _recordingIntentStatusUnavailable) return;
+      setState(() => _recordingIntentStatusUnavailable = true);
+    } finally {
+      _refreshingRecordingIntentStatus = false;
+    }
   }
 
   Widget _buildDeviceFilter(
