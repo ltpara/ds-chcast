@@ -3,10 +3,13 @@
 #include "portable_helper_protocol.h"
 
 #include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace chast::host {
+
+struct PortableHelperServiceConnection;
 
 struct PortableHelperServiceSpec {
   PortableHelperInstanceId instance_id{};
@@ -53,6 +56,10 @@ class PortableHelperServiceBackend {
                                std::string* error) = 0;
   virtual bool Start(const PortableHelperServiceSpec& spec,
                      std::string* error) = 0;
+  virtual bool Connect(
+      const PortableHelperServiceSpec& spec, uint32_t timeout_ms,
+      std::unique_ptr<PortableHelperServiceConnection>* connection,
+      std::string* error) = 0;
   virtual bool Stop(const PortableHelperServiceSpec& spec,
                     std::string* error) = 0;
   virtual bool DeleteIfOwned(const PortableHelperServiceSpec& spec,
@@ -73,6 +80,10 @@ class Win32PortableHelperServiceBackend final
                        std::string* error) override;
   bool Start(const PortableHelperServiceSpec& spec,
              std::string* error) override;
+  bool Connect(
+      const PortableHelperServiceSpec& spec, uint32_t timeout_ms,
+      std::unique_ptr<PortableHelperServiceConnection>* connection,
+      std::string* error) override;
   bool Stop(const PortableHelperServiceSpec& spec,
             std::string* error) override;
   bool DeleteIfOwned(const PortableHelperServiceSpec& spec,
@@ -92,11 +103,13 @@ enum class PortableHelperServiceState {
 // Transaction coordinator for one temporary helper service. Cleanup is
 // explicit and repeatable; a failed stop prevents deletion, and failed removal
 // remains visible as CleanupPending for a later retry. Running means the SCM
-// reports SERVICE_RUNNING; it is not the authenticated worker-ready gate.
+// reports SERVICE_RUNNING and an authenticated parent control channel; it is
+// not the authenticated desktop worker-ready gate.
 class PortableHelperServiceLifecycle final {
  public:
   PortableHelperServiceLifecycle(PortableHelperServiceSpec spec,
                                  PortableHelperServiceBackend& backend);
+  ~PortableHelperServiceLifecycle();
   PortableHelperServiceLifecycle(const PortableHelperServiceLifecycle&) = delete;
   PortableHelperServiceLifecycle& operator=(
       const PortableHelperServiceLifecycle&) = delete;
@@ -106,6 +119,9 @@ class PortableHelperServiceLifecycle final {
   bool Cleanup(std::string* error);
   PortableHelperServiceState state() const;
   std::string last_error() const;
+  // Valid only while active. Callers serialize access with Stop/Cleanup and
+  // revoke desktop authorization before stopping the service.
+  PortableHelperServiceConnection* connection() const;
 
  private:
   bool stop_locked(std::string* error);
@@ -114,6 +130,7 @@ class PortableHelperServiceLifecycle final {
 
   PortableHelperServiceSpec spec_;
   PortableHelperServiceBackend& backend_;
+  std::unique_ptr<PortableHelperServiceConnection> connection_;
   mutable std::mutex mutex_;
   PortableHelperServiceState state_ = PortableHelperServiceState::NotCreated;
   bool created_ = false;

@@ -31,6 +31,11 @@ enum class PortableHelperMessageType : uint32_t {
     Stop = 7,
     Status = 8,
     Acknowledgement = 9,
+    CapabilityGrant = 10,
+    // Strictly typed desktop capability requests. Payloads carry a fixed
+    // connection/generation/session scope; they are never generic commands.
+    CaptureFrameRequest = 11,
+    InputEventRequest = 12,
 };
 
 struct PortableHelperMessage {
@@ -94,8 +99,20 @@ class PortableHelperPipe final {
   static std::unique_ptr<PortableHelperPipe> CreateServer(
       const PortableHelperInstanceId& instance_id,
       const std::wstring& authorized_logon_sid, std::string* error);
+  // Creates a second endpoint for one interactive desktop worker while
+  // retaining the helper instance ID in every framed message. The endpoint
+  // suffix is derived from the per-connection ID and cannot be caller-chosen.
+  static std::unique_ptr<PortableHelperPipe> CreateSessionWorkerServer(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperInstanceId& connection_id,
+      const std::wstring& authorized_logon_sid, std::string* error);
   static std::unique_ptr<PortableHelperPipe> ConnectClient(
       const PortableHelperInstanceId& instance_id,
+      const PortableHelperProcessIdentity& expected_server,
+      uint32_t timeout_ms, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> ConnectSessionWorkerClient(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperInstanceId& connection_id,
       const PortableHelperProcessIdentity& expected_server,
       uint32_t timeout_ms, std::string* error);
   ~PortableHelperPipe();
@@ -104,9 +121,14 @@ class PortableHelperPipe final {
 
   static std::wstring EndpointName(
       const PortableHelperInstanceId& instance_id);
+  static std::wstring SessionWorkerEndpointName(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperInstanceId& connection_id);
 
   bool Accept(const PortableHelperProcessIdentity& expected_client,
               uint32_t timeout_ms, std::string* error);
+  bool AuthenticatedPeer(PortableHelperProcessIdentity* identity,
+                         std::string* error) const;
   bool Send(PortableHelperMessage message, uint32_t timeout_ms,
             std::string* error);
   bool Receive(PortableHelperMessage* message, uint32_t timeout_ms,
@@ -120,7 +142,17 @@ class PortableHelperPipe final {
   };
 
   PortableHelperPipe(void* pipe, PortableHelperInstanceId instance_id);
-  bool BeginOperation(Operation* operation, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> CreateServerAt(
+      const PortableHelperInstanceId& instance_id,
+      const std::wstring& endpoint,
+      const std::wstring& authorized_logon_sid, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> ConnectClientAt(
+      const PortableHelperInstanceId& instance_id,
+      const std::wstring& endpoint,
+      const PortableHelperProcessIdentity& expected_server,
+      uint32_t timeout_ms, std::string* error);
+  bool BeginOperation(Operation* operation, std::string* error,
+                      bool require_authenticated_peer = true);
   void EndOperation();
   void Poison();
 
@@ -128,10 +160,13 @@ class PortableHelperPipe final {
   PortableHelperInstanceId instance_id_{};
   uint64_t send_sequence_ = 0;
   PortableHelperSequence receive_sequence_;
-  std::mutex state_mutex_;
+  mutable std::mutex state_mutex_;
   std::condition_variable state_changed_;
   size_t active_operations_ = 0;
   bool closing_ = false;
+  bool accept_started_ = false;
+  bool peer_authenticated_ = false;
+  PortableHelperProcessIdentity peer_identity_;
   std::mutex send_mutex_;
   std::mutex receive_mutex_;
 };

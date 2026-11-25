@@ -1662,7 +1662,7 @@ bool valid_gesture_event(const GestureEvent& event) {
            (event.action == GestureAction::Zoom && event.x == 0);
 }
 
-std::vector<uint8_t> make_input_event(const InputEvent& event) {
+std::vector<uint8_t> make_input_event_payload(const InputEvent& event) {
     std::vector<uint8_t> payload(24);
     uint8_t* cursor = payload.data();
     uint8_t action = 0;
@@ -1724,7 +1724,11 @@ std::vector<uint8_t> make_input_event(const InputEvent& event) {
     put_u8(cursor, flags);
     put_u16(cursor, static_cast<uint16_t>(tilt_x));
     put_u16(cursor, static_cast<uint16_t>(tilt_y));
-    return make_control(ControlType::InputEvent, payload);
+    return payload;
+}
+
+std::vector<uint8_t> make_input_event(const InputEvent& event) {
+    return make_control(ControlType::InputEvent, make_input_event_payload(event));
 }
 
 bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error) {

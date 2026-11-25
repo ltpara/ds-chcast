@@ -53,7 +53,7 @@ uint64_t get64(const std::vector<uint8_t>& bytes, size_t at) {
 
 bool valid_type(uint32_t type) {
   return type >= static_cast<uint32_t>(PortableHelperMessageType::ClientHello) &&
-         type <= static_cast<uint32_t>(PortableHelperMessageType::Acknowledgement);
+         type <= static_cast<uint32_t>(PortableHelperMessageType::InputEventRequest);
 }
 
 bool nonzero_instance(const PortableHelperInstanceId& instance_id) {
@@ -62,6 +62,21 @@ bool nonzero_instance(const PortableHelperInstanceId& instance_id) {
 }
 
 bool fail(std::string* error, const char* message);
+
+class ByteVectorWiper final {
+ public:
+  explicit ByteVectorWiper(std::vector<uint8_t>& bytes)
+      : bytes_(bytes), size_(bytes.size()) {}
+  ~ByteVectorWiper() {
+    if (!bytes_.empty()) SecureZeroMemory(bytes_.data(), size_);
+  }
+  ByteVectorWiper(const ByteVectorWiper&) = delete;
+  ByteVectorWiper& operator=(const ByteVectorWiper&) = delete;
+
+ private:
+  std::vector<uint8_t>& bytes_;
+  size_t size_;
+};
 
 std::wstring sid_string(PSID sid) {
   if (sid == nullptr || !IsValidSid(sid)) return {};
@@ -349,12 +364,15 @@ PortableHelperPipe::Operation::~Operation() {
 }
 
 bool PortableHelperPipe::BeginOperation(Operation* operation,
-                                        std::string* error) {
+                                        std::string* error,
+                                        bool require_authenticated_peer) {
   if (operation == nullptr)
     return fail(error, "missing helper pipe operation state");
   std::lock_guard lock(state_mutex_);
   if (closing_ || pipe_ == nullptr || pipe_ == INVALID_HANDLE_VALUE)
     return fail(error, "helper named pipe is closed");
+  if (require_authenticated_peer && !peer_authenticated_)
+    return fail(error, "helper named pipe peer has not been authenticated");
   ++active_operations_;
   operation->owner = this;
   operation->pipe = pipe_;
@@ -416,11 +434,41 @@ std::wstring PortableHelperPipe::EndpointName(
   return L"\\\\.\\pipe\\ChastPortableHelper-" + hex_instance(instance_id);
 }
 
+std::wstring PortableHelperPipe::SessionWorkerEndpointName(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperInstanceId& connection_id) {
+  if (!nonzero_instance(instance_id) || !nonzero_instance(connection_id))
+    return {};
+  return L"\\\\.\\pipe\\ChastPortableHelper-" + hex_instance(instance_id) +
+         L"-Worker-" + hex_instance(connection_id);
+}
+
 std::unique_ptr<PortableHelperPipe> PortableHelperPipe::CreateServer(
     const PortableHelperInstanceId& instance_id,
     const std::wstring& authorized_logon_sid, std::string* error) {
+  return CreateServerAt(instance_id, EndpointName(instance_id),
+                        authorized_logon_sid, error);
+}
+
+std::unique_ptr<PortableHelperPipe>
+PortableHelperPipe::CreateSessionWorkerServer(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperInstanceId& connection_id,
+    const std::wstring& authorized_logon_sid, std::string* error) {
+  return CreateServerAt(instance_id,
+                        SessionWorkerEndpointName(instance_id, connection_id),
+                        authorized_logon_sid, error);
+}
+
+std::unique_ptr<PortableHelperPipe> PortableHelperPipe::CreateServerAt(
+    const PortableHelperInstanceId& instance_id, const std::wstring& endpoint,
+    const std::wstring& authorized_logon_sid, std::string* error) {
   if (!nonzero_instance(instance_id)) {
     fail(error, "empty helper instance id");
+    return nullptr;
+  }
+  if (endpoint.empty()) {
+    fail(error, "invalid helper pipe endpoint scope");
     return nullptr;
   }
   PSID parsed_logon_sid = nullptr;
@@ -449,7 +497,6 @@ std::unique_ptr<PortableHelperPipe> PortableHelperPipe::CreateServer(
     return nullptr;
   }
   SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
-  const std::wstring endpoint = EndpointName(instance_id);
   HANDLE pipe = CreateNamedPipeW(
       endpoint.c_str(),
       PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -475,11 +522,29 @@ std::unique_ptr<PortableHelperPipe> PortableHelperPipe::ConnectClient(
     const PortableHelperInstanceId& instance_id,
     const PortableHelperProcessIdentity& expected_server,
     uint32_t timeout_ms, std::string* error) {
+  return ConnectClientAt(instance_id, EndpointName(instance_id),
+                         expected_server, timeout_ms, error);
+}
+
+std::unique_ptr<PortableHelperPipe>
+PortableHelperPipe::ConnectSessionWorkerClient(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperInstanceId& connection_id,
+    const PortableHelperProcessIdentity& expected_server,
+    uint32_t timeout_ms, std::string* error) {
+  return ConnectClientAt(
+      instance_id, SessionWorkerEndpointName(instance_id, connection_id),
+      expected_server, timeout_ms, error);
+}
+
+std::unique_ptr<PortableHelperPipe> PortableHelperPipe::ConnectClientAt(
+    const PortableHelperInstanceId& instance_id, const std::wstring& endpoint,
+    const PortableHelperProcessIdentity& expected_server,
+    uint32_t timeout_ms, std::string* error) {
   if (!nonzero_instance(instance_id)) {
     fail(error, "empty helper instance id");
     return nullptr;
   }
-  const std::wstring endpoint = EndpointName(instance_id);
   if (endpoint.empty()) {
     fail(error, "cannot encode the helper pipe endpoint");
     return nullptr;
@@ -522,15 +587,24 @@ std::unique_ptr<PortableHelperPipe> PortableHelperPipe::ConnectClient(
     CloseHandle(pipe);
     return nullptr;
   }
-  return std::unique_ptr<PortableHelperPipe>(
+  auto client = std::unique_ptr<PortableHelperPipe>(
       new PortableHelperPipe(pipe, instance_id));
+  client->peer_identity_ = std::move(actual);
+  client->peer_authenticated_ = true;
+  return client;
 }
 
 bool PortableHelperPipe::Accept(
     const PortableHelperProcessIdentity& expected_client,
     uint32_t timeout_ms, std::string* error) {
+  {
+    std::lock_guard lock(state_mutex_);
+    if (accept_started_ || peer_authenticated_)
+      return fail(error, "helper named pipe accept can only run once");
+    accept_started_ = true;
+  }
   Operation operation;
-  if (!BeginOperation(&operation, error)) return false;
+  if (!BeginOperation(&operation, error, false)) return false;
   HANDLE pipe = static_cast<HANDLE>(operation.pipe);
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (event == nullptr)
@@ -557,11 +631,34 @@ bool PortableHelperPipe::Accept(
     Poison();
     return false;
   }
+  {
+    std::lock_guard lock(state_mutex_);
+    if (closing_ || pipe_ == nullptr || pipe_ == INVALID_HANDLE_VALUE) {
+      fail(error, "helper named pipe closed during peer authentication");
+      return false;
+    }
+    peer_identity_ = std::move(actual);
+    peer_authenticated_ = true;
+  }
+  return true;
+}
+
+bool PortableHelperPipe::AuthenticatedPeer(
+    PortableHelperProcessIdentity* identity, std::string* error) const {
+  if (error != nullptr) error->clear();
+  if (identity == nullptr)
+    return fail(error, "missing authenticated helper peer identity output");
+  std::lock_guard lock(state_mutex_);
+  if (closing_ || pipe_ == nullptr || pipe_ == INVALID_HANDLE_VALUE ||
+      !peer_authenticated_)
+    return fail(error, "helper named pipe has no authenticated live peer");
+  *identity = peer_identity_;
   return true;
 }
 
 bool PortableHelperPipe::Send(PortableHelperMessage message,
                               uint32_t timeout_ms, std::string* error) {
+  ByteVectorWiper payload_wiper(message.payload);
   std::lock_guard lock(send_mutex_);
   Operation operation;
   if (!BeginOperation(&operation, error)) return false;
@@ -573,6 +670,7 @@ bool PortableHelperPipe::Send(PortableHelperMessage message,
   message.sequence = next_sequence;
   std::vector<uint8_t> encoded;
   if (!encode_portable_helper_message(message, &encoded, error)) return false;
+  ByteVectorWiper encoded_wiper(encoded);
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (event == nullptr)
     return fail(error, "cannot create helper pipe write event");
@@ -610,6 +708,7 @@ bool PortableHelperPipe::Receive(PortableHelperMessage* message,
   HANDLE pipe = static_cast<HANDLE>(operation.pipe);
   std::vector<uint8_t> encoded(kPortableHelperHeaderBytes +
                                kPortableHelperMaxPayloadBytes);
+  ByteVectorWiper encoded_wiper(encoded);
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (event == nullptr)
     return fail(error, "cannot create helper pipe read event");
@@ -638,10 +737,16 @@ bool PortableHelperPipe::Receive(PortableHelperMessage* message,
     Poison();
     return fail(error, "helper pipe returned an oversized message");
   }
-  encoded.resize(received);
+  std::vector<uint8_t> frame(encoded.begin(), encoded.begin() + received);
+  ByteVectorWiper frame_wiper(frame);
   PortableHelperMessage decoded;
-  if (!decode_portable_helper_message(encoded, &decoded, error) ||
-      !receive_sequence_.Accept(decoded, error)) {
+  if (!decode_portable_helper_message(frame, &decoded, error)) {
+    Poison();
+    return false;
+  }
+  if (!receive_sequence_.Accept(decoded, error)) {
+    if (!decoded.payload.empty())
+      SecureZeroMemory(decoded.payload.data(), decoded.payload.size());
     Poison();
     return false;
   }

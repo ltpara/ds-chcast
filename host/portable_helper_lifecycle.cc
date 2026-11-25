@@ -20,6 +20,7 @@
 #include "chast/machine_state_security.h"
 #include "chast/security.h"
 #include "portable_helper_recovery.h"
+#include "portable_helper_service_channel.h"
 #include "portable_helper_staging.h"
 
 namespace chast::host {
@@ -765,6 +766,8 @@ PortableHelperServiceLifecycle::PortableHelperServiceLifecycle(
     PortableHelperServiceSpec spec, PortableHelperServiceBackend& backend)
     : spec_(std::move(spec)), backend_(backend) {}
 
+PortableHelperServiceLifecycle::~PortableHelperServiceLifecycle() = default;
+
 void PortableHelperServiceLifecycle::set_error_locked(
     const std::string& error, std::string* output) {
   last_error_ = error.empty() ? "portable helper service operation failed" : error;
@@ -832,6 +835,24 @@ bool PortableHelperServiceLifecycle::CreateAndStart(std::string* error) {
       set_error_locked(primary_error, error);
     return false;
   }
+
+  auto connected = std::make_unique<PortableHelperServiceConnection>();
+  backend_error.clear();
+  if (!backend_.Connect(spec_, 15000, &connected, &backend_error) ||
+      !connected) {
+    const std::string primary_error = backend_error.empty()
+        ? "portable helper authenticated control channel failed"
+        : backend_error;
+    std::string cleanup_error;
+    const bool cleaned = cleanup_locked(&cleanup_error);
+    if (!cleaned)
+      set_error_locked(primary_error + "; cleanup pending: " + cleanup_error,
+                       error);
+    else
+      set_error_locked(primary_error, error);
+    return false;
+  }
+  connection_ = std::move(connected);
   state_ = PortableHelperServiceState::Running;
   last_error_.clear();
   return true;
@@ -839,12 +860,22 @@ bool PortableHelperServiceLifecycle::CreateAndStart(std::string* error) {
 
 bool PortableHelperServiceLifecycle::stop_locked(std::string* error) {
   if (!created_ || !running_) return true;
+  std::string control_error;
+  if (connection_ != nullptr && connection_->service_process != nullptr)
+    (void)request_portable_helper_service_stop(*connection_, 5000,
+                                              &control_error);
   std::string backend_error;
   if (!backend_.Stop(spec_, &backend_error)) {
     state_ = PortableHelperServiceState::CleanupPending;
-    set_error_locked(backend_error, error);
+    if (!control_error.empty())
+      set_error_locked(backend_error + "; control-channel stop: " +
+                           control_error,
+                       error);
+    else
+      set_error_locked(backend_error, error);
     return false;
   }
+  connection_.reset();
   running_ = false;
   state_ = PortableHelperServiceState::Created;
   return true;
@@ -905,6 +936,12 @@ PortableHelperServiceState PortableHelperServiceLifecycle::state() const {
 std::string PortableHelperServiceLifecycle::last_error() const {
   std::lock_guard lock(mutex_);
   return last_error_;
+}
+
+PortableHelperServiceConnection*
+PortableHelperServiceLifecycle::connection() const {
+  std::lock_guard lock(mutex_);
+  return connection_.get();
 }
 
 }  // namespace chast::host

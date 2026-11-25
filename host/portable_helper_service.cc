@@ -12,6 +12,7 @@
 #include "chast/machine_state_security.h"
 #include "portable_helper_lifecycle.h"
 #include "portable_helper_recovery.h"
+#include "portable_helper_service_channel.h"
 
 namespace chast::host {
 namespace {
@@ -103,6 +104,9 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
 
   DWORD exit_code = ERROR_INVALID_DATA;
   HANDLE parent = nullptr;
+  PortableHelperServiceSpec spec;
+  std::unique_ptr<PortableHelperPipe> control_channel;
+  std::string detail;
   try {
     if (count < 1 || arguments == nullptr || arguments[0] == nullptr ||
         _wcsicmp(arguments[0], g_expected_service_name.c_str()) != 0) {
@@ -119,8 +123,6 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
       }
 
       PortableHelperProcessIdentity current;
-      std::string detail;
-      PortableHelperServiceSpec spec;
       if (!current_portable_helper_process_identity(&current, &detail)) {
         exit_code = ERROR_ACCESS_DENIED;
       } else if (current.session_id != 0 || current.user_sid != L"S-1-5-18") {
@@ -169,14 +171,20 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
                 } else if (parent_state == WAIT_FAILED) {
                   exit_code = GetLastError();
                 } else {
-                  std::lock_guard lock(g_service_mutex);
-                  if (g_stop_event == nullptr ||
-                      WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) {
-                    exit_code = ERROR_CANCELLED;
-                  } else if (!set_service_status_locked(SERVICE_RUNNING)) {
-                    exit_code = GetLastError();
+                  control_channel = PortableHelperPipe::CreateServer(
+                      spec.instance_id, spec.parent.logon_sid, &detail);
+                  if (!control_channel) {
+                    exit_code = ERROR_ACCESS_DENIED;
                   } else {
-                    exit_code = ERROR_SUCCESS;
+                    std::lock_guard lock(g_service_mutex);
+                    if (g_stop_event == nullptr ||
+                        WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) {
+                      exit_code = ERROR_CANCELLED;
+                    } else if (!set_service_status_locked(SERVICE_RUNNING)) {
+                      exit_code = GetLastError();
+                    } else {
+                      exit_code = ERROR_SUCCESS;
+                    }
                   }
                 }
               }
@@ -190,22 +198,25 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
   }
 
   if (exit_code == ERROR_SUCCESS) {
-    HANDLE waits[] = {stop_event, parent};
-    const DWORD waited = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-    if (waited == WAIT_OBJECT_0) {
-      exit_code = ERROR_SUCCESS;
-    } else if (waited == WAIT_OBJECT_0 + 1) {
-      // Parent exit is the normal end of a temporary helper instance.
-      exit_code = ERROR_SUCCESS;
-    } else {
-      exit_code = GetLastError();
-      if (exit_code == ERROR_SUCCESS) exit_code = ERROR_GEN_FAILURE;
-    }
+    const bool channel_ok = run_portable_helper_service_control_channel(
+        std::move(control_channel), spec.parent, parent, stop_event,
+        [stop_event] {
+          std::lock_guard lock(g_service_mutex);
+          if (g_status.dwCurrentState != SERVICE_STOP_PENDING)
+            (void)set_service_status_locked(SERVICE_STOP_PENDING);
+          if (g_stop_event != nullptr) SetEvent(stop_event);
+        },
+        &detail);
+    exit_code = channel_ok ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+  } else if (control_channel) {
+    control_channel.reset();
   }
 
   if (parent != nullptr) CloseHandle(parent);
   {
     std::lock_guard lock(g_service_mutex);
+    if (g_status.dwCurrentState == SERVICE_RUNNING)
+      (void)set_service_status_locked(SERVICE_STOP_PENDING);
     if (!set_service_status_locked(SERVICE_STOPPED, exit_code) &&
         exit_code == ERROR_SUCCESS)
       exit_code = GetLastError();

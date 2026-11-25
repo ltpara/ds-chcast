@@ -14,6 +14,7 @@
 
 #include "portable_helper_lifecycle.h"
 #include "portable_helper_recovery.h"
+#include "portable_helper_service_channel.h"
 #include "portable_helper_staging.h"
 
 namespace {
@@ -52,6 +53,7 @@ PortableHelperServiceSpec test_spec() {
 struct FakeBackend final : PortableHelperServiceBackend {
   bool fail_create = false;
   bool fail_start = false;
+  bool fail_connect = false;
   bool service_registered = false;
   bool simulate_name_collision = false;
   int fail_stop_count = 0;
@@ -59,6 +61,7 @@ struct FakeBackend final : PortableHelperServiceBackend {
   int fail_staged_cleanup_count = 0;
   int create_calls = 0;
   int start_calls = 0;
+  int connect_calls = 0;
   int stop_calls = 0;
   int delete_calls = 0;
   int staged_cleanup_calls = 0;
@@ -82,6 +85,23 @@ struct FakeBackend final : PortableHelperServiceBackend {
     if (!fail_start) return true;
     if (error) *error = "start rejected";
     return false;
+  }
+
+  bool Connect(const PortableHelperServiceSpec&, uint32_t,
+               std::unique_ptr<PortableHelperServiceConnection>* connection,
+               std::string* error) override {
+    ++connect_calls;
+    events.push_back("connect");
+    if (fail_connect) {
+      if (error) *error = "control channel rejected";
+      return false;
+    }
+    if (connection == nullptr) {
+      if (error) *error = "missing connection output";
+      return false;
+    }
+    *connection = std::make_unique<PortableHelperServiceConnection>();
+    return true;
   }
 
   bool Stop(const PortableHelperServiceSpec&, std::string* error) override {
@@ -388,15 +408,15 @@ void test_successful_lifecycle_is_ordered_and_idempotent() {
   std::string error;
   check(lifecycle.CreateAndStart(&error) &&
             lifecycle.state() == PortableHelperServiceState::Running,
-        "a new helper service is created and started");
+        "a new helper service is started and its control channel authenticated");
   check(lifecycle.CreateAndStart(&error) && backend.create_calls == 1 &&
-            backend.start_calls == 1,
+            backend.start_calls == 1 && backend.connect_calls == 1,
         "repeated start does not create a second service instance");
   check(lifecycle.Stop(&error) &&
             lifecycle.state() == PortableHelperServiceState::Created,
         "stop leaves the owned service created and restartable");
   check(lifecycle.CreateAndStart(&error) && backend.create_calls == 1 &&
-            backend.start_calls == 2,
+            backend.start_calls == 2 && backend.connect_calls == 2,
         "a stopped temporary service can be restarted without recreation");
   check(lifecycle.Cleanup(&error) &&
             lifecycle.state() == PortableHelperServiceState::Removed,
@@ -405,9 +425,10 @@ void test_successful_lifecycle_is_ordered_and_idempotent() {
   check(lifecycle.Cleanup(&error) && backend.events.size() == calls,
         "repeated cleanup after removal is idempotent");
   check(backend.events == std::vector<std::string>{
-            "create", "start", "stop", "start", "stop", "delete",
+            "create", "start", "connect", "stop", "start", "connect",
+            "stop", "delete",
             "remove-image"},
-        "lifecycle stops/deletes the service before removing its image");
+        "lifecycle authenticates IPC and stops/deletes the service before removing its image");
 }
 
 void test_start_failure_attempts_stop_and_delete() {
@@ -422,6 +443,20 @@ void test_start_failure_attempts_stop_and_delete() {
             backend.stop_calls == 1 && backend.delete_calls == 1 &&
             backend.staged_cleanup_calls == 1,
         "a failed start is followed by stop, service deletion and image cleanup");
+}
+
+void test_control_channel_failure_rolls_back_service_start() {
+  FakeBackend backend;
+  backend.fail_connect = true;
+  PortableHelperServiceLifecycle lifecycle(test_spec(), backend);
+  std::string error;
+  check(!lifecycle.CreateAndStart(&error) &&
+            error.find("control channel rejected") != std::string::npos,
+        "an unauthenticated service control channel fails startup");
+  check(lifecycle.state() == PortableHelperServiceState::Removed &&
+            backend.stop_calls == 1 && backend.delete_calls == 1 &&
+            backend.staged_cleanup_calls == 1,
+        "control-channel failure stops and removes only the newly owned instance");
 }
 
 void test_stop_failure_prevents_delete_and_can_be_retried() {
@@ -620,6 +655,7 @@ int main() {
   test_helper_image_copy_is_validated_and_exclusive();
   test_successful_lifecycle_is_ordered_and_idempotent();
   test_start_failure_attempts_stop_and_delete();
+  test_control_channel_failure_rolls_back_service_start();
   test_stop_failure_prevents_delete_and_can_be_retried();
   test_delete_failure_is_visible_and_retryable();
   test_staged_image_cleanup_failure_is_visible_and_retryable();

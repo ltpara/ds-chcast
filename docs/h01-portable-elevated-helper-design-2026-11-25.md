@@ -1,8 +1,16 @@
 # H01 便携特权辅助服务设计
 
-更新日期：2026-11-25
+更新日期：2026-11-26
 分支：`codex/complete-workspace-2026-11-20`
-状态：设计基线、IPC 首片、生命周期协调器、Win32 SCM adapter、独立 SCM 服务入口、受保护暂存/copy API、持久恢复记录及正式服务启动后的后台扫描接线已实现；发布者证书固定机制已实现，但项目尚无签名证书/指纹；UAC 流程接线、真实 SCM 验收和桌面 worker 尚未完成
+状态：设计基线、IPC framing、生命周期协调器、Win32 SCM adapter、独立 SCM 服务入口、受保护暂存/copy API、持久恢复记录、正式服务后台扫描、经身份校验的 Status/Stop 控制通道、本地 capability/WorkerReady 策略核心与注入式 session-worker 启动/握手协调器已实现；按连接派生的 session-worker Named Pipe endpoint 已实现。session-worker launcher 尚未接入正式 helper service 控制循环，生产 token/session 启动策略和桌面 worker 未完成；发布者固定机制已实现，但项目尚无签名证书/指纹；UAC、真实 SCM 验收及桌面捕获/输入桥接仍待完成
+
+2026-11-26 SCM 控制通道与 session-worker 启动协调：`PortableHelperServiceLifecycle::CreateAndStart` 在 SCM 启动后要求建立已认证控制通道，失败会回滚本次拥有的临时服务；停止先请求控制通道 Stop，再走 SCM Stop/Delete。正式 helper entry 持续校验父进程身份，只提供 Status/Stop，并在确认 Stop 后退出服务。独立 session-worker 协调器负责创建连接专属 endpoint、调用外部 launcher、核验进程身份与 session、认证 pipe peer、发送 CapabilityGrant 并验证 WorkerReady；启动中任一步失败都会关闭通道、撤销待处理授权并尝试有界终止进程，终止失败时保留句柄供调用方清理。Release `chast-host-parity-test` 和 `chast-portable-helper-lifecycle-test` 均构建成功；`portable_helper_authorization` 与 `portable_helper_lifecycle` CTest **2/2 PASS**。回归 launcher 是隔离普通本机子进程，Win32 进程句柄/pipe 撤权路径也不代表 SCM SYSTEM worker；launcher 由调用方注入且尚未接入服务控制循环，没有用户 token/session 选择策略、UAC 授权调用方或真实桌面 capture/input adapter。未安装/启动真实服务、触发 UAC、写 ProgramData/防火墙或注入输入。后续先接通产品控制流程与明确的 token/session 设计，再安排隔离管理员真实 SCM 验收。
+
+2026-11-26 H01 session-worker IPC endpoint 切片：`PortableHelperPipe` 新增 `CreateSessionWorkerServer` / `ConnectSessionWorkerClient`，endpoint 由 helper instance ID 与非零 connection ID 派生，framing 继续绑定 helper instance ID；控制 endpoint 与 session worker endpoint 可并行存在且各自独占。Release `chast-host-parity-test` 构建成功，直接运行 `--portable-helper-authorization` 通过；隔离本机两个子进程分别连接控制和 worker endpoint，并验证精确 PID 身份、独立双向帧序号/请求往返以及错误 connection ID 拒绝。此为真实本机 Named Pipe 传输证据，不是 SYSTEM/SCM worker 验收；endpoint 尚未接入 `run_portable_helper_service_control_channel`、服务进程启动流程或桌面回调，未创建服务、触发 UAC、修改 ProgramData/防火墙或注入真实输入。下一步应实现服务侧 session-worker 启动与两管道协调，并让 worker 完成 grant/WorkerReady 和有界撤权；随后再将真实 capture/input adapter 接入，并保持真实 SCM 验收后置。
+
+2026-11-26 capability 与桌面请求门禁切片：新增 `host/portable_helper_authorization.{h,cc}`，以 BCrypt 生成每次授权独立的 secret/challenge，WorkerReady proof 使用 HMAC-SHA256 绑定 helper 实例、连接 ID、Windows session、代次和操作掩码；WorkerReady 明确要求预期桌面 worker 的 session 等于 grant 目标 session，且 PID、创建时间、映像、用户 SID、logon SID 全部匹配和 proof 正确，状态才从 AwaitingWorkerReady 进入 Ready。新增严格类型化的 `CaptureFrameRequest` / `InputEventRequest`，输入体复用现有 24 字节 InputEvent schema，固定绑定连接/代次/session，禁止通用命令；操作 gate 核验每条请求，返回的 RAII lease 必须覆盖捕获/注入副作用。撤权提供 Begin/Wait/Finish 拆分：先关闭新请求并清除 capability、调用取消回调；监督者可限时等待在途 lease，超时后强制终止 worker，再等待 lease 排空并释放输入。`Revoke` 便利 API 保持阻塞排空后释放输入的行为；取消/释放失败仍保持撤权并要求关闭通道。该拆分和 typed-request authorization 已有非破坏性 CTest 覆盖；定长 grant/WorkerReady 与 typed request 经隔离子进程往返验证。`portable_helper_authorization` 和 `protocol` 2/2 PASS，授权 CTest 连续 10 次通过。使用隔离 `%TEMP%` 的 `chast-host-parity-test --elevation` 全套回归通过；首次默认 TEMP 运行因用户 LocalAppData Temp 访问拒绝未能创建测试目录，随后隔离到 `build/test-temp` 重跑通过。没有触发真实 UAC、创建服务或写 ProgramData/防火墙。该模块仍**未连接**实际 SCM worker、远程会话权限或桌面捕获/输入注入；`BeginGrant` 没有 UAC 授权调用方，因此不能宣称 H01 授权功能已接通或可用于生产。真实 SCM/桌面操作均未触发。
+
+2026-11-26 有界撤权监督核心：新增 `host/portable_helper_supervisor.{h,cc}`，把取消、有界 lease drain 与 worker 正常退出等待固化为可注入顺序；任一有界等待超时才强制终止，确认进程退出并再次 drain 后才释放输入；若终止/退出/二次 drain 失败，会关闭通道但不释放仍可能被按住的输入，授权保持 Revoking，可在 lease 后续排空后重试。Release 构建后运行 `ctest --test-dir build/root -C Release -R '^portable_helper_authorization$' --repeat until-fail:10 --output-on-failure`，**10/10 PASS**；回归验证协作退出、无操作但 worker 不退出时强制结束、在途 lease 超时、终止失败时不提前释放输入及后续重试。Win32 回调现已在隔离同用户子进程上真实绑定进程句柄和已认证 Named Pipe 并完成 Stop/退出等待；但尚未从真实 SCM `SERVICE_STATUS_PROCESS` 获取 SYSTEM helper PID/身份，未接入正式服务 pipe 循环或真实桌面注入回调；因此仍未形成产品 worker 闭环。验证未安装服务、触发 UAC、写 ProgramData/防火墙或注入真实输入；Release 链接仍显示既有 `LNK4098`。
 
 ## 目标与当前差距
 
@@ -60,7 +68,7 @@ H01 要补的是**会话期间可复用、由本机用户明确授权的特权�
 
 `PortableHelperPipe` 创建拒绝远程客户端、仅 SYSTEM/管理员/显式授权 logon SID 可访问的单实例 message-mode 命名管道。创建者必须从已授权的交互用户 token（例如 SYSTEM 服务用 `WTSQueryUserToken` 取得的 token）导出 logon SID；不能从 SYSTEM 服务自己的 token 推断授权用户。客户端在打开后核对服务端 PID、Windows session、映像路径、进程创建时间、用户 SID 和 logon SID；服务端在接受后对客户端执行同样核对。收发使用 overlapped I/O 和调用方时限，不将管理员凭据放入端点或命令行；端点由随机 instance ID 派生。peer 身份核对是双向的，但它仍不等于 Authenticode 发布者验证，也不允许仅凭同属 SYSTEM 就接受未知映像；服务端调用者必须将 SCM 启动记录中的确切 worker 进程身份作为 expected peer 传入。
 
-目前帧的 type、request ID、instance ID 和连续序号只提供协议边界与防重放序号，不代表一次本地授权。随机服务挑战证明、按会话/代次撤销的 capability、消息级允许操作表，以及受控桌面 worker 均未实现；当前传输层不能被当作可执行桌面操作的授权通道。
+帧的 type、request ID、instance ID 和连续序号只提供协议边界与防重放序号，不单独代表一次本地授权。2026-11-26 新增 `CaptureFrameRequest` / `InputEventRequest` 严格类型消息：载荷固定包含连接 ID、generation、Windows session；输入体复用现有 24 字节 InputEvent 编码和解析器，按 Key/LegacyKey 与 Mouse/Touch/Pen/Gesture 映射到独立键盘/指针 capability。授权模块只接收这两种桌面操作类型，拒绝通用命令、错 scope、错操作及畸形/多余载荷。每个获准请求返回 RAII operation lease；撤权先关闭新请求、调用取消回调并等待在途副作用结束，随后清除输入；监督者可使用限时 drain API 决定是否终止卡住的 worker，drain 后再调用输入释放。清理失败仍要求关闭 IPC。该消息级授权核心已有非破坏性自动化覆盖，但尚无正式 SCM worker 调用方，不能把它视为桌面能力产品闭环；真实 worker 仍需接入有界取消/强制终止策略。
 
 Release `chast-host-parity-test --elevation` 已重建并通过新增帧往返、版本/类型/flags/长度错误、超限 payload、重放、跳号和跨实例回归；还通过隔离子进程实际打开受 ACL 限制的 Named Pipe，核对双方 PID/session/映像/创建时间/用户 SID/logon SID，并完成双向帧收发。补充的传输失败回归确认：本地拒绝超限发送不消耗序号；accept/receive 超时会取消 I/O 并关闭端点；对端断开或预期 logon SID 不匹配后通道不可复用；非法授权 SID 会被拒绝。管道 ACL 的 logon SID 现由调用方显式传入，避免 SYSTEM 服务错误地使用自身服务 token 的 logon SID。该验收只运行同用户测试子进程；它没有创建 SCM 服务、启动 SYSTEM helper worker 或验证 UAC 安全桌面。既有 UAC handoff 全套用例也通过。下一切片需接入唯一临时服务实例、将 SCM 启动记录中的确切 worker 身份注入管道两端，再按会话撤权/父进程断开停止该 worker。
 
@@ -109,6 +117,6 @@ Release 生命周期 CTest 的隔离临时目录回归验证当前测试映像�
 1. **配置发布签名并接通本地 UAC 授权**：发布者 pin 机制已定为 CMake `CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256`，缺 pin 或签名/信任链/吊销验证失败时拒绝 staging 和 SCM 启动；尚需取得项目实际 Authenticode 发布证书、配置其 SHA-256，并用签名产物验证正向链路。随后将 staging API 和生命周期接入本地授权流程，验证拒绝/取消不落盘，并在隔离管理员环境核验 ProgramData ACL、服务删除及映像清理重试。
 2. **恢复扫描实机验收与安全重试**：后台扫描已接入正式服务，继续覆盖父进程强杀、helper 强杀、服务删除失败、SCM marked-for-delete、系统重启及损坏/未知文件隔离；在隔离管理员环境观察真实 SCM/ProgramData 扫描日志及失败重试，确认停止过程、正式服务可用性和残留状态。
 3. **真实 SCM 验收**：在隔离 Windows 环境由明确授权的管理员路径真实安装、启动、停止、删除临时服务，核对服务进程 PID/映像/令牌身份，验证失败回滚且正式 `chast-host` 配置不变。fake backend 与直接运行 dispatcher 探针都不能替代此项。
-4. **授权 IPC 与 worker-ready**：接入服务端挑战/证明、父进程取得并校验 SCM worker 的确切进程身份、连接代次 capability、消息级允许操作表、撤权和输入状态清理；只有全部校验完成后才向主机确认 WorkerReady。
+4. **授权 IPC 与 worker-ready**：本地 capability 状态机、HMAC 挑战 proof、worker PID 身份比对、目标 session 绑定、代次与逐操作 gate、严格类型化的 capture/input 请求、在途 operation lease 及 split Begin/Wait/Finish revocation 已有实现；定长 grant/WorkerReady 交换已接入 `PortableHelperPipe` 并由隔离子进程测试覆盖。下一步须将它接入真实 SCM worker，父进程从 SCM 取得并校验确切 worker 身份，并要求真实本地 UAC 批准后才可调用 `BeginGrant`；再由真实 worker 在每条桌面捕获/输入副作用前 acquire lease。退出、撤权、会话切换须封闭新操作，接入取消和超时后的 worker 强制终止，再清除按键状态、排空 lease 后关闭帧通道；只有全部在线校验完成后才向主机确认 WorkerReady。当前无正式调用方，未形成产品闭环。
 5. **桌面能力与产品交互**：接入限定的桌面捕获/输入 worker、本地授权状态 UI、UAC 拒绝/超时/撤权、锁屏/安全桌面及 session 切换恢复。远程网络身份、设备密钥和认证仍由原主机持有。
 6. **升级退出与发布验收**：实现新旧 worker 切换/失败回滚、父子进程与系统重启清理，再完成管理员/标准用户、RDP/控制台、多会话、锁屏、安全桌面等实机矩阵；发布前确认无临时服务、进程或暂存文件残留。

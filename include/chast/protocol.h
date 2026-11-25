@@ -1864,6 +1864,9 @@ std::vector<uint8_t> make_latency_reply(uint64_t client_us, uint64_t host_recv_u
 bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_us,
                          uint64_t& host_recv_us, uint64_t& host_send_us, std::string* error);
 std::vector<uint8_t> make_input_event(const InputEvent& event);
+// Encodes only the fixed-size InputEvent payload (without the outer control
+// frame). Local authenticated helper IPC reuses this exact schema.
+std::vector<uint8_t> make_input_event_payload(const InputEvent& event);
 bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error);
 // Returns an empty vector when `text` fails valid_clipboard_text(); callers
 // then skip the update instead of sending an invalid message.

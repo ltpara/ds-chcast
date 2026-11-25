@@ -362,6 +362,11 @@ add_library(chast.host.tray STATIC
     host/file_snapshot.cc
     host/elevation_handoff.cc
     host/portable_helper_protocol.cc
+    host/portable_helper_authorization.cc
+    host/portable_helper_supervisor.cc
+    host/portable_helper_win32_supervisor.cc
+    host/portable_helper_service_channel.cc
+    host/portable_helper_worker_session.cc
     host/portable_helper_lifecycle.cc
     host/portable_helper_recovery.cc
     host/portable_helper_staging.cc
@@ -935,6 +940,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_parity COMMAND chast-host-parity-test)
+    add_test(NAME portable_helper_authorization
+        COMMAND chast-host-parity-test --portable-helper-authorization)
     add_test(NAME desktop_stream COMMAND chast-desktop-stream-test)
     add_test(NAME shared_capturer COMMAND chast-shared-capturer-test)
     set_tests_properties(shared_capturer PROPERTIES TIMEOUT 60)
@@ -1237,6 +1244,7 @@ if(CHAST_BUILD_TESTS)
         service_stop
         service_install
         service_uninstall
+        portable_helper_authorization
         portable_helper_lifecycle
         host_parity
         desktop_stream
@@ -1279,9 +1287,9 @@ if(CHAST_BUILD_TESTS)
     )
     list(LENGTH CHAST_REVIEWED_NONDESTRUCTIVE_TESTS
          CHAST_REVIEWED_NONDESTRUCTIVE_TEST_COUNT)
-    if(NOT CHAST_REVIEWED_NONDESTRUCTIVE_TEST_COUNT EQUAL 69)
+    if(NOT CHAST_REVIEWED_NONDESTRUCTIVE_TEST_COUNT EQUAL 70)
         message(FATAL_ERROR
-            "The reviewed non-destructive CTest allowlist must contain 69 tests")
+            "The reviewed non-destructive CTest allowlist must contain 70 tests")
     endif()
     foreach(test_name IN LISTS CHAST_REVIEWED_NONDESTRUCTIVE_TESTS)
         if(NOT test_name IN_LIST CHAST_TESTS)
