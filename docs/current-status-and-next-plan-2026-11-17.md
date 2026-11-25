@@ -12,7 +12,7 @@
 
 2026-11-25 C03 WM_QUIT 诊断补强：runner 在测试 trace 开启时会于即将执行 `PostQuitMessage` 前记录 `window-post-quit`，用于把发起 WM_QUIT 的窗口与主循环退出轨迹关联。当前 Release loopback 3/3 轮关闭/重连通过，3 组 request/post/prune 均完整且没有该事件或 runner 终止事件；这不是历史故障复现，不能据此关闭 11-22 未定位问题。详见[多连接标签页记录](multi-session-tabs-design-2026-11-21.md)。
 
-2026-11-25 W1/C01 本机配置语义定向复验：Flutter `view_prefs_test`、`session_start_polling_test`、`lan_discovery_test`、`session_viewer_strategy_test`、`viewer_strategy_test` 合计 **43/43 PASS**；host `host_settings`/`host_client_strategy` CTest **2/2 PASS**；Go `server/internal/strategy` **PASS**。覆盖按设备隔离的默认仅查看偏好、查看端会话保活租约获取/释放、LAN 发现结果合并、host 本地设置/显式偏好与服务端 Strategy 覆盖/回执，以及 viewer Strategy locked/default 优先级与会话快照语义。仅为单机定向自动化证据；不代表真实局域网扫描、Windows 电源行为或双机验收。
+2026-11-25 W1/C01 本机配置语义定向复验：Flutter `view_prefs_test`、`session_start_polling_test`、`lan_discovery_test`、`session_viewer_strategy_test`、`viewer_strategy_test` 合计 **43/43 PASS**；host `host_settings`/`host_client_strategy`/`host_tunnel` CTest **3/3 PASS**；Go `server/internal/strategy` 与 `server/internal/lan` 均 PASS，其中 LAN 包测试实际用回环 UDP 验证 responder/discover 往返及过滤/合并行为。覆盖按设备隔离的默认仅查看偏好、查看端会话保活租约获取/释放、LAN 发现结果合并、host 本地设置/显式偏好与 tunnel 参数传递、服务端 Strategy 覆盖/回执，以及 viewer Strategy locked/default 优先级与会话快照语义。仅为本机定向自动化与回环证据；不代表真实物理局域网扫描、Windows 电源行为或双机验收。
 
 2026-11-25 21:51 只读设备盘点：当前仅有一个活动逻辑显示器 `2560×1440`；PnP 另列多个状态为 Unknown 的显示器节点。音频端点中 ToDesk 虚拟设备与显示器音频为 OK，Realtek USB 麦克风/耳机端点为 Unknown，无法据此确认独立物理设备可用。未改变显示拓扑、打开/采集麦克风或修改系统设置；混合 DPI/多屏及真实音频验收继续待设备确认。
 
