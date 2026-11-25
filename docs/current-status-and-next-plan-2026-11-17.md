@@ -18,7 +18,7 @@
 
 2026-11-25 `viewer_clipboard_native` 私有站探针复核：CTest 按设计标记 **SKIP**；日志明确为创建私有剪贴板 Window Station 被当前进程 token 拒绝（错误 5），因此未执行剪贴板读写。此项与两项 listener 的 skip 属同一环境策略限制，不能计为功能通过。
 
-本轮筛选累计涉及 **67/105 个不同 CTest 条目：63 PASS、4 SKIP、38 未运行**（前序重复执行的 `host_tunnel` 按不同条目去重）。4 个 skip 是 `machine_state_security_untrusted_owner`（当前 token 缺少 `SeRestorePrivilege`）及三项私有 Window Station clipboard 测试（当前策略拒绝创建/访问）。余下未运行项中仍有真实桌面捕获、摄像头/音频设备、OS 输入/电源、虚拟显示、用户 Downloads 或未完成副作用审核的场景；不会将部分筛选表述为完整 CTest 门禁。
+本轮筛选累计涉及 **62/105 个不同 CTest 条目：58 PASS、4 SKIP、43 未运行**（前序重复执行的 `host_tunnel` 按不同条目去重）。4 个 skip 是 `machine_state_security_untrusted_owner`（当前 token 缺少 `SeRestorePrivilege`）及三项私有 Window Station clipboard 测试（当前策略拒绝创建/访问）。余下未运行项中仍有真实桌面捕获、摄像头/音频设备、OS 输入/电源、虚拟显示、用户 Downloads 或未完成副作用审核的场景；不会将部分筛选表述为完整 CTest 门禁。
 
 2026-11-25 C03 tooltip 回归根因修复：主消息循环每次 dispatch 后都会调用 `PruneClosed()`，而该函数即使没有已关闭子窗口也无条件重建标签并隐藏 tooltip。诊断 trace 在没有 `prune-child` 的情况下记录到 6,699 次无效标签重建，且 tooltip show 后立即 hide；证据 `build/native-runtime-20261125-213212-645ec9cd/run-1492538567/session-tabs.tsv`。现仅在实际移除子窗口时重建标签并同步可见性。先完成 3/3 轮定向 loopback，随后固定 Windows Release 构建再做 20/20 轮关闭/重连；初次及每轮重连的长标题 tooltip 文本和移出隐藏断言通过，兄弟连接全程 active，末尾精确断开通过。20 轮轨迹记录 20 个 request/post/prune 和 142 条 runner 事件，未见消息泵 quit/error、宿主销毁或窗口集归零；验收 `build/native-runtime-20261125-214349-19e1a47e/acceptance.log`，耗时 220.99 秒。该修复解释并消除本次 tooltip 空文本回归；11-22 历史进程退出根因仍未定位，不能据此宣布关闭生命周期整体收口。
 
