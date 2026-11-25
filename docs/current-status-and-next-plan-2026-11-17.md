@@ -12,7 +12,13 @@
 
 2026-11-25 非破坏性 CTest 第三轮：10 项中 **9 PASS、1 SKIP**（cursor_hint、display_window_access、display_subscriptions、display_video、viewer_display_streams、machine_state_security、machine_state_security_untrusted_owner、display_privacy、managed_access、host_ticket_lease）。显示隐私用例使用 fake backend，不调用 `SetDisplayConfig`；多显示器协议用例使用假 decoder/本机 loopback；managed access 与 ticket lease 均为无视频的 loopback 会话。`machine_state_security_untrusted_owner` 仅在 CTest 临时目录构造 ACL fixture；因当前 token 未分配 `SeRestorePrivilege`（错误 1300）按设计 SKIP，真实 owner 迁移集成路径仍待有权限的隔离环境验收。
 
-2026-11-25 clipboard CTest 副作用核对：`clipboard_oledata` **PASS**（进程内 IDataObject，不交接系统剪贴板）；`clipboard_listener` 与 `clipboard_listener_startup` **SKIP**，前者创建私有 Window Station 返回访问拒绝（错误 5），后者在私有 station 初始化阶段返回 CTest 配置的 skip code。二者未在操作者剪贴板执行写入。综合此前定向门禁与三轮筛选，已运行的仍只是所选非破坏性子集，不是全量 105 项 CTest；后续继续依据实际副作用逐项判断，不以被跳过的用例记作通过。
+2026-11-25 clipboard CTest 副作用核对：`clipboard_oledata` **PASS**（进程内 IDataObject，不交接系统剪贴板）；`clipboard_listener`、`clipboard_listener_startup` 与 `viewer_clipboard_native` **SKIP**。前者和 native probe 明确因创建私有 Window Station 返回访问拒绝（错误 5）；startup probe 在私有 station 初始化阶段返回 CTest 配置的 skip code。它们均未在操作者剪贴板执行写入。后续依据实际副作用逐项判断，不以被跳过的用例记作通过。
+
+2026-11-25 补充纯合成与文件会话用例：`capture_transform`、`png_writer`、`viewer_files_only`、`viewer_files_only_denied` **4/4 PASS**。前两项使用合成纹理/WIC 并将产物限制在构建测试目录；后两项通过本机 loopback 验证文件专用会话，fixture、下载和上传均位于 `build/root/test-temp`，会话断言为 0 显示器、0 帧，不读取宿主桌面或用户 Downloads。另运行 `desktop` **1/1 PASS**：只读确认当前 Default 输入桌面，并把 DPI awareness 设在该测试子进程内；未切换桌面或改变系统显示设置。
+
+2026-11-25 `viewer_clipboard_native` 私有站探针复核：CTest 按设计标记 **SKIP**；日志明确为创建私有剪贴板 Window Station 被当前进程 token 拒绝（错误 5），因此未执行剪贴板读写。此项与两项 listener 的 skip 属同一环境策略限制，不能计为功能通过。
+
+本轮筛选累计涉及 **67/105 个不同 CTest 条目：63 PASS、4 SKIP、38 未运行**（前序重复执行的 `host_tunnel` 按不同条目去重）。4 个 skip 是 `machine_state_security_untrusted_owner`（当前 token 缺少 `SeRestorePrivilege`）及三项私有 Window Station clipboard 测试（当前策略拒绝创建/访问）。余下未运行项中仍有真实桌面捕获、摄像头/音频设备、OS 输入/电源、虚拟显示、用户 Downloads 或未完成副作用审核的场景；不会将部分筛选表述为完整 CTest 门禁。
 
 2026-11-25 C03 tooltip 回归根因修复：主消息循环每次 dispatch 后都会调用 `PruneClosed()`，而该函数即使没有已关闭子窗口也无条件重建标签并隐藏 tooltip。诊断 trace 在没有 `prune-child` 的情况下记录到 6,699 次无效标签重建，且 tooltip show 后立即 hide；证据 `build/native-runtime-20261125-213212-645ec9cd/run-1492538567/session-tabs.tsv`。现仅在实际移除子窗口时重建标签并同步可见性。先完成 3/3 轮定向 loopback，随后固定 Windows Release 构建再做 20/20 轮关闭/重连；初次及每轮重连的长标题 tooltip 文本和移出隐藏断言通过，兄弟连接全程 active，末尾精确断开通过。20 轮轨迹记录 20 个 request/post/prune 和 142 条 runner 事件，未见消息泵 quit/error、宿主销毁或窗口集归零；验收 `build/native-runtime-20261125-214349-19e1a47e/acceptance.log`，耗时 220.99 秒。该修复解释并消除本次 tooltip 空文本回归；11-22 历史进程退出根因仍未定位，不能据此宣布关闭生命周期整体收口。
 
