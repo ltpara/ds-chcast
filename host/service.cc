@@ -15,6 +15,7 @@
 #include "chast/machine_state_security.h"
 #include "file_snapshot.h"
 #include "platform.h"
+#include "portable_helper_recovery.h"
 #include "rollback_stack.h"
 #include "service_install.h"
 #include "service_log.h"
@@ -38,6 +39,7 @@ HANDLE g_worker_stop = nullptr;
 HANDLE g_worker_switch = nullptr;
 HANDLE g_job = nullptr;
 HANDLE g_worker_process = nullptr;
+HANDLE g_helper_recovery_thread = nullptr;
 DWORD g_worker_session = 0;
 uint64_t g_worker_logon = 0;
 // A viewer-selected session outranks the console while it stays active. It is
@@ -499,13 +501,56 @@ void stop_worker() {
     }
 }
 
+DWORD WINAPI recover_portable_helpers(void* cancellation_event) {
+    const HANDLE cancellation = static_cast<HANDLE>(cancellation_event);
+    Win32PortableHelperServiceBackend backend;
+    PortableHelperRecoveryReport recovery;
+    std::string error;
+    const bool ok = scan_and_recover_portable_helper_instances(
+        backend, &recovery, &error, [cancellation] {
+            return cancellation == nullptr ||
+                WaitForSingleObject(cancellation, 0) != WAIT_OBJECT_0;
+        });
+    if (!ok) {
+        log_event(g_log_path, "portable_helper.recovery_failed",
+                  {{"error", error}});
+        return 1;
+    }
+    log_event(g_log_path, "portable_helper.recovery_summary",
+              {{"inspected", std::to_string(recovery.inspected)},
+               {"active", std::to_string(recovery.active)},
+               {"cleaned", std::to_string(recovery.cleaned)},
+               {"pending", std::to_string(recovery.pending)},
+               {"invalid", std::to_string(recovery.invalid)},
+               {"interrupted", recovery.interrupted ? "true" : "false"}});
+    return 0;
+}
+
+void wait_for_helper_recovery() {
+    if (g_helper_recovery_thread == nullptr) return;
+    for (;;) {
+        const DWORD waited = WaitForSingleObject(g_helper_recovery_thread, 5000);
+        if (waited == WAIT_OBJECT_0) break;
+        if (waited == WAIT_TIMEOUT) {
+            report_status(SERVICE_STOP_PENDING, NO_ERROR, 30000);
+            continue;
+        }
+        log_event(g_log_path, "portable_helper.recovery_wait_failed",
+                  {{"error", std::to_string(GetLastError())}});
+        report_status(SERVICE_STOP_PENDING, NO_ERROR, 30000);
+        Sleep(1000);
+    }
+    CloseHandle(g_helper_recovery_thread);
+    g_helper_recovery_thread = nullptr;
+}
+
 DWORD WINAPI service_handler(DWORD control, DWORD event_type, void* event_data, void* context) {
     (void)context;
     switch (control) {
         case SERVICE_CONTROL_STOP:
         case SERVICE_CONTROL_SHUTDOWN:
             if (g_status.dwCurrentState == SERVICE_RUNNING) {
-                report_status(SERVICE_STOP_PENDING, NO_ERROR, 30000);
+                report_status(SERVICE_STOP_PENDING, NO_ERROR, 60000);
                 if (g_service_stop != nullptr) {
                     SetEvent(g_service_stop);
                 }
@@ -610,6 +655,12 @@ void service_main(DWORD argc, LPWSTR* argv) {
 
     report_status(SERVICE_RUNNING);
     log_event(g_log_path, "service.running");
+    g_helper_recovery_thread = CreateThread(
+        nullptr, 0, recover_portable_helpers, g_service_stop, 0, nullptr);
+    if (g_helper_recovery_thread == nullptr) {
+        log_event(g_log_path, "portable_helper.recovery_thread_failed",
+                  {{"error", std::to_string(GetLastError())}});
+    }
 
     ServiceManagerStartup managers(service_manager_executable());
     auto retry_at = std::chrono::steady_clock::now();
@@ -700,6 +751,7 @@ void service_main(DWORD argc, LPWSTR* argv) {
         WaitForMultipleObjects(3, waits, FALSE, 1000);
     }
 
+    wait_for_helper_recovery();
     stop_worker();
     if (g_job != nullptr) {
         CloseHandle(g_job);

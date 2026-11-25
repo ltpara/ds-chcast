@@ -1,8 +1,12 @@
 # 分支基线与下一步执行计划
 
-日期：2026-11-20；最新审核补充：2026-11-23
+日期：2026-11-20；最新审核补充：2026-11-25
 
 当前开发分支：`codex/complete-workspace-2026-11-20`
+
+2026-11-25 C03/H01：在当前源码重建 Windows Release Flutter 查看端，并以生命周期 trace 完成 20/20 个标签关闭/重连 loopback 周期；每轮兄弟连接保持 active，末尾精确断开通过。轨迹未出现窗口集归零或主消息泵 quit/error。11-22 历史进程退出根因仍未复现/定位，C03 保持未解决风险。源码复核确认 H01 缺口是现有一次性 UAC 主机接管之外的可复用特权桌面辅助服务；已完成安全设计、独立 IPC framing/sequence、受限 Named Pipe 传输、注入式生命周期协调器及 Win32 SCM adapter 代码。`chast-host-parity-test --elevation` 覆盖同用户隔离子进程的双向身份校验、logon SID 不匹配拒绝、超时端点清理、断连封闭及本地拒绝帧后的序号连续性并通过；`chast-portable-helper-lifecycle-test` 覆盖名字碰撞隔离及启动/停止/删除失败回滚。独立 helper service entry、staging/copy、父进程崩溃恢复、真实 SCM/UAC/安全桌面验收和桌面 worker 仍待。Win32 adapter 未在本轮调用，未安装服务或修改 SCM/ProgramData/防火墙。帧序号和消息类型不授予桌面操作权限。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
+2026-11-25 H01 恢复推进：持久恢复记录和受保护实例扫描现已实现，正式 `chast-service` 在进入运行态后启动后台扫描线程；取消检查确保服务停止后不再启动下一实例清理，主服务等待当前操作退出并记录扫描汇总。Release `chast-service` 与生命周期回归构建通过，`portable_helper_lifecycle` 1/1 PASS，SCM 外 `--run` 按预期拒绝，未安装服务或触碰 ProgramData。该接线尚缺真实已安装 SCM 服务启动、孤儿记录清理和 STOP_PENDING 行为验收；H01 的 UAC 授权、worker-ready/capability、桌面桥接及安全桌面仍未完成。更新后的功能状态与下一步见[当前状态入口](current-status-and-next-plan-2026-11-17.md)和[H01 设计记录](h01-portable-elevated-helper-design-2026-11-25.md)。
 
 2026-11-23 H03：服务端设备签名分片 API、Go tunnel 默认关闭的持久上传 worker、C++ MP4 封口事件、原子任务清单 producer 和 opt-in/队列参数接线均已实现。Release CTest 4/4、Go agent/tunnel 包测试、vet、C++→Go E2E 及编译态 `chast-tunnel.exe host` 经 C++ `TunnelProcess` 父进程启动后的私有 CA/CONNECT 代理、强杀回收和 offset 续传均通过；完整 E2E 连续两轮通过。另以真实便携 `chast-host`、合成 VP9 桌面和真实 tunnel 完成本机封口上传整链，owner、SHA-256 和源文件保留断言通过。验收夹具已按构建目录 Low Integrity 标签调整为由 C++ producer 创建，未放宽权限。正式服务/部署、ProgramData/防火墙和双机验证后置。上传成功不删除本地 MP4。详见 [H03 主机归档设计](host-recording-archive-design-2026-11-23.md)。
 

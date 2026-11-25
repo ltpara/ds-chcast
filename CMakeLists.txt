@@ -23,6 +23,17 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(CHAST_BUILD_TESTS "Build the capture test tools" ON)
+set(CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256 "" CACHE STRING
+    "SHA-256 thumbprint of the Authenticode publisher certificate allowed to stage portable helper services")
+if(CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256)
+    string(LENGTH "${CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256}"
+           _chast_publisher_thumbprint_length)
+    if(NOT _chast_publisher_thumbprint_length EQUAL 64 OR
+       NOT CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256 MATCHES "^[A-Fa-f0-9]+$")
+        message(FATAL_ERROR
+            "CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256 must be exactly 64 hexadecimal characters")
+    endif()
+endif()
 
 # Intel oneVPL. The static dispatcher is linked directly (VPL_SHARED=OFF is the
 # config file's default, which is what D:/vpl_install_static ships); the
@@ -350,6 +361,11 @@ add_library(chast.host.tray STATIC
     host/firewall_transaction.cc
     host/file_snapshot.cc
     host/elevation_handoff.cc
+    host/portable_helper_protocol.cc
+    host/portable_helper_lifecycle.cc
+    host/portable_helper_recovery.cc
+    host/portable_helper_staging.cc
+    host/portable_helper_service.cc
     host/tunnel.cc
     host/service.cc
     host/service_control.cc
@@ -360,6 +376,8 @@ add_library(chast.host.tray STATIC
 target_include_directories(chast.host.tray PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/host)
+target_compile_definitions(chast.host.tray PRIVATE
+    CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256="${CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256}")
 target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi32 userenv oleaut32)
 
 # Notification-area host application. It is product code, so it is built even
@@ -640,6 +658,9 @@ if(CHAST_BUILD_TESTS)
     target_include_directories(chast-service-install-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/host)
     add_executable(chast-service-uninstall-test tests/service_uninstall_test.cc)
     target_include_directories(chast-service-uninstall-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/host)
+    add_executable(chast-portable-helper-lifecycle-test
+        tests/portable_helper_lifecycle_test.cc)
+    target_link_libraries(chast-portable-helper-lifecycle-test PRIVATE chast.host.tray)
 
     # Multi-viewer host over loopback QUIC: concurrent admission, the
     # connection cap, per-session audit records and the control lease. The
@@ -906,6 +927,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME service_stop COMMAND chast-service-stop-test)
     add_test(NAME service_install COMMAND chast-service-install-test)
     add_test(NAME service_uninstall COMMAND chast-service-uninstall-test)
+    add_test(NAME portable_helper_lifecycle
+        COMMAND chast-portable-helper-lifecycle-test)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_parity COMMAND chast-host-parity-test)

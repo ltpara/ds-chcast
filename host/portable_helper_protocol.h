@@ -1,0 +1,139 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace chast::host {
+
+// This framing is only for the local portable-helper named pipe. It does not
+// authenticate a peer: callers must first verify the pipe server/client PID,
+// executable, token SID, Windows session, and process creation time.
+inline constexpr size_t kPortableHelperInstanceIdBytes = 16;
+inline constexpr size_t kPortableHelperHeaderBytes = 56;
+inline constexpr size_t kPortableHelperMaxPayloadBytes = 1024 * 1024;
+
+using PortableHelperInstanceId =
+    std::array<uint8_t, kPortableHelperInstanceIdBytes>;
+
+enum class PortableHelperMessageType : uint32_t {
+    ClientHello = 1,
+    ServiceChallenge = 2,
+    ClientProof = 3,
+    HostSnapshot = 4,
+    WorkerReady = 5,
+    CommitTakeover = 6,
+    Stop = 7,
+    Status = 8,
+    Acknowledgement = 9,
+};
+
+struct PortableHelperMessage {
+    PortableHelperMessageType type = PortableHelperMessageType::ClientHello;
+    PortableHelperInstanceId instance_id{};
+    uint64_t sequence = 0;
+    uint64_t request_id = 0;
+    std::vector<uint8_t> payload;
+};
+
+bool encode_portable_helper_message(const PortableHelperMessage& message,
+                                    std::vector<uint8_t>* encoded,
+                                    std::string* error);
+bool decode_portable_helper_message(const std::vector<uint8_t>& encoded,
+                                    PortableHelperMessage* message,
+                                    std::string* error);
+
+// Each pipe direction has its own sequence space. The first frame is sequence
+// 1; duplicates, gaps, and cross-instance frames all terminate that direction.
+class PortableHelperSequence final {
+ public:
+  explicit PortableHelperSequence(PortableHelperInstanceId instance_id)
+      : instance_id_(instance_id) {}
+
+  bool Accept(const PortableHelperMessage& message, std::string* error);
+  uint64_t last_sequence() const { return last_sequence_; }
+
+ private:
+  PortableHelperInstanceId instance_id_{};
+  uint64_t last_sequence_ = 0;
+};
+
+struct PortableHelperProcessIdentity {
+  uint32_t process_id = 0;
+  uint32_t session_id = 0;
+  uint64_t creation_time = 0;
+  std::wstring image_path;
+  std::wstring user_sid;
+  std::wstring logon_sid;
+};
+
+// A SYSTEM service must derive this value from the already-authorized
+// interactive user's token (for example, WTSQueryUserToken), not its own
+// service token.
+bool portable_helper_logon_sid_from_token(void* token,
+                                          std::wstring* logon_sid,
+                                          std::string* error);
+bool current_portable_helper_logon_sid(std::wstring* logon_sid,
+                                       std::string* error);
+bool query_portable_helper_process_identity(
+    uint32_t process_id, PortableHelperProcessIdentity* identity,
+    std::string* error);
+bool current_portable_helper_process_identity(
+    PortableHelperProcessIdentity* identity, std::string* error);
+
+// A single local, message-mode named pipe bound to one helper instance. The
+// caller must pass the expected peer identity from the authenticated SCM /
+// process-launch state; the instance ID and pipe ACL alone are not proof.
+class PortableHelperPipe final {
+ public:
+  static std::unique_ptr<PortableHelperPipe> CreateServer(
+      const PortableHelperInstanceId& instance_id,
+      const std::wstring& authorized_logon_sid, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> ConnectClient(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperProcessIdentity& expected_server,
+      uint32_t timeout_ms, std::string* error);
+  ~PortableHelperPipe();
+  PortableHelperPipe(const PortableHelperPipe&) = delete;
+  PortableHelperPipe& operator=(const PortableHelperPipe&) = delete;
+
+  static std::wstring EndpointName(
+      const PortableHelperInstanceId& instance_id);
+
+  bool Accept(const PortableHelperProcessIdentity& expected_client,
+              uint32_t timeout_ms, std::string* error);
+  bool Send(PortableHelperMessage message, uint32_t timeout_ms,
+            std::string* error);
+  bool Receive(PortableHelperMessage* message, uint32_t timeout_ms,
+               std::string* error);
+
+ private:
+  struct Operation {
+    PortableHelperPipe* owner = nullptr;
+    void* pipe = nullptr;
+    ~Operation();
+  };
+
+  PortableHelperPipe(void* pipe, PortableHelperInstanceId instance_id);
+  bool BeginOperation(Operation* operation, std::string* error);
+  void EndOperation();
+  void Poison();
+
+  void* pipe_ = nullptr;
+  PortableHelperInstanceId instance_id_{};
+  uint64_t send_sequence_ = 0;
+  PortableHelperSequence receive_sequence_;
+  std::mutex state_mutex_;
+  std::condition_variable state_changed_;
+  size_t active_operations_ = 0;
+  bool closing_ = false;
+  std::mutex send_mutex_;
+  std::mutex receive_mutex_;
+};
+
+}  // namespace chast::host

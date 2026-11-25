@@ -8,6 +8,20 @@
 
 本文作为当前状态入口；2026-11-21/22 审核后的源码修复、验证结果及剩余问题见 [分支审核问题修复](review-fixes-2026-11-21.md)，阶段明细见 [W1 状态与后续计划](w1-status-and-next-plan-2026-11-19.md)。下文按日期保留较早证据，不把历史音频样本或 widget 回归等同于当前原生桥及播放验收。
 
+2026-11-25 C03 关闭/重连复验：当前 Windows Release 构建通过单机 Flutter loopback **20/20** 个选中标签关闭/重连周期；每轮兄弟连接保持 active，末尾管理台精确断开也通过。轨迹 `build/native-runtime-20261125-094542-a80c0caa/run-1612339926/session-tabs.tsv` 记录 20 个 `close-tab-request`、20 个 `close-tab-post`、20 个 `prune-child` 和 142 条 runner 生命周期事件；无 `runner-window-set-empty`、`runner-empty-tabs`、宿主销毁或消息泵退出/错误事件。此次没有复现 11-22 历史进程退出；测试未进入 `PostMessage(WM_CLOSE)` 失败分支，因此 C03 根因仍未定位，不将 20 轮通过作为缺陷已修复的依据。既有 49 轮后续通过记录之外，本轮另增加 20 轮通过。验收日志同目录 `acceptance.log`，总耗时 221.13 秒；构建日志 `build.log`、`flutter-build.log`。
+
+2026-11-25 H01 IPC 与生命周期首片：源码复核确认已有本机 UAC 一次性主机接管和固定名 SYSTEM SCM 服务；缺口是与正式服务隔离、会话期间复用的受控特权桌面辅助服务。新增独立版本化本地 IPC framing：固定 header、随机 128-bit helper instance ID、单向连续序号、request ID、1 MiB 负载上限；错误版本/类型/flags、畸形长度、尾随数据、超限负载、重放、跳号和跨实例均拒绝。Named Pipe 使用 SYSTEM/管理员 ACL 和调用方从已授权交互用户 token 显式传入的 logon SID，并拒绝远程客户端；管道双方核对预期 PID、映像、用户 SID、logon SID、Windows session 和进程创建时间。Release `chast-host-parity-test --elevation` 重建后通过同用户隔离子进程双向帧收发、logon SID 不匹配拒绝、accept/receive 超时清理、断连封闭、非法授权 SID 拒绝及本地拒绝帧不消耗序号回归，旧 UAC 接管/撤权取消/身份回滚/DPAPI-TOTP 连续性也通过。生命周期协调器及 Win32 SCM adapter 代码已加入；服务名和 ProgramData 暂存映像路径按 instance ID 限定，校验 SCM 服务类型/启动方式/账户/映像/控制 DACL，并向服务传递父进程身份。fake 后端回归覆盖正常启停、冲突隔离及失败回滚，但**未调用 Win32 adapter 或真实 SCM**。专用 helper service entry、staging/copy 工具和父进程崩溃恢复仍待实现；`Running` 仅指 SCM 状态，不代表 IPC worker 已认证就绪。帧序号和消息类型不是桌面操作授权；generation capability 和消息级允许操作表均未实现。真实 SCM worker、SYSTEM 桌面能力及 UAC/安全桌面仍待接线与验收。本轮未写入 SCM/ProgramData/防火墙，也未触发真实 UAC。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
+2026-11-25 H01 独立服务入口切片：`chast-host.exe --service-name <实例名>` 现可直接进入 SCM dispatcher，并在 UI/网络初始化前分流。服务入口只接受完整、无额外项的实例与父进程身份参数；校验服务名、实例 ID、Session 0 LocalSystem 身份、本实例暂存映像受保护 ACL、父进程 PID/创建时间/session/image/user SID/logon SID，并在父进程退出或收到 SCM stop/shutdown 后结束。生命周期回归新增参数解析、损坏参数和跨实例拒绝覆盖。Release `chast-host`、生命周期测试和 `chast-host-parity-test` 构建通过，`portable_helper_lifecycle` CTest 1/1 PASS，`chast-host-parity-test --elevation` 通过；普通进程启动 dispatcher 探针按预期以 2 退出。服务入口没有初始化 IPC/桌面 worker，`SERVICE_RUNNING` 不等于 worker-ready；本轮没有创建 SCM 服务、写入 ProgramData、触发 UAC 或防火墙。受保护 staging/copy、恢复记录、真实 SCM 生命周期及 IPC capability/桌面桥接仍待。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
+2026-11-25 H01 受保护暂存/copy 实现切片：新增 `stage_portable_helper_service_image` elevated-only API，内部生成随机实例 ID，源映像限定为当前进程 image path；共享机器状态目录只在首次创建时硬化，已存在目录必须通过受信 ACL 检查；随机实例目录拒绝碰撞，PE 复制拒绝 reparse、多硬链接、坏 header、超限映像及覆盖目标，复制后硬化并校验 ACL，失败只尝试清理本实例文件/目录。隔离临时目录回归通过当前测试映像字节一致复制、现存目标保留、非法 PE/硬链接源拒绝，生命周期另覆盖非零随机 ID。Release 三目标构建、生命周期 CTest 1/1 及 `chast-host-parity-test --elevation` 均通过。staging API 尚未接入 UAC/授权流程，本轮没有调用它或写 ProgramData；代码还未校验 Authenticode 发布者/签名，生产接线前须明确发布者固定策略。真实管理员 ACL、真实 SCM 生命周期、崩溃恢复、worker-ready/授权 IPC 与桌面桥接仍待。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
+2026-11-25 H01 服务与映像清理生命周期：协调器清理已扩展为先停服务、删准确的实例 SCM 项，再确认 SCM 中该服务完全不可打开后，删除受保护的本实例映像并移除空目录。仍在运行/仍注册/marked-for-delete 的服务都会阻止映像删除；文件路径、ACL、reparse 和 hard-link 状态在删除前复核。服务删除失败或映像清理失败进入 `CleanupPending`，后续可重试；创建失败回滚同样保留名称冲突服务使用的映像。fake backend 覆盖服务先于映像的顺序、映像清理失败重试和名称冲突不误删映像，`portable_helper_lifecycle` CTest 1/1 PASS。此 Win32 SCM/ProgramData 清理代码尚未在真实管理员环境调用，H01 仍未端到端接线。
+
+2026-11-25 H01 持久恢复记录切片：新增版本化 `recovery.dat`，记录绑定实例 ID、服务/映像派生路径及父进程创建时间和交互身份；独占临时写入、Flush、受保护 ACL 硬化后原子改名。SCM 服务启动和映像清理要求记录完整且与参数/规格相符；异常文件、reparse、硬链接、坏版本/长度或身份错配均失败关闭。定向 CTest 覆盖编码往返、错误 magic、截断/尾随数据和非规范规格，`portable_helper_lifecycle` 1/1 PASS；Release `chast-host`/生命周期/提权回归构建及 `chast-host-parity-test --elevation` 通过。**该切片完成时**尚无开机/启动扫描器自动发现并恢复孤儿实例，也没有真实 ProgramData/SCM 管理员环境证据；记录不是 UAC 授权凭证，staging 仍未接入本地授权流程。
+
+2026-11-25 H01 启动恢复扫描接线：正式 `chast-service` 在报告运行后以独立后台线程调用受保护 ProgramData 恢复扫描；单实例恢复失败只记录日志，不阻断正式服务。服务停止/关机后，线程在当前 SCM 操作结束后停止继续处理记录，正式服务等待扫描线程退出并持续报告 STOP_PENDING。恢复 API 增加可注入取消检查，fake backend 验证取消后不触碰后续实例。Release `chast-service` 与生命周期测试构建通过，`portable_helper_lifecycle` CTest 1/1 PASS，`git diff --check` 通过；`--run` 在 SCM 外按预期拒绝。尚未在真实已安装服务下观察日志，也未创建/清理 ProgramData 或 SCM 实例，因此仍需隔离管理员实机验收。UAC/本地授权接线、真实 SCM lifecycle、IPC worker-ready/capability、桌面桥接、升级回滚和安全桌面验证仍待。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
 2026-11-25 S05/S06/v33 代码检查点：当前分支已接入 schema v29–v33 的安全告警、邮箱验证、邀请和登录设备白名单。S05 有独立事件、去重/留存、分页筛选/CSV、权限范围管理台查询及带数据库租约和退避重试的邮件队列；S06 有邮箱验证和一次性邀请流程；v33 的用户签名设备证明已接入密码、LDAP、OIDC、WebAuthn，Windows 安装密钥由 DPAPI 保护。管理台账号列表补上管理员设备恢复 UI，支持查看、登记公钥、启停白名单和撤销设备；读取要求全局 `accounts.read`，更改要求 `accounts.write`，启停和撤销会话影响有明确确认，无受信设备时不能启用。
 
 2026-11-25 全量门禁：`go test ./... -count=1 -timeout 10m`、`go vet ./...`、Flutter `flutter test --no-pub` 880/880、`flutter analyze --no-pub`、管理台 Node 53/53、JavaScript 语法检查及 `cmake --build build --config Release --parallel 4` 均通过。安全密钥回归测试使用无设备证明 provider 隔离既有 WebAuthn 流程，设备证明接口有独立覆盖。`CHAST_TEST_POSTGRES_DSN` 未设置；PostgreSQL 实库、真实 SMTP、部署浏览器和双机设备恢复仍待验收。S05 的告警目录、风暴/重复投递语义和生产留存值待运维确定。详情见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)和[S05 告警状态](s05-alarm-status-2026-11-24.md)。
@@ -174,7 +188,7 @@ SCM 安装/卸载编排新增快照、逆序回滚及 fake SCM/防火墙事务�
 
 | 任务 | 待实现范围 |
 | --- | --- |
-| H01 | 可复用便携特权辅助服务、受控本地 IPC、身份绑定、异常清理和升级/退出 |
+| H01 | IPC framing/Named Pipe、注入式生命周期协调器、Win32 SCM adapter、独立 SCM service entry、elevated-only 暂存/copy、持久恢复记录、严格的本实例服务/映像清理代码及正式 `chast-service` 启动后的后台恢复扫描接线已完成；尚需 UAC 授权流程、隔离管理员 SCM/ProgramData 实机验收、IPC worker-ready/capability/撤权、桌面桥接、升级回滚和真实 UAC/安全桌面验收 |
 | H02 | 扩展虚拟显示后端、自定义分辨率、驱动签名/分发条件及多 GPU、HDR、热插拔回退 |
 | H03 | 本机集中上传、断点续传和幂等归档已实现并通过真实便携主机 loopback 整链；生产服务/部署与双机验收后置，源 MP4 自动清理/保留策略仍待定义 |
 | O01 | 活动连接与指令已落库，快照 CAS 已修复且有 SQLite 双 Store 回归；仍需 PostgreSQL 双 Store 验证、共享限流、录制存储和跨实例写入协调，以及实际两实例指令投递与故障接管验收 |

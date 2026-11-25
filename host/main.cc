@@ -58,6 +58,7 @@
 #include "service_manager.h"
 #include "service_settings.h"
 #include "tunnel.h"
+#include "portable_helper_service.h"
 
 namespace {
 
@@ -4967,6 +4968,24 @@ std::wstring absolute_path(const std::wstring& path) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    int early_argc = 0;
+    LPWSTR* early_argv = CommandLineToArgvW(GetCommandLineW(), &early_argc);
+    if (early_argv != nullptr && early_argc > 1 &&
+        std::wstring(early_argv[1]) == L"--service-name") {
+        const bool valid = early_argc == 3 && early_argv[2][0] != L'\0';
+        const std::wstring service_name = valid ? early_argv[2] : L"";
+        LocalFree(early_argv);
+        return valid ? chast::host::run_portable_helper_service(service_name) : 2;
+    }
+    if (early_argv != nullptr) {
+        for (int index = 1; index < early_argc; ++index) {
+            if (std::wstring(early_argv[index]) == L"--service-name") {
+                LocalFree(early_argv);
+                return 2;
+            }
+        }
+        LocalFree(early_argv);
+    }
     SetProcessDPIAware();
     load_ui_language();
     static HostApp app;

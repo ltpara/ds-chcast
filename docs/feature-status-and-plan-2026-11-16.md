@@ -1,10 +1,10 @@
 # 功能完成情况与后续计划
 
-日期：2026-11-16；当前状态补充：2026-11-24
+日期：2026-11-16；当前状态补充：2026-11-25
 
-2026-11-24 S05/S06 当前状态：安全告警已有独立落库、分类、去重、分页筛选/CSV、管理台列表、独立留存、持久邮件任务及带租约/重试的 SMTP worker；邮箱验证和一次性用户邀请已接通。登录设备白名单的 v33 迁移、服务端准入/API、Windows 安装密钥签名和 Flutter 用户端管理已进入本地工作区，尚未提交；管理员管理台登记/恢复界面还未完成。基线 S05/S06 切片曾通过 Go、Flutter 877/877、analyze 和管理台 52 项测试；白名单接入后的最新 Flutter 全量有两项安全密钥登录测试失败，analyze 有六项 lint 提示，Go 全量及 Windows Release 构建通过。`CHAST_TEST_POSTGRES_DSN` 未设置，PostgreSQL 实库、真实 SMTP/部署浏览器验收仍待。功能必要性、产品优先级与后续退出条件见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
+2026-11-25 S05/S06/v33 当前状态：安全告警已有独立落库、分类、去重、分页筛选/CSV、管理台列表、独立留存、持久邮件任务及带租约/退避重试的 SMTP worker；邮箱验证和一次性邀请已接通；登录设备白名单已覆盖密码、LDAP、OIDC、WebAuthn 登录，Windows 安装密钥由 DPAPI 保护，管理员账号页可登记/恢复/启停/撤销设备。Go 全量与 vet、Flutter 880/880 与 analyze、管理台 Node 53/53、JavaScript 语法检查及 Windows Release 构建通过。PostgreSQL 实库、真实 SMTP、部署浏览器及双机设备恢复仍待验收；告警目录、风暴/重复投递语义和生产留存值需运维确定。详见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
 
-2026-11-23 当前执行入口：使用 `codex/complete-workspace-2026-11-20`（当前已提交基线 `688638a`；后续修复仍在工作区，尚未提交）。W1 外部验收保留，W2/C03 继续本机开发。多连接标签的输入释放/后台拒绝、兄弟隐藏时持续收流/解码/发布/录制、A/B 逐标签录制状态和录制按钮 UI、合成静音源下 Flutter 音量按钮路由、双标签保活 lease 释放，以及合成双逻辑显示器父子窗口生命周期均已有 loopback 证据。12:05/12:08 标签关闭进程退出仍未定位；累计 49 个关闭/重连周期通过，但均不能据此判为修复。`PostMessage(WM_CLOSE)` 明确失败且 HWND 仍有效时的模型回滚已实现并通过 CTest，正常关闭 loopback 追加 3 轮通过；真实投递失败注入和历史根因仍待。真实音频/物理设备、电源及物理显示验收仍待完成。H03 查看端队列恢复、首页无会话 drain、实际 Flutter UI/HTTP 强杀重启及未封口文件保留提示均已完成本机验证；主机归档 C++ producer、编译态 tunnel 子进程及真实便携 `chast-host` 从 MP4 封口到服务端的隔离整链均已通过，正式服务/ProgramData/防火墙和双机仍待。C04 快捷键 Windows Release loopback（含 Flutter 回退）及最终 Flutter 全量 870/870 通过；物理键盘/IME 和真实应用剪贴板仍待实机验收。A01 安全设计补入密钥目录与恢复边界，E2EE/托管语义待确认，尚未改协议。详细拆单见 [分支基线与下一步执行计划](branch-baseline-and-next-actions-2026-11-20.md)。下文较早的批次和测试数字保留对应日期的证据范围。
+2026-11-25 当前执行入口：分支 `codex/complete-workspace-2026-11-20`，已提交基线 `4d3cd2b`。C03 单机 Release loopback 又通过 20 轮标签关闭/重连，兄弟会话各轮保持活动，生命周期轨迹完整；11-22 历史查看端进程退出根因未复现、未定位，仍作为未解决风险。W1 双机、正式 SCM/安全桌面、生产数据库、复杂网络及物理设备场景仍待验收。H03 本机整链已通过，正式服务/双机和源文件保留策略仍待。S05/S06/v33 代码闭环与本地全量门禁已完成，外部验收待做。H01 已完成安全设计、独立 IPC framing/sequence、受限 Named Pipe 传输、注入式生命周期协调器及 Win32 SCM adapter 代码；回归覆盖 logon SID 身份核验、超时/断连封闭、名字冲突隔离、启动失败回滚及停止/删除失败重试。独立 helper service entry、受保护 staging/copy、崩溃恢复、真实 SCM 验收、桌面 worker 和真实 UAC/安全桌面验收仍未完成。当前设计和实现证据见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。本页较早状态和测试数字保留其当时证据范围，当前结论以[状态入口](current-status-and-next-plan-2026-11-17.md)为准。
 
 2026-11-23 H03 主机入站归档推进：服务端设备签名分片 API 双重认证、owner 固定和摘要失败回滚，Go tunnel worker，以及 C++ 成功封口回调、原子任务 producer、默认关闭的 opt-in 设置和 tunnel 队列参数均已接通。Release CTest 4/4、Go agent/tunnel 全包测试、vet 与完整 E2E 连续两轮通过；后者由 C++ `TunnelProcess` 启动编译态 tunnel，覆盖 TLS CA、CONNECT 代理、父进程强杀后的子进程回收和 offset 恢复。另以真实便携 `chast-host` 完成从录制封口到 tunnel/服务端归档的隔离 loopback 整链验收。正式部署/ProgramData/防火墙和双机验收仍待。设计见 [H03 归档设计](host-recording-archive-design-2026-11-23.md)。
 
@@ -349,11 +349,11 @@ S03 仍待完成：
 - A03：个人与共享地址簿密码密文同步；
 - S04：Control Role 三态覆盖；
 - S05：独立告警存储/查询/管理台/来源去重/留存已实现；分类覆盖访问拒绝、应急访问、账号锁定、账号安全设置、管理员角色/权限、主机策略/设备状态和签名密钥撤销。schema v31 的持久投递任务、后台 SMTP worker、数据库租约、失败退避重试和 S06 邮件偏好均已接通；剩余事件目录/风暴与重复投递语义、PostgreSQL 实库、生产保留时长、真实 SMTP/浏览器部署验收；
-- S06：本地邮箱验证状态、一次性验证 API、SMTP 发信、Flutter/管理台确认流程和一次性用户邀请已接通；schema v32 的邀请可创建普通账号并在接受时验证邮箱。v33 登录设备白名单已进入未提交工作区，当前 Flutter 安全密钥登录回归和 analyze 尚未通过，管理员管理台登记/恢复界面、PostgreSQL 实库、真实 SMTP/浏览器部署验收待补。
+- S06：本地邮箱验证状态、一次性验证 API、SMTP 发信、Flutter/管理台确认流程和一次性用户邀请已接通；schema v32 的邀请可创建普通账号并在接受时验证邮箱。v33 登录设备白名单、管理员设备登记/恢复/启停/撤销界面及本地全量回归已完成；PostgreSQL 实库、真实 SMTP、部署浏览器和双机恢复验收仍待。
 
 ### 8.5 W4 主机与生产部署
 
-- H01：可复用便携特权辅助服务；
+- H01：可复用便携特权辅助服务；现有一次性 UAC 主机接管与固定名 SYSTEM SCM 服务不是该能力，设计与当前接管测试基线见[H01 设计](h01-portable-elevated-helper-design-2026-11-25.md)。
 - H02：扩展虚拟显示后端和自定义分辨率；
 - O01：多实例共享限流、录制租约、活动连接路由和指令投递；
 - O02：PostgreSQL 生产配置、TLS、备份恢复、故障切换、滚动升级和监控；

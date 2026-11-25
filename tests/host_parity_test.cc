@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <future>
@@ -15,6 +16,7 @@
 #include "host_media_stub.h"
 #include "service_control.h"
 #include "elevation_handoff.h"
+#include "portable_helper_protocol.h"
 #include "platform.h"
 #include "chast/user_context.h"
 
@@ -224,6 +226,278 @@ int elevation_child(int argc, char** argv) {
     }
     server->wait();
     return 0;
+}
+
+void portable_helper_protocol() {
+    using namespace chast::host;
+    PortableHelperMessage message;
+    message.type = PortableHelperMessageType::HostSnapshot;
+    for (size_t i = 0; i < message.instance_id.size(); ++i)
+        message.instance_id[i] = static_cast<uint8_t>(i + 1);
+    message.sequence = 1;
+    message.request_id = 42;
+    message.payload = {0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff};
+
+    std::vector<uint8_t> encoded;
+    std::string error;
+    require(encode_portable_helper_message(message, &encoded, &error),
+            "encode a bounded, versioned helper message");
+    require(encoded.size() == kPortableHelperHeaderBytes + message.payload.size(),
+            "helper frame has a fixed header and exact payload length");
+    PortableHelperMessage decoded;
+    require(decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == message.type &&
+                decoded.instance_id == message.instance_id &&
+                decoded.sequence == message.sequence &&
+                decoded.request_id == message.request_id &&
+                decoded.payload == message.payload,
+            "helper message round-trips without changing its instance or body");
+
+    PortableHelperSequence sequence(message.instance_id);
+    require(sequence.Accept(decoded, &error) && sequence.last_sequence() == 1,
+            "helper receive sequence accepts the first frame");
+    require(!sequence.Accept(decoded, &error) && sequence.last_sequence() == 1,
+            "helper receive sequence rejects a replay without advancing");
+    decoded.sequence = 3;
+    require(!sequence.Accept(decoded, &error) && sequence.last_sequence() == 1,
+            "helper receive sequence rejects a gap without advancing");
+    decoded.sequence = 2;
+    decoded.instance_id[0] ^= 0xff;
+    require(!sequence.Accept(decoded, &error),
+            "helper receive sequence rejects a cross-instance frame");
+
+    const auto rejected = [&](std::vector<uint8_t> bytes, const char* reason) {
+        PortableHelperMessage output;
+        error.clear();
+        require(!decode_portable_helper_message(bytes, &output, &error) &&
+                    !error.empty(), reason);
+    };
+    auto bad = encoded;
+    bad[0] ^= 0xff;
+    rejected(bad, "helper parser rejects an invalid magic value");
+    bad = encoded;
+    bad[8] = 2;
+    rejected(bad, "helper parser rejects an unsupported protocol version");
+    bad = encoded;
+    bad[12] = 0xff;
+    bad[13] = bad[14] = bad[15] = 0;
+    rejected(bad, "helper parser rejects an unknown message type");
+    bad = encoded;
+    bad[52] = 1;
+    rejected(bad, "helper parser rejects unrecognized flags");
+    bad = encoded;
+    bad.push_back(0);
+    rejected(bad, "helper parser rejects trailing bytes");
+    bad = encoded;
+    bad[48] += 1;
+    rejected(bad, "helper parser rejects a payload-length mismatch");
+    bad = encoded;
+    bad.resize(kPortableHelperHeaderBytes - 1);
+    rejected(bad, "helper parser rejects a truncated header");
+
+    message.payload.resize(kPortableHelperMaxPayloadBytes + 1);
+    error.clear();
+    require(!encode_portable_helper_message(message, &encoded, &error) &&
+                encoded.empty() && !error.empty(),
+            "helper encoder refuses an over-limit payload");
+}
+
+int portable_helper_pipe_child(int argc, char** argv) {
+    const bool reject_server_identity = argc == 6 &&
+        std::string(argv[5]) == "--reject-server-logon-sid";
+    const bool idle_client = argc == 6 &&
+        std::string(argv[5]) == "--idle-pipe-client";
+    if (argc != 5 && !reject_server_identity && !idle_client) return 2;
+    std::vector<uint8_t> instance_bytes;
+    if (!chast::hex_decode(argv[2], instance_bytes) ||
+        instance_bytes.size() != chast::host::kPortableHelperInstanceIdBytes)
+        return 3;
+    chast::host::PortableHelperInstanceId instance_id{};
+    std::copy(instance_bytes.begin(), instance_bytes.end(), instance_id.begin());
+    const uint32_t parent_pid = static_cast<uint32_t>(std::stoul(argv[3]));
+    const uint64_t parent_creation = std::stoull(argv[4]);
+    chast::host::PortableHelperProcessIdentity parent;
+    std::string error;
+    if (!chast::host::query_portable_helper_process_identity(
+            parent_pid, &parent, &error) ||
+        parent.creation_time != parent_creation)
+        return 4;
+    if (reject_server_identity) parent.logon_sid += L"-forged";
+    auto pipe = chast::host::PortableHelperPipe::ConnectClient(
+        instance_id, parent, 5000, &error);
+    if (reject_server_identity) return pipe ? 8 : 0;
+    if (idle_client) {
+        if (!pipe) return 9;
+        Sleep(500);
+        return 0;
+    }
+    if (!pipe) {
+        std::fprintf(stderr, "portable pipe child connect: %s\n", error.c_str());
+        return 5;
+    }
+    chast::host::PortableHelperMessage message;
+    if (!pipe->Receive(&message, 5000, &error) ||
+        message.type != chast::host::PortableHelperMessageType::ServiceChallenge ||
+        message.request_id != 77 || message.payload != std::vector<uint8_t>{1, 2, 3})
+        return 6;
+    message = {};
+    message.type = chast::host::PortableHelperMessageType::Acknowledgement;
+    message.request_id = 77;
+    message.payload = {4, 5, 6};
+    if (!pipe->Send(std::move(message), 5000, &error)) {
+        std::fprintf(stderr, "portable pipe child send: %s\n", error.c_str());
+        return 7;
+    }
+    return 0;
+}
+
+void portable_helper_pipe_transport() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error),
+            "query the helper IPC host process identity");
+    require(!parent.logon_sid.empty(),
+            "helper process identity includes its Windows logon SID");
+    std::wstring authorized_logon_sid;
+    require(current_portable_helper_logon_sid(&authorized_logon_sid, &error) &&
+                authorized_logon_sid == parent.logon_sid,
+            "derive the pipe ACL SID explicitly from the authorized interactive token");
+    PortableHelperInstanceId instance_id{};
+    require(secure_random(instance_id.data(), instance_id.size()) &&
+                std::any_of(instance_id.begin(), instance_id.end(),
+                            [](uint8_t byte) { return byte != 0; }),
+            "generate a unique helper IPC instance id");
+    require(!PortableHelperPipe::CreateServer(instance_id, L"not-a-sid", &error),
+            "reject an invalid explicitly authorized logon SID");
+    auto pipe = PortableHelperPipe::CreateServer(instance_id, authorized_logon_sid,
+                                                  &error);
+    require(pipe != nullptr, "create a local helper pipe restricted to SYSTEM, administrators and the host logon");
+
+    const auto executable = executable_path();
+    const auto launch_client = [&](const PortableHelperInstanceId& client_instance,
+                                   bool reject_server, bool idle = false) {
+        std::wstring command = L"\"" + executable +
+            L"\" --portable-helper-pipe-client " +
+            widen(hex_encode(client_instance.data(), client_instance.size())) + L" " +
+            std::to_wstring(parent.process_id) + L" " +
+            std::to_wstring(parent.creation_time);
+        if (reject_server) command += L" --reject-server-logon-sid";
+        if (idle) command += L" --idle-pipe-client";
+        std::vector<wchar_t> command_line(command.begin(), command.end());
+        command_line.push_back(L'\0');
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        require(CreateProcessW(executable.c_str(), command_line.data(), nullptr, nullptr,
+                               FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                               &process) != FALSE,
+                "launch the isolated local IPC client process");
+        CloseHandle(process.hThread);
+        return process;
+    };
+    PROCESS_INFORMATION child = launch_client(instance_id, false);
+    PortableHelperProcessIdentity expected_child;
+    require(query_portable_helper_process_identity(child.dwProcessId,
+                                                    &expected_child, &error),
+            "query the exact expected helper client identity");
+    require(pipe->Accept(expected_child, 5000, &error),
+            "accept only the expected PID, session, image, creation time and SID");
+    PortableHelperMessage challenge;
+    challenge.type = PortableHelperMessageType::ServiceChallenge;
+    challenge.request_id = 77;
+    challenge.payload = {1, 2, 3};
+    PortableHelperMessage invalid;
+    invalid.type = PortableHelperMessageType::ServiceChallenge;
+    invalid.payload.resize(kPortableHelperMaxPayloadBytes + 1);
+    require(!pipe->Send(std::move(invalid), 5000, &error),
+            "reject an oversized outgoing helper message locally");
+    require(pipe->Send(std::move(challenge), 5000, &error),
+            "a locally rejected frame does not consume the next send sequence");
+    PortableHelperMessage acknowledgement;
+    require(pipe->Receive(&acknowledgement, 5000, &error) &&
+                acknowledgement.type == PortableHelperMessageType::Acknowledgement &&
+                acknowledgement.request_id == 77 &&
+                acknowledgement.payload == std::vector<uint8_t>{4, 5, 6},
+            "receive the child acknowledgement with independent sequence checks");
+    require(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
+            "portable helper IPC client exits after the exchange");
+    DWORD exit_code = 1;
+    require(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0,
+            "portable helper IPC client verified the server identity and frame");
+    CloseHandle(child.hProcess);
+    require(!pipe->Receive(&acknowledgement, 1000, &error),
+            "a disconnected helper peer terminates pending receive");
+    require(!pipe->Send(std::move(challenge), 1000, &error),
+            "a disconnected helper pipe cannot be reused");
+
+    PortableHelperInstanceId timeout_instance{};
+    require(secure_random(timeout_instance.data(), timeout_instance.size()),
+            "generate a helper instance id for timeout cleanup");
+    auto timed_out = PortableHelperPipe::CreateServer(
+        timeout_instance, authorized_logon_sid, &error);
+    require(timed_out != nullptr, "create a helper pipe for accept-timeout coverage");
+    const auto timeout_started = std::chrono::steady_clock::now();
+    require(!timed_out->Accept(parent, 50, &error),
+            "accept returns false when no helper client connects before its deadline");
+    require(std::chrono::steady_clock::now() - timeout_started <
+                std::chrono::seconds(2),
+            "accept timeout cancels pending pipe I/O promptly");
+    auto reclaimed = PortableHelperPipe::CreateServer(
+        timeout_instance, authorized_logon_sid, &error);
+    require(reclaimed != nullptr,
+            "timed-out accept closes its endpoint so the instance can be reclaimed");
+
+    PortableHelperInstanceId mismatch_instance{};
+    require(secure_random(mismatch_instance.data(), mismatch_instance.size()),
+            "generate a helper instance id for peer-identity rejection");
+    auto mismatch_server = PortableHelperPipe::CreateServer(
+        mismatch_instance, authorized_logon_sid, &error);
+    require(mismatch_server != nullptr,
+            "create a helper pipe for exact peer-identity rejection");
+    PROCESS_INFORMATION mismatch_child = launch_client(mismatch_instance, true);
+    PortableHelperProcessIdentity expected_mismatch_child;
+    require(query_portable_helper_process_identity(
+                mismatch_child.dwProcessId, &expected_mismatch_child, &error),
+            "query the helper client identity in peer-rejection coverage");
+    require(mismatch_server->Accept(expected_mismatch_child, 5000, &error),
+            "the test peer identity is established before client-side server rejection");
+    require(WaitForSingleObject(mismatch_child.hProcess, 5000) == WAIT_OBJECT_0,
+            "client exits after rejecting the mismatched expected server identity");
+    DWORD mismatch_exit_code = 1;
+    require(GetExitCodeProcess(mismatch_child.hProcess, &mismatch_exit_code) &&
+                mismatch_exit_code == 0,
+            "client rejects the server whose interactive logon SID does not match");
+    CloseHandle(mismatch_child.hProcess);
+    require(!mismatch_server->Receive(&acknowledgement, 1000, &error),
+            "peer identity rejection leaves no reusable server connection");
+
+    PortableHelperInstanceId receive_timeout_instance{};
+    require(secure_random(receive_timeout_instance.data(),
+                          receive_timeout_instance.size()),
+            "generate an instance id for read-timeout cleanup");
+    auto receive_timeout_server = PortableHelperPipe::CreateServer(
+        receive_timeout_instance, authorized_logon_sid, &error);
+    require(receive_timeout_server != nullptr,
+            "create a pipe for receive-timeout coverage");
+    PROCESS_INFORMATION idle_child = launch_client(receive_timeout_instance,
+                                                   false, true);
+    PortableHelperProcessIdentity expected_idle_child;
+    require(query_portable_helper_process_identity(
+                idle_child.dwProcessId, &expected_idle_child, &error),
+            "query the idle helper client identity");
+    require(receive_timeout_server->Accept(expected_idle_child, 5000, &error),
+            "accept the idle local helper client");
+    require(!receive_timeout_server->Receive(&acknowledgement, 50, &error),
+            "receive returns false when no frame arrives before its deadline");
+    require(!receive_timeout_server->Send(std::move(challenge), 1000, &error),
+            "a receive-timeout pipe is closed and cannot be reused");
+    require(WaitForSingleObject(idle_child.hProcess, 5000) == WAIT_OBJECT_0,
+            "idle child exits after the timed-out server closes the pipe");
+    DWORD idle_exit_code = 1;
+    require(GetExitCodeProcess(idle_child.hProcess, &idle_exit_code) &&
+                idle_exit_code == 0,
+            "idle child observed clean timeout teardown");
+    CloseHandle(idle_child.hProcess);
 }
 
 void elevation_handoff() {
@@ -2486,12 +2760,16 @@ int main(int argc, char** argv) {
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
     if (argc >= 2 && std::string(argv[1]) == "--elevated-handoff") return elevation_child(argc, argv);
+    if (argc >= 2 && std::string(argv[1]) == "--portable-helper-pipe-client")
+        return portable_helper_pipe_child(argc, argv);
     const auto run = [](const char* name, auto test) {
         std::printf("\n%s\n", name);
         try { test(); }
         catch (const std::exception& error) { ++failures; std::printf("FAIL %s\n", error.what()); }
     };
     if (argc == 2 && std::string(argv[1]) == "--elevation") {
+        run("portable helper protocol framing and replay protection", portable_helper_protocol);
+        run("portable helper authenticated named-pipe transport", portable_helper_pipe_transport);
         run("elevation permission and cancellation", elevation_permissions);
         run("authenticated local elevation handoff", elevation_handoff);
         WSACleanup(); return failures ? 1 : 0;

@@ -1,5 +1,7 @@
 # C03 多连接标签页实施拆分
 
+2026-11-25 Release 20 轮复验：当前源码 Flutter Release loopback 完成 20/20 次“关闭选中标签→兄弟连接保持 active→重连关闭标签”，最后管理台精确断开通过。生命周期 trace 记录 20 组 `close-tab-request`、`close-tab-post`、`prune-child`，runner 共 142 条事件，未见窗口集归零、宿主销毁或消息泵退出/错误。证据 `build/native-runtime-20261125-094542-a80c0caa/run-1612339926/`。未复现 2026-11-22 进程退出故障，也未命中 Win32 投递失败分支；根因继续未定位，不据本轮压力通过关闭缺陷。
+
 2026-11-23 05:42 正常关闭路径回归：失败回滚改动后再次运行 Flutter Windows Release `-MultiWindow` loopback，50.95 秒 PASS；同一进程完成 3 次关闭/重连，兄弟连接每轮保持 active，精确断开通过。trace `build/native-runtime-20261123-054108-fd4b2f28/run-1570086336/session-tabs.tsv` 记录 3 组 `close-tab-request`/`close-tab-post`/`prune-child`。累计 49 个历史问题后的关闭周期通过；未注入失败分支，旧故障根因仍未知。
 
 2026-11-23 关闭失败回滚补充：若子窗口仍有效但 `PostMessage(WM_CLOSE)` 失败，host 现在恢复 closing 标记前的选中标签及可见状态；失效 HWND 保留给 prune 清理。模型 Release CTest 1/1、Flutter Windows runner Release 构建通过。尚无 Win32 投递失败注入验收；12:05/12:08 历史进程退出原因仍未定位，不能据此判定 C03 关闭冲突解决。详情见[审核修复记录](review-fixes-2026-11-21.md)。

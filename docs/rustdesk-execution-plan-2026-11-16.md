@@ -18,6 +18,8 @@
 
 2026-11-25 S05/S06/v33 管理闭环完成：管理员账号列表新增登录设备入口，可读取设备、登记用户客户端公钥、启停白名单和撤销设备；全局 `accounts.read`/`accounts.write` 分别控制读取和更改，启停/撤销操作说明会话影响，无设备时不能启用。安全密钥登录测试隔离已修复。Go 全量与 vet、Flutter 880/880 与 analyze、管理台 Node 53/53 和 JavaScript 语法检查通过；Windows Release 构建结果见账号安全状态文档。PostgreSQL 实库、真实 SMTP、部署浏览器及双机恢复仍待验收；告警目录、风暴控制、重复投递语义和生产留存需运维确认。代码与状态文档随本轮提交到 `codex/complete-workspace-2026-11-20`。后续顺序见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
 
+2026-11-25 C03 复验：Flutter Windows Release 单机 loopback 以生命周期 trace 完成 20/20 标签关闭/重连周期，兄弟会话每轮保持 active，末尾精确断开通过。该结果未复现 11-22 历史查看端进程退出，历史根因仍未知；本轮未触发 `PostMessage(WM_CLOSE)` 失败路径，故不标记 C03 缺陷已修复。完整证据见[当前状态入口](current-status-and-next-plan-2026-11-17.md)。H01 版本化 framing/序号、Named Pipe 双向身份核验、超时/断连处理、注入式生命周期协调器及 Win32 SCM adapter 代码和 fake 回归已完成；独立 helper service entry、受保护 staging/copy、崩溃恢复、真实 SCM、SYSTEM 桌面 worker 和真实 UAC/安全桌面验收仍待，详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
 2026-11-24 账号安全与治理功能优先级复核：远控核心可靠性和 W1/W5 外部验收优先于企业辅助能力。联网/团队部署优先完成可选择启用的登录设备白名单和无锁死的管理员恢复；邮箱邀请/验证作为多用户部署的中优先级能力；告警邮件属于运维增强，先保证管理台告警可查，再确定风暴控制、重复发送语义和生产留存。个人自托管情形允许邀请和邮件通知保持可选。详细验收步骤见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
 
 最新验收：[Windows 原生进程联动记录](native-runtime-acceptance-2026-11-17.md)。实际托盘主机、tunnel 与独立 QUIC 文件模式查看端的综合用例于 2026-11-18 当前工作区复跑通过（基础步骤 152.82 秒；启用真实管理台浏览器步骤后 161.13 秒；前一轮 151.68 秒）。浏览器步骤由隔离 Chrome 登录内嵌管理台，按 connection ID 发起断开；页面显示“已确认断开”，真实目标 QUIC 会话收到签名缺席回执并关闭，非目标会话保持 active，重试页面实际 request key 返回同一 command ID。综合场景还覆盖回执上传失败后的代理恢复、带连接主机异常退出、非空旧 runtime 指令隔离，以及受管三连接获准/第四条拒绝和策略撤回后本地二连接获准/第三条拒绝。该结果是管理台页面/API/托盘/tunnel/文件模式查看端的单机联测，不是 Flutter 视频会话中的管理台断开，也不代表双机或跨网验收。最新运行产物：`build/native-runtime-20261118-051723-6d6be834/run-1261003824/`。另有本机 DXGI→MFX HEVC→D3D11VA 桌面流探针收到 39 帧。2026-11-18 真实 Flutter Release 回环查看端完成首次主机指纹确认，会话约 266 秒，主机发送 7869 帧、查看端收到/解码 7868 帧；主机启用 `--input-dry-run`，未执行键鼠/文件操作。另有 `chast-viewer-probe.exe --keyboard` 单机原生输入验收通过，实际核对 US、German AltGr、Legacy VK、Unicode 和 Microsoft Pinyin 文本；这不是 Flutter UI 或双机验收。新增 `SessionPage` 策略集成回归覆盖五项 viewer 设置的 default 建议、续票期间固定快照、下一会话应用新建议及显式本地偏好优先；全量 Flutter 814/814、`flutter analyze` 和 Windows Release 构建通过。`chast-service` Release 目标构建及 `--help` 检查通过；SCM 服务未安装，已有 `%ProgramData%\chast\host.ini` 会被安装流程复用，故未运行实际安装/启动。上述证据仍不替代双机完整 Flutter 查看端、SCM 服务或真实网络验收。前轮 [管理台验收](strategy-connection-console-acceptance-2026-11-17.md) 保持其证据范围，W1 发布门槛未全部满足，C01/P2 不提前进入当前批次。
@@ -205,7 +207,7 @@ S02 的代码缺口已经关闭，本地 PostgreSQL 的 Store 重开、命令重
 | S03 / P1 | 自定义 Admin Role：稳定权限键、资源/对象/组作用域、角色创建与分配、权限检查和管理台 | 现有固定角色迁移保持语义；所有 API 服务端鉴权，不能只隐藏按钮；测试越权、跨组访问、角色撤销和防止最后管理员失去管理能力 |
 | S04 / P2 | Control Role：命名角色及继承/启用/禁用三态配置；明确与 Strategy、访问票据和权限上限的求值顺序 | 依赖 S01/S03；“强制启用”只影响允许覆盖的偏好，不绕过身份认证、设备硬性权限上限或必要的用户同意；冲突有解释且主机最终执行结果一致 |
 | S05 / P2 | Alarm：独立事件模型、查询、管理台、去重、留存及通知接口 | 复用审计来源但保留独立事件标识；验证重复事件、查询范围、告警风暴和脱敏；通知偏好接入 S06 |
-| S06 / P2；设备白名单按部署风险为 P1 | 用户邀请、本地邮箱验证状态、告警邮件偏好、登录设备白名单 | 邮箱验证及一次性邀请已接通；v33 白名单在未提交工作区，需修复 Flutter 安全密钥登录回归和 lint，补管理员管理台恢复界面、完整恢复/撤销验收；可信 OIDC 声明与本地邮箱验证关系、PostgreSQL/真实 SMTP/部署浏览器验收仍待。告警邮件需完成投递重复语义和风暴控制定义 |
+| S06 / P2；设备白名单按部署风险为 P1 | 用户邀请、本地邮箱验证状态、告警邮件偏好、登录设备白名单 | 邮箱验证/一次性邀请和 v33 登录白名单已接通；管理员界面支持登记/恢复/启停/撤销。Go 全量/vet、Flutter 880/880/analyze、管理台 53/53、JavaScript 语法和 Windows Release 构建通过。PostgreSQL、真实 SMTP、部署浏览器、双机设备恢复仍待；告警邮件重复投递语义、风暴控制和生产留存需运维决定 |
 
 S01/S02 先复用现有管理员鉴权，并从首次实现就定义稳定操作权限键；S03 接入后重跑作用域和撤权测试。代码实现顺序为 S01 → S02 → S03，S01 的部署验收与 S02 实现并行，避免等待完整角色系统或外部环境才交付所有能力。
 
