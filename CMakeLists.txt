@@ -896,7 +896,10 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME display_window_access COMMAND chast-display-window-access-test)
     add_test(NAME session_tab_model COMMAND chast-session-tab-model-test)
     if(WIN32)
+        # The probe uses a private desktop without switching the input desktop,
+        # so it tests focus ownership without activating a window for the user.
         add_test(NAME window_focus COMMAND chast-window-focus-test)
+        set_tests_properties(window_focus PROPERTIES SKIP_RETURN_CODE 77)
         add_test(NAME session_tab_visibility
             COMMAND chast-session-tab-visibility-test)
     endif()
