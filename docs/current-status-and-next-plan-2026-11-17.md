@@ -12,6 +12,8 @@
 
 2026-11-25 C03 WM_QUIT 诊断补强：runner 在测试 trace 开启时会于即将执行 `PostQuitMessage` 前记录 `window-post-quit`，用于把发起 WM_QUIT 的窗口与主循环退出轨迹关联。当前 Release loopback 3/3 轮关闭/重连通过，3 组 request/post/prune 均完整且没有该事件或 runner 终止事件；这不是历史故障复现，不能据此关闭 11-22 未定位问题。详见[多连接标签页记录](multi-session-tabs-design-2026-11-21.md)。
 
+2026-11-25 W1/C01 本机配置语义定向复验：Flutter `view_prefs_test`、`session_start_polling_test`、`lan_discovery_test`、`session_viewer_strategy_test`、`viewer_strategy_test` 合计 **43/43 PASS**。覆盖按设备隔离的默认仅查看偏好、会话保活租约获取/释放、LAN 发现结果合并，以及 Strategy 的 locked/default 优先级与会话快照语义。仅为单机单测/widget 证据；不代表真实局域网扫描、Windows 电源行为或双机验收。
+
 2026-11-25 21:51 只读设备盘点：当前仅有一个活动逻辑显示器 `2560×1440`；PnP 另列多个状态为 Unknown 的显示器节点。音频端点中 ToDesk 虚拟设备与显示器音频为 OK，Realtek USB 麦克风/耳机端点为 Unknown，无法据此确认独立物理设备可用。未改变显示拓扑、打开/采集麦克风或修改系统设置；混合 DPI/多屏及真实音频验收继续待设备确认。
 
 账号安全代码提交前基线为 `dc63487`；本分支依次包含 `34e5a9b`、`4d3cd2b`，C03 tooltip 修复代码提交为 `3bd1214` 并已推送至远端。`688638a` 和 `172516e` 为更早开发基线。本页下方按日期保留的历史状态仍按当时证据理解。
