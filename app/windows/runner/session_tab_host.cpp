@@ -625,6 +625,7 @@ bool SessionTabHostWindow::CreateSession(
 }
 
 void SessionTabHostWindow::PruneClosed() {
+  bool removed = false;
   for (auto it = entries_.begin(); it != entries_.end();) {
     if (it->window->GetHandle() != nullptr) {
       ++it;
@@ -635,9 +636,12 @@ void SessionTabHostWindow::PruneClosed() {
     model_.BeginClose(it->id);
     model_.Remove(it->id);
     it = entries_.erase(it);
+    removed = true;
   }
-  RebuildTabs();
-  SyncVisibility();
+  if (removed) {
+    RebuildTabs();
+    SyncVisibility();
+  }
   if (entries_.empty() && GetHandle() != nullptr && !final_close_posted_) {
     final_close_posted_ = true;
     trace_tab_lifecycle("post-empty-host-close", GetHandle(), 0, nullptr,

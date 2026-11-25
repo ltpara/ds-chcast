@@ -1,5 +1,9 @@
 # C03 多连接标签页实施拆分
 
+2026-11-25 tooltip 回归根因修复与 20 轮复验：主循环在每条消息后调用 `PruneClosed()`，原实现不论是否有窗口被 prune 都会重建全部标签并隐藏 tooltip。诊断 trace 记录 6,699 次无对应子窗口移除的重建；修复后仅在 entries 实际减少时重建/同步。先 3/3 定向 loopback，再以固定 Release 构建完成 20/20 轮关闭/重连；初始及每轮重连后的真实 tooltip 标题/移出隐藏断言通过，兄弟连接保持 active，末尾精确断开通过。20 轮 trace 有 20 组 request/post/prune、142 条 runner 事件，无消息泵 quit/error、宿主销毁或窗口集归零；验收 `build/native-runtime-20261125-214349-19e1a47e/acceptance.log`（220.99 秒），定位 trace `build/native-runtime-20261125-213212-645ec9cd/run-1492538567/session-tabs.tsv`。这不解释 11-22 历史进程退出根因。
+
+2026-11-25 失败回滚回归复验：Release loopback 注入真实无效 HWND，确认 `PostMessageW` 返回错误 1400 后两标签、原选中项、唯一可见子窗口及查看端进程均保留；随后 3/3 正常关闭/重连周期通过，每轮 tooltip 正常显示/隐藏且兄弟连接 active，最后精确断开通过。证据 `build/native-runtime-20261125-214844-e6397beb/acceptance.log`（50.87 秒）。未模拟消息队列满载；历史进程退出仍未复现。
+
 2026-11-25 20:55 融合后 C03 Release loopback：完整运行未通过。初始两标签及首次关闭/重连后的长标题 tooltip 文本/隐藏断言通过；第二轮重连后，标签 `#4` 的 tooltip 断言得到空文本（鼠标仍在 tab-control 上），用例退出 1。日志/产物：`build/native-runtime-20261125-205510-fa1339bf/run-2331120209/`。本轮包含此前新增的同步重绘代码，说明 tooltip 在重连路径仍有未解决问题；需定位 popup 生命周期/显示时序，不能放宽断言。历史标签关闭进程退出根因仍独立未定位。
 
 2026-11-25 Release 20 轮复验：当前源码 Flutter Release loopback 完成 20/20 次“关闭选中标签→兄弟连接保持 active→重连关闭标签”，最后管理台精确断开通过。生命周期 trace 记录 20 组 `close-tab-request`、`close-tab-post`、`prune-child`，runner 共 142 条事件，未见窗口集归零、宿主销毁或消息泵退出/错误。证据 `build/native-runtime-20261125-094542-a80c0caa/run-1612339926/`。未复现 2026-11-22 进程退出故障，也未命中 Win32 投递失败分支；根因继续未定位，不据本轮压力通过关闭缺陷。
