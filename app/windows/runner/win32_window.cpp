@@ -220,6 +220,8 @@ Win32Window::MessageHandler(HWND hwnd,
       window_handle_ = nullptr;
       Destroy();
       if (quit_on_close_) {
+        TraceRunnerLifecycle("window-post-quit", hwnd, WM_QUIT,
+                             static_cast<intptr_t>(wparam));
         PostQuitMessage(0);
       }
       return 0;

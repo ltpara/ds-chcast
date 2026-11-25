@@ -1,5 +1,7 @@
 # C03 多连接标签页实施拆分
 
+2026-11-25 C03 WM_QUIT 来源诊断补强：`Win32Window` 现在仅在 `quit_on_close_` 为真、即即将调用 `PostQuitMessage` 时记录 `window-post-quit` 测试生命周期事件；不改变关闭行为，且 trace 仅在测试环境显式开启时写入。Windows Release Flutter loopback 3/3 轮关闭/重连通过，trace 记录 3 组 request/post/prune，未见 `window-post-quit`、消息循环退出/错误、宿主销毁或窗口集归零。验收 `build/native-runtime-20261125-221402-ddc2565a/acceptance.log`（50.99 秒），trace `build/native-runtime-20261125-221402-ddc2565a/run-740675708/session-tabs.tsv`。这只让未来经 `PostQuitMessage` 的退出来源更明确，不解释 11-22 历史进程退出，根因仍未定位。
+
 2026-11-25 tooltip 回归根因修复与 20 轮复验：主循环在每条消息后调用 `PruneClosed()`，原实现不论是否有窗口被 prune 都会重建全部标签并隐藏 tooltip。诊断 trace 记录 6,699 次无对应子窗口移除的重建；修复后仅在 entries 实际减少时重建/同步。先 3/3 定向 loopback，再以固定 Release 构建完成 20/20 轮关闭/重连；初始及每轮重连后的真实 tooltip 标题/移出隐藏断言通过，兄弟连接保持 active，末尾精确断开通过。20 轮 trace 有 20 组 request/post/prune、142 条 runner 事件，无消息泵 quit/error、宿主销毁或窗口集归零；验收 `build/native-runtime-20261125-214349-19e1a47e/acceptance.log`（220.99 秒），定位 trace `build/native-runtime-20261125-213212-645ec9cd/run-1492538567/session-tabs.tsv`。这不解释 11-22 历史进程退出根因。
 
 2026-11-25 失败回滚回归复验：Release loopback 注入真实无效 HWND，确认 `PostMessageW` 返回错误 1400 后两标签、原选中项、唯一可见子窗口及查看端进程均保留；随后 3/3 正常关闭/重连周期通过，每轮 tooltip 正常显示/隐藏且兄弟连接 active，最后精确断开通过。证据 `build/native-runtime-20261125-214844-e6397beb/acceptance.log`（50.87 秒）。未模拟消息队列满载；历史进程退出仍未复现。
