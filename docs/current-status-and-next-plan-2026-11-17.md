@@ -4,6 +4,8 @@
 
 分支：`codex/complete-workspace-2026-11-20`
 
+2026-11-25 本机自动化门禁复跑：Flutter `test --no-pub` **881/881 PASS**、`analyze --no-pub` 无问题；`server` 全量 `go test ./...` 与 `go vet ./...` PASS；管理台 Node `app_session_test.cjs` **53/53 PASS**，浏览器断开脚本 `node --check` PASS；Windows Release 定向 CTest **10/10 PASS**（host settings/strategy、Firewall 规则与 fake transaction、SCM install/uninstall fake transaction/stop、host parity、锁屏策略与 tunnel 参数）。`host_parity` 本地回环运行 124.84 秒。测试没有安装/卸载真实服务、写防火墙或 ProgramData，也不是全量 105 项 CTest/Windows Release 构建/浏览器实机/双机验收；生产 PostgreSQL/SMTP、外部设备和复杂网络门禁继续待验收。
+
 2026-11-25 C03 tooltip 回归根因修复：主消息循环每次 dispatch 后都会调用 `PruneClosed()`，而该函数即使没有已关闭子窗口也无条件重建标签并隐藏 tooltip。诊断 trace 在没有 `prune-child` 的情况下记录到 6,699 次无效标签重建，且 tooltip show 后立即 hide；证据 `build/native-runtime-20261125-213212-645ec9cd/run-1492538567/session-tabs.tsv`。现仅在实际移除子窗口时重建标签并同步可见性。先完成 3/3 轮定向 loopback，随后固定 Windows Release 构建再做 20/20 轮关闭/重连；初次及每轮重连的长标题 tooltip 文本和移出隐藏断言通过，兄弟连接全程 active，末尾精确断开通过。20 轮轨迹记录 20 个 request/post/prune 和 142 条 runner 事件，未见消息泵 quit/error、宿主销毁或窗口集归零；验收 `build/native-runtime-20261125-214349-19e1a47e/acceptance.log`，耗时 220.99 秒。该修复解释并消除本次 tooltip 空文本回归；11-22 历史进程退出根因仍未定位，不能据此宣布关闭生命周期整体收口。
 
 2026-11-25 C03 失败回滚回归复验：在同一 Release 多标签 loopback 中，将一次真实 `PostMessageW` 目标替换为无效 HWND，观察到 `ERROR_INVALID_WINDOW_HANDLE (1400)` 后恢复标签数/选中项/可见窗口且进程仍存活；其后 3/3 轮关闭/重连的 tooltip、兄弟连接及末尾精确断开均通过。证据 `build/native-runtime-20261125-214844-e6397beb/acceptance.log`，50.87 秒。该注入只覆盖无效 HWND，不模拟消息队列满载，也没有复现 11-22 的进程退出。
