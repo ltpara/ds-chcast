@@ -1077,8 +1077,8 @@ if(CHAST_BUILD_TESTS)
     # dropped folder must land byte-for-byte under the browsed folder with the
     # host creating the nested directories. The remote console must open at
     # 80x24, echo a typed marker, accept a resize to 100x30 and close cleanly.
-    # Downloads land in the user's Downloads\chast under unique names and are
-    # removed again.
+    # Downloads land in a per-run scratch directory under test-temp, never in
+    # the user's Downloads folder, and the probe removes them again.
     add_test(NAME viewer_folder_download COMMAND chast-viewer-probe)
     set_tests_properties(viewer_folder_download PROPERTIES TIMEOUT 180)
     # Two independent viewer engines share one loopback host; their local
