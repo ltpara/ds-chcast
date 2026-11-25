@@ -1,7 +1,7 @@
 # Opt-in, loopback-only Windows tray/tunnel acceptance. Requires an existing
 # CMake build tree and Go. Does not install a service or alter host profiles.
 [CmdletBinding()]
-param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter, [switch]$MultiWindow, [switch]$MultiWindowInput, [switch]$MultiWindowAudio, [switch]$MultiWindowDisplay, [switch]$FileTransfer, [switch]$ViewerStrategy, [switch]$InputInjection, [switch]$KeyboardShortcuts)
+param([string]$BuildDirectory = 'build', [switch]$Browser, [switch]$Flutter, [switch]$DualFlutter, [switch]$MultiWindow, [switch]$MultiWindowInput, [switch]$MultiWindowAudio, [switch]$MultiWindowDisplay, [switch]$MultiWindowCloseFailure, [switch]$FileTransfer, [switch]$ViewerStrategy, [switch]$InputInjection, [switch]$KeyboardShortcuts)
 
 $ErrorActionPreference = 'Stop'
 if ($Flutter -and -not $Browser -and -not $MultiWindow -and -not $MultiWindowAudio -and -not $MultiWindowDisplay -and -not $FileTransfer -and -not $ViewerStrategy -and -not $InputInjection -and -not $KeyboardShortcuts) {
@@ -12,6 +12,9 @@ if ($DualFlutter -and -not ($Flutter -and $Browser)) {
 }
 if ($MultiWindow -and -not $Flutter) {
     throw '-MultiWindow requires -Flutter.'
+}
+if ($MultiWindowCloseFailure -and -not ($Flutter -and $MultiWindow)) {
+    throw '-MultiWindowCloseFailure requires both -Flutter and -MultiWindow.'
 }
 if ($MultiWindowInput -and -not $MultiWindow) {
     throw '-MultiWindowInput requires -MultiWindow.'
@@ -73,6 +76,8 @@ $oldMultiWindow = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_MULTIWINDO
 $oldMultiWindowInput = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW_INPUT', 'Process')
 $oldMultiWindowAudio = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW_AUDIO', 'Process')
 $oldMultiWindowDisplay = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW_DISPLAY', 'Process')
+$oldClosePostFailure = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_TEST_FAIL_TAB_CLOSE_POST_ONCE', 'Process')
+$oldLifecycleTrace = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_TEST_LIFECYCLE_TRACE', 'Process')
 $oldFileTransfer = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_FILE_TRANSFER', 'Process')
 $oldViewerStrategy = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_VIEWER_STRATEGY', 'Process')
 $oldInputInjection = [Environment]::GetEnvironmentVariable('CHAST_NATIVE_INPUT_INJECTION', 'Process')
@@ -112,6 +117,16 @@ try {
             $env:CHAST_NATIVE_MULTIWINDOW = '1'
         } else {
             Remove-Item Env:CHAST_NATIVE_MULTIWINDOW -ErrorAction SilentlyContinue
+        }
+        if ($MultiWindowCloseFailure) {
+            $env:CHAST_NATIVE_TEST_FAIL_TAB_CLOSE_POST_ONCE = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_TEST_FAIL_TAB_CLOSE_POST_ONCE -ErrorAction SilentlyContinue
+        }
+        if ($MultiWindow -or $MultiWindowInput -or $MultiWindowAudio -or $MultiWindowDisplay) {
+            $env:CHAST_NATIVE_TEST_LIFECYCLE_TRACE = '1'
+        } else {
+            Remove-Item Env:CHAST_NATIVE_TEST_LIFECYCLE_TRACE -ErrorAction SilentlyContinue
         }
         if ($MultiWindowInput) {
             $env:CHAST_NATIVE_MULTIWINDOW_INPUT = '1'
@@ -188,6 +203,8 @@ try {
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW_INPUT', $oldMultiWindowInput, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW_AUDIO', $oldMultiWindowAudio, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_MULTIWINDOW_DISPLAY', $oldMultiWindowDisplay, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_TEST_FAIL_TAB_CLOSE_POST_ONCE', $oldClosePostFailure, 'Process')
+    [Environment]::SetEnvironmentVariable('CHAST_NATIVE_TEST_LIFECYCLE_TRACE', $oldLifecycleTrace, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_FILE_TRANSFER', $oldFileTransfer, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_VIEWER_STRATEGY', $oldViewerStrategy, 'Process')
     [Environment]::SetEnvironmentVariable('CHAST_NATIVE_INPUT_INJECTION', $oldInputInjection, 'Process')

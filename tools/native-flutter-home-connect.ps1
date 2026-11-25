@@ -5,7 +5,8 @@ param(
     [int]$ExpectedSessionCount = 1,
     [switch]$UseExistingCredentials,
     [switch]$AllowEmptyToken,
-    [switch]$CloseSelectedTab
+    [switch]$CloseSelectedTab,
+    [switch]$ExpectCloseFailure
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +27,8 @@ using System.Text;
 public static class FlutterHomeInput {
     [StructLayout(LayoutKind.Sequential)]
     public struct Rect { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Point { public int X, Y; }
     public struct SessionTabState {
         public IntPtr Host;
         public IntPtr Tabs;
@@ -33,6 +36,16 @@ public static class FlutterHomeInput {
         public int Selected;
         public int SessionWindows;
         public int VisibleSessionWindows;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TabItem {
+        public uint Mask;
+        public uint State;
+        public uint StateMask;
+        public IntPtr Text;
+        public int TextCapacity;
+        public int Image;
+        public IntPtr Param;
     }
     private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
     private delegate bool EnumChildWindowsCallback(IntPtr window, IntPtr parameter);
@@ -42,11 +55,25 @@ public static class FlutterHomeInput {
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")]
+    public static extern bool ClientToScreen(IntPtr window, ref Point point);
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")]
     public static extern IntPtr SendMessageW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll", EntryPoint = "GetDlgItem")]
     public static extern IntPtr GetDlgItem(IntPtr window, int controlId);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteProcessMemory(IntPtr process, IntPtr address,
+        byte[] buffer, UIntPtr size, out UIntPtr bytesWritten);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(IntPtr process, IntPtr address,
+        byte[] buffer, UIntPtr size, out UIntPtr bytesRead);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr VirtualAllocEx(IntPtr process, IntPtr address,
         UIntPtr size, uint allocationType, uint protect);
@@ -139,6 +166,114 @@ public static class FlutterHomeInput {
             CloseHandle(process);
         }
     }
+    public static string[] GetTabLabels(IntPtr tabs) {
+        int count = (int)SendMessageW(tabs, 0x1304, IntPtr.Zero, IntPtr.Zero).ToInt64();
+        if (count <= 0) return new string[0];
+        uint processId;
+        GetWindowThreadProcessId(tabs, out processId);
+        // The tab control is in another process: allocate the TCITEMW descriptor
+        // and its text buffer there, then read back only the public tab captions.
+        var process = OpenProcess(0x0038, false, processId);
+        if (process == IntPtr.Zero) return new string[0];
+        int itemSize = Marshal.SizeOf(typeof(TabItem));
+        const int textCapacity = 1200;
+        int textBytes = textCapacity * 2;
+        var remoteItem = VirtualAllocEx(process, IntPtr.Zero,
+            new UIntPtr((uint)itemSize), 0x3000, 0x04);
+        var remoteText = VirtualAllocEx(process, IntPtr.Zero,
+            new UIntPtr((uint)textBytes), 0x3000, 0x04);
+        if (remoteItem == IntPtr.Zero || remoteText == IntPtr.Zero) {
+            if (remoteItem != IntPtr.Zero) VirtualFreeEx(process, remoteItem, UIntPtr.Zero, 0x8000);
+            if (remoteText != IntPtr.Zero) VirtualFreeEx(process, remoteText, UIntPtr.Zero, 0x8000);
+            CloseHandle(process);
+            return new string[0];
+        }
+        var labels = new List<string>();
+        IntPtr localItem = Marshal.AllocHGlobal(itemSize);
+        try {
+            for (int index = 0; index < count; ++index) {
+                var item = new TabItem {
+                    Mask = 0x0001, // TCIF_TEXT
+                    Text = remoteText,
+                    TextCapacity = textCapacity
+                };
+                Marshal.StructureToPtr(item, localItem, false);
+                var descriptor = new byte[itemSize];
+                Marshal.Copy(localItem, descriptor, 0, itemSize);
+                UIntPtr written;
+                if (!WriteProcessMemory(process, remoteItem, descriptor,
+                    new UIntPtr((uint)itemSize), out written) ||
+                    written.ToUInt64() != (ulong)itemSize)
+                    return new string[0];
+                if (SendMessageW(tabs, 0x133C, new IntPtr(index), remoteItem) == IntPtr.Zero)
+                    return new string[0];
+                var text = new byte[textBytes];
+                UIntPtr read;
+                if (!ReadProcessMemory(process, remoteText, text,
+                    new UIntPtr((uint)textBytes), out read) || read.ToUInt64() < 2)
+                    return new string[0];
+                labels.Add(Encoding.Unicode.GetString(text).TrimEnd('\0'));
+            }
+            return labels.ToArray();
+        } finally {
+            Marshal.FreeHGlobal(localItem);
+            VirtualFreeEx(process, remoteText, UIntPtr.Zero, 0x8000);
+            VirtualFreeEx(process, remoteItem, UIntPtr.Zero, 0x8000);
+            CloseHandle(process);
+        }
+    }
+    public static string FindVisibleWindowText(int ownerProcessId, string expected,
+        string expectedClassName) {
+        string found = "";
+        EnumWindows((window, _) => {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (processId != (uint)ownerProcessId || !IsWindowVisible(window)) return true;
+            var className = new StringBuilder(128);
+            GetClassName(window, className, className.Capacity);
+            if (!String.Equals(className.ToString(), expectedClassName,
+                StringComparison.Ordinal)) return true;
+            var text = new StringBuilder(2048);
+            GetWindowText(window, text, text.Capacity);
+            if (String.Equals(text.ToString(), expected, StringComparison.Ordinal)) {
+                found = text.ToString();
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+    public static IntPtr FindVisibleWindowHandle(int ownerProcessId, string expected,
+        string expectedClassName) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((window, _) => {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (processId != (uint)ownerProcessId || !IsWindowVisible(window)) return true;
+            var className = new StringBuilder(128);
+            GetClassName(window, className, className.Capacity);
+            if (!String.Equals(className.ToString(), expectedClassName,
+                StringComparison.Ordinal)) return true;
+            var text = new StringBuilder(2048);
+            GetWindowText(window, text, text.Capacity);
+            if (String.Equals(text.ToString(), expected, StringComparison.Ordinal)) {
+                found = window;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+    public static bool ClickTabClose(IntPtr tabs, int index) {
+        Rect rect;
+        if (!GetTabItemRect(tabs, index, out rect)) return false;
+        int x = rect.Right - 15;
+        int y = (rect.Top + rect.Bottom) / 2;
+        long point = ((long)(ushort)y << 16) | (ushort)x;
+        SendMessageW(tabs, 0x0201, new IntPtr(1), new IntPtr(point));
+        SendMessageW(tabs, 0x0202, IntPtr.Zero, new IntPtr(point));
+        return true;
+    }
     public static SessionTabState FindSessionTabs(int ownerProcessId) {
         var state = new SessionTabState {
             Host = IntPtr.Zero,
@@ -204,6 +339,25 @@ function Capture-Window([IntPtr]$Window, [string]$Path) {
         $graphics.ReleaseHdc($dc)
     }
     try {
+        $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
+function Capture-ScreenRegion([IntPtr]$Window, [string]$Path) {
+    $rect = New-Object FlutterHomeInput+Rect
+    if (-not [FlutterHomeInput]::GetWindowRect($Window, [ref]$rect)) {
+        throw 'Could not read the tab host bounds for tooltip capture.'
+    }
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    $bitmap = New-Object Drawing.Bitmap($width, $height)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0,
+            [Drawing.Size]::new($width, $height))
         $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
     } finally {
         $graphics.Dispose()
@@ -299,13 +453,58 @@ if ($CloseSelectedTab) {
     if ($before.Host -eq $homeWindow) {
         throw "The session tab host unexpectedly matches the home window ($homeWindow)."
     }
-    $closeButton = [FlutterHomeInput]::GetDlgItem($before.Host, 4103)
-    if ($closeButton -eq [IntPtr]::Zero) {
-        throw "Could not resolve close button 4103 under tab host $($before.Host)."
+    $beforeLabels = @([FlutterHomeInput]::GetTabLabels($before.Tabs))
+    $closedCaption = $beforeLabels[$before.Selected]
+    if (-not [FlutterHomeInput]::ClickTabClose($before.Tabs, $before.Selected)) {
+        throw "Could not click the selected tab's close glyph at index $($before.Selected)."
     }
     Capture-Window $before.Host (Join-Path $ArtifactDirectory 'flutter-session-tabs-before-close.png')
-    Write-Output "Clicking native close button: host=$($before.Host) control=$closeButton home=$homeWindow selected=$($before.Selected)."
-    [void][FlutterHomeInput]::SendMessageW($closeButton, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    Write-Output "Clicking selected tab close glyph: host=$($before.Host) tabs=$($before.Tabs) home=$homeWindow selected=$($before.Selected)."
+    if ($ExpectCloseFailure) {
+        $tracePath = Join-Path $ArtifactDirectory 'session-tabs.tsv'
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        $trace = ''
+        $win32FailureObserved = $false
+        do {
+            Start-Sleep -Milliseconds 50
+            $state = Get-SessionTabState
+            if (Test-Path -LiteralPath $tracePath) {
+                $trace = Get-Content -LiteralPath $tracePath -Raw
+            }
+            $win32FailureObserved = [regex]::IsMatch($trace,
+                '(?m)^runner\tclose-tab-post-failed\t[^\t]*\t[^\t]*\t[^\t]*\t16\t1400\t')
+        } while ((-not [regex]::IsMatch($trace, '(?m)^close-tab-test-inject-invalid-hwnd\t') -or
+            -not [regex]::IsMatch($trace, '(?m)^close-tab-post-failed\t') -or
+            -not [regex]::IsMatch($trace, '(?m)^close-tab-post-rollback\t') -or
+            -not $win32FailureObserved) -and
+            [DateTime]::UtcNow -lt $deadline)
+
+        $processAlive = $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+        if (-not [regex]::IsMatch($trace, '(?m)^close-tab-test-inject-invalid-hwnd\t') -or
+            -not [regex]::IsMatch($trace, '(?m)^close-tab-post-failed\t') -or
+            -not [regex]::IsMatch($trace, '(?m)^close-tab-post-rollback\t') -or
+            -not $win32FailureObserved -or
+            $state.Count -ne $ExpectedSessionCount -or
+            $state.SessionWindows -ne $ExpectedSessionCount -or
+            $state.VisibleSessionWindows -ne 1 -or
+            $state.Selected -ne $before.Selected -or -not $processAlive) {
+            throw "Injected PostMessageW failure did not restore the selected live tab: before=$($before | ConvertTo-Json -Compress) after=$($state | ConvertTo-Json -Compress) process_alive=$processAlive; trace=$tracePath`n$trace"
+        }
+        Capture-Window $state.Host (Join-Path $ArtifactDirectory 'flutter-session-tabs-after-close-failure.png')
+        $evidence = [ordered]@{
+            scope = 'Windows Flutter loopback; real PostMessageW call against invalid HWND; live child remains valid'
+            before = $before
+            after = $state
+            process_alive = $processAlive
+            injection_observed = $true
+            post_failure_observed = $true
+            win32_error_code = 1400
+            rollback_observed = $true
+        }
+        $evidence | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'flutter-session-tabs-close-failure.json') -Encoding UTF8
+        Write-Output "PASS: real Win32 PostMessageW failure returned ERROR_INVALID_WINDOW_HANDLE (1400) and rolled back; $($state.Count) tabs remain, selected=$($state.Selected), visible=$($state.VisibleSessionWindows), process_alive=$processAlive."
+        return
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
         Start-Sleep -Milliseconds 50
@@ -320,6 +519,11 @@ if ($CloseSelectedTab) {
         $inventoryPath = Join-Path $ArtifactDirectory 'flutter-window-inventory-after-close-failure.txt'
         Set-Content -LiteralPath $inventoryPath -Value $inventory -Encoding UTF8
         throw "Closing the selected tab did not leave one active session: count=$($state.Count), windows=$($state.SessionWindows), visible=$($state.VisibleSessionWindows), process_alive=$processAlive; window inventory: $inventoryPath`n$inventory"
+    }
+    Start-Sleep -Milliseconds 150
+    if ([FlutterHomeInput]::FindVisibleWindowText(
+        $ProcessId, $closedCaption, 'ChastSessionTabTooltip') -eq $closedCaption) {
+        throw "Closing tab '$closedCaption' left its stale tooltip visible."
     }
     Capture-Window $state.Host (Join-Path $ArtifactDirectory 'flutter-session-tabs-after-close.png')
     $newButton = [FlutterHomeInput]::GetDlgItem($state.Host, 4102)
@@ -399,6 +603,75 @@ if ($ExpectedSessionCount -gt 1) {
         $state.Selected -lt 0 -or $state.Selected -ge $ExpectedSessionCount) {
         throw "Expected $ExpectedSessionCount hosted session windows and exactly one visible; found $($state.SessionWindows) windows, $($state.VisibleSessionWindows) visible, selected=$($state.Selected)."
     }
+    $tabLabels = @([FlutterHomeInput]::GetTabLabels($state.Tabs))
+    if ($tabLabels.Count -ne $ExpectedSessionCount -or
+        @($tabLabels | Select-Object -Unique).Count -ne $ExpectedSessionCount) {
+        throw "Expected distinct accessible captions for all $ExpectedSessionCount session tabs; found: $($tabLabels -join ' | ')."
+    }
+    Write-Output "Verified distinct accessible session tab captions: $($tabLabels -join ' | ')."
+    $savedCursor = New-Object FlutterHomeInput+Point
+    if (-not [FlutterHomeInput]::GetCursorPos([ref]$savedCursor)) {
+        throw 'Could not save the cursor position before the tooltip check.'
+    }
+    $hoverIndex = $state.Selected
+    $hoverRect = New-Object FlutterHomeInput+Rect
+    if (-not [FlutterHomeInput]::GetTabItemRect($state.Tabs, $hoverIndex, [ref]$hoverRect)) {
+        throw "Could not resolve tab $hoverIndex for the tooltip check."
+    }
+    $hoverPoint = New-Object FlutterHomeInput+Point
+    $hoverPoint.X = [int](($hoverRect.Left + $hoverRect.Right) / 2)
+    $hoverPoint.Y = [int](($hoverRect.Top + $hoverRect.Bottom) / 2)
+    $hoverClientPoint = New-Object FlutterHomeInput+Point
+    $hoverClientPoint.X = $hoverPoint.X
+    $hoverClientPoint.Y = $hoverPoint.Y
+    if (-not [FlutterHomeInput]::ClientToScreen($state.Tabs, [ref]$hoverPoint)) {
+        throw 'Could not translate the tab caption to screen coordinates.'
+    }
+    if (-not [FlutterHomeInput]::SetCursorPos($hoverPoint.X, $hoverPoint.Y)) {
+        throw 'Could not move the cursor over the tab caption for its tooltip check.'
+    }
+    $packedPoint = [IntPtr]([int64]$hoverClientPoint.X -bor
+        ([int64]$hoverClientPoint.Y -shl 16))
+    [void][FlutterHomeInput]::SendMessageW(
+        $state.Tabs, 0x0200, [IntPtr]::Zero, $packedPoint)
+    try {
+        $tooltipText = ''
+        $tooltipWindow = [IntPtr]::Zero
+        $tooltipDeadline = [DateTime]::UtcNow.AddSeconds(3)
+        do {
+            Start-Sleep -Milliseconds 100
+            $tooltipWindow = [FlutterHomeInput]::FindVisibleWindowHandle(
+                $ProcessId, $tabLabels[$hoverIndex], 'ChastSessionTabTooltip')
+            $tooltipText = [FlutterHomeInput]::FindVisibleWindowText(
+                $ProcessId, $tabLabels[$hoverIndex], 'ChastSessionTabTooltip')
+        } while (($tooltipWindow -eq [IntPtr]::Zero -or
+            [string]::IsNullOrEmpty($tooltipText)) -and
+            [DateTime]::UtcNow -lt $tooltipDeadline)
+        if ($tooltipText -ne $tabLabels[$hoverIndex]) {
+            Capture-Window $state.Host (Join-Path $ArtifactDirectory 'flutter-session-tabs-tooltip-probe.png')
+        } else {
+            # Give the compositor time to present the popup before capturing
+            # both the popup bounds and host region; PrintWindow does not
+            # include owned overlays.
+            Start-Sleep -Milliseconds 500
+            Capture-ScreenRegion $tooltipWindow (Join-Path $ArtifactDirectory 'flutter-session-tabs-tooltip-popup.png')
+            Capture-ScreenRegion $state.Host (Join-Path $ArtifactDirectory 'flutter-session-tabs-tooltip-visible.png')
+        }
+    } finally {
+        [void][FlutterHomeInput]::SetCursorPos($savedCursor.X, $savedCursor.Y)
+    }
+    if ($tooltipText -ne $tabLabels[$hoverIndex]) {
+        $windowUnderCursor = [FlutterHomeInput]::WindowFromPoint($hoverPoint)
+        throw "Expected the hovered tab tooltip '$($tabLabels[$hoverIndex])'; got '$tooltipText'; probe=($($hoverPoint.X),$($hoverPoint.Y)) windowUnderCursor=$windowUnderCursor."
+    }
+    Write-Output "Verified hovered tab tooltip text: $tooltipText."
+    Start-Sleep -Milliseconds 250
+    $hiddenTooltipText = [FlutterHomeInput]::FindVisibleWindowText(
+        $ProcessId, $tabLabels[$hoverIndex], 'ChastSessionTabTooltip')
+    if ($hiddenTooltipText -eq $tabLabels[$hoverIndex]) {
+        throw 'The tab tooltip remained visible after moving the pointer away.'
+    }
+    Write-Output 'Verified tab tooltip hides after pointer leaves the tab.'
     $hostWindow = $state.Host
     $firstIndex = $state.Selected
     $otherIndex = ($firstIndex + 1) % $ExpectedSessionCount

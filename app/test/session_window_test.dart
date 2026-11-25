@@ -111,7 +111,42 @@ void main() {
     expect(calls.single.arguments, <String, Object?>{
       'request': request().encode(),
       'label': 'Desk',
+      'deviceHint': 'host-1',
     });
+  });
+
+  test('tab hints contain only a valid server device ID tail', () {
+    String hint(ConnectTarget target) =>
+        SessionWindowRequest(target: target).tabDeviceHint;
+
+    expect(
+      hint(const ConnectTarget(
+        '',
+        0,
+        hostId: 'office-desktop-Ab1234',
+        server: 'https://server.example',
+        token: 'excluded',
+        linkKey: 'also-excluded',
+      )),
+      'Ab1234',
+    );
+    expect(
+      hint(const ConnectTarget(
+        '127.0.0.1',
+        4433,
+        hostId: 'not-a-server-id',
+      )),
+      isEmpty,
+    );
+    expect(
+      hint(const ConnectTarget(
+        '',
+        0,
+        hostId: 'https://invalid.example',
+        server: 'https://server.example',
+      )),
+      isEmpty,
+    );
   });
 
   test('open falls back when no runner answers', () async {

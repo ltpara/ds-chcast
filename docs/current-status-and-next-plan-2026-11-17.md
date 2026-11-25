@@ -4,11 +4,17 @@
 
 分支：`codex/complete-workspace-2026-11-20`
 
-本轮账号安全切片前已提交基线：`dc63487`；`688638a` 和 `172516e` 为较早开发基线。本页下方按日期保留的“未提交”描述属于当时状态；2026-11-23 快照的归档信息见下文。
+账号安全代码提交前基线为 `dc63487`；本分支现已快进同步至 `34e5a9b`（包含 `4d3cd2b`），`688638a` 和 `172516e` 为更早开发基线。本页下方按日期保留的历史状态仍按当时证据理解。
 
 本文作为当前状态入口；2026-11-21/22 审核后的源码修复、验证结果及剩余问题见 [分支审核问题修复](review-fixes-2026-11-21.md)，阶段明细见 [W1 状态与后续计划](w1-status-and-next-plan-2026-11-19.md)。下文按日期保留较早证据，不把历史音频样本或 widget 回归等同于当前原生桥及播放验收。
 
 2026-11-25 C03 关闭/重连复验：当前 Windows Release 构建通过单机 Flutter loopback **20/20** 个选中标签关闭/重连周期；每轮兄弟连接保持 active，末尾管理台精确断开也通过。轨迹 `build/native-runtime-20261125-094542-a80c0caa/run-1612339926/session-tabs.tsv` 记录 20 个 `close-tab-request`、20 个 `close-tab-post`、20 个 `prune-child` 和 142 条 runner 生命周期事件；无 `runner-window-set-empty`、`runner-empty-tabs`、宿主销毁或消息泵退出/错误事件。此次没有复现 11-22 历史进程退出；测试未进入 `PostMessage(WM_CLOSE)` 失败分支，因此 C03 根因仍未定位，不将 20 轮通过作为缺陷已修复的依据。既有 49 轮后续通过记录之外，本轮另增加 20 轮通过。验收日志同目录 `acceptance.log`，总耗时 221.13 秒；构建日志 `build.log`、`flutter-build.log`。
+
+2026-11-25 20:55 融合后 C03 tooltip 回归未通过：Release loopback 初始长标题及第一轮重连通过，第二轮重连后 `#4` 标签提示返回空文本，窗口下仍为 tab-control；用例退出 1。证据 `build/native-runtime-20261125-205510-fa1339bf/run-2331120209/`。本轮包含同步重绘改动；提示窗口在重连路径的生命周期/显示时序仍待定位，未降低断言。该问题与 11-22 历史查看端进程退出根因分别跟踪。
+
+2026-11-24 C03 标签体验与回归：长标签悬停提示的自动化文本/显隐断言通过；同名标签按经校验的 Host ID 短尾号或稳定会话序号消歧，跨进程 caption 唯一断言通过。对应 Flutter Release loopback 分别通过；Flutter 全量 871/871、analyze 无问题。专项截图捕获不可靠（画面显示底部工具栏而非提示文本）；随后增加的同步重绘改动尚未回归，因此 tooltip 视觉证据仍待补。详见[多会话标签设计](multi-session-tabs-design-2026-11-21.md)。这些单机证据不替代双机、屏幕阅读器或物理显示验收。
+
+2026-11-24 验收环境：仅枚举到一台 `IDV10bit2K144` 显示设备（是否物理显示器未确认），未枚举到独立物理麦克风；物理多屏/热插拔和真实麦克风/AEC 场景仍待实机验收，未改变显示拓扑或打开麦克风。
 
 2026-11-25 H01 IPC 与生命周期首片：源码复核确认已有本机 UAC 一次性主机接管和固定名 SYSTEM SCM 服务；缺口是与正式服务隔离、会话期间复用的受控特权桌面辅助服务。新增独立版本化本地 IPC framing：固定 header、随机 128-bit helper instance ID、单向连续序号、request ID、1 MiB 负载上限；错误版本/类型/flags、畸形长度、尾随数据、超限负载、重放、跳号和跨实例均拒绝。Named Pipe 使用 SYSTEM/管理员 ACL 和调用方从已授权交互用户 token 显式传入的 logon SID，并拒绝远程客户端；管道双方核对预期 PID、映像、用户 SID、logon SID、Windows session 和进程创建时间。Release `chast-host-parity-test --elevation` 重建后通过同用户隔离子进程双向帧收发、logon SID 不匹配拒绝、accept/receive 超时清理、断连封闭、非法授权 SID 拒绝及本地拒绝帧不消耗序号回归，旧 UAC 接管/撤权取消/身份回滚/DPAPI-TOTP 连续性也通过。生命周期协调器及 Win32 SCM adapter 代码已加入；服务名和 ProgramData 暂存映像路径按 instance ID 限定，校验 SCM 服务类型/启动方式/账户/映像/控制 DACL，并向服务传递父进程身份。fake 后端回归覆盖正常启停、冲突隔离及失败回滚，但**未调用 Win32 adapter 或真实 SCM**。专用 helper service entry、staging/copy 工具和父进程崩溃恢复仍待实现；`Running` 仅指 SCM 状态，不代表 IPC worker 已认证就绪。帧序号和消息类型不是桌面操作授权；generation capability 和消息级允许操作表均未实现。真实 SCM worker、SYSTEM 桌面能力及 UAC/安全桌面仍待接线与验收。本轮未写入 SCM/ProgramData/防火墙，也未触发真实 UAC。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
 
@@ -24,7 +30,7 @@
 
 2026-11-25 S05/S06/v33 代码检查点：当前分支已接入 schema v29–v33 的安全告警、邮箱验证、邀请和登录设备白名单。S05 有独立事件、去重/留存、分页筛选/CSV、权限范围管理台查询及带数据库租约和退避重试的邮件队列；S06 有邮箱验证和一次性邀请流程；v33 的用户签名设备证明已接入密码、LDAP、OIDC、WebAuthn，Windows 安装密钥由 DPAPI 保护。管理台账号列表补上管理员设备恢复 UI，支持查看、登记公钥、启停白名单和撤销设备；读取要求全局 `accounts.read`，更改要求 `accounts.write`，启停和撤销会话影响有明确确认，无受信设备时不能启用。
 
-2026-11-25 全量门禁：`go test ./... -count=1 -timeout 10m`、`go vet ./...`、Flutter `flutter test --no-pub` 880/880、`flutter analyze --no-pub`、管理台 Node 53/53、JavaScript 语法检查及 `cmake --build build --config Release --parallel 4` 均通过。安全密钥回归测试使用无设备证明 provider 隔离既有 WebAuthn 流程，设备证明接口有独立覆盖。`CHAST_TEST_POSTGRES_DSN` 未设置；PostgreSQL 实库、真实 SMTP、部署浏览器和双机设备恢复仍待验收。S05 的告警目录、风暴/重复投递语义和生产留存值待运维确定。详情见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)和[S05 告警状态](s05-alarm-status-2026-11-24.md)。
+2026-11-25 融合后门禁复跑：`go test ./... -count=1 -timeout 10m`、`go vet ./...`、Flutter `flutter test --no-pub` 881/881、`flutter analyze --no-pub`、管理台 Node 53/53、`session_tab_model` CTest 1/1 及 `cmake --build build/root --config Release --parallel 4` 均通过；Windows Flutter C03 Release loopback 因第二轮重连后的 tooltip 空文本失败（见上方记录），因此 C03 端到端门禁未通过。安全密钥回归测试使用无设备证明测试 provider 隔离既有 WebAuthn 流程，设备证明接口有独立覆盖。`CHAST_TEST_POSTGRES_DSN` 未设置；PostgreSQL 实库、真实 SMTP、部署浏览器和双机设备恢复仍待验收。S05 的告警目录、风暴/重复投递语义和生产留存值待运维确定。详情见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)和[S05 告警状态](s05-alarm-status-2026-11-24.md)。
 
 2026-11-23 状态归档：本次快照涵盖 C03 多连接标签/媒体隔离与关闭失败回滚、C04 剪贴板/触控板/快捷键、H03 查看端队列恢复及主机入站录制归档整链、O01 活动连接快照 CAS，以及相关测试和设计记录。现有记录中的 Flutter 870/870、音视频/窗口 loopback、H03 Release CTest 4/4 与 Go 定向测试均按各自日志和范围成立；归档操作不代表重新运行全量门禁。C03 历史查看端退出根因仍未定位，Win32 关闭消息失败注入待做。C04 真实应用剪贴板、键盘/IME、触控板和音视频/物理显示场景待实机验收。H03 正式服务/生产部署、双机及源 MP4 清理策略待定。W1 正式 SCM/安全桌面/防火墙回滚与双机/生产数据库验收仍未关闭；W3 A01–A03、S04–S06，W4 H01–H02/O01–O04 及 W5 发布候选门禁仍按路线图待实施或验收。测试夹具和构建产物不属于源码快照。
 
@@ -82,7 +88,7 @@
 
 项目尚未达到“功能与性能全面对齐 RustDesk”的完成条件。当前为 **W1 外部验收待收口，W2 本机功能已大体实现、场景验收继续推进**：审核发现的明确缺陷已修复，S01、S02、S03 的必要代码链路已接通，并取得本地 SQLite、PostgreSQL、浏览器和 Windows 原生进程证据；安装/卸载事务与防火墙 COM 后端已继续加固并通过 fake/隔离回归，但 W1 的双机、正式 SCM 服务、真实 COM 写入回滚和生产环境验收尚未完成。C01–C04 已有主要实现和本机自动化/loopback 证据；C03 标签关闭的历史进程退出原因仍未定位，物理显示、音频、输入设备等场景验收继续待做。W3 企业治理与 W4 生产能力仍有明确实现缺口。
 
-远端已提交源码基线为 schema v28；当前本地工作区迁移最高为 v33。S05/S06 与登录设备白名单实现尚未进入远端源码。
+截至 `34e5a9b`，当前分支已包含 schema v29–v33 的 S05 告警、S06 邮箱验证/邀请和登录设备白名单实现。PostgreSQL 实库、真实 SMTP、部署浏览器及双机设备恢复仍待验收；告警运营语义亦待确认。
 
 ## 2. 已完成的修复与实现
 
@@ -96,8 +102,8 @@
 | S01 通用 Strategy | 代码闭环完成 | 配置目录、版本/摘要、服务端分配、签名投递、主机与查看端逐键回执、管理台、撤销及重启语义已接通；本地 PostgreSQL、浏览器和实际主机进程已有验证 |
 | S02 活动连接与精确断开 | 代码闭环完成 | 快照、指令状态机、幂等重试、回执持久化、代理恢复、旧 runtime 隔离、管理台确认语义及按连接 ID 定向断开已接通；实际托盘、tunnel 和独立 QUIC 文件查看端联动通过 |
 | S03 自定义 Admin Role | 代码闭环完成 | 稳定权限键、命名角色、global/group/object 绑定、服务端鉴权、权限上限、最后管理员保护及角色 revision 并发保护已接通；本地 PostgreSQL 24 项无跳过及主要浏览器场景通过 |
-| S05 安全告警 | 核心代码已实现，实环境验收进行中 | schema v29 告警事件、v31 持久邮件任务与偏好；告警分类、来源去重、独立留存、分页/筛选/CSV、管理台和 SMTP worker 均已接通；PostgreSQL 实库、真实 SMTP/浏览器验收、事件目录扩充、风暴/重复投递语义及生产保留值待完成 |
-| S06 本地邮箱验证与用户邀请 | 工作区代码已接通，外部验收待完成 | schema v30 邮箱验证、v32 一次性邀请已接通；v33 登录设备白名单仍在未提交工作区，当前 Flutter 全量和 analyze 未通过，管理员管理台恢复界面、PostgreSQL 实库、真实 SMTP/浏览器验收待完成 |
+| S05 安全告警 | 代码与自动化门禁已通过；实环境验收待完成 | schema v29 告警事件、v31 持久邮件任务及偏好已接通；PostgreSQL 实库、真实 SMTP/部署浏览器、事件目录、风暴/重复投递语义及生产留存值待确认/验收 |
+| S06 本地邮箱验证与用户邀请 / v33 登录设备白名单 | 代码与本地门禁已通过；外部验收待完成 | 邮箱验证、一次性邀请和管理员设备登记/恢复/启停/撤销已提交；PostgreSQL、真实 SMTP、部署浏览器及双机设备恢复仍待验收 |
 
 Windows 原生进程综合验收于 2026-11-17 首次通过（151.68 秒），并于 2026-11-18 在当前工作区复跑通过（152.82 秒）；随后启用真实浏览器管理台步骤复验通过（161.13 秒）。最新一轮覆盖实际管理台页面精准断开目标 QUIC 会话、目标签名缺席回执确认、非目标会话保持活动、同一 request key 幂等重试，以及受管上限 3/本地上限 2 的准入边界。另有单机原生桌面流验收通过：DXGI 1920×1080、MFX HEVC 硬编、D3D11VA 解码收到 39 帧，文件操作和双终端通过。Flutter `analyze` 通过、814 项测试通过，Windows Release 构建成功；主机策略定向 CTest 重建后 5/5 通过（49.61 秒）。`chast-service` Release 目标也已构建且 `--help` 正常，但没有安装或启动 SCM 服务。最新综合验收目录为 `build/native-runtime-20261118-051723-6d6be834/`，浏览器联测运行目录为 `run-1261003824/`；更早 152.82 秒复跑目录为 `build/native-runtime-20261118-044608-f9561864/`。详细范围与边界见 [原生进程验收](native-runtime-acceptance-2026-11-17.md)。本轮另以隔离 `APPDATA` 启动 Windows Release 查看端，实测 800×600 首页侧栏滚动及服务设置对话框滚动/Tab；将窄窗口回归固定为 `home_page_test.dart` 800×600，首页测试 60/60 通过，`flutter analyze` 无问题，Release 重建成功。
 

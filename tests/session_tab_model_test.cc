@@ -1,5 +1,6 @@
 #include <cstdio>
 
+#include "session_tab_labels.h"
 #include "session_tab_model.h"
 
 namespace {
@@ -10,9 +11,56 @@ void Check(bool condition, const char* name) {
   std::fprintf(stderr, "FAIL %s\n", name);
   ++failures;
 }
+
+void TestLabels() {
+  using namespace session_tab_labels;
+  const auto clipped = BaseLabel(std::wstring(31, L'A') + L"xx", 9);
+  Check(clipped == BaseLabel(std::wstring(31, L'A') + L"yy", 10),
+        "collision detection uses the capped base label");
+  Check(BaseLabel(L"A\tB\n", 7) == L"AB", "label drops controls");
+  const auto long_label = std::wstring(96, L'N');
+  Check(Sanitize(long_label) == long_label &&
+            BaseLabel(long_label, 7).size() == 32,
+        "full accessible caption is retained while the collision key is capped");
+  Check(AccessibleCaption(long_label, L"#7") ==
+            long_label + L" · #7",
+        "accessible captions retain the full long name and disambiguator");
+  Check(BaseLabel(L"\n", 7) == L"\u4f1a\u8bdd 7",
+        "empty label falls back to stable id");
+  Check(PublicDeviceHint("D_42-9") == L"D_42-9" &&
+            PublicDeviceHint("abcdefg").empty() &&
+            PublicDeviceHint("pw: 12").empty(),
+        "only bounded public-id characters are accepted");
+
+  std::vector<Tab> tabs{{1, L"Office", L"12AB"},
+                        {2, L"Office", L"34CD"},
+                        {4, L"Office", L""},
+                        {5, L"Lab", L"12AB"}};
+  Check(Disambiguator(tabs[0], tabs) == L"12AB" &&
+            Disambiguator(tabs[1], tabs) == L"34CD",
+        "same named devices get their distinct device hints");
+  Check(Disambiguator(tabs[2], tabs) == L"#4" &&
+            Disambiguator(tabs[3], tabs).empty(),
+        "missing hint uses a local number; unique names stay unchanged");
+  tabs.push_back({7, L"Office", L"12AB"});
+  Check(Disambiguator(tabs[0], tabs) == L"#1" &&
+            Disambiguator(tabs.back(), tabs) == L"#7",
+        "duplicate hints use distinct stable numbers");
+  tabs.erase(tabs.begin() + 1);
+  Check(Disambiguator(tabs[1], tabs) == L"#4",
+        "remaining tab number is stable when a neighbor closes");
+  tabs = {{1, clipped, L""}, {2, clipped, L""}};
+  Check(Disambiguator(tabs[0], tabs) == L"#1" &&
+            Disambiguator(tabs[1], tabs) == L"#2",
+        "long aliases sharing the capped prefix also get a suffix");
+  tabs.pop_back();
+  Check(Disambiguator(tabs.front(), tabs).empty(),
+        "suffix is removed when no collision remains");
+}
 }  // namespace
 
 int main() {
+  TestLabels();
   SessionTabModel model;
   const auto first = model.Add();
   const auto second = model.Add();

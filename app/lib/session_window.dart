@@ -90,6 +90,14 @@ class SessionWindowRequest {
     return '会话';
   }
 
+  // Pass only a short, public ID hint to the tab strip. Direct connections
+  // and invalid/missing IDs use a local tab number when names collide.
+  String get tabDeviceHint {
+    final String id = target.hostId.trim();
+    if (!target.viaServer || !isValidHostId(id)) return '';
+    return id.length <= 6 ? id : id.substring(id.length - 6);
+  }
+
   static SessionWindowRequest? fromArguments(List<String> args) {
     if (args.length != 2 || args.first != '--session-window') {
       return null;
@@ -125,7 +133,11 @@ class SessionWindowRequest {
     try {
       return await _channel.invokeMethod<bool>(
             'openSessionWindow',
-            <String, Object?>{'request': encode(), 'label': tabLabel},
+            <String, Object?>{
+              'request': encode(),
+              'label': tabLabel,
+              'deviceHint': tabDeviceHint,
+            },
           ) ??
           false;
     } on MissingPluginException {

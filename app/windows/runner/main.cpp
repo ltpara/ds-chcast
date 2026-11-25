@@ -119,7 +119,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     return true;
   };
   open_window = [&windows, &session_tabs, &tab_visibility, &open_window,
-                 &open_display](const std::string& request, const std::string& label) {
+                 &open_display](const std::string& request,
+                                const std::string& label,
+                                const std::string& device_hint) {
     if (windows.size() + (session_tabs ? session_tabs->session_count() : 0) >=
             kMaxSessionWindows + 1 ||
         request.size() > kMaxSessionRequestBytes) {
@@ -144,7 +146,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
       session_tabs = std::move(host);
     }
     const bool opened = session_tabs->CreateSession(
-        request, label, open_window, open_display);
+        request, label, device_hint, open_window, open_display);
     if (!opened && session_tabs->session_count() == 0)
       PostMessageW(session_tabs->GetHandle(), WM_CLOSE, 0, 0);
     return opened;

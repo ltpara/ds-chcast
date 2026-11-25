@@ -17,7 +17,8 @@ class FlutterWindow : public Win32Window {
       std::shared_ptr<chast_viewer::SharedViewerSession>, uint32_t,
       const std::string&, const std::string&, uint32_t, RECT, RECT, uint32_t)>;
   using OpenSessionWindow =
-      std::function<bool(const std::string&, const std::string&)>;
+      std::function<bool(const std::string&, const std::string&,
+                         const std::string&)>;
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project,
                          OpenSessionWindow open_window = {},

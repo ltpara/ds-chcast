@@ -52,7 +52,8 @@ public:
     // Set by the runner: starts another engine window for an encoded
     // SessionWindowRequest. False means the caller should fall back to an
     // in-process page.
-    std::function<bool(const std::string&, const std::string&)> open_session_window;
+    std::function<bool(const std::string&, const std::string&,
+                       const std::string&)> open_session_window;
     // The peer and display identify saved placement; remote geometry supplies
     // the default placement on the matching local desktop layout.
     std::function<bool(std::shared_ptr<SharedViewerSession>, uint32_t,

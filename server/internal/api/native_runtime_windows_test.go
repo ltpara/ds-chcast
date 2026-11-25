@@ -252,6 +252,7 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 	for _, entry := range env {
 		key := strings.SplitN(entry, "=", 2)[0]
 		if strings.EqualFold(key, "APPDATA") || strings.EqualFold(key, "USERPROFILE") || strings.EqualFold(key, "CHAST_NATIVE_TESTING") ||
+			strings.EqualFold(key, "CHAST_NATIVE_TEST_TAB_LABEL") ||
 			strings.EqualFold(key, "CHAST_NATIVE_TEST_STATUS_DIR") ||
 			strings.EqualFold(key, "CHAST_NATIVE_TEST_DOWNLOAD_DIR") ||
 			strings.EqualFold(key, "CHAST_NATIVE_TEST_UPLOAD_DIR") {
@@ -265,6 +266,10 @@ func startNativeFlutterViewer(t *testing.T, dir, name, binary, serverURL, server
 		"CHAST_NATIVE_TESTING=1",
 		"CHAST_NATIVE_TEST_TICKET_DIR="+chastDir,
 		"CHAST_NATIVE_TEST_TABS_TRACE="+filepath.Join(dir, "session-tabs.tsv"))
+	if os.Getenv("CHAST_NATIVE_MULTIWINDOW") == "1" {
+		viewerEnv = append(viewerEnv,
+			"CHAST_NATIVE_TEST_TAB_LABEL=nativebox session title deliberately long for full tooltip acceptance 0123456789 abcdefghijklmnopqrstuvwxyz")
+	}
 	if statusDirectory != "" {
 		viewerEnv = append(viewerEnv, "CHAST_NATIVE_TEST_STATUS_DIR="+statusDirectory)
 	}
@@ -415,7 +420,7 @@ func runNativeFlutterHomeConnect(t *testing.T, pid int, peer, token, artifacts s
 }
 
 func runNativeFlutterCloseSelectedTab(t *testing.T, viewer *nativeProcess, peer, token, artifacts string,
-	expectedSessions int) {
+	expectedSessions int, expectPostFailure ...bool) {
 	t.Helper()
 	pid := viewer.cmd.Process.Pid
 	script := filepath.Join("..", "..", "..", "tools", "native-flutter-home-connect.ps1")
@@ -424,6 +429,9 @@ func runNativeFlutterCloseSelectedTab(t *testing.T, viewer *nativeProcess, peer,
 	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
 		"-ExecutionPolicy", "Bypass", "-File", script, strconv.Itoa(pid), peer, artifacts,
 		"-ExpectedSessionCount", strconv.Itoa(expectedSessions), "-UseExistingCredentials", "-CloseSelectedTab")
+	if len(expectPostFailure) > 0 && expectPostFailure[0] {
+		cmd.Args = append(cmd.Args, "-ExpectCloseFailure")
+	}
 	cmd.Stdin = strings.NewReader(token + "\n")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	output, err := cmd.CombinedOutput()
@@ -1711,6 +1719,16 @@ func TestWindowsNativeRuntimeAcceptance(t *testing.T) {
 			verifyNativeFlutterTabRecordingIsolation(t, dir, firstViewerStatusPath, statusPath,
 				filepath.Join(dir, "flutter-target-profile", "Videos"))
 			return
+		}
+		if os.Getenv("CHAST_NATIVE_TEST_FAIL_TAB_CLOSE_POST_ONCE") == "1" {
+			t.Log("injecting one real PostMessageW failure against an invalid HWND; the live child HWND remains valid")
+			runNativeFlutterCloseSelectedTab(t, flutterViewer, peer,
+				"native-runtime-viewer-token", dir, 2, true)
+			select {
+			case <-flutterViewer.done:
+				t.Fatalf("Flutter viewer exited after the injected close-message failure: %v", flutterViewer.err)
+			default:
+			}
 		}
 		closeCycles := 3
 		if raw := strings.TrimSpace(os.Getenv("CHAST_NATIVE_MULTIWINDOW_CLOSE_CYCLES")); raw != "" {

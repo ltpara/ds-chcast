@@ -673,13 +673,15 @@ void ViewerBridge::HandleMethodCall(
     if (method == "openSessionWindow") {
         std::string request;
         std::string label;
+        std::string device_hint;
         if (const auto* args = std::get_if<flutter::EncodableMap>(call.arguments())) {
             map_string(*args, "request", &request);
             map_string(*args, "label", &label);
+            map_string(*args, "deviceHint", &device_hint);
         }
         if (request.empty() || request.size() > 1024 * 1024 ||
             label.size() > 1024 || !open_session_window ||
-            !open_session_window(request, label)) {
+            !open_session_window(request, label, device_hint)) {
             result->Error("window_open_failed",
                           "Could not open a session window (limit 16)");
         } else {

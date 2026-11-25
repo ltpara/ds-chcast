@@ -2,9 +2,9 @@
 
 日期：2026-11-16；当前状态补充：2026-11-25
 
-2026-11-25 S05/S06/v33 当前状态：安全告警已有独立落库、分类、去重、分页筛选/CSV、管理台列表、独立留存、持久邮件任务及带租约/退避重试的 SMTP worker；邮箱验证和一次性邀请已接通；登录设备白名单已覆盖密码、LDAP、OIDC、WebAuthn 登录，Windows 安装密钥由 DPAPI 保护，管理员账号页可登记/恢复/启停/撤销设备。Go 全量与 vet、Flutter 880/880 与 analyze、管理台 Node 53/53、JavaScript 语法检查及 Windows Release 构建通过。PostgreSQL 实库、真实 SMTP、部署浏览器及双机设备恢复仍待验收；告警目录、风暴/重复投递语义和生产留存值需运维确定。详见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
+2026-11-25 S05/S06/v33 当前状态：安全告警已有独立落库、分类、去重、分页筛选/CSV、管理台列表、独立留存、持久邮件任务及带租约/退避重试的 SMTP worker；邮箱验证和一次性邀请已接通；登录设备白名单已覆盖密码、LDAP、OIDC、WebAuthn 登录，Windows 安装密钥由 DPAPI 保护，管理员账号页可登记/恢复/启停/撤销设备。融合后复跑 Go 全量与 vet、Flutter 881/881 与 analyze、管理台 Node 53/53、JavaScript 语法检查及 Windows CMake Release 构建通过；C03 多窗口 loopback 在重连后 tooltip 文本断言失败，详见当前状态记录。PostgreSQL 实库、真实 SMTP、部署浏览器及双机设备恢复仍待验收；告警目录、风暴/重复投递语义和生产留存值需运维确定。详见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
 
-2026-11-25 当前执行入口：分支 `codex/complete-workspace-2026-11-20`，已提交基线 `4d3cd2b`。C03 单机 Release loopback 又通过 20 轮标签关闭/重连，兄弟会话各轮保持活动，生命周期轨迹完整；11-22 历史查看端进程退出根因未复现、未定位，仍作为未解决风险。W1 双机、正式 SCM/安全桌面、生产数据库、复杂网络及物理设备场景仍待验收。H03 本机整链已通过，正式服务/双机和源文件保留策略仍待。S05/S06/v33 代码闭环与本地全量门禁已完成，外部验收待做。H01 已完成安全设计、独立 IPC framing/sequence、受限 Named Pipe 传输、注入式生命周期协调器及 Win32 SCM adapter 代码；回归覆盖 logon SID 身份核验、超时/断连封闭、名字冲突隔离、启动失败回滚及停止/删除失败重试。独立 helper service entry、受保护 staging/copy、崩溃恢复、真实 SCM 验收、桌面 worker 和真实 UAC/安全桌面验收仍未完成。当前设计和实现证据见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。本页较早状态和测试数字保留其当时证据范围，当前结论以[状态入口](current-status-and-next-plan-2026-11-17.md)为准。
+2026-11-25 当前执行入口：分支 `codex/complete-workspace-2026-11-20`，已同步基线 `34e5a9b`（含 `4d3cd2b`）。C03 单机 20 轮关闭/重连 loopback 通过，但随后融合后复跑在第二轮重连的 tooltip 文本断言失败；11-22 历史查看端进程退出根因仍未复现、未定位，二者均作为未解决风险。W1 双机、真实 SCM/安全桌面、生产数据库、复杂网络及物理设备场景仍待验收。H03 本机整链已通过，正式服务/双机和源文件保留策略仍待。S05/S06/v33 代码闭环与本地门禁已完成，外部验收待做。H01 已完成安全设计、IPC、独立 helper service entry、受保护 staging/copy、恢复记录及正式服务后台扫描代码；真实签名证书正向验证、UAC 授权接线、真实 SCM/ProgramData 管理员验收、worker-ready/capability、桌面 worker 和安全桌面验收仍未完成。当前边界见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。本页较早状态和测试数字保留其当时证据范围，当前结论以[状态入口](current-status-and-next-plan-2026-11-17.md)为准。
 
 2026-11-23 H03 主机入站归档推进：服务端设备签名分片 API 双重认证、owner 固定和摘要失败回滚，Go tunnel worker，以及 C++ 成功封口回调、原子任务 producer、默认关闭的 opt-in 设置和 tunnel 队列参数均已接通。Release CTest 4/4、Go agent/tunnel 全包测试、vet 与完整 E2E 连续两轮通过；后者由 C++ `TunnelProcess` 启动编译态 tunnel，覆盖 TLS CA、CONNECT 代理、父进程强杀后的子进程回收和 offset 恢复。另以真实便携 `chast-host` 完成从录制封口到 tunnel/服务端归档的隔离 loopback 整链验收。正式部署/ProgramData/防火墙和双机验收仍待。设计见 [H03 归档设计](host-recording-archive-design-2026-11-23.md)。
 
@@ -353,7 +353,7 @@ S03 仍待完成：
 
 ### 8.5 W4 主机与生产部署
 
-- H01：可复用便携特权辅助服务；现有一次性 UAC 主机接管与固定名 SYSTEM SCM 服务不是该能力，设计与当前接管测试基线见[H01 设计](h01-portable-elevated-helper-design-2026-11-25.md)。
+- H01：可复用便携特权辅助服务的生命周期、独立服务入口、受保护 staging/copy 和恢复扫描代码已实现；真实发布者签名/SCM/ProgramData 验收、UAC 授权接线、worker capability 与桌面桥接仍待，详见[H01 设计](h01-portable-elevated-helper-design-2026-11-25.md)。
 - H02：扩展虚拟显示后端和自定义分辨率；
 - O01：多实例共享限流、录制租约、活动连接路由和指令投递；
 - O02：PostgreSQL 生产配置、TLS、备份恢复、故障切换、滚动升级和监控；

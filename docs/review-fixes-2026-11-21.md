@@ -2,7 +2,17 @@
 
 归档前基线：`688638a`，分支 `codex/complete-workspace-2026-11-20`。本记录区分源码修复、本机验证及仍需专用环境的验收；其中按日期记载的未提交状态均是当时快照。2026-11-23 归档将本记录及对应源码/测试纳入当前分支快照，不改变下文的验证范围和未完成项。
 
-## 最新结果（2026-11-23）
+## 最新结果（2026-11-24）
+
+### C03 Win32 关闭消息失败注入与双标签回归（2026-11-24）
+
+运行 `tools/test-native-runtime.ps1 -BuildDirectory build\root -Flutter -MultiWindow -MultiWindowCloseFailure`。首轮测试注入器使用 `HWND(-1)` 后观察到 `host-wm-close`/`close-all`，没有进入预期的 `PostMessageW` 失败回滚；这是无效句柄选择错误，未作为通过证据。改用非特殊值 `0xDEADBEEF` 后重新运行，Windows Release 构建及 Flutter/Go loopback 验收 **PASS**（50.86 秒）。证据：`build/native-runtime-20261124-193406-b320b956/run-243170596/`。
+
+通过轮次先在真实 Flutter 双标签进程中调用真实 `PostMessageW`，对无效 HWND 触发失败；TSV 记录 `close-tab-post-failed` 与 `close-tab-post-rollback`。JSON 快照确认前后均为 2 个标签、2 个会话窗口、1 个可见窗口，选中项保持为 1，查看端进程仍存活。随后同一进程完成 3 轮正常选中标签关闭/重连，兄弟会话每轮保持活动，末尾精确断开通过。失败轮次及修正过程日志保留于 `build/native-runtime-20261124-193156-44d3cb76/run-1531887794/` 与上述通过目录。
+
+补充回归：`ctest --test-dir build\root -C Release -R '^session_tab_model$' --output-on-failure` **1/1 PASS**；`cd server && go test ./internal/api -count=1 -timeout 10m` **PASS**（42.788 秒）；两份验收 PowerShell 脚本 Parser 和 `git diff --check` 均通过。
+
+本验收只证明“无效 HWND 导致的真实 Win32 `PostMessageW` 失败”路径及状态回滚，不模拟消息队列满载或所有其它投递错误，也没有定位 11-22 历史查看端进程退出的原因；不能据此宣称 C03 关闭异常整体解决。双机、物理显示/音频、电源及正式服务验收仍待。
 
 ### C03 正常关闭路径回归（2026-11-23 05:42）
 
@@ -10,7 +20,7 @@
 
 ### C03 子窗口关闭消息投递失败回滚（2026-11-23）
 
-`SessionTabHostWindow::CloseTab` 现在保存关闭前的选中标签；若 `PostMessage(WM_CLOSE)` 明确失败且子窗口 HWND 仍有效，则撤销 closing 状态、恢复原选中项并同步可见性。若 HWND 已失效，继续由现有 prune 路径清理。成功投递时的关闭流程不变。新增模型回归覆盖选中项恢复、关闭最后一个活动标签后的恢复及恢复后可再次关闭；Release `session_tab_model` CTest 1/1 通过，Flutter Windows `chast_viewer` Release runner 重建通过。尚未注入真实 Win32 消息投递失败验证 host 集成分支；这不解释 11-22 两次历史进程退出，C03 根因仍未定位，不能宣称关闭问题已整体修复。
+`SessionTabHostWindow::CloseTab` 现在保存关闭前的选中标签；若 `PostMessage(WM_CLOSE)` 明确失败且子窗口 HWND 仍有效，则撤销 closing 状态、恢复原选中项并同步可见性。若 HWND 已失效，继续由现有 prune 路径清理。成功投递时的关闭流程不变。新增模型回归覆盖选中项恢复、关闭最后一个活动标签后的恢复及恢复后可再次关闭；Release `session_tab_model` CTest 1/1 通过，Flutter Windows `chast_viewer` Release runner 重建通过。2026-11-24 已通过真实 Flutter loopback 对无效 HWND 注入 `PostMessageW` 失败并验证 host 集成回滚；该结果不解释 11-22 两次历史进程退出，C03 历史根因仍未定位，不能宣称关闭问题已整体修复。
 
 ### H03 主机入站归档服务端 API 第一阶段
 
@@ -317,7 +327,7 @@ C03 多连接标签容器已从设计进入本地实现，并通过基础真实�
 | --- | --- | --- |
 | 服务器与管理台 | 独立共享地址簿及密码端到端加密/密钥恢复轮换、Control Role、独立 Alarm、用户邀请/邮箱验证/设备白名单、多实例限流与连接路由/存储协调、自有协议 API 回退、定制客户端发布管理 | 生产 PostgreSQL TLS/最小权限/灾备/故障切换、全管理台辅助技术覆盖 |
 | 主机/发射端 | 便携特权辅助服务、扩展虚拟显示后端、主机录制源文件保留/清理策略 | H03 服务端 API、Go 持久 worker、C++ 封口队列及真实便携 `chast-host` 整链已通过隔离 loopback；正式 SCM/worker、安全桌面/锁屏/账号切换、Firewall COM 写入与回滚、生产部署/双机、非可信 owner 的 NTFS 集成专项仍待 |
-| 查看端/接收端 | C03 标签关闭历史进程退出根因及关闭生命周期一致性 | `PostMessage(WM_CLOSE)` 明确失败时的模型状态回滚已实现并通过单测，正常关闭/重连新增 3 轮 Release loopback 通过；Win32 失败注入仍待。H03 查看端持久队列及实际 Flutter 上传进程强杀重启已通过本机验收。C04 剪贴板按键发送、触控板速度、边缘滚动/样式、SVG 和快捷键配置均已实现；22:43 Windows Release loopback 覆盖原生 hook 与 Flutter 回退并通过，真实应用间剪贴板互通、键盘/输入法、物理触控板仍待。C03 逐标签媒体/输入隔离、双标签 lease 及合成双显示器窗口生命周期已有 loopback 证据；12:05/12:08 关闭后进程退出原因未定位。真实语音/AEC/降噪、设备切换、长时听感、独立第二连接完整关闭/重连、物理混合 DPI/旋转/全屏/热插拔、真实电源行为及 Release 撤权弹窗仍待验收 |
+| 查看端/接收端 | C03 标签关闭历史进程退出根因及关闭生命周期一致性 | 无效 HWND 触发的真实 Win32 `PostMessageW` 失败回滚及同进程 3 轮正常关闭/重连已通过 Release loopback；历史 12:05/12:08 进程退出根因仍未定位，且未测试消息队列满载。H03 查看端持久队列及实际 Flutter 上传进程强杀重启已通过本机验收。C04 剪贴板按键发送、触控板速度、边缘滚动/样式、SVG 和快捷键配置均已实现；22:43 Windows Release loopback 覆盖原生 hook 与 Flutter 回退并通过，真实应用间剪贴板互通、键盘/输入法、物理触控板仍待。C03 逐标签媒体/输入隔离、双标签 lease 及合成双显示器窗口生命周期已有 loopback 证据。真实语音/AEC/降噪、设备切换、长时听感、独立第二连接完整关闭/重连、物理混合 DPI/旋转/全屏/热插拔、真实电源行为及 Release 撤权弹窗仍待验收 |
 
 各批测试的数量、版本及范围以上方分别记录为准，不将不同版本测试相加作为全量门禁。未重跑不受影响的 Go/管理台或全量发布矩阵。此处原“未提交/未推送”是该记录形成时的状态；2026-11-23 归档纳入源码、测试与文档，原有生成物仍保留在工作区且不纳入源码提交。
 
