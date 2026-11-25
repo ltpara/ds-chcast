@@ -3,11 +3,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'server_identity.dart';
 import 'server_settings.dart';
 import 'tunnel_proxy.dart';
 import 'viewer_strategy.dart';
+import 'viewer_bridge.dart';
 import 'package:chast_viewer/l10n.dart';
 
 /// The short-lived credential a managed host requires at Hello (v62).
@@ -323,6 +326,77 @@ class AccountDeviceSession {
   }
 }
 
+/// A signed, one-use proof that a login was made by this viewer installation.
+class LoginDeviceProof {
+  const LoginDeviceProof({
+    required this.challengeId,
+    required this.publicKey,
+    required this.signature,
+  });
+
+  final String challengeId;
+  final String publicKey;
+  final String signature;
+
+  Map<String, String> toJson() => <String, String>{
+    'challenge_id': challengeId,
+    'public_key': publicKey,
+    'signature': signature,
+  };
+}
+
+class TrustedLoginDevice {
+  const TrustedLoginDevice({
+    required this.id,
+    required this.deviceName,
+    required this.createdAtMs,
+    required this.lastSeenAtMs,
+    this.current = false,
+  });
+
+  final String id;
+  final String deviceName;
+  final int createdAtMs;
+  final int lastSeenAtMs;
+  final bool current;
+
+  static TrustedLoginDevice? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final String id = value['id']?.toString().trim() ?? '';
+    final Object? created = value['created_at_ms'];
+    final Object? lastSeen = value['last_seen_at_ms'];
+    if (id.isEmpty || created is! num || lastSeen is! num) return null;
+    return TrustedLoginDevice(
+      id: id,
+      deviceName: value['device_name']?.toString().trim() ?? '',
+      createdAtMs: created.toInt(),
+      lastSeenAtMs: lastSeen.toInt(),
+      current: value['current'] == true,
+    );
+  }
+}
+
+class LoginDeviceState {
+  const LoginDeviceState({required this.enabled, required this.devices});
+
+  final bool enabled;
+  final List<TrustedLoginDevice> devices;
+
+  static LoginDeviceState? fromJson(Object? value) {
+    if (value is! Map || value['devices'] is! List) return null;
+    final List<TrustedLoginDevice> devices = <TrustedLoginDevice>[];
+    for (final Object? item in value['devices'] as List) {
+      final TrustedLoginDevice? device = TrustedLoginDevice.fromJson(item);
+      if (device == null) return null;
+      devices.add(device);
+    }
+    return LoginDeviceState(
+      enabled: value['enabled'] == true,
+      devices: devices,
+    );
+  }
+}
+
 /// One viewer recording stored in the signed-in account's server archive.
 /// The bytes live on the server; [sha256] lets a download be verified against
 /// the digest computed while it was uploaded.
@@ -420,6 +494,10 @@ class AccountInfo {
   const AccountInfo({
     required this.username,
     this.email = '',
+    this.emailVerified = false,
+    this.alarmEmailEnabled = false,
+    this.alarmEmailAvailable = false,
+    this.canReceiveSecurityAlerts = false,
     this.phone = '',
     this.twoFactor = false,
     this.recoveryCodes = 0,
@@ -429,6 +507,18 @@ class AccountInfo {
 
   /// Optional recovery address; empty means password reset by mail is off.
   final String email;
+
+  /// True only after this saved recovery address is confirmed locally.
+  final bool emailVerified;
+
+  /// Whether this account opted in to email copies of security alarms.
+  final bool alarmEmailEnabled;
+
+  /// Whether the server currently has an SMTP sender for security alarms.
+  final bool alarmEmailAvailable;
+
+  /// Whether this account has global audit access and can receive these alerts.
+  final bool canReceiveSecurityAlerts;
 
   /// Optional recovery number, normalized to digits; empty means SMS reset is
   /// off.
@@ -451,6 +541,10 @@ class AccountInfo {
     return AccountInfo(
       username: username,
       email: user['email']?.toString().trim() ?? '',
+      emailVerified: value['email_verified'] == true,
+      alarmEmailEnabled: value['alarm_email_enabled'] == true,
+      alarmEmailAvailable: value['alarm_email_available'] == true,
+      canReceiveSecurityAlerts: value['can_receive_security_alerts'] == true,
       phone: user['phone']?.toString().trim() ?? '',
       twoFactor: value['two_factor'] == true,
       recoveryCodes: rawRecovery is num ? rawRecovery.toInt() : 0,
@@ -1335,6 +1429,10 @@ class _DigestSink implements Sink<Digest> {
 /// lookup must carry it too: the host id and punch proof are only as private
 /// as the registry that hands them out.
 class ServerApi {
+  @visibleForTesting
+  static Future<LoginDeviceProof?> Function(ServerSettings, Duration)?
+  loginDeviceProofProviderForTesting;
+
   ServerApi._();
 
   /// Server-side limit for `GET /v1/hosts?ids=...`.
@@ -1580,6 +1678,10 @@ class ServerApi {
     if (name.isEmpty || password.isEmpty) {
       throw ServerApiException(tr('请输入用户名和密码'));
     }
+    final LoginDeviceProof? deviceProof = await _createLoginDeviceProof(
+      settings,
+      timeout: timeout,
+    );
     // Precedence mirrors the server: authenticator code, then recovery code,
     // then the SMS backup code, then the email backup code, so only one is
     // sent.
@@ -1607,6 +1709,7 @@ class ServerApi {
         body: <String, Object?>{
           'username': name,
           'password': password,
+          if (deviceProof != null) 'device_proof': deviceProof.toJson(),
           if (device.isNotEmpty) 'device_name': device,
           if (otp.isNotEmpty) 'totp_code': otp,
           if (otp.isEmpty && recovery.isNotEmpty) 'recovery_code': recovery,
@@ -1630,6 +1733,20 @@ class ServerApi {
           code: 'totp_invalid',
         );
       }
+      if (error.code == 'login_device_not_allowed') {
+        throw ServerApiException(
+          tr('此设备不在账号的信任列表中，请联系管理员恢复访问'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      }
+      if (error.code == 'login_device_proof') {
+        throw ServerApiException(
+          tr('无法验证此设备，请重试登录或联系管理员'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      }
       rethrow;
     }
     final AccountLoginResult? result = _parseLoginReply(decoded);
@@ -1637,6 +1754,71 @@ class ServerApi {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
     return result;
+  }
+
+  static Future<LoginDeviceProof?> _createLoginDeviceProof(
+    ServerSettings settings, {
+    required Duration timeout,
+  }) async {
+    final Future<LoginDeviceProof?> Function(ServerSettings, Duration)?
+    provider = loginDeviceProofProviderForTesting;
+    if (provider != null) return provider(settings, timeout);
+    final String publicKey;
+    try {
+      publicKey = (await ViewerBridge.ticketIdentity()).trim();
+    } on MissingPluginException {
+      return null;
+    } on FlutterError {
+      return null;
+    }
+    if (publicKey.isEmpty) {
+      throw ServerApiException(tr('无法读取此设备的登录密钥'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login-device-challenge');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded;
+    try {
+      decoded = await _requestJson(
+        'POST',
+        uri,
+        timeout,
+        body: <String, Object?>{'public_key': publicKey},
+      );
+    } on ServerApiException catch (error) {
+      // Older account servers ignore device proofs and keep the existing login
+      // contract. Every current server has this route and enforces proofs only
+      // after the account owner enables the allowlist.
+      if (error.statusCode == HttpStatus.notFound) return null;
+      rethrow;
+    }
+    if (decoded is! Map) {
+      throw ServerApiException(tr('连接服务返回了无效的设备验证挑战'));
+    }
+    final String challengeId = decoded['challenge_id']?.toString().trim() ?? '';
+    final String message = decoded['message']?.toString().trim() ?? '';
+    if (challengeId.isEmpty || message.isEmpty) {
+      throw ServerApiException(tr('连接服务返回了无效的设备验证挑战'));
+    }
+    final String signature;
+    try {
+      signature = (await ViewerBridge.signLoginDeviceChallenge(message)).trim();
+    } on MissingPluginException {
+      return null;
+    } on FlutterError {
+      return null;
+    }
+    if (signature.isEmpty) {
+      throw ServerApiException(tr('无法验证此设备的登录密钥'));
+    }
+    return LoginDeviceProof(
+      challengeId: challengeId,
+      publicKey: publicKey,
+      signature: signature,
+    );
   }
 
   /// Asks the server to text a single-use login code to the account's
@@ -1803,6 +1985,10 @@ class ServerApi {
     if (!settings.configured) {
       throw ServerApiException(tr('未配置连接服务'));
     }
+    final LoginDeviceProof? deviceProof = await _createLoginDeviceProof(
+      settings,
+      timeout: timeout,
+    );
     final Uri uri;
     try {
       uri = Uri.parse('${settings.url}/v1/account/oidc/begin');
@@ -1816,6 +2002,7 @@ class ServerApi {
       body: <String, Object?>{
         'device_id': deviceId.trim(),
         'device_name': deviceName.trim(),
+        if (deviceProof != null) 'device_proof': deviceProof.toJson(),
       },
       unavailable: tr('连接服务未启用单点登录'),
     );
@@ -1904,6 +2091,18 @@ class ServerApi {
       case 'no_account':
         return ServerApiException(
           tr('该身份未关联账号，请联系管理员'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      case 'login_device_not_allowed':
+        return ServerApiException(
+          tr('此设备不在账号的信任列表中，请联系管理员恢复访问'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      case 'login_device_proof':
+        return ServerApiException(
+          tr('设备验证已过期，请重新开始登录'),
           statusCode: error.statusCode,
           code: error.code,
         );
@@ -2022,6 +2221,85 @@ class ServerApi {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
     return info;
+  }
+
+  static Future<LoginDeviceState> loginDevices(
+    ServerSettings settings,
+    String token, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login-devices');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'GET',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      unauthorized: tr('账号登录已失效，请重新登录'),
+    );
+    final LoginDeviceState? state = LoginDeviceState.fromJson(decoded);
+    if (state == null) throw ServerApiException(tr('连接服务返回了无效的设备列表'));
+    return state;
+  }
+
+  static Future<LoginDeviceState> setLoginDevicePolicy(
+    ServerSettings settings,
+    String token, {
+    required bool enabled,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login-devices/policy');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'PUT',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'enabled': enabled},
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      conflict: tr('请先使用此设备重新登录，再启用登录设备白名单'),
+    );
+    final LoginDeviceState? state = LoginDeviceState.fromJson(decoded);
+    if (state == null) throw ServerApiException(tr('连接服务返回了无效的设备列表'));
+    return state;
+  }
+
+  static Future<void> revokeLoginDevice(
+    ServerSettings settings,
+    String token,
+    String deviceId, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final String id = deviceId.trim();
+    if (id.isEmpty) throw ServerApiException(tr('登录设备 ID 为空'));
+    final Uri uri;
+    try {
+      uri = Uri.parse(
+        '${settings.url}/v1/account/login-devices/${Uri.encodeComponent(id)}',
+      );
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    await _requestJson(
+      'DELETE',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      success: const <int>{HttpStatus.noContent},
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      notFound: tr('登录设备不存在'),
+    );
   }
 
   /// Creates a pending authenticator secret. The current password is required
@@ -2512,29 +2790,53 @@ class ServerApi {
         signature.isEmpty) {
       throw ServerApiException(tr('安全密钥数据不完整'));
     }
+    final LoginDeviceProof? deviceProof = await _createLoginDeviceProof(
+      settings,
+      timeout: timeout,
+    );
     final Uri uri;
     try {
       uri = Uri.parse('${settings.url}$path');
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded = await _requestJson(
-      'POST',
-      uri,
-      timeout,
-      body: <String, Object?>{
-        'username': name,
-        'credential_id': credentialId,
-        'client_data_json': clientDataJSON,
-        'authenticator_data': authenticatorData,
-        'signature': signature,
-        if (device.isNotEmpty) 'device_name': device,
-      },
-      unauthorized: tr('安全密钥验证未通过'),
-      forbidden: tr('账号已被封禁'),
-      badRequest: tr('安全密钥数据无效'),
-      unavailable: tr('连接服务未启用安全密钥'),
-    );
+    final Object? decoded;
+    try {
+      decoded = await _requestJson(
+        'POST',
+        uri,
+        timeout,
+        body: <String, Object?>{
+          'username': name,
+          'credential_id': credentialId,
+          'client_data_json': clientDataJSON,
+          'authenticator_data': authenticatorData,
+          'signature': signature,
+          if (deviceProof != null) 'device_proof': deviceProof.toJson(),
+          if (device.isNotEmpty) 'device_name': device,
+        },
+        unauthorized: tr('安全密钥验证未通过'),
+        forbidden: tr('账号已被封禁'),
+        badRequest: tr('安全密钥数据无效'),
+        unavailable: tr('连接服务未启用安全密钥'),
+      );
+    } on ServerApiException catch (error) {
+      if (error.code == 'login_device_not_allowed') {
+        throw ServerApiException(
+          tr('此设备不在账号的信任列表中，请联系管理员恢复访问'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      }
+      if (error.code == 'login_device_proof') {
+        throw ServerApiException(
+          tr('无法验证此设备，请重试登录或联系管理员'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      }
+      rethrow;
+    }
     final AccountLoginResult? result = _parseLoginReply(decoded);
     if (result == null) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
@@ -2933,6 +3235,94 @@ class ServerApi {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
     return stored?.toString().trim() ?? '';
+  }
+
+  /// Sends a single-use verification token to the saved recovery address.
+  static Future<void> requestEmailVerification(
+    ServerSettings settings,
+    String token, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/email/verify');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      success: const <int>{HttpStatus.accepted},
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      badRequest: tr('请先设置有效的找回邮箱'),
+      conflict: tr('该邮箱已经验证'),
+      unavailable: tr('连接服务未配置邮件发送'),
+    );
+  }
+
+  /// Confirms ownership of the saved recovery address with its mailed token.
+  static Future<void> confirmEmailVerification(
+    ServerSettings settings,
+    String token, {
+    required String verificationToken,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final String value = verificationToken.trim();
+    if (value.isEmpty) {
+      throw ServerApiException(tr('请输入邮件中的邮箱验证令牌'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/email/verify/confirm');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'token': value},
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      badRequest: tr('邮箱验证令牌无效或已过期'),
+    );
+    if (decoded is! Map || decoded['email_verified'] != true) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+  }
+
+  /// Enables or disables security alarm email for the signed-in global auditor.
+  static Future<void> setAlarmEmailPreference(
+    ServerSettings settings,
+    String token, {
+    required bool enabled,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/alarm-email-preference');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'PUT',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'enabled': enabled},
+      unauthorized: tr('账号登录已失效，请重新登录'),
+      forbidden: tr('只有拥有全局审计权限的账号可以订阅安全告警'),
+      badRequest: tr('请先验证找回邮箱'),
+      unavailable: tr('连接服务未配置邮件发送'),
+    );
+    if (decoded is! Map || decoded['enabled'] != enabled) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
   }
 
   /// Asks the server to mail a reset token. Known and unknown names both

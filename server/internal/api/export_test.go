@@ -77,6 +77,8 @@ func exportCSV(t *testing.T, url string) [][]string {
 		prefix = "chast-connections"
 	} else if strings.Contains(url, "/file-transfers") {
 		prefix = "chast-file-transfers"
+	} else if strings.Contains(url, "/alarms") {
+		prefix = "chast-alarms"
 	}
 	return decodeExport(t, header, body, prefix)
 }

@@ -14,7 +14,7 @@ function reply(status, value) {
 }
 function app(fetch, stubEntry = false) {
   const saved = [];
-  const runtime = {fetch, stubEntry, sessionStorage: {setItem: (_, value) => saved.push(value), removeItem() {}}, exported: {}, locks: 0};
+  const runtime = {fetch, stubEntry, URLSearchParams, window: {confirm: () => true}, sessionStorage: {setItem: (_, value) => saved.push(value), removeItem() {}}, exported: {}, locks: 0};
   const source = fs.readFileSync(path.join(__dirname, 'assets/app.js'), 'utf8').replace(/\r\n/g, '\n');
   // Run the actual API/session functions without booting the DOM. Stubs only
   // remove rendering side effects; request and refresh implementations remain.
@@ -26,7 +26,7 @@ function app(fetch, stubEntry = false) {
     // Keep the real lock cleanup available to role/session regressions.
     const realLock = lock;
     lock = () => { locks++; state.auth = null; };
-    Object.assign(exported, {loadPolicies, resetPolicyConsole, openClientStrategy, saveClientStrategy, openClientStrategyStatus, openConnectionDetail, refreshConnectionDetail, handleConnectionDialogClose, resetConnectionDetail, requestDisconnect, renderConnectionDetail});
+    Object.assign(exported, {loadPolicies, resetPolicyConsole, openClientStrategy, saveClientStrategy, openClientStrategyStatus, openConnectionDetail, refreshConnectionDetail, handleConnectionDialogClose, resetConnectionDetail, requestDisconnect, renderConnectionDetail, AUDIT, loadAudit, selectAuditTab, requestMineEmailVerification, confirmMineEmailVerification, renderMineEmailVerification, renderMineAlarmEmailPreference, setMineAlarmEmailPreference, renderMine, accountRow, openAccountLoginDevicesDialog, loadAccountLoginDevices, renderAccountLoginDevices, renderAccountLoginDevicePolicyControls, saveAccountLoginDevicePolicy, trustAccountLoginDevice});
     Object.assign(exported, {state, api, adoptAccountSession, canPermission, canDeviceCollection, canDeviceAction, tabVisible, applySessionPermissions, refreshConsolePermissions, refreshSession, connectionConfirmedDisconnected, connectionRequestKeyFor, releaseConnectionRequestKeyIfSettled, loadRoles, fmtTime, realLock, resetRoleConsole, renderPermissionOptions, renderRoles, renderRoleBindings, renderRoleSelects, applyRoleControlPermissions, syncRoleBindingScope, mutateRoles, clearRolePanels, editRole, saveRole, reloadRoleEditor, resetRoleEditor, deleteRole, openRoleAction, closeRoleAction, confirmRoleAction, roleActionKeydown, updateTabSelection, handleTabKeydown, initializeTableRegions});
   })();`), runtime);
   return {...runtime.exported, runtime, saved};
@@ -36,13 +36,15 @@ function app(fetch, stubEntry = false) {
 // updates, request ownership and write completion functions run unchanged.
 function roleDOM(loaded) {
   class Element {
-    constructor() {
+    constructor(tag = '') {
+      this.tagName = tag.toUpperCase();
       this.children = [];
       this.value = '';
       this.disabled = false;
       this.checked = false;
       this.dataset = {};
       this.attributes = {};
+      this.listeners = {};
       this.classList = {add() {}, remove() {}, toggle() {}};
     }
     appendChild(child) { this.children.push(child); }
@@ -50,7 +52,8 @@ function roleDOM(loaded) {
     get firstChild() { return this.children[0]; }
     setAttribute(key, value) { this.attributes[key] = value; }
     removeAttribute(key) { delete this.attributes[key]; }
-    addEventListener() {}
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+    click() { return this.listeners.click && this.listeners.click({currentTarget: this, preventDefault() {}}); }
     scrollIntoView() {}
     focus() { if (!this.disabled) loaded.runtime.document.activeElement = this; }
     showModal() { this.open = true; }
@@ -58,6 +61,7 @@ function roleDOM(loaded) {
     querySelectorAll(selector) {
       const all = this.children.flatMap(child => child instanceof Element ? [child, ...child.querySelectorAll('*')] : []);
       if (selector === '[data-role-focus]') return all.filter(child => child.dataset.roleFocus);
+      if (selector === 'button') return all.filter(child => child.tagName === 'BUTTON');
       return all;
     }
     reset() { this.children.forEach(child => { child.value = child.defaultValue || ''; child.checked = false; }); }
@@ -73,7 +77,7 @@ function roleDOM(loaded) {
   loaded.runtime.clearTimeout = () => {};
   loaded.runtime.document = {
     getElementById: node,
-    createElement: () => new Element(),
+    createElement: tag => new Element(tag),
     createTextNode: text => ({text}),
     querySelectorAll(selector) {
       assert.ok(selector.startsWith('#role-permission-options input'));
@@ -181,6 +185,214 @@ test('admin tabs expose linked panels and standard keyboard navigation', () => {
   assert.equal(loaded.state.tab, 'connections');
   tabs[1].classList.remove('hidden');
   assert.equal(press(0, 'Enter'), false);
+});
+
+test('account invitations have an admin form and a public single-use acceptance page', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'assets/index.html'), 'utf8');
+  const inviteHtml = fs.readFileSync(path.join(__dirname, 'assets/invite.html'), 'utf8');
+  const inviteJs = fs.readFileSync(path.join(__dirname, 'assets/invite.js'), 'utf8');
+  const appJs = fs.readFileSync(path.join(__dirname, 'assets/app.js'), 'utf8');
+
+  for (const id of ['account-invitation-create', 'account-invitation-email',
+    'account-invitation-refresh', 'account-invitation-rows']) {
+    assert.match(html, new RegExp('id="' + id + '"'));
+  }
+  assert.match(appJs, /POST', body: \{ email \}/);
+  assert.match(appJs, /DELETE'\s*\}\)/);
+  assert.match(inviteHtml, /id="invitation-accept"/);
+  assert.match(inviteHtml, /id="invitation-token"/);
+  assert.match(inviteJs, /window\.location\.hash/);
+  assert.match(inviteJs, /\/v1\/account-invitations\/accept/);
+  assert.match(inviteJs, /history\.replaceState/);
+});
+
+test('security alarm audit tab requests the alarm report with category and severity filters', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'assets/index.html'), 'utf8');
+  assert.match(html, /data-audit="alarms">安全告警/);
+  assert.match(html, /<option value="account">账号<\/option>/);
+
+  let requested = '';
+  const loaded = app(async path => {
+    requested = path;
+    return reply(200, {events: [{
+      id: 7, created_at_ms: Date.UTC(2026, 10, 24), username: 'alice', host_id: 'host-a',
+      category: 'security', severity: 'warning', code: 'host_access_denied',
+      summary: '主机按访问策略拒绝了连接', source_action: 'host_denied', source_audit_id: 31,
+    }]});
+  }, true);
+  const node = roleDOM(loaded);
+  loaded.state.auth = {mode: 'account', token: 'audit-reader', permissions: ['audit.read'], scoped_permissions: []};
+  loaded.state.auditTab = 'alarms';
+  node('alarm-category').value = 'security';
+  node('alarm-severity').value = 'warning';
+
+  await loaded.loadAudit(true);
+
+  assert.match(requested, /^\/v1\/alarms\?/);
+  assert.match(requested, /category=security/);
+  assert.match(requested, /severity=warning/);
+  assert.equal(node('audit-head').children[0].children.length, 8);
+  assert.equal(node('audit-rows').children.length, 1);
+});
+
+test('my account verifies the saved recovery email and keeps unsaved edits out of the request', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'assets/index.html'), 'utf8');
+  assert.match(html, /id="mine-email-verification-send"/);
+  assert.match(html, /id="mine-email-verification-token"/);
+  assert.match(html, /id="mine-email-verification-confirm"/);
+
+  const requests = [];
+  const loaded = app(async (url, options) => {
+    requests.push({url, options});
+    return url === '/v1/account/email/verify'
+      ? reply(202, {status: 'sent'})
+      : reply(200, {email_verified: true});
+  }, true);
+  const node = roleDOM(loaded);
+  loaded.state.auth = {mode: 'account', token: 'account-token'};
+  loaded.state.accountInfo = {
+    user: {username: 'alice', email: 'alice@example.com', role: 'user'},
+    email_verified: false,
+  };
+  node('mine-email').value = 'new@example.com';
+
+  await loaded.requestMineEmailVerification();
+  assert.equal(requests.length, 0, 'unsaved address must not receive the token');
+
+  node('mine-email').value = 'alice@example.com';
+  await loaded.requestMineEmailVerification();
+  assert.equal(requests[0].url, '/v1/account/email/verify');
+  assert.equal(requests[0].options.method, 'POST');
+  assert.equal(loaded.state.accountEmailVerificationSent, true);
+
+  node('mine-email-verification-token').value = 'one-time-token';
+  await loaded.confirmMineEmailVerification();
+  assert.equal(requests[1].url, '/v1/account/email/verify/confirm');
+  assert.equal(requests[1].options.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[1].options.body), {token: 'one-time-token'});
+  assert.equal(loaded.state.accountInfo.email_verified, true);
+  assert.equal(loaded.state.accountEmailVerificationSent, false);
+  assert.equal(node('mine-email-verification-token').value, '');
+  assert.equal(node('mine-email-verification-state').textContent, '找回邮箱已验证。');
+});
+
+test('my account can subscribe only a verified global auditor to alarm email', async () => {
+  const requests = [];
+  const loaded = app(async (url, options) => {
+    requests.push({url, options});
+    return reply(200, {enabled: JSON.parse(options.body).enabled});
+  }, true);
+  const node = roleDOM(loaded);
+  loaded.state.accountInfo = {
+    user: {username: 'alice', email: 'alice@example.com'},
+    email_verified: false,
+    alarm_email_enabled: false,
+    alarm_email_available: true,
+    can_receive_security_alerts: true,
+  };
+  loaded.renderMineAlarmEmailPreference();
+  assert.equal(node('mine-alarm-email-preference').disabled, true);
+  await loaded.setMineAlarmEmailPreference(true);
+  assert.equal(requests.length, 0, 'unverified address cannot subscribe');
+
+  loaded.state.accountInfo.email_verified = true;
+  await loaded.setMineAlarmEmailPreference(true);
+  assert.equal(requests[0].url, '/v1/account/alarm-email-preference');
+  assert.equal(requests[0].options.method, 'PUT');
+  assert.deepEqual(JSON.parse(requests[0].options.body), {enabled: true});
+  assert.equal(loaded.state.accountInfo.alarm_email_enabled, true);
+  await loaded.setMineAlarmEmailPreference(false);
+  assert.deepEqual(JSON.parse(requests[1].options.body), {enabled: false});
+  assert.equal(loaded.state.accountInfo.alarm_email_enabled, false);
+
+  loaded.state.accountInfo.can_receive_security_alerts = false;
+  await loaded.setMineAlarmEmailPreference(true);
+  assert.equal(requests.length, 2, 'accounts without global audit access cannot subscribe');
+});
+
+test('account administrators can restore trusted login devices and manage the allowlist', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'assets/index.html'), 'utf8');
+  for (const id of ['account-login-devices-dialog', 'account-login-device-rows',
+    'account-login-device-policy-enabled', 'account-login-device-key', 'account-login-device-name']) {
+    assert.match(html, new RegExp('id="' + id + '"'));
+  }
+
+  const requests = [];
+  let enabled = false;
+  let devices = [];
+  const loaded = app(async (url, options = {}) => {
+    requests.push({url, options});
+    if (url.endsWith('/login-devices') && options.method !== 'POST') {
+      return reply(200, {enabled, devices});
+    }
+    if (url.endsWith('/login-devices/policy')) {
+      enabled = JSON.parse(options.body).enabled;
+      return reply(200, {enabled, devices});
+    }
+    if (url.endsWith('/login-devices')) {
+      devices = [{id: 'fingerprint-a', device_name: 'Alice laptop', created_at_ms: 1000, last_seen_at_ms: 2000}];
+      return reply(201, {enabled, devices});
+    }
+    if (url.endsWith('/fingerprint-a')) {
+      devices = [];
+      return reply(204, null);
+    }
+    throw new Error('unexpected request: ' + url);
+  }, true);
+  const node = roleDOM(loaded);
+  loaded.state.auth = {mode: 'account', token: 'admin-token', permissions: ['accounts.read', 'accounts.write'], scoped_permissions: []};
+  const user = {username: 'alice'};
+  const account = loaded.accountRow(user);
+  const loginDevices = account.children[6].children[0].children[3];
+  assert.equal(loginDevices.textContent, '登录设备');
+  assert.equal(loginDevices.disabled, false);
+  loginDevices.click();
+  await loaded.loadAccountLoginDevices();
+  assert.equal(node('account-login-devices-dialog').open, true);
+  assert.equal(requests[0].url, '/v1/accounts/alice/login-devices');
+  assert.equal(node('account-login-device-rows').children.length, 0);
+
+  node('account-login-device-name').value = 'Alice laptop';
+  node('account-login-device-key').value = 'raw-ed25519-public-key';
+  await loaded.trustAccountLoginDevice();
+  assert.equal(requests.at(-1).url, '/v1/accounts/alice/login-devices');
+  assert.deepEqual(JSON.parse(requests.at(-1).options.body), {
+    device_name: 'Alice laptop', public_key: 'raw-ed25519-public-key',
+  });
+  assert.equal(node('account-login-device-rows').children.length, 1);
+
+  node('account-login-device-policy-enabled').checked = true;
+  loaded.renderAccountLoginDevicePolicyControls(1);
+  await loaded.saveAccountLoginDevicePolicy();
+  assert.equal(requests.at(-1).url, '/v1/accounts/alice/login-devices/policy');
+  assert.deepEqual(JSON.parse(requests.at(-1).options.body), {enabled: true});
+  assert.equal(node('account-login-device-policy-enabled').checked, true);
+
+  loaded.runtime.window.confirm = () => false;
+  node('account-login-device-policy-enabled').checked = false;
+  loaded.renderAccountLoginDevicePolicyControls(1);
+  const requestCount = requests.length;
+  await loaded.saveAccountLoginDevicePolicy();
+  assert.equal(requests.length, requestCount, 'cancelled policy change does not reach the server');
+  assert.equal(node('account-login-device-policy-enabled').checked, true);
+  loaded.runtime.window.confirm = () => true;
+
+  const revoke = node('account-login-device-rows').children[0].children[4].children[0].children[0];
+  assert.equal(revoke.tagName, 'BUTTON');
+  assert.equal(revoke.disabled, false);
+  assert.equal(typeof revoke.listeners.click, 'function');
+  await revoke.click();
+  const revoked = requests.find(request => request.url === '/v1/accounts/alice/login-devices/fingerprint-a');
+  assert.equal(revoked.options.method, 'DELETE');
+  assert.equal(node('account-login-device-rows').children.length, 0);
+
+  loaded.state.auth.permissions = ['accounts.read'];
+  loaded.renderAccountLoginDevices({enabled: true, devices: [{
+    id: 'fingerprint-b', device_name: 'Other laptop', created_at_ms: 1000, last_seen_at_ms: 2000,
+  }]});
+  assert.equal(node('account-login-device-policy-enabled').disabled, true);
+  assert.equal(node('account-login-device-trust-submit').disabled, true);
+  assert.equal(node('account-login-device-rows').children[0].children[4].children[0].children[0].disabled, true);
 });
 
 test('scrollable table regions are focusable and named by their columns', () => {

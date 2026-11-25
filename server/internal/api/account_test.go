@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	serverapi "github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
@@ -2379,7 +2381,14 @@ func TestAccountLoginLockout(t *testing.T) {
 		Lockout:     30 * time.Second,
 		Now:         func() time.Time { return now },
 	})
-	s := testutil.StartWith(t, testutil.Options{LoginLimiter: limiter})
+	var queuedAlarms []account.AlarmEvent
+	s := testutil.StartWith(t, testutil.Options{
+		LoginLimiter: limiter,
+		AlarmQueue: serverapi.AlarmQueueFunc(func(alarm account.AlarmEvent) error {
+			queuedAlarms = append(queuedAlarms, alarm)
+			return errors.New("notification queue unavailable")
+		}),
+	})
 	for _, name := range []string{"alice", "bob"} {
 		if _, err := s.Accounts.CreateUser(name, "correct horse"); err != nil {
 			t.Fatalf("create %s: %v", name, err)
@@ -2436,6 +2445,20 @@ func TestAccountLoginLockout(t *testing.T) {
 	if !sawTriggered || !sawLocked {
 		t.Fatalf("lockout audit missing: triggering=%v locked=%v events=%+v",
 			sawTriggered, sawLocked, events)
+	}
+	alarms, err := s.Accounts.AlarmEventsForFilterBefore("", account.AlarmFilter{
+		Code: "account_login_locked", Username: "alice",
+	}, 0, 10)
+	if err != nil {
+		t.Fatalf("query account lockout alarm: %v", err)
+	}
+	if len(alarms) != 1 || alarms[0].Username != "alice" ||
+		alarms[0].SourceAction != account.AuditLogin || alarms[0].Severity != "warning" {
+		t.Fatalf("account lockout alarms = %+v, want one threshold-crossing event", alarms)
+	}
+	if len(queuedAlarms) != 1 || queuedAlarms[0].ID != alarms[0].ID ||
+		queuedAlarms[0].Code != "account_login_locked" {
+		t.Fatalf("queued lockout alarms = %+v, want exactly the committed threshold event", queuedAlarms)
 	}
 }
 

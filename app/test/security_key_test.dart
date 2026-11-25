@@ -18,9 +18,12 @@ void main() {
 
   setUp(() {
     calls.clear();
+    ServerApi.loginDeviceProofProviderForTesting =
+        (ServerSettings _, Duration _) async => null;
   });
 
   tearDown(() {
+    ServerApi.loginDeviceProofProviderForTesting = null;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
   });

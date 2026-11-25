@@ -564,12 +564,15 @@ func writeAccountError(w http.ResponseWriter, err error) {
 	case errors.Is(err, account.ErrUnknownUser):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, account.ErrUserExists), errors.Is(err, account.ErrLastAdmin),
-		errors.Is(err, account.ErrEmailTaken), errors.Is(err, account.ErrPhoneTaken):
+		errors.Is(err, account.ErrEmailTaken), errors.Is(err, account.ErrPhoneTaken),
+		errors.Is(err, account.ErrEmailAlreadyVerified):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, account.ErrInvalidUsername), errors.Is(err, account.ErrWeakPassword),
 		errors.Is(err, account.ErrInvalidRole), errors.Is(err, account.ErrInvalidEmail),
 		errors.Is(err, account.ErrInvalidPhone), errors.Is(err, account.ErrNoRecoveryEmail),
 		errors.Is(err, account.ErrNoRecoveryPhone), errors.Is(err, account.ErrInvalidResetToken),
+		errors.Is(err, account.ErrInvalidEmailVerificationToken),
+		errors.Is(err, account.ErrInvalidAccountInvitation),
 		errors.Is(err, account.ErrInvalidResetCode):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, account.ErrAccountBanned):

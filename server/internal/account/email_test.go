@@ -50,6 +50,61 @@ func TestEmailStoredAndUnique(t *testing.T) {
 	}
 }
 
+func TestEmailVerificationLifecycle(t *testing.T) {
+	store := openTemp(t, "email-verification.db")
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+	if _, err := store.CreateUserWithEmail("alice", "secret123", "alice@example.com"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if verified, err := store.EmailVerified("alice"); err != nil || verified {
+		t.Fatalf("new address verification state = %v, %v", verified, err)
+	}
+	first, _, expires, err := store.CreateEmailVerification("alice", time.Hour)
+	if err != nil || !expires.Equal(now.Add(time.Hour)) {
+		t.Fatalf("create first verification token: expires=%v err=%v", expires, err)
+	}
+	second, _, _, err := store.CreateEmailVerification("alice", time.Hour)
+	if err != nil || first == second {
+		t.Fatalf("replace verification token: first=%q second=%q err=%v", first, second, err)
+	}
+	if err := store.ConsumeEmailVerification(first, "alice"); !errors.Is(err, ErrInvalidEmailVerificationToken) {
+		t.Fatalf("replaced token remained usable: %v", err)
+	}
+	if err := store.ConsumeEmailVerification(second, "bob"); !errors.Is(err, ErrInvalidEmailVerificationToken) {
+		t.Fatalf("another account consumed token: %v", err)
+	}
+	if err := store.ConsumeEmailVerification(second, "alice"); err != nil {
+		t.Fatalf("consume current token: %v", err)
+	}
+	if verified, err := store.EmailVerified("alice"); err != nil || !verified {
+		t.Fatalf("verified address state = %v, %v", verified, err)
+	}
+	if err := store.ConsumeEmailVerification(second, "alice"); !errors.Is(err, ErrInvalidEmailVerificationToken) {
+		t.Fatalf("verification token replay accepted: %v", err)
+	}
+	if _, err := store.SetEmail("alice", "alice@example.com"); err != nil {
+		t.Fatalf("save existing address: %v", err)
+	}
+	if verified, err := store.EmailVerified("alice"); err != nil || !verified {
+		t.Fatalf("saving unchanged email cleared verification = %v, %v", verified, err)
+	}
+	if _, err := store.SetEmail("alice", "new@example.com"); err != nil {
+		t.Fatalf("change verified address: %v", err)
+	}
+	if verified, err := store.EmailVerified("alice"); err != nil || verified {
+		t.Fatalf("changed address retained verification = %v, %v", verified, err)
+	}
+	expiring, _, _, err := store.CreateEmailVerification("alice", time.Minute)
+	if err != nil {
+		t.Fatalf("create expiring token: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	if err := store.ConsumeEmailVerification(expiring, "alice"); !errors.Is(err, ErrInvalidEmailVerificationToken) {
+		t.Fatalf("expired verification token accepted: %v", err)
+	}
+}
+
 func TestCheckPassword(t *testing.T) {
 	store := openTemp(t, "state.db")
 	if _, err := store.CreateUser("alice", "secret123"); err != nil {

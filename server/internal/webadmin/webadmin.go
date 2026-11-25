@@ -24,9 +24,11 @@ const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 
 var assets embed.FS
 
 var allowed = map[string]string{
-	"index.html": "text/html; charset=utf-8",
-	"app.js":     "text/javascript; charset=utf-8",
-	"style.css":  "text/css; charset=utf-8",
+	"index.html":  "text/html; charset=utf-8",
+	"invite.html": "text/html; charset=utf-8",
+	"app.js":      "text/javascript; charset=utf-8",
+	"invite.js":   "text/javascript; charset=utf-8",
+	"style.css":   "text/css; charset=utf-8",
 }
 
 // Handler serves the console. index.html is returned for the mount point

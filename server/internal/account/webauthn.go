@@ -407,6 +407,11 @@ func (s *Store) RemoveWebAuthnCredential(userID string, credentialID []byte, pas
 // first; a second concurrent finish finds the challenge gone and fails.
 // purpose selects which login ceremony the challenge belongs to.
 func (s *Store) CompleteWebAuthnLogin(username, purpose string, credentialID, expectedChallenge []byte, signCount uint32, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
+	return s.CompleteWebAuthnLoginWithDeviceProof(username, purpose, credentialID,
+		expectedChallenge, signCount, deviceID, deviceName, LoginDeviceProof{})
+}
+
+func (s *Store) CompleteWebAuthnLoginWithDeviceProof(username, purpose string, credentialID, expectedChallenge []byte, signCount uint32, deviceID, deviceName string, proof LoginDeviceProof) (User, string, time.Time, string, time.Time, error) {
 	if !validLoginPurpose(purpose) {
 		return User{}, "", time.Time{}, "", time.Time{}, errors.New("invalid security key login purpose")
 	}
@@ -454,6 +459,10 @@ func (s *Store) CompleteWebAuthnLogin(username, purpose string, credentialID, ex
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: begin security key login: %w", s.path, err)
 	}
 	defer tx.Rollback()
+	deviceID, err = s.loginDeviceProofTx(tx, user.ID, deviceName, deviceID, proof, now)
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	}
 	res, err := tx.Exec(
 		`DELETE FROM webauthn_challenges
 		 WHERE user_id = ? AND purpose = ? AND challenge = ? AND expires_at > ?`,

@@ -24,6 +24,96 @@ type auditResponse struct {
 	NextBeforeID int64            `json:"next_before_id,omitempty"`
 }
 
+type alarmEventView struct {
+	ID            int64  `json:"id"`
+	CreatedAtMS   int64  `json:"created_at_ms"`
+	Username      string `json:"username"`
+	HostID        string `json:"host_id,omitempty"`
+	ClientIP      string `json:"client_ip,omitempty"`
+	Location      string `json:"location,omitempty"`
+	Category      string `json:"category"`
+	Severity      string `json:"severity"`
+	Code          string `json:"code"`
+	Summary       string `json:"summary"`
+	Detail        string `json:"detail,omitempty"`
+	SourceAction  string `json:"source_action"`
+	SourceAuditID int64  `json:"source_audit_id"`
+}
+
+type alarmResponse struct {
+	Events       []alarmEventView `json:"events"`
+	NextBeforeID int64            `json:"next_before_id,omitempty"`
+}
+
+// alarmLog exposes independently persisted security alarms through the same
+// audit permission and group scope as the existing audit reports.
+func (s *server) alarmLog(w http.ResponseWriter, r *http.Request) {
+	groupID, ok := s.auditGroupFilter(w, r)
+	if !ok {
+		return
+	}
+	if groupID == "" {
+		if _, _, ok := s.consoleActor(w, r, consoleRead, account.TokenResourceAudit); !ok {
+			return
+		}
+	}
+	if s.cfg.Accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
+		return
+	}
+	if asCSV, ok := exportRequest(w, r); !ok {
+		return
+	} else if asCSV {
+		s.alarmsCSV(w, r, groupID)
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 200 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+	beforeID, ok := s.listBeforeID(w, r)
+	if !ok {
+		return
+	}
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
+	alarms, err := s.cfg.Accounts.AlarmEventsForFilterBefore(groupID, account.AlarmFilter{
+		Category: r.URL.Query().Get("category"),
+		Severity: r.URL.Query().Get("severity"),
+		Code:     r.URL.Query().Get("code"),
+		Username: r.URL.Query().Get("user"),
+		HostID:   r.URL.Query().Get("host"),
+		Bounds:   bounds,
+	}, beforeID, limit)
+	if err != nil {
+		s.cfg.Logger.Error("security alarm query", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read security alarms")
+		return
+	}
+	out := alarmResponse{Events: make([]alarmEventView, 0, len(alarms))}
+	for _, alarm := range alarms {
+		out.Events = append(out.Events, alarmEventView{
+			ID: alarm.ID, CreatedAtMS: alarm.CreatedAt.UnixMilli(),
+			Username: alarm.Username, HostID: alarm.HostID,
+			ClientIP: alarm.ClientIP, Location: alarm.Location,
+			Category: alarm.Category, Severity: alarm.Severity,
+			Code: alarm.Code, Summary: alarm.Summary, Detail: alarm.Detail,
+			SourceAction: alarm.SourceAction, SourceAuditID: alarm.SourceAuditID,
+		})
+	}
+	if len(out.Events) > 0 {
+		out.NextBeforeID = nextBeforeID(out.Events[len(out.Events)-1].ID, len(out.Events), limit)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // auditLog exposes the persisted account-security trail to console readers.
 // Any console role may read it; ordinary viewer accounts may not.
 func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {

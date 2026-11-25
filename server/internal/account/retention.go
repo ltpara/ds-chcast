@@ -52,6 +52,31 @@ func (s *Store) PruneBefore(cutoff time.Time) (PruneReport, error) {
 	return report, nil
 }
 
+// AlarmPruneReport counts removed security alarm events.
+type AlarmPruneReport struct {
+	Alarms int64 `json:"alarms"`
+}
+
+// PruneAlarmsBefore deletes only alarms older than cutoff. Alarm age retention
+// is independent from audit-history retention so an operator can keep the
+// security event stream longer than its source audit rows.
+func (s *Store) PruneAlarmsBefore(cutoff time.Time) (AlarmPruneReport, error) {
+	if cutoff.IsZero() {
+		return AlarmPruneReport{}, errors.New("alarm retention cutoff must not be zero")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(`DELETE FROM alarm_events WHERE created_at < ?`, unixMillis(cutoff.UTC()))
+	if err != nil {
+		return AlarmPruneReport{}, fmt.Errorf("account store %s: prune security alarms: %w", s.path, err)
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return AlarmPruneReport{}, fmt.Errorf("account store %s: count pruned security alarms: %w", s.path, err)
+	}
+	return AlarmPruneReport{Alarms: removed}, nil
+}
+
 // TombstoneReport counts address-book tombstones removed by retention.
 type TombstoneReport struct {
 	Peers  int64 `json:"peers"`

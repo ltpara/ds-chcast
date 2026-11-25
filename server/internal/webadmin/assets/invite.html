@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>接受账号邀请 · chast</title>
+  <link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/invite.js" defer></script>
+</head>
+<body>
+  <main class="auth-page">
+    <section class="panel auth-panel">
+      <div class="panel-head"><h1>接受账号邀请</h1></div>
+      <p class="muted">创建普通查看器账号。邀请邮箱将作为已验证邮箱保存。</p>
+      <form id="invitation-accept" class="stack-form" autocomplete="on">
+        <label>邀请代码<input id="invitation-token" name="token" required autocomplete="one-time-code" spellcheck="false"></label>
+        <label>用户名<input id="invitation-username" name="username" required maxlength="64" autocomplete="username" spellcheck="false"></label>
+        <label>密码<input id="invitation-password" name="password" type="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
+        <button type="submit" class="primary">创建账号</button>
+      </form>
+      <p id="invitation-status" class="muted" role="status" aria-live="polite"></p>
+      <p id="invitation-login" class="hidden">账号已创建。现在可以返回 chast 查看器并使用新账号登录。</p>
+    </section>
+  </main>
+</body>
+</html>

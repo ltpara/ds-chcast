@@ -183,6 +183,52 @@ func (s *server) auditCSV(w http.ResponseWriter, r *http.Request, group string) 
 	export.done()
 }
 
+func (s *server) alarmsCSV(w http.ResponseWriter, r *http.Request, group string) {
+	bounds, ok := reportTimeBounds(w, r)
+	if !ok {
+		return
+	}
+	filter := account.AlarmFilter{
+		Category: r.URL.Query().Get("category"),
+		Severity: r.URL.Query().Get("severity"),
+		Code:     r.URL.Query().Get("code"),
+		Username: strings.TrimSpace(r.URL.Query().Get("user")),
+		HostID:   strings.TrimSpace(r.URL.Query().Get("host")),
+		Bounds:   bounds,
+	}
+	export := s.newCSVExport(w, "chast-alarms", "alarm", []string{
+		"id", "created_at", "category", "severity", "code", "summary",
+		"username", "host_id", "client_ip", "location", "source_action",
+		"source_audit_id", "detail",
+	})
+	var before int64
+	for {
+		alarms, err := s.cfg.Accounts.AlarmEventsForFilterBefore(group, filter, before, exportBatch)
+		if err != nil {
+			export.fail(err, "could not read security alarms")
+			return
+		}
+		rows := make([][]string, 0, len(alarms))
+		for _, alarm := range alarms {
+			rows = append(rows, []string{
+				strconv.FormatInt(alarm.ID, 10),
+				alarm.CreatedAt.UTC().Format(time.RFC3339Nano),
+				alarm.Category, alarm.Severity, alarm.Code, alarm.Summary,
+				alarm.Username, alarm.HostID, alarm.ClientIP, alarm.Location,
+				alarm.SourceAction, strconv.FormatInt(alarm.SourceAuditID, 10), alarm.Detail,
+			})
+		}
+		if !export.write(rows) {
+			return
+		}
+		if len(alarms) < exportBatch {
+			break
+		}
+		before = alarms[len(alarms)-1].ID
+	}
+	export.done()
+}
+
 func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request, group string) {
 	username := r.URL.Query().Get("username")
 	host := strings.TrimSpace(r.URL.Query().Get("host"))

@@ -66,13 +66,14 @@ type webauthnLoginBeginResponse struct {
 }
 
 type webauthnLoginFinishRequest struct {
-	Username          string `json:"username"`
-	CredentialID      string `json:"credential_id"`
-	ClientDataJSON    string `json:"client_data_json"`
-	AuthenticatorData string `json:"authenticator_data"`
-	Signature         string `json:"signature"`
-	DeviceID          string `json:"device_id"`
-	DeviceName        string `json:"device_name"`
+	Username          string           `json:"username"`
+	CredentialID      string           `json:"credential_id"`
+	ClientDataJSON    string           `json:"client_data_json"`
+	AuthenticatorData string           `json:"authenticator_data"`
+	Signature         string           `json:"signature"`
+	DeviceID          string           `json:"device_id"`
+	DeviceName        string           `json:"device_name"`
+	DeviceProof       loginDeviceProof `json:"device_proof"`
 }
 
 func viewWebAuthnCredential(cred account.WebAuthnCredential) webauthnCredentialView {
@@ -544,12 +545,23 @@ func (s *server) finishWebAuthnAssertion(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, "could not complete the login")
 		return
 	}
-	user, token, _, refresh, _, err := s.cfg.Accounts.CompleteWebAuthnLogin(
-		user.Username, purpose, credential.ID, expected, counter, req.DeviceID, req.DeviceName)
+	user, token, _, refresh, _, err := s.cfg.Accounts.CompleteWebAuthnLoginWithDeviceProof(
+		user.Username, purpose, credential.ID, expected, counter, req.DeviceID, req.DeviceName,
+		req.DeviceProof.accountProof())
 	switch {
 	case errors.Is(err, account.ErrAccountBanned):
 		s.auditLogin(r, username, "account banned", false)
 		writeError(w, http.StatusForbidden, "account is banned")
+		return
+	case errors.Is(err, account.ErrLoginDeviceNotAllowed):
+		s.auditLogin(r, username, "login device not trusted", false)
+		writeLoginDeviceAuthError(w, http.StatusForbidden, "login_device_not_allowed",
+			"this device is not on the account's trusted login list")
+		return
+	case errors.Is(err, account.ErrInvalidLoginDeviceProof):
+		s.auditLogin(r, username, "login device proof rejected", false)
+		writeLoginDeviceAuthError(w, http.StatusUnauthorized, "login_device_proof",
+			"device verification failed; retry sign-in")
 		return
 	case errors.Is(err, account.ErrWebAuthnChallenge), errors.Is(err, account.ErrWebAuthnCredential):
 		reject("security key assertion replayed", http.StatusUnauthorized,

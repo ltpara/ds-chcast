@@ -74,6 +74,56 @@ func TestPostgresLiveSnapshotRejectsStaleWriter(t *testing.T) {
 	}
 }
 
+func TestPostgresAlarmEventsFromAudit(t *testing.T) {
+	dsn := pgtest.Schema(t)
+	store, err := OpenPostgres(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	user, err := store.CreateUserWithRole("pg-alarm-auditor", "correct horse", "pg-alarm@example.com", "", RoleAdmin)
+	if err != nil {
+		t.Fatalf("create PostgreSQL alarm auditor: %v", err)
+	}
+	verification, _, _, err := store.CreateEmailVerification(user.Username, time.Hour)
+	if err != nil {
+		t.Fatalf("create PostgreSQL email verification: %v", err)
+	}
+	if err := store.ConsumeEmailVerification(verification, user.Username); err != nil {
+		t.Fatalf("verify PostgreSQL alarm email: %v", err)
+	}
+	if err := store.SetAlarmEmailPreference(user.ID, true); err != nil {
+		t.Fatalf("subscribe PostgreSQL alarm email: %v", err)
+	}
+
+	denial := AuditEvent{
+		Username: "-", Action: AuditHostDenied, HostID: "pg-alarm-host",
+		ClientIP: "192.0.2.8", Detail: "policy denied access", EventKey: "pg-stable-denial",
+	}
+	if err := store.AppendAudit(denial); err != nil {
+		t.Fatalf("append PostgreSQL host denial: %v", err)
+	}
+	if err := store.AppendAudit(denial); err != nil {
+		t.Fatalf("append PostgreSQL retry: %v", err)
+	}
+	alarms, err := store.AlarmEventsForFilterBefore("", AlarmFilter{
+		Code: "host_access_denied", HostID: "PG-ALARM-HOST",
+	}, 0, 10)
+	if err != nil {
+		t.Fatalf("query PostgreSQL alarms: %v", err)
+	}
+	if len(alarms) != 1 || alarms[0].SourceAction != AuditHostDenied ||
+		alarms[0].HostID != "pg-alarm-host" || alarms[0].SourceAuditID <= 0 {
+		t.Fatalf("PostgreSQL alarms = %+v", alarms)
+	}
+	delivery, err := store.ClaimAlarmEmailDelivery(time.Now().UTC(), 30*time.Second)
+	if err != nil || delivery == nil || delivery.Recipient != "pg-alarm@example.com" ||
+		delivery.Alarm.Code != "host_access_denied" {
+		t.Fatalf("PostgreSQL alarm email delivery = %+v, %v", delivery, err)
+	}
+}
+
 // TestPostgresStore exercises the PostgreSQL backend end to end. It is gated
 // on CHAST_TEST_POSTGRES_DSN so the default SQLite test run stays self-contained.
 func TestPostgresStore(t *testing.T) {

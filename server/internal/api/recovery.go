@@ -15,6 +15,8 @@ import (
 type Mailer interface {
 	SendPasswordReset(to, username, token, link string, ttl time.Duration) error
 	SendLoginCode(to, username, code string, ttl time.Duration) error
+	SendEmailVerification(to, username, token string, ttl time.Duration) error
+	SendAccountInvitation(to, token, link string, ttl time.Duration) error
 }
 
 // SMSer delivers one SMS password-reset code and one login second-factor code.
@@ -133,6 +135,67 @@ func (s *server) changeAccountEmail(w http.ResponseWriter, r *http.Request) {
 	s.recordAudit(r, user.Username, account.AuditAccountEmail, detail, true)
 	s.cfg.Logger.Info("account recovery email changed", "user", updated.Username)
 	writeJSON(w, http.StatusOK, emailChangeResponse{Email: updated.Email})
+}
+
+type emailVerificationRequest struct {
+	Token string `json:"token"`
+}
+
+type emailVerificationResponse struct {
+	Status        string `json:"status,omitempty"`
+	EmailVerified bool   `json:"email_verified,omitempty"`
+	ExpiresAtMS   int64  `json:"expires_at_ms,omitempty"`
+}
+
+// requestAccountEmailVerification sends a single-use token to the account's
+// saved email address. A new request replaces any older token.
+func (s *server) requestAccountEmailVerification(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	if s.cfg.Mailer == nil {
+		writeError(w, http.StatusServiceUnavailable, "email delivery is not configured")
+		return
+	}
+	if !s.allowRecovery("email-verify|" + strings.ToLower(user.Username)) {
+		writeError(w, http.StatusTooManyRequests, "a verification email was requested too recently")
+		return
+	}
+	token, target, expires, err := s.cfg.Accounts.CreateEmailVerification(user.Username, s.cfg.RecoveryTTL)
+	if err != nil {
+		writeAccountError(w, err)
+		return
+	}
+	if err := s.cfg.Mailer.SendEmailVerification(target.Email, target.Username, token, s.cfg.RecoveryTTL); err != nil {
+		s.cfg.Logger.Warn("account email verification send failed", "user", target.Username, "error", err)
+		s.recordAudit(r, user.Username, account.AuditAccountEmail, "verification email failed", false)
+		writeError(w, http.StatusBadGateway, "could not send the verification email")
+		return
+	}
+	s.recordAudit(r, user.Username, account.AuditAccountEmail, "verification email sent", true)
+	writeJSON(w, http.StatusAccepted, emailVerificationResponse{
+		Status: "sent", ExpiresAtMS: expires.UnixMilli(),
+	})
+}
+
+// confirmAccountEmailVerification consumes the token sent to the saved address.
+func (s *server) confirmAccountEmailVerification(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	var req emailVerificationRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.cfg.Accounts.ConsumeEmailVerification(req.Token, user.Username); err != nil {
+		writeAccountError(w, err)
+		return
+	}
+	s.recordAudit(r, user.Username, account.AuditAccountEmail, "email verified", true)
+	writeJSON(w, http.StatusOK, emailVerificationResponse{EmailVerified: true})
 }
 
 // changeAccountPhone lets a signed-in user attach or clear the SMS recovery

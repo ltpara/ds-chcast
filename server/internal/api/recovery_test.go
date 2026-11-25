@@ -21,10 +21,12 @@ type resetMail struct {
 }
 
 type fakeMailer struct {
-	mu     sync.Mutex
-	sent   []resetMail
-	logins []resetMail
-	err    error
+	mu            sync.Mutex
+	sent          []resetMail
+	logins        []resetMail
+	verifications []resetMail
+	invitations   []resetMail
+	err           error
 }
 
 func (f *fakeMailer) SendPasswordReset(to, username, token, link string, ttl time.Duration) error {
@@ -47,6 +49,34 @@ func (f *fakeMailer) SendLoginCode(to, username, code string, ttl time.Duration)
 	return nil
 }
 
+func (f *fakeMailer) SendEmailVerification(to, username, token string, ttl time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.verifications = append(f.verifications,
+		resetMail{To: to, Username: username, Token: token, TTL: ttl})
+	return nil
+}
+
+func (f *fakeMailer) SendAccountInvitation(to, token, link string, ttl time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.invitations = append(f.invitations,
+		resetMail{To: to, Token: token, Link: link, TTL: ttl})
+	return nil
+}
+
+func (f *fakeMailer) invitationMessages() []resetMail {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]resetMail(nil), f.invitations...)
+}
+
 func (f *fakeMailer) messages() []resetMail {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -57,6 +87,12 @@ func (f *fakeMailer) loginMessages() []resetMail {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]resetMail(nil), f.logins...)
+}
+
+func (f *fakeMailer) verificationMessages() []resetMail {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]resetMail(nil), f.verifications...)
 }
 
 func TestAccountEmailChange(t *testing.T) {
@@ -135,6 +171,119 @@ func TestAccountEmailChange(t *testing.T) {
 	}
 	if status, data := change("new@example.com", "correct horse", ""); status != http.StatusUnauthorized {
 		t.Fatalf("change without token: %d %s", status, data)
+	}
+}
+
+func TestAccountEmailVerificationLifecycle(t *testing.T) {
+	mailer := &fakeMailer{}
+	s := testutil.StartWith(t, testutil.Options{Mailer: mailer})
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	aliceToken := login(t, s.URL, "alice", "correct horse").Token
+	bobToken := login(t, s.URL, "bob", "battery staple").Token
+	changeBody, _ := json.Marshal(map[string]string{
+		"email": "alice@example.com", "password": "correct horse",
+	})
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/email", string(changeBody), aliceToken); status != http.StatusOK {
+		t.Fatalf("set email: %d %s", status, body)
+	}
+	if verified, err := s.Accounts.EmailVerified("alice"); err != nil || verified {
+		t.Fatalf("new address verification state = %v, %v", verified, err)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/email/verify", "", aliceToken); status != http.StatusAccepted {
+		t.Fatalf("request verification: %d %s", status, body)
+	}
+	verificationMessages := mailer.verificationMessages()
+	if len(verificationMessages) != 1 || verificationMessages[0].To != "alice@example.com" ||
+		verificationMessages[0].Token == "" {
+		t.Fatalf("verification mail = %+v", verificationMessages)
+	}
+	body, _ := json.Marshal(map[string]string{"token": verificationMessages[0].Token})
+	if status, reply := request(t, http.MethodPost, s.URL+"/v1/account/email/verify/confirm", string(body), bobToken); status != http.StatusBadRequest {
+		t.Fatalf("another account consumed the token: %d %s", status, reply)
+	}
+	if verified, err := s.Accounts.EmailVerified("alice"); err != nil || verified {
+		t.Fatalf("cross-account attempt changed verification state = %v, %v", verified, err)
+	}
+	if status, reply := request(t, http.MethodPost, s.URL+"/v1/account/email/verify/confirm", string(body), aliceToken); status != http.StatusOK {
+		t.Fatalf("confirm verification: %d %s", status, reply)
+	}
+	if verified, err := s.Accounts.EmailVerified("alice"); err != nil || !verified {
+		t.Fatalf("confirmed email verification state = %v, %v", verified, err)
+	}
+	if status, reply := request(t, http.MethodPost, s.URL+"/v1/account/email/verify/confirm", string(body), aliceToken); status != http.StatusBadRequest {
+		t.Fatalf("verification token replay: %d %s", status, reply)
+	}
+
+	changeBody, _ = json.Marshal(map[string]string{
+		"email": "alice-new@example.com", "password": "correct horse",
+	})
+	if status, reply := request(t, http.MethodPost, s.URL+"/v1/account/email", string(changeBody), aliceToken); status != http.StatusOK {
+		t.Fatalf("change verified email: %d %s", status, reply)
+	}
+	if verified, err := s.Accounts.EmailVerified("alice"); err != nil || verified {
+		t.Fatalf("changed address kept old verification = %v, %v", verified, err)
+	}
+	status, reply := request(t, http.MethodGet, s.URL+"/v1/account", "", aliceToken)
+	var info struct {
+		EmailVerified bool `json:"email_verified"`
+	}
+	if err := json.Unmarshal(reply, &info); status != http.StatusOK || err != nil || info.EmailVerified {
+		t.Fatalf("account verification status: %d %+v (%v)", status, info, err)
+	}
+}
+
+func TestAccountAlarmEmailPreferenceRequiresVerifiedGlobalAuditor(t *testing.T) {
+	mailer := &fakeMailer{}
+	s := testutil.StartWith(t, testutil.Options{Mailer: mailer})
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	aliceToken := login(t, s.URL, "alice", "correct horse").Token
+	bobToken := login(t, s.URL, "bob", "battery staple").Token
+	if status, body := request(t, http.MethodPut, s.URL+"/v1/account/alarm-email-preference", `{"enabled":true}`, aliceToken); status != http.StatusBadRequest {
+		t.Fatalf("enable without verified email: %d %s", status, body)
+	}
+	changeBody, _ := json.Marshal(map[string]string{
+		"email": "alice@example.com", "password": "correct horse",
+	})
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/email", string(changeBody), aliceToken); status != http.StatusOK {
+		t.Fatalf("set email: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/email/verify", "", aliceToken); status != http.StatusAccepted {
+		t.Fatalf("request email verification: %d %s", status, body)
+	}
+	messages := mailer.verificationMessages()
+	if len(messages) != 1 {
+		t.Fatalf("verification messages = %+v", messages)
+	}
+	confirmBody, _ := json.Marshal(map[string]string{"token": messages[0].Token})
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/email/verify/confirm", string(confirmBody), aliceToken); status != http.StatusOK {
+		t.Fatalf("confirm email: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPut, s.URL+"/v1/account/alarm-email-preference", `{"enabled":true}`, bobToken); status != http.StatusForbidden {
+		t.Fatalf("non-auditor enabled alert mail: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPut, s.URL+"/v1/account/alarm-email-preference", `{"enabled":true}`, aliceToken); status != http.StatusOK {
+		t.Fatalf("enable alert mail: %d %s", status, body)
+	}
+	var info struct {
+		AlarmEmailEnabled bool `json:"alarm_email_enabled"`
+	}
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", aliceToken); status != http.StatusOK {
+		t.Fatalf("get account after enabling alerts: %d %s", status, body)
+	} else if err := json.Unmarshal(body, &info); err != nil || !info.AlarmEmailEnabled {
+		t.Fatalf("account alert preference = %+v, %v", info, err)
+	}
+	if status, body := request(t, http.MethodPut, s.URL+"/v1/account/alarm-email-preference", `{"enabled":false}`, aliceToken); status != http.StatusOK {
+		t.Fatalf("disable alert mail: %d %s", status, body)
 	}
 }
 

@@ -2980,6 +2980,31 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "signLoginDeviceChallenge") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        std::vector<uint8_t> message;
+        if (text == nullptr || text->empty() || text->size() > 4096 ||
+            !chast::decode_ticket_base64url(*text, &message) || message.empty()) {
+            result->Error("bad_args", "signLoginDeviceChallenge wants a base64url message");
+            return;
+        }
+        std::vector<uint8_t> seed;
+        std::string error;
+        if (!load_or_create_ticket_seed(&seed, &error)) {
+            result->Error("ticket_key", error);
+            return;
+        }
+        std::vector<uint8_t> signature;
+        const bool signed_ok = chast::sign_access_ticket_proof(seed, message, &signature);
+        std::fill(seed.begin(), seed.end(), '\0');
+        if (!signed_ok) {
+            result->Error("ticket_key", "could not sign the login device challenge");
+            return;
+        }
+        result->Success(flutter::EncodableValue(chast::encode_ticket_base64url(signature)));
+        return;
+    }
+
     if (method == "renewAccessTicket") {
         const auto* text = std::get_if<std::string>(call.arguments());
         std::vector<uint8_t> ticket;

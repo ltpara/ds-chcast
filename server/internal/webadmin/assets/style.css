@@ -104,12 +104,26 @@ main {
   padding: 18px 0 40px;
 }
 
+.auth-page {
+  display: grid;
+  place-items: start center;
+  width: 100%;
+  padding-top: min(12vh, 100px);
+}
+
+.auth-panel { width: min(480px, 100%); }
+.auth-panel h1 { margin: 0; font-size: 20px; }
+.stack-form { display: flex; flex-direction: column; gap: 12px; }
+.stack-form label { display: flex; flex-direction: column; gap: 5px; }
+.stack-form input { width: 100%; }
+.stack-form button { align-self: flex-start; }
+
 input, select, button {
   font: inherit;
   color: var(--text);
 }
 
-input[type="search"], input[type="password"], input[type="text"], input:not([type]), select {
+input[type="search"], input[type="password"], input[type="text"], input[type="email"], input:not([type]), select {
   background: var(--bg-soft);
   border: 1px solid var(--border);
   border-radius: 8px;

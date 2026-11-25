@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/account"
 )
 
 type fakeSMTP struct {
@@ -161,6 +163,103 @@ func TestSendLoginCode(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no SMTP message")
+	}
+}
+
+func TestSendEmailVerification(t *testing.T) {
+	server := startFakeSMTP(t, false)
+	sender, err := New(Config{Addr: server.addr, From: "chast@example.com", TLS: TLSOff})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	if err := sender.SendEmailVerification(
+		"alice@example.com", "alice", "verify-token-1", 30*time.Minute,
+	); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case body := <-server.messages:
+		for _, want := range []string{
+			"To: alice@example.com",
+			"Subject: chast email verification",
+			`account "alice"`,
+			"verify-token-1",
+			"30m0s",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("message missing %q:\n%s", want, body)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no SMTP message")
+	}
+}
+
+func TestSendAccountInvitation(t *testing.T) {
+	server := startFakeSMTP(t, false)
+	sender, err := New(Config{Addr: server.addr, From: "chast@example.com", TLS: TLSOff})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	link := "https://console.example.com/admin/invite.html#token=invite-code"
+	if err := sender.SendAccountInvitation(
+		"new.person@example.com", "invite-code", link, 48*time.Hour,
+	); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case body := <-server.messages:
+		for _, want := range []string{
+			"To: new.person@example.com",
+			"Subject: chast account invitation",
+			"invite-code",
+			link,
+			"48h0m0s",
+			"viewer access",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("message missing %q:\n%s", want, body)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no SMTP message")
+	}
+}
+
+func TestSendSecurityAlarm(t *testing.T) {
+	server := startFakeSMTP(t, false)
+	sender, err := New(Config{Addr: server.addr, From: "chast@example.com", TLS: TLSOff})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	alarm := account.AlarmEvent{
+		ID: 7, CreatedAt: time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC),
+		Username: "alice", HostID: "desk-01", Category: "security", Severity: "warning",
+		Code: "host_access_denied", Summary: "主机按访问策略拒绝了连接",
+		Detail: "private audit payload",
+	}
+	if err := sender.SendSecurityAlarm("alice@example.com", alarm); err != nil {
+		t.Fatalf("send security alarm: %v", err)
+	}
+	select {
+	case body := <-server.messages:
+		for _, want := range []string{
+			"To: alice@example.com", "Subject: chast security alert: host_access_denied",
+			"Category: security", "Severity: warning", "Summary: 主机按访问策略拒绝了连接",
+			"Account: alice", "Host: desk-01", "2026-11-24T12:00:00Z",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("message missing %q:\n%s", want, body)
+			}
+		}
+		if strings.Contains(body, alarm.Detail) {
+			t.Fatalf("free-form audit detail leaked into email:\n%s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no SMTP message")
+	}
+	if err := sender.SendSecurityAlarm("alice@example.com", account.AlarmEvent{Code: "bad\r\nBcc: x"}); err == nil {
+		t.Fatal("alarm header injection accepted")
 	}
 }
 

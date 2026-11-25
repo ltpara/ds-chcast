@@ -16,6 +16,8 @@ import (
 	"net/smtp"
 	"strings"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/account"
 )
 
 // TLS modes accepted by New. StartTLS is the default and requires the server
@@ -144,6 +146,75 @@ func (s *Sender) SendLoginCode(to, username, code string, ttl time.Duration) err
 		username, ttl.Round(time.Minute), code,
 	)
 	return s.deliver(recipient.Address, s.headers(recipient.Address, subject)+body)
+}
+
+// SendEmailVerification delivers the single-use token that marks the saved
+// recovery address as locally verified.
+func (s *Sender) SendEmailVerification(to, username, token string, ttl time.Duration) error {
+	recipient, err := mail.ParseAddress(strings.TrimSpace(to))
+	if err != nil || recipient.Name != "" || recipient.Address == "" {
+		return fmt.Errorf("recipient %q is not a bare email address", to)
+	}
+	if strings.ContainsAny(username, "\r\n") || strings.ContainsAny(token, "\r\n") {
+		return errors.New("verification message contained a line break")
+	}
+	subject := "chast email verification"
+	body := fmt.Sprintf(
+		"A verification was requested for the chast account %q.\r\n\r\n"+
+			"Enter this single-use token within %s to confirm ownership of this address:\r\n\r\n%s\r\n\r\n"+
+			"If you did not request it, ignore this message.\r\n",
+		username, ttl.Round(time.Minute), token,
+	)
+	return s.deliver(recipient.Address, s.headers(recipient.Address, subject)+body)
+}
+
+// SendAccountInvitation sends the single-use code that creates an ordinary
+// viewer account. The recipient email becomes verified when the code is used.
+func (s *Sender) SendAccountInvitation(to, token, link string, ttl time.Duration) error {
+	recipient, err := mail.ParseAddress(strings.TrimSpace(to))
+	if err != nil || recipient.Name != "" || recipient.Address == "" {
+		return fmt.Errorf("recipient %q is not a bare email address", to)
+	}
+	if strings.ContainsAny(token+link, "\r\n") {
+		return errors.New("account invitation message contained a line break")
+	}
+	subject := "chast account invitation"
+	body := fmt.Sprintf(
+		"You have been invited to create a chast viewer account.\r\n\r\n"+
+			"Use this single-use invitation code within %s:\r\n\r\n%s\r\n\r\n"+
+			"The account will start with viewer access.\r\n",
+		ttl.Round(time.Minute), token,
+	)
+	if link != "" {
+		body += "\r\nOpen this page to accept the invitation:\r\n" + link + "\r\n"
+	} else {
+		body += "\r\nOpen the chast server invitation page and enter the code above.\r\n"
+	}
+	return s.deliver(recipient.Address, s.headers(recipient.Address, subject)+body)
+}
+
+// SendSecurityAlarm sends the useful audit context without including free-form
+// audit detail, which can contain values that should remain in the console.
+func (s *Sender) SendSecurityAlarm(to string, alarm account.AlarmEvent) error {
+	recipient, err := mail.ParseAddress(strings.TrimSpace(to))
+	if err != nil || recipient.Name != "" || recipient.Address == "" {
+		return fmt.Errorf("recipient %q is not a bare email address", to)
+	}
+	for _, value := range []string{alarm.Category, alarm.Severity, alarm.Code,
+		alarm.Summary, alarm.Username, alarm.HostID} {
+		if strings.ContainsAny(value, "\r\n") {
+			return errors.New("security alarm message contained a line break")
+		}
+	}
+	body := fmt.Sprintf(
+		"A security alarm was recorded by the chast server.\r\n\r\n"+
+			"Category: %s\r\nSeverity: %s\r\nEvent: %s\r\nSummary: %s\r\n"+
+			"Account: %s\r\nHost: %s\r\nTime (UTC): %s\r\n\r\n"+
+			"Sign in to the management console to review the event.",
+		alarm.Category, alarm.Severity, alarm.Code, alarm.Summary,
+		alarm.Username, alarm.HostID, alarm.CreatedAt.UTC().Format(time.RFC3339),
+	)
+	return s.deliver(recipient.Address, s.headers(recipient.Address, "chast security alert: "+alarm.Code)+body)
 }
 
 func (s *Sender) headers(to, subject string) string {

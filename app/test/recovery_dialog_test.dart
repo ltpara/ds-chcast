@@ -88,8 +88,11 @@ void main() {
       'load|account-token',
       'save|account-token|new@example.com|secret123',
     ]);
+    expect(results, isEmpty);
+    expect(find.byKey(const Key('recovery-email-verification-state')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('recovery-email-close')));
+    await tester.pumpAndSettle();
     expect(results, <String?>['new@example.com']);
-    expect(find.byKey(const Key('recovery-email-save')), findsNothing);
   });
 
   testWidgets('an empty address clears the recovery email',
@@ -124,7 +127,135 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(saved, <String>['']);
+    expect(results, isEmpty);
+    await tester.tap(find.byKey(const Key('recovery-email-close')));
+    await tester.pumpAndSettle();
     expect(results, <String?>['']);
+  });
+
+  testWidgets('recovery email can be verified after sending a token',
+      (WidgetTester tester) async {
+    final List<String> calls = <String>[];
+    final List<String?> results = await open<String>(
+      tester,
+      RecoveryEmailDialog(
+        server: settings,
+        account: account,
+        infoFetcher: (ServerSettings server, String token) async {
+          return const AccountInfo(
+            username: 'alice',
+            email: 'alice@example.com',
+            emailVerified: false,
+          );
+        },
+        requestEmailVerification: (
+          ServerSettings server,
+          String token,
+        ) async {
+          calls.add('send|$token');
+        },
+        confirmEmailVerification: (
+          ServerSettings server,
+          String token, {
+          required String verificationToken,
+        }) async {
+          calls.add('confirm|$token|$verificationToken');
+        },
+      ),
+    );
+
+    expect(
+      find.byKey(const Key('recovery-email-verification-state')),
+      findsOneWidget,
+    );
+    expect(find.text('邮箱尚未验证'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('recovery-email-send-verification')));
+    await tester.pumpAndSettle();
+
+    expect(calls, <String>['send|account-token']);
+    expect(find.text('验证邮件已发送，请输入邮件中的令牌'), findsOneWidget);
+    await tester.enterText(
+      find.byKey(const Key('recovery-email-verification-token')),
+      ' one-time-token ',
+    );
+    await tester.tap(find.byKey(const Key('recovery-email-confirm-verification')));
+    await tester.pumpAndSettle();
+
+    expect(calls, <String>[
+      'send|account-token',
+      'confirm|account-token|one-time-token',
+    ]);
+    expect(
+      tester.widget<Text>(
+        find.byKey(const Key('recovery-email-verification-state')),
+      ).data,
+      '邮箱已验证',
+    );
+    expect(find.byKey(const Key('recovery-email-send-verification')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('recovery-email-close')));
+    await tester.pumpAndSettle();
+    expect(results, <String?>[null]);
+  });
+
+  testWidgets('global auditor can opt into security alarm email',
+      (WidgetTester tester) async {
+    final List<bool> saved = <bool>[];
+    await open<String>(
+      tester,
+      RecoveryEmailDialog(
+        server: settings,
+        account: account,
+        infoFetcher: (ServerSettings server, String token) async {
+          return const AccountInfo(
+            username: 'alice',
+            email: 'alice@example.com',
+            emailVerified: true,
+            alarmEmailAvailable: true,
+            canReceiveSecurityAlerts: true,
+          );
+        },
+        setAlarmEmailPreference: (
+          ServerSettings server,
+          String token, {
+          required bool enabled,
+        }) async {
+          saved.add(enabled);
+        },
+      ),
+    );
+
+    final Finder preference =
+        find.byKey(const Key('recovery-email-alarm-preference'));
+    expect(preference, findsOneWidget);
+    await tester.tap(preference);
+    await tester.pumpAndSettle();
+    expect(saved, <bool>[true]);
+    expect(find.text('安全告警邮件已开启'), findsOneWidget);
+  });
+
+  testWidgets('alarm email preference is hidden without global audit access',
+      (WidgetTester tester) async {
+    await open<String>(
+      tester,
+      RecoveryEmailDialog(
+        server: settings,
+        account: account,
+        infoFetcher: (ServerSettings server, String token) async {
+          return const AccountInfo(
+            username: 'alice',
+            email: 'alice@example.com',
+            emailVerified: true,
+            alarmEmailAvailable: true,
+            canReceiveSecurityAlerts: false,
+          );
+        },
+      ),
+    );
+    expect(
+      find.byKey(const Key('recovery-email-alarm-preference')),
+      findsNothing,
+    );
   });
 
   testWidgets('the email format is validated before calling the API',
@@ -203,6 +334,9 @@ void main() {
     await tester.tap(find.byKey(const Key('recovery-email-save')));
     await tester.pumpAndSettle();
 
+    expect(results, isEmpty);
+    await tester.tap(find.byKey(const Key('recovery-email-close')));
+    await tester.pumpAndSettle();
     expect(results, <String?>['new@example.com']);
   });
 

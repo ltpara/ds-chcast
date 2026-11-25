@@ -26,6 +26,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/acl"
 	"github.com/ltpara/ds-chcast/server/internal/acmecert"
 	"github.com/ltpara/ds-chcast/server/internal/admin"
+	"github.com/ltpara/ds-chcast/server/internal/alarmnotify"
 	"github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/auditarchive"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
@@ -101,6 +102,8 @@ func run() error {
 		smtpTLS          = flag.String("smtp-tls", mail.TLSStart, "SMTP security: starttls, implicit or none")
 		recoveryURL      = flag.String("recovery-url", "", "page password-reset links point at; the token is always included in the mail")
 		recoveryTTL      = flag.Duration("recovery-ttl", 30*time.Minute, "password-reset token lifetime")
+		invitationURL    = flag.String("invitation-url", "", "public account invitation page included in invitation emails; empty sends a code to enter manually")
+		invitationTTL    = flag.Duration("invitation-ttl", 7*24*time.Hour, "account invitation lifetime")
 		smsURL           = flag.String("sms-url", "", "HTTP SMS gateway endpoint for password-reset codes; empty disables SMS recovery")
 		smsToken         = flag.String("sms-token", "", "bearer token sent to --sms-url; prefer an env file over the command line")
 		smsFrom          = flag.String("sms-from", "", "optional sender ID passed to the SMS gateway")
@@ -125,6 +128,7 @@ func run() error {
 		ldapTimeout      = flag.Duration("ldap-timeout", 8*time.Second, "deadline for one directory login")
 		ldapAutoCreate   = flag.Bool("ldap-auto-create", true, "link a directory user to a new account on first login")
 		auditRetention   = flag.Int("audit-retention-days", 0, "delete audit, connection and file-transfer history older than this many days; 0 keeps the row caps only")
+		alarmRetention   = flag.Int("alarm-retention-days", 0, "delete security alarms older than this many days; 0 keeps the 10000-row cap only")
 		auditArchive     = flag.String("audit-archive-dir", "", "append audit, connection and file-transfer history to JSONL files in this directory; empty disables the archive")
 		archiveEvery     = flag.Duration("audit-archive-interval", time.Hour, "how often new history rows are appended to the archive")
 		archiveGzip      = flag.Bool("audit-archive-compress", true, "gzip archive files once their UTC day is closed")
@@ -288,6 +292,16 @@ func run() error {
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			return errors.New("--recovery-url must be an absolute http or https URL")
 		}
+	}
+	invitePage := strings.TrimSpace(*invitationURL)
+	if invitePage != "" {
+		parsed, err := url.Parse(invitePage)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return errors.New("--invitation-url must be an absolute http or https URL")
+		}
+	}
+	if *invitationTTL < time.Minute {
+		return errors.New("--invitation-ttl must be at least 1m")
 	}
 	smsEndpoint := strings.TrimSpace(*smsURL)
 	if smsEndpoint == "" {
@@ -512,6 +526,9 @@ func run() error {
 	}
 	if *recordingsQuota < 0 || *recordingsMax < 0 || *recordingsDays < 0 {
 		return errors.New("--recordings-quota-mb, --recordings-max-mb and --recordings-retention-days must not be negative")
+	}
+	if *alarmRetention < 0 {
+		return errors.New("--alarm-retention-days must not be negative")
 	}
 	var acmeManager *acmecert.Manager
 	acmeDomainsRaw := strings.TrimSpace(*acmeDomain)
@@ -927,6 +944,10 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if accounts != nil && mailSender != nil {
+		go alarmnotify.New(accounts, mailSender, log).Run(ctx)
+		log.Info("security alarm email delivery enabled")
+	}
 	var recordingArchive *recordings.Archive
 	if *recordingsDir != "" {
 		if accounts == nil {
@@ -977,8 +998,9 @@ func run() error {
 			}
 		}()
 	}
-	if (*auditRetention > 0 || *tombstoneDays > 0) && accounts != nil {
+	if (*auditRetention > 0 || *alarmRetention > 0 || *tombstoneDays > 0) && accounts != nil {
 		auditAge := time.Duration(*auditRetention) * 24 * time.Hour
+		alarmAge := time.Duration(*alarmRetention) * 24 * time.Hour
 		tombstoneAge := time.Duration(*tombstoneDays) * 24 * time.Hour
 		prune := func() {
 			if auditAge > 0 {
@@ -988,6 +1010,14 @@ func run() error {
 				} else if report.AuditEvents+report.Connections+report.FileTransfers > 0 {
 					log.Info("history retention pruned rows", "audit", report.AuditEvents,
 						"connections", report.Connections, "transfers", report.FileTransfers)
+				}
+			}
+			if alarmAge > 0 {
+				report, err := accounts.PruneAlarmsBefore(time.Now().Add(-alarmAge))
+				if err != nil {
+					log.Error("security alarm retention", "error", err)
+				} else if report.Alarms > 0 {
+					log.Info("security alarm retention pruned rows", "alarms", report.Alarms)
 				}
 			}
 			if tombstoneAge > 0 {
@@ -1215,6 +1245,8 @@ func run() error {
 		SMS:                        apiSMS,
 		RecoveryURL:                resetPage,
 		RecoveryTTL:                *recoveryTTL,
+		InvitationURL:              invitePage,
+		InvitationTTL:              *invitationTTL,
 		SMSTTL:                     *smsTTL,
 		WebAuthnRPID:               relyingParty,
 		WebAuthnOrigins:            webauthnOrigins,

@@ -217,7 +217,7 @@ func (s *server) recordHostDenial(hostID string, req hostAuditRequest) error {
 	if req.OccurredAtMS > 0 {
 		createdAt = time.UnixMilli(req.OccurredAtMS)
 	}
-	if err := s.cfg.Accounts.AppendAudit(account.AuditEvent{
+	alarm, err := s.cfg.Accounts.AppendAuditWithAlarm(account.AuditEvent{
 		HostID:    hostID,
 		EventKey:  hex.EncodeToString(digest[:]),
 		Username:  "-",
@@ -227,8 +227,10 @@ func (s *server) recordHostDenial(hostID string, req hostAuditRequest) error {
 		Location:  s.clientLocation(ip),
 		Success:   false,
 		CreatedAt: createdAt,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+	s.enqueueAlarm(alarm)
 	return nil
 }

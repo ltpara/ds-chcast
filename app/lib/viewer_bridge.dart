@@ -2075,6 +2075,16 @@ class ViewerBridge {
     return key ?? '';
   }
 
+  /// Signs a base64url challenge using the DPAPI-protected installation key.
+  /// The private seed stays in the Windows bridge and is never returned to Dart.
+  static Future<String> signLoginDeviceChallenge(String message) async {
+    final String? signature = await _channel.invokeMethod<String>(
+      'signLoginDeviceChallenge',
+      message,
+    );
+    return signature ?? '';
+  }
+
   /// Hands a freshly fetched ticket to the running managed session. The engine
   /// sends TicketRenew on its own thread and moves the host's lease to the new
   /// expiry. Returns false when no session is running or the ticket is not a

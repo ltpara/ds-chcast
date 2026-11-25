@@ -2,7 +2,7 @@
 
 日期：2026-11-24
 分支：`codex/complete-workspace-2026-11-20`
-状态：**工作区已实现告警查询、管理台和持久邮件投递；S05 整体验收仍在进行，产品代码尚未提交**
+状态：**代码和自动化门禁已通过；PostgreSQL、SMTP 与部署验收仍在进行**
 
 ## 已交付
 
@@ -54,3 +54,7 @@
 ## 2026-11-24 后续工作区门禁补充
 
 随后接入的 v33 登录设备白名单尚未提交。该工作区的 Go 全量测试和 Windows Release 构建通过；Flutter 最新全量运行有两项安全密钥登录测试失败，`flutter analyze --no-pub` 报告六项 lint 提示。因此上方 877/877 是 S05/S06 切片基线，不代表当前整个工作区门禁通过。PostgreSQL 实库、真实 SMTP 和部署浏览器验收仍待完成。账号安全功能的优先级和后续顺序见[账号安全与企业治理计划](account-security-priority-and-next-plan-2026-11-24.md)。
+
+## 2026-11-25 门禁与恢复界面更新
+
+上节记录的问题已修复：既有安全密钥登录测试使用无设备证明测试 provider，设备证明 API 由单独测试验证；Flutter 全量 880/880、`flutter analyze --no-pub` 无问题。管理台现已补齐管理员登录设备列表、公钥登记、白名单启停和设备撤销；权限区分全局 `accounts.read` 与 `accounts.write`，启停/撤销会话影响有确认提示，无设备时不能启用。Go 全量及 `go vet ./...`、管理台 Node 53/53 和 `cmake --build build --config Release --parallel 4` 均通过。PostgreSQL 实库、真实 SMTP、部署浏览器和双机恢复仍待完成，详见[当前完成状态与后续计划](current-status-and-next-plan-2026-11-17.md)。

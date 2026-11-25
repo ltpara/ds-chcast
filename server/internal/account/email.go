@@ -62,7 +62,10 @@ func (s *Store) SetEmail(username, email string) (User, error) {
 		return User{}, fmt.Errorf("account store %s: begin email change: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE users SET email = ? WHERE username = ?`, email, username)
+	res, err := tx.Exec(`UPDATE users SET
+		email_verified_at = CASE WHEN email <> ? THEN 0 ELSE email_verified_at END,
+		alarm_email_enabled = CASE WHEN email <> ? THEN FALSE ELSE alarm_email_enabled END,
+		email = ? WHERE username = ?`, email, email, email, username)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return User{}, ErrEmailTaken
@@ -83,6 +86,21 @@ func (s *Store) SetEmail(username, email string) (User, error) {
 		username,
 	); err != nil {
 		return User{}, fmt.Errorf("account store %s: drop login email code: %w", s.path, err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM email_verification_tokens WHERE user_id = (SELECT id FROM users WHERE username = ?)`,
+		username,
+	); err != nil {
+		return User{}, fmt.Errorf("account store %s: drop email verification token: %w", s.path, err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE alarm_email_deliveries SET status = 'cancelled', lease_until = 0
+		 WHERE user_id = (SELECT id FROM users WHERE username = ?)
+		   AND status IN ('pending', 'retry')
+		   AND (recipient <> ? OR NOT (SELECT alarm_email_enabled FROM users WHERE username = ?))`,
+		username, email, username,
+	); err != nil {
+		return User{}, fmt.Errorf("account store %s: cancel stale alarm email deliveries: %w", s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return User{}, fmt.Errorf("account store %s: commit email change: %w", s.path, err)

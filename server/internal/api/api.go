@@ -202,6 +202,13 @@ type Config struct {
 	// Mailer delivers password-reset messages. Nil disables self-service
 	// recovery, while other account routes keep working.
 	Mailer Mailer
+	// InvitationURL is an optional public page used in invitation emails. The
+	// one-time code remains present in the message when this is empty.
+	InvitationURL string
+	InvitationTTL time.Duration
+	// AlarmQueue accepts newly persisted security alarms for asynchronous
+	// notification. Nil leaves notifications disabled.
+	AlarmQueue AlarmQueue
 	// SMS delivers password-reset codes through an HTTP gateway. Nil disables
 	// SMS recovery.
 	SMS SMSer
@@ -263,6 +270,9 @@ func New(cfg Config) http.Handler {
 	if cfg.RecoveryTTL <= 0 {
 		cfg.RecoveryTTL = 30 * time.Minute
 	}
+	if cfg.InvitationTTL <= 0 {
+		cfg.InvitationTTL = 7 * 24 * time.Hour
+	}
 	if cfg.SMSTTL <= 0 {
 		cfg.SMSTTL = 10 * time.Minute
 	}
@@ -292,6 +302,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("PATCH /v1/identities/{id}", s.updateIdentity)
 	mux.HandleFunc("POST /v1/identities/bulk", s.bulkDevices)
 	mux.HandleFunc("POST /v1/account/login", s.login)
+	mux.HandleFunc("POST /v1/account/login-device-challenge", s.createLoginDeviceChallenge)
 	mux.HandleFunc("POST /v1/account/login/sms", s.requestLoginSMSCode)
 	mux.HandleFunc("POST /v1/account/login/email", s.requestLoginEmailCode)
 	mux.HandleFunc("POST /v1/account/login/webauthn/begin", s.beginWebAuthnLogin)
@@ -309,7 +320,13 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/refresh", s.refresh)
 	mux.HandleFunc("POST /v1/account/logout", s.logout)
 	mux.HandleFunc("GET /v1/account", s.accountInfo)
+	mux.HandleFunc("GET /v1/account/login-devices", s.listLoginDevices)
+	mux.HandleFunc("PUT /v1/account/login-devices/policy", s.setLoginDevicePolicy)
+	mux.HandleFunc("DELETE /v1/account/login-devices/{id}", s.revokeLoginDevice)
+	mux.HandleFunc("PUT /v1/account/alarm-email-preference", s.setAlarmEmailPreference)
 	mux.HandleFunc("POST /v1/account/email", s.changeAccountEmail)
+	mux.HandleFunc("POST /v1/account/email/verify", s.requestAccountEmailVerification)
+	mux.HandleFunc("POST /v1/account/email/verify/confirm", s.confirmAccountEmailVerification)
 	mux.HandleFunc("POST /v1/account/phone", s.changeAccountPhone)
 	mux.HandleFunc("POST /v1/account/password", s.changeAccountPassword)
 	mux.HandleFunc("POST /v1/account/recover", s.requestPasswordRecovery)
@@ -358,6 +375,7 @@ func New(cfg Config) http.Handler {
 	}
 	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/audit", s.auditLog)
+	mux.HandleFunc("GET /v1/alarms", s.alarmLog)
 	mux.HandleFunc("GET /v1/audit/connections", s.auditConnections)
 	mux.HandleFunc("POST /v1/account/connections", s.recordAccountConnection)
 	mux.HandleFunc("GET /v1/account/connections", s.accountConnections)
@@ -400,6 +418,10 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/role-bindings/{id}", s.deleteRoleBinding)
 	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /v1/accounts", s.adminCreateAccount)
+	mux.HandleFunc("GET /v1/account-invitations", s.adminListAccountInvitations)
+	mux.HandleFunc("POST /v1/account-invitations", s.adminCreateAccountInvitation)
+	mux.HandleFunc("DELETE /v1/account-invitations/{id}", s.adminCancelAccountInvitation)
+	mux.HandleFunc("POST /v1/account-invitations/accept", s.acceptAccountInvitation)
 	mux.HandleFunc("PATCH /v1/accounts/{username}", s.adminUpdateAccount)
 	mux.HandleFunc("DELETE /v1/accounts/{username}", s.adminDeleteAccount)
 	mux.HandleFunc("POST /v1/accounts/{username}/ban", s.adminSetAccountBan)
@@ -411,6 +433,10 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/accounts/{username}/recover", s.adminSendAccountResetEmail)
 	mux.HandleFunc("POST /v1/accounts/{username}/sms", s.adminSendAccountSMSCode)
 	mux.HandleFunc("POST /v1/accounts/{username}/2fa/reset", s.adminResetAccountTwoFactor)
+	mux.HandleFunc("GET /v1/accounts/{username}/login-devices", s.adminListLoginDevices)
+	mux.HandleFunc("POST /v1/accounts/{username}/login-devices", s.adminTrustLoginDevice)
+	mux.HandleFunc("PUT /v1/accounts/{username}/login-devices/policy", s.adminSetLoginDevicePolicy)
+	mux.HandleFunc("DELETE /v1/accounts/{username}/login-devices/{id}", s.adminRevokeLoginDevice)
 	mux.HandleFunc("GET /v1/accounts/{username}/sessions", s.adminAccountSessions)
 	mux.HandleFunc("POST /v1/accounts/{username}/sessions/revoke-all", s.adminRevokeAccountSessions)
 	mux.HandleFunc("DELETE /v1/accounts/{username}/sessions/{id}", s.adminRevokeAccountSession)

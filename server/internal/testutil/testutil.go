@@ -96,7 +96,11 @@ type Options struct {
 	// by the account database instead of process memory.
 	LoginPersistent bool
 	// Mailer delivers password-reset mail. Nil leaves recovery routes at 503.
-	Mailer api.Mailer
+	Mailer        api.Mailer
+	InvitationURL string
+	InvitationTTL time.Duration
+	// AlarmQueue receives newly persisted security alarms for notification.
+	AlarmQueue api.AlarmQueue
 	// SMS delivers password-reset codes. Nil leaves SMS recovery at 503.
 	SMS api.SMSer
 	// RecoveryURL and RecoveryTTL shape reset links and token lifetime.
@@ -392,6 +396,9 @@ func StartWith(t testing.TB, opts Options) *Server {
 		Accounts:                   accounts,
 		Recordings:                 recordingArchive,
 		Mailer:                     opts.Mailer,
+		InvitationURL:              opts.InvitationURL,
+		InvitationTTL:              opts.InvitationTTL,
+		AlarmQueue:                 opts.AlarmQueue,
 		SMS:                        opts.SMS,
 		RecoveryURL:                opts.RecoveryURL,
 		RecoveryTTL:                opts.RecoveryTTL,

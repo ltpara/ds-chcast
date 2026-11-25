@@ -64,6 +64,8 @@
     accountCapUser: null,
     accountRecoveryUser: null,
     accountSessionsUser: null,
+    accountLoginDevicesUser: null,
+    accountLoginDevicePolicyEnabled: false,
     accountSessionsOffset: 0,
     accountSessionsTotal: 0,
     accountSessionsLimit: 20,
@@ -76,6 +78,7 @@
     // Self-service state: GET /v1/account, its sessions, and the pending
     // TOTP secret between start and enable.
     accountInfo: null,
+    accountEmailVerificationSent: false,
     accountSessions: [],
     mineSessionsOffset: 0,
     mineSessionsTotal: 0,
@@ -1010,7 +1013,15 @@
     $('policy-create').disabled = !policyWrite;
     $('policy-import-json').disabled = !policyWrite;
     $('account-create').querySelectorAll('input,select,button').forEach((node) => { node.disabled = !accountsWrite; });
+    $('account-invitation-create').querySelectorAll('input,button').forEach((node) => { node.disabled = !accountsWrite; });
+    $('account-invitation-refresh').disabled = !canPermission('accounts.read');
+    $('account-invitation-readonly').classList.toggle('hidden', accountsWrite);
+    $('account-invitation-rows').querySelectorAll('button').forEach((node) => { node.disabled = !accountsWrite; });
     $('token-create').querySelectorAll('input,select,button').forEach((node) => { node.disabled = !accountsWrite; });
+    if ($('account-login-devices-dialog').open) {
+      if (!canPermission('accounts.read')) $('account-login-devices-dialog').close();
+      else applyAccountLoginDevicePermissions();
+    }
     applyRoleControlPermissions();
 
     if (!visibility[state.tab]) {
@@ -1127,6 +1138,8 @@
     if (tokenSecretDialog.open) tokenSecretDialog.close();
     const accountCapDialog = $('account-cap-dialog');
     if (accountCapDialog.open) accountCapDialog.close();
+    const accountLoginDevicesDialog = $('account-login-devices-dialog');
+    if (accountLoginDevicesDialog.open) accountLoginDevicesDialog.close();
     $('token-secret-value').textContent = '';
     clearSession();
     $('workspace').classList.add('hidden');
@@ -1181,7 +1194,10 @@
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'connections') loadConnections(true).catch(reportError);
     else if (tab === 'policies') loadPolicies().catch(reportError);
-    else if (tab === 'accounts') loadAccounts().catch(reportError);
+    else if (tab === 'accounts') {
+      loadAccounts().catch(reportError);
+      loadAccountInvitations().catch(reportError);
+    }
     else if (tab === 'mine') loadMine().catch(reportError);
     else if (tab === 'tokens') loadTokens().catch(reportError);
     else if (tab === 'groups') loadGroups().catch(reportError);
@@ -2496,6 +2512,43 @@
       data && data.total === undefined ? null : data.total);
   }
 
+  async function loadAccountInvitations() {
+    const data = await api('/v1/account-invitations');
+    renderAccountInvitations(Array.isArray(data && data.invitations) ? data.invitations : []);
+  }
+
+  function renderAccountInvitations(invitations) {
+    const body = $('account-invitation-rows');
+    clear(body);
+    invitations.forEach((invitation) => {
+      const row = document.createElement('tr');
+      row.appendChild(cell(invitation.email));
+      row.appendChild(cell(fmtTime(invitation.created_at_ms)));
+      row.appendChild(cell(fmtTime(invitation.expires_at_ms)));
+      const status = invitation.status === 'pending' ? pill('待接受', 'warn')
+        : invitation.status === 'accepted' ? pill('已接受', 'ok')
+          : invitation.status === 'expired' ? pill('已过期', 'bad')
+            : pill('已撤销');
+      row.appendChild(cell(status));
+      row.appendChild(cell(invitation.accepted_username || '—'));
+      const actions = el('div', 'actions-wrap');
+      if (invitation.status === 'pending') {
+        const cancel = button('撤销', 'small danger');
+        cancel.disabled = !canPermission('accounts.write');
+        cancel.addEventListener('click', () => withButton(cancel, async () => {
+          if (!window.confirm('撤销发往 ' + invitation.email + ' 的邀请？')) return;
+          await api('/v1/account-invitations/' + invitation.id, { method: 'DELETE' });
+          toast('邀请已撤销');
+          await loadAccountInvitations();
+        }));
+        actions.appendChild(cancel);
+      }
+      row.appendChild(cell(actions));
+      body.appendChild(row);
+    });
+    $('account-invitation-empty').classList.toggle('hidden', invitations.length > 0);
+  }
+
   function renderAccounts(users, total) {
     const body = $('account-rows');
     clear(body);
@@ -2573,6 +2626,11 @@
     sessions.addEventListener('click', () => openAccountSessionsDialog(user));
     actions.appendChild(sessions);
 
+    const loginDevices = button('登录设备', 'small');
+    loginDevices.disabled = !canPermission('accounts.read');
+    loginDevices.addEventListener('click', () => openAccountLoginDevicesDialog(user));
+    actions.appendChild(loginDevices);
+
     const ban = button(user.banned ? '解封' : '封禁', 'small' + (user.banned ? '' : ' danger'));
     ban.addEventListener('click', () => withButton(ban, async () => {
       if (!user.banned && !window.confirm('封禁账号 ' + user.username + '？现有会话会被吊销。')) return;
@@ -2623,6 +2681,123 @@
     return tr;
   }
 
+  function openAccountLoginDevicesDialog(user) {
+    state.accountLoginDevicesUser = user;
+    $('account-login-devices-title').textContent = '登录设备 · ' + user.username;
+    $('account-login-device-policy-enabled').checked = false;
+    $('account-login-device-policy-note').textContent = '';
+    $('account-login-device-name').value = '';
+    $('account-login-device-key').value = '';
+    renderAccountLoginDevices({enabled: false, devices: []});
+    $('account-login-devices-dialog').showModal();
+    loadAccountLoginDevices().catch(reportError);
+  }
+
+  async function loadAccountLoginDevices() {
+    const user = state.accountLoginDevicesUser;
+    if (!user) return;
+    const data = await api('/v1/accounts/' + encodeURIComponent(user.username) + '/login-devices');
+    renderAccountLoginDevices(data);
+  }
+
+  function renderAccountLoginDevices(data) {
+    state.accountLoginDevicePolicyEnabled = data.enabled;
+    $('account-login-device-policy-enabled').checked = data.enabled;
+    const canWrite = canPermission('accounts.write');
+
+    const body = $('account-login-device-rows');
+    clear(body);
+    data.devices.forEach((device) => {
+      const row = document.createElement('tr');
+      row.appendChild(cell(device.device_name || '未命名设备'));
+      const id = cell(device.id);
+      id.className = 'mono';
+      row.appendChild(id);
+      row.appendChild(cell(fmtTime(device.created_at_ms)));
+      row.appendChild(cell(fmtTime(device.last_seen_at_ms)));
+      const actions = el('div', 'actions-wrap');
+      const revoke = button('撤销', 'small danger');
+      revoke.disabled = !canWrite;
+      revoke.addEventListener('click', () => withButton(revoke, async () => {
+        if (!window.confirm('撤销 ' + (device.device_name || device.id) + ' 的设备信任？该设备的现有登录会话也会立即失效。')) return;
+        const user = state.accountLoginDevicesUser;
+        await api('/v1/accounts/' + encodeURIComponent(user.username) + '/login-devices/' + encodeURIComponent(device.id), {method: 'DELETE'});
+        toast('已撤销设备 ' + (device.device_name || device.id));
+        await loadAccountLoginDevices();
+      }).finally(applyAccountLoginDevicePermissions));
+      actions.appendChild(revoke);
+      row.appendChild(cell(actions));
+      body.appendChild(row);
+    });
+    $('account-login-device-empty').classList.toggle('hidden', data.devices.length > 0);
+    applyAccountLoginDevicePermissions();
+    renderAccountLoginDevicePolicyControls(data.devices.length);
+  }
+
+  function applyAccountLoginDevicePermissions() {
+    const canWrite = canPermission('accounts.write');
+    $('account-login-device-policy-enabled').disabled = !canWrite;
+    $('account-login-device-trust-submit').disabled = !canWrite;
+    $('account-login-device-name').disabled = !canWrite;
+    $('account-login-device-key').disabled = !canWrite;
+    $('account-login-device-readonly').classList.toggle('hidden', canWrite);
+    $('account-login-device-rows').querySelectorAll('button').forEach((node) => { node.disabled = !canWrite; });
+  }
+
+  function renderAccountLoginDevicePolicyControls(deviceCount) {
+    const enabled = $('account-login-device-policy-enabled').checked;
+    const hasDevices = deviceCount > 0;
+    $('account-login-device-policy-save').disabled = !canPermission('accounts.write') ||
+      enabled === state.accountLoginDevicePolicyEnabled || (enabled && !hasDevices);
+    $('account-login-device-policy-note').textContent = !hasDevices
+      ? '至少登记一台信任设备后才能启用白名单。'
+      : enabled
+        ? '启用后，白名单外设备的现有登录会话会被吊销。'
+        : '停用后，账号可以从任何设备登录。';
+  }
+
+  async function saveAccountLoginDevicePolicy() {
+    const user = state.accountLoginDevicesUser;
+    if (!user || !canPermission('accounts.write')) return;
+    const enabled = $('account-login-device-policy-enabled').checked;
+    const action = enabled ? '启用' : '停用';
+    const effect = enabled
+      ? '白名单外设备的现有登录会话会被吊销。'
+      : '账号将可以从任何设备登录。';
+    const save = $('account-login-device-policy-save');
+    await withButton(save, async () => {
+      if (!window.confirm(action + ' ' + user.username + ' 的登录设备白名单？' + effect)) {
+        $('account-login-device-policy-enabled').checked = state.accountLoginDevicePolicyEnabled;
+        return;
+      }
+      const data = await api('/v1/accounts/' + encodeURIComponent(user.username) + '/login-devices/policy', {
+        method: 'PUT', body: {enabled},
+      });
+      renderAccountLoginDevices(data);
+      toast('已' + action + ' ' + user.username + ' 的登录设备白名单');
+    });
+    renderAccountLoginDevicePolicyControls($('account-login-device-rows').children.length);
+  }
+
+  async function trustAccountLoginDevice() {
+    const user = state.accountLoginDevicesUser;
+    if (!user || !canPermission('accounts.write')) return;
+    const deviceName = $('account-login-device-name').value.trim();
+    const publicKey = $('account-login-device-key').value.trim();
+    if (!window.confirm('将设备“' + deviceName + '”登记为 ' + user.username + ' 的信任登录设备？')) return;
+    const submit = $('account-login-device-trust-submit');
+    await withButton(submit, async () => {
+      const data = await api('/v1/accounts/' + encodeURIComponent(user.username) + '/login-devices', {
+        method: 'POST', body: {device_name: deviceName, public_key: publicKey},
+      });
+      $('account-login-device-name').value = '';
+      $('account-login-device-key').value = '';
+      renderAccountLoginDevices(data);
+      toast('已登记信任设备');
+    });
+    applyAccountLoginDevicePermissions();
+  }
+
   async function createAccount() {
     const username = $('account-username').value.trim();
     const password = $('account-password').value;
@@ -2641,6 +2816,17 @@
         toast('账号已创建');
       }
       await loadAccounts();
+    });
+  }
+
+  async function createAccountInvitation() {
+    const email = $('account-invitation-email').value.trim();
+    const submit = $('account-invitation-create').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/account-invitations', { method: 'POST', body: { email } });
+      $('account-invitation-email').value = '';
+      toast('邀请邮件已发送');
+      await loadAccountInvitations();
     });
   }
 
@@ -4361,6 +4547,24 @@
         ];
       },
     },
+    alarms: {
+      path: '/v1/alarms',
+      filterKey: 'code',
+      filterPlaceholder: '告警代码（可选）',
+      hasHost: true,
+      hasUser: true,
+      hasCategory: true,
+      hasSeverity: true,
+      columns: ['时间', '级别', '分类', '事件', '用户', '主机', '客户端 IP', '详情'],
+      row(event) {
+        const severity = event.severity === 'warning' ? pill('警告', 'warn') : pill('提示', 'ok');
+        return [
+          fmtTime(event.created_at_ms), severity, event.category, event.summary,
+          event.username || '—', event.host_id || '—', event.client_ip || '—',
+          event.detail || event.code,
+        ];
+      },
+    },
   };
 
   function renderAuditGroups() {
@@ -4401,10 +4605,14 @@
     $('audit-host').classList.toggle('hidden', !spec.hasHost);
     $('audit-user').classList.toggle('hidden', !spec.hasUser);
     $('audit-note').classList.toggle('hidden', !spec.hasNote);
+    $('alarm-category').classList.toggle('hidden', !spec.hasCategory);
+    $('alarm-severity').classList.toggle('hidden', !spec.hasSeverity);
     $('audit-filter').value = '';
     $('audit-host').value = '';
     $('audit-user').value = '';
     $('audit-note').value = '';
+    $('alarm-category').value = '';
+    $('alarm-severity').value = '';
     loadAudit(true).catch(reportError);
   }
 
@@ -4426,6 +4634,8 @@
       const note = $('audit-note').value.trim();
       if (note) params.set('note', note);
     }
+    if (spec.hasCategory && $('alarm-category').value) params.set('category', $('alarm-category').value);
+    if (spec.hasSeverity && $('alarm-severity').value) params.set('severity', $('alarm-severity').value);
     // datetime-local is wall-clock time in the operator's zone; the report API
     // takes unix milliseconds, so convert here and let the server stay zone-free.
     [['since', 'audit-since'], ['until', 'audit-until']].forEach(([key, id]) => {
@@ -4763,6 +4973,22 @@
       state.accountSessionsUser = null;
     });
 
+    $('account-login-device-policy').addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveAccountLoginDevicePolicy().catch(reportError);
+    });
+    $('account-login-device-policy-enabled').addEventListener('change', () =>
+      renderAccountLoginDevicePolicyControls($('account-login-device-rows').children.length));
+    $('account-login-device-trust').addEventListener('submit', (event) => {
+      event.preventDefault();
+      trustAccountLoginDevice();
+    });
+    $('account-login-devices-close').addEventListener('click', () =>
+      $('account-login-devices-dialog').close());
+    $('account-login-devices-dialog').addEventListener('close', () => {
+      state.accountLoginDevicesUser = null;
+    });
+
     $('account-recovery-form').addEventListener('submit', (event) => {
       event.preventDefault();
       saveAccountRecovery();
@@ -4805,6 +5031,15 @@
       event.preventDefault();
       createAccount();
     });
+    $('account-invitation-create').addEventListener('submit', (event) => {
+      event.preventDefault();
+      createAccountInvitation().catch(reportError);
+    });
+    $('account-invitation-refresh').addEventListener('click', (event) =>
+      withButton(event.currentTarget, async () => {
+        await loadAccountInvitations();
+        toast('已刷新邀请');
+      }));
     $('account-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
       await loadAccounts();
       toast('已刷新');
@@ -4880,6 +5115,17 @@
     });
     $('mine-email-clear').addEventListener('click', (event) => {
       withButton(event.currentTarget, () => saveMineContact('email', true, null).catch(reportError));
+    });
+    $('mine-email').addEventListener('input', renderMineEmailVerification);
+    $('mine-email-verification-token').addEventListener('input', renderMineEmailVerification);
+    $('mine-email-verification-send').addEventListener('click', (event) => {
+      withButton(event.currentTarget, requestMineEmailVerification);
+    });
+    $('mine-email-verification-confirm').addEventListener('click', (event) => {
+      withButton(event.currentTarget, confirmMineEmailVerification);
+    });
+    $('mine-alarm-email-preference').addEventListener('change', (event) => {
+      setMineAlarmEmailPreference(event.currentTarget.checked).catch(reportError);
     });
     $('mine-phone-form').addEventListener('submit', (event) => {
       saveMineContact('phone', false, event).catch(reportError);
@@ -5023,6 +5269,9 @@
         if (event.key === 'Enter') loadAudit(true).catch(reportError);
       });
     });
+    [$('alarm-category'), $('alarm-severity')].forEach((select) => {
+      select.addEventListener('change', () => loadAudit(true).catch(reportError));
+    });
     [$('audit-since'), $('audit-until')].forEach((input) => {
       input.addEventListener('change', () => loadAudit(true).catch(reportError));
     });
@@ -5071,6 +5320,7 @@
 
   function resetMine() {
     state.accountInfo = null;
+    state.accountEmailVerificationSent = false;
     state.accountSessions = [];
     state.mineSessionsOffset = 0;
     state.mineSessionsTotal = 0;
@@ -5084,6 +5334,7 @@
     $('mine-2fa-state').textContent = '';
     $('mine-keys-state').textContent = '';
     $('mine-email').value = '';
+    $('mine-email-verification-token').value = '';
     $('mine-phone').value = '';
     $('mine-email-password').value = '';
     $('mine-phone-password').value = '';
@@ -5110,7 +5361,15 @@
             throw err;
           }),
       ]);
+      const oldEmail = state.accountInfo && state.accountInfo.user
+        ? state.accountInfo.user.email || ''
+        : '';
       state.accountInfo = info || null;
+      const newEmail = info && info.user ? info.user.email || '' : '';
+      if (oldEmail !== newEmail || (info && info.email_verified)) {
+        state.accountEmailVerificationSent = false;
+        $('mine-email-verification-token').value = '';
+      }
       applySessionPermissions(info);
       state.accountSessions = sessions && Array.isArray(sessions.sessions) ? sessions.sessions : [];
       state.mineSessionsTotal = sessions && Number.isInteger(sessions.total)
@@ -5145,6 +5404,7 @@
       ['用户名', user.username || (state.auth && state.auth.username) || '—'],
       ['角色', rolePill(user.role || (state.auth && state.auth.role) || '')],
       ['邮箱', user.email || '—'],
+      ['邮箱验证', !user.email ? '未设置' : (info.email_verified ? '已验证' : '待验证')],
       ['手机', user.phone || '—'],
       ['两步验证', twoFactor ? '已启用' : '未启用'],
       ['恢复码', twoFactor ? (Number(info.recovery_codes) || 0) + ' 枚未使用' : '—'],
@@ -5165,12 +5425,122 @@
     }
     $('mine-email').value = user.email || '';
     $('mine-phone').value = user.phone || '';
+    renderMineEmailVerification();
+    renderMineAlarmEmailPreference();
     if (pending) {
       $('mine-2fa-secret').textContent = pending.secret;
       $('mine-2fa-uri').textContent = pending.otpauth_uri;
     }
     renderMineKeys();
     renderMineSessions();
+  }
+
+  function renderMineEmailVerification() {
+    const info = state.accountInfo;
+    const user = info && info.user ? info.user : {};
+    const email = user.email || '';
+    const verified = Boolean(info && info.email_verified);
+    $('mine-email-verification-state').textContent = !email
+      ? '尚未设置找回邮箱。'
+      : (verified ? '找回邮箱已验证。' : '找回邮箱尚未验证。');
+    $('mine-email-verification-actions').classList.toggle('hidden', !email || verified);
+    $('mine-email-verification-token-row').classList.toggle(
+      'hidden', !state.accountEmailVerificationSent,
+    );
+    $('mine-email-verification-confirm').classList.toggle(
+      'hidden', !state.accountEmailVerificationSent,
+    );
+    $('mine-email-verification-send').disabled = !email || verified ||
+      $('mine-email').value.trim() !== email;
+    $('mine-email-verification-confirm').disabled =
+      !state.accountEmailVerificationSent || !$('mine-email-verification-token').value.trim();
+  }
+
+  function renderMineAlarmEmailPreference() {
+    const info = state.accountInfo;
+    const user = info && info.user ? info.user : {};
+    const available = Boolean(info && info.alarm_email_available && info.can_receive_security_alerts);
+    const verified = Boolean(info && info.email_verified);
+    const row = $('mine-alarm-email-preference-row');
+    const note = $('mine-alarm-email-preference-note');
+    row.classList.toggle('hidden', !available);
+    note.classList.toggle('hidden', !available);
+    $('mine-alarm-email-preference').checked = Boolean(info && info.alarm_email_enabled);
+    $('mine-alarm-email-preference').disabled = !verified || !user.email;
+    note.textContent = verified
+      ? '只发送与当前全局审计权限相关的安全事件。'
+      : '验证找回邮箱后即可开启；更改邮箱会清除现有订阅。';
+  }
+
+  async function setMineAlarmEmailPreference(enabled) {
+    const info = state.accountInfo;
+    if (!info || !info.can_receive_security_alerts || !info.alarm_email_available) {
+      renderMineAlarmEmailPreference();
+      return;
+    }
+    if (enabled && (!info.email_verified || !info.user || !info.user.email)) {
+      renderMineAlarmEmailPreference();
+      toast('请先验证找回邮箱', true);
+      return;
+    }
+    let result;
+    try {
+      result = await api('/v1/account/alarm-email-preference', {
+        method: 'PUT',
+        body: {enabled},
+      });
+    } catch (err) {
+      renderMineAlarmEmailPreference();
+      throw err;
+    }
+    if (!result || result.enabled !== enabled) {
+      throw new ApiError('服务端没有保存安全告警邮件偏好。', 502);
+    }
+    state.accountInfo.alarm_email_enabled = enabled;
+    renderMineAlarmEmailPreference();
+    toast(enabled ? '已开启安全告警邮件' : '已关闭安全告警邮件');
+  }
+
+  async function requestMineEmailVerification() {
+    const info = state.accountInfo;
+    const email = info && info.user ? info.user.email || '' : '';
+    if (!email) {
+      toast('请先设置找回邮箱', true);
+      return;
+    }
+    if ($('mine-email').value.trim() !== email) {
+      toast('请先保存邮箱变更', true);
+      return;
+    }
+    if (info.email_verified) {
+      toast('找回邮箱已经验证');
+      return;
+    }
+    await api('/v1/account/email/verify', { method: 'POST' });
+    state.accountEmailVerificationSent = true;
+    $('mine-email-verification-token').value = '';
+    renderMineEmailVerification();
+    toast('验证邮件已发送，请检查邮箱');
+  }
+
+  async function confirmMineEmailVerification() {
+    const verificationToken = $('mine-email-verification-token').value.trim();
+    if (!verificationToken) {
+      toast('请输入邮件中的邮箱验证令牌', true);
+      return;
+    }
+    const result = await api('/v1/account/email/verify/confirm', {
+      method: 'POST',
+      body: { token: verificationToken },
+    });
+    if (!result || result.email_verified !== true) {
+      throw new ApiError('服务端没有确认邮箱验证状态。', 502);
+    }
+    if (state.accountInfo) state.accountInfo.email_verified = true;
+    state.accountEmailVerificationSent = false;
+    $('mine-email-verification-token').value = '';
+    renderMine();
+    toast('找回邮箱已验证');
   }
 
   function keyAlgorithmLabel(alg) {

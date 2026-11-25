@@ -31,6 +31,23 @@ typedef AccountInfoFetcher = Future<AccountInfo> Function(
   String token,
 );
 
+typedef EmailVerificationRequester =
+    Future<void> Function(ServerSettings settings, String token);
+
+typedef EmailVerificationConfirmer =
+    Future<void> Function(
+      ServerSettings settings,
+      String token, {
+      required String verificationToken,
+    });
+
+typedef AlarmEmailPreferenceSetter =
+    Future<void> Function(
+      ServerSettings settings,
+      String token, {
+      required bool enabled,
+    });
+
 typedef RecoveryPhoneChanger = Future<String> Function(
   ServerSettings settings,
   String token, {
@@ -59,12 +76,18 @@ class RecoveryEmailDialog extends StatefulWidget {
     required this.account,
     this.changeEmail,
     this.infoFetcher,
+    this.requestEmailVerification,
+    this.confirmEmailVerification,
+    this.setAlarmEmailPreference,
   });
 
   final ServerSettings server;
   final AccountSession account;
   final RecoveryEmailChanger? changeEmail;
   final AccountInfoFetcher? infoFetcher;
+  final EmailVerificationRequester? requestEmailVerification;
+  final EmailVerificationConfirmer? confirmEmailVerification;
+  final AlarmEmailPreferenceSetter? setAlarmEmailPreference;
 
   @override
   State<RecoveryEmailDialog> createState() => _RecoveryEmailDialogState();
@@ -73,10 +96,18 @@ class RecoveryEmailDialog extends StatefulWidget {
 class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
   final TextEditingController _email = TextEditingController();
   final TextEditingController _password = TextEditingController();
+  final TextEditingController _verificationToken = TextEditingController();
   bool _loading = true;
   bool _busy = false;
+  bool _emailVerified = false;
+  bool _alarmEmailEnabled = false;
+  bool _showAlarmEmailPreference = false;
+  bool _verificationSent = false;
+  bool _didSave = false;
+  String _storedEmail = '';
   String _loadError = '';
   String _error = '';
+  String _status = '';
 
   @override
   void initState() {
@@ -88,34 +119,45 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
   void dispose() {
     _email.dispose();
     _password.dispose();
+    _verificationToken.dispose();
     super.dispose();
   }
 
   Future<void> _load() async {
     try {
-      final AccountInfo info = await (widget.infoFetcher ??
-          ServerApi.accountInfo)(widget.server, widget.account.token);
+      final AccountInfo info =
+          await (widget.infoFetcher ?? ServerApi.accountInfo)(
+            widget.server,
+            widget.account.token,
+          );
       if (!mounted) {
         return;
       }
       setState(() {
         _loading = false;
-        if (info.email.isNotEmpty) {
-          _email.text = info.email;
-        }
+        _storedEmail = info.email;
+        _email.text = info.email;
+        _emailVerified = info.emailVerified;
+        _alarmEmailEnabled = info.alarmEmailEnabled;
+        _showAlarmEmailPreference =
+            info.alarmEmailAvailable && info.canReceiveSecurityAlerts;
       });
     } on ServerApiException catch (error) {
       if (mounted) {
         setState(() {
           _loading = false;
-          _loadError = tr('无法读取当前邮箱：{p1}', <String, Object?>{'p1': error.message});
+          _loadError = tr('无法读取当前邮箱：{p1}', <String, Object?>{
+            'p1': error.message,
+          });
         });
       }
     } catch (error) {
       if (mounted) {
         setState(() {
           _loading = false;
-          _loadError = tr('无法读取当前邮箱：{error}', <String, Object?>{'error': error});
+          _loadError = tr('无法读取当前邮箱：{error}', <String, Object?>{
+            'error': error,
+          });
         });
       }
     }
@@ -126,6 +168,10 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
       return;
     }
     final String email = _email.text.trim();
+    if (email == _storedEmail) {
+      setState(() => _error = tr('邮箱没有变化'));
+      return;
+    }
     if (email.isNotEmpty && !email.contains('@')) {
       setState(() => _error = tr('请输入有效的邮箱地址'));
       return;
@@ -139,17 +185,29 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
       _error = '';
     });
     try {
-      final String stored = await (widget.changeEmail ??
-          ServerApi.changeRecoveryEmail)(
-        widget.server,
-        widget.account.token,
-        email: email,
-        password: _password.text,
-      );
+      final String stored =
+          await (widget.changeEmail ?? ServerApi.changeRecoveryEmail)(
+            widget.server,
+            widget.account.token,
+            email: email,
+            password: _password.text,
+          );
       if (!mounted) {
         return;
       }
-      Navigator.of(context).pop(stored);
+      setState(() {
+        _busy = false;
+        _storedEmail = stored;
+        _email.text = stored;
+        _emailVerified = false;
+        _alarmEmailEnabled = false;
+        _verificationSent = false;
+        _verificationToken.clear();
+        _password.clear();
+        _didSave = true;
+        _error = '';
+        _status = stored.isEmpty ? tr('找回邮箱已清除') : tr('邮箱已保存，请发送验证邮件确认所有权');
+      });
     } on ServerApiException catch (error) {
       if (mounted) {
         setState(() {
@@ -167,83 +225,303 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
     }
   }
 
+  Future<void> _sendVerification() async {
+    if (_busy || _storedEmail.isEmpty || _email.text.trim() != _storedEmail) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+      _status = '';
+    });
+    try {
+      await (widget.requestEmailVerification ??
+          ServerApi.requestEmailVerification)(
+        widget.server,
+        widget.account.token,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _busy = false;
+        _verificationSent = true;
+        _verificationToken.clear();
+        _status = tr('验证邮件已发送，请输入邮件中的令牌');
+      });
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = tr('发送验证邮件失败：{error}', <String, Object?>{'error': error});
+        });
+      }
+    }
+  }
+
+  Future<void> _confirmVerification() async {
+    if (_busy) {
+      return;
+    }
+    final String token = _verificationToken.text.trim();
+    if (token.isEmpty) {
+      setState(() => _error = tr('请输入邮件中的邮箱验证令牌'));
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+      _status = '';
+    });
+    try {
+      await (widget.confirmEmailVerification ??
+          ServerApi.confirmEmailVerification)(
+        widget.server,
+        widget.account.token,
+        verificationToken: token,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _busy = false;
+        _emailVerified = true;
+        _verificationSent = false;
+        _verificationToken.clear();
+        _status = tr('邮箱已验证');
+      });
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = tr('验证邮箱失败：{error}', <String, Object?>{'error': error});
+        });
+      }
+    }
+  }
+
+  Future<void> _setAlarmEmailPreference(bool enabled) async {
+    if (_busy || !_showAlarmEmailPreference) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+    });
+    try {
+      await (widget.setAlarmEmailPreference ??
+          ServerApi.setAlarmEmailPreference)(
+        widget.server,
+        widget.account.token,
+        enabled: enabled,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _busy = false;
+        _alarmEmailEnabled = enabled;
+        _status = enabled ? tr('安全告警邮件已开启') : tr('安全告警邮件已关闭');
+      });
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = tr('更新安全告警邮件偏好失败：{error}', <String, Object?>{
+            'error': error,
+          });
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
+    final bool emailMatchesStored = _email.text.trim() == _storedEmail;
+    final bool canSendVerification =
+        _storedEmail.isNotEmpty && !_emailVerified && emailMatchesStored;
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
       title: Text(tr('找回邮箱')),
       content: SizedBox(
         width: 380,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            Text(
-              tr('忘记密码时，服务端会把一次性重置令牌发送到该邮箱。留空并保存表示关闭邮件找回。'),
-              style: mutedStyle(context, size: 12),
-            ),
-            const SizedBox(height: 12),
-            if (_loading)
-              Text(tr('正在读取当前邮箱…'), style: mutedStyle(context, size: 11))
-            else if (_loadError.isNotEmpty)
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
               Text(
-                _loadError,
-                key: const Key('recovery-email-load-error'),
-                style: TextStyle(color: theme.colorScheme.error, fontSize: 11),
-              )
-            else
-              Text(
-                _email.text.isEmpty ? tr('当前邮箱：未设置') : tr('当前邮箱：{p2}', <String, Object?>{'p2': _email.text}),
-                key: const Key('recovery-email-current'),
-                style: mutedStyle(context, size: 11),
+                tr('忘记密码时，服务端会把一次性重置令牌发送到该邮箱。留空并保存表示关闭邮件找回。'),
+                style: mutedStyle(context, size: 12),
               ),
-            const SizedBox(height: 12),
-            TextField(
-              key: const Key('recovery-email-value'),
-              controller: _email,
-              keyboardType: TextInputType.emailAddress,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: InputDecoration(
-                labelText: tr('找回邮箱'),
-                hintText: 'name@example.com',
-                prefixIcon: Icon(Icons.alternate_email_rounded, size: 18),
+              const SizedBox(height: 12),
+              if (_loading)
+                Text(tr('正在读取当前邮箱…'), style: mutedStyle(context, size: 11))
+              else if (_loadError.isNotEmpty)
+                Text(
+                  _loadError,
+                  key: const Key('recovery-email-load-error'),
+                  style: TextStyle(
+                    color: theme.colorScheme.error,
+                    fontSize: 11,
+                  ),
+                )
+              else
+                Text(
+                  _storedEmail.isEmpty
+                      ? tr('当前邮箱：未设置')
+                      : tr('当前邮箱：{p2}', <String, Object?>{'p2': _storedEmail}),
+                  key: const Key('recovery-email-current'),
+                  style: mutedStyle(context, size: 11),
+                ),
+              if (_storedEmail.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 4),
+                Text(
+                  _emailVerified ? tr('邮箱已验证') : tr('邮箱尚未验证'),
+                  key: const Key('recovery-email-verification-state'),
+                  style: mutedStyle(context, size: 11),
+                ),
+              ],
+              const SizedBox(height: 12),
+              TextField(
+                key: const Key('recovery-email-value'),
+                controller: _email,
+                keyboardType: TextInputType.emailAddress,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: tr('找回邮箱'),
+                  hintText: 'name@example.com',
+                  prefixIcon: Icon(Icons.alternate_email_rounded, size: 18),
+                ),
+                onChanged: (_) {
+                  setState(() {
+                    _error = '';
+                    _status = '';
+                    if (_email.text.trim() != _storedEmail) {
+                      _verificationSent = false;
+                      _verificationToken.clear();
+                    }
+                  });
+                },
               ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              key: const Key('recovery-email-password'),
-              controller: _password,
-              obscureText: true,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: InputDecoration(
-                labelText: tr('当前密码'),
-                prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
-              ),
-              onSubmitted: (_) => _submit(),
-            ),
-            if (_error.isNotEmpty) ...<Widget>[
               const SizedBox(height: 10),
-              Text(
-                _error,
-                key: const Key('recovery-email-error'),
-                style: TextStyle(color: theme.colorScheme.error, fontSize: 12),
+              TextField(
+                key: const Key('recovery-email-password'),
+                controller: _password,
+                obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: tr('当前密码'),
+                  prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
+                ),
+                onSubmitted: (_) => _submit(),
               ),
+              if (_error.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 10),
+                Text(
+                  _error,
+                  key: const Key('recovery-email-error'),
+                  style: TextStyle(
+                    color: theme.colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+              if (_status.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 10),
+                Text(
+                  _status,
+                  key: const Key('recovery-email-status'),
+                  style: mutedStyle(context, size: 12),
+                ),
+              ],
+              if (_storedEmail.isNotEmpty && !_emailVerified) ...<Widget>[
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  key: const Key('recovery-email-send-verification'),
+                  onPressed: _busy || !canSendVerification
+                      ? null
+                      : _sendVerification,
+                  icon: const Icon(Icons.mark_email_unread_outlined, size: 17),
+                  label: Text(tr('发送验证邮件')),
+                ),
+                if (_verificationSent && emailMatchesStored) ...<Widget>[
+                  TextField(
+                    key: const Key('recovery-email-verification-token'),
+                    controller: _verificationToken,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: InputDecoration(
+                      labelText: tr('邮箱验证令牌'),
+                      prefixIcon: Icon(Icons.verified_user_outlined, size: 18),
+                    ),
+                    onSubmitted: (_) => _confirmVerification(),
+                  ),
+                  const SizedBox(height: 8),
+                  FilledButton.tonal(
+                    key: const Key('recovery-email-confirm-verification'),
+                    onPressed: _busy ? null : _confirmVerification,
+                    child: Text(tr('确认邮箱')),
+                  ),
+                ],
+              ],
+              if (_showAlarmEmailPreference) ...<Widget>[
+                const Divider(height: 24),
+                SwitchListTile.adaptive(
+                  key: const Key('recovery-email-alarm-preference'),
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(tr('通过邮件接收安全告警')),
+                  subtitle: Text(
+                    _emailVerified
+                        ? tr('仅发送与当前全局审计权限相关的安全事件')
+                        : tr('验证找回邮箱后即可开启'),
+                  ),
+                  value: _alarmEmailEnabled,
+                  onChanged: _busy || !_emailVerified
+                      ? null
+                      : _setAlarmEmailPreference,
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
       actions: <Widget>[
         TextButton(
-          onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: Text(tr('取消')),
+          key: const Key('recovery-email-close'),
+          onPressed: _busy
+              ? null
+              : () => Navigator.of(context).pop(_didSave ? _storedEmail : null),
+          child: Text(_didSave ? tr('完成') : tr('取消')),
         ),
         FilledButton(
           key: const Key('recovery-email-save'),
-          onPressed: _busy || _loading ? null : _submit,
+          onPressed: _busy || _loading || emailMatchesStored ? null : _submit,
           child: _busy
               ? const SizedBox(
                   width: 15,

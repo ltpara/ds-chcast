@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	serverapi "github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
@@ -204,7 +205,25 @@ func TestHostAuditDeniedConnections(t *testing.T) {
 }
 
 func TestHostDenialRetriesAndHostIdentity(t *testing.T) {
-	s := testutil.Start(t)
+	var s *testutil.Server
+	var queuedAlarms []account.AlarmEvent
+	s = testutil.StartWith(t, testutil.Options{
+		AlarmQueue: serverapi.AlarmQueueFunc(func(alarm account.AlarmEvent) error {
+			stored, err := s.Accounts.AlarmEventsForFilterBefore("", account.AlarmFilter{
+				Code: alarm.Code, HostID: alarm.HostID,
+			}, 0, 10)
+			if err != nil {
+				return err
+			}
+			for _, event := range stored {
+				if event.ID == alarm.ID {
+					queuedAlarms = append(queuedAlarms, alarm)
+					return nil
+				}
+			}
+			return fmt.Errorf("alarm %d was not committed before enqueue", alarm.ID)
+		}),
+	})
 	now := time.Now().Unix()
 	for _, host := range []string{"host-a", "host-b"} {
 		if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
@@ -232,6 +251,9 @@ func TestHostDenialRetriesAndHostIdentity(t *testing.T) {
 	if err != nil || len(events) != 2 || events[0].HostID != "host-b" || events[1].HostID != "host-a" ||
 		events[0].EventKey == events[1].EventKey || events[0].Detail == events[1].Detail {
 		t.Fatalf("retry and host attribution: %+v, %v", events, err)
+	}
+	if len(queuedAlarms) != 2 || queuedAlarms[0].HostID != "host-a" || queuedAlarms[1].HostID != "host-b" {
+		t.Fatalf("host denial alarm enqueues = %+v, want one committed enqueue per source event", queuedAlarms)
 	}
 	status, body := request(t, http.MethodGet, s.URL+"/v1/audit?action=host_denied", "", testutil.ServerKey)
 	var page struct {

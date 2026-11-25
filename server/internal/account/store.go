@@ -104,14 +104,17 @@ var (
 	ErrLastAdmin            = errors.New("at least one admin account must remain")
 	ErrAccountBanned        = errors.New("account is banned")
 
-	ErrInvalidEmail      = errors.New("email address is not valid")
-	ErrEmailTaken        = errors.New("email address is already in use")
-	ErrNoRecoveryEmail   = errors.New("account has no recovery email")
-	ErrInvalidResetToken = errors.New("password reset token is invalid or expired")
-	ErrInvalidPhone      = errors.New("phone number must be 6..15 digits, optionally starting with +")
-	ErrPhoneTaken        = errors.New("phone number is already in use")
-	ErrNoRecoveryPhone   = errors.New("account has no recovery phone")
-	ErrInvalidResetCode  = errors.New("password reset code is invalid or expired")
+	ErrInvalidEmail                  = errors.New("email address is not valid")
+	ErrEmailTaken                    = errors.New("email address is already in use")
+	ErrInvalidAccountInvitation      = errors.New("account invitation is invalid or expired")
+	ErrNoRecoveryEmail               = errors.New("account has no recovery email")
+	ErrInvalidResetToken             = errors.New("password reset token is invalid or expired")
+	ErrEmailAlreadyVerified          = errors.New("account email is already verified")
+	ErrInvalidEmailVerificationToken = errors.New("email verification token is invalid or expired")
+	ErrInvalidPhone                  = errors.New("phone number must be 6..15 digits, optionally starting with +")
+	ErrPhoneTaken                    = errors.New("phone number is already in use")
+	ErrNoRecoveryPhone               = errors.New("account has no recovery phone")
+	ErrInvalidResetCode              = errors.New("password reset code is invalid or expired")
 
 	ErrOIDCAccountNotFound = errors.New("no account is linked to this identity provider subject")
 	ErrInvalidOIDCIdentity = errors.New("identity provider issuer and subject are required")
@@ -1230,6 +1233,13 @@ func (s *Store) LoginWithRefreshSMS(username, password, deviceID, deviceName, co
 // the SMS code, then the email code. The chosen backup code is deleted in the
 // same transaction that issues the session, so a code can never sign in twice.
 func (s *Store) LoginWithRefreshFactors(username, password, deviceID, deviceName, code, recoveryCode, smsCode, emailCode string) (User, string, time.Time, string, time.Time, error) {
+	return s.LoginWithRefreshFactorsAndDevice(username, password, deviceID, deviceName,
+		code, recoveryCode, smsCode, emailCode, LoginDeviceProof{})
+}
+
+// LoginWithRefreshFactorsAndDevice is LoginWithRefreshFactors plus proof that
+// the caller holds the installation key associated with this device.
+func (s *Store) LoginWithRefreshFactorsAndDevice(username, password, deviceID, deviceName, code, recoveryCode, smsCode, emailCode string, proof LoginDeviceProof) (User, string, time.Time, string, time.Time, error) {
 	username = strings.TrimSpace(username)
 	code = strings.TrimSpace(code)
 	recoveryCode = normalizeRecoveryCode(recoveryCode)
@@ -1335,6 +1345,10 @@ func (s *Store) LoginWithRefreshFactors(username, password, deviceID, deviceName
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: begin login: %w", s.path, err)
 	}
 	defer tx.Rollback()
+	deviceID, err = s.loginDeviceProofTx(tx, user.ID, deviceName, deviceID, proof, now)
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	}
 	if useRecovery {
 		res, err := tx.Exec(
 			`UPDATE recovery_codes SET used_at = ?

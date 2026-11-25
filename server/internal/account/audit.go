@@ -1,6 +1,7 @@
 package account
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ const (
 	AuditLoginUnlock       = "login_unlock"
 	AuditRoleChange        = "role_change"
 	AuditAccountCreate     = "account_create"
+	AuditAccountInvite     = "account_invite"
 	AuditAccountDelete     = "account_delete"
 	AuditAccountPassword   = "account_password_reset"
 	AuditAccountBan        = "account_ban"
@@ -34,6 +36,9 @@ const (
 	AuditAccountRecover    = "account_recover"
 	AuditWebAuthnRegister  = "webauthn_register"
 	AuditWebAuthnRemove    = "webauthn_remove"
+	AuditLoginDevicePolicy = "login_device_policy"
+	AuditLoginDeviceTrust  = "login_device_trust"
+	AuditLoginDeviceRevoke = "login_device_revoke"
 	AuditDeviceLabels      = "device_labels"
 	AuditDeviceReset       = "device_reset"
 	AuditDeviceDisable     = "device_disable"
@@ -138,9 +143,18 @@ type AuditFilter struct {
 }
 
 func (s *Store) AppendAudit(event AuditEvent) error {
+	_, err := s.AppendAuditWithAlarm(event)
+	return err
+}
+
+// AppendAuditWithAlarm writes the audit event and, when it is classified as an
+// alarm, the independent alarm row in one transaction. The returned alarm is
+// non-nil only when this call created a new alarm; callers can enqueue it for
+// delivery after the transaction commits.
+func (s *Store) AppendAuditWithAlarm(event AuditEvent) (*AlarmEvent, error) {
 	action := strings.TrimSpace(event.Action)
 	if action == "" {
-		return fmt.Errorf("account store %s: append audit: action is empty", s.path)
+		return nil, fmt.Errorf("account store %s: append audit: action is empty", s.path)
 	}
 	username := strings.TrimSpace(event.Username)
 	if username == "" {
@@ -153,34 +167,49 @@ func (s *Store) AppendAudit(event AuditEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := strings.TrimSpace(event.EventKey)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: begin audit write: %w", s.path, err)
+	}
+	defer tx.Rollback()
 	// The SELECT avoids advancing the sequence for routine retries; the
 	// unique index also handles simultaneous writers on different servers.
-	result, err := s.db.Exec(
+	var id int64
+	err = tx.QueryRow(
 		`INSERT INTO audit_events (created_at, username, action, detail, client_ip, location, success, host_id, event_key)
 		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
 		 WHERE ? = '' OR NOT EXISTS (SELECT 1 FROM audit_events WHERE event_key = ?)
-		 ON CONFLICT(event_key) WHERE event_key <> '' DO NOTHING`,
+		 ON CONFLICT(event_key) WHERE event_key <> '' DO NOTHING
+		 RETURNING id`,
 		unixMillis(at), username, action, strings.TrimSpace(event.Detail),
 		strings.TrimSpace(event.ClientIP), strings.TrimSpace(event.Location), event.Success,
 		strings.TrimSpace(event.HostID), key, key, key,
-	)
-	if err != nil {
-		return fmt.Errorf("account store %s: append audit: %w", s.path, err)
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-	if inserted, err := result.RowsAffected(); err != nil {
-		return fmt.Errorf("account store %s: append audit result: %w", s.path, err)
-	} else if inserted == 0 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: append audit: %w", s.path, err)
+	}
+	event.ID = id
+	event.Username = username
+	createdAt := unixMillis(at)
+	alarm, err := appendAlarmForAuditTx(tx, id, event, createdAt)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: append security alarm: %w", s.path, err)
 	}
 	// Conflict races can still leave sequence gaps, so retain actual rows.
-	if _, err := s.db.Exec(
+	if _, err := tx.Exec(
 		`DELETE FROM audit_events WHERE id <
 		 (SELECT id FROM audit_events ORDER BY id DESC LIMIT 1 OFFSET ?)`,
 		auditRetention-1,
 	); err != nil {
-		return fmt.Errorf("account store %s: trim audit: %w", s.path, err)
+		return nil, fmt.Errorf("account store %s: trim audit: %w", s.path, err)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("account store %s: commit audit write: %w", s.path, err)
+	}
+	return alarm, nil
 }
 
 // AuditEvents returns the newest events first. Limit defaults to 20 and is

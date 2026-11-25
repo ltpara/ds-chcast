@@ -18,6 +18,15 @@ func (s *Store) LoginLDAP(
 	dn, username, email, deviceID, deviceName string,
 	autoCreate bool,
 ) (User, string, time.Time, string, time.Time, error) {
+	return s.LoginLDAPWithDeviceProof(dn, username, email, deviceID, deviceName,
+		autoCreate, LoginDeviceProof{})
+}
+
+func (s *Store) LoginLDAPWithDeviceProof(
+	dn, username, email, deviceID, deviceName string,
+	autoCreate bool,
+	proof LoginDeviceProof,
+) (User, string, time.Time, string, time.Time, error) {
 	dn = strings.TrimSpace(dn)
 	username = strings.TrimSpace(username)
 	if dn == "" || username == "" {
@@ -31,7 +40,7 @@ func (s *Store) LoginLDAP(
 		return User{}, "", time.Time{}, "", time.Time{}, err
 	}
 	if found {
-		return s.ldapSession(user, deviceID, deviceName)
+		return s.ldapSession(user, deviceID, deviceName, proof)
 	}
 
 	// A name that already belongs to an account without a directory link is
@@ -74,7 +83,7 @@ func (s *Store) LoginLDAP(
 		if user.Banned {
 			return User{}, "", time.Time{}, "", time.Time{}, ErrAccountBanned
 		}
-		return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
+		return s.issueVerifiedSessionLocked(user, deviceID, deviceName, proof)
 	}
 	if _, err := s.findUserLocked(username); err == nil {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrLDAPNameTaken
@@ -122,7 +131,7 @@ func (s *Store) LoginLDAP(
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: commit directory account: %w", s.path, err)
 	}
 	user = User{ID: id, Username: username, Role: role, CreatedAt: now, Email: email}
-	return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
+	return s.issueVerifiedSessionLocked(user, deviceID, deviceName, proof)
 }
 
 // LDAPLinked reports whether the named account signs in through the
@@ -146,13 +155,13 @@ func (s *Store) LDAPLinked(username string) (bool, error) {
 	return true, nil
 }
 
-func (s *Store) ldapSession(user User, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
+func (s *Store) ldapSession(user User, deviceID, deviceName string, proof LoginDeviceProof) (User, string, time.Time, string, time.Time, error) {
 	if user.Banned {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrAccountBanned
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
+	return s.issueVerifiedSessionLocked(user, deviceID, deviceName, proof)
 }
 
 func (s *Store) ldapUserLocked(dn string) (User, bool, error) {

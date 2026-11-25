@@ -21,14 +21,25 @@ const accountUnavailable = "accounts require persistent server state"
 const twoFactorHeader = "X-Chast-2FA"
 
 type loginRequest struct {
-	Username     string `json:"username"`
-	Password     string `json:"password"`
-	DeviceID     string `json:"device_id"`
-	DeviceName   string `json:"device_name"`
-	TOTPCode     string `json:"totp_code"`
-	RecoveryCode string `json:"recovery_code"`
-	SMSCode      string `json:"sms_code"`
-	EmailCode    string `json:"email_code"`
+	Username     string           `json:"username"`
+	Password     string           `json:"password"`
+	DeviceID     string           `json:"device_id"`
+	DeviceName   string           `json:"device_name"`
+	TOTPCode     string           `json:"totp_code"`
+	RecoveryCode string           `json:"recovery_code"`
+	SMSCode      string           `json:"sms_code"`
+	EmailCode    string           `json:"email_code"`
+	DeviceProof  loginDeviceProof `json:"device_proof"`
+}
+
+type loginDeviceProof struct {
+	ChallengeID string `json:"challenge_id"`
+	PublicKey   string `json:"public_key"`
+	Signature   string `json:"signature"`
+}
+
+func (p loginDeviceProof) accountProof() account.LoginDeviceProof {
+	return account.LoginDeviceProof{ChallengeID: p.ChallengeID, PublicKey: p.PublicKey, Signature: p.Signature}
 }
 
 type accountView struct {
@@ -54,11 +65,15 @@ type refreshRequest struct {
 }
 
 type accountResponse struct {
-	User              accountView    `json:"user"`
-	TwoFactor         bool           `json:"two_factor"`
-	RecoveryCodes     int            `json:"recovery_codes"`
-	Permissions       []string       `json:"permissions"`
-	ScopedPermissions []consoleGrant `json:"scoped_permissions"`
+	User                     accountView    `json:"user"`
+	EmailVerified            bool           `json:"email_verified"`
+	AlarmEmailEnabled        bool           `json:"alarm_email_enabled"`
+	AlarmEmailAvailable      bool           `json:"alarm_email_available"`
+	CanReceiveSecurityAlerts bool           `json:"can_receive_security_alerts"`
+	TwoFactor                bool           `json:"two_factor"`
+	RecoveryCodes            int            `json:"recovery_codes"`
+	Permissions              []string       `json:"permissions"`
+	ScopedPermissions        []consoleGrant `json:"scoped_permissions"`
 }
 
 type twoFactorStartResponse struct {
@@ -344,9 +359,9 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	user, token, _, refresh, _, err := s.cfg.Accounts.LoginWithRefreshFactors(
+	user, token, _, refresh, _, err := s.cfg.Accounts.LoginWithRefreshFactorsAndDevice(
 		req.Username, req.Password, req.DeviceID, req.DeviceName,
-		req.TOTPCode, req.RecoveryCode, req.SMSCode, req.EmailCode,
+		req.TOTPCode, req.RecoveryCode, req.SMSCode, req.EmailCode, req.DeviceProof.accountProof(),
 	)
 	if errors.Is(err, account.ErrInvalidCredentials) && s.cfg.LDAP != nil {
 		s.loginDirectory(w, r, req, key)
@@ -372,6 +387,18 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, account.ErrAccountBanned) {
 		s.auditLogin(r, req.Username, "account banned", false)
 		writeError(w, http.StatusForbidden, "account is banned")
+		return
+	}
+	if errors.Is(err, account.ErrLoginDeviceNotAllowed) {
+		s.auditLogin(r, req.Username, "login device not trusted", false)
+		writeLoginDeviceAuthError(w, http.StatusForbidden, "login_device_not_allowed",
+			"this device is not on the account's trusted login list")
+		return
+	}
+	if errors.Is(err, account.ErrInvalidLoginDeviceProof) {
+		s.auditLogin(r, req.Username, "login device proof rejected", false)
+		writeLoginDeviceAuthError(w, http.StatusUnauthorized, "login_device_proof",
+			"device verification failed; retry sign-in")
 		return
 	}
 	if errors.Is(err, account.ErrInvalidCredentials) {
@@ -430,9 +457,9 @@ func (s *server) loginDirectory(w http.ResponseWriter, r *http.Request, req logi
 		}
 		return
 	}
-	user, token, _, refresh, _, err := s.cfg.Accounts.LoginLDAP(
+	user, token, _, refresh, _, err := s.cfg.Accounts.LoginLDAPWithDeviceProof(
 		identity.DN, req.Username, identity.Email, req.DeviceID, req.DeviceName,
-		s.cfg.LDAPAutoCreate,
+		s.cfg.LDAPAutoCreate, req.DeviceProof.accountProof(),
 	)
 	switch {
 	case errors.Is(err, account.ErrAccountBanned):
@@ -446,6 +473,16 @@ func (s *server) loginDirectory(w http.ResponseWriter, r *http.Request, req logi
 	case errors.Is(err, account.ErrLDAPAccountNotFound):
 		s.auditLogin(r, req.Username, "directory account has no local account", false)
 		writeError(w, http.StatusUnauthorized, "username or password was not accepted")
+		return
+	case errors.Is(err, account.ErrLoginDeviceNotAllowed):
+		s.auditLogin(r, req.Username, "login device not trusted", false)
+		writeLoginDeviceAuthError(w, http.StatusForbidden, "login_device_not_allowed",
+			"this device is not on the account's trusted login list")
+		return
+	case errors.Is(err, account.ErrInvalidLoginDeviceProof):
+		s.auditLogin(r, req.Username, "login device proof rejected", false)
+		writeLoginDeviceAuthError(w, http.StatusUnauthorized, "login_device_proof",
+			"device verification failed; retry sign-in")
 		return
 	case errors.Is(err, account.ErrInvalidUsername):
 		s.auditLogin(r, req.Username, "directory login name is not usable", false)
@@ -550,15 +587,31 @@ func (s *server) recordAudit(r *http.Request, username, action, detail string, s
 		return
 	}
 	ip := s.clientIP(r)
-	if err := s.cfg.Accounts.AppendAudit(account.AuditEvent{
+	alarm, err := s.cfg.Accounts.AppendAuditWithAlarm(account.AuditEvent{
 		Username: username,
 		Action:   action,
 		Detail:   detail,
 		ClientIP: ip,
 		Location: s.clientLocation(ip),
 		Success:  success,
-	}); err != nil {
+	})
+	if err != nil {
 		s.cfg.Logger.Error("account audit", "error", err)
+		return
+	}
+	s.enqueueAlarm(alarm)
+}
+
+// enqueueAlarm hands a committed alarm to the configured notification queue.
+// Queue outages are logged but do not change the result of the operation that
+// produced the audit event.
+func (s *server) enqueueAlarm(alarm *account.AlarmEvent) {
+	if alarm == nil || s.cfg.AlarmQueue == nil {
+		return
+	}
+	if err := s.cfg.AlarmQueue.EnqueueAlarm(*alarm); err != nil {
+		s.cfg.Logger.Error("security alarm enqueue", "alarm_id", alarm.ID,
+			"code", alarm.Code, "error", err)
 	}
 }
 
@@ -641,6 +694,24 @@ func (s *server) accountInfo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	emailVerified, err := s.cfg.Accounts.EmailVerified(user.Username)
+	if err != nil {
+		s.cfg.Logger.Error("account email verification state", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read the account")
+		return
+	}
+	alarmEmailEnabled, err := s.cfg.Accounts.AlarmEmailPreference(user.ID)
+	if err != nil {
+		s.cfg.Logger.Error("account alarm email preference", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read the account")
+		return
+	}
+	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
+	if err != nil {
+		s.cfg.Logger.Error("account permissions", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read the account permissions")
+		return
+	}
 	enabled, err := s.cfg.Accounts.TwoFactorEnabled(user.ID)
 	if err != nil {
 		s.cfg.Logger.Error("account two-factor state", "error", err)
@@ -658,19 +729,65 @@ func (s *server) accountInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not resolve console grants")
 		return
 	}
-	permissions, err := s.cfg.Accounts.EffectiveConsolePermissions(user.ID, "", "", "")
-	if err != nil {
-		s.cfg.Logger.Error("account permissions", "error", err)
-		writeError(w, http.StatusInternalServerError, "could not read the account permissions")
+	writeJSON(w, http.StatusOK, accountResponse{
+		User:                     viewAccount(user),
+		EmailVerified:            emailVerified,
+		AlarmEmailEnabled:        alarmEmailEnabled,
+		AlarmEmailAvailable:      s.cfg.Mailer != nil,
+		CanReceiveSecurityAlerts: permissions[account.PermissionAuditRead],
+		TwoFactor:                enabled,
+		RecoveryCodes:            remaining,
+		Permissions:              permissionKeys(permissions),
+		ScopedPermissions:        grants,
+	})
+}
+
+type alarmEmailPreferenceRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
+type alarmEmailPreferenceResponse struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *server) setAlarmEmailPreference(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.consolePrincipalFor(w, r, account.PermissionAuditRead, account.TokenResourceAudit)
+	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, accountResponse{
-		User:              viewAccount(user),
-		TwoFactor:         enabled,
-		RecoveryCodes:     remaining,
-		Permissions:       permissionKeys(permissions),
-		ScopedPermissions: grants,
-	})
+	if principal.APIToken || principal.User.ID == "" {
+		writeError(w, http.StatusForbidden, "use a signed-in console account to change notification preferences")
+		return
+	}
+	var req alarmEmailPreferenceRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "enabled is required")
+		return
+	}
+	if *req.Enabled && s.cfg.Mailer == nil {
+		writeError(w, http.StatusServiceUnavailable, "security alert email delivery is not configured")
+		return
+	}
+	if err := s.cfg.Accounts.SetAlarmEmailPreference(principal.User.ID, *req.Enabled); err != nil {
+		if errors.Is(err, account.ErrAlarmEmailRequiresVerifiedAddress) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, account.ErrUnknownUser) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		s.cfg.Logger.Error("set account alarm email preference", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not update notification preference")
+		return
+	}
+	s.recordAudit(r, principal.User.Username, account.AuditAccountEmail,
+		"security alert email "+map[bool]string{true: "enabled", false: "disabled"}[*req.Enabled], true)
+	writeJSON(w, http.StatusOK, alarmEmailPreferenceResponse{Enabled: *req.Enabled})
 }
 
 // changeAccountPassword lets a signed-in user rotate their own password. The

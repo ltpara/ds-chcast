@@ -1113,6 +1113,103 @@ void main() {
     );
   });
 
+  test('requestEmailVerification sends an authenticated request', () async {
+    Uri? requested;
+    String? authorization;
+    String? method;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      method = request.method;
+      request.response.statusCode = HttpStatus.accepted;
+      request.response.write('{"status":"sent"}');
+      await request.response.close();
+    });
+
+    await ServerApi.requestEmailVerification(settings, 'account-token');
+
+    expect(method, 'POST');
+    expect(requested?.path, '/v1/account/email/verify');
+    expect(authorization, 'Bearer account-token');
+  });
+
+  test('confirmEmailVerification posts the single-use token', () async {
+    Uri? requested;
+    String? authorization;
+    String? method;
+    Object? body;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      method = request.method;
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write('{"email_verified":true}');
+      await request.response.close();
+    });
+
+    await ServerApi.confirmEmailVerification(
+      settings,
+      'account-token',
+      verificationToken: ' mail-token ',
+    );
+
+    expect(method, 'POST');
+    expect(requested?.path, '/v1/account/email/verify/confirm');
+    expect(authorization, 'Bearer account-token');
+    expect(body, <String, Object?>{'token': 'mail-token'});
+  });
+
+  test('confirmEmailVerification requires a verified response', () async {
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType.json;
+      request.response.write('{"email_verified":false}');
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.confirmEmailVerification(
+        settings,
+        'account-token',
+        verificationToken: 'mail-token',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '连接服务返回了无效数据',
+        ),
+      ),
+    );
+  });
+
+  test('setAlarmEmailPreference writes the account subscription', () async {
+    Uri? requested;
+    String? method;
+    String? authorization;
+    Object? body;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      method = request.method;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write('{"enabled":true}');
+      await request.response.close();
+    });
+
+    await ServerApi.setAlarmEmailPreference(
+      settings,
+      'account-token',
+      enabled: true,
+    );
+
+    expect(method, 'PUT');
+    expect(requested?.path, '/v1/account/alarm-email-preference');
+    expect(authorization, 'Bearer account-token');
+    expect(body, <String, Object?>{'enabled': true});
+  });
+
   test(
     'requestPasswordRecovery posts a name, accepts 202 and sends no key',
     () async {
@@ -1830,7 +1927,7 @@ void main() {
   });
 
   test(
-    'accountInfo reads the two-factor flag and the recovery phone',
+    'accountInfo reads email verification and account security flags',
     () async {
       Uri? requested;
       String? authorization;
@@ -1846,6 +1943,10 @@ void main() {
               'email': 'alice@example.com',
               'phone': '+86 138 0013 8000',
             },
+            'email_verified': true,
+            'alarm_email_enabled': true,
+            'alarm_email_available': true,
+            'can_receive_security_alerts': true,
             'two_factor': true,
             'recovery_codes': 4,
           }),
@@ -1861,6 +1962,10 @@ void main() {
       expect(authorization, 'Bearer account-token');
       expect(info.username, 'alice');
       expect(info.email, 'alice@example.com');
+      expect(info.emailVerified, isTrue);
+      expect(info.alarmEmailEnabled, isTrue);
+      expect(info.alarmEmailAvailable, isTrue);
+      expect(info.canReceiveSecurityAlerts, isTrue);
       expect(info.phone, '+86 138 0013 8000');
       expect(info.twoFactor, isTrue);
       expect(info.recoveryCodes, 4);

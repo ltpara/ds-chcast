@@ -47,7 +47,9 @@ func TestServesConsoleAssets(t *testing.T) {
 	}{
 		{"mount point", "/admin/", "text/html", "chast 管理台"},
 		{"index", "/admin/index.html", "text/html", "<!doctype html>"},
+		{"invitation acceptance page", "/admin/invite.html", "text/html", "接受账号邀请"},
 		{"script", "/admin/app.js", "text/javascript", "'use strict'"},
+		{"invitation script", "/admin/invite.js", "text/javascript", "invitation-accept"},
 		{"style", "/admin/style.css", "text/css", "--bg"},
 	}
 	for _, tc := range cases {

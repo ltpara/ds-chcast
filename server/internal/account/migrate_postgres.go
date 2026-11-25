@@ -42,8 +42,145 @@ var accountPostgresMigrations = func() []schemamig.Migration {
 	list[25].Apply = applyAdminRoleRevisionsPostgres
 	list[26].Apply = applyRecordingUploadIdempotencyPostgres
 	list[27].Apply = applyHostRecordingUploadOwnersPostgres
+	list[28].Apply = applyAlarmEventsPostgres
+	list[29].Apply = applyEmailVerificationPostgres
+	list[30].Apply = applyAlarmEmailNotificationsPostgres
+	list[31].Apply = applyAccountInvitationsPostgres
+	list[32].Apply = applyLoginDevicesPostgres
 	return list
 }()
+
+func applyLoginDevicesPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS login_device_allowlist_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`CREATE TABLE IF NOT EXISTS account_login_devices (
+			user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			device_id     TEXT NOT NULL,
+			public_key    TEXT NOT NULL,
+			device_name   TEXT NOT NULL DEFAULT '',
+			created_at    BIGINT NOT NULL,
+			last_seen_at  BIGINT NOT NULL,
+			PRIMARY KEY (user_id, device_id),
+			UNIQUE (user_id, public_key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS account_login_device_challenges (
+			challenge_id  TEXT PRIMARY KEY,
+			public_key    TEXT NOT NULL,
+			message       TEXT NOT NULL,
+			created_at    BIGINT NOT NULL,
+			expires_at    BIGINT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_login_device_challenge_expiry
+			ON account_login_device_challenges(expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL account login device schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyAccountInvitationsPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS account_invitations (
+			id                   BIGSERIAL PRIMARY KEY,
+			token_hash           TEXT NOT NULL UNIQUE,
+			email                TEXT NOT NULL,
+			invited_by           TEXT NOT NULL,
+			created_at           BIGINT NOT NULL,
+			expires_at           BIGINT NOT NULL,
+			status               TEXT NOT NULL,
+			accepted_at          BIGINT NOT NULL DEFAULT 0,
+			accepted_username    TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_invitations_email_status
+			ON account_invitations(email, status, expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL account invitation schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyAlarmEmailNotificationsPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS alarm_email_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`CREATE TABLE IF NOT EXISTS alarm_email_deliveries (
+			id               BIGSERIAL PRIMARY KEY,
+			alarm_id         BIGINT NOT NULL REFERENCES alarm_events(id) ON DELETE CASCADE,
+			user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			recipient        TEXT NOT NULL,
+			status           TEXT NOT NULL,
+			attempts         INTEGER NOT NULL DEFAULT 0,
+			available_at     BIGINT NOT NULL,
+			lease_until      BIGINT NOT NULL DEFAULT 0,
+			last_error       TEXT NOT NULL DEFAULT '',
+			created_at       BIGINT NOT NULL,
+			sent_at          BIGINT NOT NULL DEFAULT 0,
+			UNIQUE (alarm_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS alarm_email_deliveries_pending
+			ON alarm_email_deliveries(status, available_at, lease_until, id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL persistent alarm email schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyAlarmEventsPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS alarm_events (
+			id               BIGSERIAL PRIMARY KEY,
+			created_at       BIGINT NOT NULL,
+			username         TEXT NOT NULL DEFAULT '-',
+			host_id          TEXT NOT NULL DEFAULT '',
+			client_ip        TEXT NOT NULL DEFAULT '',
+			location         TEXT NOT NULL DEFAULT '',
+			category         TEXT NOT NULL,
+			severity         TEXT NOT NULL,
+			code             TEXT NOT NULL,
+			summary          TEXT NOT NULL,
+			detail           TEXT NOT NULL DEFAULT '',
+			source_action    TEXT NOT NULL,
+			source_audit_id  BIGINT NOT NULL,
+			source_key       TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS alarm_events_created ON alarm_events(created_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS alarm_events_source_audit ON alarm_events(source_audit_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS alarm_events_source_key ON alarm_events(source_key)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL alarm event schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyEmailVerificationPostgres(db *sql.DB) error {
+	for _, statement := range []string{
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at BIGINT NOT NULL DEFAULT 0`,
+		`CREATE TABLE IF NOT EXISTS email_verification_tokens (
+			token_hash TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			email TEXT NOT NULL,
+			created_at BIGINT NOT NULL,
+			expires_at BIGINT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS email_verification_user ON email_verification_tokens(user_id)`,
+		`CREATE INDEX IF NOT EXISTS email_verification_expiry ON email_verification_tokens(expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create PostgreSQL email verification schema: %w", err)
+		}
+	}
+	return nil
+}
 
 func applyRecordingUploadIdempotencyPostgres(db *sql.DB) error {
 	for _, statement := range []string{

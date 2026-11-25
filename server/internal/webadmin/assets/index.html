@@ -233,6 +233,25 @@
       </div>
       <div class="panel">
         <div class="panel-head">
+          <h2>邀请用户</h2>
+          <button type="button" id="account-invitation-refresh">刷新邀请</button>
+        </div>
+        <form id="account-invitation-create" class="inline-form" autocomplete="off">
+          <label>邮箱<input id="account-invitation-email" type="email" required maxlength="254" autocomplete="email"></label>
+          <button type="submit" class="primary">发送邀请</button>
+        </form>
+        <p class="muted">受邀者通过邮件中的一次性代码创建普通查看器账号。邀请默认 7 天有效；创建后可在下表撤销未使用的邀请。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>邮箱</th><th>创建时间</th><th>有效期至</th><th>状态</th><th>已接受账号</th><th class="actions-col">操作</th></tr></thead>
+            <tbody id="account-invitation-rows"></tbody>
+          </table>
+        </div>
+        <p id="account-invitation-empty" class="muted hidden">还没有账号邀请。</p>
+        <p id="account-invitation-readonly" class="muted hidden">只有具有全局账号权限的管理员可以发送或撤销邀请。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
           <h2>账号列表</h2>
           <div class="toolbar">
             <input id="account-query" type="search" placeholder="搜索用户名、邮箱或手机" spellcheck="false">
@@ -301,6 +320,19 @@
             <button type="submit" class="primary">保存邮箱</button>
             <button type="button" id="mine-email-clear" class="ghost">清除</button>
           </form>
+          <div class="stack">
+            <p id="mine-email-verification-state" class="muted"></p>
+            <div id="mine-email-verification-actions" class="inline-form">
+              <button type="button" id="mine-email-verification-send">发送验证邮件</button>
+              <label id="mine-email-verification-token-row" class="hidden">邮箱验证令牌<input id="mine-email-verification-token" autocomplete="one-time-code"></label>
+              <button type="button" id="mine-email-verification-confirm" class="primary hidden">确认邮箱</button>
+            </div>
+            <label id="mine-alarm-email-preference-row" class="hidden">
+              <input id="mine-alarm-email-preference" type="checkbox">
+              通过邮件接收安全告警
+            </label>
+            <p id="mine-alarm-email-preference-note" class="muted">仅全局审计员可订阅；邮箱更改后需要重新验证并开启。</p>
+          </div>
           <form id="mine-phone-form" class="inline-form" autocomplete="off">
             <label>找回手机<input id="mine-phone" type="tel" placeholder="6–15 位数字"></label>
             <label>当前密码<input id="mine-phone-password" type="password" autocomplete="current-password"></label>
@@ -513,10 +545,22 @@
             <button type="button" class="subtab active" data-audit="events">账号审计</button>
             <button type="button" class="subtab" data-audit="connections">连接记录</button>
             <button type="button" class="subtab" data-audit="files">文件传输</button>
+            <button type="button" class="subtab" data-audit="alarms">安全告警</button>
           </div>
           <span class="spacer"></span>
           <select id="audit-group" aria-label="按分组过滤"></select>
           <input id="audit-filter" type="search" placeholder="动作" spellcheck="false">
+          <select id="alarm-category" class="hidden" aria-label="告警分类">
+            <option value="">全部分类</option>
+            <option value="security">安全</option>
+            <option value="access">访问</option>
+            <option value="account">账号</option>
+          </select>
+          <select id="alarm-severity" class="hidden" aria-label="告警级别">
+            <option value="">全部级别</option>
+            <option value="warning">警告</option>
+            <option value="notice">提示</option>
+          </select>
           <input id="audit-user" class="hidden" type="search" placeholder="账号（可选，精确匹配）" spellcheck="false">
           <input id="audit-host" class="hidden" type="search" placeholder="主机 ID（可选）" spellcheck="false">
           <input id="audit-note" class="hidden" type="search" placeholder="备注（可选，包含匹配）" spellcheck="false">
@@ -797,6 +841,35 @@
         <button type="button" id="account-sessions-revoke-all" class="danger">全部退出</button>
         <span class="spacer"></span>
         <button type="button" id="account-sessions-close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="account-login-devices-dialog" class="wide">
+    <div class="dialog-stack">
+      <h2 id="account-login-devices-title">登录设备</h2>
+      <p class="muted">用户可在客户端账号设置中复制安装公钥。管理员通过可信渠道取得公钥后可为账号恢复设备信任；撤销设备会立即结束该设备的登录会话。</p>
+      <form id="account-login-device-policy" class="inline-form" autocomplete="off">
+        <label class="check"><input type="checkbox" id="account-login-device-policy-enabled">启用登录设备白名单</label>
+        <button type="submit" id="account-login-device-policy-save" class="primary">保存白名单设置</button>
+      </form>
+      <p id="account-login-device-policy-note" class="muted"></p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>设备名称</th><th>设备 ID / 公钥指纹</th><th>登记时间</th><th>最近使用</th><th class="actions-col">操作</th></tr></thead>
+          <tbody id="account-login-device-rows"></tbody>
+        </table>
+      </div>
+      <p id="account-login-device-empty" class="muted hidden">该账号还没有信任设备。</p>
+      <form id="account-login-device-trust" class="inline-form" autocomplete="off">
+        <label>设备名称<input id="account-login-device-name" required maxlength="128" autocomplete="off"></label>
+        <label>安装公钥<input id="account-login-device-key" required spellcheck="false" autocomplete="off" placeholder="从用户的客户端账号设置粘贴"></label>
+        <button type="submit" id="account-login-device-trust-submit" class="primary">登记信任设备</button>
+      </form>
+      <p id="account-login-device-readonly" class="muted hidden">当前账号只有全局账号读取权限；登记、启用白名单及撤销设备需要账号管理权限。</p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="account-login-devices-close">关闭</button>
       </div>
     </div>
   </dialog>

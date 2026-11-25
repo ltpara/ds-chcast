@@ -298,6 +298,10 @@ TCP 直连断开后同样转载体，回退后迟到的 TCP/UDP 不再接管会�
 | `POST` | `/v1/account/phone` | Bearer account token | 提交 `phone` 与 `password` 设置或清除（空 `phone`）找回手机，号码去空白/`-`/`(`/`)`/`.` 与开头 `+` 后须为 6–15 位数字；密码错误 403，非法号码 400，被其他账号占用 409；成功返回 `{"phone":...}`、写入 `account_phone` 审计并作废该账号未使用的短信验证码 |
 | `POST` | `/v1/account/recover` | 无（仅用户名与 HTTP 限流） | 提交 `username`；无论账号是否存在、是否有邮箱、发信是否成功都返回 202 `{"status":"accepted"}`，未知用户不发信也不泄露；同一客户端 IP+用户名每分钟最多触发一次；未配置 SMTP 或账号存储返回 503；成功发信写入 `account_recover` 审计 |
 | `POST` | `/v1/account/recover/complete` | 无 | 提交 `token` 与 `password`；令牌一次性、默认 30 分钟（`--recovery-ttl`）有效，成功返回 `{"username":...}` 并吊销该账号全部访问/刷新令牌；弱密码 400 且不消耗令牌，未知、过期、已用或被替换的令牌均为 400 |
+| `POST` | `/v1/account-invitations` | Bearer server-key 或具有全局 `accounts.write` 的管理员 | 提交 `email`；SMTP 发出一次性邀请代码并返回 202。邀请有效期由 `--invitation-ttl` 控制，接受后创建普通 `user` 角色并将邀请邮箱标记为已验证；同一邮箱的新邀请会撤销旧的待处理邀请 |
+| `GET` | `/v1/account-invitations` | Bearer server-key 或具有全局 `accounts.read` 的账号 | 列出最近 200 条邀请及 pending/accepted/cancelled/expired 状态；不返回邀请令牌 |
+| `DELETE` | `/v1/account-invitations/{id}` | Bearer server-key 或具有全局 `accounts.write` 的管理员 | 撤销一个尚未接受且未过期的邀请，返回 204；已接受、过期或已撤销的邀请不可再次撤销 |
+| `POST` | `/v1/account-invitations/accept` | 无 | 提交 `token`、`username`、`password` 创建普通查看器账号，返回用户名及已验证邮箱；邀请验证、账号创建和一次性消费在同一事务中完成 |
 | `POST` | `/v1/account/recover/sms` | 无（仅用户名与 HTTP 限流） | 提交 `username`；与邮件找回一样只有 202 `{"status":"accepted"}`，未知账号、未设手机与网关失败都不泄露；同一客户端 IP+用户名每分钟最多一条；未配置短信网关或账号存储返回 503；成功发送写入 `account_recover` 审计 |
 | `POST` | `/v1/account/recover/sms/complete` | 无 | 提交 `username`、8 位 `code`（可含空格/短横线）与 `password`；验证码一次性、默认 10 分钟（`--sms-ttl`，最长 1h）有效，5 次错误后作废，成功返回 `{"username":...}` 并吊销全部访问/刷新令牌；弱密码 400 且不消耗验证码，未知、过期、已用或错误验证码均为 400 |
 | `POST` | `/v1/account/2fa/start` | Bearer account token | 提交当前 `password` 生成待确认的 TOTP 密钥，返回 `secret`（base32、无填充）与 `otpauth_uri`；密码错误 403、已启用时返回 409 |
@@ -1156,6 +1160,10 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   重置链接指向的绝对 http(s) 页面（令牌始终也在邮件正文中），
   `--recovery-ttl`（默认 30m）控制令牌有效期且至少 1m。设置 SMTP 但缺少
   发件人、只给认证/发件人却未配置服务器、或链接不是绝对 http(s) 时启动失败。
+  同一 SMTP 发送账号邀请；`--invitation-ttl`（默认 7d，至少 1m）控制邀请有效期，
+  `--invitation-url` 可设为公开接受页面（通常为 `https://<server>/admin/invite.html`）。
+  邮件始终附一次性代码；页面链接把代码放在 URL fragment 中，页面读取后会立即从地址栏移除。
+  邀请只能创建普通 `user` 账号，接受时完成邮箱验证；管理台“账号”页可创建、查看和撤销邀请。
   同一 SMTP 也发送两步验证的登录邮件码（`POST /v1/account/login/email`，
   复用 `--recovery-ttl`）；未配置 SMTP 时该接口返回 503。
 - `--sms-url`（默认空，关闭短信找回）指定接收 `{"to","text","from"}` JSON

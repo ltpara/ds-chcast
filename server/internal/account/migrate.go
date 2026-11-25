@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 28
+const accountSchemaVersion = 33
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -42,6 +42,155 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 26, Name: "admin role edit revisions", Apply: applyAdminRoleRevisions},
 	{Version: 27, Name: "recording upload idempotency", Apply: applyRecordingUploadIdempotency},
 	{Version: 28, Name: "host recording upload owner binding", Apply: applyHostRecordingUploadOwners},
+	{Version: 29, Name: "independent security alarm events", Apply: applyAlarmEvents},
+	{Version: 30, Name: "local email verification state", Apply: applyEmailVerification},
+	{Version: 31, Name: "persistent alarm email notifications", Apply: applyAlarmEmailNotifications},
+	{Version: 32, Name: "single-use account invitations", Apply: applyAccountInvitations},
+	{Version: 33, Name: "account login device allowlists", Apply: applyLoginDevices},
+}
+
+func applyAlarmEvents(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS alarm_events (
+			id               INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at       INTEGER NOT NULL,
+			username         TEXT NOT NULL DEFAULT '-',
+			host_id          TEXT NOT NULL DEFAULT '',
+			client_ip        TEXT NOT NULL DEFAULT '',
+			location         TEXT NOT NULL DEFAULT '',
+			category         TEXT NOT NULL,
+			severity         TEXT NOT NULL,
+			code             TEXT NOT NULL,
+			summary          TEXT NOT NULL,
+			detail           TEXT NOT NULL DEFAULT '',
+			source_action    TEXT NOT NULL,
+			source_audit_id  INTEGER NOT NULL,
+			source_key       TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS alarm_events_created ON alarm_events(created_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS alarm_events_source_audit ON alarm_events(source_audit_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS alarm_events_source_key ON alarm_events(source_key)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create alarm event schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyEmailVerification(db *sql.DB) error {
+	if err := ensureColumn(db, "users", "email_verified_at", "email_verified_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("add email verification state: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS email_verification_tokens (
+			token_hash TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			email TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS email_verification_user ON email_verification_tokens(user_id)`,
+		`CREATE INDEX IF NOT EXISTS email_verification_expiry ON email_verification_tokens(expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create email verification schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyAlarmEmailNotifications(db *sql.DB) error {
+	if err := ensureColumn(db, "users", "email", "email TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add alarm email recipient address: %w", err)
+	}
+	if err := ensureColumn(db, "users", "role", "role TEXT NOT NULL DEFAULT 'user'"); err != nil {
+		return fmt.Errorf("add alarm email account role: %w", err)
+	}
+	if err := ensureColumn(db, "users", "banned", "banned INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("add alarm email account status: %w", err)
+	}
+	if err := ensureColumn(db, "users", "alarm_email_enabled", "alarm_email_enabled INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("add alarm email preference: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS alarm_email_deliveries (
+			id               INTEGER PRIMARY KEY AUTOINCREMENT,
+			alarm_id         INTEGER NOT NULL REFERENCES alarm_events(id) ON DELETE CASCADE,
+			user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			recipient        TEXT NOT NULL,
+			status           TEXT NOT NULL,
+			attempts         INTEGER NOT NULL DEFAULT 0,
+			available_at     INTEGER NOT NULL,
+			lease_until      INTEGER NOT NULL DEFAULT 0,
+			last_error       TEXT NOT NULL DEFAULT '',
+			created_at       INTEGER NOT NULL,
+			sent_at          INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (alarm_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS alarm_email_deliveries_pending
+			ON alarm_email_deliveries(status, available_at, lease_until, id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create persistent alarm email schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyAccountInvitations(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS account_invitations (
+			id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+			token_hash           TEXT NOT NULL UNIQUE,
+			email                TEXT NOT NULL,
+			invited_by           TEXT NOT NULL,
+			created_at           INTEGER NOT NULL,
+			expires_at           INTEGER NOT NULL,
+			status               TEXT NOT NULL,
+			accepted_at          INTEGER NOT NULL DEFAULT 0,
+			accepted_username    TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_invitations_email_status
+			ON account_invitations(email, status, expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create account invitation schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func applyLoginDevices(db *sql.DB) error {
+	if err := ensureColumn(db, "users", "login_device_allowlist_enabled", "login_device_allowlist_enabled BOOLEAN NOT NULL DEFAULT FALSE"); err != nil {
+		return fmt.Errorf("add account login device allowlist state: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS account_login_devices (
+			user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			device_id     TEXT NOT NULL,
+			public_key    TEXT NOT NULL,
+			device_name   TEXT NOT NULL DEFAULT '',
+			created_at    INTEGER NOT NULL,
+			last_seen_at  INTEGER NOT NULL,
+			PRIMARY KEY (user_id, device_id),
+			UNIQUE (user_id, public_key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS account_login_device_challenges (
+			challenge_id  TEXT PRIMARY KEY,
+			public_key    TEXT NOT NULL,
+			message       TEXT NOT NULL,
+			created_at    INTEGER NOT NULL,
+			expires_at    INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_login_device_challenge_expiry
+			ON account_login_device_challenges(expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create account login device schema: %w", err)
+		}
+	}
+	return nil
 }
 
 func applyHostRecordingUploadOwners(db *sql.DB) error {

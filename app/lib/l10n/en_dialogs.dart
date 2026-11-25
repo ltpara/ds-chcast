@@ -1,5 +1,48 @@
 /// English for the account, recovery, sharing, security-key and 2FA dialogs.
 const Map<String, String> kEnglishDialogs = <String, String>{
+  '登录设备白名单': 'Trusted login devices',
+  '启用': 'Enable',
+  '撤销': 'Revoke',
+  '关闭时，新登录设备会自动加入信任列表。开启后，仅列表中的设备可以登录；管理员可通过账号管理恢复访问。':
+      'When disabled, successful sign-ins add their device to the list. When enabled, only listed devices can sign in. An administrator can restore access through account management.',
+  '仅允许信任设备登录': 'Only allow trusted devices to sign in',
+  '白名单已启用': 'Allowlist enabled',
+  '白名单已关闭': 'Allowlist disabled',
+  '启用登录设备白名单？': 'Enable the login device allowlist?',
+  '启用后，只有已登记的查看器设备可以登录。其他设备上的现有账号会话也会退出。请确认当前设备已显示在信任列表中。':
+      'Only registered viewer devices will be able to sign in. Existing sessions on other devices will also be signed out. Confirm that this device appears in the trusted list.',
+  '还没有登记的登录设备': 'No login devices are registered yet',
+  '白名单已启用但没有登记设备；请联系管理员恢复访问。':
+      'The allowlist is enabled with no registered devices. Contact an administrator to restore access.',
+  '此账号没有已登记设备；请退出并重新登录以登记此设备。':
+      'No devices are registered for this account. Sign out and back in to register this device.',
+  '当前设备 · ID {id}': 'This device · ID {id}',
+  'ID {id}': 'ID {id}',
+  '未命名设备': 'Unnamed device',
+  '复制本机登录设备公钥': 'Copy this device’s public key',
+  '本机登录设备公钥已复制': 'This device’s public key was copied',
+  '无法复制本机登录设备公钥：{error}': 'Could not copy this device’s public key: {error}',
+  '撤销设备': 'Revoke device',
+  '撤销登录设备？': 'Revoke this login device?',
+  '撤销“{name}”后，该设备上的所有账号会话都会立即失效。':
+      'Revoking “{name}” immediately ends all account sessions on that device.',
+  '无法读取登录设备：{error}': 'Failed to read login devices: {error}',
+  '更新登录设备策略失败：{error}': 'Failed to update the login device policy: {error}',
+  '撤销登录设备失败：{error}': 'Failed to revoke the login device: {error}',
+  '无法读取此设备的登录密钥': 'Could not read this device’s sign-in key',
+  '无法验证此设备的登录密钥': 'Could not prove this device’s sign-in key',
+  '连接服务返回了无效的设备验证挑战':
+      'The connection server returned an invalid device verification challenge',
+  '连接服务返回了无效的设备列表': 'The connection server returned an invalid device list',
+  '请先使用此设备重新登录，再启用登录设备白名单':
+      'Sign in again from this device before enabling the login device allowlist',
+  '此设备不在账号的信任列表中，请联系管理员恢复访问':
+      'This device is not trusted for this account. Contact an administrator to restore access.',
+  '无法验证此设备，请重试登录或联系管理员':
+      'This device could not be verified. Retry sign-in or contact an administrator.',
+  '设备验证已过期，请重新开始登录': 'Device verification expired. Start sign-in again.',
+  '登录设备 ID 为空': 'The login device ID is empty',
+  '登录设备不存在': 'The login device was not found',
   '例如：书房 PC': 'For example: Study PC',
   '刷新': 'Refresh',
   '已更新设备名称': 'Device name updated',
@@ -112,6 +155,33 @@ const Map<String, String> kEnglishDialogs = <String, String>{
   '当前手机号：未设置': 'Current phone: not set',
   '当前邮箱：{p2}': 'Current email: {p2}',
   '当前邮箱：未设置': 'Current email: not set',
+  '邮箱已保存，请发送验证邮件确认所有权':
+      'The email is saved. Send a verification message to confirm ownership.',
+  '邮箱已验证': 'Email verified',
+  '邮箱尚未验证': 'Email not verified',
+  '通过邮件接收安全告警': 'Receive security alerts by email',
+  '仅发送与当前全局审计权限相关的安全事件':
+      'Only security events available to your global audit permission are sent.',
+  '验证找回邮箱后即可开启': 'Verify your recovery email to enable this.',
+  '安全告警邮件已开启': 'Security alert emails enabled',
+  '安全告警邮件已关闭': 'Security alert emails disabled',
+  '更新安全告警邮件偏好失败：{error}':
+      'Failed to update the security alert email preference: {error}',
+  '只有拥有全局审计权限的账号可以订阅安全告警':
+      'Only an account with global audit permission can subscribe to security alerts.',
+  '请先验证找回邮箱': 'Verify your recovery email first',
+  '验证邮件已发送，请输入邮件中的令牌':
+      'Verification email sent. Enter the token from the message.',
+  '发送验证邮件': 'Send verification email',
+  '发送验证邮件失败：{error}': 'Failed to send the verification email: {error}',
+  '验证邮箱失败：{error}': 'Failed to verify the email: {error}',
+  '邮箱验证令牌': 'Email verification token',
+  '确认邮箱': 'Confirm email',
+  '邮箱没有变化': 'The email address has not changed',
+  '请先设置有效的找回邮箱': 'Set a valid recovery email first',
+  '该邮箱已经验证': 'This email address is already verified',
+  '连接服务未配置邮件发送': 'Email delivery is not configured on this server',
+  '邮箱验证令牌无效或已过期': 'The email verification token is invalid or expired',
   '忘记密码时，服务端会把一次性重置令牌发送到该邮箱。留空并保存表示关闭邮件找回。':
       'When you forget the password, the server sends a one-time reset token to this email. Leave it empty and save to disable email recovery.',
   '忘记密码时，服务端会把一次性验证码发送到该手机号。留空并保存表示关闭短信找回。':
@@ -135,6 +205,7 @@ const Map<String, String> kEnglishDialogs = <String, String>{
   '请输入用户名': 'Enter the username',
   '请输入短信中的验证码': 'Enter the code from the text message',
   '请输入邮件中的重置令牌': 'Enter the reset token from the email',
+  '请输入邮件中的邮箱验证令牌': 'Enter the email verification token from the message',
   '输入账号用户名，服务端会向该账号的找回手机发送 8 位验证码。没有设置手机号的账号不会收到短信。':
       'Enter the account username; the server sends an 8-digit code to the recovery phone. Accounts without a phone receive nothing.',
   '输入账号用户名，服务端会向该账号的找回邮箱发送一次性令牌。没有设置邮箱的账号不会收到邮件。':

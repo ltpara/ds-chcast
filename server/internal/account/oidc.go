@@ -24,6 +24,17 @@ func (s *Store) LoginOIDC(
 	deviceID, deviceName string,
 	autoCreate bool,
 ) (User, string, time.Time, string, time.Time, error) {
+	return s.LoginOIDCWithDeviceProof(issuer, subject, usernameHint, email,
+		emailVerified, deviceID, deviceName, autoCreate, LoginDeviceProof{})
+}
+
+func (s *Store) LoginOIDCWithDeviceProof(
+	issuer, subject, usernameHint, email string,
+	emailVerified bool,
+	deviceID, deviceName string,
+	autoCreate bool,
+	proof LoginDeviceProof,
+) (User, string, time.Time, string, time.Time, error) {
 	issuer = strings.TrimSpace(issuer)
 	subject = strings.TrimSpace(subject)
 	usernameHint = strings.TrimSpace(usernameHint)
@@ -44,7 +55,7 @@ func (s *Store) LoginOIDC(
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
+		return s.issueVerifiedSessionLocked(user, deviceID, deviceName, proof)
 	}
 	if !autoCreate {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrOIDCAccountNotFound
@@ -69,7 +80,7 @@ func (s *Store) LoginOIDC(
 		if user.Banned {
 			return User{}, "", time.Time{}, "", time.Time{}, ErrAccountBanned
 		}
-		return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
+		return s.issueVerifiedSessionLocked(user, deviceID, deviceName, proof)
 	}
 	username, err := s.availableOIDCUsernameLocked(base)
 	if err != nil {
@@ -116,7 +127,7 @@ func (s *Store) LoginOIDC(
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: commit OIDC account: %w", s.path, err)
 	}
 	user = User{ID: id, Username: username, Role: role, CreatedAt: now, Email: email}
-	return s.issueVerifiedSessionLocked(user, deviceID, deviceName)
+	return s.issueVerifiedSessionLocked(user, deviceID, deviceName, proof)
 }
 
 func (s *Store) oidcUserLocked(issuer, subject string) (User, bool, error) {
@@ -143,7 +154,7 @@ func (s *Store) oidcUserLocked(issuer, subject string) (User, bool, error) {
 // issueVerifiedSessionLocked writes one access/refresh pair for an account an
 // external provider has already authenticated. It mirrors the token half of
 // LoginWithRefreshFactors without touching local two-factor state.
-func (s *Store) issueVerifiedSessionLocked(user User, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
+func (s *Store) issueVerifiedSessionLocked(user User, deviceID, deviceName string, proof LoginDeviceProof) (User, string, time.Time, string, time.Time, error) {
 	now := s.now().UTC()
 	token, err := newToken()
 	if err != nil {
@@ -172,6 +183,10 @@ func (s *Store) issueVerifiedSessionLocked(user User, deviceID, deviceName strin
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: begin OIDC session: %w", s.path, err)
 	}
 	defer tx.Rollback()
+	deviceID, err = s.loginDeviceProofTx(tx, user.ID, deviceName, deviceID, proof, now)
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	}
 	if _, err := tx.Exec(
 		`INSERT INTO user_tokens
 			(token_hash, user_id, created_at, expires_at, access_expires_at,

@@ -24,11 +24,12 @@ const (
 // oidcLoginState is one authorization-code attempt. The state itself is the
 // only handle the viewer and the browser callback share; it is never logged.
 type oidcLoginState struct {
-	created    time.Time
-	nonce      string
-	verifier   string
-	deviceID   string
-	deviceName string
+	created     time.Time
+	nonce       string
+	verifier    string
+	deviceID    string
+	deviceName  string
+	deviceProof account.LoginDeviceProof
 	// client is the optional caller hint ("console") that lets the browser
 	// callback page word its "return to ..." line for the right app.
 	client  string
@@ -48,8 +49,9 @@ type oidcStatusResponse struct {
 }
 
 type oidcBeginRequest struct {
-	DeviceID   string `json:"device_id"`
-	DeviceName string `json:"device_name"`
+	DeviceID    string           `json:"device_id"`
+	DeviceName  string           `json:"device_name"`
+	DeviceProof loginDeviceProof `json:"device_proof"`
 	// Client is an optional caller hint; only "console" is recognised and
 	// makes the callback page send the user back to the admin console.
 	Client string `json:"client"`
@@ -126,12 +128,13 @@ func (s *server) oidcBegin(w http.ResponseWriter, r *http.Request) {
 	s.oidcMu.Lock()
 	s.pruneOIDCPendingLocked(now)
 	s.oidcPending[state] = &oidcLoginState{
-		created:    now,
-		nonce:      nonce,
-		verifier:   verifier,
-		deviceID:   strings.TrimSpace(req.DeviceID),
-		deviceName: strings.TrimSpace(req.DeviceName),
-		client:     client,
+		created:     now,
+		nonce:       nonce,
+		verifier:    verifier,
+		deviceID:    strings.TrimSpace(req.DeviceID),
+		deviceName:  strings.TrimSpace(req.DeviceName),
+		deviceProof: req.DeviceProof.accountProof(),
+		client:      client,
 	}
 	s.oidcMu.Unlock()
 	writeJSON(w, http.StatusOK, oidcBeginResponse{
@@ -176,7 +179,7 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	entry.started = true
 	nonce, verifier := entry.nonce, entry.verifier
-	deviceID, deviceName := entry.deviceID, entry.deviceName
+	deviceID, deviceName, deviceProof := entry.deviceID, entry.deviceName, entry.deviceProof
 	client := entry.client
 	s.oidcMu.Unlock()
 	returnTo := oidcReturnTarget(client)
@@ -208,10 +211,10 @@ func (s *server) oidcCallback(w http.ResponseWriter, r *http.Request) {
 			"The identity provider response could not be verified.", returnTo)
 		return
 	}
-	user, token, _, refresh, _, err := s.cfg.Accounts.LoginOIDC(
+	user, token, _, refresh, _, err := s.cfg.Accounts.LoginOIDCWithDeviceProof(
 		s.cfg.OIDC.Issuer(), identity.Subject, identity.PreferredUsername,
 		identity.Email, identity.EmailVerified, deviceID, deviceName,
-		s.cfg.OIDC.AutoCreate(),
+		s.cfg.OIDC.AutoCreate(), deviceProof,
 	)
 	if err != nil {
 		status, code, message := oidcLoginError(err)
@@ -331,6 +334,10 @@ func oidcLoginError(err error) (status int, code, message string) {
 		return http.StatusConflict, "email_taken", "the email address is already used by another account"
 	case errors.Is(err, account.ErrOIDCAccountNotFound):
 		return http.StatusUnauthorized, "no_account", "no account is linked to this identity"
+	case errors.Is(err, account.ErrLoginDeviceNotAllowed):
+		return http.StatusForbidden, "login_device_not_allowed", "this device is not on the account's trusted login list"
+	case errors.Is(err, account.ErrInvalidLoginDeviceProof):
+		return http.StatusUnauthorized, "login_device_proof", "device verification expired; retry sign-in"
 	default:
 		return http.StatusInternalServerError, "oidc_failed", "single sign-on could not complete the login"
 	}

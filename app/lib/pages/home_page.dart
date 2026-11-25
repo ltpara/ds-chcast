@@ -30,6 +30,7 @@ import '../wake_on_lan.dart';
 import 'session_page.dart';
 import 'groups_dialog.dart';
 import 'account_sessions_dialog.dart';
+import 'login_devices_dialog.dart';
 import 'change_password_dialog.dart';
 import 'recording_archive_dialog.dart';
 import 'recovery_dialog.dart';
@@ -6723,6 +6724,15 @@ class _AccountDialogState extends State<_AccountDialog> {
     );
   }
 
+  Future<void> _openLoginDevices(AccountSession account) {
+    return showDialog<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return LoginDevicesDialog(server: widget.server, account: account);
+      },
+    );
+  }
+
   Future<void> _openRecordings(AccountSession account) {
     return showDialog<void>(
       context: context,
@@ -7179,6 +7189,13 @@ class _AccountDialogState extends State<_AccountDialog> {
           onPressed: _busy ? null : () => _openSessions(account),
           icon: const Icon(Icons.devices_outlined, size: 17),
           label: Text(tr('设备会话')),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          key: const Key('account-login-devices'),
+          onPressed: _busy ? null : () => _openLoginDevices(account),
+          icon: const Icon(Icons.verified_user_outlined, size: 17),
+          label: Text(tr('登录设备白名单')),
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
