@@ -1,8 +1,10 @@
 # 当前完成状态与后续计划
 
-日期：2026-11-25（2026-11-18 状态基线延续）
+日期：2026-11-26（2026-11-18 状态基线延续）
 
 分支：`codex/complete-workspace-2026-11-20`
+
+2026-11-26 CTest 可重复安全门禁：CMake 对经副作用审查的 69 项加 `reviewed_non_destructive` label；allowlist fail-closed，新注册测试在人工审查前不会进入该集合。CTest dry-run 确认该 label 命中 69 项、补集 36 项。Release 顺序执行 `ctest --test-dir build/root -C Release -L '^reviewed_non_destructive$' --output-on-failure --parallel 1`，结果 **69 项：65 PASS、4 SKIP、0 FAIL**，234.10 秒。4 个 skip 为 `clipboard_listener`、`clipboard_listener_startup`、`machine_state_security_untrusted_owner`、`viewer_clipboard_native`，均由既有权限/Window Station 环境限制触发；未计为 PASS。完整原始日志：`build/test-temp/isolated-ctest/reviewed-nondestructive-20261126-LastTest.log`。这只是审计过的安全子集，剩余 36 项仍需隔离 Windows 桌面/设备环境，不等于全量 105 项门禁。
 
 2026-11-25 本机自动化门禁复跑：Flutter `test --no-pub` **881/881 PASS**、`analyze --no-pub` 无问题；`server` 全量 `go test ./...` 与 `go vet ./...` PASS；管理台 Node `app_session_test.cjs` **53/53 PASS**，浏览器断开脚本 `node --check` PASS；CMake Windows Release 全目标构建 `cmake --build build/root --config Release --parallel 4` PASS；定向 CTest **10/10 PASS**（host settings/strategy、Firewall 规则与 fake transaction、SCM install/uninstall fake transaction/stop、host parity、锁屏策略与 tunnel 参数）。`host_parity` 本地回环运行 124.84 秒。测试没有安装/卸载真实服务、写防火墙或 ProgramData，也不是全量 105 项 CTest、部署浏览器/屏幕阅读器、双机、生产 PostgreSQL/SMTP、外部设备或复杂网络验收；这些门禁继续待验收。
 

@@ -1203,4 +1203,92 @@ if(CHAST_BUILD_TESTS)
         set_tests_properties("${test_name}" PROPERTIES
             ENVIRONMENT "TEMP=${test_temp};TMP=${test_temp}")
     endforeach()
+
+    # Fail-closed allowlist: new CTests stay out of the reviewed safe batch
+    # until their side effects have been audited explicitly.
+    set(CHAST_REVIEWED_NONDESTRUCTIVE_TESTS
+        cursor
+        capture_transform
+        png_writer
+        remote_cursor
+        cursor_hint
+        annotation_paint
+        protocol
+        display_window_access
+        session_tab_model
+        window_focus
+        session_tab_visibility
+        keyboard
+        protocol_fuzz
+        desktop
+        security
+        host_settings
+        recording_upload_queue
+        host_client_strategy
+        host_live_connection
+        reference_counted_lease
+        viewer_awake_request
+        service_log
+        platform_process
+        firewall_rule
+        firewall_transaction
+        file_snapshot
+        rollback_stack
+        service_stop
+        service_install
+        service_uninstall
+        portable_helper_lifecycle
+        host_parity
+        desktop_stream
+        recording_disk
+        display_subscriptions
+        display_video
+        viewer_display_streams
+        video_qos
+        host_voice
+        clipboard_listener
+        clipboard_listener_startup
+        clipboard_oledata
+        lock_after_session
+        virtual_display
+        machine_state_security
+        machine_state_security_untrusted_owner
+        display_privacy
+        display_layout
+        host_security
+        access_ticket
+        managed_access
+        host_ticket_lease
+        host_tunnel
+        host_i18n
+        audio
+        audio_forwarder
+        audio_dsp
+        audio_playout
+        shared_loopback
+        file_transfer
+        carrier
+        decoder_padding
+        decode_rejects_vp9
+        mp4_recorder
+        quic_microphone_reference
+        quic_weak_link_budget
+        viewer_files_only
+        viewer_files_only_denied
+        viewer_clipboard_native
+    )
+    list(LENGTH CHAST_REVIEWED_NONDESTRUCTIVE_TESTS
+         CHAST_REVIEWED_NONDESTRUCTIVE_TEST_COUNT)
+    if(NOT CHAST_REVIEWED_NONDESTRUCTIVE_TEST_COUNT EQUAL 69)
+        message(FATAL_ERROR
+            "The reviewed non-destructive CTest allowlist must contain 69 tests")
+    endif()
+    foreach(test_name IN LISTS CHAST_REVIEWED_NONDESTRUCTIVE_TESTS)
+        if(NOT test_name IN_LIST CHAST_TESTS)
+            message(FATAL_ERROR
+                "Reviewed non-destructive CTest '${test_name}' is not registered")
+        endif()
+    endforeach()
+    set_tests_properties(${CHAST_REVIEWED_NONDESTRUCTIVE_TESTS}
+        PROPERTIES LABELS "reviewed_non_destructive")
 endif()
