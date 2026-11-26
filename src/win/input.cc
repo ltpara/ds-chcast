@@ -508,13 +508,24 @@ std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* 
     std::function<void(const INPUT&)> dry_run_observer,
     std::function<HKL()> keyboard_layout_provider,
     std::function<bool()> ime_open_provider,
-    std::function<void(const char*)> release_trace_observer) {
+    std::function<void(const char*)> release_trace_observer,
+    InputSideEffectObserver side_effect_observer,
+    DryRunInputApiResultProvider dry_run_api_result_provider) {
+    if (static_cast<bool>(side_effect_observer.prepare) !=
+        static_cast<bool>(side_effect_observer.complete)) {
+        if (error != nullptr) {
+            *error = "input side-effect observer requires both prepare and complete callbacks";
+        }
+        return nullptr;
+    }
     std::unique_ptr<InputInjector> injector(new InputInjector());
     injector->dry_run_ = dry_run;
     injector->dry_run_observer_ = std::move(dry_run_observer);
     injector->release_trace_observer_ = std::move(release_trace_observer);
     injector->keyboard_layout_provider_ = std::move(keyboard_layout_provider);
     injector->ime_open_provider_ = std::move(ime_open_provider);
+    injector->side_effect_observer_ = std::move(side_effect_observer);
+    injector->dry_run_api_result_provider_ = std::move(dry_run_api_result_provider);
     try {
         injector->thread_ = std::thread(&InputInjector::run, injector.get());
     } catch (const std::exception& e) {
@@ -527,21 +538,85 @@ std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* 
 UINT InputInjector::send(const INPUT& input) {
     INPUT tagged = input;
     if (tagged.type == INPUT_KEYBOARD) tagged.ki.dwExtraInfo = kInputInjectionTag;
+    InputSideEffectIntent intent;
+    intent.api = InputSideEffectApi::SendInput;
+    intent.inputs.push_back(tagged);
+    if (!prepare_side_effect(intent)) return 0;
     // A dry run stops at the OS boundary: everything above it (mapping,
     // coordinate conversion, held-key tracking) runs exactly as it does for a
     // real event, so a loopback check covers all of our code and none of the
     // desktop's.
+    UINT inserted = 0;
+    DWORD api_error = ERROR_SUCCESS;
     if (dry_run_) {
-        if (dry_run_observer_) dry_run_observer_(tagged);
-        return 1u;
+        try {
+            if (dry_run_observer_) dry_run_observer_(tagged);
+            const DryRunInputApiResult simulated = dry_run_api_result_provider_
+                ? dry_run_api_result_provider_(intent)
+                : DryRunInputApiResult{1u, ERROR_SUCCESS};
+            inserted = static_cast<UINT>(simulated.return_value);
+            api_error = simulated.last_error;
+        } catch (...) {
+            side_effect_observer_failed_ = true;
+            operation_side_effects_succeeded_ = false;
+            return 0;
+        }
+    } else {
+        SetLastError(ERROR_SUCCESS);
+        inserted = SendInput(1, &tagged, sizeof(tagged));
+        if (inserted == 0) api_error = GetLastError();
     }
-    const UINT inserted = SendInput(1, &tagged, sizeof(tagged));
     if (inserted == 0) {
         // The desktop can change between the check in run() and this call;
         // SendInput then drops the event. Look again before the next one.
         desktop_check_due_ = true;
     }
+    complete_side_effect(intent, inserted, api_error, inserted == 1);
     return inserted;
+}
+
+bool InputInjector::prepare_side_effect(InputSideEffectIntent& intent) {
+    if (operation_side_effect_count_ != UINT32_MAX) {
+        ++operation_side_effect_count_;
+    } else {
+        operation_side_effects_succeeded_ = false;
+        side_effect_observer_failed_ = true;
+        return false;
+    }
+    if (side_effect_observer_failed_ || side_effect_sequence_ == UINT64_MAX) {
+        operation_side_effects_succeeded_ = false;
+        side_effect_observer_failed_ = true;
+        return false;
+    }
+    intent.sequence = ++side_effect_sequence_;
+    if (!side_effect_observer_.prepare) return true;
+    try {
+        if (side_effect_observer_.prepare(intent)) return true;
+    } catch (...) {
+        // Treat a lost/throwing preflight channel as an unresolved safety
+        // boundary. The OS API must not run after the journal becomes unsure.
+    }
+    operation_side_effects_succeeded_ = false;
+    side_effect_observer_failed_ = true;
+    return false;
+}
+
+void InputInjector::complete_side_effect(const InputSideEffectIntent& intent,
+                                         uint32_t return_value,
+                                         uint32_t last_error,
+                                         bool api_succeeded) {
+    if (!api_succeeded) operation_side_effects_succeeded_ = false;
+    if (!side_effect_observer_.complete) return;
+    const InputSideEffectResult result{intent.sequence, intent.api, return_value,
+                                       last_error, api_succeeded};
+    try {
+        if (side_effect_observer_.complete(result)) return;
+    } catch (...) {
+        // The call may already have changed desktop state. Leave the prepare
+        // record unresolved for the external recovery owner.
+    }
+    operation_side_effects_succeeded_ = false;
+    side_effect_observer_failed_ = true;
 }
 
 HKL InputInjector::keyboard_layout() const {
@@ -719,22 +794,36 @@ void InputInjector::run() {
             // the desktop is busy, and submit() must stay non-blocking.
             lock.unlock();
             for (const Pending& pending : batch) {
-                follow_input_desktop_if_due();
-                if (pending.release) {
-                    if (dry_run_ && release_trace_observer_) {
-                        release_trace_observer_("release_all_begin");
+                operation_side_effect_count_ = 0;
+                operation_side_effects_succeeded_ = true;
+                try {
+                    follow_input_desktop_if_due();
+                    if (pending.release) {
+                        if (dry_run_ && release_trace_observer_) {
+                            release_trace_observer_("release_all_begin");
+                        }
+                        release_all();
+                        if (dry_run_ && release_trace_observer_) {
+                            release_trace_observer_("release_all_end");
+                        }
+                    } else if (pending.has_text) {
+                        apply_text(pending.text);
+                    } else {
+                        apply(pending.event);
                     }
-                    release_all();
-                    if (dry_run_ && release_trace_observer_) {
-                        release_trace_observer_("release_all_end");
-                    }
-                } else if (pending.has_text) {
-                    apply_text(pending.text);
-                } else {
-                    apply(pending.event);
+                } catch (...) {
+                    // Allocation or a test/provider callback can fail before
+                    // or after an API attempt. Never strand submit_and_wait();
+                    // the conservative choice is to stop further injection
+                    // and let the external recovery owner retain prior intents.
+                    operation_side_effects_succeeded_ = false;
+                    side_effect_observer_failed_ = true;
                 }
                 if (pending.completion != nullptr)
-                    pending.completion->set_value(true);
+                    pending.completion->set_value(
+                        operation_side_effect_count_ != 0 &&
+                        operation_side_effects_succeeded_ &&
+                        !side_effect_observer_failed_);
             }
             lock.lock();
         }
@@ -980,11 +1069,13 @@ void InputInjector::apply_mouse(const MouseEvent& event) {
                 button.type = INPUT_MOUSE;
                 button.mi.dwFlags = flags;
                 button.mi.mouseData = data;
-                if (send(button) == 1) {
+                const bool succeeded = send(button) == 1;
+                if (succeeded) {
                     ++applied;
                 } else {
                     ++failed;
                 }
+                return succeeded;
             };
             // One INPUT carries one flag, so a mask with several bits needs
             // one call per bit. This matters for Back+Forward: sending a
@@ -992,11 +1083,12 @@ void InputInjector::apply_mouse(const MouseEvent& event) {
             const uint16_t primary =
                 static_cast<uint16_t>(pressed & ~(kMouseBack | kMouseForward));
             if (primary != 0) {
-                send_button(mouse_flag(event.action, primary), 0);
-                if (down) {
-                    held_buttons_ |= primary;
-                } else {
-                    held_buttons_ &= static_cast<uint16_t>(~primary);
+                if (send_button(mouse_flag(event.action, primary), 0)) {
+                    if (down) {
+                        held_buttons_ |= primary;
+                    } else {
+                        held_buttons_ &= static_cast<uint16_t>(~primary);
+                    }
                 }
             }
             for (const uint16_t bit :
@@ -1004,12 +1096,13 @@ void InputInjector::apply_mouse(const MouseEvent& event) {
                 if ((pressed & bit) == 0) {
                     continue;
                 }
-                send_button(down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP,
-                            bit == kMouseBack ? XBUTTON1 : XBUTTON2);
-                if (down) {
-                    held_buttons_ |= bit;
-                } else {
-                    held_buttons_ &= static_cast<uint16_t>(~bit);
+                if (send_button(down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP,
+                                bit == kMouseBack ? XBUTTON1 : XBUTTON2)) {
+                    if (down) {
+                        held_buttons_ |= bit;
+                    } else {
+                        held_buttons_ &= static_cast<uint16_t>(~bit);
+                    }
                 }
             }
             std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -1069,6 +1162,7 @@ void InputInjector::apply_touch(const TouchEvent& event) {
         return;
     }
 
+    const auto previous_slots = touch_slots_;
     TouchSlot& slot = touch_slots_[event.contact];
     TouchAction action = event.action;
     bool deactivate = false;
@@ -1148,10 +1242,63 @@ void InputInjector::apply_touch(const TouchEvent& event) {
         contacts.push_back(info);
     }
 
-    bool ok = true;
-    if (!contacts.empty() && !dry_run_) {
-        ok = InjectTouchInput(static_cast<UINT32>(contacts.size()), contacts.data()) != 0;
+    if (contacts.empty()) {
+        touch_slots_ = previous_slots;
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.rejected;
+        operation_side_effects_succeeded_ = false;
+        return;
     }
+
+    InputSideEffectIntent intent;
+    intent.api = InputSideEffectApi::InjectTouchInput;
+    intent.touch_contacts = contacts;
+    if (!prepare_side_effect(intent)) {
+        touch_slots_ = previous_slots;
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.failed;
+        return;
+    }
+
+    uint32_t api_result = 0;
+    uint32_t api_error = ERROR_SUCCESS;
+    if (dry_run_) {
+        try {
+            for (unsigned attempt = 0; attempt < 3; ++attempt) {
+                const DryRunInputApiResult simulated = dry_run_api_result_provider_
+                    ? dry_run_api_result_provider_(intent)
+                    : DryRunInputApiResult{1u, ERROR_SUCCESS};
+                api_result = simulated.return_value != 0 ? 1u : 0u;
+                api_error = simulated.last_error;
+                if (api_result != 0 || api_error != ERROR_NOT_READY || attempt == 2)
+                    break;
+                Sleep(1);
+            }
+        } catch (...) {
+            side_effect_observer_failed_ = true;
+            operation_side_effects_succeeded_ = false;
+            return;
+        }
+    } else {
+        // Windows can reject a touch frame with ERROR_NOT_READY if calls are
+        // too close together. The frame is not invalidated; retry the exact
+        // same frame a small bounded number of times.
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            SetLastError(ERROR_SUCCESS);
+            const BOOL injected = InjectTouchInput(
+                static_cast<UINT32>(contacts.size()), contacts.data());
+            if (injected != 0) {
+                api_result = 1;
+                api_error = ERROR_SUCCESS;
+                break;
+            }
+            api_error = GetLastError();
+            if (api_error != ERROR_NOT_READY || attempt == 2) break;
+            Sleep(1);
+        }
+    }
+    const bool ok = api_result != 0;
+    complete_side_effect(intent, api_result, api_error, ok);
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         if (ok) {
@@ -1161,10 +1308,15 @@ void InputInjector::apply_touch(const TouchEvent& event) {
         }
     }
     if (!ok) {
-        // Windows cancels every contact when a frame is invalid, so drop our
-        // view of them; the next Down starts a fresh sequence.
-        for (TouchSlot& current : touch_slots_) {
-            current = TouchSlot{};
+        if (api_error == ERROR_INVALID_PARAMETER) {
+            // InjectTouchInput documents that an invalid frame cancels all
+            // active contacts. Other failures (notably ERROR_NOT_READY) do
+            // not justify forgetting the previously accepted contact set.
+            for (TouchSlot& current : touch_slots_) {
+                current = TouchSlot{};
+            }
+        } else {
+            touch_slots_ = previous_slots;
         }
         return;
     }
@@ -1204,6 +1356,13 @@ void InputInjector::apply_pen(const PenEvent& event) {
         return;
     }
 
+    const bool previous_pen_down = pen_down_;
+    const int32_t previous_pen_x = pen_x_;
+    const int32_t previous_pen_y = pen_y_;
+    const uint16_t previous_pen_pressure = pen_pressure_;
+    const uint8_t previous_pen_flags = pen_flags_;
+    const int16_t previous_pen_tilt_x = pen_tilt_x_;
+    const int16_t previous_pen_tilt_y = pen_tilt_y_;
     TouchAction action = event.action;
     bool deactivate = false;
     int32_t left = 0;
@@ -1281,7 +1440,43 @@ void InputInjector::apply_pen(const PenEvent& event) {
         info.penInfo.tiltY = pen_tilt_y_;
     }
 
-    const bool ok = dry_run_ || inject_pointer_input_(pen_device_, &info, 1) != 0;
+    InputSideEffectIntent intent;
+    intent.api = InputSideEffectApi::InjectSyntheticPointerInput;
+    intent.pointer_inputs.push_back(info);
+    if (!prepare_side_effect(intent)) {
+        pen_down_ = previous_pen_down;
+        pen_x_ = previous_pen_x;
+        pen_y_ = previous_pen_y;
+        pen_pressure_ = previous_pen_pressure;
+        pen_flags_ = previous_pen_flags;
+        pen_tilt_x_ = previous_pen_tilt_x;
+        pen_tilt_y_ = previous_pen_tilt_y;
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.failed;
+        return;
+    }
+
+    uint32_t api_result = 0;
+    uint32_t api_error = ERROR_SUCCESS;
+    if (dry_run_) {
+        try {
+            const DryRunInputApiResult simulated = dry_run_api_result_provider_
+                ? dry_run_api_result_provider_(intent)
+                : DryRunInputApiResult{1u, ERROR_SUCCESS};
+            api_result = simulated.return_value != 0 ? 1u : 0u;
+            api_error = simulated.last_error;
+        } catch (...) {
+            side_effect_observer_failed_ = true;
+            operation_side_effects_succeeded_ = false;
+            return;
+        }
+    } else {
+        SetLastError(ERROR_SUCCESS);
+        api_result = inject_pointer_input_(pen_device_, &info, 1) != 0 ? 1u : 0u;
+        if (api_result == 0) api_error = GetLastError();
+    }
+    const bool ok = api_result != 0;
+    complete_side_effect(intent, api_result, api_error, ok);
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         if (ok) {
@@ -1290,7 +1485,15 @@ void InputInjector::apply_pen(const PenEvent& event) {
             ++stats_.failed;
         }
     }
-    if (!ok || deactivate) {
+    if (!ok) {
+        pen_down_ = previous_pen_down;
+        pen_x_ = previous_pen_x;
+        pen_y_ = previous_pen_y;
+        pen_pressure_ = previous_pen_pressure;
+        pen_flags_ = previous_pen_flags;
+        pen_tilt_x_ = previous_pen_tilt_x;
+        pen_tilt_y_ = previous_pen_tilt_y;
+    } else if (deactivate) {
         pen_down_ = false;
     }
 }
@@ -1370,11 +1573,13 @@ void InputInjector::release_fallback_pointer() {
     if (fallback_pointer_ == FallbackPointer::None) {
         return;
     }
-    fallback_pointer_ = FallbackPointer::None;
     MouseEvent up;
     up.action = MouseAction::ButtonUp;
     up.buttons = kMouseLeft;
     apply_mouse(up);
+    if ((held_buttons_ & kMouseLeft) == 0) {
+        fallback_pointer_ = FallbackPointer::None;
+    }
 }
 
 void InputInjector::release_touch_contacts() {
@@ -1583,8 +1788,7 @@ void InputInjector::apply_text(const std::string& text) {
 
 void InputInjector::release_all() {
     // Buttons first: releasing a key mid-drag would still leave the drag on.
-    uint16_t buttons = held_buttons_;
-    held_buttons_ = 0;
+    const uint16_t buttons = held_buttons_;
     const MouseButtonBit order[] = {kMouseLeft, kMouseRight, kMouseMiddle, kMouseBack,
                                     kMouseForward};
     for (MouseButtonBit bit : order) {
@@ -1603,7 +1807,6 @@ void InputInjector::release_all() {
     release_fallback_pointer();
     while (!held_keys_.empty()) {
         const HeldKey held = held_keys_.back();
-        held_keys_.pop_back();
         INPUT input{};
         if (!(held.legacy ? make_legacy_keyboard_input(held.usage, false, input)
                           : (held.scan_code
@@ -1612,15 +1815,19 @@ void InputInjector::release_all() {
                                        held.virtual_key, false, input)))) {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             ++stats_.rejected;
-            continue;
+            break;
         }
         const UINT inserted = send(input);
-        std::lock_guard<std::mutex> lock(stats_mutex_);
-        if (inserted == 1) {
-            ++stats_.applied;
-        } else {
-            ++stats_.failed;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            if (inserted == 1) {
+                ++stats_.applied;
+            } else {
+                ++stats_.failed;
+            }
         }
+        if (inserted != 1) break;
+        held_keys_.pop_back();
     }
 }
 

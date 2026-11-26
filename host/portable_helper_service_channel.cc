@@ -91,7 +91,8 @@ PortableHelperServiceConnection::PortableHelperServiceConnection(
     PortableHelperServiceConnection&& other) noexcept
     : channel(std::move(other.channel)),
       service_process(std::exchange(other.service_process, nullptr)),
-      service_identity(std::move(other.service_identity)) {}
+      service_identity(std::move(other.service_identity)),
+      instance_id(std::exchange(other.instance_id, {})) {}
 
 PortableHelperServiceConnection& PortableHelperServiceConnection::operator=(
     PortableHelperServiceConnection&& other) noexcept {
@@ -100,6 +101,7 @@ PortableHelperServiceConnection& PortableHelperServiceConnection::operator=(
   channel = std::move(other.channel);
   service_process = std::exchange(other.service_process, nullptr);
   service_identity = std::move(other.service_identity);
+  instance_id = std::exchange(other.instance_id, {});
   return *this;
 }
 
@@ -110,6 +112,7 @@ void PortableHelperServiceConnection::Reset() noexcept {
     service_process = nullptr;
   }
   service_identity = {};
+  instance_id = {};
 }
 
 bool connect_portable_helper_service_channel(
@@ -209,12 +212,14 @@ bool connect_portable_helper_service_channel(
   connection->channel = std::move(channel);
   connection->service_process = process;
   connection->service_identity = std::move(identity);
+  connection->instance_id = spec.instance_id;
   return true;
 }
 
 bool request_portable_helper_service_stop(
     PortableHelperServiceConnection& connection, uint32_t timeout_ms,
     std::string* error) {
+  std::lock_guard rpc_lock(connection.rpc_mutex);
   if (error != nullptr) error->clear();
   if (connection.service_process == nullptr)
     return fail(error, "portable helper connection has no SCM process handle");
@@ -271,6 +276,251 @@ bool request_portable_helper_service_stop(
     return fail(error, control_error.empty()
                            ? "portable helper exited without a stop acknowledgement"
                            : control_error);
+  return true;
+}
+
+namespace {
+
+bool new_control_request_id(uint64_t* request_id, std::string* error) {
+  if (request_id == nullptr)
+    return fail(error, "missing portable helper request ID output");
+  *request_id = 0;
+  do {
+    if (!secure_random(reinterpret_cast<uint8_t*>(request_id),
+                       sizeof(*request_id)))
+      return fail(error, "cannot generate a portable helper request ID");
+  } while (*request_id == 0);
+  return true;
+}
+
+bool expect_acknowledgement(PortableHelperPipe& channel, uint64_t request_id,
+                            uint32_t timeout_ms, std::string* error) {
+  PortableHelperMessage response;
+  if (!channel.Receive(&response, timeout_ms, error)) return false;
+  if (response.type != PortableHelperMessageType::Acknowledgement ||
+      response.request_id != request_id || response.payload.size() != 1 ||
+      response.payload[0] != 1)
+    return fail(error, "portable helper returned a rejected or uncorrelated acknowledgement");
+  return true;
+}
+
+void revoke_parent_forwarding_gate(
+    PortableHelperServiceConnection& connection,
+    PortableHelperAuthorization& authorization, const std::string& reason,
+    std::string* error) {
+  std::string revoke_error;
+  // The parent authorization gates messages sent to the helper; it does not
+  // inject input itself. The worker/service owns the actual desktop release.
+  (void)authorization.Revoke([] { return true; }, [] { return true; },
+                             &revoke_error);
+  connection.channel.reset();
+  if (error != nullptr) {
+    *error = reason;
+    if (!revoke_error.empty()) *error += "; local authorization revoked: " + revoke_error;
+  }
+}
+
+}  // namespace
+
+bool start_portable_helper_session_worker(
+    PortableHelperServiceConnection& connection,
+    PortableHelperAuthorization& authorization,
+    const PortableHelperGrant& grant, uint32_t timeout_ms,
+    std::string* error) {
+  std::lock_guard rpc_lock(connection.rpc_mutex);
+  if (error != nullptr) error->clear();
+  if (authorization.state() !=
+      PortableHelperAuthorizationState::AwaitingWorkerReady) {
+    if (error != nullptr)
+      *error = "portable helper start requires a locally authorized pending grant";
+    return false;
+  }
+  if (!connection.channel ||
+      connection.instance_id == PortableHelperInstanceId{} ||
+      connection.instance_id != grant.instance_id) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        "portable helper start connection does not match the local grant",
+        error);
+    return false;
+  }
+  if (connection.service_process != nullptr &&
+      WaitForSingleObject(connection.service_process, 0) != WAIT_TIMEOUT) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        "portable helper service process is no longer running", error);
+    return false;
+  }
+
+  uint64_t request_id = 0;
+  PortableHelperMessage request;
+  std::string rpc_error;
+  if (!new_control_request_id(&request_id, &rpc_error) ||
+      !make_portable_helper_session_worker_start_request(
+          grant, request_id, &request, &rpc_error) ||
+      !connection.channel->Send(std::move(request), timeout_ms, &rpc_error) ||
+      !expect_acknowledgement(*connection.channel, request_id, timeout_ms,
+                              &rpc_error)) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        rpc_error.empty() ? "portable helper worker start failed" : rpc_error,
+        error);
+    return false;
+  }
+
+  PortableHelperMessage ready;
+  if (!connection.channel->Receive(&ready, timeout_ms, &rpc_error)) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        rpc_error.empty() ? "portable helper WorkerReady proof was not received"
+                          : rpc_error,
+        error);
+    return false;
+  }
+  if (ready.type != PortableHelperMessageType::WorkerReady ||
+      ready.instance_id != grant.instance_id ||
+      ready.request_id != grant.generation ||
+      ready.payload.size() != PortableHelperSecret{}.size()) {
+    if (!ready.payload.empty())
+      SecureZeroMemory(ready.payload.data(), ready.payload.size());
+    revoke_parent_forwarding_gate(connection, authorization,
+        "portable helper WorkerReady proof has an invalid scope or size", error);
+    return false;
+  }
+  PortableHelperSecret proof{};
+  std::copy(ready.payload.begin(), ready.payload.end(), proof.begin());
+  SecureZeroMemory(ready.payload.data(), ready.payload.size());
+  const bool confirmed = authorization.ConfirmBrokerManagedWorkerReady(
+      grant, proof, &rpc_error);
+  SecureZeroMemory(proof.data(), proof.size());
+  if (!confirmed) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        rpc_error.empty() ? "portable helper WorkerReady proof was rejected"
+                          : rpc_error,
+        error);
+    return false;
+  }
+  return true;
+}
+
+bool stop_portable_helper_session_worker(
+    PortableHelperServiceConnection& connection,
+    PortableHelperAuthorization& authorization,
+    const PortableHelperGrant& grant, uint32_t timeout_ms,
+    std::string* error) {
+  std::lock_guard rpc_lock(connection.rpc_mutex);
+  if (error != nullptr) error->clear();
+  if (authorization.state() != PortableHelperAuthorizationState::Ready) {
+    if (error != nullptr)
+      *error = "portable helper stop requires a ready session grant";
+    return false;
+  }
+  if (!connection.channel || connection.instance_id != grant.instance_id) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        "portable helper stop connection does not match the active grant",
+        error);
+    return false;
+  }
+  if (connection.service_process != nullptr &&
+      WaitForSingleObject(connection.service_process, 0) != WAIT_TIMEOUT) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        "portable helper service process exited before worker stop", error);
+    return false;
+  }
+
+  uint64_t request_id = 0;
+  std::string rpc_error;
+  PortableHelperMessage stop;
+  if (!new_control_request_id(&request_id, &rpc_error)) {
+    revoke_parent_forwarding_gate(connection, authorization, rpc_error, error);
+    return false;
+  }
+  stop.type = PortableHelperMessageType::SessionWorkerStop;
+  stop.request_id = request_id;
+  stop.payload.insert(stop.payload.end(), grant.connection_id.begin(),
+                      grant.connection_id.end());
+  for (unsigned shift = 0; shift < 64; shift += 8)
+    stop.payload.push_back(static_cast<uint8_t>(grant.generation >> shift));
+  if (!connection.channel->Send(std::move(stop), timeout_ms, &rpc_error) ||
+      !expect_acknowledgement(*connection.channel, request_id, timeout_ms,
+                              &rpc_error)) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        rpc_error.empty() ? "portable helper worker stop was not confirmed"
+                          : rpc_error,
+        error);
+    return false;
+  }
+
+  if (!authorization.Revoke([] { return true; }, [] { return true; },
+                            &rpc_error)) {
+    connection.channel.reset();
+    if (error != nullptr)
+      *error = rpc_error.empty()
+          ? "portable helper stopped but the parent authorization gate could not be revoked"
+          : rpc_error;
+    return false;
+  }
+  return true;
+}
+
+bool request_portable_helper_capture_frame(
+    PortableHelperServiceConnection& connection,
+    PortableHelperAuthorization& authorization,
+    const PortableHelperGrant& grant, uint64_t request_id,
+    uint32_t timeout_ms, PortableHelperCapturedFrame* frame,
+    std::string* error) {
+  std::lock_guard rpc_lock(connection.rpc_mutex);
+  if (error != nullptr) error->clear();
+  if (frame == nullptr || !connection.channel ||
+      connection.instance_id != grant.instance_id ||
+      authorization.state() != PortableHelperAuthorizationState::Ready)
+    return fail(error, "portable helper capture request requires a ready matching connection");
+  *frame = {};
+  PortableHelperMessage request;
+  std::string rpc_error;
+  if (!make_portable_helper_capture_request(authorization, grant, request_id,
+                                             &request, &rpc_error)) {
+    if (error != nullptr) *error = rpc_error;
+    return false;
+  }
+  if (!connection.channel->Send(std::move(request), timeout_ms, &rpc_error) ||
+      !receive_portable_helper_captured_frame(
+          *connection.channel, grant, request_id, frame, timeout_ms,
+          &rpc_error)) {
+    if (!frame->png.empty()) {
+      SecureZeroMemory(frame->png.data(), frame->png.size());
+      frame->png.clear();
+    }
+    revoke_parent_forwarding_gate(connection, authorization,
+        rpc_error.empty() ? "portable helper capture RPC failed" : rpc_error,
+        error);
+    return false;
+  }
+  return true;
+}
+
+bool request_portable_helper_input_event(
+    PortableHelperServiceConnection& connection,
+    PortableHelperAuthorization& authorization,
+    const PortableHelperGrant& grant, uint64_t request_id,
+    const chast::InputEvent& event, uint32_t timeout_ms,
+    std::string* error) {
+  std::lock_guard rpc_lock(connection.rpc_mutex);
+  if (error != nullptr) error->clear();
+  if (!connection.channel || connection.instance_id != grant.instance_id ||
+      authorization.state() != PortableHelperAuthorizationState::Ready)
+    return fail(error, "portable helper input request requires a ready matching connection");
+  PortableHelperMessage request;
+  std::string rpc_error;
+  if (!make_portable_helper_input_request(authorization, grant, request_id,
+                                          event, &request, &rpc_error)) {
+    if (error != nullptr) *error = rpc_error;
+    return false;
+  }
+  if (!connection.channel->Send(std::move(request), timeout_ms, &rpc_error) ||
+      !expect_acknowledgement(*connection.channel, request_id, timeout_ms,
+                              &rpc_error)) {
+    revoke_parent_forwarding_gate(connection, authorization,
+        rpc_error.empty() ? "portable helper input RPC failed" : rpc_error,
+        error);
+    return false;
+  }
   return true;
 }
 

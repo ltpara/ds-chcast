@@ -14,6 +14,11 @@ bool machine_state_directory_trusted(const std::wstring& path, std::string* erro
 
 bool machine_state_file_trusted(const std::wstring& path, std::string* error);
 
+// Validates an already-open no-follow file handle. Callers must also validate
+// the containing directory; this avoids reopening a file by name when a shared
+// handle would otherwise cause a sharing conflict.
+bool machine_state_file_handle_trusted(void* file_handle, std::string* error);
+
 // Secures one file beneath a trusted machine-state directory. Missing files are
 // accepted so callers can prepare a path before its first atomic write.
 bool harden_machine_state_file(const std::wstring& path, std::string* error);

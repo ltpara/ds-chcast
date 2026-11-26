@@ -1,8 +1,12 @@
 # 分支基线与下一步执行计划
 
-日期：2026-11-20；最新审核补充：2026-11-25
+日期：2026-11-20；最新审核补充：2026-11-27
 
 当前开发分支：`codex/complete-workspace-2026-11-20`
+
+2026-11-27 H01 输入释放 journal：受保护、逐 instance/connection/session/generation 的 Windows 原子文件后端及 worker `InputSideEffectObserver` 接线已实现；v2 released tombstone 防止已有 generation 被重置。Release host/service/parity/keyboard 目标构建通过；`protocol`、`keyboard`、`portable_helper_lifecycle`、`portable_helper_authorization` 重复 5 轮 **20/20 PASS**，高完整性 `--portable-helper-authorization` 套件也通过并实际运行文件后端回归。独立认证的目标 session 清理执行端和生命周期删除接线仍未实现，产品键鼠 grant 继续 fail-closed。详见[H01 专题记录](h01-portable-elevated-helper-design-2026-11-25.md)及[当前状态入口](current-status-and-next-plan-2026-11-17.md)。
+
+2026-11-26 H01 更新：父端 helper worker RPC caller 已补齐隔离测试；`BeginGrant` 现在要求一次性、短时效本机批准 receipt，批准 gate 限定创建线程并要求实时连接/session/权限复核。Release host/service/lifecycle/parity 目标构建成功，H01 授权 CTest 连续 5 次通过、生命周期 CTest 1/1 通过。该审批 gate 与 caller 尚未接入 `host/main.cc` 实际 UI/UAC/staging/SCM；签名 pin 和产品输入释放 provider 未配置，故仍无产品可用提权会话。真实 SYSTEM/SCM/ProgramData/安全桌面验收继续待做，详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)及[当前状态入口](current-status-and-next-plan-2026-11-17.md)。
 
 2026-11-25 C03/H01：在当前源码重建 Windows Release Flutter 查看端，并以生命周期 trace 完成 20/20 个标签关闭/重连 loopback 周期；每轮兄弟连接保持 active，末尾精确断开通过。轨迹未出现窗口集归零或主消息泵 quit/error。11-22 历史进程退出根因仍未复现/定位，C03 保持未解决风险。H01 的 framing、受限 Named Pipe、生命周期协调器、独立 service entry、staging/copy、恢复记录及正式 `chast-service` 后台恢复扫描代码均已实现并有注入式/隔离回归；不过发布签名证书正向验证、授权/UAC 接线、真实 SCM/ProgramData 管理员验收、worker-ready/capability、桌面 worker 及安全桌面验收仍待。Win32 adapter 未在本轮调用，未安装服务或修改 SCM/ProgramData/防火墙。帧序号和消息类型不授予桌面操作权限。详见[H01 设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
 

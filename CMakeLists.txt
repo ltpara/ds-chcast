@@ -363,6 +363,8 @@ add_library(chast.host.tray STATIC
     host/elevation_handoff.cc
     host/portable_helper_protocol.cc
     host/portable_helper_authorization.cc
+    host/portable_helper_input_journal.cc
+    host/portable_helper_input_journal_store.cc
     host/portable_helper_supervisor.cc
     host/portable_helper_win32_supervisor.cc
     host/portable_helper_service_channel.cc

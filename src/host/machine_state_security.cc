@@ -603,6 +603,36 @@ bool machine_state_file_trusted(const std::wstring& path, std::string* error) {
     return trusted;
 }
 
+bool machine_state_file_handle_trusted(void* file_handle, std::string* error) {
+    if (error != nullptr) error->clear();
+    HANDLE file = static_cast<HANDLE>(file_handle);
+    if (file == nullptr || file == INVALID_HANDLE_VALUE) {
+        if (error != nullptr) *error = "machine-state file handle is invalid";
+        return false;
+    }
+    std::string detail;
+    if (object_is_reparse_or_wrong_type(file, false, &detail)) {
+        if (error != nullptr) *error = detail;
+        return false;
+    }
+    PSID owner = nullptr;
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    DWORD result = ERROR_SUCCESS;
+    if (!read_owner_acl(file, &owner, &acl, &descriptor, &result)) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        if (error != nullptr) *error = "cannot read machine-state file handle owner/DACL (error " +
+            std::to_string(result) + ")";
+        return false;
+    }
+    const bool protected_dacl = dacl_is_protected(descriptor);
+    const bool trusted = protected_dacl && acl_trusted(owner, acl, &detail);
+    LocalFree(descriptor);
+    if (!trusted && error != nullptr) *error = detail.empty()
+        ? "the file DACL is not protected from inheritance" : detail;
+    return trusted;
+}
+
 bool harden_machine_state_directory(const std::wstring& path, std::string* error) {
     if (error != nullptr) error->clear();
     if (!process_can_harden_machine_state()) {

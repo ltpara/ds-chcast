@@ -9,11 +9,13 @@
 #include <filesystem>
 #include <future>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "chast/security.h"
 #include "chast/decoder.h"
@@ -23,6 +25,8 @@
 #include "elevation_handoff.h"
 #include "portable_helper_protocol.h"
 #include "portable_helper_authorization.h"
+#include "portable_helper_input_journal.h"
+#include "portable_helper_input_journal_store.h"
 #include "portable_helper_supervisor.h"
 #include "portable_helper_win32_supervisor.h"
 #include "portable_helper_service_channel.h"
@@ -31,6 +35,7 @@
 #include "platform.h"
 #include "chast/user_context.h"
 #include "chast/png.h"
+#include "chast/machine_state_security.h"
 
 namespace {
 using namespace chast;
@@ -41,6 +46,37 @@ void require(bool condition, const char* message) {
     std::printf("%s %s\n", condition ? "ok  " : "FAIL", message);
     if (!condition) throw std::runtime_error(message);
 }
+
+bool begin_local_approval_test_grant(
+    chast::host::PortableHelperAuthorization& authorization,
+    const chast::host::PortableHelperInstanceId& instance_id,
+    const chast::host::PortableHelperConnectionId& connection_id,
+    uint32_t windows_session_id, uint32_t operations,
+    chast::host::PortableHelperGrant* grant, std::string* error) {
+    chast::host::PortableHelperLocalApprovalGate gate;
+    chast::host::PortableHelperPendingApproval pending;
+    chast::host::PortableHelperLocalApprovalReceipt receipt;
+    if (!gate.QueueRemoteRequest(instance_id, connection_id, windows_session_id,
+                                 operations, &pending, error)) {
+        return false;
+    }
+    const bool approved = gate.Approve(
+        std::move(pending), operations,
+        [](const chast::host::PortableHelperApprovalRequestView& request,
+           uint32_t approved_operations, std::string* revalidation_error) {
+            if (request.windows_session_id == 0 ||
+                request.requested_operations != approved_operations) {
+                if (revalidation_error != nullptr)
+                    *revalidation_error = "test local consent context changed";
+                return false;
+            }
+            return true;
+        },
+        &receipt, error);
+    return approved &&
+        authorization.BeginGrant(std::move(receipt), grant, error);
+}
+
 template<class Predicate> bool until(Predicate predicate, std::chrono::milliseconds timeout = 3s) {
     const auto end = std::chrono::steady_clock::now() + timeout;
     do {
@@ -431,6 +467,442 @@ void portable_helper_worker_command_line() {
             "worker CLI rejects an overflowing process creation time");
 }
 
+void portable_helper_input_journal() {
+    using namespace chast::host;
+    PortableHelperInputJournalScope scope;
+    scope.instance_id[0] = 0x41;
+    scope.connection_id[0] = 0x92;
+    scope.windows_session_id = 7;
+    scope.generation = 12;
+    std::string error;
+    PortableHelperInputJournalImage durable;
+    int persist_calls = 0;
+    bool fail_next_persist = false;
+    const auto persist = [&](const PortableHelperInputJournalImage& image,
+                             std::string* persist_error) {
+        ++persist_calls;
+        if (fail_next_persist) {
+            fail_next_persist = false;
+            if (persist_error != nullptr) *persist_error = "injected store failure";
+            return false;
+        }
+        durable = image;
+        return true;
+    };
+    const auto key_intent = [](uint64_t sequence, bool down) {
+        chast::InputSideEffectIntent intent;
+        intent.sequence = sequence;
+        intent.api = chast::InputSideEffectApi::SendInput;
+        INPUT input{};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = 'A';
+        input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        intent.inputs.push_back(input);
+        return intent;
+    };
+    const auto result_for = [](const chast::InputSideEffectIntent& intent,
+                               bool succeeded, uint32_t last_error = ERROR_SUCCESS) {
+        return chast::InputSideEffectResult{
+            intent.sequence, intent.api, succeeded ? 1u : 0u,
+            last_error, succeeded};
+    };
+
+    PortableHelperInputJournal journal(scope, persist);
+    require(journal.Initialize(&error) && !durable.pending,
+            "input journal creates an initial empty generation record");
+    const auto down = key_intent(1, true);
+    require(journal.Prepare(down, &error) && durable.pending &&
+                durable.pending_sequence == 1 && durable.committed.keys.empty() &&
+                durable.possible.keys.size() == 1,
+            "key-down write-ahead state is durable before the OS call");
+    std::vector<uint8_t> encoded;
+    PortableHelperInputJournalImage decoded;
+    require(encode_portable_helper_input_journal(durable, &encoded, &error) &&
+                decode_portable_helper_input_journal(encoded, &decoded, &error) &&
+                decoded.pending && decoded.scope.generation == scope.generation &&
+                decoded.possible.keys.size() == 1,
+            "journal wire image round-trips a crash-window pending key");
+    auto corrupted = encoded;
+    corrupted[0] ^= 0x01;
+    require(!decode_portable_helper_input_journal(corrupted, &decoded, &error),
+            "journal decoder rejects an invalid magic value");
+    corrupted = encoded;
+    corrupted[73] = 1;
+    require(!decode_portable_helper_input_journal(corrupted, &decoded, &error),
+            "journal decoder rejects nonzero reserved header bytes");
+    corrupted = encoded;
+    corrupted.push_back(0);
+    require(!decode_portable_helper_input_journal(corrupted, &decoded, &error),
+            "journal decoder rejects trailing unframed bytes");
+
+    PortableHelperInputJournal recovered(scope,
+        [](const PortableHelperInputJournalImage&, std::string*) { return true; });
+    require(recovered.Restore(durable, &error) &&
+                recovered.has_pending_operation() &&
+                !recovered.Prepare(key_intent(2, false), &error),
+            "recovery never resumes an unresolved OS input operation");
+    require(recovered.MarkReleased(&error) && !recovered.has_pending_operation() &&
+                recovered.image().committed.keys.empty() &&
+                !recovered.Prepare(key_intent(2, false), &error),
+            "independent cleanup may clear a pending journal and terminally close its generation");
+    require(encode_portable_helper_input_journal(recovered.image(), &encoded,
+                                                 &error) &&
+                decode_portable_helper_input_journal(encoded, &decoded, &error) &&
+                decoded.released && !decoded.pending &&
+                decoded.committed.keys.empty() && decoded.possible.keys.empty(),
+            "journal v2 round-trips a durable released-generation tombstone");
+    PortableHelperInputJournal released_recovery(scope,
+        [](const PortableHelperInputJournalImage&, std::string*) { return true; });
+    require(released_recovery.Restore(decoded, &error) &&
+                released_recovery.recovery_only() &&
+                !released_recovery.Prepare(key_intent(2, false), &error) &&
+                released_recovery.MarkReleased(&error),
+            "restoring a released generation stays terminal and is idempotently cleanable");
+
+    const auto mismatched = result_for(down, true);
+    auto wrong_sequence = mismatched;
+    ++wrong_sequence.sequence;
+    require(!journal.Complete(wrong_sequence, &error) &&
+                journal.has_pending_operation(),
+            "journal rejects a duplicate or out-of-order API result");
+    require(journal.Complete(mismatched, &error) && !durable.pending &&
+                durable.last_sequence == 1 && durable.committed.keys.size() == 1,
+            "successful key-down result commits its held state");
+    const auto up = key_intent(2, false);
+    PortableHelperInputJournal recovered_committed(scope,
+        [](const PortableHelperInputJournalImage&, std::string*) { return true; });
+    require(recovered_committed.Restore(journal.image(), &error) &&
+                recovered_committed.recovery_only() &&
+                !recovered_committed.Prepare(up, &error),
+            "recovery cannot resume injection from a committed but held key state");
+    require(journal.Prepare(up, &error) && durable.pending &&
+                durable.possible.keys.size() == 1 &&
+                journal.Complete(result_for(up, true), &error) &&
+                durable.committed.keys.empty(),
+            "key-up is write-ahead recorded before the committed state is cleared");
+    require(!journal.Complete(result_for(up, true), &error),
+            "a completed API result cannot be replayed");
+
+    PortableHelperInputJournalScope failed_scope = scope;
+    ++failed_scope.generation;
+    PortableHelperInputJournalImage failed_durable;
+    PortableHelperInputJournal failed_journal(failed_scope,
+        [&](const PortableHelperInputJournalImage& image, std::string*) {
+            failed_durable = image;
+            return true;
+        });
+    require(failed_journal.Initialize(&error), "initialize failure-window journal");
+    const auto uncertain_down = key_intent(1, true);
+    require(failed_journal.Prepare(uncertain_down, &error),
+            "prepare possible key state before simulating an API failure");
+    require(!failed_journal.Complete(
+                result_for(uncertain_down, false, ERROR_ACCESS_DENIED), &error) &&
+                failed_durable.pending && failed_durable.possible.keys.size() == 1,
+            "failed API result retains the conservative recovery record");
+    require(failed_journal.MarkReleased(&error) && !failed_durable.pending &&
+                failed_durable.possible.keys.empty(),
+            "confirmed external release durably clears uncertain held state");
+
+    PortableHelperInputJournalScope store_scope = scope;
+    store_scope.generation += 2;
+    PortableHelperInputJournalImage store_durable;
+    bool store_failure = false;
+    PortableHelperInputJournal store_journal(store_scope,
+        [&](const PortableHelperInputJournalImage& image, std::string* store_error) {
+            if (store_failure) {
+                store_failure = false;
+                if (store_error != nullptr) *store_error = "injected persistence failure";
+                return false;
+            }
+            store_durable = image;
+            return true;
+        });
+    require(store_journal.Initialize(&error), "initialize persistence-failure journal");
+    const auto store_down = key_intent(1, true);
+    store_failure = true;
+    require(!store_journal.Prepare(store_down, &error) &&
+                !store_journal.has_pending_operation() && !store_durable.pending,
+            "prepare persistence failure vetoes the OS operation");
+    require(store_journal.Prepare(store_down, &error),
+            "prepare can proceed after a proven pre-call persistence failure");
+    store_failure = true;
+    require(!store_journal.Complete(result_for(store_down, true), &error) &&
+                store_durable.pending && store_journal.has_pending_operation(),
+            "result persistence failure preserves write-ahead recovery data");
+    require(store_journal.MarkReleased(&error) && !store_durable.pending,
+            "external cleanup resolves a result-persistence failure");
+
+    PortableHelperInputJournalScope stateless_scope = scope;
+    stateless_scope.generation += 3;
+    PortableHelperInputJournalImage stateless_durable;
+    int stateless_persist_calls = 0;
+    PortableHelperInputJournal stateless_journal(stateless_scope,
+        [&](const PortableHelperInputJournalImage& image, std::string*) {
+            ++stateless_persist_calls;
+            stateless_durable = image;
+            return true;
+        });
+    require(stateless_journal.Initialize(&error), "initialize stateless journal");
+    const int initial_persist_calls = stateless_persist_calls;
+    chast::InputSideEffectIntent motion;
+    motion.sequence = 1;
+    motion.inputs.resize(1);
+    motion.inputs[0].type = INPUT_MOUSE;
+    motion.inputs[0].mi.dwFlags = MOUSEEVENTF_MOVE;
+    require(stateless_journal.Prepare(motion, &error) &&
+                stateless_journal.Complete(result_for(motion, true), &error) &&
+                stateless_persist_calls == initial_persist_calls,
+            "stateless mouse motion avoids unnecessary journal writes");
+
+    PortableHelperInputJournalScope touch_scope = scope;
+    touch_scope.generation += 4;
+    PortableHelperInputJournalImage touch_durable;
+    PortableHelperInputJournal touch_journal(touch_scope,
+        [&](const PortableHelperInputJournalImage& image, std::string*) {
+            touch_durable = image;
+            return true;
+        });
+    require(touch_journal.Initialize(&error), "initialize touch journal");
+    const auto touch_intent = [&](uint64_t sequence, DWORD flags, int32_t x) {
+        chast::InputSideEffectIntent intent;
+        intent.sequence = sequence;
+        intent.api = chast::InputSideEffectApi::InjectTouchInput;
+        POINTER_TOUCH_INFO touch{};
+        touch.pointerInfo.pointerType = PT_TOUCH;
+        touch.pointerInfo.pointerId = 0;
+        touch.pointerInfo.pointerFlags = flags;
+        touch.pointerInfo.ptPixelLocation.x = x;
+        touch.pointerInfo.ptPixelLocation.y = 50;
+        intent.touch_contacts.push_back(touch);
+        return intent;
+    };
+    const auto touch_down = touch_intent(1, POINTER_FLAG_DOWN |
+        POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT, 10);
+    require(touch_journal.Prepare(touch_down, &error) &&
+                touch_journal.Complete(result_for(touch_down, true), &error) &&
+                touch_durable.committed.touches.size() == 1,
+            "touch down persists an active contact");
+    const auto touch_up = touch_intent(2, POINTER_FLAG_UP, 10);
+    require(touch_journal.Prepare(touch_up, &error) &&
+                touch_journal.Complete(result_for(touch_up, true), &error) &&
+                touch_durable.committed.touches.empty(),
+            "touch up clears only the acknowledged contact");
+
+    PortableHelperInputJournalScope pen_scope = scope;
+    pen_scope.generation += 5;
+    PortableHelperInputJournalImage pen_durable;
+    PortableHelperInputJournal pen_journal(pen_scope,
+        [&](const PortableHelperInputJournalImage& image, std::string*) {
+            pen_durable = image;
+            return true;
+        });
+    require(pen_journal.Initialize(&error), "initialize pen journal");
+    const auto pen_intent = [](uint64_t sequence, DWORD flags) {
+        chast::InputSideEffectIntent intent;
+        intent.sequence = sequence;
+        intent.api = chast::InputSideEffectApi::InjectSyntheticPointerInput;
+        POINTER_TYPE_INFO pointer{};
+        pointer.type = PT_PEN;
+        pointer.penInfo.pointerInfo.pointerType = PT_PEN;
+        pointer.penInfo.pointerInfo.pointerId = 0;
+        pointer.penInfo.pointerInfo.pointerFlags = flags;
+        pointer.penInfo.pointerInfo.ptPixelLocation.x = 20;
+        pointer.penInfo.pointerInfo.ptPixelLocation.y = 30;
+        intent.pointer_inputs.push_back(pointer);
+        return intent;
+    };
+    const auto pen_down = pen_intent(1, POINTER_FLAG_DOWN |
+        POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
+    const auto pen_up = pen_intent(2, POINTER_FLAG_UP);
+    require(pen_journal.Prepare(pen_down, &error) &&
+                pen_journal.Complete(result_for(pen_down, true), &error) &&
+                pen_durable.committed.pen_down &&
+                pen_journal.Prepare(pen_up, &error) &&
+                pen_journal.Complete(result_for(pen_up, true), &error) &&
+                !pen_durable.committed.pen_down,
+            "pen down/up state transitions round-trip through the journal");
+    require(persist_calls > 0, "input journal persistence seam was exercised");
+}
+
+void portable_helper_input_journal_file_store() {
+    using namespace chast::host;
+    if (!process_can_harden_machine_state()) {
+        std::printf("skip protected input journal files (elevated admin or SYSTEM token required)\n");
+        return;
+    }
+
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("chast-input-journal-" + std::to_string(GetCurrentProcessId()) + "-" +
+         std::to_string(GetTickCount64()));
+    struct DirectoryCleanup final {
+        std::filesystem::path path;
+        ~DirectoryCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } cleanup{directory};
+    std::string error;
+    require(chast::harden_machine_state_directory(directory.wstring(), &error),
+            "create and harden an isolated input journal directory");
+
+    PortableHelperInputJournalScope scope;
+    scope.instance_id[0] = 0x51;
+    scope.connection_id[0] = 0xA4;
+    scope.windows_session_id = 9;
+    scope.generation = 25;
+    auto store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    require(store != nullptr, "open a scoped store in the protected test directory");
+    if (!store) return;
+    const std::wstring record_path = store->record_path();
+
+    auto journal = std::make_unique<PortableHelperInputJournal>(scope,
+        [&store](const PortableHelperInputJournalImage& image,
+                 std::string* persist_error) {
+            return store->Persist(image, persist_error);
+        });
+    require(journal->Initialize(&error) && std::filesystem::exists(record_path),
+            "initialize atomically creates the first empty on-disk generation");
+    PortableHelperInputJournalImage loaded;
+    bool found = false;
+    require(store->Load(&loaded, &found, &error) && found && !loaded.pending,
+            "load validates and decodes the protected initial image");
+
+    auto competing_store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    PortableHelperInputJournalImage fresh;
+    fresh.scope = scope;
+    require(competing_store != nullptr &&
+                !competing_store->Persist(fresh, &error),
+            "a fresh store refuses to overwrite an existing generation record");
+    competing_store.reset();
+
+    chast::InputSideEffectIntent key_down;
+    key_down.sequence = 1;
+    key_down.api = chast::InputSideEffectApi::SendInput;
+    INPUT key{};
+    key.type = INPUT_KEYBOARD;
+    key.ki.wVk = 'B';
+    key_down.inputs.push_back(key);
+    require(journal->Prepare(key_down, &error),
+            "flush a write-ahead possible key state to the protected file");
+    journal.reset();
+    store.reset();
+
+    store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    require(store != nullptr, "reopen the store after simulating a worker crash");
+    if (!store) return;
+    require(store->Load(&loaded, &found, &error) && found && loaded.pending &&
+                loaded.pending_sequence == 1 && loaded.possible.keys.size() == 1,
+            "restart recovers the durable pending state without resuming injection");
+    PortableHelperInputJournal recovered(scope,
+        [&store](const PortableHelperInputJournalImage& image,
+                 std::string* persist_error) {
+            return store->Persist(image, persist_error);
+        });
+    require(recovered.Restore(loaded, &error) &&
+                store->ResumeLoadedRecord(recovered, &error) &&
+                !recovered.Prepare(key_down, &error),
+            "restored pending generation is recovery-only and remains closed to new input");
+    require(recovered.MarkReleased(&error) &&
+                store->Load(&loaded, &found, &error) && found &&
+                loaded.released && !loaded.pending &&
+                loaded.committed.keys.empty() && loaded.possible.keys.empty(),
+            "confirmed external cleanup atomically persists a released tombstone");
+    PortableHelperInputJournal released_recovery(scope,
+        [&store](const PortableHelperInputJournalImage& image,
+                 std::string* persist_error) {
+            return store->Persist(image, persist_error);
+        });
+    require(released_recovery.Restore(loaded, &error) &&
+                store->ResumeLoadedRecord(released_recovery, &error) &&
+                !released_recovery.Prepare(key_down, &error),
+            "recovered released file record cannot reactivate its generation");
+    store.reset();
+    auto released_replay_store =
+        detail::open_portable_helper_input_journal_file_store_for_test(
+            scope, directory.wstring(), &error);
+    fresh = {};
+    fresh.scope = scope;
+    require(released_replay_store != nullptr &&
+                !released_replay_store->Persist(fresh, &error),
+            "a new store cannot replace a released tombstone with a fresh generation");
+
+    PortableHelperInputJournalScope live_scope = scope;
+    live_scope.generation += 2;
+    auto live_store = detail::open_portable_helper_input_journal_file_store_for_test(
+        live_scope, directory.wstring(), &error);
+    require(live_store != nullptr, "open an isolated generation for observer integration");
+    if (!live_store) return;
+    auto live_journal = std::make_unique<PortableHelperInputJournal>(live_scope,
+        [&live_store](const PortableHelperInputJournalImage& image,
+                      std::string* persist_error) {
+            return live_store->Persist(image, persist_error);
+        });
+    require(live_journal->Initialize(&error),
+            "initialize the journal used by the dry-run input observer");
+    InputSideEffectObserver observer;
+    observer.prepare = [journal = live_journal.get()](
+        const InputSideEffectIntent& intent) {
+      std::string observer_error;
+      return journal->Prepare(intent, &observer_error);
+    };
+    observer.complete = [journal = live_journal.get()](
+        const InputSideEffectResult& result) {
+      std::string observer_error;
+      return journal->Complete(result, &observer_error);
+    };
+    auto dry_run_injector = InputInjector::create(
+        true, &error, {}, {}, {}, {}, std::move(observer));
+    require(dry_run_injector != nullptr,
+            "create a dry-run injector wired to durable journal callbacks");
+    if (!dry_run_injector) return;
+    InputEvent dry_down;
+    dry_down.kind = InputKind::Key;
+    dry_down.key = {KeyAction::Down, 0x04};
+    InputEvent dry_up = dry_down;
+    dry_up.key.action = KeyAction::Up;
+    require(dry_run_injector->submit_and_wait(dry_down) &&
+                live_store->Load(&loaded, &found, &error) && found &&
+                loaded.committed.keys.size() == 1 &&
+                dry_run_injector->submit_and_wait(dry_up) &&
+                live_store->Load(&loaded, &found, &error) && found &&
+                loaded.committed.keys.empty(),
+            "InputInjector prepare/result callbacks persist key-down and key-up without desktop input");
+    dry_run_injector->stop();
+    dry_run_injector.reset();
+
+    PortableHelperInputJournalScope corrupt_scope = scope;
+    ++corrupt_scope.generation;
+    auto corrupt_store = detail::open_portable_helper_input_journal_file_store_for_test(
+        corrupt_scope, directory.wstring(), &error);
+    PortableHelperInputJournalImage corrupt_initial;
+    corrupt_initial.scope = corrupt_scope;
+    require(corrupt_store != nullptr &&
+                corrupt_store->Persist(corrupt_initial, &error),
+            "create a separate generation for on-disk corruption checks");
+    const std::wstring corrupt_path = corrupt_store->record_path();
+    corrupt_store.reset();
+    {
+        HANDLE file = CreateFileW(corrupt_path.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+        DWORD written = 0;
+        const uint8_t invalid_magic = 0;
+        const bool corrupted = file != INVALID_HANDLE_VALUE &&
+            WriteFile(file, &invalid_magic, sizeof(invalid_magic), &written, nullptr) &&
+            written == sizeof(invalid_magic) && FlushFileBuffers(file);
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        require(corrupted, "corrupt an isolated journal record for fail-closed coverage");
+    }
+    corrupt_store = detail::open_portable_helper_input_journal_file_store_for_test(
+        corrupt_scope, directory.wstring(), &error);
+    require(corrupt_store != nullptr &&
+                !corrupt_store->Load(&loaded, &found, &error),
+            "on-disk malformed journal data is rejected instead of reset");
+}
+
 void portable_helper_authorization() {
     using namespace chast::host;
     PortableHelperInstanceId instance{};
@@ -441,18 +913,126 @@ void portable_helper_authorization() {
     constexpr uint32_t operations =
         static_cast<uint32_t>(PortableHelperOperation::CaptureFrames) |
         static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
+    std::string error;
+
+    PortableHelperLocalApprovalGate approval_gate;
+    PortableHelperPendingApproval pending_approval;
+    PortableHelperLocalApprovalReceipt approval_receipt;
+    require(!approval_gate.QueueRemoteRequest(
+                instance, connection, 0, operations, &pending_approval, nullptr),
+            "remote helper request cannot queue a Session 0 approval");
+    require(!approval_gate.QueueRemoteRequest(
+                instance, connection, windows_session, operations | (1u << 7),
+                &pending_approval, nullptr),
+            "remote helper request cannot queue unknown capabilities");
+    require(approval_gate.QueueRemoteRequest(
+                instance, connection, windows_session, operations,
+                &pending_approval, &error) &&
+                pending_approval.view().requested_operations == operations &&
+                approval_gate.pending_count() == 1,
+            "remote request only creates an opaque pending local-approval item");
+    bool wrong_thread_approval_succeeded = false;
+    std::thread non_ui_approval([&] {
+        std::string thread_error;
+        wrong_thread_approval_succeeded = approval_gate.Approve(
+            std::move(pending_approval), operations,
+            [](const PortableHelperApprovalRequestView&, uint32_t,
+               std::string*) { return true; },
+            &approval_receipt, &thread_error);
+    });
+    non_ui_approval.join();
+    require(!wrong_thread_approval_succeeded && pending_approval &&
+                approval_gate.pending_count() == 1,
+            "remote/network worker threads cannot approve a queued helper request");
+    PortableHelperPendingApproval duplicate_pending;
+    require(!approval_gate.QueueRemoteRequest(
+                instance, connection, windows_session, operations,
+                &duplicate_pending, &error),
+            "one connection cannot flood the local approval queue");
+    require(approval_gate.Approve(
+                std::move(pending_approval),
+                static_cast<uint32_t>(PortableHelperOperation::CaptureFrames),
+                [connection](
+                    const PortableHelperApprovalRequestView& request,
+                    uint32_t approved_operations, std::string*) {
+                  return request.connection_id == connection &&
+                      request.windows_session_id == 8 &&
+                      approved_operations == static_cast<uint32_t>(
+                          PortableHelperOperation::CaptureFrames);
+                },
+                &approval_receipt, &error) &&
+                approval_receipt && approval_gate.pending_count() == 0,
+            "local approval revalidates scope and can reduce requested capabilities");
+    PortableHelperAuthorization reduced_authorization;
+    PortableHelperGrant reduced_grant;
+    require(reduced_authorization.BeginGrant(std::move(approval_receipt),
+                                             &reduced_grant, &error) &&
+                reduced_grant.operations == static_cast<uint32_t>(
+                    PortableHelperOperation::CaptureFrames),
+            "one-use approval receipt mints only the locally approved capability mask");
+    require(!reduced_authorization.BeginGrant(std::move(approval_receipt),
+                                              &reduced_grant, &error),
+            "a consumed local approval receipt cannot mint a second grant");
+
+    PortableHelperConnectionId stale_connection = connection;
+    stale_connection[2] = 0x21;
+    PortableHelperPendingApproval stale_approval;
+    require(approval_gate.QueueRemoteRequest(
+                instance, stale_connection, windows_session, operations,
+                &stale_approval, &error),
+            "queue a second approval request for stale-state coverage");
+    PortableHelperLocalApprovalReceipt stale_receipt;
+    require(!approval_gate.Approve(
+                std::move(stale_approval), operations,
+                [](const PortableHelperApprovalRequestView&, uint32_t,
+                   std::string* error) {
+                  if (error != nullptr) *error = "connection is no longer active";
+                  return false;
+                },
+                &stale_receipt, &error) &&
+                !stale_receipt && approval_gate.pending_count() == 0,
+            "changed connection state consumes the pending request without issuing a receipt");
+
+    PortableHelperConnectionId denied_connection = connection;
+    denied_connection[3] = 0x47;
+    PortableHelperPendingApproval denied_approval;
+    require(approval_gate.QueueRemoteRequest(
+                instance, denied_connection, windows_session, operations,
+                &denied_approval, &error) &&
+                approval_gate.Deny(std::move(denied_approval), &error) &&
+                approval_gate.pending_count() == 0,
+            "local denial removes the remote request without minting a capability");
+
+    PortableHelperConnectionId disconnected_connection = connection;
+    disconnected_connection[4] = 0x53;
+    PortableHelperPendingApproval disconnected_approval;
+    require(approval_gate.QueueRemoteRequest(
+                instance, disconnected_connection, windows_session, operations,
+                &disconnected_approval, &error),
+            "queue a connection approval before disconnect cancellation");
+    approval_gate.CancelConnection(disconnected_connection);
+    PortableHelperLocalApprovalReceipt disconnected_receipt;
+    require(!approval_gate.Approve(
+                std::move(disconnected_approval), operations,
+                [](const PortableHelperApprovalRequestView&, uint32_t,
+                   std::string*) { return true; },
+                &disconnected_receipt, &error) &&
+                !disconnected_receipt && approval_gate.pending_count() == 0,
+            "disconnect cancellation makes a queued approval unusable");
 
     PortableHelperAuthorization authorization;
     PortableHelperGrant grant;
-    std::string error;
-    require(!authorization.BeginGrant(instance, connection, 0, operations,
-                                      &grant, &error),
+    require(!begin_local_approval_test_grant(
+                authorization, instance, connection, 0, operations, &grant,
+                &error),
             "helper authorization rejects Session 0 grants");
-    require(!authorization.BeginGrant(instance, connection, windows_session,
-                                      operations | (1u << 7), &grant, &error),
+    require(!begin_local_approval_test_grant(
+                authorization, instance, connection, windows_session,
+                operations | (1u << 7), &grant, &error),
             "helper authorization rejects unknown operation bits");
-    require(authorization.BeginGrant(instance, connection, windows_session,
-                                     operations, &grant, &error),
+    require(begin_local_approval_test_grant(
+                authorization, instance, connection, windows_session,
+                operations, &grant, &error),
             "explicitly authorized helper session receives a fresh scoped grant");
     require(grant.generation == 1 && grant.operations == operations &&
                 authorization.state() ==
@@ -462,8 +1042,9 @@ void portable_helper_authorization() {
                                      grant.generation,
                                      PortableHelperOperation::CaptureFrames),
             "desktop capabilities remain denied before WorkerReady");
-    require(!authorization.BeginGrant(instance, connection, windows_session,
-                                     operations, &grant, &error),
+    require(!begin_local_approval_test_grant(
+                authorization, instance, connection, windows_session,
+                operations, &grant, &error),
             "a second grant cannot replace an active pending generation");
 
     PortableHelperMessage start_request;
@@ -623,8 +1204,9 @@ void portable_helper_authorization() {
     PortableHelperConnectionId capture_connection{};
     PortableHelperSecret capture_proof{};
     require(secure_random(capture_connection.data(), capture_connection.size()) &&
-                capture_broker.BeginGrant(
-                    instance, capture_connection, windows_session,
+                begin_local_approval_test_grant(
+                    capture_broker, instance, capture_connection,
+                    windows_session,
                     static_cast<uint32_t>(PortableHelperOperation::CaptureFrames),
                     &capture_grant, &error),
             "create a scoped capture grant for a worker");
@@ -823,8 +1405,9 @@ void portable_helper_authorization() {
             "revocation denies operations before input cleanup and invalidates the old generation");
 
     PortableHelperGrant next_grant;
-    require(authorization.BeginGrant(instance, connection, windows_session,
-                                     operations, &next_grant, &error) &&
+    require(begin_local_approval_test_grant(
+                authorization, instance, connection, windows_session,
+                operations, &next_grant, &error) &&
                 next_grant.generation == grant.generation + 1,
             "reconnect receives a strictly newer authorization generation");
     require(!authorization.Authorize(instance, connection, windows_session,
@@ -889,8 +1472,9 @@ void portable_helper_worker_supervision() {
         worker.logon_sid = L"S-1-5-5-0-456";
         PortableHelperSecret proof{};
         std::string error;
-        require(authorization.BeginGrant(instance, connection, session,
-                                          operations, grant, &error),
+        require(begin_local_approval_test_grant(
+                    authorization, instance, connection, session, operations,
+                    grant, &error),
                 "supervisor fixture creates an explicitly scoped grant");
         require(make_portable_helper_worker_ready_proof(*grant, &proof, &error) &&
                     authorization.ConfirmWorkerReady(*grant, worker, worker,
@@ -1114,8 +1698,11 @@ int portable_helper_control_server_child(int argc, char** argv) {
             "--portable-helper-worker-no-release-control-server";
     const bool basic_control_server = argc == 5 &&
         std::string(argv[1]) == "--portable-helper-control-server";
+    const bool negative_input_control_server = argc == 5 &&
+        std::string(argv[1]) ==
+            "--portable-helper-negative-input-control-server";
     if (!worker_control_server && !worker_no_release_control_server &&
-        !basic_control_server)
+        !basic_control_server && !negative_input_control_server)
         return 2;
     std::vector<uint8_t> bytes;
     if (!chast::hex_decode(argv[2], bytes) ||
@@ -1202,6 +1789,26 @@ int portable_helper_control_server_child(int argc, char** argv) {
             bool* stop_service, std::string* handler_error) {
             return session_worker->HandleControlRequest(
                 control, request, stop_service, handler_error);
+        };
+    } else if (negative_input_control_server) {
+        request_handler = [](chast::host::PortableHelperPipe& control,
+                            const chast::host::PortableHelperMessage& request,
+                            bool* stop_service, std::string* handler_error) {
+            if (stop_service == nullptr ||
+                request.type != chast::host::PortableHelperMessageType::InputEventRequest ||
+                request.request_id == 0) {
+                if (handler_error != nullptr)
+                    *handler_error = "negative-input test server received an unexpected request";
+                return false;
+            }
+            *stop_service = false;
+            chast::host::PortableHelperMessage acknowledgement;
+            acknowledgement.type =
+                chast::host::PortableHelperMessageType::Acknowledgement;
+            acknowledgement.request_id = request.request_id;
+            acknowledgement.payload = {0};
+            return control.Send(std::move(acknowledgement), 5000,
+                                handler_error);
         };
     }
     const bool ok = chast::host::run_portable_helper_service_control_channel(
@@ -1619,6 +2226,95 @@ void portable_helper_service_channel_transport() {
     child.hProcess = nullptr;
 }
 
+void portable_helper_parent_rpc_rejection_revokes_gate() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "parent-RPC rejection test captures its interactive parent identity");
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection_id{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection_id.data(), connection_id.size()),
+            "parent-RPC rejection test creates unique helper and connection scopes");
+
+    const auto executable = executable_path();
+    const std::wstring command = L"\"" + executable +
+        L"\" --portable-helper-negative-input-control-server " +
+        widen(hex_encode(instance.data(), instance.size())) + L" " +
+        std::to_wstring(parent.process_id) + L" " +
+        std::to_wstring(parent.creation_time);
+    std::vector<wchar_t> command_line(command.begin(), command.end());
+    command_line.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &startup, &child) != FALSE,
+            "launch a test helper that returns a negative correlated input ACK");
+    CloseHandle(child.hThread);
+    const auto stop_child = [&] {
+        if (WaitForSingleObject(child.hProcess, 0) != WAIT_OBJECT_0)
+            (void)TerminateProcess(child.hProcess, ERROR_CANCELLED);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+    };
+    const auto check_child = [&](bool condition, const char* message) {
+        if (condition) return;
+        stop_child();
+        CloseHandle(child.hProcess);
+        child.hProcess = nullptr;
+        require(false, message);
+    };
+
+    PortableHelperProcessIdentity helper_identity;
+    check_child(query_portable_helper_process_identity(
+                    child.dwProcessId, &helper_identity, &error),
+                "parent-RPC rejection test queries the helper process identity");
+    auto pipe = PortableHelperPipe::ConnectClient(instance, helper_identity,
+                                                   5000, &error);
+    check_child(pipe != nullptr,
+                "parent-RPC rejection test authenticates its helper pipe peer");
+
+    PortableHelperAuthorization authorization;
+    PortableHelperGrant grant;
+    const uint32_t operations = static_cast<uint32_t>(
+        PortableHelperOperation::SendKeyboardInput);
+    PortableHelperSecret proof{};
+    check_child(begin_local_approval_test_grant(
+                    authorization, instance, connection_id,
+                    parent.session_id, operations, &grant, &error) &&
+                    make_portable_helper_worker_ready_proof(
+                        grant, &proof, &error) &&
+                    authorization.ConfirmBrokerManagedWorkerReady(
+                        grant, proof, &error),
+                "parent-RPC rejection test establishes a locally approved ready grant");
+    SecureZeroMemory(proof.data(), proof.size());
+
+    PortableHelperServiceConnection service_connection;
+    service_connection.instance_id = instance;
+    service_connection.channel = std::move(pipe);
+    InputEvent event;
+    event.kind = InputKind::Key;
+    event.key.action = KeyAction::Down;
+    event.key.hid_usage = 0x04;
+    std::string rpc_error;
+    const bool accepted = request_portable_helper_input_event(
+        service_connection, authorization, grant, 301, event, 5000,
+        &rpc_error);
+    check_child(!accepted && service_connection.channel == nullptr &&
+                    authorization.state() ==
+                        PortableHelperAuthorizationState::Revoked,
+                "a negative correlated input ACK closes the pipe and revokes the parent forwarding gate");
+    check_child(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
+                "the isolated helper observes parent-channel closure after a rejected RPC");
+    DWORD exit_code = 1;
+    check_child(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 7,
+                "helper exits through its failed-control-channel cleanup path");
+    CloseHandle(child.hProcess);
+    child.hProcess = nullptr;
+}
+
 void portable_helper_service_session_worker_control_loop() {
     using namespace chast::host;
     PortableHelperProcessIdentity parent;
@@ -1675,9 +2371,9 @@ void portable_helper_service_session_worker_control_loop() {
         static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
     PortableHelperAuthorization parent_authorization;
     PortableHelperGrant parent_grant;
-    require(parent_authorization.BeginGrant(
-                instance, connection, parent.session_id, operations,
-                &parent_grant, &error),
+    require(begin_local_approval_test_grant(
+                parent_authorization, instance, connection,
+                parent.session_id, operations, &parent_grant, &error),
             "parent creates a capability only after simulated local approval");
 
     PortableHelperGrant wrong_session_grant = parent_grant;
@@ -1694,87 +2390,81 @@ void portable_helper_service_session_worker_control_loop() {
                     response.payload == std::vector<uint8_t>{0},
                 "helper rejects a grant targeting another Windows session");
 
-    require(make_portable_helper_session_worker_start_request(
-                parent_grant, 201, &start, &error) &&
-                control->Send(std::move(start), 5000, &error),
-            "parent starts a worker using the exact locally authorized grant");
-    check_child(control->Receive(&response, 10000, &error) &&
-                    response.type == PortableHelperMessageType::Acknowledgement &&
-                    response.request_id == 201 &&
-                    response.payload == std::vector<uint8_t>{1},
-                "helper acknowledges worker start only after authenticated WorkerReady");
-    PortableHelperMessage ready;
-    check_child(control->Receive(&ready, 5000, &error) &&
-                    ready.type == PortableHelperMessageType::WorkerReady &&
-                    ready.request_id == parent_grant.generation &&
-                    ready.payload.size() == PortableHelperSecret{}.size(),
-                "helper relays the correlated WorkerReady proof to its authenticated parent");
-    PortableHelperSecret proof{};
-    std::copy(ready.payload.begin(), ready.payload.end(), proof.begin());
-    check_child(parent_authorization.ConfirmBrokerManagedWorkerReady(
-                    parent_grant, proof, &error) &&
+    PortableHelperServiceConnection service_connection;
+    service_connection.instance_id = instance;
+    service_connection.channel = std::move(control);
+    PortableHelperPipe& control_pipe = *service_connection.channel;
+    check_child(start_portable_helper_session_worker(
+                    service_connection, parent_authorization, parent_grant,
+                    10000, &error) &&
                     parent_authorization.state() ==
                         PortableHelperAuthorizationState::Ready,
-                "parent opens its request gate only after validating broker WorkerReady proof");
-    SecureZeroMemory(proof.data(), proof.size());
+                "parent caller starts the worker and opens its request gate only after correlated ACK and WorkerReady proof");
 
-    require(send_portable_helper_capture_request(
-                *control, parent_authorization, parent_grant, 202, 5000,
-                &error),
-            "helper forwards an authorized scoped frame request to the worker");
     PortableHelperCapturedFrame frame;
-    check_child(receive_portable_helper_captured_frame(
-                    *control, parent_grant, 202, &frame, 5000, &error) &&
+    check_child(request_portable_helper_capture_frame(
+                    service_connection, parent_authorization, parent_grant,
+                    202, 5000, &frame, &error) &&
                     frame.width == 2 && frame.height == 2 &&
                     frame.frame_number == 23 && !frame.png.empty(),
-                "helper relays only the worker's grant-bound captured PNG chunks");
+                "parent RPC atomically receives only the worker's grant-bound captured PNG chunks");
     if (!frame.png.empty())
         SecureZeroMemory(frame.png.data(), frame.png.size());
+
+    PortableHelperCapturedFrame concurrent_frame_a;
+    PortableHelperCapturedFrame concurrent_frame_b;
+    auto capture_a = std::async(std::launch::async, [&] {
+        std::string request_error;
+        return request_portable_helper_capture_frame(
+            service_connection, parent_authorization, parent_grant, 208,
+            5000, &concurrent_frame_a, &request_error);
+    });
+    auto capture_b = std::async(std::launch::async, [&] {
+        std::string request_error;
+        return request_portable_helper_capture_frame(
+            service_connection, parent_authorization, parent_grant, 209,
+            5000, &concurrent_frame_b, &request_error);
+    });
+    check_child(capture_a.get() && capture_b.get() &&
+                    concurrent_frame_a.width == 2 &&
+                    concurrent_frame_b.width == 2 &&
+                    !concurrent_frame_a.png.empty() &&
+                    !concurrent_frame_b.png.empty(),
+                "concurrent parent capture callers serialize complete request/response pairs without cross-correlating frames");
+    SecureZeroMemory(concurrent_frame_a.png.data(),
+                     concurrent_frame_a.png.size());
+    SecureZeroMemory(concurrent_frame_b.png.data(),
+                     concurrent_frame_b.png.size());
 
     InputEvent key;
     key.kind = InputKind::Key;
     key.key.action = KeyAction::Down;
     key.key.hid_usage = 0x04;
-    require(send_portable_helper_input_request(
-                *control, parent_authorization, parent_grant, 203, key, 5000,
-                &error),
-            "helper forwards an authorized typed keyboard request");
-    check_child(control->Receive(&response, 5000, &error) &&
-                    response.type == PortableHelperMessageType::Acknowledgement &&
-                    response.request_id == 203 &&
-                    response.payload == std::vector<uint8_t>{1},
-                "helper returns the worker's correlated input completion acknowledgement");
+    check_child(request_portable_helper_input_event(
+                    service_connection, parent_authorization, parent_grant,
+                    203, key, 5000, &error),
+                "parent RPC waits for the worker's correlated typed input completion acknowledgement");
 
-    PortableHelperMessage stop_worker;
-    stop_worker.type = PortableHelperMessageType::SessionWorkerStop;
-    stop_worker.request_id = 204;
-    stop_worker.payload.insert(stop_worker.payload.end(),
-                               parent_grant.connection_id.begin(),
-                               parent_grant.connection_id.end());
-    for (unsigned shift = 0; shift < 64; shift += 8)
-        stop_worker.payload.push_back(static_cast<uint8_t>(
-            parent_grant.generation >> shift));
-    require(control->Send(std::move(stop_worker), 5000, &error),
-            "parent requests generation-scoped worker revocation");
-    check_child(control->Receive(&response, 10000, &error) &&
-                    response.type == PortableHelperMessageType::Acknowledgement &&
-                    response.request_id == 204 &&
-                    response.payload == std::vector<uint8_t>{1},
-                "helper revokes the worker, observes exit, then acknowledges Stop");
+    check_child(stop_portable_helper_session_worker(
+                    service_connection, parent_authorization, parent_grant,
+                    10000, &error) &&
+                    parent_authorization.state() ==
+                        PortableHelperAuthorizationState::Revoked,
+                "parent caller revokes its forwarding gate after helper confirms worker exit");
 
     PortableHelperConnectionId second_connection{};
     require(secure_random(second_connection.data(), second_connection.size()),
             "single-use worker test creates a fresh connection generation");
     PortableHelperAuthorization second_authorization;
     PortableHelperGrant second_grant;
-    require(second_authorization.BeginGrant(
-                instance, second_connection, parent.session_id, operations,
-                &second_grant, &error) &&
+    require(begin_local_approval_test_grant(
+                second_authorization, instance, second_connection,
+                parent.session_id, operations, &second_grant, &error) &&
                 make_portable_helper_session_worker_start_request(
                     second_grant, 207, &start, &error) &&
-                control->Send(std::move(start), 5000, &error),
+                control_pipe.Send(std::move(start), 5000, &error),
             "parent tries to reuse the UAC-approved helper for a second connection");
-    check_child(control->Receive(&response, 5000, &error) &&
+    check_child(control_pipe.Receive(&response, 5000, &error) &&
                     response.type == PortableHelperMessageType::Acknowledgement &&
                     response.request_id == 207 &&
                     response.payload == std::vector<uint8_t>{0},
@@ -1783,9 +2473,9 @@ void portable_helper_service_session_worker_control_loop() {
     PortableHelperMessage status;
     status.type = PortableHelperMessageType::Status;
     status.request_id = 205;
-    require(control->Send(std::move(status), 5000, &error),
+    require(control_pipe.Send(std::move(status), 5000, &error),
             "helper remains available for cleanup after its worker stops");
-    check_child(control->Receive(&response, 5000, &error) &&
+    check_child(control_pipe.Receive(&response, 5000, &error) &&
                     response.type == PortableHelperMessageType::Acknowledgement &&
                     response.request_id == 205 &&
                     response.payload == std::vector<uint8_t>{1},
@@ -1794,14 +2484,14 @@ void portable_helper_service_session_worker_control_loop() {
     PortableHelperMessage stop_service;
     stop_service.type = PortableHelperMessageType::Stop;
     stop_service.request_id = 206;
-    require(control->Send(std::move(stop_service), 5000, &error),
+    require(control_pipe.Send(std::move(stop_service), 5000, &error),
             "parent stops the now-idle helper service");
-    check_child(control->Receive(&response, 5000, &error) &&
+    check_child(control_pipe.Receive(&response, 5000, &error) &&
                     response.type == PortableHelperMessageType::Acknowledgement &&
                     response.request_id == 206 &&
                     response.payload == std::vector<uint8_t>{1},
                 "helper acknowledges service stop after worker cleanup");
-    control.reset();
+    service_connection.Reset();
     check_child(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
                 "worker-control helper exits after clean session-worker shutdown");
     DWORD exit_code = 1;
@@ -1862,8 +2552,9 @@ void portable_helper_service_requires_emergency_input_release() {
     PortableHelperGrant grant;
     const uint32_t input_operation = static_cast<uint32_t>(
         PortableHelperOperation::SendKeyboardInput);
-    require(authorization.BeginGrant(instance, connection, parent.session_id,
-                                    input_operation, &grant, &error),
+    require(begin_local_approval_test_grant(
+                authorization, instance, connection, parent.session_id,
+                input_operation, &grant, &error),
             "create a locally authorized keyboard grant for policy rejection");
     PortableHelperMessage start;
     require(make_portable_helper_session_worker_start_request(
@@ -2159,9 +2850,9 @@ void portable_helper_session_worker_handshake() {
         static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
     PortableHelperAuthorization authorization;
     PortableHelperGrant grant;
-    require(authorization.BeginGrant(spec.instance_id, connection,
-                                     broker.session_id, operations, &grant,
-                                     &error),
+    require(begin_local_approval_test_grant(
+                authorization, spec.instance_id, connection,
+                broker.session_id, operations, &grant, &error),
             "create a test capability after simulated local approval");
 
     std::unique_ptr<PortableHelperPipe> channel;
@@ -2346,8 +3037,9 @@ void portable_helper_supervisor_releases_input_after_worker_exit_without_ack() {
     PortableHelperGrant grant;
     constexpr uint32_t input_operations = static_cast<uint32_t>(
         PortableHelperOperation::SendKeyboardInput);
-    require(authorization.BeginGrant(instance, connection, broker.session_id,
-                                     input_operations, &grant, &error),
+    require(begin_local_approval_test_grant(
+                authorization, instance, connection, broker.session_id,
+                input_operations, &grant, &error),
             "create a scoped input grant for the no-ack shutdown case");
     PortableHelperSecret proof{};
     PortableHelperProcessIdentity authenticated_peer;
@@ -2456,9 +3148,9 @@ void portable_helper_session_worker_rejects_forged_ready() {
     const uint32_t operations =
         static_cast<uint32_t>(PortableHelperOperation::CaptureFrames) |
         static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
-    require(authorization.BeginGrant(spec.instance_id, connection,
-                                     broker.session_id, operations, &grant,
-                                     &error),
+    require(begin_local_approval_test_grant(
+                authorization, spec.instance_id, connection,
+                broker.session_id, operations, &grant, &error),
             "negative worker-start test creates a scoped pending grant");
 
     std::unique_ptr<PortableHelperPipe> channel;
@@ -2749,8 +3441,9 @@ void portable_helper_authorization_pipe() {
         static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
     PortableHelperAuthorization authorization;
     PortableHelperGrant grant;
-    require(authorization.BeginGrant(instance, connection, parent.session_id,
-                                     operations, &grant, &error),
+    require(begin_local_approval_test_grant(
+                authorization, instance, connection, parent.session_id,
+                operations, &grant, &error),
             "issue a generation-scoped test grant after simulated local approval");
     require(send_portable_helper_grant(*pipe, grant, 5000, &error),
             "send the fixed-size secret grant only over the authenticated pipe");
@@ -5098,6 +5791,8 @@ int main(int argc, char** argv) {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
     if (argc >= 2 &&
         (std::string(argv[1]) == "--portable-helper-control-server" ||
+         std::string(argv[1]) ==
+             "--portable-helper-negative-input-control-server" ||
          std::string(argv[1]) == "--portable-helper-worker-control-server" ||
          std::string(argv[1]) == "--portable-helper-worker-no-release-control-server"))
         return portable_helper_control_server_child(argc, argv);
@@ -5126,6 +5821,10 @@ int main(int argc, char** argv) {
         catch (const std::exception& error) { ++failures; std::printf("FAIL %s\n", error.what()); }
     };
     if (argc == 2 && std::string(argv[1]) == "--portable-helper-authorization") {
+        run("portable helper crash-safe input journal",
+            portable_helper_input_journal);
+        run("portable helper protected durable input journal store",
+            portable_helper_input_journal_file_store);
         run("portable helper worker command-line validation",
             portable_helper_worker_command_line);
         run("portable helper generation-scoped authorization", portable_helper_authorization);
@@ -5133,6 +5832,8 @@ int main(int argc, char** argv) {
             portable_helper_worker_supervision);
         run("portable helper authenticated SCM control-channel loop",
             portable_helper_service_channel_transport);
+        run("portable helper parent RPC rejection revokes forwarding gate",
+            portable_helper_parent_rpc_rejection_revokes_gate);
         run("portable helper service session-worker control loop",
             portable_helper_service_session_worker_control_loop);
         run("portable helper requires emergency input release",
@@ -5154,6 +5855,10 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--elevation") {
         run("portable helper protocol framing and replay protection", portable_helper_protocol);
+        run("portable helper crash-safe input journal",
+            portable_helper_input_journal);
+        run("portable helper protected durable input journal store",
+            portable_helper_input_journal_file_store);
         run("portable helper worker command-line validation",
             portable_helper_worker_command_line);
         run("portable helper generation-scoped authorization", portable_helper_authorization);
@@ -5161,6 +5866,8 @@ int main(int argc, char** argv) {
             portable_helper_worker_supervision);
         run("portable helper authenticated SCM control-channel loop",
             portable_helper_service_channel_transport);
+        run("portable helper parent RPC rejection revokes forwarding gate",
+            portable_helper_parent_rpc_rejection_revokes_gate);
         run("portable helper service session-worker control loop",
             portable_helper_service_session_worker_control_loop);
         run("portable helper requires emergency input release",

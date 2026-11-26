@@ -61,6 +61,8 @@
 #include "service_settings.h"
 #include "tunnel.h"
 #include "portable_helper_service.h"
+#include "portable_helper_input_journal.h"
+#include "portable_helper_input_journal_store.h"
 #include "portable_helper_worker_session.h"
 
 namespace {
@@ -5022,6 +5024,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             static_cast<uint32_t>(
                 chast::host::PortableHelperOperation::SendPointerInput);
         std::unique_ptr<chast::IDxgiCapturer> worker_capturer;
+        std::unique_ptr<chast::host::PortableHelperInputJournalFileStore>
+            worker_journal_store;
+        std::unique_ptr<chast::host::PortableHelperInputJournal>
+            worker_input_journal;
         std::unique_ptr<chast::InputInjector> worker_injector;
 
         if ((worker_grant.operations & capture_operation) != 0) {
@@ -5063,8 +5069,49 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
         if ((worker_grant.operations & input_operations) != 0) {
             std::string adapter_error;
+            chast::host::PortableHelperInputJournalScope journal_scope;
+            journal_scope.instance_id = worker_grant.instance_id;
+            journal_scope.connection_id = worker_grant.connection_id;
+            journal_scope.windows_session_id = worker_grant.windows_session_id;
+            journal_scope.generation = worker_grant.generation;
+            worker_journal_store =
+                chast::host::PortableHelperInputJournalFileStore::OpenForInstance(
+                    journal_scope, &adapter_error);
+            if (!worker_journal_store) return ERROR_NOT_READY;
+            chast::host::PortableHelperInputJournalImage recovered_image;
+            bool prior_record_found = false;
+            if (!worker_journal_store->Load(
+                    &recovered_image, &prior_record_found, &adapter_error) ||
+                prior_record_found) {
+                // Never replace or resume an earlier generation. The helper's
+                // independent cleanup path must resolve existing state first.
+                return ERROR_RECOVERY_FAILURE;
+            }
+            worker_input_journal =
+                std::make_unique<chast::host::PortableHelperInputJournal>(
+                    journal_scope,
+                    [&store = worker_journal_store](
+                        const chast::host::PortableHelperInputJournalImage& image,
+                        std::string* persist_error) {
+                        return store && store->Persist(image, persist_error);
+                    });
+            if (!worker_input_journal->Initialize(&adapter_error))
+                return ERROR_WRITE_FAULT;
+            chast::InputSideEffectObserver observer;
+            observer.prepare = [journal = worker_input_journal.get()](
+                const chast::InputSideEffectIntent& intent) {
+                std::string journal_error;
+                return journal != nullptr &&
+                    journal->Prepare(intent, &journal_error);
+            };
+            observer.complete = [journal = worker_input_journal.get()](
+                const chast::InputSideEffectResult& result) {
+                std::string journal_error;
+                return journal != nullptr &&
+                    journal->Complete(result, &journal_error);
+            };
             worker_injector = chast::InputInjector::create(
-                false, &adapter_error);
+                false, &adapter_error, {}, {}, {}, {}, std::move(observer));
             if (!worker_injector) return ERROR_NOT_READY;
         }
 

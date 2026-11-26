@@ -275,6 +275,22 @@ void erase_grant(PortableHelperGrant* grant) {
   grant->operations = 0;
 }
 
+constexpr uint64_t kPortableHelperApprovalLifetimeMs = 60'000;
+constexpr uint64_t kPortableHelperReceiptLifetimeMs = 5'000;
+constexpr size_t kPortableHelperMaxPendingApprovals = 64;
+
+bool same_approval_view(const PortableHelperApprovalRequestView& left,
+                        const PortableHelperApprovalRequestView& right) {
+  return left.instance_id == right.instance_id &&
+      left.connection_id == right.connection_id &&
+      left.windows_session_id == right.windows_session_id &&
+      left.requested_operations == right.requested_operations;
+}
+
+void erase_approval_view(PortableHelperApprovalRequestView* view) {
+  if (view != nullptr) SecureZeroMemory(view, sizeof(*view));
+}
+
 }  // namespace
 
 bool make_portable_helper_worker_ready_proof(
@@ -407,6 +423,276 @@ PortableHelperAuthorization::~PortableHelperAuthorization() {
   erase_grant(&grant_);
 }
 
+PortableHelperPendingApproval::PortableHelperPendingApproval(
+    PortableHelperPendingApproval&& other) noexcept
+    : ticket_(other.ticket_),
+      nonce_(other.nonce_),
+      view_(other.view_),
+      expires_at_ms_(other.expires_at_ms_),
+      valid_(other.valid_) {
+  other.Clear();
+}
+
+PortableHelperPendingApproval& PortableHelperPendingApproval::operator=(
+    PortableHelperPendingApproval&& other) noexcept {
+  if (this == &other) return *this;
+  Clear();
+  ticket_ = other.ticket_;
+  nonce_ = other.nonce_;
+  view_ = other.view_;
+  expires_at_ms_ = other.expires_at_ms_;
+  valid_ = other.valid_;
+  other.Clear();
+  return *this;
+}
+
+void PortableHelperPendingApproval::Clear() noexcept {
+  SecureZeroMemory(ticket_.data(), ticket_.size());
+  SecureZeroMemory(nonce_.data(), nonce_.size());
+  erase_approval_view(&view_);
+  expires_at_ms_ = 0;
+  valid_ = false;
+}
+
+PortableHelperApprovalRequestView PortableHelperPendingApproval::view() const {
+  return view_;
+}
+
+PortableHelperLocalApprovalReceipt::PortableHelperLocalApprovalReceipt(
+    PortableHelperLocalApprovalReceipt&& other) noexcept
+    : view_(other.view_),
+      expires_at_ms_(other.expires_at_ms_),
+      valid_(other.valid_) {
+  other.Clear();
+}
+
+PortableHelperLocalApprovalReceipt&
+PortableHelperLocalApprovalReceipt::operator=(
+    PortableHelperLocalApprovalReceipt&& other) noexcept {
+  if (this == &other) return *this;
+  Clear();
+  view_ = other.view_;
+  expires_at_ms_ = other.expires_at_ms_;
+  valid_ = other.valid_;
+  other.Clear();
+  return *this;
+}
+
+void PortableHelperLocalApprovalReceipt::Clear() noexcept {
+  erase_approval_view(&view_);
+  expires_at_ms_ = 0;
+  valid_ = false;
+}
+
+PortableHelperLocalApprovalGate::Entry::~Entry() {
+  SecureZeroMemory(ticket.data(), ticket.size());
+  SecureZeroMemory(nonce.data(), nonce.size());
+  erase_approval_view(&view);
+  expires_at_ms = 0;
+}
+
+PortableHelperLocalApprovalGate::Entry::Entry(Entry&& other) noexcept
+    : ticket(other.ticket),
+      nonce(other.nonce),
+      view(other.view),
+      expires_at_ms(other.expires_at_ms) {
+  SecureZeroMemory(other.ticket.data(), other.ticket.size());
+  SecureZeroMemory(other.nonce.data(), other.nonce.size());
+  erase_approval_view(&other.view);
+  other.expires_at_ms = 0;
+}
+
+PortableHelperLocalApprovalGate::Entry&
+PortableHelperLocalApprovalGate::Entry::operator=(Entry&& other) noexcept {
+  if (this == &other) return *this;
+  SecureZeroMemory(ticket.data(), ticket.size());
+  SecureZeroMemory(nonce.data(), nonce.size());
+  erase_approval_view(&view);
+  ticket = other.ticket;
+  nonce = other.nonce;
+  view = other.view;
+  expires_at_ms = other.expires_at_ms;
+  SecureZeroMemory(other.ticket.data(), other.ticket.size());
+  SecureZeroMemory(other.nonce.data(), other.nonce.size());
+  erase_approval_view(&other.view);
+  other.expires_at_ms = 0;
+  return *this;
+}
+
+PortableHelperLocalApprovalGate::PortableHelperLocalApprovalGate()
+    : approval_thread_id_(GetCurrentThreadId()) {}
+
+PortableHelperLocalApprovalGate::~PortableHelperLocalApprovalGate() {
+  std::lock_guard lock(mutex_);
+  pending_.clear();
+}
+
+void PortableHelperLocalApprovalGate::purge_expired_locked(uint64_t now_ms) {
+  pending_.erase(
+      std::remove_if(pending_.begin(), pending_.end(),
+                     [now_ms](const Entry& entry) {
+                       return entry.expires_at_ms <= now_ms;
+                     }),
+      pending_.end());
+}
+
+bool PortableHelperLocalApprovalGate::QueueRemoteRequest(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperConnectionId& connection_id,
+    uint32_t windows_session_id, uint32_t requested_operations,
+    PortableHelperPendingApproval* pending, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (pending == nullptr)
+    return fail(error, "missing local approval request output");
+  *pending = PortableHelperPendingApproval{};
+  if (!any_nonzero(instance_id.data(), instance_id.size()) ||
+      !any_nonzero(connection_id.data(), connection_id.size()) ||
+      windows_session_id == 0 || !valid_operation_mask(requested_operations))
+    return fail(error, "portable helper approval request scope is invalid");
+
+  Entry entry;
+  if (BCryptGenRandom(nullptr, entry.ticket.data(),
+                      static_cast<ULONG>(entry.ticket.size()),
+                      BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+      BCryptGenRandom(nullptr, entry.nonce.data(),
+                      static_cast<ULONG>(entry.nonce.size()),
+                      BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+      !any_nonzero(entry.ticket.data(), entry.ticket.size()) ||
+      !any_nonzero(entry.nonce.data(), entry.nonce.size()))
+    return fail(error, "cannot create local approval request token");
+  entry.view.instance_id = instance_id;
+  entry.view.connection_id = connection_id;
+  entry.view.windows_session_id = windows_session_id;
+  entry.view.requested_operations = requested_operations;
+  const uint64_t now_ms = GetTickCount64();
+  entry.expires_at_ms = now_ms + kPortableHelperApprovalLifetimeMs;
+
+  {
+    std::lock_guard lock(mutex_);
+    purge_expired_locked(now_ms);
+    if (pending_.size() >= kPortableHelperMaxPendingApprovals)
+      return fail(error, "too many portable helper approval requests are pending");
+    if (std::any_of(pending_.begin(), pending_.end(),
+                    [&connection_id](const Entry& existing) {
+                      return existing.view.connection_id == connection_id;
+                    }))
+      return fail(error, "this connection already has a pending local approval");
+    try {
+      pending_.emplace_back(std::move(entry));
+    } catch (...) {
+      return fail(error, "cannot store the local approval request");
+    }
+    const Entry& stored = pending_.back();
+    pending->ticket_ = stored.ticket;
+    pending->nonce_ = stored.nonce;
+    pending->view_ = stored.view;
+    pending->expires_at_ms_ = stored.expires_at_ms;
+    pending->valid_ = true;
+  }
+  return true;
+}
+
+bool PortableHelperLocalApprovalGate::consume_pending(
+    PortableHelperPendingApproval&& pending, Entry* entry,
+    std::string* error) {
+  if (entry == nullptr) {
+    pending.Clear();
+    return fail(error, "missing local approval request entry output");
+  }
+  Entry token;
+  const bool was_valid = pending.valid_;
+  token.ticket = pending.ticket_;
+  token.nonce = pending.nonce_;
+  token.view = pending.view_;
+  token.expires_at_ms = pending.expires_at_ms_;
+  pending.Clear();
+  if (!was_valid || token.expires_at_ms <= GetTickCount64())
+    return fail(error, "local approval request is invalid or expired");
+
+  std::lock_guard lock(mutex_);
+  purge_expired_locked(GetTickCount64());
+  const auto found = std::find_if(
+      pending_.begin(), pending_.end(), [&token](const Entry& stored) {
+        return stored.ticket == token.ticket &&
+            constant_time_equal(stored.nonce, token.nonce) &&
+            stored.expires_at_ms == token.expires_at_ms &&
+            same_approval_view(stored.view, token.view);
+      });
+  if (found == pending_.end())
+    return fail(error, "local approval request was canceled, expired, or replayed");
+  *entry = std::move(*found);
+  pending_.erase(found);
+  return true;
+}
+
+bool PortableHelperLocalApprovalGate::Approve(
+    PortableHelperPendingApproval&& pending, uint32_t approved_operations,
+    const Revalidate& revalidate,
+    PortableHelperLocalApprovalReceipt* receipt, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (receipt == nullptr)
+    return fail(error, "missing local approval receipt output");
+  *receipt = PortableHelperLocalApprovalReceipt{};
+  if (GetCurrentThreadId() != approval_thread_id_)
+    return fail(error, "local helper approval must run on the bound UI thread");
+
+  Entry entry;
+  if (!consume_pending(std::move(pending), &entry, error)) return false;
+  if (!valid_operation_mask(approved_operations) ||
+      (approved_operations & ~entry.view.requested_operations) != 0)
+    return fail(error, "approved helper operations exceed the pending request");
+  if (!revalidate)
+    return fail(error, "local approval requires live connection revalidation");
+  try {
+    if (!revalidate(entry.view, approved_operations, error)) {
+      if (error != nullptr && error->empty())
+        *error = "connection or permissions changed during local approval";
+      return false;
+    }
+  } catch (...) {
+    return fail(error, "local approval revalidation failed");
+  }
+  if (GetTickCount64() >= entry.expires_at_ms)
+    return fail(error, "local approval expired during revalidation");
+
+  receipt->view_ = entry.view;
+  receipt->view_.requested_operations = approved_operations;
+  receipt->expires_at_ms_ = (std::min)(
+      entry.expires_at_ms,
+      GetTickCount64() + kPortableHelperReceiptLifetimeMs);
+  receipt->valid_ = true;
+  return true;
+}
+
+bool PortableHelperLocalApprovalGate::Deny(
+    PortableHelperPendingApproval&& pending, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (GetCurrentThreadId() != approval_thread_id_)
+    return fail(error, "local helper denial must run on the bound UI thread");
+  Entry denied;
+  return consume_pending(std::move(pending), &denied, error);
+}
+
+void PortableHelperLocalApprovalGate::CancelConnection(
+    const PortableHelperConnectionId& connection_id) {
+  std::lock_guard lock(mutex_);
+  pending_.erase(
+      std::remove_if(pending_.begin(), pending_.end(),
+                     [&connection_id](const Entry& entry) {
+                       return entry.view.connection_id == connection_id;
+                     }),
+      pending_.end());
+}
+
+size_t PortableHelperLocalApprovalGate::pending_count() const {
+  std::lock_guard lock(mutex_);
+  const uint64_t now_ms = GetTickCount64();
+  return static_cast<size_t>(std::count_if(
+      pending_.begin(), pending_.end(), [now_ms](const Entry& entry) {
+        return entry.expires_at_ms > now_ms;
+      }));
+}
+
 PortableHelperAuthorization::OperationLease::~OperationLease() {
   Reset();
 }
@@ -432,15 +718,21 @@ void PortableHelperAuthorization::OperationLease::Reset() noexcept {
 }
 
 bool PortableHelperAuthorization::BeginGrant(
-    const PortableHelperInstanceId& instance_id,
-    const PortableHelperConnectionId& connection_id,
-    uint32_t windows_session_id, uint32_t operations,
+    PortableHelperLocalApprovalReceipt&& approval,
     PortableHelperGrant* grant, std::string* error) {
   if (error != nullptr) error->clear();
-  if (grant == nullptr) return fail(error, "missing portable helper grant output");
-  if (!any_nonzero(instance_id.data(), instance_id.size()) ||
-      !any_nonzero(connection_id.data(), connection_id.size()) ||
-      windows_session_id == 0 || !valid_operation_mask(operations))
+  const bool receipt_valid = approval.valid_ &&
+      approval.expires_at_ms_ > GetTickCount64();
+  const PortableHelperApprovalRequestView scope = approval.view_;
+  approval.Clear();
+  if (!receipt_valid)
+    return fail(error, "local approval receipt is invalid, expired, or already consumed");
+  if (grant == nullptr)
+    return fail(error, "missing portable helper grant output");
+  if (!any_nonzero(scope.instance_id.data(), scope.instance_id.size()) ||
+      !any_nonzero(scope.connection_id.data(), scope.connection_id.size()) ||
+      scope.windows_session_id == 0 ||
+      !valid_operation_mask(scope.requested_operations))
     return fail(error, "portable helper grant scope is invalid");
 
   std::lock_guard lock(mutex_);
@@ -451,11 +743,11 @@ bool PortableHelperAuthorization::BeginGrant(
     return fail(error, "portable helper authorization generation exhausted");
 
   PortableHelperGrant next;
-  next.instance_id = instance_id;
-  next.connection_id = connection_id;
+  next.instance_id = scope.instance_id;
+  next.connection_id = scope.connection_id;
   next.generation = grant_.generation + 1;
-  next.windows_session_id = windows_session_id;
-  next.operations = operations;
+  next.windows_session_id = scope.windows_session_id;
+  next.operations = scope.requested_operations;
   if (BCryptGenRandom(nullptr, next.secret.data(),
                       static_cast<ULONG>(next.secret.size()),
                       BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||

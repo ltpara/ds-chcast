@@ -10,6 +10,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace chast::host {
 
@@ -80,6 +81,125 @@ enum class PortableHelperAuthorizationState {
 
 class PortableHelperAuthorization;
 
+struct PortableHelperApprovalRequestView {
+  PortableHelperInstanceId instance_id{};
+  PortableHelperConnectionId connection_id{};
+  uint32_t windows_session_id = 0;
+  uint32_t requested_operations = 0;
+};
+
+// Opaque, one-use handle for a remote request that is waiting for local
+// approval. It carries no capability material and cannot itself authorize a
+// helper operation.
+class PortableHelperPendingApproval final {
+ public:
+  PortableHelperPendingApproval() = default;
+  ~PortableHelperPendingApproval() { Clear(); }
+  PortableHelperPendingApproval(const PortableHelperPendingApproval&) = delete;
+  PortableHelperPendingApproval& operator=(
+      const PortableHelperPendingApproval&) = delete;
+  PortableHelperPendingApproval(PortableHelperPendingApproval&& other) noexcept;
+  PortableHelperPendingApproval& operator=(
+      PortableHelperPendingApproval&& other) noexcept;
+
+  explicit operator bool() const { return valid_; }
+  PortableHelperApprovalRequestView view() const;
+
+ private:
+  friend class PortableHelperLocalApprovalGate;
+  void Clear() noexcept;
+  std::array<uint8_t, 16> ticket_{};
+  PortableHelperSecret nonce_{};
+  PortableHelperApprovalRequestView view_{};
+  uint64_t expires_at_ms_ = 0;
+  bool valid_ = false;
+};
+
+// Created only by a local approval decision after the caller revalidates the
+// live connection, session and current permissions. The receipt is scoped,
+// short-lived, move-only and consumed by BeginGrant even when grant creation
+// fails.
+class PortableHelperLocalApprovalReceipt final {
+ public:
+  PortableHelperLocalApprovalReceipt() = default;
+  ~PortableHelperLocalApprovalReceipt() { Clear(); }
+  PortableHelperLocalApprovalReceipt(
+      const PortableHelperLocalApprovalReceipt&) = delete;
+  PortableHelperLocalApprovalReceipt& operator=(
+      const PortableHelperLocalApprovalReceipt&) = delete;
+  PortableHelperLocalApprovalReceipt(
+      PortableHelperLocalApprovalReceipt&& other) noexcept;
+  PortableHelperLocalApprovalReceipt& operator=(
+      PortableHelperLocalApprovalReceipt&& other) noexcept;
+
+  explicit operator bool() const { return valid_; }
+
+ private:
+  friend class PortableHelperLocalApprovalGate;
+  friend class PortableHelperAuthorization;
+  void Clear() noexcept;
+  PortableHelperApprovalRequestView view_{};
+  uint64_t expires_at_ms_ = 0;
+  bool valid_ = false;
+};
+
+// Remote requests may only be queued. A receipt is minted after the UI has
+// made an explicit approval decision and the supplied callback confirms that
+// the same connection/session still has the approved permissions.
+class PortableHelperLocalApprovalGate final {
+ public:
+  using Revalidate = std::function<bool(
+      const PortableHelperApprovalRequestView&, uint32_t approved_operations,
+      std::string* error)>;
+
+  // Construct this gate on the local UI thread. Remote/network threads may
+  // queue requests or cancel a disconnected connection, but only the bound UI
+  // thread can approve or deny one.
+  PortableHelperLocalApprovalGate();
+  ~PortableHelperLocalApprovalGate();
+  PortableHelperLocalApprovalGate(const PortableHelperLocalApprovalGate&) =
+      delete;
+  PortableHelperLocalApprovalGate& operator=(
+      const PortableHelperLocalApprovalGate&) = delete;
+
+  bool QueueRemoteRequest(const PortableHelperInstanceId& instance_id,
+                         const PortableHelperConnectionId& connection_id,
+                         uint32_t windows_session_id,
+                         uint32_t requested_operations,
+                         PortableHelperPendingApproval* pending,
+                         std::string* error);
+  bool Approve(PortableHelperPendingApproval&& pending,
+               uint32_t approved_operations, const Revalidate& revalidate,
+               PortableHelperLocalApprovalReceipt* receipt,
+               std::string* error);
+  bool Deny(PortableHelperPendingApproval&& pending, std::string* error);
+  void CancelConnection(const PortableHelperConnectionId& connection_id);
+  size_t pending_count() const;
+
+ private:
+  struct Entry {
+    Entry() = default;
+    ~Entry();
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
+    Entry(Entry&& other) noexcept;
+    Entry& operator=(Entry&& other) noexcept;
+
+    std::array<uint8_t, 16> ticket{};
+    PortableHelperSecret nonce{};
+    PortableHelperApprovalRequestView view{};
+    uint64_t expires_at_ms = 0;
+  };
+
+  bool consume_pending(PortableHelperPendingApproval&& pending,
+                      Entry* entry, std::string* error);
+  void purge_expired_locked(uint64_t now_ms);
+
+  mutable std::mutex mutex_;
+  std::vector<Entry> pending_;
+  uint32_t approval_thread_id_ = 0;
+};
+
 // Computes the worker's possession proof over all grant scope fields and the
 // one-time challenge. The caller must still authenticate the pipe peer's exact
 // process identity; this proof does not replace OS identity checks.
@@ -143,11 +263,11 @@ class PortableHelperAuthorization final {
   PortableHelperAuthorization& operator=(
       const PortableHelperAuthorization&) = delete;
 
-  // Call only after explicit local authorization has completed. This creates
-  // a fresh connection generation, scoped operation mask, secret, and challenge.
-  bool BeginGrant(const PortableHelperInstanceId& instance_id,
-                  const PortableHelperConnectionId& connection_id,
-                  uint32_t windows_session_id, uint32_t operations,
+  // A remote request cannot call this API directly: it must first pass through
+  // PortableHelperLocalApprovalGate and consume a matching local approval
+  // receipt. This creates a fresh connection generation, scoped operation
+  // mask, secret, and challenge.
+  bool BeginGrant(PortableHelperLocalApprovalReceipt&& approval,
                   PortableHelperGrant* grant, std::string* error);
 
   // Worker-side initialization after receiving a grant over an authenticated

@@ -1,8 +1,19 @@
 # 当前完成状态与后续计划
 
-日期：2026-11-26（2026-11-18 状态基线延续）
+日期：2026-11-27（2026-11-18 状态基线延续）
 
 分支：`codex/complete-workspace-2026-11-20`
+
+2026-11-27 H01 输入释放 journal 文件后端与 worker observer 验证：已新增受保护、按 instance/connection/session/generation 隔离的 Windows journal 文件存储；按原子 no-replace 初始化、同目录临时文件加固、Flush 与 write-through 原子替换持久化状态，并拒绝损坏、错 scope、旧记录覆盖和非法状态转移。`--portable-helper-worker` 已在注入前同步持久化 `InputSideEffectObserver` 的 prepare/result；发现既有 scope 记录时拒绝启动，不恢复注入。journal v2 增加持久 `released` 终态，防止清理 tombstone 被同 generation 重置。补充 released 编解码、恢复终态、同 generation 不可覆盖/重启激活测试。Release `chast-host-parity-test`、`chast-host`、`chast-service`、`chast-keyboard-test` 构建通过；`protocol`、`keyboard`、`portable_helper_lifecycle`、`portable_helper_authorization` 各重复 5 轮 **20/20 PASS**；高完整性 token 下 `chast-host-parity-test --portable-helper-authorization` 全套通过，实际运行受保护文件后端用例；`git diff --check` 通过。该测试是隔离文件存储/进程重启模拟与 dry-run 输入，不代表真实 worker 崩溃、桌面副作用释放或 SYSTEM/SCM 验收。独立、经身份认证的目标 session 清理执行端及生命周期调用仍未实现；正式 service 的 emergency-release provider 仍为空，因此产品键鼠 grant 继续 fail-closed。下一步实现清理执行端并验证 worker/helper/清理器崩溃窗口和可重试恢复，完成前不得开放输入授权。
+
+2026-11-26 H01 输入 journal 状态核心（阶段记录）：新增 `portable_helper_input_journal.{h,cc}`，按 helper instance/connection/session/generation 建立独立状态图像，采用显式有界编码与同步持久化回调契约；覆盖按键、鼠标按钮、touch contact、pen 状态，单个未决 API intent 的写前 `possible` 状态、序号/结果关联及崩溃恢复视图。该阶段仅完成状态机与可注入持久化边界；后续 2026-11-27 文件后端和 worker observer 的实现/验证见本节最新记录。产品键鼠 grant 仍 fail-closed。
+
+
+2026-11-26 H01 输入释放桥接进展：正式 `chast-service` 仍以空 `EmergencyInputRelease` 创建 session-worker controller，因此产品服务继续在启动前拒绝键鼠 grant；worker 强杀后，进程内输入状态仍无法由 broker 精准恢复。已在 `InputInjector` 的 `SendInput`、`InjectTouchInput`、`InjectSyntheticPointerInput` 边界加入同步 prepare/result observer，并修正 `submit_and_wait()`：只有至少一次 OS API 调用、该逻辑事件所有 API 均明确成功且结果回执获确认才返回 true；失败时附带即时错误码，touch 的 `ERROR_NOT_READY` 对相同 frame 有界重试。observer 仅提供调用边界，不提供持久化、跨进程 journal、身份/ACL、connection/generation 隔离或崩溃恢复；结果回执未知时必须保留未决 intent，不能把 false ACK 理解为没有副作用。dry-run 定向测试覆盖成功、API 拒绝、prepare 拒绝、结果通道丢失、touch/pen 和 touch 重试，不注入真实输入；`protocol`、`keyboard`、`portable_helper_lifecycle`、`portable_helper_authorization` 各重复 5 轮通过。下一步实现受保护、逐连接/代次的写前 journal 与独立目标 session 清理端，并验证 prepare→OS→result 的崩溃窗口、桌面切换/锁屏及清理重试。该桥接和隔离回归完成前继续 fail-closed。详见 [H01 专题设计与实现状态](h01-portable-elevated-helper-design-2026-11-25.md)。
+
+2026-11-26 H01 本机审批 gate 核心（工作区未提交）：`PortableHelperAuthorization::BeginGrant` 现必须消费 `PortableHelperLocalApprovalGate` 签发的 move-only、5 秒有效 receipt；远端请求只能进入有界且按连接去重的 60 秒待审批队列，批准仅允许在 gate 创建线程（计划绑定本机 UI 线程）执行，并须通过调用方的实时连接/session/权限复核回调。可缩减批准操作集；拒绝、取消、过期、复核失败及重复消费均不签发能力。新增回归覆盖非法 scope/操作、重复排队、非 UI 线程审批、权限缩减、失效状态、断线取消、拒绝及 receipt 重放。Release `chast-host`、`chast-service`、`chast-portable-helper-lifecycle-test`、`chast-host-parity-test` 构建通过；`portable_helper_authorization` 单次及 `--repeat until-fail:5` 均通过，`portable_helper_lifecycle` **1/1 PASS**，`git diff --check` 通过。该 gate 尚未接入 `host/main.cc` 的真实审批 UI/连接请求；不会把测试中的模拟批准记作产品同意验收。输入释放 provider、正式签名 pin、UAC/staging/真实 SCM 与桌面验收仍是后续依赖。
+
+2026-11-26 H01 父进程 worker RPC caller 与失败关闭强化（工作区未提交）：补齐 `PortableHelperServiceConnection` 的 helper instance 绑定，并新增 parent-side `start_portable_helper_session_worker` / `stop_portable_helper_session_worker` 与 connection-aware capture/input RPC；同一连接的请求及完整响应由 mutex 序列化。Start 校验相关 ACK 和 generation-scoped WorkerReady proof 后才进入 Ready；Stop 等待 helper 确认 worker 撤权/退出后才撤销父端 gate。捕获/输入 RPC 在本地准入失败时不发送；请求发出后若传输、响应关联或有效载荷校验失败，则关闭 forwarding gate、撤销父端授权并关闭控制 pipe。隔离多进程回归验证错误 session 拒绝、PNG/键盘请求、并发 capture 不串响应，以及负向相关 ACK 导致关闭管道/撤销 gate。Release `chast-host-parity-test` 构建通过；`portable_helper_authorization` **3/3 PASS（5.64 秒）**、`portable_helper_lifecycle` **3/3 PASS（0.13 秒）**，共 **6/6**。本轮未重跑 70 项 reviewed allowlist。此为已测试的 parent caller 组件，尚未接入 `host/main.cc` 本机批准 UI、UAC/staging/SCM lifecycle；publisher pin 仍为空，键鼠 grant 在产品服务仍 fail-closed，真实 SYSTEM/SCM/ProgramData/桌面验收未完成。下一步接入明确本机授权和生命周期编排，并先解决可信输入释放提供方。
 
 2026-11-26 H01 service-side per-connection worker 控制链路（工作区未提交）：新增 `SessionWorkerStart` / `SessionWorkerStop` 控制消息和 `PortableHelperServiceSessionWorker`，已接入正式 helper SCM service 的已认证控制管道。Start 携带父进程本地授权后生成的完整 capability grant（仅本机 pipe）；service 检查 instance/session/connection/operation/generation，按连接创建 worker endpoint，通过产品 launcher 启动并验证 pipe peer、grant 与 WorkerReady proof，成功后才 ACK 并向父进程转发 proof。service 使用相同 grant 对每个 capture/input 请求再次 Acquire lease 后转发；Stop 绑定 connection/generation，先有界撤权/停止 worker，清理成功才 ACK。每个 helper 实例仅接受一次有效 Start，拒绝错误 session 和重放启动；没有配置紧急输入释放提供方时，service 在启动前拒绝含键盘/指针操作的 grant，避免异常结束无法释放按键。测试验证错误 grant 拒绝后仍可合法启动（测试注入 cleanup provider）、PNG 捕获/键盘 ACK 转发、缺少 cleanup provider 时输入授权拒绝、停止后再次启动拒绝及 helper 后续可清理。Release `chast-host`、`chast-service`、`chast-host-parity-test` 构建成功，`protocol`/`portable_helper_lifecycle`/`portable_helper_authorization` **3/3 PASS**，授权测试 **5/5 PASS**，隔离 `%TEMP%` 下 `--elevation` 组合回归通过。worker 为隔离普通用户子进程，不是 SYSTEM/SCM 验收；当前 host UI/UAC 仍未创建并发送 Start/grant，本机明确授权调用方和产品紧急输入释放桥接尚未接通，且 publisher pin 为空，因此没有正向 staged launch 或可用产品会话。真实 SCM/ProgramData/桌面与输入验收仍待。
 
@@ -148,7 +159,7 @@
 
 项目尚未达到“功能与性能全面对齐 RustDesk”的完成条件。当前为 **W1 外部验收待收口，W2 本机功能已大体实现、场景验收继续推进**：审核发现的明确缺陷已修复，S01、S02、S03 的必要代码链路已接通，并取得本地 SQLite、PostgreSQL、浏览器和 Windows 原生进程证据；安装/卸载事务与防火墙 COM 后端已继续加固并通过 fake/隔离回归，但 W1 的双机、正式 SCM 服务、真实 COM 写入回滚和生产环境验收尚未完成。C01–C04 已有主要实现和本机自动化/loopback 证据；C03 标签关闭的历史进程退出原因仍未定位，物理显示、音频、输入设备等场景验收继续待做。W3 企业治理与 W4 生产能力仍有明确实现缺口。
 
-截至 `34e5a9b`，当前分支已包含 schema v29–v33 的 S05 告警、S06 邮箱验证/邀请和登录设备白名单实现。PostgreSQL 实库、真实 SMTP、部署浏览器及双机设备恢复仍待验收；告警运营语义亦待确认。
+S05 告警、S06 邮箱验证/邀请及 v33 登录设备白名单的功能状态曾以 `34e5a9b` 为基线；当前分支之后还包含后续开发提交。上述功能仍缺 PostgreSQL 实库、真实 SMTP、部署浏览器及双机设备恢复验收，告警运营语义亦待确认。
 
 ## 2. 已完成的修复与实现
 
@@ -254,7 +265,7 @@ SCM 安装/卸载编排新增快照、逆序回滚及 fake SCM/防火墙事务�
 
 | 任务 | 待实现范围 |
 | --- | --- |
-| H01 | 部分完成 | helper 内逐连接 worker 生命周期和请求转发已接线；host 本地授权调用方/签名与实机验收未闭环 | 已实现 helper 生命周期/恢复、认证控制 IPC、`SessionWorkerStart`/`SessionWorkerStop`、单实例单连接 worker 控制器、父进程 grant 传递、WorkerReady proof 回传、typed capture/input 二次授权转发、lease/有界撤权、Winlogon SYSTEM token selector、suspended launcher 及 worker runtime。隔离本机多进程验证正常握手、PNG/键盘转发、错误 session 拒绝、二次 Start 拒绝和撤权；测试 worker 不是 SYSTEM/SCM worker。host UI/UAC 尚未发送 Start/grant，明确本机授权流程未接通；Authenticode pin 未配置，正向 staged launch 与真实 SYSTEM worker、管理员 SCM/ProgramData、真实桌面捕获/输入、锁屏/安全桌面、升级回滚和实机异常退出后的输入释放仍待 |
+| H01 | 部分完成 | helper 内逐连接 worker 生命周期、service handler、parent RPC caller、本机审批 gate 核心，以及输入释放 journal 文件后端/worker observer 已实现；host UI/生命周期、认证清理端、签名与实机验收未闭环 | 已实现 helper 生命周期/恢复、认证控制 IPC、`SessionWorkerStart`/`SessionWorkerStop`、单实例单连接 worker 控制器、测试覆盖的 parent-side Start/Stop/capture/input RPC（同一连接序列化完整 request/response）、move-only 且 UI-thread-bound 的本机审批 receipt gate、父进程 grant 传递、WorkerReady proof 回传、typed capture/input 二次授权转发、lease/有界撤权、Winlogon SYSTEM token selector、suspended launcher 及 worker runtime。输入注入已接入逐代受保护 journal 与 prepare/result observer；隔离本机多进程和高完整性文件存储回归通过，但尚无独立认证的目标 session 清理 executor，产品键鼠 grant 继续 fail-closed。审批 gate 尚未接至 `host/main.cc` 真实本机 UI/实时连接复核；parent RPC caller 也未接 staging/SCM lifecycle；Authenticode pin 未配置，正向 staged launch 与真实 SYSTEM worker、管理员 SCM/ProgramData、真实桌面捕获/输入、锁屏/安全桌面、升级回滚和崩溃后输入释放仍待 |
 | H02 | 扩展虚拟显示后端、自定义分辨率、驱动签名/分发条件及多 GPU、HDR、热插拔回退 |
 | H03 | 本机集中上传、断点续传和幂等归档已实现并通过真实便携主机 loopback 整链；生产服务/部署与双机验收后置，源 MP4 自动清理/保留策略仍待定义 |
 | O01 | 活动连接与指令已落库，快照 CAS 已修复且有 SQLite 双 Store 回归；仍需 PostgreSQL 双 Store 验证、共享限流、录制存储和跨实例写入协调，以及实际两实例指令投递与故障接管验收 |

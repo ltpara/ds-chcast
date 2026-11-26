@@ -31,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "chast/protocol.h"
 
@@ -67,10 +68,61 @@ uint16_t modifier_bit_for_vk(uint16_t virtual_key);
 struct InputStats {
     uint64_t applied = 0;
     uint64_t rejected = 0;  // unknown key or malformed event
-    uint64_t failed = 0;    // SendInput reported zero inserted events
+    uint64_t failed = 0;    // API rejected the effect or preflight vetoed it
     uint64_t dropped = 0;   // queue overflow, including work discarded for release
     uint64_t lock_toggles = 0;  // temporary lock adjustments and restoration
 };
+
+// A concrete OS input call, captured before crossing the API boundary. A
+// safety-sensitive observer can persist this intent before allowing injection
+// and later reconcile its result. The vectors contain exactly the payload
+// passed to the corresponding Windows API.
+enum class InputSideEffectApi : uint8_t {
+    SendInput,
+    InjectTouchInput,
+    InjectSyntheticPointerInput,
+};
+
+struct InputSideEffectIntent {
+    uint64_t sequence = 0;
+    InputSideEffectApi api = InputSideEffectApi::SendInput;
+    std::vector<INPUT> inputs;
+    std::vector<POINTER_TOUCH_INFO> touch_contacts;
+    std::vector<POINTER_TYPE_INFO> pointer_inputs;
+};
+
+struct InputSideEffectResult {
+    uint64_t sequence = 0;
+    InputSideEffectApi api = InputSideEffectApi::SendInput;
+    // The raw API return value: SendInput's inserted count, or the BOOL value
+    // returned by the touch/pen injection API (normalized to 0 or 1).
+    uint32_t return_value = 0;
+    uint32_t last_error = 0;
+    bool api_succeeded = false;
+};
+
+struct InputSideEffectObserver {
+    // Called synchronously on the injector thread before the OS API. For a
+    // safety-sensitive journal, true must mean the intent has been durably
+    // recorded; false/throw vetoes injection and permanently fails this
+    // injector closed.
+    std::function<bool(const InputSideEffectIntent&)> prepare;
+    // Called after the OS API with its exact result. false/throw means the
+    // result could not be committed/acknowledged; the prepare record remains
+    // unresolved and this injector permanently fails closed. This callback
+    // does not itself provide durable storage or crash recovery.
+    std::function<bool(const InputSideEffectResult&)> complete;
+};
+
+struct DryRunInputApiResult {
+    uint32_t return_value = 0;
+    uint32_t last_error = 0;
+};
+
+// Test seam used only when create() is called with dry_run=true. A zero return
+// value simulates an API rejection without injecting into the real desktop.
+using DryRunInputApiResultProvider =
+    std::function<DryRunInputApiResult(const InputSideEffectIntent&)>;
 
 class InputInjector {
 public:
@@ -86,7 +138,9 @@ public:
         std::function<void(const INPUT&)> dry_run_observer = {},
         std::function<HKL()> keyboard_layout_provider = {},
         std::function<bool()> ime_open_provider = {},
-        std::function<void(const char*)> release_trace_observer = {});
+        std::function<void(const char*)> release_trace_observer = {},
+        InputSideEffectObserver side_effect_observer = {},
+        DryRunInputApiResultProvider dry_run_api_result_provider = {});
 
     ~InputInjector();
     InputInjector(const InputInjector&) = delete;
@@ -168,6 +222,13 @@ private:
     void release_fallback_pointer();
     void release_all();
     UINT send(const INPUT& input);
+    // Returns false if the observer rejected the intent or threw. In that
+    // case the OS API was not called. A failed completion acknowledgement is
+    // distinct: the API was called, but its durable result is unknown.
+    bool prepare_side_effect(InputSideEffectIntent& intent);
+    void complete_side_effect(const InputSideEffectIntent& intent,
+                              uint32_t return_value, uint32_t last_error,
+                              bool api_succeeded);
     HKL keyboard_layout() const;
     bool keyboard_ime_open() const;
     // Moves the injection thread onto the desktop that currently receives
@@ -181,6 +242,14 @@ private:
     std::function<void(const char*)> release_trace_observer_;
     std::function<HKL()> keyboard_layout_provider_;
     std::function<bool()> ime_open_provider_;
+    InputSideEffectObserver side_effect_observer_;
+    DryRunInputApiResultProvider dry_run_api_result_provider_;
+    uint64_t side_effect_sequence_ = 0;
+    bool side_effect_observer_failed_ = false;
+    // Per logical queued item; all constituent OS calls must succeed before
+    // submit_and_wait() reports success.
+    uint32_t operation_side_effect_count_ = 0;
+    bool operation_side_effects_succeeded_ = true;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     struct Pending {

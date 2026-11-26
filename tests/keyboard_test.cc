@@ -5,6 +5,7 @@
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -45,6 +46,27 @@ chast::InputEvent legacy_key(uint16_t vk, bool down, uint16_t modifiers = 0) {
     event.kind = chast::InputKind::LegacyKey;
     event.legacy_key = {down ? chast::KeyAction::Down : chast::KeyAction::Up, vk};
     event.modifiers = modifiers;
+    return event;
+}
+
+chast::InputEvent touch_event(chast::TouchAction action) {
+    chast::InputEvent event;
+    event.kind = chast::InputKind::Touch;
+    event.touch.action = action;
+    event.touch.contact = 2;
+    event.touch.x = 100;
+    event.touch.y = 120;
+    event.touch.pressure = 512;
+    return event;
+}
+
+chast::InputEvent pen_event(chast::TouchAction action) {
+    chast::InputEvent event;
+    event.kind = chast::InputKind::Pen;
+    event.pen.action = action;
+    event.pen.x = 100;
+    event.pen.y = 120;
+    event.pen.pressure = 512;
     return event;
 }
 }
@@ -517,6 +539,254 @@ int main() {
                       injected.size() == 1 && is_key(injected[0], 0x1E, true),
                   "synchronous submission returns after the ordered input attempt");
             injector->stop();
+        }
+    }
+    {
+        std::vector<std::string> order;
+        std::vector<chast::InputSideEffectIntent> prepared;
+        std::vector<chast::InputSideEffectResult> completed;
+        chast::InputSideEffectObserver observer;
+        observer.prepare = [&](const chast::InputSideEffectIntent& intent) {
+            order.push_back("prepare");
+            prepared.push_back(intent);
+            return true;
+        };
+        observer.complete = [&](const chast::InputSideEffectResult& result) {
+            order.push_back("result");
+            completed.push_back(result);
+            return true;
+        };
+        auto api_result = [&](const chast::InputSideEffectIntent& intent) {
+            order.push_back("api");
+            check(intent.api == chast::InputSideEffectApi::SendInput &&
+                      intent.inputs.size() == 1,
+                  "SendInput observer receives its exact one-input payload");
+            return chast::DryRunInputApiResult{1u, ERROR_SUCCESS};
+        };
+        auto injector = chast::InputInjector::create(
+            true, &error, {}, us_layout_provider, [] { return false; }, {},
+            std::move(observer), api_result);
+        check(injector != nullptr, "side-effect observer starts in dry-run mode");
+        if (injector) {
+            const bool down = injector->submit_and_wait(input_key(0x04, true));
+            const bool up = injector->submit_and_wait(input_key(0x04, false));
+            injector->stop();
+            check(down && up && order == std::vector<std::string>{
+                      "prepare", "api", "result", "prepare", "api", "result"} &&
+                      prepared.size() == 2 && completed.size() == 2 &&
+                      prepared[0].sequence == 1 && prepared[1].sequence == 2 &&
+                      completed[0].sequence == prepared[0].sequence &&
+                      completed[1].sequence == prepared[1].sequence &&
+                      completed[0].api_succeeded && completed[1].api_succeeded,
+                  "each successful API call is prepared, invoked, and acknowledged in order");
+        }
+    }
+    {
+        int prepare_calls = 0;
+        int api_calls = 0;
+        int result_calls = 0;
+        chast::InputSideEffectObserver observer;
+        observer.prepare = [&](const chast::InputSideEffectIntent&) {
+            ++prepare_calls;
+            return false;
+        };
+        observer.complete = [&](const chast::InputSideEffectResult&) {
+            ++result_calls;
+            return true;
+        };
+        auto injector = chast::InputInjector::create(
+            true, &error, {}, us_layout_provider, [] { return false; }, {},
+            std::move(observer), [&](const chast::InputSideEffectIntent&) {
+                ++api_calls;
+                return chast::DryRunInputApiResult{1u, ERROR_SUCCESS};
+            });
+        check(injector != nullptr, "prepare-veto observer starts");
+        if (injector) {
+            const bool first = injector->submit_and_wait(input_key(0x04, true));
+            const bool second = injector->submit_and_wait(input_key(0x04, false));
+            injector->stop();
+            check(!first && !second && prepare_calls == 1 && api_calls == 0 &&
+                      result_calls == 0,
+                  "prepare rejection blocks injection and permanently fails closed");
+        }
+    }
+    {
+        std::vector<chast::InputSideEffectResult> results;
+        chast::InputSideEffectObserver observer;
+        observer.prepare = [](const chast::InputSideEffectIntent&) { return true; };
+        observer.complete = [&](const chast::InputSideEffectResult& result) {
+            results.push_back(result);
+            return true;
+        };
+        auto injector = chast::InputInjector::create(
+            true, &error, {}, us_layout_provider, [] { return false; }, {},
+            std::move(observer), [](const chast::InputSideEffectIntent&) {
+                return chast::DryRunInputApiResult{0u, ERROR_ACCESS_DENIED};
+            });
+        check(injector != nullptr, "API-failure observer starts");
+        if (injector) {
+            const bool accepted = injector->submit_and_wait(input_key(0x04, true));
+            injector->stop();
+            check(!accepted && results.size() == 1 &&
+                      results[0].api == chast::InputSideEffectApi::SendInput &&
+                      results[0].return_value == 0 &&
+                      results[0].last_error == ERROR_ACCESS_DENIED &&
+                      !results[0].api_succeeded,
+                  "a definite SendInput failure reaches the caller as a failed ACK");
+        }
+    }
+    {
+        std::vector<chast::InputSideEffectResult> results;
+        uint32_t simulated_calls = 0;
+        chast::InputSideEffectObserver observer;
+        observer.prepare = [](const chast::InputSideEffectIntent&) { return true; };
+        observer.complete = [&](const chast::InputSideEffectResult& result) {
+            results.push_back(result);
+            return true;
+        };
+        auto injector = chast::InputInjector::create(
+            true, &error, {}, us_layout_provider, [] { return false; }, {},
+            std::move(observer), [&](const chast::InputSideEffectIntent&) {
+                return chast::DryRunInputApiResult{
+                    ++simulated_calls == 2 ? 0u : 1u, ERROR_SUCCESS};
+            });
+        check(injector != nullptr, "multi-call result observer starts");
+        if (injector) {
+            chast::InputEvent mouse;
+            mouse.kind = chast::InputKind::Mouse;
+            mouse.mouse.action = chast::MouseAction::ButtonDown;
+            mouse.mouse.buttons = chast::kMouseLeft | chast::kMouseBack;
+            const bool accepted = injector->submit_and_wait(mouse);
+            injector->stop();
+            check(!accepted && simulated_calls == 3 && results.size() == 3 &&
+                      results[0].api_succeeded && !results[1].api_succeeded,
+                  "one failed constituent API call makes the full input ACK fail");
+        }
+    }
+    {
+        int prepare_calls = 0;
+        int api_calls = 0;
+        int result_calls = 0;
+        chast::InputSideEffectObserver observer;
+        observer.prepare = [&](const chast::InputSideEffectIntent&) {
+            ++prepare_calls;
+            return true;
+        };
+        observer.complete = [&](const chast::InputSideEffectResult&) {
+            ++result_calls;
+            return false;  // Simulate losing the result-channel acknowledgement.
+        };
+        auto injector = chast::InputInjector::create(
+            true, &error, {}, us_layout_provider, [] { return false; }, {},
+            std::move(observer), [&](const chast::InputSideEffectIntent&) {
+                ++api_calls;
+                return chast::DryRunInputApiResult{1u, ERROR_SUCCESS};
+            });
+        check(injector != nullptr, "unknown-result observer starts");
+        if (injector) {
+            const bool first = injector->submit_and_wait(input_key(0x04, true));
+            const bool second = injector->submit_and_wait(input_key(0x04, false));
+            injector->stop();
+            check(!first && !second && prepare_calls == 1 && api_calls == 1 &&
+                      result_calls == 1,
+                  "lost result acknowledgement leaves intent unresolved and blocks later effects");
+        }
+    }
+    {
+        const auto exercise_pointer_api = [&](bool pen, bool api_success) {
+            std::vector<chast::InputSideEffectIntent> prepared;
+            std::vector<chast::InputSideEffectResult> completed;
+            chast::InputSideEffectObserver observer;
+            observer.prepare = [&](const chast::InputSideEffectIntent& intent) {
+                prepared.push_back(intent);
+                return true;
+            };
+            observer.complete = [&](const chast::InputSideEffectResult& result) {
+                completed.push_back(result);
+                return true;
+            };
+            auto injector = chast::InputInjector::create(
+                true, &error, {}, us_layout_provider, [] { return false; }, {},
+                std::move(observer), [=](const chast::InputSideEffectIntent&) {
+                    return chast::DryRunInputApiResult{
+                        api_success ? 1u : 0u, ERROR_SUCCESS};
+                });
+            check(injector != nullptr, pen ? "pen observer starts" : "touch observer starts");
+            if (!injector) return false;
+            const auto down_event = pen ? pen_event(chast::TouchAction::Down)
+                                        : touch_event(chast::TouchAction::Down);
+            const auto up_event = pen ? pen_event(chast::TouchAction::Up)
+                                      : touch_event(chast::TouchAction::Up);
+            const bool down = injector->submit_and_wait(down_event);
+            bool up = false;
+            if (api_success) up = injector->submit_and_wait(up_event);
+            injector->stop();
+            const auto expected_api = pen
+                ? chast::InputSideEffectApi::InjectSyntheticPointerInput
+                : chast::InputSideEffectApi::InjectTouchInput;
+            const size_t expected_calls = api_success ? 2 : 1;
+            bool payload_ok = prepared.size() == expected_calls &&
+                              completed.size() == expected_calls;
+            for (size_t i = 0; i < prepared.size(); ++i) {
+                payload_ok = payload_ok && prepared[i].api == expected_api &&
+                             completed[i].api == expected_api &&
+                             completed[i].sequence == prepared[i].sequence &&
+                             completed[i].api_succeeded == api_success &&
+                             completed[i].return_value == (api_success ? 1u : 0u);
+                if (pen) {
+                    payload_ok = payload_ok && prepared[i].pointer_inputs.size() == 1 &&
+                                 prepared[i].touch_contacts.empty();
+                } else {
+                    payload_ok = payload_ok && prepared[i].touch_contacts.size() == 1 &&
+                                 prepared[i].pointer_inputs.empty();
+                }
+            }
+            return payload_ok && down == api_success && up == api_success;
+        };
+        check(exercise_pointer_api(false, true),
+              "touch down/up side effects report exact successful API results");
+        check(exercise_pointer_api(false, false),
+              "touch API rejection is reported without real input injection");
+        check(exercise_pointer_api(true, true),
+              "pen down/up side effects report exact successful API results");
+        check(exercise_pointer_api(true, false),
+              "pen API rejection is reported without real input injection");
+    }
+    {
+        std::vector<chast::InputSideEffectIntent> api_attempts;
+        std::vector<chast::InputSideEffectResult> results;
+        chast::InputSideEffectObserver observer;
+        observer.prepare = [](const chast::InputSideEffectIntent&) { return true; };
+        observer.complete = [&](const chast::InputSideEffectResult& result) {
+            results.push_back(result);
+            return true;
+        };
+        auto injector = chast::InputInjector::create(
+            true, &error, {}, us_layout_provider, [] { return false; }, {},
+            std::move(observer), [&](const chast::InputSideEffectIntent& intent) {
+                api_attempts.push_back(intent);
+                if (api_attempts.size() == 1) {
+                    return chast::DryRunInputApiResult{0u, ERROR_NOT_READY};
+                }
+                return chast::DryRunInputApiResult{1u, ERROR_SUCCESS};
+            });
+        check(injector != nullptr, "touch ERROR_NOT_READY retry observer starts");
+        if (injector) {
+            const bool accepted = injector->submit_and_wait(
+                touch_event(chast::TouchAction::Down));
+            const bool retried_same_frame = accepted && api_attempts.size() == 2 &&
+                results.size() == 1 && results[0].api_succeeded &&
+                results[0].last_error == ERROR_SUCCESS &&
+                api_attempts[0].sequence == api_attempts[1].sequence &&
+                api_attempts[0].touch_contacts.size() == 1 &&
+                api_attempts[1].touch_contacts.size() == 1 &&
+                api_attempts[0].touch_contacts[0].pointerInfo.pointerId ==
+                    api_attempts[1].touch_contacts[0].pointerInfo.pointerId &&
+                api_attempts[0].touch_contacts[0].pointerInfo.pointerFlags ==
+                    api_attempts[1].touch_contacts[0].pointerInfo.pointerFlags;
+            injector->stop();
+            check(retried_same_frame,
+                  "ERROR_NOT_READY retries the identical touch frame and reports the final result");
         }
     }
     {
