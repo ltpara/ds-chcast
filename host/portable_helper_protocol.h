@@ -36,6 +36,11 @@ enum class PortableHelperMessageType : uint32_t {
     // connection/generation/session scope; they are never generic commands.
     CaptureFrameRequest = 11,
     InputEventRequest = 12,
+    CaptureFrameChunk = 13,
+    // Parent-to-helper control for one locally authorized session worker.
+    // The helper accepts only one worker start for each service instance.
+    SessionWorkerStart = 14,
+    SessionWorkerStop = 15,
 };
 
 struct PortableHelperMessage {

@@ -614,6 +614,26 @@ void InputInjector::submit(const InputEvent& event) {
     cv_.notify_one();
 }
 
+bool InputInjector::submit_and_wait(const InputEvent& event) {
+    auto completion = std::make_shared<std::promise<bool>>();
+    auto completed = completion->get_future();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) return false;
+        if (queue_.size() >= 1024) {
+            std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+            ++stats_.dropped;
+            return false;
+        }
+        Pending pending;
+        pending.event = event;
+        pending.completion = std::move(completion);
+        queue_.push_back(std::move(pending));
+    }
+    cv_.notify_one();
+    return completed.get();
+}
+
 void InputInjector::submit_text(const std::string& text) {
     if (!valid_text_input(text)) {
         std::lock_guard<std::mutex> stats_lock(stats_mutex_);
@@ -649,6 +669,10 @@ void InputInjector::release_held() {
         if (queue_.size() >= 1024) {
             std::lock_guard<std::mutex> stats_lock(stats_mutex_);
             stats_.dropped += queue_.size();
+            for (const Pending& pending : queue_) {
+                if (pending.completion != nullptr)
+                    pending.completion->set_value(false);
+            }
             queue_.clear();
         }
         Pending pending;
@@ -709,6 +733,8 @@ void InputInjector::run() {
                 } else {
                     apply(pending.event);
                 }
+                if (pending.completion != nullptr)
+                    pending.completion->set_value(true);
             }
             lock.lock();
         }

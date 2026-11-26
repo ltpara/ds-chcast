@@ -46,6 +46,10 @@ bool request_portable_helper_service_stop(
     PortableHelperServiceConnection& connection, uint32_t timeout_ms,
     std::string* error);
 
+using PortableHelperServiceControlRequestHandler = std::function<bool(
+    PortableHelperPipe& control_channel, const PortableHelperMessage& request,
+    bool* stop_service, std::string* error)>;
+
 // Accepts one exact parent process on the already-created instance pipe, then
 // serves only Status and Stop control messages. Stop is acknowledged before
 // the callback is invoked. Parent death, SCM stop or Stop all close the pipe;
@@ -55,6 +59,7 @@ bool run_portable_helper_service_control_channel(
     const PortableHelperProcessIdentity& expected_parent,
     HANDLE parent_process, HANDLE service_stop_event,
     const std::function<void()>& request_service_stop,
-    std::string* error);
+    std::string* error,
+    PortableHelperServiceControlRequestHandler request_handler = {});
 
 }  // namespace chast::host

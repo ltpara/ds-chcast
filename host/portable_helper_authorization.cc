@@ -296,6 +296,42 @@ bool send_portable_helper_grant(PortableHelperPipe& pipe,
   return pipe.Send(std::move(message), timeout_ms, error);
 }
 
+bool make_portable_helper_session_worker_start_request(
+    const PortableHelperGrant& grant, uint64_t request_id,
+    PortableHelperMessage* request, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (request == nullptr || request_id == 0)
+    return fail(error, "session worker start request is missing or uncorrelated");
+  PortableHelperMessage encoded;
+  encoded.type = PortableHelperMessageType::SessionWorkerStart;
+  encoded.instance_id = grant.instance_id;
+  encoded.request_id = request_id;
+  if (!encode_grant_payload(grant, &encoded.payload, error)) return false;
+  *request = std::move(encoded);
+  return true;
+}
+
+bool parse_portable_helper_session_worker_start_request(
+    const PortableHelperMessage& request,
+    const PortableHelperInstanceId& expected_instance,
+    uint32_t expected_session, PortableHelperGrant* grant,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (grant == nullptr || request.type != PortableHelperMessageType::SessionWorkerStart ||
+      request.request_id == 0 || request.instance_id != expected_instance ||
+      expected_session == 0)
+    return fail(error, "session worker start request has an invalid control envelope");
+  std::vector<uint8_t> payload = request.payload;
+  ByteVectorWiper payload_wiper(payload);
+  PortableHelperGrant parsed;
+  if (!decode_grant_payload(payload, &parsed, error)) return false;
+  if (parsed.instance_id != expected_instance ||
+      parsed.windows_session_id != expected_session)
+    return fail(error, "session worker start grant is outside the helper parent scope");
+  *grant = parsed;
+  return true;
+}
+
 bool receive_portable_helper_grant(PortableHelperPipe& pipe,
                                    PortableHelperGrant* grant,
                                    uint32_t timeout_ms, std::string* error) {
@@ -336,8 +372,10 @@ bool receive_portable_helper_worker_ready(
     PortableHelperPipe& pipe, PortableHelperAuthorization& authorization,
     const PortableHelperGrant& grant,
     const PortableHelperProcessIdentity& expected_worker,
-    uint32_t timeout_ms, std::string* error) {
+    uint32_t timeout_ms, std::string* error,
+    PortableHelperSecret* worker_ready_proof) {
   if (error != nullptr) error->clear();
+  if (worker_ready_proof != nullptr) worker_ready_proof->fill(0);
   PortableHelperMessage message;
   if (!pipe.Receive(&message, timeout_ms, error)) return false;
   ByteVectorWiper payload_wiper(message.payload);
@@ -353,9 +391,12 @@ bool receive_portable_helper_worker_ready(
     SecureZeroMemory(proof.data(), proof.size());
     return false;
   }
+  if (worker_ready_proof != nullptr) *worker_ready_proof = proof;
   const bool ready = authorization.ConfirmWorkerReady(
       grant, expected_worker, actual_worker, proof, error);
   SecureZeroMemory(proof.data(), proof.size());
+  if (!ready && worker_ready_proof != nullptr)
+    SecureZeroMemory(worker_ready_proof->data(), worker_ready_proof->size());
   return ready;
 }
 
@@ -433,6 +474,35 @@ bool PortableHelperAuthorization::BeginGrant(
   return true;
 }
 
+bool PortableHelperAuthorization::AcceptWorkerGrant(
+    const PortableHelperGrant& grant, uint32_t actual_windows_session_id,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (!any_nonzero(grant.instance_id.data(), grant.instance_id.size()) ||
+      !any_nonzero(grant.connection_id.data(), grant.connection_id.size()) ||
+      grant.generation == 0 || grant.windows_session_id == 0 ||
+      actual_windows_session_id != grant.windows_session_id ||
+      !valid_operation_mask(grant.operations) ||
+      !any_nonzero(grant.secret.data(), grant.secret.size()) ||
+      !any_nonzero(grant.challenge.data(), grant.challenge.size()))
+    return fail(error, "received worker capability has an invalid scope");
+
+  std::lock_guard lock(mutex_);
+  if (state_ != PortableHelperAuthorizationState::Idle ||
+      active_operations_ != 0)
+    return fail(error, "worker capability can only initialize an idle authorization gate");
+  grant_ = grant;
+  state_ = PortableHelperAuthorizationState::Ready;
+  const uint32_t input_operations =
+      static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput) |
+      static_cast<uint32_t>(PortableHelperOperation::SendPointerInput);
+  revocation_input_granted_ = (grant.operations & input_operations) != 0;
+  revocation_cancel_completed_ = false;
+  revocation_cancel_succeeded_ = true;
+  revocation_finish_in_progress_ = false;
+  return true;
+}
+
 bool PortableHelperAuthorization::ConfirmWorkerReady(
     const PortableHelperGrant& grant,
     const PortableHelperProcessIdentity& expected_worker,
@@ -459,6 +529,59 @@ bool PortableHelperAuthorization::ConfirmWorkerReady(
   const bool valid = constant_time_equal(expected_proof, proof);
   SecureZeroMemory(expected_proof.data(), expected_proof.size());
   if (!valid) return fail(error, "portable helper worker-ready proof is invalid");
+  state_ = PortableHelperAuthorizationState::Ready;
+  return true;
+}
+
+bool PortableHelperAuthorization::AcceptParentAuthorizedGrant(
+    const PortableHelperGrant& grant, uint32_t expected_windows_session_id,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (!any_nonzero(grant.instance_id.data(), grant.instance_id.size()) ||
+      !any_nonzero(grant.connection_id.data(), grant.connection_id.size()) ||
+      grant.generation == 0 || grant.windows_session_id == 0 ||
+      grant.windows_session_id != expected_windows_session_id ||
+      !valid_operation_mask(grant.operations) ||
+      !any_nonzero(grant.secret.data(), grant.secret.size()) ||
+      !any_nonzero(grant.challenge.data(), grant.challenge.size()))
+    return fail(error, "parent-authorized helper grant has an invalid scope");
+
+  std::lock_guard lock(mutex_);
+  if ((state_ != PortableHelperAuthorizationState::Idle &&
+       state_ != PortableHelperAuthorizationState::Revoked) ||
+      active_operations_ != 0)
+    return fail(error, "parent-authorized helper grant cannot replace an active capability");
+  if (grant.generation <= grant_.generation)
+    return fail(error, "parent-authorized helper generation is stale or replayed");
+  grant_ = grant;
+  revocation_input_granted_ = false;
+  revocation_cancel_completed_ = false;
+  revocation_cancel_succeeded_ = true;
+  revocation_finish_in_progress_ = false;
+  state_ = PortableHelperAuthorizationState::AwaitingWorkerReady;
+  return true;
+}
+
+bool PortableHelperAuthorization::ConfirmBrokerManagedWorkerReady(
+    const PortableHelperGrant& grant, const PortableHelperSecret& proof,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  std::lock_guard lock(mutex_);
+  if (state_ != PortableHelperAuthorizationState::AwaitingWorkerReady ||
+      grant_.instance_id != grant.instance_id ||
+      grant_.connection_id != grant.connection_id ||
+      grant_.generation != grant.generation ||
+      grant_.windows_session_id != grant.windows_session_id ||
+      grant_.operations != grant.operations ||
+      !constant_time_equal(grant_.secret, grant.secret) ||
+      !constant_time_equal(grant_.challenge, grant.challenge))
+    return fail(error, "broker WorkerReady does not match the pending local grant");
+  PortableHelperSecret expected_proof{};
+  if (!make_proof(grant_, &expected_proof, error)) return false;
+  const bool matches = constant_time_equal(expected_proof, proof);
+  SecureZeroMemory(expected_proof.data(), expected_proof.size());
+  if (!matches)
+    return fail(error, "broker WorkerReady proof is invalid");
   state_ = PortableHelperAuthorizationState::Ready;
   return true;
 }

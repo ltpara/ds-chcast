@@ -289,6 +289,25 @@ void test_publisher_signature_requires_trusted_pinned_signer() {
               std::wstring(image, image_length), std::string(64, '0'), &error) &&
               error.find("Authenticode validation failed") != std::string::npos,
           "an unsigned executable is rejected even when a publisher pin is configured");
+
+    error.clear();
+    const bool configured_signature_ok =
+        verify_configured_portable_helper_publisher_signature(
+            std::wstring(image, image_length), &error);
+    if (!configured_signature_ok &&
+        error.find("staging is disabled") != std::string::npos) {
+      PortableHelperServiceSpec spec;
+      spec.service_name = L"must-be-cleared";
+      error.clear();
+      check(!stage_portable_helper_service_image(&spec, &error) &&
+                spec.service_name.empty() &&
+                error.find("staging is disabled") != std::string::npos,
+            "an unset publisher pin rejects staging before elevation or filesystem access");
+    } else {
+      check(configured_signature_ok ||
+                error.find("Authenticode validation failed") != std::string::npos,
+            "configured publisher verification accepts only a trusted pinned signature");
+    }
   }
 }
 

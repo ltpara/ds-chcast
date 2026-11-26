@@ -11,6 +11,7 @@
 
 #include "chast/machine_state_security.h"
 #include "chast/security.h"
+#include "portable_helper_worker_session.h"
 #include "portable_helper_staging.h"
 
 namespace chast::host {
@@ -278,7 +279,8 @@ bool run_portable_helper_service_control_channel(
     const PortableHelperProcessIdentity& expected_parent,
     HANDLE parent_process, HANDLE service_stop_event,
     const std::function<void()>& request_service_stop,
-    std::string* error) {
+    std::string* error,
+    PortableHelperServiceControlRequestHandler request_handler) {
   if (error != nullptr) error->clear();
   if (!server_channel || parent_process == nullptr ||
       parent_process == INVALID_HANDLE_VALUE || service_stop_event == nullptr ||
@@ -311,6 +313,44 @@ bool run_portable_helper_service_control_channel(
                                              : read_error);
         done();
         return;
+      }
+
+      if (request_handler) {
+        bool stop_service = false;
+        std::string handler_error;
+        bool handled = false;
+        try {
+          handled = request_handler(*pipe, request, &stop_service,
+                                    &handler_error);
+        } catch (...) {
+          handler_error = "helper control handler raised an exception";
+        }
+        if (!handled) {
+          save_thread_error(error_mutex, reader_error,
+                            handler_error.empty()
+                                ? "helper control handler rejected a request"
+                                : handler_error);
+          done();
+          return;
+        }
+        if (stop_service && request.type != PortableHelperMessageType::Stop) {
+          save_thread_error(error_mutex, reader_error,
+                            "helper control handler requested shutdown for a non-Stop message");
+          done();
+          return;
+        }
+        if (stop_service) {
+          orderly_stop.store(true, std::memory_order_release);
+          try {
+            request_service_stop();
+          } catch (...) {
+            save_thread_error(error_mutex, reader_error,
+                              "service stop callback raised an exception");
+          }
+          done();
+          return;
+        }
+        continue;
       }
 
       if (request.type != PortableHelperMessageType::Status &&

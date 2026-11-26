@@ -53,7 +53,7 @@ uint64_t get64(const std::vector<uint8_t>& bytes, size_t at) {
 
 bool valid_type(uint32_t type) {
   return type >= static_cast<uint32_t>(PortableHelperMessageType::ClientHello) &&
-         type <= static_cast<uint32_t>(PortableHelperMessageType::InputEventRequest);
+         type <= static_cast<uint32_t>(PortableHelperMessageType::SessionWorkerStop);
 }
 
 bool nonzero_instance(const PortableHelperInstanceId& instance_id) {

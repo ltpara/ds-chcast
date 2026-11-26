@@ -485,6 +485,41 @@ int main() {
         }
     }
     {
+        std::promise<void> entered;
+        auto entered_future = entered.get_future();
+        std::promise<void> resume;
+        auto resume_future = resume.get_future();
+        std::vector<INPUT> injected;
+        auto injector = chast::InputInjector::create(true, &error,
+            [&](const INPUT& value) {
+                injected.push_back(value);
+                if (injected.size() == 1) {
+                    entered.set_value();
+                    resume_future.wait();
+                }
+            }, us_layout_provider);
+        check(injector != nullptr, "synchronous injection observer starts");
+        if (injector) {
+            auto submitted = std::async(std::launch::async, [&] {
+                return injector->submit_and_wait(input_key(0x04, true));
+            });
+            const bool entered_injection = entered_future.wait_for(
+                std::chrono::seconds(2)) == std::future_status::ready;
+            check(entered_injection,
+                  "synchronous input reaches the injection boundary");
+            const bool returned_before_injection = submitted.wait_for(
+                std::chrono::milliseconds(50)) == std::future_status::ready;
+            check(!returned_before_injection,
+                  "synchronous input retains its caller until the injection attempt completes");
+            resume.set_value();
+            const bool processed = submitted.get();
+            check(entered_injection && !returned_before_injection && processed &&
+                      injected.size() == 1 && is_key(injected[0], 0x1E, true),
+                  "synchronous submission returns after the ordered input attempt");
+            injector->stop();
+        }
+    }
+    {
         std::vector<INPUT> injected;
         auto injector = chast::InputInjector::create(true, &error,
             [&](const INPUT& value) { injected.push_back(value); }, us_layout_provider);

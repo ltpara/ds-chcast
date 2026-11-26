@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -95,6 +96,12 @@ public:
     // dropped and counted, which is the right trade for a pointer stream that
     // is already stale at that point.
     void submit(const InputEvent& event);
+
+    // Queues one event and blocks until the injection thread has attempted it.
+    // This lets an authorization lease cover the actual SendInput boundary;
+    // false means the event was rejected before entering the queue. Do not call
+    // from the injection thread or its dry-run observer.
+    bool submit_and_wait(const InputEvent& event);
 
     // Queues a block of composed text (protocol v36). The injection thread
     // types it as Unicode, so it lands as the viewer sent it regardless of the
@@ -181,6 +188,7 @@ private:
         bool has_text = false;
         InputEvent event;
         std::string text;
+        std::shared_ptr<std::promise<bool>> completion;
     };
     std::deque<Pending> queue_;
     bool stopping_ = false;

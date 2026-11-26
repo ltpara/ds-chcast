@@ -366,6 +366,7 @@ add_library(chast.host.tray STATIC
     host/portable_helper_supervisor.cc
     host/portable_helper_win32_supervisor.cc
     host/portable_helper_service_channel.cc
+    host/portable_helper_service_worker.cc
     host/portable_helper_worker_session.cc
     host/portable_helper_lifecycle.cc
     host/portable_helper_recovery.cc

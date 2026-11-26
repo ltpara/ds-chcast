@@ -41,10 +41,12 @@
 #include <vector>
 
 #include "chast/audio.h"
+#include "chast/capture.h"
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
 #include "chast/host_client_strategy.h"
 #include "chast/host_settings.h"
+#include "chast/input.h"
 #include "chast/live_connection.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
@@ -59,6 +61,7 @@
 #include "service_settings.h"
 #include "tunnel.h"
 #include "portable_helper_service.h"
+#include "portable_helper_worker_session.h"
 
 namespace {
 
@@ -4970,6 +4973,107 @@ std::wstring absolute_path(const std::wstring& path) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int early_argc = 0;
     LPWSTR* early_argv = CommandLineToArgvW(GetCommandLineW(), &early_argc);
+    if (early_argv == nullptr) return ERROR_NOT_ENOUGH_MEMORY;
+    if (early_argv != nullptr && early_argc > 1 &&
+        std::wstring(early_argv[1]) == L"--portable-helper-worker") {
+        // The helper service does not yet launch this mode from its control
+        // loop. If invoked, validate the exact staged worker/broker identities
+        // and grant before any desktop access.
+        std::vector<std::wstring> arguments;
+        chast::host::PortableHelperSessionWorkerLaunchArguments parsed;
+        chast::host::PortableHelperProcessIdentity worker_identity;
+        chast::host::PortableHelperProcessIdentity broker_identity;
+        std::string error;
+        bool parsed_ok = false;
+        try {
+            arguments.reserve(static_cast<size_t>(early_argc));
+            for (int index = 0; index < early_argc; ++index)
+                arguments.emplace_back(early_argv[index]);
+            parsed_ok = chast::host::parse_portable_helper_session_worker_command_line(
+                arguments, &parsed, &error);
+        } catch (...) {
+            LocalFree(early_argv);
+            return ERROR_NOT_ENOUGH_MEMORY;
+        }
+        const bool identity_ok = parsed_ok &&
+            chast::host::validate_portable_helper_session_worker_process_identity(
+                parsed, &worker_identity, &broker_identity, &error);
+        std::unique_ptr<chast::host::PortableHelperPipe> worker_channel;
+        chast::host::PortableHelperAuthorization worker_authorization;
+        chast::host::PortableHelperGrant worker_grant;
+        bool grant_received = false;
+        if (identity_ok) {
+            grant_received =
+                chast::host::connect_portable_helper_session_worker_pipe(
+                    parsed, broker_identity, 5000, &worker_channel, &error) &&
+                chast::host::accept_portable_helper_session_worker_grant(
+                    *worker_channel, parsed, broker_identity, worker_identity,
+                    worker_authorization, &worker_grant, 5000, &error);
+        }
+        LocalFree(early_argv);
+        if (!parsed_ok) return ERROR_INVALID_PARAMETER;
+        if (!identity_ok || !grant_received) return ERROR_ACCESS_DENIED;
+
+        SetProcessDPIAware();
+        const uint32_t capture_operation = static_cast<uint32_t>(
+            chast::host::PortableHelperOperation::CaptureFrames);
+        const uint32_t input_operations = static_cast<uint32_t>(
+            chast::host::PortableHelperOperation::SendKeyboardInput) |
+            static_cast<uint32_t>(
+                chast::host::PortableHelperOperation::SendPointerInput);
+        std::unique_ptr<chast::IDxgiCapturer> worker_capturer;
+        std::unique_ptr<chast::InputInjector> worker_injector;
+
+        if ((worker_grant.operations & capture_operation) != 0) {
+            std::string adapter_error;
+            auto displays = chast::enumerate_displays();
+            const auto primary = std::find_if(
+                displays.begin(), displays.end(),
+                [](const chast::DisplayInfo& display) { return display.primary; });
+            if (displays.empty()) return ERROR_NOT_READY;
+            const auto& target = primary == displays.end() ? displays.front()
+                                                            : *primary;
+            chast::CaptureConfig capture_config;
+            capture_config.backend = chast::CaptureBackend::GdiCpu;
+            capture_config.capture_cursor = true;
+            capture_config.want_hdr = false;
+            worker_capturer = chast::create_capturer(
+                target, capture_config, &adapter_error);
+            if (!worker_capturer) return ERROR_NOT_READY;
+
+            // Probe the initialized adapter while holding a valid capture
+            // lease, but do not disclose pixels until the broker requests a
+            // frame. A failed probe leaves WorkerReady unsent.
+            chast::host::PortableHelperMessage probe_request;
+            chast::host::PortableHelperCapturedFrame probe_frame;
+            if (!chast::host::make_portable_helper_capture_request(
+                    worker_authorization, worker_grant, 1, &probe_request,
+                    &adapter_error) ||
+                !chast::host::capture_portable_helper_worker_frame(
+                    worker_authorization, *worker_capturer, probe_request,
+                    &probe_frame, &adapter_error)) {
+                if (!probe_frame.png.empty())
+                    SecureZeroMemory(probe_frame.png.data(),
+                                     probe_frame.png.size());
+                return ERROR_NOT_READY;
+            }
+            if (!probe_frame.png.empty())
+                SecureZeroMemory(probe_frame.png.data(), probe_frame.png.size());
+        }
+
+        if ((worker_grant.operations & input_operations) != 0) {
+            std::string adapter_error;
+            worker_injector = chast::InputInjector::create(
+                false, &adapter_error);
+            if (!worker_injector) return ERROR_NOT_READY;
+        }
+
+        const bool worker_stopped =
+            chast::host::run_portable_helper_session_worker_request_loop(
+                *worker_channel, worker_authorization, worker_grant,
+                worker_capturer.get(), worker_injector.get(), &error);
+        return worker_stopped ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+    }
     if (early_argv != nullptr && early_argc > 1 &&
         std::wstring(early_argv[1]) == L"--service-name") {
         const bool valid = early_argc == 3 && early_argv[2][0] != L'\0';
@@ -4979,7 +5083,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     if (early_argv != nullptr) {
         for (int index = 1; index < early_argc; ++index) {
-            if (std::wstring(early_argv[index]) == L"--service-name") {
+            if (std::wstring(early_argv[index]) == L"--service-name" ||
+                std::wstring(early_argv[index]) == L"--portable-helper-worker") {
                 LocalFree(early_argv);
                 return 2;
             }

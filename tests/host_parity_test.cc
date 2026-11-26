@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -25,9 +26,11 @@
 #include "portable_helper_supervisor.h"
 #include "portable_helper_win32_supervisor.h"
 #include "portable_helper_service_channel.h"
+#include "portable_helper_service_worker.h"
 #include "portable_helper_worker_session.h"
 #include "platform.h"
 #include "chast/user_context.h"
+#include "chast/png.h"
 
 namespace {
 using namespace chast;
@@ -270,6 +273,26 @@ void portable_helper_protocol() {
                 decoded.type == PortableHelperMessageType::InputEventRequest,
             "versioned IPC framing recognizes the new typed desktop request");
 
+    typed_request.type = PortableHelperMessageType::CaptureFrameChunk;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::CaptureFrameChunk,
+            "versioned IPC framing recognizes bounded capture-frame chunks");
+
+    typed_request.type = PortableHelperMessageType::SessionWorkerStart;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::SessionWorkerStart,
+            "versioned IPC framing recognizes the session-worker start control");
+    typed_request.type = PortableHelperMessageType::SessionWorkerStop;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::SessionWorkerStop,
+            "versioned IPC framing recognizes the session-worker stop control");
+
     PortableHelperSequence sequence(message.instance_id);
     require(sequence.Accept(decoded, &error) && sequence.last_sequence() == 1,
             "helper receive sequence accepts the first frame");
@@ -300,9 +323,11 @@ void portable_helper_protocol() {
     bad[13] = bad[14] = bad[15] = 0;
     rejected(bad, "helper parser rejects an unknown message type");
     bad = encoded;
-    bad[12] = 13;
+    bad[12] = 14;
     bad[13] = bad[14] = bad[15] = 0;
-    rejected(bad, "helper parser rejects message types beyond the typed request table");
+    bad[12] = static_cast<uint8_t>(
+        static_cast<uint32_t>(PortableHelperMessageType::SessionWorkerStop) + 1);
+    rejected(bad, "helper parser rejects message types beyond the session-worker control table");
     bad = encoded;
     bad[52] = 1;
     rejected(bad, "helper parser rejects unrecognized flags");
@@ -321,6 +346,89 @@ void portable_helper_protocol() {
     require(!encode_portable_helper_message(message, &encoded, &error) &&
                 encoded.empty() && !error.empty(),
             "helper encoder refuses an over-limit payload");
+}
+
+void portable_helper_worker_command_line() {
+    using namespace chast::host;
+    const std::vector<std::wstring> canonical = {
+        L"C:\\ProgramData\\ChastPortableHelper\\chast-host.exe",
+        L"--portable-helper-worker",
+        L"--portable-helper-instance",
+        L"00112233445566778899aabbccddeeff",
+        L"--portable-helper-connection",
+        L"ffeeddccbbaa99887766554433221100",
+        L"--portable-helper-broker-pid",
+        L"1234",
+        L"--portable-helper-broker-created",
+        L"987654321",
+    };
+    PortableHelperSessionWorkerLaunchArguments parsed;
+    std::string error;
+    require(parse_portable_helper_session_worker_command_line(
+                canonical, &parsed, &error) &&
+                parsed.instance_id[0] == 0x00 &&
+                parsed.instance_id[1] == 0x11 &&
+                parsed.instance_id[15] == 0xff &&
+                parsed.connection_id[0] == 0xff &&
+                parsed.connection_id[15] == 0x00 &&
+                parsed.broker_process_id == 1234 &&
+                parsed.broker_creation_time == 987654321,
+            "worker CLI parses the launcher's exact canonical instance, connection and broker identity");
+
+    PortableHelperProcessIdentity worker_identity;
+    PortableHelperProcessIdentity broker_identity;
+    require(!validate_portable_helper_session_worker_process_identity(
+                parsed, &worker_identity, &broker_identity, &error) &&
+                worker_identity.process_id == 0 && broker_identity.process_id == 0,
+            "ordinary test process cannot claim the staged interactive SYSTEM worker identity");
+
+    const auto rejects = [&](std::vector<std::wstring> arguments,
+                             const char* description) {
+        PortableHelperSessionWorkerLaunchArguments output;
+        output.broker_process_id = 99;
+        std::string detail;
+        require(!parse_portable_helper_session_worker_command_line(
+                    arguments, &output, &detail) &&
+                    !detail.empty() && output.broker_process_id == 0 &&
+                    output.broker_creation_time == 0 &&
+                    std::all_of(output.instance_id.begin(),
+                                output.instance_id.end(),
+                                [](uint8_t value) { return value == 0; }),
+                description);
+    };
+
+    auto malformed = canonical;
+    malformed.pop_back();
+    rejects(std::move(malformed),
+            "worker CLI rejects a missing broker creation-time argument");
+    malformed = canonical;
+    malformed.push_back(L"--tray");
+    rejects(std::move(malformed),
+            "worker CLI rejects trailing switches instead of entering the tray host");
+    malformed = canonical;
+    malformed[6] = L"--portable-helper-parent-pid";
+    rejects(std::move(malformed),
+            "worker CLI rejects reordered or unknown switches");
+    malformed = canonical;
+    malformed[3] = L"00112233445566778899AABBCCDDEEFF";
+    rejects(std::move(malformed),
+            "worker CLI accepts only the launcher's lowercase hexadecimal identifiers");
+    malformed = canonical;
+    malformed[5] = L"00000000000000000000000000000000";
+    rejects(std::move(malformed),
+            "worker CLI rejects an empty per-connection identifier");
+    malformed = canonical;
+    malformed[7] = L"01234";
+    rejects(std::move(malformed),
+            "worker CLI rejects noncanonical decimal process IDs");
+    malformed = canonical;
+    malformed[7] = L"4294967296";
+    rejects(std::move(malformed),
+            "worker CLI rejects process IDs outside the Win32 range");
+    malformed = canonical;
+    malformed[9] = L"18446744073709551616";
+    rejects(std::move(malformed),
+            "worker CLI rejects an overflowing process creation time");
 }
 
 void portable_helper_authorization() {
@@ -358,6 +466,114 @@ void portable_helper_authorization() {
                                      operations, &grant, &error),
             "a second grant cannot replace an active pending generation");
 
+    PortableHelperMessage start_request;
+    require(make_portable_helper_session_worker_start_request(
+                grant, 41, &start_request, &error),
+            "serialize the locally authorized grant into a correlated service start request");
+    PortableHelperGrant imported_parent_grant;
+    require(parse_portable_helper_session_worker_start_request(
+                start_request, instance, windows_session,
+                &imported_parent_grant, &error) &&
+                imported_parent_grant.connection_id == grant.connection_id &&
+                imported_parent_grant.generation == grant.generation &&
+                imported_parent_grant.operations == grant.operations,
+            "helper service imports only the exact instance and session-scoped parent grant");
+    require(!parse_portable_helper_session_worker_start_request(
+                start_request, instance, windows_session + 1,
+                &imported_parent_grant, &error),
+            "helper service rejects a parent grant for a different Windows session");
+    PortableHelperAuthorization delegated_authorization;
+    require(delegated_authorization.AcceptParentAuthorizedGrant(
+                grant, windows_session, &error) &&
+                delegated_authorization.state() ==
+                    PortableHelperAuthorizationState::AwaitingWorkerReady,
+            "helper service keeps the parent-issued capability closed until its worker is ready");
+    PortableHelperSecret delegated_proof{};
+    require(make_portable_helper_worker_ready_proof(grant, &delegated_proof,
+                                                     &error) &&
+                delegated_authorization.ConfirmBrokerManagedWorkerReady(
+                    grant, delegated_proof, &error) &&
+                delegated_authorization.state() ==
+                    PortableHelperAuthorizationState::Ready &&
+                delegated_authorization.Authorize(
+                    instance, connection, windows_session, grant.generation,
+                    PortableHelperOperation::CaptureFrames),
+            "parent accepts broker WorkerReady only with the correlated grant proof");
+    SecureZeroMemory(delegated_proof.data(), delegated_proof.size());
+    PortableHelperSecret forged_proof{};
+    require(!delegated_authorization.ConfirmBrokerManagedWorkerReady(
+                grant, forged_proof, &error),
+            "parent rejects a forged or replayed broker WorkerReady proof");
+
+    PortableHelperAuthorization worker_gate;
+    require(!worker_gate.AcceptWorkerGrant(grant, windows_session + 1, &error) &&
+                worker_gate.state() == PortableHelperAuthorizationState::Idle,
+            "worker-side grant import rejects a different Windows session");
+    require(worker_gate.AcceptWorkerGrant(grant, windows_session, &error) &&
+                worker_gate.state() == PortableHelperAuthorizationState::Ready &&
+                worker_gate.Authorize(instance, connection, windows_session,
+                                      grant.generation,
+                                      PortableHelperOperation::CaptureFrames) &&
+                worker_gate.Authorize(instance, connection, windows_session,
+                                      grant.generation,
+                                      PortableHelperOperation::SendKeyboardInput),
+            "authenticated worker stores the received grant as its local operation gate");
+    require(!worker_gate.AcceptWorkerGrant(grant, windows_session, &error),
+            "worker-side grant import cannot replace an active capability");
+
+    InputEvent imported_key;
+    imported_key.kind = InputKind::Key;
+    imported_key.key.action = KeyAction::Down;
+    imported_key.key.hid_usage = 0x04;
+    PortableHelperMessage worker_input_request;
+    require(make_portable_helper_input_request(
+                worker_gate, grant, 99, imported_key, &worker_input_request,
+                &error),
+            "worker can validate a typed input request against its imported grant");
+    std::promise<void> input_entered;
+    auto input_entered_future = input_entered.get_future();
+    std::promise<void> finish_input;
+    auto finish_input_future = finish_input.get_future();
+    std::vector<INPUT> applied_inputs;
+    auto injector = InputInjector::create(
+        true, &error,
+        [&](const INPUT& input) {
+          applied_inputs.push_back(input);
+          if (applied_inputs.size() == 1) {
+            input_entered.set_value();
+            finish_input_future.wait();
+          }
+        },
+        [] { return GetKeyboardLayout(0); });
+    require(injector != nullptr,
+            "worker input adapter creates its session-scoped injector");
+    auto input_task = std::async(std::launch::async, [&] {
+      return apply_portable_helper_worker_input_request(
+          worker_gate, *injector, worker_input_request, &error);
+    });
+    const bool input_started = input_entered_future.wait_for(2s) ==
+                               std::future_status::ready;
+    const bool revocation_started =
+        worker_gate.BeginRevocation([] { return true; }, &error);
+    const bool lease_held = !worker_gate.WaitForOperations(10, &error);
+    finish_input.set_value();
+    const bool input_applied = input_task.get();
+    const bool lease_drained = worker_gate.WaitForOperations(1000, &error);
+    const bool revoke_finished = worker_gate.FinishRevocation(
+        [&] {
+          injector->release_held();
+          injector->stop();
+          return true;
+        }, &error);
+    require(input_started && revocation_started && lease_held && input_applied &&
+                lease_drained && revoke_finished &&
+                worker_gate.state() == PortableHelperAuthorizationState::Revoked &&
+                !worker_gate.Authorize(instance, connection, windows_session,
+                                       grant.generation,
+                                       PortableHelperOperation::CaptureFrames) &&
+                !applied_inputs.empty(),
+            "worker releases input only after injection completes and capability is revoked");
+
     PortableHelperProcessIdentity expected_worker;
     expected_worker.process_id = 42;
     expected_worker.session_id = windows_session;
@@ -369,6 +585,81 @@ void portable_helper_authorization() {
     PortableHelperSecret proof{};
     require(make_portable_helper_worker_ready_proof(grant, &proof, &error),
             "worker-ready proof binds a challenge and the entire grant scope");
+
+    class SyntheticCapturer final : public IDxgiCapturer {
+     public:
+      SyntheticCapturer() {
+        frame_.cpu_bgra = std::make_shared<const std::vector<uint8_t>>(
+            std::vector<uint8_t>{0, 0, 255, 255, 0, 255, 0, 255,
+                                 255, 0, 0, 255, 255, 255, 255, 255});
+        frame_.cpu_image = true;
+        frame_.width = 2;
+        frame_.height = 2;
+        frame_.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        frame_.frame_number = 7;
+      }
+
+      CaptureResult capture(std::chrono::milliseconds) override {
+        return CaptureResult::Frame;
+      }
+      const FrameInfo& frame() const override { return frame_; }
+      const CursorInfo& cursor() const override { return cursor_; }
+      const DisplayInfo& display() const override { return display_; }
+      AdapterDevice adapter_device() const override { return {}; }
+      Error reinitialize() override { return Error::success(); }
+      Error set_nv12_scale(UINT) override { return Error::success(); }
+      const Error& last_error() const override { return error_; }
+
+     private:
+      FrameInfo frame_;
+      CursorInfo cursor_;
+      DisplayInfo display_;
+      Error error_ = Error::success();
+    } synthetic_capture;
+
+    PortableHelperAuthorization capture_broker;
+    PortableHelperAuthorization capture_worker_gate;
+    PortableHelperGrant capture_grant;
+    PortableHelperConnectionId capture_connection{};
+    PortableHelperSecret capture_proof{};
+    require(secure_random(capture_connection.data(), capture_connection.size()) &&
+                capture_broker.BeginGrant(
+                    instance, capture_connection, windows_session,
+                    static_cast<uint32_t>(PortableHelperOperation::CaptureFrames),
+                    &capture_grant, &error),
+            "create a scoped capture grant for a worker");
+    require(make_portable_helper_worker_ready_proof(
+                capture_grant, &capture_proof, &error) &&
+                capture_broker.ConfirmWorkerReady(
+                    capture_grant, expected_worker, actual_worker,
+                    capture_proof, &error),
+            "authenticate the capture grant against a worker identity");
+    require(capture_worker_gate.AcceptWorkerGrant(capture_grant,
+                                                   windows_session, &error),
+            "worker imports the authenticated capture grant");
+    PortableHelperMessage synthetic_capture_request;
+    require(make_portable_helper_capture_request(
+                capture_worker_gate, capture_grant, 100,
+                &synthetic_capture_request, &error),
+            "worker builds a fixed-scope capture request");
+    PortableHelperCapturedFrame captured_frame;
+    require(capture_portable_helper_worker_frame(
+                capture_worker_gate, synthetic_capture,
+                synthetic_capture_request, &captured_frame, &error) &&
+                captured_frame.width == 2 && captured_frame.height == 2 &&
+                captured_frame.frame_number == 7 &&
+                captured_frame.png.size() > 8 &&
+                captured_frame.png[0] == 137 && captured_frame.png[1] == 80 &&
+                captured_frame.png[2] == 78 && captured_frame.png[3] == 71 &&
+                captured_frame.png[4] == 13 && captured_frame.png[5] == 10 &&
+                captured_frame.png[6] == 26 && captured_frame.png[7] == 10,
+            "worker capture adapter encodes its leased BGRA frame as PNG");
+    require(capture_worker_gate.Revoke([] { return true; }, &error) &&
+                !capture_worker_gate.Authorize(
+                    instance, capture_connection, windows_session,
+                    capture_grant.generation,
+                    PortableHelperOperation::CaptureFrames),
+            "capture worker cannot start another frame after revocation");
 
     PortableHelperProcessIdentity wrong_worker = actual_worker;
     ++wrong_worker.process_id;
@@ -815,8 +1106,16 @@ void portable_helper_worker_supervision() {
 }
 
 int portable_helper_control_server_child(int argc, char** argv) {
-    if (argc != 5 ||
-        std::string(argv[1]) != "--portable-helper-control-server")
+    using namespace chast::host;
+    const bool worker_control_server = argc == 5 &&
+        std::string(argv[1]) == "--portable-helper-worker-control-server";
+    const bool worker_no_release_control_server = argc == 5 &&
+        std::string(argv[1]) ==
+            "--portable-helper-worker-no-release-control-server";
+    const bool basic_control_server = argc == 5 &&
+        std::string(argv[1]) == "--portable-helper-control-server";
+    if (!worker_control_server && !worker_no_release_control_server &&
+        !basic_control_server)
         return 2;
     std::vector<uint8_t> bytes;
     if (!chast::hex_decode(argv[2], bytes) ||
@@ -842,9 +1141,81 @@ int portable_helper_control_server_child(int argc, char** argv) {
         if (stop_event != nullptr) CloseHandle(stop_event);
         return 6;
     }
+    std::unique_ptr<chast::host::PortableHelperServiceSessionWorker>
+        session_worker;
+    chast::host::PortableHelperServiceControlRequestHandler request_handler;
+    if (worker_control_server || worker_no_release_control_server) {
+        chast::host::PortableHelperServiceSpec spec;
+        spec.instance_id = instance;
+        spec.executable_path = executable_path();
+        spec.service_name = chast::host::portable_helper_service_name(instance);
+        spec.parent = parent;
+        chast::host::PortableHelperProcessIdentity broker;
+        if (!chast::host::current_portable_helper_process_identity(
+                &broker, &error)) {
+            CloseHandle(parent_process);
+            CloseHandle(stop_event);
+            return 7;
+        }
+        const std::wstring executable = spec.executable_path;
+        auto launcher = [executable, broker](
+            const chast::host::PortableHelperServiceSpec& launch_spec,
+            const chast::host::PortableHelperGrant& grant, HANDLE* process,
+            std::string* launch_error) {
+            const std::wstring command = L"\"" + executable +
+                L"\" --portable-helper-session-worker-auth-client " +
+                widen(hex_encode(launch_spec.instance_id.data(),
+                                 launch_spec.instance_id.size())) + L" " +
+                widen(hex_encode(grant.connection_id.data(),
+                                 grant.connection_id.size())) + L" " +
+                std::to_wstring(broker.process_id) + L" " +
+                std::to_wstring(broker.creation_time);
+            std::vector<wchar_t> command_line(command.begin(), command.end());
+            command_line.push_back(L'\0');
+            STARTUPINFOW startup{sizeof(startup)};
+            PROCESS_INFORMATION created{};
+            if (!CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                                nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                                nullptr, &startup, &created)) {
+                if (launch_error != nullptr)
+                    *launch_error = "cannot launch isolated service worker peer";
+                return false;
+            }
+            CloseHandle(created.hThread);
+            *process = created.hProcess;
+            return true;
+        };
+        if (worker_no_release_control_server) {
+            session_worker =
+                std::make_unique<chast::host::PortableHelperServiceSessionWorker>(
+                    std::move(spec), std::move(launcher));
+        } else {
+            session_worker =
+                std::make_unique<chast::host::PortableHelperServiceSessionWorker>(
+                    std::move(spec), std::move(launcher),
+                    [](const chast::host::PortableHelperGrant&,
+                       std::string*) { return true; });
+        }
+        request_handler = [&session_worker](
+            chast::host::PortableHelperPipe& control,
+            const chast::host::PortableHelperMessage& request,
+            bool* stop_service, std::string* handler_error) {
+            return session_worker->HandleControlRequest(
+                control, request, stop_service, handler_error);
+        };
+    }
     const bool ok = chast::host::run_portable_helper_service_control_channel(
         std::move(pipe), parent, parent_process, stop_event,
-        [stop_event] { SetEvent(stop_event); }, &error);
+        [stop_event] { SetEvent(stop_event); }, &error,
+        std::move(request_handler));
+    if (session_worker) {
+        std::string cleanup_error;
+        if (!session_worker->Shutdown(&cleanup_error)) {
+            CloseHandle(parent_process);
+            CloseHandle(stop_event);
+            return 8;
+        }
+    }
     CloseHandle(parent_process);
     CloseHandle(stop_event);
     return ok ? 0 : 7;
@@ -857,9 +1228,12 @@ int portable_helper_pipe_child(int argc, char** argv) {
         std::string(argv[1]) == "--portable-helper-session-worker-auth-client";
     const bool session_worker_bad_ready_client = argc == 6 &&
         std::string(argv[1]) == "--portable-helper-session-worker-bad-ready-client";
+    const bool session_worker_no_stop_ack_client = argc == 6 &&
+        std::string(argv[1]) ==
+            "--portable-helper-session-worker-no-stop-ack-client";
     const bool session_worker_mode =
         session_worker_client || session_worker_auth_client ||
-        session_worker_bad_ready_client;
+        session_worker_bad_ready_client || session_worker_no_stop_ack_client;
     const bool authorization_client = argc == 5 &&
         std::string(argv[1]) == "--portable-helper-auth-client";
     const bool supervised_worker = argc == 5 &&
@@ -916,27 +1290,96 @@ int portable_helper_pipe_child(int argc, char** argv) {
         return 5;
     }
     if (session_worker_auth_client) {
+        chast::host::PortableHelperSessionWorkerLaunchArguments launch_arguments;
+        launch_arguments.instance_id = instance_id;
+        launch_arguments.connection_id = connection_id;
+        launch_arguments.broker_process_id = parent.process_id;
+        launch_arguments.broker_creation_time = parent.creation_time;
         chast::host::PortableHelperGrant grant;
         chast::host::PortableHelperProcessIdentity worker;
-        if (!chast::host::receive_portable_helper_grant(*pipe, &grant, 5000,
-                                                        &error) ||
-            !chast::host::current_portable_helper_process_identity(&worker,
-                                                                    &error) ||
-            grant.instance_id != instance_id ||
-            grant.connection_id != connection_id ||
+        chast::host::PortableHelperProcessIdentity authenticated_broker;
+        chast::host::PortableHelperAuthorization worker_authorization;
+        // This child is an ordinary interactive test process, not the
+        // Session-0 SYSTEM broker required by the product import routine.
+        // Exercise the coordinator's grant/WorkerReady exchange with a test
+        // peer while preserving the production broker identity checks.
+        if (!chast::host::current_portable_helper_process_identity(
+                &worker, &error) ||
+            !pipe->AuthenticatedPeer(&authenticated_broker, &error) ||
+            authenticated_broker.process_id != parent.process_id ||
+            authenticated_broker.creation_time != parent.creation_time ||
+            authenticated_broker.session_id != parent.session_id ||
+            authenticated_broker.user_sid != parent.user_sid ||
+            authenticated_broker.logon_sid != parent.logon_sid ||
+            !chast::host::receive_portable_helper_grant(
+                *pipe, &grant, 5000, &error) ||
+            grant.instance_id != launch_arguments.instance_id ||
+            grant.connection_id != launch_arguments.connection_id ||
             grant.windows_session_id != worker.session_id ||
+            grant.generation == 0 ||
+            !worker_authorization.AcceptWorkerGrant(
+                grant, worker.session_id, &error) ||
+            !worker_authorization.Authorize(
+                instance_id, connection_id, worker.session_id,
+                grant.generation,
+                chast::host::PortableHelperOperation::CaptureFrames) ||
+            !worker_authorization.Authorize(
+                instance_id, connection_id, worker.session_id,
+                grant.generation,
+                chast::host::PortableHelperOperation::SendKeyboardInput) ||
             grant.windows_session_id != parent.session_id ||
-            !chast::host::send_portable_helper_worker_ready(
-                *pipe, grant, 5000, &error)) {
+            grant.windows_session_id != worker.session_id) {
             std::fprintf(stderr, "portable session worker handshake: %s\n",
                          error.c_str());
             return 18;
         }
-        chast::host::PortableHelperMessage stop;
-        if (!pipe->Receive(&stop, 5000, &error) ||
-            stop.type != chast::host::PortableHelperMessageType::Stop)
+        class SessionLoopCapturer final : public chast::IDxgiCapturer {
+         public:
+          SessionLoopCapturer() {
+            frame_.cpu_bgra = std::make_shared<const std::vector<uint8_t>>(
+                std::vector<uint8_t>{0, 0, 255, 255, 0, 255, 0, 255,
+                                     255, 0, 0, 255, 255, 255, 255, 255});
+            frame_.cpu_image = true;
+            frame_.width = 2;
+            frame_.height = 2;
+            frame_.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            frame_.frame_number = 23;
+          }
+          chast::CaptureResult capture(std::chrono::milliseconds) override {
+            return chast::CaptureResult::Frame;
+          }
+          const chast::FrameInfo& frame() const override { return frame_; }
+          const chast::CursorInfo& cursor() const override { return cursor_; }
+          const chast::DisplayInfo& display() const override { return display_; }
+          chast::AdapterDevice adapter_device() const override { return {}; }
+          chast::Error reinitialize() override { return chast::Error::success(); }
+          chast::Error set_nv12_scale(UINT) override { return chast::Error::success(); }
+          const chast::Error& last_error() const override { return error_; }
+
+         private:
+          chast::FrameInfo frame_;
+          chast::CursorInfo cursor_;
+          chast::DisplayInfo display_;
+          chast::Error error_ = chast::Error::success();
+        } capturer;
+        auto injector = chast::InputInjector::create(true, &error);
+        if (!injector ||
+            !chast::host::run_portable_helper_session_worker_request_loop(
+                *pipe, worker_authorization, grant, &capturer, injector.get(),
+                &error)) {
+            std::fprintf(stderr, "portable session worker request loop: %s\n",
+                         error.c_str());
             return 19;
+        }
         return 0;
+    }
+    if (session_worker_no_stop_ack_client) {
+        chast::host::PortableHelperMessage stop;
+        return pipe->Receive(&stop, 5000, &error) &&
+                       stop.type == chast::host::PortableHelperMessageType::Stop &&
+                       stop.request_id != 0 && stop.payload.empty()
+                   ? 0
+                   : 23;
     }
     if (session_worker_bad_ready_client) {
         chast::host::PortableHelperGrant grant;
@@ -1031,10 +1474,15 @@ int portable_helper_pipe_child(int argc, char** argv) {
         if (!pipe->Send(std::move(input_ack), 5000, &error)) return 16;
         if (supervised_worker) {
             chast::host::PortableHelperMessage stop;
-            return pipe->Receive(&stop, 5000, &error) &&
-                           stop.type == chast::host::PortableHelperMessageType::Stop
-                       ? 0
-                       : 17;
+            if (!pipe->Receive(&stop, 5000, &error) ||
+                stop.type != chast::host::PortableHelperMessageType::Stop)
+                return 17;
+            chast::host::PortableHelperMessage stop_ack;
+            stop_ack.type =
+                chast::host::PortableHelperMessageType::Acknowledgement;
+            stop_ack.request_id = stop.request_id;
+            stop_ack.payload = {1};
+            return pipe->Send(std::move(stop_ack), 5000, &error) ? 0 : 18;
         }
         return 0;
     }
@@ -1050,6 +1498,41 @@ int portable_helper_pipe_child(int argc, char** argv) {
     if (!pipe->Send(std::move(message), 5000, &error)) {
         std::fprintf(stderr, "portable pipe child send: %s\n", error.c_str());
         return 7;
+    }
+    if (session_worker_client) {
+        chast::host::PortableHelperMessage transfer_begin;
+        if (!pipe->Receive(&transfer_begin, 5000, &error) ||
+            transfer_begin.type !=
+                chast::host::PortableHelperMessageType::Acknowledgement ||
+            transfer_begin.request_id != 78 ||
+            transfer_begin.payload.size() != 4)
+            return 8;
+        const uint32_t chunk_count =
+            static_cast<uint32_t>(transfer_begin.payload[0]) |
+            (static_cast<uint32_t>(transfer_begin.payload[1]) << 8) |
+            (static_cast<uint32_t>(transfer_begin.payload[2]) << 16) |
+            (static_cast<uint32_t>(transfer_begin.payload[3]) << 24);
+        if (chunk_count < 2 || chunk_count > 128) return 9;
+        chast::host::PortableHelperMessage transfer_ready;
+        transfer_ready.type =
+            chast::host::PortableHelperMessageType::Acknowledgement;
+        transfer_ready.request_id = 78;
+        transfer_ready.payload = {1};
+        if (!pipe->Send(std::move(transfer_ready), 5000, &error)) return 10;
+        std::vector<chast::host::PortableHelperMessage> chunks;
+        chunks.reserve(chunk_count);
+        for (uint32_t index = 0; index < chunk_count; ++index) {
+            chast::host::PortableHelperMessage chunk;
+            if (!pipe->Receive(&chunk, 5000, &error) ||
+                chunk.type !=
+                    chast::host::PortableHelperMessageType::CaptureFrameChunk ||
+                chunk.request_id != 79)
+                return 11;
+            chunks.push_back(std::move(chunk));
+        }
+        for (auto& chunk : chunks) {
+            if (!pipe->Send(std::move(chunk), 5000, &error)) return 12;
+        }
     }
     return 0;
 }
@@ -1134,6 +1617,302 @@ void portable_helper_service_channel_transport() {
                 "helper control server exits successfully after orderly stop");
     CloseHandle(child.hProcess);
     child.hProcess = nullptr;
+}
+
+void portable_helper_service_session_worker_control_loop() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "worker-control integration test captures its interactive parent identity");
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "worker-control integration test creates unique service and connection scopes");
+
+    const auto executable = executable_path();
+    const std::wstring command = L"\"" + executable +
+        L"\" --portable-helper-worker-control-server " +
+        widen(hex_encode(instance.data(), instance.size())) + L" " +
+        std::to_wstring(parent.process_id) + L" " +
+        std::to_wstring(parent.creation_time);
+    std::vector<wchar_t> command_line(command.begin(), command.end());
+    command_line.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &startup, &child) != FALSE,
+            "launch an isolated helper with the session-worker control loop");
+    CloseHandle(child.hThread);
+    const auto stop_child = [&] {
+        if (child.hProcess == nullptr) return;
+        if (WaitForSingleObject(child.hProcess, 0) != WAIT_OBJECT_0)
+            (void)TerminateProcess(child.hProcess, ERROR_CANCELLED);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+    };
+    const auto check_child = [&](bool condition, const char* message) {
+        if (condition) return;
+        stop_child();
+        if (child.hProcess != nullptr) CloseHandle(child.hProcess);
+        child.hProcess = nullptr;
+        require(false, message);
+    };
+
+    PortableHelperProcessIdentity helper_identity;
+    check_child(query_portable_helper_process_identity(
+                    child.dwProcessId, &helper_identity, &error),
+                "worker-control integration test queries the helper identity");
+    auto control = PortableHelperPipe::ConnectClient(
+        instance, helper_identity, 5000, &error);
+    check_child(control != nullptr,
+                "parent connects only to the exact worker-control helper");
+
+    constexpr uint32_t operations =
+        static_cast<uint32_t>(PortableHelperOperation::CaptureFrames) |
+        static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
+    PortableHelperAuthorization parent_authorization;
+    PortableHelperGrant parent_grant;
+    require(parent_authorization.BeginGrant(
+                instance, connection, parent.session_id, operations,
+                &parent_grant, &error),
+            "parent creates a capability only after simulated local approval");
+
+    PortableHelperGrant wrong_session_grant = parent_grant;
+    ++wrong_session_grant.windows_session_id;
+    PortableHelperMessage start;
+    require(make_portable_helper_session_worker_start_request(
+                wrong_session_grant, 200, &start, &error) &&
+                control->Send(std::move(start), 5000, &error),
+            "parent sends a malformed-scope worker start for negative coverage");
+    PortableHelperMessage response;
+    check_child(control->Receive(&response, 5000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 200 &&
+                    response.payload == std::vector<uint8_t>{0},
+                "helper rejects a grant targeting another Windows session");
+
+    require(make_portable_helper_session_worker_start_request(
+                parent_grant, 201, &start, &error) &&
+                control->Send(std::move(start), 5000, &error),
+            "parent starts a worker using the exact locally authorized grant");
+    check_child(control->Receive(&response, 10000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 201 &&
+                    response.payload == std::vector<uint8_t>{1},
+                "helper acknowledges worker start only after authenticated WorkerReady");
+    PortableHelperMessage ready;
+    check_child(control->Receive(&ready, 5000, &error) &&
+                    ready.type == PortableHelperMessageType::WorkerReady &&
+                    ready.request_id == parent_grant.generation &&
+                    ready.payload.size() == PortableHelperSecret{}.size(),
+                "helper relays the correlated WorkerReady proof to its authenticated parent");
+    PortableHelperSecret proof{};
+    std::copy(ready.payload.begin(), ready.payload.end(), proof.begin());
+    check_child(parent_authorization.ConfirmBrokerManagedWorkerReady(
+                    parent_grant, proof, &error) &&
+                    parent_authorization.state() ==
+                        PortableHelperAuthorizationState::Ready,
+                "parent opens its request gate only after validating broker WorkerReady proof");
+    SecureZeroMemory(proof.data(), proof.size());
+
+    require(send_portable_helper_capture_request(
+                *control, parent_authorization, parent_grant, 202, 5000,
+                &error),
+            "helper forwards an authorized scoped frame request to the worker");
+    PortableHelperCapturedFrame frame;
+    check_child(receive_portable_helper_captured_frame(
+                    *control, parent_grant, 202, &frame, 5000, &error) &&
+                    frame.width == 2 && frame.height == 2 &&
+                    frame.frame_number == 23 && !frame.png.empty(),
+                "helper relays only the worker's grant-bound captured PNG chunks");
+    if (!frame.png.empty())
+        SecureZeroMemory(frame.png.data(), frame.png.size());
+
+    InputEvent key;
+    key.kind = InputKind::Key;
+    key.key.action = KeyAction::Down;
+    key.key.hid_usage = 0x04;
+    require(send_portable_helper_input_request(
+                *control, parent_authorization, parent_grant, 203, key, 5000,
+                &error),
+            "helper forwards an authorized typed keyboard request");
+    check_child(control->Receive(&response, 5000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 203 &&
+                    response.payload == std::vector<uint8_t>{1},
+                "helper returns the worker's correlated input completion acknowledgement");
+
+    PortableHelperMessage stop_worker;
+    stop_worker.type = PortableHelperMessageType::SessionWorkerStop;
+    stop_worker.request_id = 204;
+    stop_worker.payload.insert(stop_worker.payload.end(),
+                               parent_grant.connection_id.begin(),
+                               parent_grant.connection_id.end());
+    for (unsigned shift = 0; shift < 64; shift += 8)
+        stop_worker.payload.push_back(static_cast<uint8_t>(
+            parent_grant.generation >> shift));
+    require(control->Send(std::move(stop_worker), 5000, &error),
+            "parent requests generation-scoped worker revocation");
+    check_child(control->Receive(&response, 10000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 204 &&
+                    response.payload == std::vector<uint8_t>{1},
+                "helper revokes the worker, observes exit, then acknowledges Stop");
+
+    PortableHelperConnectionId second_connection{};
+    require(secure_random(second_connection.data(), second_connection.size()),
+            "single-use worker test creates a fresh connection generation");
+    PortableHelperAuthorization second_authorization;
+    PortableHelperGrant second_grant;
+    require(second_authorization.BeginGrant(
+                instance, second_connection, parent.session_id, operations,
+                &second_grant, &error) &&
+                make_portable_helper_session_worker_start_request(
+                    second_grant, 207, &start, &error) &&
+                control->Send(std::move(start), 5000, &error),
+            "parent tries to reuse the UAC-approved helper for a second connection");
+    check_child(control->Receive(&response, 5000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 207 &&
+                    response.payload == std::vector<uint8_t>{0},
+                "one helper authorization cannot be replayed to start another session worker");
+
+    PortableHelperMessage status;
+    status.type = PortableHelperMessageType::Status;
+    status.request_id = 205;
+    require(control->Send(std::move(status), 5000, &error),
+            "helper remains available for cleanup after its worker stops");
+    check_child(control->Receive(&response, 5000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 205 &&
+                    response.payload == std::vector<uint8_t>{1},
+                "helper reports control readiness after per-connection cleanup");
+
+    PortableHelperMessage stop_service;
+    stop_service.type = PortableHelperMessageType::Stop;
+    stop_service.request_id = 206;
+    require(control->Send(std::move(stop_service), 5000, &error),
+            "parent stops the now-idle helper service");
+    check_child(control->Receive(&response, 5000, &error) &&
+                    response.type == PortableHelperMessageType::Acknowledgement &&
+                    response.request_id == 206 &&
+                    response.payload == std::vector<uint8_t>{1},
+                "helper acknowledges service stop after worker cleanup");
+    control.reset();
+    check_child(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
+                "worker-control helper exits after clean session-worker shutdown");
+    DWORD exit_code = 1;
+    check_child(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0,
+                "worker-control helper child exits successfully");
+    CloseHandle(child.hProcess);
+    child.hProcess = nullptr;
+}
+
+void portable_helper_service_requires_emergency_input_release() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "input-release policy test captures the interactive parent identity");
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "input-release policy test creates isolated scope identifiers");
+    const auto executable = executable_path();
+    const std::wstring command = L"\"" + executable +
+        L"\" --portable-helper-worker-no-release-control-server " +
+        widen(hex_encode(instance.data(), instance.size())) + L" " +
+        std::to_wstring(parent.process_id) + L" " +
+        std::to_wstring(parent.creation_time);
+    std::vector<wchar_t> command_line(command.begin(), command.end());
+    command_line.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &startup, &child) != FALSE,
+            "launch a helper without an emergency input-release provider");
+    CloseHandle(child.hThread);
+    auto cleanup_child = [&] {
+        if (WaitForSingleObject(child.hProcess, 0) != WAIT_OBJECT_0)
+            (void)TerminateProcess(child.hProcess, ERROR_CANCELLED);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+        CloseHandle(child.hProcess);
+    };
+
+    PortableHelperProcessIdentity helper_identity;
+    if (!query_portable_helper_process_identity(child.dwProcessId,
+                                               &helper_identity, &error)) {
+        cleanup_child();
+        require(false, "query the helper missing its input-release provider");
+    }
+    auto control = PortableHelperPipe::ConnectClient(
+        instance, helper_identity, 5000, &error);
+    if (!control) {
+        cleanup_child();
+        require(false, "connect to the helper input-release policy test");
+    }
+
+    PortableHelperAuthorization authorization;
+    PortableHelperGrant grant;
+    const uint32_t input_operation = static_cast<uint32_t>(
+        PortableHelperOperation::SendKeyboardInput);
+    require(authorization.BeginGrant(instance, connection, parent.session_id,
+                                    input_operation, &grant, &error),
+            "create a locally authorized keyboard grant for policy rejection");
+    PortableHelperMessage start;
+    require(make_portable_helper_session_worker_start_request(
+                grant, 301, &start, &error) &&
+                control->Send(std::move(start), 5000, &error),
+            "request a keyboard worker without an emergency cleanup provider");
+    PortableHelperMessage response;
+    const bool received = control->Receive(&response, 5000, &error);
+    if (!received || response.type != PortableHelperMessageType::Acknowledgement ||
+        response.request_id != 301 ||
+        response.payload != std::vector<uint8_t>{0} ||
+        authorization.state() !=
+            PortableHelperAuthorizationState::AwaitingWorkerReady) {
+        std::fprintf(stderr,
+                     "input-release refusal: received=%d type=%u id=%llu "
+                     "payload-size=%zu payload=%u auth-state=%u error=%s\n",
+                     received ? 1 : 0, static_cast<unsigned>(response.type),
+                     static_cast<unsigned long long>(response.request_id),
+                     response.payload.size(),
+                     response.payload.empty() ? 255u : response.payload[0],
+                     static_cast<unsigned>(authorization.state()), error.c_str());
+    }
+    const bool rejected = received &&
+        response.type == PortableHelperMessageType::Acknowledgement &&
+        response.request_id == 301 &&
+        response.payload == std::vector<uint8_t>{0} &&
+        authorization.state() == PortableHelperAuthorizationState::AwaitingWorkerReady;
+    require(authorization.Revoke([] { return true; }, [] { return true; },
+                                 &error),
+            "parent revokes its pending grant after helper rejects unsafe input startup");
+    require(rejected,
+            "helper refuses input capability until emergency release is configured");
+
+    PortableHelperMessage stop;
+    stop.type = PortableHelperMessageType::Stop;
+    stop.request_id = 302;
+    require(control->Send(std::move(stop), 5000, &error) &&
+                control->Receive(&response, 5000, &error) &&
+                response.type == PortableHelperMessageType::Acknowledgement &&
+                response.request_id == 302 &&
+                response.payload == std::vector<uint8_t>{1},
+            "a rejected input grant leaves the helper available for safe shutdown");
+    control.reset();
+    require(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
+            "input-release policy helper exits after clean Stop");
+    DWORD exit_code = 1;
+    require(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0,
+            "input-release policy helper returns success");
+    CloseHandle(child.hProcess);
 }
 
 void portable_helper_session_worker_pipe() {
@@ -1245,6 +2024,94 @@ void portable_helper_session_worker_pipe() {
                     worker_ack.request_id == 77 &&
                     worker_ack.payload == std::vector<uint8_t>({4, 5, 6}),
                 "control and worker pipes keep independent authenticated traffic");
+
+        PortableHelperCapturedFrame original_frame;
+        original_frame.width = 1024;
+        original_frame.height = 1024;
+        original_frame.frame_number = 0x1020304050607080ull;
+        std::vector<uint8_t> bgra(
+            static_cast<size_t>(original_frame.width) *
+            original_frame.height * 4);
+        uint32_t noise = 0x6d2b79f5u;
+        for (size_t pixel = 0; pixel < bgra.size(); pixel += 4) {
+            noise ^= noise << 13;
+            noise ^= noise >> 17;
+            noise ^= noise << 5;
+            bgra[pixel] = static_cast<uint8_t>(noise);
+            bgra[pixel + 1] = static_cast<uint8_t>(noise >> 8);
+            bgra[pixel + 2] = static_cast<uint8_t>(noise >> 16);
+            bgra[pixel + 3] = 255;
+        }
+        require(encode_png_bgra(bgra.data(), original_frame.width,
+                                original_frame.height,
+                                original_frame.width * 4,
+                                original_frame.png, &error) &&
+                    original_frame.png.size() > kPortableHelperMaxPayloadBytes,
+                "encode a valid PNG large enough to require multiple IPC frames");
+        PortableHelperGrant frame_grant;
+        frame_grant.instance_id = instance;
+        frame_grant.connection_id = connection;
+        frame_grant.generation = 7;
+        frame_grant.windows_session_id = broker.session_id;
+        frame_grant.operations = static_cast<uint32_t>(
+            PortableHelperOperation::CaptureFrames);
+        std::vector<PortableHelperMessage> frame_chunks;
+        require(make_portable_helper_capture_frame_chunks(
+                    frame_grant, 79, original_frame, &frame_chunks, &error) &&
+                    frame_chunks.size() > 1,
+                "split a captured PNG into grant-scoped bounded chunks");
+        PortableHelperMessage transfer_begin;
+        transfer_begin.type = PortableHelperMessageType::Acknowledgement;
+        transfer_begin.request_id = 78;
+        const uint32_t chunk_count =
+            static_cast<uint32_t>(frame_chunks.size());
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            transfer_begin.payload.push_back(
+                static_cast<uint8_t>(chunk_count >> shift));
+        require(worker->Send(std::move(transfer_begin), 5000, &error),
+                "announce the bounded chunk count to the isolated worker peer");
+        PortableHelperMessage transfer_ready;
+        require(worker->Receive(&transfer_ready, 5000, &error) &&
+                    transfer_ready.type ==
+                        PortableHelperMessageType::Acknowledgement &&
+                    transfer_ready.request_id == 78 &&
+                    transfer_ready.payload == std::vector<uint8_t>{1},
+                "worker peer is ready for the PNG chunk roundtrip");
+        require(send_portable_helper_captured_frame(
+                    *worker, frame_grant, 79, original_frame, 5000, &error),
+                "send the bounded PNG response over the authenticated pipe");
+        PortableHelperCapturedFrame returned_frame;
+        require(receive_portable_helper_captured_frame(
+                    *worker, frame_grant, 79, &returned_frame, 5000, &error) &&
+                    returned_frame.width == original_frame.width &&
+                    returned_frame.height == original_frame.height &&
+                    returned_frame.frame_number == original_frame.frame_number &&
+                    returned_frame.png == original_frame.png,
+                "reassemble an exact greater-than-1-MiB PNG pipe roundtrip");
+
+        std::vector<PortableHelperMessage> echoed_chunks;
+        require(make_portable_helper_capture_frame_chunks(
+                    frame_grant, 79, returned_frame, &echoed_chunks, &error),
+                "recreate captured-frame chunks for malformed-order checks");
+        auto reordered_chunks = echoed_chunks;
+        std::swap(reordered_chunks[0], reordered_chunks[1]);
+        require(!reassemble_portable_helper_capture_frame_chunks(
+                    frame_grant, 79, reordered_chunks, &returned_frame, &error) &&
+                    returned_frame.png.empty(),
+                "reject reordered PNG chunks and clear partial output");
+        auto wrong_scope_chunks = echoed_chunks;
+        wrong_scope_chunks[0].payload[0] ^= 0x01;
+        require(!reassemble_portable_helper_capture_frame_chunks(
+                    frame_grant, 79, wrong_scope_chunks, &returned_frame,
+                    &error),
+                "reject PNG chunks bound to a different connection");
+        auto truncated_chunks = echoed_chunks;
+        truncated_chunks.back().payload.pop_back();
+        require(!reassemble_portable_helper_capture_frame_chunks(
+                    frame_grant, 79, truncated_chunks, &returned_frame,
+                    &error),
+                "reject truncated PNG chunk payloads");
+
         require(WaitForSingleObject(control_client.hProcess, 5000) ==
                     WAIT_OBJECT_0 &&
                     WaitForSingleObject(worker_client.hProcess, 5000) ==
@@ -1358,6 +2225,30 @@ void portable_helper_session_worker_handshake() {
                     PortableHelperAuthorizationState::Ready,
             "the coordinator returns only the exact ready worker and channel");
 
+    require(send_portable_helper_capture_request(
+                *channel, authorization, grant, 501, 5000, &error),
+            "the ready session worker accepts a scoped capture request");
+    PortableHelperCapturedFrame captured;
+    require(receive_portable_helper_captured_frame(
+                *channel, grant, 501, &captured, 5000, &error) &&
+                captured.width == 2 && captured.height == 2 &&
+                captured.frame_number == 23 && !captured.png.empty(),
+            "the session worker returns the leased capture as bounded PNG chunks");
+
+    InputEvent key;
+    key.kind = InputKind::Key;
+    key.key.action = KeyAction::Down;
+    key.key.hid_usage = 0x04;
+    require(send_portable_helper_input_request(
+                *channel, authorization, grant, 502, key, 5000, &error),
+            "the ready session worker accepts a typed keyboard input request");
+    PortableHelperMessage input_ack;
+    require(channel->Receive(&input_ack, 5000, &error) &&
+                input_ack.type == PortableHelperMessageType::Acknowledgement &&
+                input_ack.request_id == 502 &&
+                input_ack.payload == std::vector<uint8_t>{1},
+            "the session worker acknowledges input only after its adapter completes");
+
     bool released = false;
     PortableHelperWorkerRevocationCallbacks callbacks;
     require(make_win32_portable_helper_revocation_callbacks(
@@ -1378,6 +2269,167 @@ void portable_helper_session_worker_handshake() {
                 WaitForSingleObject(worker_process, 0) == WAIT_OBJECT_0 &&
                 GetExitCodeProcess(worker_process, &exit_code) && exit_code == 0,
             "revocation releases input only after the session worker exits");
+}
+
+void portable_helper_supervisor_releases_input_after_worker_exit_without_ack() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity broker;
+    std::string error;
+    require(current_portable_helper_process_identity(&broker, &error) &&
+                broker.session_id != 0,
+            "worker cleanup-ack test captures its interactive broker identity");
+
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "worker cleanup-ack test generates scoped endpoint identifiers");
+    auto channel = PortableHelperPipe::CreateSessionWorkerServer(
+        instance, connection, broker.logon_sid, &error);
+    require(channel != nullptr,
+            "create an authenticated worker pipe for missing cleanup acknowledgement");
+
+    const auto executable = executable_path();
+    std::wstring command = L"\"" + executable +
+        L"\" --portable-helper-session-worker-no-stop-ack-client " +
+        widen(hex_encode(instance.data(), instance.size())) + L" " +
+        widen(hex_encode(connection.data(), connection.size())) + L" " +
+        std::to_wstring(broker.process_id) + L" " +
+        std::to_wstring(broker.creation_time);
+    std::vector<wchar_t> command_line(command.begin(), command.end());
+    command_line.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION created{};
+    require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &startup, &created) != FALSE,
+            "launch an isolated worker peer that deliberately omits cleanup acknowledgement");
+    CloseHandle(created.hThread);
+    HANDLE worker_process = created.hProcess;
+    struct Cleanup final {
+      std::unique_ptr<PortableHelperPipe>* channel;
+      HANDLE* process;
+      ~Cleanup() {
+        if (channel != nullptr) channel->reset();
+        if (process == nullptr || *process == nullptr) return;
+        if (WaitForSingleObject(*process, 0) != WAIT_OBJECT_0) {
+          (void)TerminateProcess(*process, ERROR_CANCELLED);
+          (void)WaitForSingleObject(*process, 5000);
+        }
+        CloseHandle(*process);
+        *process = nullptr;
+      }
+    } cleanup{&channel, &worker_process};
+
+    PortableHelperProcessIdentity worker;
+    const bool queried_worker = query_portable_helper_process_identity(
+        GetProcessId(worker_process), &worker, &error);
+    if (!queried_worker)
+        std::fprintf(stderr, "query missing-ack worker identity: %s\n",
+                     error.c_str());
+    require(queried_worker,
+            "query the exact child before requesting worker cleanup");
+    error.clear();
+    const bool authenticated_worker = channel->Accept(worker, 5000, &error);
+    if (!authenticated_worker) {
+        DWORD child_exit_code = STILL_ACTIVE;
+        (void)GetExitCodeProcess(worker_process, &child_exit_code);
+        std::fprintf(stderr,
+                     "authenticate missing-ack worker pipe peer: %s "
+                     "(child exit code %lu)\n",
+                     error.c_str(), static_cast<unsigned long>(child_exit_code));
+    }
+    require(authenticated_worker,
+            "authenticate the exact child before requesting worker cleanup");
+
+    PortableHelperAuthorization authorization;
+    PortableHelperGrant grant;
+    constexpr uint32_t input_operations = static_cast<uint32_t>(
+        PortableHelperOperation::SendKeyboardInput);
+    require(authorization.BeginGrant(instance, connection, broker.session_id,
+                                     input_operations, &grant, &error),
+            "create a scoped input grant for the no-ack shutdown case");
+    PortableHelperSecret proof{};
+    PortableHelperProcessIdentity authenticated_peer;
+    require(make_portable_helper_worker_ready_proof(grant, &proof, &error) &&
+                channel->AuthenticatedPeer(&authenticated_peer, &error) &&
+                authorization.ConfirmWorkerReady(grant, worker,
+                                                  authenticated_peer, proof,
+                                                  &error),
+            "mark only the authenticated worker process ready for revocation");
+    SecureZeroMemory(proof.data(), proof.size());
+
+    bool external_release_called = false;
+    PortableHelperWorkerRevocationCallbacks callbacks;
+    require(make_win32_portable_helper_revocation_callbacks(
+                worker_process, channel,
+                [&](std::string*) {
+                  external_release_called = true;
+                  return true;
+                },
+                &callbacks, &error),
+            "bind Stop and input-release callbacks to the authenticated worker");
+    std::string release_error;
+    require(!callbacks.release_input(&release_error) &&
+                !external_release_called && !release_error.empty(),
+            "external input cleanup is blocked while the worker may still inject");
+    const bool revoked = revoke_portable_helper_worker(
+        authorization, callbacks, 1000, 5000, &error);
+    require(!revoked && !error.empty() &&
+                authorization.state() ==
+                    PortableHelperAuthorizationState::Revoked &&
+                external_release_called && channel == nullptr &&
+                WaitForSingleObject(worker_process, 0) == WAIT_OBJECT_0,
+            "missing Stop acknowledgement is reported, but input is released after confirmed worker exit");
+}
+
+void portable_helper_winlogon_token_fail_closed() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "winlogon-token policy test runs under an interactive parent");
+
+    PortableHelperInstanceId instance{};
+    require(secure_random(instance.data(), instance.size()),
+            "winlogon-token policy test generates a helper instance");
+    std::wstring staging_directory;
+    std::wstring staged_image;
+    require(portable_helper_staging_paths(instance, &staging_directory,
+                                           &staged_image, &error),
+            "derive a canonical staged helper path without creating files");
+    PortableHelperServiceSpec spec;
+    require(make_portable_helper_service_spec(instance, staged_image, parent,
+                                              &spec, &error),
+            "bind the test worker-token request to the interactive parent");
+
+    HANDLE token = nullptr;
+    error.clear();
+    const bool opened = open_portable_helper_session_worker_token(
+        spec, &token, &error);
+    if (token != nullptr) CloseHandle(token);
+    require(!opened && token == nullptr && !error.empty(),
+            "an interactive host process cannot obtain the Session 0 SYSTEM worker token");
+
+    PortableHelperGrant grant;
+    grant.instance_id = instance;
+    require(secure_random(grant.connection_id.data(), grant.connection_id.size()),
+            "worker launch policy test creates a scoped connection ID");
+    grant.generation = 1;
+    grant.windows_session_id = parent.session_id;
+    grant.operations = static_cast<uint32_t>(PortableHelperOperation::CaptureFrames);
+    HANDLE process = nullptr;
+    error.clear();
+    const bool launched = launch_portable_helper_session_worker_process(
+        spec, grant, &process, &error);
+    if (process != nullptr) {
+        TerminateProcess(process, ERROR_CANCELLED);
+        WaitForSingleObject(process, 5000);
+        CloseHandle(process);
+    }
+    require(!launched && process == nullptr && !error.empty(),
+            "an interactive host process cannot launch a SYSTEM desktop worker");
 }
 
 void portable_helper_session_worker_rejects_forged_ready() {
@@ -4044,7 +5096,10 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
-    if (argc >= 2 && std::string(argv[1]) == "--portable-helper-control-server")
+    if (argc >= 2 &&
+        (std::string(argv[1]) == "--portable-helper-control-server" ||
+         std::string(argv[1]) == "--portable-helper-worker-control-server" ||
+         std::string(argv[1]) == "--portable-helper-worker-no-release-control-server"))
         return portable_helper_control_server_child(argc, argv);
     if (argc >= 2 && std::string(argv[1]) == "--elevated-handoff") return elevation_child(argc, argv);
     if (argc >= 2 && std::string(argv[1]) == "--portable-helper-pipe-client")
@@ -4058,6 +5113,9 @@ int main(int argc, char** argv) {
     if (argc >= 2 &&
         std::string(argv[1]) == "--portable-helper-session-worker-bad-ready-client")
         return portable_helper_pipe_child(argc, argv);
+    if (argc >= 2 &&
+        std::string(argv[1]) == "--portable-helper-session-worker-no-stop-ack-client")
+        return portable_helper_pipe_child(argc, argv);
     if (argc >= 2 && std::string(argv[1]) == "--portable-helper-auth-client")
         return portable_helper_pipe_child(argc, argv);
     if (argc >= 2 && std::string(argv[1]) == "--portable-helper-supervisor-client")
@@ -4068,15 +5126,25 @@ int main(int argc, char** argv) {
         catch (const std::exception& error) { ++failures; std::printf("FAIL %s\n", error.what()); }
     };
     if (argc == 2 && std::string(argv[1]) == "--portable-helper-authorization") {
+        run("portable helper worker command-line validation",
+            portable_helper_worker_command_line);
         run("portable helper generation-scoped authorization", portable_helper_authorization);
         run("portable helper bounded worker revocation supervision",
             portable_helper_worker_supervision);
         run("portable helper authenticated SCM control-channel loop",
             portable_helper_service_channel_transport);
+        run("portable helper service session-worker control loop",
+            portable_helper_service_session_worker_control_loop);
+        run("portable helper requires emergency input release",
+            portable_helper_service_requires_emergency_input_release);
         run("portable helper per-session worker pipe isolation",
             portable_helper_session_worker_pipe);
         run("portable helper session-worker launch and ready handshake",
             portable_helper_session_worker_handshake);
+        run("portable helper releases input after worker exit without Stop acknowledgement",
+            portable_helper_supervisor_releases_input_after_worker_exit_without_ack);
+        run("portable helper winlogon token launch policy",
+            portable_helper_winlogon_token_fail_closed);
         run("portable helper session-worker startup fail-closed paths",
             portable_helper_session_worker_rejects_forged_ready);
         run("portable helper authenticated grant and WorkerReady exchange",
@@ -4086,15 +5154,25 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--elevation") {
         run("portable helper protocol framing and replay protection", portable_helper_protocol);
+        run("portable helper worker command-line validation",
+            portable_helper_worker_command_line);
         run("portable helper generation-scoped authorization", portable_helper_authorization);
         run("portable helper bounded worker revocation supervision",
             portable_helper_worker_supervision);
         run("portable helper authenticated SCM control-channel loop",
             portable_helper_service_channel_transport);
+        run("portable helper service session-worker control loop",
+            portable_helper_service_session_worker_control_loop);
+        run("portable helper requires emergency input release",
+            portable_helper_service_requires_emergency_input_release);
         run("portable helper per-session worker pipe isolation",
             portable_helper_session_worker_pipe);
         run("portable helper session-worker launch and ready handshake",
             portable_helper_session_worker_handshake);
+        run("portable helper releases input after worker exit without Stop acknowledgement",
+            portable_helper_supervisor_releases_input_after_worker_exit_without_ack);
+        run("portable helper winlogon token launch policy",
+            portable_helper_winlogon_token_fail_closed);
         run("portable helper session-worker startup fail-closed paths",
             portable_helper_session_worker_rejects_forged_ready);
         run("portable helper authenticated grant and WorkerReady exchange",

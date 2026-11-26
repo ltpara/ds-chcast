@@ -13,6 +13,7 @@
 #include "portable_helper_lifecycle.h"
 #include "portable_helper_recovery.h"
 #include "portable_helper_service_channel.h"
+#include "portable_helper_service_worker.h"
 
 namespace chast::host {
 namespace {
@@ -198,6 +199,7 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
   }
 
   if (exit_code == ERROR_SUCCESS) {
+    PortableHelperServiceSessionWorker session_worker(spec);
     const bool channel_ok = run_portable_helper_service_control_channel(
         std::move(control_channel), spec.parent, parent, stop_event,
         [stop_event] {
@@ -206,8 +208,21 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
             (void)set_service_status_locked(SERVICE_STOP_PENDING);
           if (g_stop_event != nullptr) SetEvent(stop_event);
         },
-        &detail);
+        &detail,
+        [&session_worker](PortableHelperPipe& pipe,
+                          const PortableHelperMessage& request,
+                          bool* stop_service, std::string* handler_error) {
+          return session_worker.HandleControlRequest(
+              pipe, request, stop_service, handler_error);
+        });
+    std::string worker_cleanup_error;
+    const bool workers_cleaned =
+        session_worker.Shutdown(&worker_cleanup_error);
     exit_code = channel_ok ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+    if (!workers_cleaned) {
+      if (detail.empty()) detail = worker_cleanup_error;
+      exit_code = ERROR_PROCESS_ABORTED;
+    }
   } else if (control_channel) {
     control_channel.reset();
   }

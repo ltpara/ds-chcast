@@ -93,6 +93,14 @@ bool make_portable_helper_worker_ready_proof(
 bool send_portable_helper_grant(PortableHelperPipe& pipe,
                                const PortableHelperGrant& grant,
                                uint32_t timeout_ms, std::string* error);
+bool make_portable_helper_session_worker_start_request(
+    const PortableHelperGrant& grant, uint64_t request_id,
+    PortableHelperMessage* request, std::string* error);
+bool parse_portable_helper_session_worker_start_request(
+    const PortableHelperMessage& request,
+    const PortableHelperInstanceId& expected_instance,
+    uint32_t expected_session, PortableHelperGrant* grant,
+    std::string* error);
 bool receive_portable_helper_grant(PortableHelperPipe& pipe,
                                    PortableHelperGrant* grant,
                                    uint32_t timeout_ms, std::string* error);
@@ -104,7 +112,8 @@ bool receive_portable_helper_worker_ready(
     PortableHelperPipe& pipe, PortableHelperAuthorization& authorization,
     const PortableHelperGrant& grant,
     const PortableHelperProcessIdentity& expected_worker,
-    uint32_t timeout_ms, std::string* error);
+    uint32_t timeout_ms, std::string* error,
+    PortableHelperSecret* worker_ready_proof = nullptr);
 
 class PortableHelperAuthorization final {
  public:
@@ -140,6 +149,28 @@ class PortableHelperAuthorization final {
                   const PortableHelperConnectionId& connection_id,
                   uint32_t windows_session_id, uint32_t operations,
                   PortableHelperGrant* grant, std::string* error);
+
+  // Worker-side initialization after receiving a grant over an authenticated
+  // per-connection helper pipe. This does not issue a capability or prove the
+  // pipe peer; callers must authenticate the Session 0 helper first and send
+  // WorkerReady only after the worker is prepared to enforce this local gate.
+  bool AcceptWorkerGrant(const PortableHelperGrant& grant,
+                         uint32_t actual_windows_session_id,
+                         std::string* error);
+
+  // Imports a capability from the exact authenticated local parent/service
+  // control channel. The caller must establish explicit local consent before
+  // sending it; a remote request alone is never sufficient.
+  bool AcceptParentAuthorizedGrant(const PortableHelperGrant& grant,
+                                   uint32_t expected_windows_session_id,
+                                   std::string* error);
+
+  // The parent uses this only after a successful correlated Start response and
+  // WorkerReady proof over its authenticated helper-service control pipe.
+  // The service attests that it authenticated the actual worker identity.
+  bool ConfirmBrokerManagedWorkerReady(
+      const PortableHelperGrant& grant,
+      const PortableHelperSecret& proof, std::string* error);
 
   // WorkerReady is accepted only for the exact expected desktop worker, whose
   // Windows session must equal the grant's target session, and a valid
