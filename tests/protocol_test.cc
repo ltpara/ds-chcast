@@ -71,7 +71,8 @@ void test_elevation() {
     check(!parse_elevation_request(bytes, id, &error), "elevation request rejects trailing bytes");
     for (const auto code : {ElevationCode::Available, ElevationCode::Elevated, ElevationCode::Pending,
                             ElevationCode::Restarting, ElevationCode::Cancelled, ElevationCode::Denied,
-                            ElevationCode::Busy, ElevationCode::Failed}) {
+                            ElevationCode::Busy, ElevationCode::Failed,
+                            ElevationCode::HelperReady}) {
         bytes = payload_of(make_elevation_state({0, code, {}}));
         check(parse_elevation_state(bytes, state, &error) && state.request_id == 0 && state.code == code,
               "unsolicited elevation state allows an empty reason");

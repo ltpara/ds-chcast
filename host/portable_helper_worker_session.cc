@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "portable_helper_recovery.h"
+#include "portable_helper_input_cleanup.h"
 #include "portable_helper_staging.h"
 
 namespace chast::host {
@@ -214,6 +215,16 @@ class Handle final {
   }
   Handle(const Handle&) = delete;
   Handle& operator=(const Handle&) = delete;
+  Handle(Handle&& other) noexcept
+      : value_(std::exchange(other.value_, nullptr)) {}
+  Handle& operator=(Handle&& other) noexcept {
+    if (this != &other) {
+      if (value_ != nullptr && value_ != INVALID_HANDLE_VALUE)
+        CloseHandle(value_);
+      value_ = std::exchange(other.value_, nullptr);
+    }
+    return *this;
+  }
   HANDLE get() const { return value_; }
   HANDLE* put() {
     if (value_ != nullptr && value_ != INVALID_HANDLE_VALUE)
@@ -684,6 +695,198 @@ bool connect_portable_helper_session_worker_pipe(
   return true;
 }
 
+bool parse_portable_helper_input_cleanup_command_line(
+    const std::vector<std::wstring>& arguments,
+    PortableHelperInputCleanupLaunchArguments* parsed,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (parsed == nullptr)
+    return fail(error, "missing portable helper cleanup argument output");
+  *parsed = {};
+  if (arguments.size() != 12 || arguments[0].empty() ||
+      arguments[1] != L"--portable-helper-cleanup-worker" ||
+      arguments[2] != L"--portable-helper-instance" ||
+      arguments[4] != L"--portable-helper-connection" ||
+      arguments[6] != L"--portable-helper-generation" ||
+      arguments[8] != L"--portable-helper-broker-pid" ||
+      arguments[10] != L"--portable-helper-broker-created")
+    return fail(error, "portable helper cleanup command line is not canonical");
+
+  PortableHelperInputCleanupLaunchArguments candidate;
+  uint64_t broker_pid = 0;
+  if (!parse_nonzero_hex_id(arguments[3], &candidate.instance_id) ||
+      !parse_nonzero_hex_id(arguments[5], &candidate.connection_id) ||
+      !parse_canonical_decimal(arguments[7], &candidate.generation) ||
+      !parse_canonical_decimal(arguments[9], &broker_pid) ||
+      broker_pid > std::numeric_limits<uint32_t>::max() ||
+      !parse_canonical_decimal(arguments[11], &candidate.broker_creation_time))
+    return fail(error, "portable helper cleanup command line has an invalid identity");
+
+  candidate.broker_process_id = static_cast<uint32_t>(broker_pid);
+  *parsed = candidate;
+  return true;
+}
+
+bool validate_portable_helper_input_cleanup_process_identity(
+    const PortableHelperInputCleanupLaunchArguments& arguments,
+    PortableHelperServiceSpec* recorded_spec,
+    PortableHelperProcessIdentity* worker_identity,
+    PortableHelperProcessIdentity* broker_identity, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (recorded_spec == nullptr || worker_identity == nullptr ||
+      broker_identity == nullptr || arguments.generation == 0)
+    return fail(error, "portable helper cleanup identity outputs or generation are invalid");
+  *recorded_spec = {};
+  *worker_identity = {};
+  *broker_identity = {};
+
+  PortableHelperSessionWorkerLaunchArguments base;
+  base.instance_id = arguments.instance_id;
+  base.connection_id = arguments.connection_id;
+  base.broker_process_id = arguments.broker_process_id;
+  base.broker_creation_time = arguments.broker_creation_time;
+  if (!validate_portable_helper_session_worker_process_identity(
+          base, worker_identity, broker_identity, error))
+    return false;
+
+  PortableHelperServiceSpec recovery;
+  if (!read_portable_helper_recovery_record_for_instance(
+          arguments.instance_id, &recovery, error) ||
+      recovery.instance_id != arguments.instance_id ||
+      recovery.parent.session_id != worker_identity->session_id ||
+      _wcsicmp(recovery.executable_path.c_str(),
+               worker_identity->image_path.c_str()) != 0)
+    return fail(error, "cleanup worker does not match its protected recovery record");
+
+  Handle user_token;
+  if (!WTSQueryUserToken(recovery.parent.session_id, user_token.put()) ||
+      !interactive_token_matches(user_token.get(), recovery.parent, error))
+    return fail(error, "authorized interactive session changed before input cleanup");
+
+  *recorded_spec = std::move(recovery);
+  return true;
+}
+
+bool connect_portable_helper_input_cleanup_pipe(
+    const PortableHelperInputCleanupLaunchArguments& arguments,
+    const PortableHelperProcessIdentity& broker_identity,
+    uint32_t timeout_ms, std::unique_ptr<PortableHelperPipe>* channel,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (channel == nullptr || *channel != nullptr ||
+      arguments.generation == 0 ||
+      broker_identity.process_id != arguments.broker_process_id ||
+      broker_identity.creation_time != arguments.broker_creation_time ||
+      broker_identity.session_id != 0 ||
+      _wcsicmp(broker_identity.user_sid.c_str(), L"S-1-5-18") != 0 ||
+      broker_identity.image_path.empty() || broker_identity.logon_sid.empty())
+    return fail(error, "portable helper cleanup pipe scope is invalid");
+  auto connected = PortableHelperPipe::ConnectInputCleanupClient(
+      arguments.instance_id, arguments.connection_id, arguments.generation,
+      broker_identity, timeout_ms, error);
+  if (!connected) return false;
+  *channel = std::move(connected);
+  return true;
+}
+
+bool make_portable_helper_input_cleanup_request(
+    const PortableHelperInputJournalScope& scope, uint64_t request_id,
+    PortableHelperMessage* request, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (request == nullptr || request_id == 0 || scope.generation == 0 ||
+      scope.windows_session_id == 0 || !nonzero(scope.instance_id) ||
+      !nonzero(scope.connection_id) || request_id != scope.generation)
+    return fail(error, "portable helper input cleanup request scope is invalid");
+  PortableHelperMessage message;
+  message.type = PortableHelperMessageType::InputCleanupExecute;
+  message.instance_id = scope.instance_id;
+  message.request_id = request_id;
+  message.payload.insert(message.payload.end(), scope.connection_id.begin(),
+                         scope.connection_id.end());
+  append_u32(message.payload, scope.windows_session_id);
+  append_u64(message.payload, scope.generation);
+  *request = std::move(message);
+  return true;
+}
+
+bool validate_portable_helper_input_cleanup_request(
+    const PortableHelperMessage& request,
+    const PortableHelperInputJournalScope& expected_scope,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  constexpr size_t kPayloadBytes = 16 + 4 + 8;
+  if (request.type != PortableHelperMessageType::InputCleanupExecute ||
+      request.instance_id != expected_scope.instance_id ||
+      request.request_id == 0 || request.request_id != expected_scope.generation ||
+      request.payload.size() != kPayloadBytes || expected_scope.generation == 0 ||
+      expected_scope.windows_session_id == 0 ||
+      !nonzero(expected_scope.instance_id) || !nonzero(expected_scope.connection_id) ||
+      !std::equal(expected_scope.connection_id.begin(),
+                  expected_scope.connection_id.end(), request.payload.begin()) ||
+      read_u32(request.payload, 16) != expected_scope.windows_session_id ||
+      read_u64(request.payload, 20) != expected_scope.generation)
+    return fail(error, "portable helper input cleanup request does not match its journal scope");
+  return true;
+}
+
+bool run_portable_helper_input_cleanup_worker(
+    PortableHelperPipe& channel,
+    const PortableHelperInputCleanupLaunchArguments& arguments,
+    const PortableHelperProcessIdentity& expected_broker,
+    const PortableHelperProcessIdentity& expected_worker,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  PortableHelperProcessIdentity actual_worker, actual_broker;
+  if (!current_portable_helper_process_identity(&actual_worker, error) ||
+      !exact_identity(actual_worker, expected_worker) ||
+      !channel.AuthenticatedPeer(&actual_broker, error) ||
+      !exact_identity(actual_broker, expected_broker) ||
+      expected_worker.session_id == 0 ||
+      expected_worker.process_id != GetCurrentProcessId() ||
+      expected_broker.process_id != arguments.broker_process_id ||
+      expected_broker.creation_time != arguments.broker_creation_time)
+    return fail(error, "input cleanup worker pipe peer identity changed");
+
+  PortableHelperInputJournalScope scope;
+  scope.instance_id = arguments.instance_id;
+  scope.connection_id = arguments.connection_id;
+  scope.windows_session_id = expected_worker.session_id;
+  scope.generation = arguments.generation;
+  PortableHelperMessage request;
+  if (!channel.Receive(&request, 10000, error) ||
+      !validate_portable_helper_input_cleanup_request(request, scope, error))
+    return false;
+
+  auto store = PortableHelperInputJournalFileStore::OpenForInstance(scope, error);
+  if (!store) return false;
+  const bool recovered = recover_portable_helper_input_journal(
+      scope, *store,
+      [](const PortableHelperInputJournalScope& executor_scope,
+         const PortableHelperInputJournalImage& image,
+         std::string* executor_error) {
+        PortableHelperInputCleanupPlan plan;
+        return make_portable_helper_input_cleanup_plan(
+                   executor_scope, image, &plan, executor_error) &&
+            execute_portable_helper_input_cleanup_plan(plan, executor_error);
+      }, error);
+
+  PortableHelperMessage response;
+  response.type = PortableHelperMessageType::Acknowledgement;
+  response.request_id = request.request_id;
+  response.payload = {static_cast<uint8_t>(recovered ? 1 : 0)};
+  std::string send_error;
+  const bool acknowledged = channel.Send(std::move(response), 3000, &send_error);
+  if (!recovered)
+    return fail(error, error != nullptr && !error->empty()
+                           ? *error
+                           : "input cleanup worker could not release its journal state");
+  if (!acknowledged)
+    return fail(error, send_error.empty()
+                           ? "input cleanup completed but its acknowledgement was lost"
+                           : send_error);
+  return true;
+}
+
 bool accept_portable_helper_session_worker_grant(
     PortableHelperPipe& channel,
     const PortableHelperSessionWorkerLaunchArguments& arguments,
@@ -870,9 +1073,9 @@ bool receive_portable_helper_captured_frame(
       grant, request_id, chunks, frame, error);
 }
 
-bool open_portable_helper_session_worker_token(
+static bool open_portable_helper_target_session_token(
     const PortableHelperServiceSpec& spec, HANDLE* primary_token,
-    std::string* error) {
+    bool require_live_parent, std::string* error) {
   if (error != nullptr) error->clear();
   if (primary_token == nullptr || *primary_token != nullptr)
     return fail(error, "session worker token output must be empty");
@@ -899,27 +1102,30 @@ bool open_portable_helper_session_worker_token(
       _wcsicmp(helper.image_path.c_str(), spec.executable_path.c_str()) != 0)
     return fail(error, "session worker tokens are available only to this staged Session 0 SYSTEM helper");
 
-  PortableHelperProcessIdentity parent;
-  if (!query_portable_helper_process_identity(spec.parent.process_id, &parent,
-                                               error) ||
-      !exact_identity(parent, spec.parent))
-    return fail(error, "authorized parent identity changed before worker launch");
-  Handle parent_process(OpenProcess(
-      SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
-      spec.parent.process_id));
-  if (parent_process.get() == nullptr)
-    return fail(error, win32_error("authorized parent is not live",
-                                   GetLastError()));
+  Handle parent_process;
   DWORD process_error = ERROR_SUCCESS;
-  if (GetProcessId(parent_process.get()) != spec.parent.process_id ||
-      !process_is_live(parent_process.get(), &process_error))
-    return fail(error, win32_error("authorized parent is not live",
-                                   process_error));
-  uint64_t parent_creation_time = 0;
-  if (!process_creation_time(parent_process.get(), &parent_creation_time,
-                             &process_error) ||
-      parent_creation_time != spec.parent.creation_time)
-    return fail(error, "authorized parent process creation time changed");
+  if (require_live_parent) {
+    PortableHelperProcessIdentity parent;
+    if (!query_portable_helper_process_identity(spec.parent.process_id,
+                                                 &parent, error) ||
+        !exact_identity(parent, spec.parent))
+      return fail(error, "authorized parent identity changed before worker launch");
+    parent_process = Handle(OpenProcess(
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+        spec.parent.process_id));
+    if (parent_process.get() == nullptr)
+      return fail(error, win32_error("authorized parent is not live",
+                                     GetLastError()));
+    if (GetProcessId(parent_process.get()) != spec.parent.process_id ||
+        !process_is_live(parent_process.get(), &process_error))
+      return fail(error, win32_error("authorized parent is not live",
+                                     process_error));
+    uint64_t parent_creation_time = 0;
+    if (!process_creation_time(parent_process.get(), &parent_creation_time,
+                               &process_error) ||
+        parent_creation_time != spec.parent.creation_time)
+      return fail(error, "authorized parent process creation time changed");
+  }
 
   Handle interactive_user_token;
   if (!WTSQueryUserToken(spec.parent.session_id,
@@ -993,21 +1199,34 @@ bool open_portable_helper_session_worker_token(
   Handle final_user_token;
   if (!WTSQueryUserToken(spec.parent.session_id, final_user_token.put()) ||
       !interactive_token_matches(final_user_token.get(), spec.parent, error) ||
-      !process_is_live(parent_process.get(), &process_error) ||
+      (require_live_parent &&
+       !process_is_live(parent_process.get(), &process_error)) ||
       !process_is_live(winlogon_process.get(), &process_error))
-    return fail(error, "authorized session changed while preparing the worker token");
+    return fail(error, "authorized session changed while preparing the target-session token");
 
   *primary_token = duplicate.release();
   return true;
 }
 
-bool launch_portable_helper_session_worker_process(
-    const PortableHelperServiceSpec& spec, const PortableHelperGrant& grant,
+bool open_portable_helper_session_worker_token(
+    const PortableHelperServiceSpec& spec, HANDLE* primary_token,
+    std::string* error) {
+  return open_portable_helper_target_session_token(
+      spec, primary_token, true, error);
+}
+
+static bool launch_portable_helper_target_session_process(
+    const PortableHelperServiceSpec& spec,
+    const PortableHelperConnectionId& connection_id,
+    uint64_t generation, bool cleanup_mode,
     HANDLE* worker_process, std::string* error) {
   if (error != nullptr) error->clear();
   if (worker_process == nullptr || *worker_process != nullptr)
-    return fail(error, "session worker process output must be empty");
-  if (!worker_grant_matches_spec(spec, grant, error)) return false;
+    return fail(error, "target-session process output must be empty");
+  if (std::all_of(connection_id.begin(), connection_id.end(),
+                  [](uint8_t byte) { return byte == 0; }) ||
+      spec.parent.session_id == 0 || (cleanup_mode && generation == 0))
+    return fail(error, "target-session process scope is incomplete");
 
   PortableHelperServiceSpec canonical;
   if (!make_portable_helper_service_spec(spec.instance_id,
@@ -1018,7 +1237,7 @@ bool launch_portable_helper_session_worker_process(
                spec.staging_directory.c_str()) != 0 ||
       _wcsicmp(canonical.executable_path.c_str(),
                spec.executable_path.c_str()) != 0)
-    return fail(error, "portable helper worker launch spec is not canonical");
+    return fail(error, "portable helper target-session launch spec is not canonical");
 
   PortableHelperServiceSpec recorded;
   if (!read_portable_helper_recovery_record(spec, &recorded, error) ||
@@ -1031,14 +1250,14 @@ bool launch_portable_helper_session_worker_process(
       recorded.parent.user_sid != spec.parent.user_sid ||
       recorded.parent.logon_sid != spec.parent.logon_sid ||
       _wcsicmp(recorded.executable_path.c_str(), spec.executable_path.c_str()) != 0)
-    return fail(error, "session worker launch does not match its protected recovery record");
+    return fail(error, "target-session launch does not match its protected recovery record");
 
   PortableHelperProcessIdentity helper;
   if (!current_portable_helper_process_identity(&helper, error) ||
       helper.session_id != 0 ||
       _wcsicmp(helper.user_sid.c_str(), L"S-1-5-18") != 0 ||
       _wcsicmp(helper.image_path.c_str(), spec.executable_path.c_str()) != 0)
-    return fail(error, "session worker launch is restricted to its staged Session 0 SYSTEM helper");
+    return fail(error, "target-session launch is restricted to its staged Session 0 SYSTEM helper");
   DWORD process_error = ERROR_SUCCESS;
   Handle helper_process(OpenProcess(
       SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
@@ -1056,20 +1275,24 @@ bool launch_portable_helper_session_worker_process(
     return false;
 
   HANDLE primary_token = nullptr;
-  if (!open_portable_helper_session_worker_token(spec, &primary_token, error))
+  if (!open_portable_helper_target_session_token(
+          spec, &primary_token, !cleanup_mode, error))
     return false;
   Handle token(primary_token);
 
-  Handle authorized_parent(OpenProcess(
-      SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
-      spec.parent.process_id));
-  if (authorized_parent.get() == nullptr ||
-      !same_live_process(authorized_parent.get(), spec.parent.process_id,
-                         spec.parent.creation_time, &process_error))
-    return fail(error, win32_error("authorized helper parent is not live",
-                                   authorized_parent.get() == nullptr
-                                       ? GetLastError()
-                                       : process_error));
+  Handle authorized_parent;
+  if (!cleanup_mode) {
+    authorized_parent = Handle(OpenProcess(
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+        spec.parent.process_id));
+    if (authorized_parent.get() == nullptr ||
+        !same_live_process(authorized_parent.get(), spec.parent.process_id,
+                           spec.parent.creation_time, &process_error))
+      return fail(error, win32_error("authorized helper parent is not live",
+                                     authorized_parent.get() == nullptr
+                                         ? GetLastError()
+                                         : process_error));
+  }
 
   LPVOID environment = nullptr;
   if (!CreateEnvironmentBlock(&environment, token.get(), FALSE))
@@ -1077,10 +1300,16 @@ bool launch_portable_helper_session_worker_process(
                                    GetLastError()));
 
   std::wstring command = quote_command_line_argument(spec.executable_path);
-  command.append(L" --portable-helper-worker --portable-helper-instance ");
+  command.append(cleanup_mode
+      ? L" --portable-helper-cleanup-worker --portable-helper-instance "
+      : L" --portable-helper-worker --portable-helper-instance ");
   command.append(hex_id(spec.instance_id));
   command.append(L" --portable-helper-connection ");
-  command.append(hex_id(grant.connection_id));
+  command.append(hex_id(connection_id));
+  if (cleanup_mode) {
+    command.append(L" --portable-helper-generation ");
+    command.append(std::to_wstring(generation));
+  }
   command.append(L" --portable-helper-broker-pid ");
   command.append(std::to_wstring(helper.process_id));
   command.append(L" --portable-helper-broker-created ");
@@ -1102,7 +1331,7 @@ bool launch_portable_helper_session_worker_process(
   const DWORD create_error = started ? ERROR_SUCCESS : GetLastError();
   DestroyEnvironmentBlock(environment);
   if (!started)
-    return fail(error, win32_error("cannot create the authorized session worker",
+    return fail(error, win32_error("cannot create the authorized target-session process",
                                    create_error));
 
   LaunchedProcess child(created.hProcess, worker_process);
@@ -1118,18 +1347,19 @@ bool launch_portable_helper_session_worker_process(
 
   PortableHelperProcessIdentity worker_identity;
   if (!validate_launched_worker(child.get(), spec.executable_path,
-                                grant.windows_session_id, &worker_identity,
+                                spec.parent.session_id, &worker_identity,
                                 error)) {
     const std::string identity_error = error == nullptr || error->empty()
-        ? "launched session worker identity validation failed"
+        ? "launched target-session process identity validation failed"
         : *error;
     return fail_and_reap(identity_error);
   }
   if (!session_user_still_matches(spec, error) ||
       !same_live_process(helper_process.get(), helper.process_id,
                          helper.creation_time, &process_error) ||
-      !same_live_process(authorized_parent.get(), spec.parent.process_id,
-                         spec.parent.creation_time, &process_error) ||
+      (!cleanup_mode &&
+       !same_live_process(authorized_parent.get(), spec.parent.process_id,
+                          spec.parent.creation_time, &process_error)) ||
       GetProcessId(helper_process.get()) != helper.process_id)
     return fail_and_reap(error != nullptr && !error->empty()
         ? *error
@@ -1138,16 +1368,17 @@ bool launch_portable_helper_session_worker_process(
 
   const DWORD previous_suspend_count = ResumeThread(initial_thread.get());
   if (previous_suspend_count == static_cast<DWORD>(-1))
-    return fail_and_reap(win32_error("cannot resume the session worker",
+    return fail_and_reap(win32_error("cannot resume the target-session process",
                                      GetLastError()));
   if (previous_suspend_count != 1)
-    return fail_and_reap("session worker initial thread suspend count changed unexpectedly");
+    return fail_and_reap("target-session process initial thread suspend count changed unexpectedly");
 
   if (!session_user_still_matches(spec, error) ||
       !same_live_process(helper_process.get(), helper.process_id,
                          helper.creation_time, &process_error) ||
-      !same_live_process(authorized_parent.get(), spec.parent.process_id,
-                         spec.parent.creation_time, &process_error) ||
+      (!cleanup_mode &&
+       !same_live_process(authorized_parent.get(), spec.parent.process_id,
+                          spec.parent.creation_time, &process_error)) ||
       !process_is_live(child.get(), &process_error))
     return fail_and_reap(error != nullptr && !error->empty()
         ? *error
@@ -1155,6 +1386,128 @@ bool launch_portable_helper_session_worker_process(
                        process_error));
 
   *worker_process = child.release();
+  return true;
+}
+
+bool launch_portable_helper_session_worker_process(
+    const PortableHelperServiceSpec& spec, const PortableHelperGrant& grant,
+    HANDLE* worker_process, std::string* error) {
+  if (!worker_grant_matches_spec(spec, grant, error)) return false;
+  return launch_portable_helper_target_session_process(
+      spec, grant.connection_id, 0, false, worker_process, error);
+}
+
+bool launch_portable_helper_input_cleanup_process(
+    const PortableHelperServiceSpec& spec,
+    const PortableHelperInputJournalScope& scope,
+    HANDLE* worker_process, std::string* error) {
+  if (scope.instance_id != spec.instance_id ||
+      scope.windows_session_id != spec.parent.session_id ||
+      scope.generation == 0 ||
+      std::all_of(scope.connection_id.begin(), scope.connection_id.end(),
+                  [](uint8_t byte) { return byte == 0; }))
+    return fail(error, "input cleanup worker scope does not match its helper instance");
+  return launch_portable_helper_target_session_process(
+      spec, scope.connection_id, scope.generation, true, worker_process, error);
+}
+
+bool execute_portable_helper_authenticated_input_cleanup(
+    const PortableHelperServiceSpec& spec,
+    const PortableHelperInputJournalScope& scope, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (scope.instance_id != spec.instance_id ||
+      scope.windows_session_id != spec.parent.session_id ||
+      scope.generation == 0 || spec.parent.logon_sid.empty() ||
+      std::all_of(scope.connection_id.begin(), scope.connection_id.end(),
+                  [](uint8_t byte) { return byte == 0; }))
+    return fail(error, "authenticated input cleanup scope is not bound to this helper session");
+
+  auto channel = PortableHelperPipe::CreateInputCleanupServer(
+      scope.instance_id, scope.connection_id, scope.generation,
+      spec.parent.logon_sid, error);
+  if (!channel) return false;
+
+  HANDLE process = nullptr;
+  if (!launch_portable_helper_input_cleanup_process(spec, scope, &process,
+                                                   error))
+    return false;
+  Handle process_handle(process);
+  const auto terminate_child = [&] {
+    const DWORD state = WaitForSingleObject(process_handle.get(), 0);
+    if (state == WAIT_OBJECT_0) return true;
+    if (state != WAIT_TIMEOUT) return false;
+    if (!TerminateProcess(process_handle.get(), ERROR_CANCELLED) &&
+        WaitForSingleObject(process_handle.get(), 0) != WAIT_OBJECT_0)
+      return false;
+    return WaitForSingleObject(process_handle.get(), 5000) == WAIT_OBJECT_0;
+  };
+
+  const DWORD process_id = GetProcessId(process_handle.get());
+  PortableHelperProcessIdentity worker_identity;
+  FILETIME process_created{}, process_exited{}, process_kernel{}, process_user{};
+  const bool process_handle_matches = process_id != 0 &&
+      GetProcessTimes(process_handle.get(), &process_created, &process_exited,
+                      &process_kernel, &process_user) != FALSE;
+  const uint64_t handle_creation_time = process_handle_matches
+      ? ((static_cast<uint64_t>(process_created.dwHighDateTime) << 32) |
+         process_created.dwLowDateTime)
+      : 0;
+  if (process_id == 0 ||
+      !process_handle_matches ||
+      !query_portable_helper_process_identity(process_id, &worker_identity,
+                                               error) ||
+      worker_identity.process_id != process_id ||
+      worker_identity.creation_time != handle_creation_time ||
+      worker_identity.session_id != scope.windows_session_id ||
+      _wcsicmp(worker_identity.user_sid.c_str(), L"S-1-5-18") != 0 ||
+      _wcsicmp(worker_identity.image_path.c_str(),
+               spec.executable_path.c_str()) != 0 ||
+      worker_identity.creation_time == 0 ||
+      WaitForSingleObject(process_handle.get(), 0) != WAIT_TIMEOUT ||
+      !channel->Accept(worker_identity, 10000, error)) {
+    const std::string primary = error == nullptr ? std::string{} : *error;
+    if (!terminate_child())
+      return fail(error, primary + "; cleanup worker exit could not be confirmed");
+    return fail(error, primary.empty()
+                           ? "cleanup worker failed peer authentication"
+                           : primary);
+  }
+
+  PortableHelperMessage request;
+  if (!make_portable_helper_input_cleanup_request(scope, scope.generation,
+                                                   &request, error) ||
+      !channel->Send(std::move(request), 3000, error)) {
+    const std::string primary = error == nullptr ? std::string{} : *error;
+    if (!terminate_child())
+      return fail(error, primary + "; cleanup worker exit could not be confirmed");
+    return false;
+  }
+
+  PortableHelperMessage acknowledgement;
+  if (!channel->Receive(&acknowledgement, 15000, error) ||
+      acknowledgement.type != PortableHelperMessageType::Acknowledgement ||
+      acknowledgement.request_id != scope.generation ||
+      acknowledgement.payload != std::vector<uint8_t>{1}) {
+    const std::string primary = error == nullptr ? std::string{} : *error;
+    (void)terminate_child();
+    return fail(error, primary.empty()
+                           ? "cleanup worker did not confirm durable input release"
+                           : primary);
+  }
+
+  DWORD exited = WaitForSingleObject(process_handle.get(), 5000);
+  if (exited == WAIT_TIMEOUT) {
+    if (!terminate_child())
+      return fail(error, "cleanup worker acknowledged release but did not exit");
+    return true;
+  }
+  if (exited != WAIT_OBJECT_0)
+    return fail(error, win32_error("cannot confirm cleanup worker exit",
+                                   GetLastError()));
+  DWORD child_exit_code = ERROR_GEN_FAILURE;
+  if (!GetExitCodeProcess(process_handle.get(), &child_exit_code) ||
+      child_exit_code != ERROR_SUCCESS)
+    return fail(error, "cleanup worker returned an unsuccessful exit status");
   return true;
 }
 

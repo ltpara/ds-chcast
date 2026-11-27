@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 78.
+// The chast wire protocol, version 79.
 //
 // One QUIC connection carries:
 //
@@ -56,7 +56,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 78;
+inline constexpr uint16_t kProtocolVersion = 79;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -2259,6 +2259,9 @@ bool parse_screenshot_response(const std::vector<uint8_t>& payload,
 enum class ElevationCode : uint8_t {
     Unsupported = 0, Available = 1, Elevated = 2, Pending = 3,
     Restarting = 4, Cancelled = 5, Denied = 6, Busy = 7, Failed = 8,
+    // A per-viewer elevated helper is ready. The host process and other
+    // viewers stay connected; this is not the whole-host UAC handoff state.
+    HelperReady = 9,
 };
 struct ElevationState {
     uint32_t request_id = 0;

@@ -9,7 +9,9 @@
 #include <array>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "chast/machine_state_security.h"
@@ -107,6 +109,91 @@ std::wstring scope_stem(const PortableHelperInputJournalScope& scope) {
       hex_bytes(scope.connection_id) + suffix;
 }
 
+int lower_hex_value(wchar_t character) {
+  if (character >= L'0' && character <= L'9') return character - L'0';
+  if (character >= L'a' && character <= L'f') return character - L'a' + 10;
+  return -1;
+}
+
+template <size_t Size>
+bool parse_lower_hex(std::wstring_view text, std::array<uint8_t, Size>* value) {
+  if (value == nullptr || text.size() != Size * 2) return false;
+  value->fill(0);
+  for (size_t index = 0; index < Size; ++index) {
+    const int high = lower_hex_value(text[index * 2]);
+    const int low = lower_hex_value(text[index * 2 + 1]);
+    if (high < 0 || low < 0) return false;
+    (*value)[index] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+bool parse_lower_hex_number(std::wstring_view text, uint64_t* value) {
+  if (value == nullptr || text.empty()) return false;
+  uint64_t parsed = 0;
+  for (wchar_t character : text) {
+    const int digit = lower_hex_value(character);
+    if (digit < 0 || parsed >
+          (std::numeric_limits<uint64_t>::max() -
+           static_cast<uint64_t>(digit)) / 16)
+      return false;
+    parsed = parsed * 16 + static_cast<uint64_t>(digit);
+  }
+  *value = parsed;
+  return true;
+}
+
+struct JournalArtifacts final {
+  PortableHelperInputJournalScope scope;
+  bool record = false;
+  bool temporary = false;
+  bool lock = false;
+};
+
+bool parse_journal_artifact_name(
+    const std::wstring& name, const PortableHelperInstanceId& instance_id,
+    std::wstring* stem, std::wstring* extension,
+    PortableHelperInputJournalScope* scope) {
+  if (stem == nullptr || extension == nullptr || scope == nullptr) return false;
+  const std::wstring prefix = L"input-" + hex_bytes(instance_id) + L"-";
+  const size_t dot = name.rfind(L'.');
+  if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0 ||
+      dot == std::wstring::npos || dot + 1 >= name.size())
+    return false;
+  const std::wstring_view body(name.data() + prefix.size(), dot - prefix.size());
+  constexpr size_t kConnectionHex = 32;
+  constexpr size_t kSessionHex = 8;
+  constexpr size_t kGenerationHex = 16;
+  if (body.size() != kConnectionHex + 2 + kSessionHex + 2 + kGenerationHex ||
+      body.substr(kConnectionHex, 2) != L"-s" ||
+      body.substr(kConnectionHex + 2 + kSessionHex, 2) != L"-g")
+    return false;
+
+  PortableHelperInputJournalScope parsed;
+  parsed.instance_id = instance_id;
+  uint64_t session = 0;
+  if (!parse_lower_hex(body.substr(0, kConnectionHex), &parsed.connection_id) ||
+      !nonzero(parsed.connection_id) ||
+      !parse_lower_hex_number(body.substr(kConnectionHex + 2, kSessionHex),
+                              &session) ||
+      session == 0 || session > std::numeric_limits<uint32_t>::max() ||
+      !parse_lower_hex_number(
+          body.substr(kConnectionHex + 2 + kSessionHex + 2,
+                      kGenerationHex),
+          &parsed.generation) || parsed.generation == 0)
+    return false;
+  parsed.windows_session_id = static_cast<uint32_t>(session);
+
+  const std::wstring parsed_extension = name.substr(dot + 1);
+  if (parsed_extension != L"dat" && parsed_extension != L"tmp" &&
+      parsed_extension != L"lck")
+    return false;
+  *stem = name.substr(0, dot);
+  *extension = parsed_extension;
+  *scope = parsed;
+  return true;
+}
+
 bool state_equal(const PortableHelperInputJournalState& left,
                  const PortableHelperInputJournalState& right) {
   if (left.mouse_buttons != right.mouse_buttons ||
@@ -169,6 +256,7 @@ bool image_equal(const PortableHelperInputJournalImage& left,
       left.scope.connection_id == right.scope.connection_id &&
       left.scope.windows_session_id == right.scope.windows_session_id &&
       left.scope.generation == right.scope.generation &&
+      left.input_desktop_name == right.input_desktop_name &&
       left.last_sequence == right.last_sequence &&
       left.pending == right.pending &&
       left.released == right.released &&
@@ -184,20 +272,28 @@ bool legal_transition(const PortableHelperInputJournalImage& old_image,
   if (new_image.released) {
     return !new_image.pending &&
         new_image.last_sequence == old_image.last_sequence &&
+        new_image.input_desktop_name.empty() &&
         state_empty(new_image.committed) && state_empty(new_image.possible);
   }
   if (!old_image.pending && new_image.pending) {
     return new_image.last_sequence == old_image.last_sequence &&
         new_image.pending_sequence > old_image.last_sequence &&
         state_equal(new_image.committed, old_image.committed) &&
+        !new_image.input_desktop_name.empty() &&
+        (state_empty(old_image.committed) ||
+         old_image.input_desktop_name == new_image.input_desktop_name) &&
         state_is_superset(new_image.possible, old_image.committed);
   }
   if (old_image.pending && !new_image.pending) {
     const bool result_commit =
         new_image.last_sequence == old_image.pending_sequence &&
-        state_is_superset(old_image.possible, new_image.committed);
+        state_is_superset(old_image.possible, new_image.committed) &&
+        (state_empty(new_image.committed)
+             ? new_image.input_desktop_name.empty()
+             : new_image.input_desktop_name == old_image.input_desktop_name);
     const bool confirmed_release =
         new_image.last_sequence == old_image.last_sequence &&
+        new_image.input_desktop_name.empty() &&
         state_empty(new_image.committed) && state_empty(new_image.possible);
     return result_commit || confirmed_release;
   }
@@ -273,6 +369,14 @@ bool read_image_file(const std::wstring& path,
 }
 
 bool delete_regular_file(const std::wstring& path, std::string* error) {
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    const DWORD code = GetLastError();
+    if (path_missing_error(code)) return true;
+    return fail(error, win32_error("inspect stale journal temporary", code));
+  }
+  if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+    return fail(error, "refusing to delete a journal path that is not a regular file");
   if (!chast::machine_state_file_trusted(path, error)) return false;
   ScopedHandle file(CreateFileW(path.c_str(), DELETE | READ_CONTROL |
       FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -386,6 +490,119 @@ PortableHelperInputJournalFileStore::OpenForInstance(
           instance.parent_path().parent_path().wstring(), error))
     return nullptr;
   return OpenAtDirectory(scope, directory, error);
+}
+
+bool PortableHelperInputJournalFileStore::RemoveReleasedForInstance(
+    const PortableHelperInstanceId& instance_id, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (!nonzero(instance_id))
+    return fail(error, "input journal cleanup requires a nonzero instance ID");
+  std::wstring directory, executable;
+  if (!portable_helper_staging_paths(instance_id, &directory, &executable,
+                                     error))
+    return false;
+  const std::filesystem::path instance(directory);
+  if (!chast::machine_state_directory_trusted(directory, error) ||
+      !chast::machine_state_directory_trusted(
+          instance.parent_path().wstring(), error) ||
+      !chast::machine_state_directory_trusted(
+          instance.parent_path().parent_path().wstring(), error))
+    return false;
+  return RemoveReleasedAtDirectory(instance_id, directory, error);
+}
+
+bool PortableHelperInputJournalFileStore::RemoveReleasedAtDirectory(
+    const PortableHelperInstanceId& instance_id,
+    const std::wstring& directory, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (!nonzero(instance_id) ||
+      !chast::machine_state_directory_trusted(directory, error))
+    return fail(error, "input journal cleanup directory or instance is invalid");
+
+  const std::wstring pattern = (std::filesystem::path(directory) /
+      (L"input-" + hex_bytes(instance_id) + L"-*")).wstring();
+  WIN32_FIND_DATAW data{};
+  HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+  if (find == INVALID_HANDLE_VALUE) {
+    const DWORD code = GetLastError();
+    if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return true;
+    return fail(error, win32_error("enumerate input journal artifacts", code));
+  }
+
+  std::map<std::wstring, JournalArtifacts> artifacts;
+  bool enumerated = true;
+  do {
+    if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+      continue;
+    if ((data.dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+      enumerated = fail(error,
+          "input journal cleanup found a directory or reparse artifact");
+      break;
+    }
+    std::wstring stem, extension;
+    PortableHelperInputJournalScope scope;
+    if (!parse_journal_artifact_name(data.cFileName, instance_id, &stem,
+                                     &extension, &scope)) {
+      enumerated = fail(error,
+          "input journal cleanup found an unknown instance artifact");
+      break;
+    }
+    JournalArtifacts& entry = artifacts[stem];
+    if ((entry.record && extension == L"dat") ||
+        (entry.temporary && extension == L"tmp") ||
+        (entry.lock && extension == L"lck")) {
+      enumerated = fail(error, "input journal cleanup found a duplicate artifact");
+      break;
+    }
+    if (entry.scope.generation != 0 &&
+        (entry.scope.connection_id != scope.connection_id ||
+         entry.scope.windows_session_id != scope.windows_session_id ||
+         entry.scope.generation != scope.generation)) {
+      enumerated = fail(error, "input journal artifact scope is inconsistent");
+      break;
+    }
+    entry.scope = scope;
+    entry.record = entry.record || extension == L"dat";
+    entry.temporary = entry.temporary || extension == L"tmp";
+    entry.lock = entry.lock || extension == L"lck";
+  } while (FindNextFileW(find, &data));
+  const DWORD enumeration_error = GetLastError();
+  FindClose(find);
+  if (!enumerated) return false;
+  if (enumeration_error != ERROR_NO_MORE_FILES)
+    return fail(error, win32_error("finish enumerating input journal artifacts",
+                                   enumeration_error));
+
+  // First prove that every installed generation reached a durable terminal
+  // tombstone. Do not begin deleting any generation while one may still hold
+  // input, so a pending or malformed record keeps the complete instance intact.
+  for (const auto& [stem, entry] : artifacts) {
+    if (!entry.record) continue;
+    if (!entry.lock)
+      return fail(error, "input journal record has no protected lock artifact");
+    auto store = OpenAtDirectory(entry.scope, directory, error);
+    PortableHelperInputJournalImage image;
+    bool found = false;
+    if (!store || !store->Load(&image, &found, error) || !found ||
+        !image.released || image.pending || !state_empty(image.committed) ||
+        !state_empty(image.possible) || !image.input_desktop_name.empty())
+      return fail(error,
+          "input journal cleanup requires every installed record to be released");
+  }
+
+  // The service is already gone at this call site. Open handles still prevent
+  // deletion of the lock file, which makes a leftover live store fail closed.
+  for (const auto& [stem, entry] : artifacts) {
+    const auto path = [&](const wchar_t* extension) {
+      return (std::filesystem::path(directory) /
+          (stem + L"." + extension)).wstring();
+    };
+    if (entry.record && !delete_regular_file(path(L"dat"), error)) return false;
+    if (entry.temporary && !delete_regular_file(path(L"tmp"), error)) return false;
+    if (entry.lock && !delete_regular_file(path(L"lck"), error)) return false;
+  }
+  return true;
 }
 
 std::unique_ptr<PortableHelperInputJournalFileStore>
@@ -611,6 +828,13 @@ open_portable_helper_input_journal_file_store_for_test(
     const std::wstring& trusted_instance_directory, std::string* error) {
   return PortableHelperInputJournalFileStore::OpenAtDirectory(
       scope, trusted_instance_directory, error);
+}
+
+bool remove_released_portable_helper_input_journals_for_test(
+    const PortableHelperInstanceId& instance_id,
+    const std::wstring& trusted_instance_directory, std::string* error) {
+  return PortableHelperInputJournalFileStore::RemoveReleasedAtDirectory(
+      instance_id, trusted_instance_directory, error);
 }
 
 }  // namespace detail

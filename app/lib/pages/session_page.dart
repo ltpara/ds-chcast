@@ -2689,6 +2689,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             message = tr('提权失败：{reason}', <String, Object?>{
               'reason': status.elevationReason,
             });
+          case 9:
+            message = tr('主机已为此连接启动提权辅助会话');
         }
         if (message != null) {
           ScaffoldMessenger.of(
@@ -7439,6 +7441,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         elevationPending:
                             _status.elevationPending || _elevationSubmitting,
                         elevated: _status.elevationCode == 2,
+                        elevationHelperReady: _status.elevationCode == 9,
                         onElevation: () => unawaited(_requestElevation()),
                         onSessionSelect: () => unawaited(_openSessionDialog()),
                         remoteConfigAvailable: _status.remoteConfigSupported,

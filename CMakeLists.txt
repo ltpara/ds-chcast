@@ -363,8 +363,11 @@ add_library(chast.host.tray STATIC
     host/elevation_handoff.cc
     host/portable_helper_protocol.cc
     host/portable_helper_authorization.cc
+    host/portable_helper_manager_channel.cc
+    host/portable_helper_manager_task.cc
     host/portable_helper_input_journal.cc
     host/portable_helper_input_journal_store.cc
+    host/portable_helper_input_cleanup.cc
     host/portable_helper_supervisor.cc
     host/portable_helper_win32_supervisor.cc
     host/portable_helper_service_channel.cc
@@ -373,6 +376,7 @@ add_library(chast.host.tray STATIC
     host/portable_helper_lifecycle.cc
     host/portable_helper_recovery.cc
     host/portable_helper_staging.cc
+    host/portable_helper_approved_session.cc
     host/portable_helper_service.cc
     host/tunnel.cc
     host/service.cc

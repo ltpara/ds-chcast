@@ -3,6 +3,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -25,11 +26,15 @@
 #include "elevation_handoff.h"
 #include "portable_helper_protocol.h"
 #include "portable_helper_authorization.h"
+#include "portable_helper_manager_channel.h"
+#include "portable_helper_manager_task.h"
 #include "portable_helper_input_journal.h"
 #include "portable_helper_input_journal_store.h"
+#include "portable_helper_input_cleanup.h"
 #include "portable_helper_supervisor.h"
 #include "portable_helper_win32_supervisor.h"
 #include "portable_helper_service_channel.h"
+#include "portable_helper_approved_session.h"
 #include "portable_helper_service_worker.h"
 #include "portable_helper_worker_session.h"
 #include "platform.h"
@@ -196,6 +201,40 @@ struct FakeElevation : IElevationTask {
     void cancel() override { if (!committed) cancelled = true; }
 };
 
+struct FakeHelperCaptureTask final : IElevationTask {
+    std::atomic<ElevationCode> code{ElevationCode::Pending};
+    std::atomic<bool> cancelled{false};
+    std::atomic<uint64_t> frames{0};
+    std::atomic<unsigned> capture_started{0};
+    std::atomic<unsigned> delay_ms{0};
+
+    ElevationState poll() override { return {0, code.load(), {}}; }
+    void commit() override {}
+    void cancel() override {
+        cancelled = true;
+        code = ElevationCode::Cancelled;
+    }
+    bool capture_ready() const override {
+        return code.load() == ElevationCode::HelperReady && !cancelled.load();
+    }
+    bool capture_frame(ElevationCaptureFrame* frame, std::string* error) override {
+        if (error) error->clear();
+        if (!frame || !capture_ready()) {
+            if (error) *error = "fake helper is not ready";
+            return false;
+        }
+        ++capture_started;
+        const unsigned delay = delay_ms.load();
+        if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        constexpr uint32_t width = 640, height = 480;
+        frame->width = width;
+        frame->height = height;
+        frame->frame_number = ++frames;
+        frame->bgra.assign(static_cast<size_t>(width) * height * 4u, 0x7f);
+        return true;
+    }
+};
+
 ElevationState elevation_answer(QuicSession& viewer, uint32_t id, ElevationCode code) {
     ElevationState result;
     require(until([&] {
@@ -212,8 +251,17 @@ void elevation_permissions() {
     Fixture f;
     auto task = std::make_shared<FakeElevation>();
     std::atomic<unsigned> launches{0};
+    std::mutex context_mutex;
+    ElevationRequestContext last_context;
     f.config.elevation_state = [] { return ElevationState{0, ElevationCode::Available, {}}; };
-    f.config.request_elevation = [&] { ++launches; return task; };
+    f.config.request_elevation = [&](const ElevationRequestContext& context) {
+        {
+            std::lock_guard lock(context_mutex);
+            last_context = context;
+        }
+        ++launches;
+        return task;
+    };
     f.start();
     auto viewer = f.connect();
     elevation_answer(*viewer, 0, ElevationCode::Available);
@@ -225,6 +273,19 @@ void elevation_permissions() {
     elevation_answer(*files, 0, ElevationCode::Unsupported);
     require(viewer->request_elevation(1).ok(), "controller requests local UAC");
     elevation_answer(*viewer, 1, ElevationCode::Pending);
+    {
+        std::lock_guard lock(context_mutex);
+        const auto viewers = f.host->viewers();
+        const auto owner = std::find_if(viewers.begin(), viewers.end(),
+            [](const HostViewer& candidate) { return candidate.controls_input; });
+        require(last_context.connection_id != 0 && last_context.request_id == 1 &&
+                    last_context.mode == SessionMode::Desktop &&
+                    (last_context.permissions & kPermissionInput) != 0 &&
+                    owner != viewers.end() &&
+                    last_context.connection_id == owner->id &&
+                    last_context.peer_address == owner->peer_address,
+                "elevation callback receives the exact live input-owning connection context");
+    }
     require(viewer->request_elevation(2).ok(), "duplicate request reaches host");
     elevation_answer(*viewer, 2, ElevationCode::Busy);
     require(launches == 1 && !task->committed, "one pending launch; no premature takeover");
@@ -250,6 +311,124 @@ void elevation_permissions() {
     require(until([&] { return task->committed.load(); }), "host commits after queuing restarting response");
     viewer.reset(); f.host->stop();
     require(!task->cancelled, "ordinary teardown does not cancel committed handoff");
+}
+
+void helper_ready_state_tracks_the_viewer_lifetime() {
+    Fixture fixture;
+    auto task = std::make_shared<FakeElevation>();
+    fixture.config.elevation_state = [] {
+        return ElevationState{0, ElevationCode::Available, {}};
+    };
+    fixture.config.request_elevation =
+        [task](const ElevationRequestContext&) { return task; };
+    fixture.start();
+    auto viewer = fixture.connect();
+    elevation_answer(*viewer, 0, ElevationCode::Available);
+
+    require(viewer->request_elevation(31).ok(),
+            "viewer requests a per-connection elevated helper");
+    elevation_answer(*viewer, 31, ElevationCode::Pending);
+    task->code = ElevationCode::HelperReady;
+    elevation_answer(*viewer, 31, ElevationCode::HelperReady);
+    require(!task->cancelled.load(),
+            "helper-ready status keeps its connection task alive");
+
+    require(viewer->request_elevation(32).ok(),
+            "viewer can still send a duplicate while a helper is active");
+    elevation_answer(*viewer, 32, ElevationCode::Busy);
+    require(!task->cancelled.load(),
+            "a duplicate request does not revoke the active helper");
+
+    viewer.reset();
+    require(until([&] { return task->cancelled.load(); }),
+            "viewer disconnect cancels its helper lifecycle task");
+}
+
+void portable_helper_capture_uses_an_isolated_per_viewer_vp9_source() {
+    Fixture fixture;
+    auto task = std::make_shared<FakeHelperCaptureTask>();
+    std::atomic<bool> helper_context_supported{false};
+    task->delay_ms = 1500;
+    fixture.config.portable_helper_mode = true;
+    fixture.config.elevation_state = [] {
+        return ElevationState{0, ElevationCode::Available, {}};
+    };
+    fixture.config.request_elevation = [task, &helper_context_supported](
+        const ElevationRequestContext& context) {
+        helper_context_supported = context.helper_capture_supported;
+        return task;
+    };
+    fixture.media->moving = true;
+    fixture.start();
+    auto viewer = fixture.connect();
+    elevation_answer(*viewer, 0, ElevationCode::Available);
+    auto sibling = fixture.connect(SessionMode::Desktop,
+        kPermissionAll & ~kPermissionInput);
+    elevation_answer(*sibling, 0, ElevationCode::Available);
+
+    FrameHeader initial;
+    std::vector<uint8_t> initial_bytes;
+    require(until([&] {
+        const auto result = viewer->receive_frame(initial, initial_bytes, 40ms);
+        return result.ok() && initial.codec == VideoCodec::H264;
+    }), "controller starts on the normal shared display stream");
+
+    require(viewer->request_elevation(51).ok(),
+            "controller requests the portable per-viewer capture helper");
+    elevation_answer(*viewer, 51, ElevationCode::Pending);
+    require(helper_context_supported,
+            "portable helper request is scoped to an available primary VP9 stream");
+    task->code = ElevationCode::HelperReady;
+    elevation_answer(*viewer, 51, ElevationCode::HelperReady);
+
+    require(until([&] { return task->capture_started.load() != 0; }),
+            "helper capture RPC runs on its independent capture worker");
+    const auto duplicate_started = std::chrono::steady_clock::now();
+    require(viewer->request_elevation(52).ok(),
+            "controller sends a duplicate while the first helper capture RPC is blocked");
+    elevation_answer(*viewer, 52, ElevationCode::Busy);
+    require(std::chrono::steady_clock::now() - duplicate_started < 800ms,
+            "a slow helper frame does not stall the viewer control loop");
+
+    FrameHeader helper_frame;
+    std::vector<uint8_t> helper_bytes;
+    require(until([&] {
+        const auto result = viewer->receive_frame(helper_frame, helper_bytes, 40ms);
+        return result.ok() && helper_frame.codec == VideoCodec::Vp9 && helper_frame.idr;
+    }, 6s), "helper BGRA frame is decoded and forwarded as a VP9 IDR");
+    require(fixture.media->software_created > 0 && task->frames > 0,
+            "helper capture uses the software CPU encoder");
+
+    FrameHeader sibling_frame;
+    std::vector<uint8_t> sibling_bytes;
+    require(until([&] {
+        const auto result = sibling->receive_frame(sibling_frame, sibling_bytes, 40ms);
+        return result.ok() && sibling_frame.codec == VideoCodec::H264;
+    }), "another viewer keeps its original shared H264 display stream");
+
+    const auto current_viewers = fixture.host->viewers();
+    const auto owner = std::find_if(current_viewers.begin(),
+        current_viewers.end(), [](const HostViewer& candidate) {
+            return candidate.controls_input;
+        });
+    require(owner != current_viewers.end(),
+            "helper controller remains the input owner before revocation");
+    const uint64_t owner_id = owner->id;
+    fixture.host->set_permissions(owner_id, kPermissionAll & ~kPermissionInput);
+    elevation_answer(*viewer, 51, ElevationCode::Denied);
+    require(until([&] { return task->cancelled.load(); }),
+            "input revocation stops the helper capture task");
+
+    FrameHeader restored;
+    std::vector<uint8_t> restored_bytes;
+    require(until([&] {
+        const auto result = viewer->receive_frame(restored, restored_bytes, 40ms);
+        return result.ok() && restored.codec == VideoCodec::H264;
+    }, 5s), "revoking the helper restores the viewer's normal display stream");
+
+    sibling.reset();
+    viewer.reset();
+    fixture.host->stop();
 }
 
 int elevation_child(int argc, char** argv) {
@@ -328,6 +507,42 @@ void portable_helper_protocol() {
                 decode_portable_helper_message(encoded, &decoded, &error) &&
                 decoded.type == PortableHelperMessageType::SessionWorkerStop,
             "versioned IPC framing recognizes the session-worker stop control");
+    typed_request.type = PortableHelperMessageType::ManagerStart;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::ManagerStart,
+            "versioned IPC framing recognizes the elevated-manager start control");
+    typed_request.type = PortableHelperMessageType::ManagerReady;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::ManagerReady,
+            "versioned IPC framing recognizes the elevated-manager ready response");
+    typed_request.type = PortableHelperMessageType::ManagerStop;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::ManagerStop,
+            "versioned IPC framing recognizes the elevated-manager stop request");
+    typed_request.type = PortableHelperMessageType::ManagerStopped;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::ManagerStopped,
+            "versioned IPC framing recognizes the elevated-manager stop result");
+    typed_request.type = PortableHelperMessageType::ManagerCaptureFrameRequest;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::ManagerCaptureFrameRequest,
+            "versioned IPC framing recognizes the manager capture RPC");
+    typed_request.type = PortableHelperMessageType::ManagerInputEventRequest;
+    typed_request.sequence = 1;
+    require(encode_portable_helper_message(typed_request, &encoded, &error) &&
+                decode_portable_helper_message(encoded, &decoded, &error) &&
+                decoded.type == PortableHelperMessageType::ManagerInputEventRequest,
+            "versioned IPC framing recognizes the manager input RPC");
 
     PortableHelperSequence sequence(message.instance_id);
     require(sequence.Accept(decoded, &error) && sequence.last_sequence() == 1,
@@ -362,8 +577,8 @@ void portable_helper_protocol() {
     bad[12] = 14;
     bad[13] = bad[14] = bad[15] = 0;
     bad[12] = static_cast<uint8_t>(
-        static_cast<uint32_t>(PortableHelperMessageType::SessionWorkerStop) + 1);
-    rejected(bad, "helper parser rejects message types beyond the session-worker control table");
+        static_cast<uint32_t>(PortableHelperMessageType::ManagerInputEventRequest) + 1);
+    rejected(bad, "helper parser rejects message types beyond the manager RPC table");
     bad = encoded;
     bad[52] = 1;
     rejected(bad, "helper parser rejects unrecognized flags");
@@ -467,6 +682,79 @@ void portable_helper_worker_command_line() {
             "worker CLI rejects an overflowing process creation time");
 }
 
+void portable_helper_input_cleanup_command_line_and_scope() {
+    using namespace chast::host;
+    const std::vector<std::wstring> canonical = {
+        L"C:\\ProgramData\\ChastPortableHelper\\chast-host.exe",
+        L"--portable-helper-cleanup-worker",
+        L"--portable-helper-instance",
+        L"00112233445566778899aabbccddeeff",
+        L"--portable-helper-connection",
+        L"ffeeddccbbaa99887766554433221100",
+        L"--portable-helper-generation",
+        L"35",
+        L"--portable-helper-broker-pid",
+        L"1234",
+        L"--portable-helper-broker-created",
+        L"987654321",
+    };
+    PortableHelperInputCleanupLaunchArguments parsed;
+    std::string error;
+    require(parse_portable_helper_input_cleanup_command_line(
+                canonical, &parsed, &error) && parsed.generation == 35 &&
+                parsed.broker_process_id == 1234 &&
+                parsed.broker_creation_time == 987654321,
+            "cleanup CLI accepts only its canonical scope and broker identity arguments");
+
+    const auto rejects = [&](std::vector<std::wstring> arguments,
+                             const char* description) {
+        PortableHelperInputCleanupLaunchArguments output;
+        output.generation = 88;
+        std::string detail;
+        require(!parse_portable_helper_input_cleanup_command_line(
+                    arguments, &output, &detail) && !detail.empty() &&
+                    output.generation == 0 && output.broker_process_id == 0,
+                description);
+    };
+    auto malformed = canonical;
+    malformed[7] = L"035";
+    rejects(std::move(malformed),
+            "cleanup CLI rejects noncanonical generation values");
+    malformed = canonical;
+    malformed.push_back(L"--tray");
+    rejects(std::move(malformed),
+            "cleanup CLI rejects trailing switches instead of entering the host");
+
+    PortableHelperInputJournalScope scope;
+    scope.instance_id = parsed.instance_id;
+    scope.connection_id = parsed.connection_id;
+    scope.windows_session_id = 7;
+    scope.generation = parsed.generation;
+    PortableHelperMessage request;
+    require(make_portable_helper_input_cleanup_request(
+                scope, scope.generation, &request, &error) &&
+                validate_portable_helper_input_cleanup_request(
+                    request, scope, &error),
+            "cleanup IPC request round-trips the exact instance/connection/session/generation scope");
+    auto tampered = request;
+    ++tampered.request_id;
+    require(!validate_portable_helper_input_cleanup_request(
+                tampered, scope, &error),
+            "cleanup IPC rejects a replay or request ID outside its generation");
+    tampered = request;
+    tampered.payload[20] ^= 1;
+    require(!validate_portable_helper_input_cleanup_request(
+                tampered, scope, &error),
+            "cleanup IPC rejects a payload whose generation differs from the journal");
+    PortableHelperServiceSpec recorded_spec;
+    PortableHelperProcessIdentity worker_identity, broker_identity;
+    require(!validate_portable_helper_input_cleanup_process_identity(
+                parsed, &recorded_spec, &worker_identity, &broker_identity,
+                &error) && worker_identity.process_id == 0 &&
+                broker_identity.process_id == 0,
+            "ordinary test process cannot claim the staged SYSTEM cleanup identity");
+}
+
 void portable_helper_input_journal() {
     using namespace chast::host;
     PortableHelperInputJournalScope scope;
@@ -493,6 +781,7 @@ void portable_helper_input_journal() {
         chast::InputSideEffectIntent intent;
         intent.sequence = sequence;
         intent.api = chast::InputSideEffectApi::SendInput;
+        intent.input_desktop_name = "Default";
         INPUT input{};
         input.type = INPUT_KEYBOARD;
         input.ki.wVk = 'A';
@@ -527,7 +816,7 @@ void portable_helper_input_journal() {
     require(!decode_portable_helper_input_journal(corrupted, &decoded, &error),
             "journal decoder rejects an invalid magic value");
     corrupted = encoded;
-    corrupted[73] = 1;
+    corrupted[83] = 1;
     require(!decode_portable_helper_input_journal(corrupted, &decoded, &error),
             "journal decoder rejects nonzero reserved header bytes");
     corrupted = encoded;
@@ -550,7 +839,7 @@ void portable_helper_input_journal() {
                 decode_portable_helper_input_journal(encoded, &decoded, &error) &&
                 decoded.released && !decoded.pending &&
                 decoded.committed.keys.empty() && decoded.possible.keys.empty(),
-            "journal v2 round-trips a durable released-generation tombstone");
+            "journal v3 round-trips a durable released-generation tombstone");
     PortableHelperInputJournal released_recovery(scope,
         [](const PortableHelperInputJournalImage&, std::string*) { return true; });
     require(released_recovery.Restore(decoded, &error) &&
@@ -575,11 +864,24 @@ void portable_helper_input_journal() {
                 recovered_committed.recovery_only() &&
                 !recovered_committed.Prepare(up, &error),
             "recovery cannot resume injection from a committed but held key state");
+    auto wrong_desktop_up = up;
+    wrong_desktop_up.input_desktop_name = "Winlogon";
+    require(!journal.Prepare(wrong_desktop_up, &error) &&
+                !durable.pending &&
+                durable.input_desktop_name == "Default",
+            "a desktop transition cannot release an old desktop's held key state");
     require(journal.Prepare(up, &error) && durable.pending &&
                 durable.possible.keys.size() == 1 &&
                 journal.Complete(result_for(up, true), &error) &&
-                durable.committed.keys.empty(),
+                durable.committed.keys.empty() &&
+                durable.input_desktop_name.empty(),
             "key-up is write-ahead recorded before the committed state is cleared");
+    auto new_desktop_down = key_intent(3, true);
+    new_desktop_down.input_desktop_name = "Winlogon";
+    require(journal.Prepare(new_desktop_down, &error) &&
+                journal.Complete(result_for(new_desktop_down, true), &error) &&
+                durable.input_desktop_name == "Winlogon",
+            "an empty generation may bind new state to the newly active desktop");
     require(!journal.Complete(result_for(up, true), &error),
             "a completed API result cannot be replayed");
 
@@ -667,6 +969,7 @@ void portable_helper_input_journal() {
         chast::InputSideEffectIntent intent;
         intent.sequence = sequence;
         intent.api = chast::InputSideEffectApi::InjectTouchInput;
+        intent.input_desktop_name = "Default";
         POINTER_TOUCH_INFO touch{};
         touch.pointerInfo.pointerType = PT_TOUCH;
         touch.pointerInfo.pointerId = 0;
@@ -701,6 +1004,7 @@ void portable_helper_input_journal() {
         chast::InputSideEffectIntent intent;
         intent.sequence = sequence;
         intent.api = chast::InputSideEffectApi::InjectSyntheticPointerInput;
+        intent.input_desktop_name = "Default";
         POINTER_TYPE_INFO pointer{};
         pointer.type = PT_PEN;
         pointer.penInfo.pointerInfo.pointerType = PT_PEN;
@@ -722,6 +1026,113 @@ void portable_helper_input_journal() {
                 !pen_durable.committed.pen_down,
             "pen down/up state transitions round-trip through the journal");
     require(persist_calls > 0, "input journal persistence seam was exercised");
+}
+
+void portable_helper_input_cleanup_plan() {
+    using namespace chast::host;
+    PortableHelperInputJournalScope scope;
+    scope.instance_id[0] = 0x44;
+    scope.connection_id[0] = 0x77;
+    scope.windows_session_id = 7;
+    scope.generation = 31;
+
+    PortableHelperInputJournalImage image;
+    image.scope = scope;
+    image.input_desktop_name = "Default";
+    image.last_sequence = 9;
+    image.committed.mouse_buttons = chast::kMouseLeft | chast::kMouseBack;
+    image.committed.keys.push_back(
+        PortableHelperJournalKey{0, 0x1D,
+            KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY, 0,
+            chast::kInputInjectionTag});
+    image.committed.touches.push_back(
+        PortableHelperJournalTouch{2, 123, 456, 512});
+    image.committed.pen_down = true;
+    image.committed.pen = PortableHelperJournalPen{
+        200, 300, 700, PEN_FLAG_BARREL, 12, -8};
+    image.possible = image.committed;
+
+    PortableHelperInputCleanupPlan plan;
+    std::string error;
+    require(make_portable_helper_input_cleanup_plan(scope, image, &plan,
+                                                     &error),
+            "build an exact release plan from the journal's possible state");
+    require(plan.input_desktop_name == "Default" &&
+                plan.mouse_buttons_up.size() == 2 &&
+                plan.touch_contacts_up.size() == 1 && plan.pen_up &&
+                plan.keys_up.size() == 1,
+            "cleanup plan includes only journal-owned keyboard and pointer state");
+    require(plan.mouse_buttons_up[0].mi.dwFlags == MOUSEEVENTF_LEFTUP &&
+                plan.mouse_buttons_up[1].mi.dwFlags == MOUSEEVENTF_XUP &&
+                plan.mouse_buttons_up[1].mi.mouseData == XBUTTON1 &&
+                plan.touch_contacts_up[0].pointerInfo.pointerId == 2 &&
+                plan.touch_contacts_up[0].pointerInfo.pointerFlags ==
+                    (POINTER_FLAG_UP | POINTER_FLAG_CANCELED) &&
+                plan.pen.x == 200 && plan.pen.pressure == 700 &&
+                plan.keys_up[0].ki.wVk == 0 &&
+                plan.keys_up[0].ki.wScan == 0x1D &&
+                plan.keys_up[0].ki.dwFlags ==
+                    (KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY |
+                     KEYEVENTF_KEYUP),
+            "cleanup actions preserve exact buttons, pointer IDs and scan-code identity");
+
+    const auto rejects_execution = [](PortableHelperInputCleanupPlan malformed,
+                                      const char* description) {
+        std::string execution_error;
+        require(!execute_portable_helper_input_cleanup_plan(
+                    malformed, &execution_error) && !execution_error.empty(),
+                description);
+    };
+    auto malformed_plan = plan;
+    malformed_plan.keys_up[0].ki.dwFlags &= ~KEYEVENTF_KEYUP;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects a keyboard down event before touching the desktop");
+    malformed_plan = plan;
+    malformed_plan.keys_up[0].ki.dwExtraInfo = 0;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects a key release without this injector's tag");
+    malformed_plan = plan;
+    malformed_plan.mouse_buttons_up[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects a mouse down event before touching the desktop");
+    malformed_plan = plan;
+    malformed_plan.mouse_buttons_up[0].mi.dwExtraInfo = 1;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects mouse metadata outside the journal release shape");
+    malformed_plan = plan;
+    malformed_plan.touch_contacts_up[0].pointerInfo.pointerFlags = POINTER_FLAG_DOWN;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects a touch down event before touching the desktop");
+    malformed_plan = plan;
+    malformed_plan.touch_contacts_up[0].pointerInfo.dwKeyStates = 1;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects unjournaled touch pointer state");
+    malformed_plan = plan;
+    malformed_plan.keys_up.push_back(malformed_plan.keys_up.front());
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects duplicate keyboard releases");
+    malformed_plan = plan;
+    malformed_plan.pen.pressure = 1025;
+    rejects_execution(std::move(malformed_plan),
+        "cleanup executor rejects out-of-range pen state before touching the desktop");
+
+    PortableHelperInputJournalScope wrong_scope = scope;
+    ++wrong_scope.generation;
+    require(!make_portable_helper_input_cleanup_plan(
+                wrong_scope, image, &plan, &error),
+            "cleanup plan refuses a journal from another connection generation");
+    image.possible.keys.front().extra_info = 0;
+    image.committed.keys.front().extra_info = 0;
+    require(!make_portable_helper_input_cleanup_plan(scope, image, &plan,
+                                                      &error),
+            "cleanup plan refuses an untagged key that may not belong to this injector");
+    image.possible.keys.front().extra_info = chast::kInputInjectionTag;
+    image.committed.keys.front().extra_info = chast::kInputInjectionTag;
+    image.input_desktop_name = "Winlogon";
+    require(make_portable_helper_input_cleanup_plan(scope, image, &plan,
+                                                    &error) &&
+                plan.input_desktop_name == "Winlogon",
+            "recovery plan binds every release to its original input desktop");
 }
 
 void portable_helper_input_journal_file_store() {
@@ -780,6 +1191,7 @@ void portable_helper_input_journal_file_store() {
     chast::InputSideEffectIntent key_down;
     key_down.sequence = 1;
     key_down.api = chast::InputSideEffectApi::SendInput;
+    key_down.input_desktop_name = "Default";
     INPUT key{};
     key.type = INPUT_KEYBOARD;
     key.ki.wVk = 'B';
@@ -828,6 +1240,117 @@ void portable_helper_input_journal_file_store() {
     require(released_replay_store != nullptr &&
                 !released_replay_store->Persist(fresh, &error),
             "a new store cannot replace a released tombstone with a fresh generation");
+
+    PortableHelperInputJournalScope cleanup_scope = scope;
+    cleanup_scope.generation += 10;
+    auto cleanup_store = detail::open_portable_helper_input_journal_file_store_for_test(
+        cleanup_scope, directory.wstring(), &error);
+    require(cleanup_store != nullptr,
+            "open a separate generation for cleanup transaction recovery");
+    if (!cleanup_store) return;
+    auto cleanup_journal = std::make_unique<PortableHelperInputJournal>(
+        cleanup_scope,
+        [&cleanup_store](const PortableHelperInputJournalImage& image,
+                         std::string* persist_error) {
+          return cleanup_store->Persist(image, persist_error);
+        });
+    require(cleanup_journal->Initialize(&error),
+            "initialize the generation before simulating worker input");
+    chast::InputSideEffectIntent cleanup_key_down;
+    cleanup_key_down.sequence = 1;
+    cleanup_key_down.api = chast::InputSideEffectApi::SendInput;
+    cleanup_key_down.input_desktop_name = "Default";
+    INPUT cleanup_key{};
+    cleanup_key.type = INPUT_KEYBOARD;
+    cleanup_key.ki.wVk = 'C';
+    cleanup_key.ki.dwExtraInfo = chast::kInputInjectionTag;
+    cleanup_key_down.inputs.push_back(cleanup_key);
+    const chast::InputSideEffectResult cleanup_key_result{
+        1, chast::InputSideEffectApi::SendInput, 1, ERROR_SUCCESS, true};
+    require(cleanup_journal->Prepare(cleanup_key_down, &error) &&
+                cleanup_journal->Complete(cleanup_key_result, &error),
+            "persist a held key before cleanup executor recovery");
+    cleanup_journal.reset();
+    cleanup_store.reset();
+
+    cleanup_store = detail::open_portable_helper_input_journal_file_store_for_test(
+        cleanup_scope, directory.wstring(), &error);
+    require(cleanup_store != nullptr,
+            "reopen the durable generation for independent cleanup");
+    if (!cleanup_store) return;
+    unsigned cleanup_attempts = 0;
+    unsigned cleanup_effects = 0;
+    HANDLE block_tombstone_commit = INVALID_HANDLE_VALUE;
+    const PortableHelperAuthenticatedInputCleanupExecutor cleanup_executor =
+        [&cleanup_attempts, &cleanup_effects, &block_tombstone_commit,
+         &cleanup_store](const PortableHelperInputJournalScope& executor_scope,
+                         const PortableHelperInputJournalImage& executor_image,
+                         std::string* executor_error) {
+          ++cleanup_attempts;
+          if (executor_scope.generation != 35 ||
+              executor_image.possible.keys.size() != 1 ||
+              executor_image.input_desktop_name != "Default") {
+            if (executor_error != nullptr)
+              *executor_error = "cleanup request scope/state mismatch";
+            return false;
+          }
+          if (cleanup_attempts == 1) {
+            if (executor_error != nullptr)
+              *executor_error = "simulated cleanup process interruption";
+            return false;
+          }
+          // Simulate the external release succeeding while a reader keeps the
+          // old journal image open without FILE_SHARE_DELETE. The subsequent
+          // atomic tombstone replacement must fail and leave the old image
+          // retryable.
+          ++cleanup_effects;
+          if (cleanup_attempts == 2) {
+            block_tombstone_commit = CreateFileW(
+                cleanup_store->record_path().c_str(), GENERIC_READ,
+                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            if (block_tombstone_commit == INVALID_HANDLE_VALUE) {
+              if (executor_error != nullptr)
+                *executor_error = "cannot hold the journal image for failure injection";
+              return false;
+            }
+          }
+          return true;
+        };
+    require(!recover_portable_helper_input_journal(
+                cleanup_scope, *cleanup_store, cleanup_executor, &error) &&
+                cleanup_store->Load(&loaded, &found, &error) && found &&
+                !loaded.released && loaded.possible.keys.size() == 1,
+            "failed cleanup keeps the durable possible state for retry");
+    std::string tombstone_error;
+    const bool tombstone_recovery_succeeded =
+        recover_portable_helper_input_journal(
+            cleanup_scope, *cleanup_store, cleanup_executor,
+            &tombstone_error);
+    const bool tombstone_state_loaded =
+        cleanup_store->Load(&loaded, &found, &error) && found;
+    const bool tombstone_write_failed = !tombstone_recovery_succeeded &&
+        tombstone_error.find("atomically install input journal image") !=
+            std::string::npos && tombstone_state_loaded && !loaded.released &&
+        loaded.possible.keys.size() == 1 && cleanup_attempts == 2 &&
+        cleanup_effects == 1 &&
+        block_tombstone_commit != INVALID_HANDLE_VALUE;
+    if (block_tombstone_commit != INVALID_HANDLE_VALUE) {
+      CloseHandle(block_tombstone_commit);
+      block_tombstone_commit = INVALID_HANDLE_VALUE;
+    }
+    require(tombstone_write_failed,
+            "a successful release with a blocked tombstone write retains possible state for retry");
+    require(recover_portable_helper_input_journal(
+                cleanup_scope, *cleanup_store, cleanup_executor, &error) &&
+                cleanup_store->Load(&loaded, &found, &error) && found &&
+                loaded.released && loaded.possible.keys.empty() &&
+                cleanup_attempts == 3 && cleanup_effects == 2,
+            "retry repeats the idempotent release and persists the released tombstone");
+    require(recover_portable_helper_input_journal(
+                cleanup_scope, *cleanup_store, cleanup_executor, &error) &&
+                cleanup_attempts == 3 && cleanup_effects == 2,
+            "a retry after a lost ACK skips cleanup when the released tombstone is durable");
 
     PortableHelperInputJournalScope live_scope = scope;
     live_scope.generation += 2;
@@ -901,6 +1424,351 @@ void portable_helper_input_journal_file_store() {
     require(corrupt_store != nullptr &&
                 !corrupt_store->Load(&loaded, &found, &error),
             "on-disk malformed journal data is rejected instead of reset");
+
+    const auto teardown_directory = directory / "instance-teardown";
+    require(CreateDirectoryW(teardown_directory.c_str(), nullptr) != FALSE &&
+                chast::harden_machine_state_directory(
+                    teardown_directory.wstring(), &error),
+            "create a separate protected directory for released journal teardown");
+    PortableHelperInputJournalScope teardown_held = scope;
+    teardown_held.connection_id[0] = 0xB1;
+    teardown_held.generation = 41;
+    PortableHelperInputJournalScope teardown_idle = teardown_held;
+    teardown_idle.connection_id[0] = 0xB2;
+    teardown_idle.generation = 42;
+    const auto create_generation = [&](
+        const PortableHelperInputJournalScope& generation_scope,
+        bool leave_possible_key) {
+      auto generation_store = detail::open_portable_helper_input_journal_file_store_for_test(
+          generation_scope, teardown_directory.wstring(), &error);
+      if (!generation_store) return false;
+      auto generation_journal = std::make_unique<PortableHelperInputJournal>(
+          generation_scope,
+          [&generation_store](const PortableHelperInputJournalImage& image,
+                              std::string* persist_error) {
+            return generation_store->Persist(image, persist_error);
+          });
+      if (!generation_journal->Initialize(&error)) return false;
+      if (leave_possible_key) {
+        chast::InputSideEffectIntent intent;
+        intent.sequence = 1;
+        intent.api = chast::InputSideEffectApi::SendInput;
+        intent.input_desktop_name = "Default";
+        INPUT input{};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = 'D';
+        input.ki.dwExtraInfo = chast::kInputInjectionTag;
+        intent.inputs.push_back(input);
+        if (!generation_journal->Prepare(intent, &error)) return false;
+      }
+      generation_journal.reset();
+      generation_store.reset();
+      return true;
+    };
+    require(create_generation(teardown_held, true) &&
+                create_generation(teardown_idle, false),
+            "create held and idle generations before instance teardown");
+    require(!detail::remove_released_portable_helper_input_journals_for_test(
+                scope.instance_id, teardown_directory.wstring(), &error),
+            "instance teardown refuses to delete any journal while a generation is not released");
+    const auto release_generation = [&] (
+        const PortableHelperInputJournalScope& generation_scope) {
+      auto generation_store = detail::open_portable_helper_input_journal_file_store_for_test(
+          generation_scope, teardown_directory.wstring(), &error);
+      if (!generation_store) return false;
+      return recover_portable_helper_input_journal(
+          generation_scope, *generation_store,
+          [](const PortableHelperInputJournalScope&,
+             const PortableHelperInputJournalImage&, std::string*) {
+            return true;
+          }, &error);
+    };
+    require(release_generation(teardown_held) && release_generation(teardown_idle),
+            "both generations receive durable released tombstones before teardown");
+    auto teardown_lock_blocker = detail::open_portable_helper_input_journal_file_store_for_test(
+        teardown_held, teardown_directory.wstring(), &error);
+    require(teardown_lock_blocker != nullptr &&
+                !detail::remove_released_portable_helper_input_journals_for_test(
+                    scope.instance_id, teardown_directory.wstring(), &error),
+            "instance teardown defers lock removal while a journal store handle remains open");
+    teardown_lock_blocker.reset();
+    require(detail::remove_released_portable_helper_input_journals_for_test(
+                scope.instance_id, teardown_directory.wstring(), &error),
+            "instance teardown retries and removes only verified released journal artifacts");
+    WIN32_FIND_DATAW remaining_artifact{};
+    const std::wstring teardown_pattern =
+        (teardown_directory / L"input-*").wstring();
+    HANDLE remaining = FindFirstFileW(teardown_pattern.c_str(), &remaining_artifact);
+    const bool no_journal_artifacts = remaining == INVALID_HANDLE_VALUE &&
+        GetLastError() == ERROR_FILE_NOT_FOUND;
+    if (remaining != INVALID_HANDLE_VALUE) FindClose(remaining);
+    require(no_journal_artifacts,
+            "released journal data, temporary files, and locks are removed together");
+
+    const std::wstring malformed_artifact =
+        (teardown_directory /
+         L"input-51000000000000000000000000000000-invalid.bad").wstring();
+    HANDLE invalid_file = CreateFileW(malformed_artifact.c_str(), GENERIC_WRITE,
+        0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool invalid_created = invalid_file != INVALID_HANDLE_VALUE;
+    if (invalid_created) CloseHandle(invalid_file);
+    require(invalid_created &&
+                !detail::remove_released_portable_helper_input_journals_for_test(
+                    scope.instance_id, teardown_directory.wstring(), &error),
+            "instance teardown rejects unknown journal-shaped artifacts");
+}
+
+int portable_helper_cleanup_journal_child(int argc, char** argv) {
+    using namespace chast::host;
+    if (argc != 10) return 2;
+    const std::string mode(argv[2]);
+    if (mode != "pause" && mode != "complete" && mode != "replay") return 3;
+
+    std::vector<uint8_t> directory_bytes, instance_bytes, connection_bytes;
+    if (!chast::hex_decode(argv[3], directory_bytes) ||
+        directory_bytes.empty())
+      return 4;
+    const std::string directory_utf8(directory_bytes.begin(),
+                                     directory_bytes.end());
+    const std::filesystem::path directory(widen(directory_utf8));
+    if (directory.empty()) return 4;
+    if (!chast::hex_decode(argv[4], instance_bytes) ||
+        instance_bytes.size() != kPortableHelperInstanceIdBytes ||
+        !chast::hex_decode(argv[5], connection_bytes) ||
+        connection_bytes.size() != kPortableHelperInstanceIdBytes)
+      return 5;
+    PortableHelperInputJournalScope scope;
+    std::copy(instance_bytes.begin(), instance_bytes.end(), scope.instance_id.begin());
+    std::copy(connection_bytes.begin(), connection_bytes.end(), scope.connection_id.begin());
+    try {
+      scope.windows_session_id = static_cast<uint32_t>(std::stoul(argv[6]));
+      scope.generation = std::stoull(argv[7]);
+    } catch (...) {
+      return 6;
+    }
+    if (scope.windows_session_id == 0 || scope.generation == 0) return 7;
+
+    const std::wstring reached_name(argv[8], argv[8] + strlen(argv[8]));
+    const std::wstring resume_name(argv[9], argv[9] + strlen(argv[9]));
+    HANDLE reached = OpenEventW(EVENT_MODIFY_STATE, FALSE, reached_name.c_str());
+    HANDLE resume = OpenEventW(SYNCHRONIZE, FALSE, resume_name.c_str());
+    if (reached == nullptr || resume == nullptr) {
+      if (reached != nullptr) CloseHandle(reached);
+      if (resume != nullptr) CloseHandle(resume);
+      return 8;
+    }
+
+    std::string error;
+    auto store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    if (!store) {
+      CloseHandle(reached);
+      CloseHandle(resume);
+      return 9;
+    }
+    const std::wstring marker_path =
+        (directory / L"cleanup-effects.bin").wstring();
+    const auto executor = [&](const PortableHelperInputJournalScope& actual_scope,
+                              const PortableHelperInputJournalImage& image,
+                              std::string* executor_error) {
+      if (actual_scope.instance_id != scope.instance_id ||
+          actual_scope.connection_id != scope.connection_id ||
+          actual_scope.windows_session_id != scope.windows_session_id ||
+          actual_scope.generation != scope.generation || image.released ||
+          image.possible.keys.size() != 1) {
+        if (executor_error != nullptr)
+          *executor_error = "cleanup child received unexpected journal state";
+        return false;
+      }
+      HANDLE marker = CreateFileW(marker_path.c_str(), FILE_APPEND_DATA,
+          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+      if (marker == INVALID_HANDLE_VALUE) {
+        if (executor_error != nullptr)
+          *executor_error = "cleanup child cannot open effect counter";
+        return false;
+      }
+      const uint8_t effect = 0xA5;
+      DWORD written = 0;
+      const bool recorded = WriteFile(marker, &effect, sizeof(effect),
+                                      &written, nullptr) != FALSE &&
+          written == sizeof(effect) && FlushFileBuffers(marker) != FALSE;
+      CloseHandle(marker);
+      if (!recorded) {
+        if (executor_error != nullptr)
+          *executor_error = "cleanup child cannot durably record its simulated effect";
+        return false;
+      }
+      if (mode == "pause") {
+        if (!SetEvent(reached)) return false;
+        return WaitForSingleObject(resume, INFINITE) == WAIT_OBJECT_0;
+      }
+      return true;
+    };
+
+    const bool recovered = recover_portable_helper_input_journal(
+        scope, *store, executor, &error);
+    store.reset();
+    CloseHandle(reached);
+    CloseHandle(resume);
+    return recovered ? 0 : 9;
+}
+
+void portable_helper_cleanup_worker_crash_recovery() {
+    using namespace chast::host;
+    if (!process_can_harden_machine_state()) {
+      std::printf("skip cleanup child crash recovery (elevated admin or SYSTEM token required)\n");
+      return;
+    }
+
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"chast-cleanup-崩溃恢复-" +
+         std::to_wstring(GetCurrentProcessId()) + L"-" +
+         std::to_wstring(GetTickCount64()));
+    struct DirectoryCleanup final {
+      std::filesystem::path path;
+      ~DirectoryCleanup() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+      }
+    } cleanup{directory};
+    require(CreateDirectoryW(directory.c_str(), nullptr) != FALSE &&
+                chast::harden_machine_state_directory(directory.wstring(), nullptr),
+            "create a protected directory for cleanup child crash recovery");
+
+    PortableHelperInputJournalScope scope;
+    scope.windows_session_id = 9;
+    scope.generation = 73;
+    require(secure_random(scope.instance_id.data(), scope.instance_id.size()) &&
+                secure_random(scope.connection_id.data(), scope.connection_id.size()),
+            "create an isolated journal scope for cleanup child crash recovery");
+    std::string error;
+    auto store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    require(store != nullptr, "open the isolated cleanup crash journal");
+    if (!store) return;
+    auto journal = std::make_unique<PortableHelperInputJournal>(scope,
+        [&store](const PortableHelperInputJournalImage& image,
+                 std::string* persist_error) {
+          return store->Persist(image, persist_error);
+        });
+    require(journal->Initialize(&error), "initialize the cleanup crash journal");
+    chast::InputSideEffectIntent down;
+    down.sequence = 1;
+    down.api = chast::InputSideEffectApi::SendInput;
+    down.input_desktop_name = "Default";
+    INPUT key{};
+    key.type = INPUT_KEYBOARD;
+    key.ki.wVk = 'K';
+    key.ki.dwExtraInfo = chast::kInputInjectionTag;
+    down.inputs.push_back(key);
+    require(journal->Prepare(down, &error) &&
+                journal->Complete(chast::InputSideEffectResult{
+                    1, chast::InputSideEffectApi::SendInput, 1,
+                    ERROR_SUCCESS, true}, &error),
+            "persist a possible held key before terminating a cleanup child");
+    journal.reset();
+    store.reset();
+
+    std::array<uint8_t, 16> event_nonce{};
+    require(secure_random(event_nonce.data(), event_nonce.size()),
+            "generate private synchronization names for cleanup child processes");
+    const std::string event_suffix = hex_encode(event_nonce.data(), event_nonce.size());
+    const std::wstring reached_name = widen("Local\\ChastCleanupReached-" + event_suffix);
+    const std::wstring resume_name = widen("Local\\ChastCleanupResume-" + event_suffix);
+    HANDLE reached = CreateEventW(nullptr, TRUE, FALSE, reached_name.c_str());
+    HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, resume_name.c_str());
+    struct EventCleanup final {
+      HANDLE reached;
+      HANDLE resume;
+      ~EventCleanup() {
+        if (reached != nullptr) CloseHandle(reached);
+        if (resume != nullptr) CloseHandle(resume);
+      }
+    } event_cleanup{reached, resume};
+    require(reached != nullptr && resume != nullptr,
+            "create private synchronization events for cleanup child processes");
+    if (reached == nullptr || resume == nullptr) return;
+
+    const auto marker_path = directory / L"cleanup-effects.bin";
+    const auto run_child = [&](const char* mode, bool terminate_after_effect) {
+      const std::wstring executable = executable_path();
+      const std::string directory_utf8 = narrow(directory.wstring());
+      const std::string encoded_directory = hex_encode(
+          reinterpret_cast<const uint8_t*>(directory_utf8.data()),
+          directory_utf8.size());
+      const auto quote = [](const std::wstring& value) {
+        return L"\"" + value + L"\"";
+      };
+      const std::wstring command = quote(executable) +
+          L" --portable-helper-cleanup-journal-child " + widen(mode) + L" " +
+          widen(encoded_directory) + L" " +
+          widen(hex_encode(scope.instance_id.data(), scope.instance_id.size())) + L" " +
+          widen(hex_encode(scope.connection_id.data(), scope.connection_id.size())) + L" " +
+          std::to_wstring(scope.windows_session_id) + L" " +
+          std::to_wstring(scope.generation) + L" " + quote(reached_name) + L" " +
+          quote(resume_name);
+      std::vector<wchar_t> command_line(command.begin(), command.end());
+      command_line.push_back(L'\0');
+      STARTUPINFOW startup{sizeof(startup)};
+      PROCESS_INFORMATION child{};
+      if (!CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                          nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                          &startup, &child))
+        return false;
+      CloseHandle(child.hThread);
+      if (terminate_after_effect) {
+        const bool reached_effect =
+            WaitForSingleObject(reached, 10000) == WAIT_OBJECT_0;
+        const bool terminated =
+            TerminateProcess(child.hProcess, ERROR_CANCELLED) != FALSE;
+        const bool exited = WaitForSingleObject(child.hProcess, 10000) == WAIT_OBJECT_0;
+        DWORD exit_code = 0;
+        const bool queried = exited && GetExitCodeProcess(child.hProcess, &exit_code);
+        CloseHandle(child.hProcess);
+        return reached_effect && terminated && queried &&
+            exit_code == ERROR_CANCELLED;
+      }
+      const DWORD waited = WaitForSingleObject(child.hProcess, 10000);
+      DWORD exit_code = ERROR_GEN_FAILURE;
+      const bool succeeded = waited == WAIT_OBJECT_0 &&
+          GetExitCodeProcess(child.hProcess, &exit_code) != FALSE &&
+          exit_code == ERROR_SUCCESS;
+      if (waited != WAIT_OBJECT_0) {
+        (void)TerminateProcess(child.hProcess, ERROR_TIMEOUT);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+      }
+      CloseHandle(child.hProcess);
+      return succeeded;
+    };
+
+    require(run_child("pause", true),
+            "terminate the cleanup child after its simulated release but before tombstone commit");
+    store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    PortableHelperInputJournalImage loaded;
+    bool found = false;
+    require(store != nullptr && store->Load(&loaded, &found, &error) && found &&
+                !loaded.released && loaded.possible.keys.size() == 1,
+            "child termination leaves the durable possible input state retryable");
+    store.reset();
+
+    require(run_child("complete", false),
+            "restart cleanup in a child process and durably commit the released tombstone");
+    store = detail::open_portable_helper_input_journal_file_store_for_test(
+        scope, directory.wstring(), &error);
+    require(store != nullptr && store->Load(&loaded, &found, &error) && found &&
+                loaded.released && loaded.possible.keys.empty(),
+            "restarted child leaves a durable empty tombstone");
+    store.reset();
+
+    require(run_child("replay", false),
+            "simulate losing the cleanup result and retry from a separate process");
+    std::error_code size_error;
+    const uintmax_t cleanup_effect_count =
+        std::filesystem::file_size(marker_path, size_error);
+    require(!size_error && cleanup_effect_count == 2,
+            "restart retries an interrupted effect once and skips a durable tombstone after ACK loss");
 }
 
 void portable_helper_authorization() {
@@ -1063,6 +1931,22 @@ void portable_helper_authorization() {
                 start_request, instance, windows_session + 1,
                 &imported_parent_grant, &error),
             "helper service rejects a parent grant for a different Windows session");
+    std::vector<uint8_t> serialized_manager_grant;
+    require(encode_portable_helper_grant_payload(
+                grant, &serialized_manager_grant, &error),
+            "encode a scoped grant for the authenticated manager channel");
+    PortableHelperGrant stale_manager_output = grant;
+    require(!decode_portable_helper_grant_payload(
+                serialized_manager_grant, instance, windows_session + 1,
+                &stale_manager_output, &error) &&
+                stale_manager_output.generation == 0 &&
+                stale_manager_output.operations == 0 &&
+                std::all_of(stale_manager_output.secret.begin(),
+                            stale_manager_output.secret.end(),
+                            [](uint8_t value) { return value == 0; }),
+            "manager grant decoder rejects a wrong session and clears stale secret output");
+    SecureZeroMemory(serialized_manager_grant.data(),
+                     serialized_manager_grant.size());
     PortableHelperAuthorization delegated_authorization;
     require(delegated_authorization.AcceptParentAuthorizedGrant(
                 grant, windows_session, &error) &&
@@ -1451,6 +2335,360 @@ void portable_helper_authorization() {
             "failed input cleanup still revokes capability and requires channel teardown");
 }
 
+void portable_helper_approved_session() {
+    using namespace chast::host;
+
+    class FakeBackend final : public PortableHelperServiceBackend {
+     public:
+        bool CreateExclusive(const PortableHelperServiceSpec&, std::string*) override {
+            events.push_back("create"); created = true; return true;
+        }
+        bool Start(const PortableHelperServiceSpec&, std::string*) override {
+            events.push_back("start"); running = created; return running;
+        }
+        bool Connect(const PortableHelperServiceSpec& spec, uint32_t timeout_ms,
+                     std::unique_ptr<PortableHelperServiceConnection>* output,
+                     std::string* error) override {
+            events.push_back("connect");
+            if (output == nullptr || !running) {
+                if (error) *error = "fake helper is not running";
+                return false;
+            }
+            auto server = PortableHelperPipe::CreateServer(
+                spec.instance_id, spec.parent.logon_sid, error);
+            if (!server) return false;
+            service_thread = std::thread(
+                [this, server = std::move(server), spec, timeout_ms]() mutable {
+                    std::string detail;
+                    if (!server->Accept(spec.parent, timeout_ms, &detail)) {
+                        save_error(detail);
+                        return;
+                    }
+                    PortableHelperAuthorization worker_authorization;
+                    bool worker_ready = false;
+                    for (;;) {
+                        PortableHelperMessage request;
+                        if (!server->Receive(&request, INFINITE, &detail)) break;
+                        if (request.type == PortableHelperMessageType::SessionWorkerStart) {
+                            PortableHelperGrant grant;
+                            PortableHelperSecret proof{};
+                            if (!parse_portable_helper_session_worker_start_request(
+                                    request, spec.instance_id, spec.parent.session_id,
+                                    &grant, &detail) ||
+                                !worker_authorization.AcceptParentAuthorizedGrant(
+                                    grant, spec.parent.session_id, &detail) ||
+                                !make_portable_helper_worker_ready_proof(
+                                    grant, &proof, &detail) ||
+                                !worker_authorization.ConfirmBrokerManagedWorkerReady(
+                                    grant, proof, &detail)) {
+                                SecureZeroMemory(proof.data(), proof.size());
+                                break;
+                            }
+                            PortableHelperMessage ack;
+                            ack.type = PortableHelperMessageType::Acknowledgement;
+                            ack.request_id = request.request_id;
+                            ack.payload = {1};
+                            if (!server->Send(std::move(ack), timeout_ms, &detail)) {
+                                SecureZeroMemory(proof.data(), proof.size());
+                                break;
+                            }
+                            PortableHelperMessage ready;
+                            ready.type = PortableHelperMessageType::WorkerReady;
+                            ready.instance_id = grant.instance_id;
+                            ready.request_id = grant.generation;
+                            ready.payload.assign(proof.begin(), proof.end());
+                            SecureZeroMemory(proof.data(), proof.size());
+                            if (!server->Send(std::move(ready), timeout_ms, &detail)) break;
+                            worker_ready = true;
+                            ++starts;
+                            continue;
+                        }
+                        if (request.type == PortableHelperMessageType::InputEventRequest) {
+                            PortableHelperAuthorization::OperationLease lease;
+                            PortableHelperOperation operation{};
+                            InputEvent event;
+                            if (!worker_ready ||
+                                !acquire_portable_helper_desktop_request(
+                                    worker_authorization, request, &lease,
+                                    &operation, &event, &detail) ||
+                                operation != PortableHelperOperation::SendKeyboardInput) {
+                                detail = "fake worker rejected an unauthorized input event";
+                                break;
+                            }
+                            PortableHelperMessage ack;
+                            ack.type = PortableHelperMessageType::Acknowledgement;
+                            ack.request_id = request.request_id;
+                            ack.payload = {1};
+                            if (!server->Send(std::move(ack), timeout_ms, &detail)) break;
+                            ++inputs;
+                            continue;
+                        }
+                        if (request.type == PortableHelperMessageType::SessionWorkerStop) {
+                            if (!worker_ready || request.payload.size() != 24) {
+                                detail = "fake worker rejected an invalid stop scope";
+                                break;
+                            }
+                            if (!worker_authorization.Revoke(
+                                    [] { return true; }, [] { return true; }, &detail))
+                                break;
+                            worker_ready = false;
+                            PortableHelperMessage ack;
+                            ack.type = PortableHelperMessageType::Acknowledgement;
+                            ack.request_id = request.request_id;
+                            ack.payload = {1};
+                            if (!server->Send(std::move(ack), timeout_ms, &detail)) break;
+                            ++worker_stops;
+                            continue;
+                        }
+                        if (request.type == PortableHelperMessageType::Stop) {
+                            PortableHelperMessage ack;
+                            ack.type = PortableHelperMessageType::Acknowledgement;
+                            ack.request_id = request.request_id;
+                            ack.payload = {1};
+                            if (!server->Send(std::move(ack), timeout_ms, &detail)) break;
+                            ++service_stops;
+                            break;
+                        }
+                        detail = "fake helper received an unexpected control message";
+                        break;
+                    }
+                    if (!detail.empty()) save_error(detail);
+                });
+            const DWORD thread_id = GetThreadId(
+                static_cast<HANDLE>(service_thread.native_handle()));
+            HANDLE thread_handle = OpenThread(SYNCHRONIZE, FALSE, thread_id);
+            if (thread_handle == nullptr) {
+                if (error) *error = "cannot open the fake service thread handle";
+                return false;
+            }
+            auto client = PortableHelperPipe::ConnectClient(
+                spec.instance_id, spec.parent, timeout_ms, error);
+            if (!client) {
+                CloseHandle(thread_handle);
+                return false;
+            }
+            auto connected = std::make_unique<PortableHelperServiceConnection>();
+            connected->channel = std::move(client);
+            connected->service_process = thread_handle;
+            connected->service_identity = spec.parent;
+            connected->instance_id = spec.instance_id;
+            *output = std::move(connected);
+            connected_instance = spec.instance_id;
+            return true;
+        }
+        bool Stop(const PortableHelperServiceSpec&, std::string*) override {
+            events.push_back("stop");
+            running = false;
+            if (service_thread.joinable()) service_thread.join();
+            return true;
+        }
+        bool DeleteIfOwned(const PortableHelperServiceSpec&, std::string*) override {
+            events.push_back("delete"); created = false; return true;
+        }
+        bool RemoveStagedImage(const PortableHelperServiceSpec&,
+                               std::string*) override {
+            events.push_back("remove-image"); return true;
+        }
+        ~FakeBackend() override {
+            if (service_thread.joinable()) service_thread.join();
+        }
+        void save_error(const std::string& value) {
+            std::lock_guard lock(error_mutex);
+            thread_error = value;
+        }
+
+        std::vector<std::string> events;
+        PortableHelperInstanceId connected_instance{};
+        std::atomic<unsigned> starts{0}, inputs{0}, worker_stops{0}, service_stops{0};
+        std::mutex error_mutex;
+        std::string thread_error;
+        bool created = false, running = false;
+        std::thread service_thread;
+    };
+
+    std::string error;
+    PortableHelperProcessIdentity parent;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "approved-session coordinator test uses an interactive parent identity");
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "approved-session coordinator receives fresh scope identifiers");
+    constexpr uint32_t operations =
+        static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
+    PortableHelperLocalApprovalGate gate;
+    PortableHelperPendingApproval pending;
+    PortableHelperLocalApprovalReceipt receipt;
+    require(gate.QueueRemoteRequest(instance, connection, parent.session_id,
+                                    operations, &pending, &error) &&
+                gate.Approve(
+                    std::move(pending), operations,
+                    [instance, connection, session = parent.session_id](
+                        const PortableHelperApprovalRequestView& request,
+                        uint32_t approved, std::string*) {
+                      return request.instance_id == instance &&
+                          request.connection_id == connection &&
+                          request.windows_session_id == session &&
+                          approved == operations;
+                    },
+                    &receipt, &error),
+            "local gate issues a one-use receipt for the approved session coordinator");
+
+    FakeBackend backend;
+    auto stage = [parent](const PortableHelperInstanceId& authorized_instance,
+                          PortableHelperServiceSpec* spec,
+                          std::string* stage_error) {
+        std::wstring directory, image;
+        return portable_helper_staging_paths(authorized_instance, &directory,
+                                              &image, stage_error) &&
+            make_portable_helper_service_spec(authorized_instance, image, parent,
+                                              spec, stage_error);
+    };
+    std::unique_ptr<PortableHelperApprovedSession> session;
+    require(PortableHelperApprovedSession::Start(
+                std::move(receipt), backend, stage, 5000, &session, &error) &&
+                session != nullptr && session->ready() &&
+                session->operations() == operations &&
+                backend.connected_instance == instance && backend.starts == 1,
+            "the approved instance is staged and the parent gate opens only after WorkerReady");
+
+    InputEvent key;
+    key.kind = InputKind::Key;
+    key.key.action = KeyAction::Down;
+    key.key.hid_usage = 0x04;
+    require(session->SendInputEvent(701, key, 5000, &error) &&
+                backend.inputs == 1 && session->ready(),
+            "ready approved session forwards an authorized typed keyboard RPC");
+    InputEvent pointer;
+    pointer.kind = InputKind::Mouse;
+    pointer.mouse.action = MouseAction::Move;
+    pointer.mouse.x = 10;
+    pointer.mouse.y = 10;
+    require(!session->SendInputEvent(702, pointer, 5000, &error) &&
+                backend.inputs == 1 && session->ready(),
+            "approved session refuses a pointer request outside its capability mask");
+    require(session->Stop(5000, &error) && !session->ready() &&
+                session->service_state() == PortableHelperServiceState::Removed &&
+                backend.worker_stops == 1 && backend.service_stops == 1 &&
+                backend.events == std::vector<std::string>(
+                    {"create", "start", "connect", "stop", "delete", "remove-image"}),
+            "session stop revokes the worker before cleaning the service and staged image");
+    session.reset();
+
+    PortableHelperInstanceId manager_instance{};
+    PortableHelperConnectionId manager_connection{};
+    require(secure_random(manager_instance.data(), manager_instance.size()) &&
+                secure_random(manager_connection.data(), manager_connection.size()),
+            "elevated-manager test creates an independent approved scope");
+    PortableHelperLocalApprovalGate manager_gate;
+    PortableHelperPendingApproval manager_pending;
+    PortableHelperLocalApprovalReceipt manager_receipt;
+    require(manager_gate.QueueRemoteRequest(
+                manager_instance, manager_connection, parent.session_id,
+                operations, &manager_pending, &error) &&
+                manager_gate.Approve(
+                    std::move(manager_pending), operations,
+                    [](const PortableHelperApprovalRequestView&, uint32_t,
+                       std::string*) { return true; },
+                    &manager_receipt, &error),
+            "local UI receipt is ready for transfer to the elevated manager");
+    PortableHelperAuthorization original_parent_authorization;
+    PortableHelperGrant manager_grant;
+    require(original_parent_authorization.BeginGrant(std::move(manager_receipt),
+                                                      &manager_grant, &error),
+            "original host consumes its receipt before sending only the scoped grant");
+    FakeBackend wrong_session_backend;
+    std::unique_ptr<PortableHelperApprovedSession> wrong_session;
+    const uint32_t wrong_session_id = parent.session_id == 1
+        ? 2 : parent.session_id - 1;
+    error.clear();
+    require(!PortableHelperApprovedSession::StartAuthorizedGrant(
+                manager_grant, wrong_session_id, wrong_session_backend, {},
+                5000, &wrong_session, &error) && wrong_session != nullptr &&
+                !wrong_session->ready() && wrong_session_backend.events.empty() &&
+                error.find("different Windows session") != std::string::npos,
+            "elevated manager refuses a grant for another Windows session before staging");
+    wrong_session.reset();
+
+    FakeBackend manager_backend;
+    PortableHelperSecret relayed_ready_proof{};
+    auto manager_stage = [parent](const PortableHelperInstanceId& authorized_instance,
+                                  PortableHelperServiceSpec* spec,
+                                  std::string* stage_error) {
+        std::wstring directory, image;
+        return portable_helper_staging_paths(authorized_instance, &directory,
+                                              &image, stage_error) &&
+            make_portable_helper_service_spec(authorized_instance, image, parent,
+                                              spec, stage_error);
+    };
+    std::unique_ptr<PortableHelperApprovedSession> manager_session;
+    require(PortableHelperApprovedSession::StartAuthorizedGrant(
+                manager_grant, parent.session_id, manager_backend, manager_stage,
+                5000, &manager_session, &error, &relayed_ready_proof) &&
+                manager_session != nullptr && manager_session->ready() &&
+                manager_backend.connected_instance == manager_instance &&
+                original_parent_authorization.ConfirmBrokerManagedWorkerReady(
+                    manager_grant, relayed_ready_proof, &error) &&
+                original_parent_authorization.state() ==
+                    PortableHelperAuthorizationState::Ready,
+            "elevated manager starts from the parent-issued grant and returns the authenticated WorkerReady proof");
+    SecureZeroMemory(relayed_ready_proof.data(), relayed_ready_proof.size());
+    require(manager_session->Stop(5000, &error) &&
+                manager_session->service_state() == PortableHelperServiceState::Removed,
+            "elevated manager tears down its service after the original parent confirms WorkerReady");
+    manager_session.reset();
+    require(original_parent_authorization.Revoke(
+                [] { return true; }, [] { return true; }, &error),
+            "original parent can revoke its proxy authorization after manager shutdown");
+
+    PortableHelperInstanceId other_instance{};
+    PortableHelperConnectionId other_connection{};
+    require(secure_random(other_instance.data(), other_instance.size()) &&
+                secure_random(other_connection.data(), other_connection.size()),
+            "scope mismatch test uses unrelated randomized instance identifiers");
+    PortableHelperInstanceId wrong_instance = other_instance;
+    wrong_instance[0] ^= 0xff;
+    if (std::all_of(wrong_instance.begin(), wrong_instance.end(),
+                    [](uint8_t value) { return value == 0; }))
+        wrong_instance[1] = 1;
+    PortableHelperLocalApprovalGate mismatch_gate;
+    PortableHelperPendingApproval mismatch_pending;
+    PortableHelperLocalApprovalReceipt mismatch_receipt;
+    require(mismatch_gate.QueueRemoteRequest(
+                other_instance, other_connection, parent.session_id, operations,
+                &mismatch_pending, &error) &&
+                mismatch_gate.Approve(
+                    std::move(mismatch_pending), operations,
+                    [](const PortableHelperApprovalRequestView&, uint32_t,
+                       std::string*) { return true; },
+                    &mismatch_receipt, &error),
+            "second local receipt scopes the mismatched staging regression");
+    FakeBackend mismatch_backend;
+    auto wrong_stage = [parent, wrong_instance](
+                           const PortableHelperInstanceId&,
+                           PortableHelperServiceSpec* spec,
+                           std::string* stage_error) {
+        std::wstring directory, image;
+        return portable_helper_staging_paths(wrong_instance, &directory, &image,
+                                              stage_error) &&
+            make_portable_helper_service_spec(wrong_instance, image, parent,
+                                              spec, stage_error);
+    };
+    std::unique_ptr<PortableHelperApprovedSession> rejected;
+    error.clear();
+    require(!PortableHelperApprovedSession::Start(
+                std::move(mismatch_receipt), mismatch_backend, wrong_stage,
+                5000, &rejected, &error) && rejected != nullptr &&
+                !rejected->ready() &&
+                rejected->service_state() == PortableHelperServiceState::Removed &&
+                mismatch_backend.events == std::vector<std::string>({"remove-image"}) &&
+                error.find("outside the approved grant scope") != std::string::npos,
+            "wrong staging instance is rejected and removed before SCM creation");
+    rejected.reset();
+}
+
 void portable_helper_worker_supervision() {
     using namespace chast::host;
     constexpr uint32_t session = 12;
@@ -1689,6 +2927,85 @@ void portable_helper_worker_supervision() {
             "a later supervisor retry finishes cleanup once the stuck operation drains");
 }
 
+int portable_helper_manager_channel_server_child(int argc, char** argv) {
+    using namespace chast::host;
+    if (argc != 5 ||
+        std::string(argv[1]) != "--portable-helper-manager-channel-server")
+        return 2;
+    std::vector<uint8_t> instance_bytes;
+    if (!chast::hex_decode(argv[2], instance_bytes) ||
+        instance_bytes.size() != kPortableHelperInstanceIdBytes)
+        return 3;
+    PortableHelperInstanceId instance{};
+    std::copy(instance_bytes.begin(), instance_bytes.end(), instance.begin());
+
+    uint32_t parent_pid = 0;
+    uint64_t parent_creation = 0;
+    try {
+        parent_pid = static_cast<uint32_t>(std::stoul(argv[3]));
+        parent_creation = std::stoull(argv[4]);
+    } catch (...) {
+        return 4;
+    }
+    PortableHelperProcessIdentity parent, current;
+    std::string error;
+    if (!query_portable_helper_process_identity(parent_pid, &parent, &error) ||
+        parent.creation_time != parent_creation ||
+        !current_portable_helper_process_identity(&current, &error) ||
+        parent.session_id == 0 || parent.session_id != current.session_id ||
+        _wcsicmp(parent.image_path.c_str(), current.image_path.c_str()) != 0)
+        return 5;
+    auto pipe = PortableHelperPipe::ConnectManagerClient(instance, parent,
+                                                          5000, &error);
+    if (!pipe) return 6;
+
+    PortableHelperAuthorization manager_authorization;
+    const auto start_session = [&manager_authorization, &current](
+        const PortableHelperGrant& grant, PortableHelperSecret* proof,
+        std::string* start_error) {
+        if (!manager_authorization.AcceptParentAuthorizedGrant(
+                grant, current.session_id, start_error) ||
+            !make_portable_helper_worker_ready_proof(grant, proof,
+                                                       start_error) ||
+            !manager_authorization.ConfirmBrokerManagedWorkerReady(
+                grant, *proof, start_error))
+            return false;
+        return true;
+    };
+    const auto stop_session = [&manager_authorization](std::string* stop_error) {
+        return manager_authorization.Revoke([] { return true; },
+                                           [] { return true; }, stop_error);
+    };
+    const auto capture_frame = [](uint64_t, uint32_t,
+                                  PortableHelperCapturedFrame* frame,
+                                  std::string* capture_error) {
+        if (frame == nullptr) {
+            if (capture_error != nullptr)
+                *capture_error = "missing test frame output";
+            return false;
+        }
+        frame->width = 2;
+        frame->height = 2;
+        frame->frame_number = 17;
+        frame->png = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+        return true;
+    };
+    const auto input_event = [](uint64_t, const chast::InputEvent& event,
+                                uint32_t, std::string* input_error) {
+        if (event.kind == chast::InputKind::Key &&
+            event.key.action == chast::KeyAction::Down &&
+            event.key.hid_usage == 0x04)
+            return true;
+        if (input_error != nullptr)
+            *input_error = "unexpected test input event";
+        return false;
+    };
+    return run_portable_helper_manager_control_channel(
+               *pipe, current.session_id, 5000, start_session, stop_session,
+               &error, capture_frame, input_event)
+        ? 0 : 10;
+}
+
 int portable_helper_control_server_child(int argc, char** argv) {
     using namespace chast::host;
     const bool worker_control_server = argc == 5 &&
@@ -1696,12 +3013,20 @@ int portable_helper_control_server_child(int argc, char** argv) {
     const bool worker_no_release_control_server = argc == 5 &&
         std::string(argv[1]) ==
             "--portable-helper-worker-no-release-control-server";
+    const bool worker_unvalidated_input_control_server = argc == 5 &&
+        std::string(argv[1]) ==
+            "--portable-helper-worker-unvalidated-input-control-server";
+    const bool worker_retry_cleanup_control_server = argc == 5 &&
+        std::string(argv[1]) ==
+            "--portable-helper-worker-retry-cleanup-control-server";
     const bool basic_control_server = argc == 5 &&
         std::string(argv[1]) == "--portable-helper-control-server";
     const bool negative_input_control_server = argc == 5 &&
         std::string(argv[1]) ==
             "--portable-helper-negative-input-control-server";
     if (!worker_control_server && !worker_no_release_control_server &&
+        !worker_unvalidated_input_control_server &&
+        !worker_retry_cleanup_control_server &&
         !basic_control_server && !negative_input_control_server)
         return 2;
     std::vector<uint8_t> bytes;
@@ -1730,8 +3055,11 @@ int portable_helper_control_server_child(int argc, char** argv) {
     }
     std::unique_ptr<chast::host::PortableHelperServiceSessionWorker>
         session_worker;
+    auto cleanup_attempts = std::make_shared<std::atomic<unsigned>>(0);
     chast::host::PortableHelperServiceControlRequestHandler request_handler;
-    if (worker_control_server || worker_no_release_control_server) {
+    if (worker_control_server || worker_no_release_control_server ||
+        worker_unvalidated_input_control_server ||
+        worker_retry_cleanup_control_server) {
         chast::host::PortableHelperServiceSpec spec;
         spec.instance_id = instance;
         spec.executable_path = executable_path();
@@ -1780,15 +3108,30 @@ int portable_helper_control_server_child(int argc, char** argv) {
             session_worker =
                 std::make_unique<chast::host::PortableHelperServiceSessionWorker>(
                     std::move(spec), std::move(launcher),
-                    [](const chast::host::PortableHelperGrant&,
-                       std::string*) { return true; });
+                    [cleanup_attempts, worker_retry_cleanup_control_server](
+                        const chast::host::PortableHelperGrant&,
+                        std::string* cleanup_error) {
+                        if (worker_retry_cleanup_control_server &&
+                            cleanup_attempts->fetch_add(1) == 0) {
+                            if (cleanup_error != nullptr)
+                                *cleanup_error = "injected first cleanup failure";
+                            return false;
+                        }
+                        return true;
+                    },
+                    !worker_unvalidated_input_control_server);
         }
-        request_handler = [&session_worker](
+        request_handler = [&session_worker, worker_retry_cleanup_control_server](
             chast::host::PortableHelperPipe& control,
             const chast::host::PortableHelperMessage& request,
             bool* stop_service, std::string* handler_error) {
-            return session_worker->HandleControlRequest(
+            const bool handled = session_worker->HandleControlRequest(
                 control, request, stop_service, handler_error);
+            if (worker_retry_cleanup_control_server && handler_error != nullptr &&
+                !handler_error->empty())
+                std::fprintf(stderr, "cleanup-retry helper: %s\n",
+                             handler_error->c_str());
+            return handled;
         };
     } else if (negative_input_control_server) {
         request_handler = [](chast::host::PortableHelperPipe& control,
@@ -1822,6 +3165,12 @@ int portable_helper_control_server_child(int argc, char** argv) {
             CloseHandle(stop_event);
             return 8;
         }
+    }
+    if (worker_retry_cleanup_control_server &&
+        cleanup_attempts->load() != 2) {
+        CloseHandle(parent_process);
+        CloseHandle(stop_event);
+        return 9;
     }
     CloseHandle(parent_process);
     CloseHandle(stop_event);
@@ -2178,7 +3527,10 @@ void portable_helper_service_channel_transport() {
         WaitForSingleObject(child.hProcess, 5000);
     };
     const auto check_child = [&](bool condition, const char* message) {
-        if (condition) return;
+        if (condition) {
+            std::printf("ok   %s\n", message);
+            return;
+        }
         stop_child();
         CloseHandle(child.hProcess);
         child.hProcess = nullptr;
@@ -2224,6 +3576,482 @@ void portable_helper_service_channel_transport() {
                 "helper control server exits successfully after orderly stop");
     CloseHandle(child.hProcess);
     child.hProcess = nullptr;
+}
+
+void portable_helper_manager_channel_transport() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "manager-channel test captures the interactive host identity");
+
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "manager-channel test creates fresh instance and connection scopes");
+    PortableHelperAuthorization authorization;
+    PortableHelperGrant grant;
+    const uint32_t operations = static_cast<uint32_t>(
+        PortableHelperOperation::CaptureFrames) |
+        static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
+    require(begin_local_approval_test_grant(
+                authorization, instance, connection, parent.session_id,
+                operations, &grant, &error),
+            "manager-channel test mints a grant only through local approval");
+
+    std::wstring authorized_logon_sid;
+    require(current_portable_helper_logon_sid(&authorized_logon_sid, &error),
+            "manager-channel endpoint is restricted to the host logon SID");
+    auto server = PortableHelperPipe::CreateManagerServer(
+        instance, authorized_logon_sid, &error);
+    require(server != nullptr &&
+                PortableHelperPipe::ManagerEndpointName(instance) !=
+                    PortableHelperPipe::EndpointName(instance) &&
+                PortableHelperPipe::ManagerEndpointName(instance) !=
+                    PortableHelperPipe::SessionWorkerEndpointName(instance,
+                                                                  connection),
+            "manager bootstrap uses a separate instance-derived pipe endpoint");
+    if (!server) return;
+
+    const auto executable = executable_path();
+    const std::wstring command = L"\"" + executable +
+        L"\" --portable-helper-manager-channel-server " +
+        widen(hex_encode(instance.data(), instance.size())) + L" " +
+        std::to_wstring(parent.process_id) + L" " +
+        std::to_wstring(parent.creation_time);
+    std::vector<wchar_t> command_line(command.begin(), command.end());
+    command_line.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &startup, &child) != FALSE,
+            "launch an isolated manager-channel peer process");
+    if (child.hProcess == nullptr) return;
+    CloseHandle(child.hThread);
+    const auto stop_child = [&] {
+        if (WaitForSingleObject(child.hProcess, 0) != WAIT_OBJECT_0)
+            (void)TerminateProcess(child.hProcess, ERROR_CANCELLED);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+    };
+    const auto check_child = [&](bool condition, const char* message) {
+        if (condition) {
+            std::printf("ok   %s\n", message);
+            return;
+        }
+        stop_child();
+        CloseHandle(child.hProcess);
+        child.hProcess = nullptr;
+        require(false, message);
+    };
+
+    PortableHelperProcessIdentity manager;
+    check_child(query_portable_helper_process_identity(
+                    child.dwProcessId, &manager, &error) &&
+                    manager.session_id == parent.session_id &&
+                    manager.user_sid == parent.user_sid &&
+                    manager.logon_sid == parent.logon_sid,
+                "manager peer identity is bound to the exact interactive logon");
+    bool manager_elevated = false;
+    check_child(query_portable_helper_process_elevation(
+                    child.dwProcessId, &manager_elevated, &error),
+                "manager process elevation can be queried independently of pipe framing");
+    (void)manager_elevated;  // This same-user test peer is not a UAC launch.
+    check_child(server->Accept(manager, 5000, &error),
+                "host authenticates the exact manager PID, image, session and logon");
+
+    check_child(send_portable_helper_manager_start(
+                    *server, grant, 701, 5000, &error),
+                "host sends only the locally approved scoped grant over manager IPC");
+    PortableHelperSecret proof{};
+    const bool manager_ready = receive_portable_helper_manager_ready(
+        *server, authorization, grant, 701, 5000, &proof, &error);
+    const bool valid_proof = std::any_of(proof.begin(), proof.end(),
+                                         [](uint8_t value) { return value != 0; });
+    const bool ready_gate_open = authorization.state() ==
+        PortableHelperAuthorizationState::Ready;
+    SecureZeroMemory(proof.data(), proof.size());
+    check_child(manager_ready && ready_gate_open && valid_proof,
+                "host opens its forwarding gate only after correlated WorkerReady proof");
+    PortableHelperManagerRpc manager_rpc(*server, authorization, grant);
+    PortableHelperCapturedFrame frame;
+    check_child(manager_rpc.CaptureFrame(703, 5000, &frame, &error) &&
+                    frame.width == 2 && frame.height == 2 &&
+                    frame.frame_number == 17 && frame.png.size() == 8,
+                "manager relays a grant-scoped captured frame through bounded PNG chunks");
+    InputEvent event;
+    event.kind = InputKind::Key;
+    event.key.action = KeyAction::Down;
+    event.key.hid_usage = 0x04;
+    InputEvent pointer_event;
+    pointer_event.kind = InputKind::Mouse;
+    pointer_event.mouse.action = MouseAction::ButtonDown;
+    pointer_event.mouse.buttons = kMouseLeft;
+    check_child(!manager_rpc.SendInputEvent(705, pointer_event, 5000, &error) &&
+                    authorization.state() ==
+                        PortableHelperAuthorizationState::Ready,
+                "manager proxy refuses an input operation outside the approved grant before IPC");
+    check_child(manager_rpc.SendInputEvent(704, event, 5000, &error),
+                "manager relays only the locally authorized typed input event");
+    check_child(manager_rpc.Stop(702, 5000, &error) &&
+                    authorization.state() ==
+                        PortableHelperAuthorizationState::Revoked,
+                "host waits for cleanup acknowledgement before closing its authorization gate");
+    server.reset();
+    check_child(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
+                "manager channel closes after the helper lifecycle is acknowledged");
+    DWORD exit_code = 1;
+    check_child(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0,
+                "isolated manager peer completes the typed lifecycle exchange");
+    CloseHandle(child.hProcess);
+    child.hProcess = nullptr;
+}
+
+void portable_helper_elevated_manager_parent_session() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "parent-manager session test captures its interactive identity");
+    bool parent_elevated = false;
+    require(query_portable_helper_process_elevation(
+                parent.process_id, &parent_elevated, &error),
+            "parent-manager session test queries the caller token level");
+
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "parent-manager session test creates fresh approval scope");
+    PortableHelperLocalApprovalGate gate;
+    PortableHelperPendingApproval pending;
+    PortableHelperLocalApprovalReceipt receipt;
+    const uint32_t operations =
+        static_cast<uint32_t>(PortableHelperOperation::CaptureFrames) |
+        static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
+    require(gate.QueueRemoteRequest(instance, connection, parent.session_id,
+                                    operations, &pending, &error) &&
+                gate.Approve(std::move(pending), operations,
+                    [](const PortableHelperApprovalRequestView& request,
+                       uint32_t approved, std::string*) {
+                      return request.windows_session_id != 0 &&
+                          request.requested_operations == approved;
+                    }, &receipt, &error),
+            "parent-manager test creates a one-use receipt on the local approval thread");
+
+    const auto executable = executable_path();
+    const auto make_launcher = [&](PortableHelperInstanceId instance_scope,
+                                   HANDLE* retained_process,
+                                   bool* canonical_arguments,
+                                   const std::function<void()>& after_launch = {}) {
+      return PortableHelperElevatedManagerSession::Launcher(
+          [&, instance_scope, retained_process, canonical_arguments,
+           after_launch](const std::wstring& parameters,
+                         DWORD& launch_error) -> HANDLE {
+        const std::wstring expected = L"--portable-helper-manager " +
+            widen(hex_encode(instance_scope.data(), instance_scope.size())) + L" " +
+            std::to_wstring(parent.process_id) + L" " +
+            std::to_wstring(parent.creation_time);
+        *canonical_arguments = parameters == expected;
+        if (!*canonical_arguments) {
+          launch_error = ERROR_INVALID_PARAMETER;
+          return nullptr;
+        }
+        const std::wstring command = L"\"" + executable +
+            L"\" --portable-helper-manager-channel-server " +
+            widen(hex_encode(instance_scope.data(), instance_scope.size())) + L" " +
+            std::to_wstring(parent.process_id) + L" " +
+            std::to_wstring(parent.creation_time);
+        std::vector<wchar_t> command_line(command.begin(), command.end());
+        command_line.push_back(L'\0');
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION child{};
+        if (!CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                            nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                            nullptr, &startup, &child)) {
+          launch_error = GetLastError();
+          return nullptr;
+        }
+        CloseHandle(child.hThread);
+        HANDLE retained = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), child.hProcess,
+                             GetCurrentProcess(), &retained,
+                             SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                             FALSE, 0)) {
+          launch_error = GetLastError();
+          TerminateProcess(child.hProcess, ERROR_CANCELLED);
+          CloseHandle(child.hProcess);
+          return nullptr;
+        }
+        *retained_process = retained;
+        launch_error = ERROR_SUCCESS;
+        if (after_launch) after_launch();
+        return child.hProcess;
+      });
+    };
+    HANDLE test_process = nullptr;
+    bool canonical_manager_arguments = false;
+    bool connection_live = true;
+    unsigned revalidation_calls = 0;
+    auto launcher = make_launcher(instance, &test_process,
+                                  &canonical_manager_arguments);
+
+    std::unique_ptr<PortableHelperElevatedManagerSession> session;
+    const bool started = PortableHelperElevatedManagerSession::Start(
+        std::move(receipt), 5000,
+        [&](std::string* revalidation_error) {
+          ++revalidation_calls;
+          if (!connection_live && revalidation_error != nullptr)
+            *revalidation_error = "the original viewer disconnected";
+          return connection_live;
+        },
+        &session, &error, std::move(launcher));
+    require(canonical_manager_arguments,
+            "parent launcher passes only canonical instance and parent identity arguments");
+    if (!parent_elevated) {
+      require(!started && session == nullptr &&
+                  error.find("UAC-elevated") != std::string::npos,
+              "parent refuses a manager child without an elevated token before sending its grant");
+      if (test_process != nullptr) {
+        require(WaitForSingleObject(test_process, 5000) == WAIT_OBJECT_0,
+                "rejected non-elevated manager child exits after endpoint teardown");
+        CloseHandle(test_process);
+      }
+      return;
+    }
+
+    require(started && session != nullptr && session->ready() &&
+                session->grant().instance_id == instance &&
+                session->grant().connection_id == connection &&
+                revalidation_calls >= 3,
+            "elevated manager session consumes the approved receipt and validates WorkerReady");
+    require(test_process != nullptr &&
+                WaitForSingleObject(test_process, 0) == WAIT_TIMEOUT,
+            "elevated manager remains alive after successful readiness");
+    PortableHelperCapturedFrame frame;
+    require(session->CaptureFrame(711, 5000, &frame, &error) &&
+                frame.width == 2 && frame.height == 2,
+            "parent manager session exposes the approved capture proxy");
+    InputEvent event;
+    event.kind = InputKind::Key;
+    event.key.action = KeyAction::Down;
+    event.key.hid_usage = 0x04;
+    require(session->SendInputEvent(712, event, 5000, &error),
+            "parent manager session exposes the approved typed input proxy");
+    require(session->Stop(713, 5000, &error) && !session->ready(),
+            "parent manager session waits for cleanup ACK and process exit");
+    require(test_process != nullptr &&
+                WaitForSingleObject(test_process, 5000) == WAIT_OBJECT_0,
+            "manager test child exits after confirmed session cleanup");
+    CloseHandle(test_process);
+    test_process = nullptr;
+
+    PortableHelperInstanceId task_instance{};
+    PortableHelperConnectionId task_connection{};
+    require(secure_random(task_instance.data(), task_instance.size()) &&
+                secure_random(task_connection.data(), task_connection.size()),
+            "background manager task test creates a new viewer scope");
+    PortableHelperLocalApprovalGate task_gate;
+    PortableHelperPendingApproval task_pending;
+    PortableHelperLocalApprovalReceipt task_receipt;
+    const uint32_t capture_only =
+        static_cast<uint32_t>(PortableHelperOperation::CaptureFrames);
+    require(task_gate.QueueRemoteRequest(task_instance, task_connection,
+                                         parent.session_id, capture_only,
+                                         &task_pending, &error) &&
+                task_gate.Approve(std::move(task_pending), capture_only,
+                    [](const PortableHelperApprovalRequestView& request,
+                       uint32_t approved, std::string*) {
+                      return request.windows_session_id != 0 &&
+                          request.requested_operations == approved;
+                    }, &task_receipt, &error),
+            "background manager task receives a one-use local approval receipt");
+    HANDLE task_process = nullptr;
+    bool task_arguments_canonical = false;
+    auto task_launcher = make_launcher(task_instance, &task_process,
+                                      &task_arguments_canonical);
+    auto manager_task = PortableHelperElevatedManagerTask::Start(
+        std::move(task_receipt), 5000,
+        [](std::string*) { return true; }, &error,
+        std::move(task_launcher));
+    require(manager_task != nullptr,
+            "background manager task starts its owned UAC transaction off the caller");
+    const bool task_ready = until([&] {
+      const auto state = manager_task->poll();
+      return state.code != ElevationCode::Pending;
+    }, 10s);
+    require(task_ready && manager_task->poll().code == ElevationCode::HelperReady &&
+                manager_task->ready() && task_arguments_canonical,
+            "background manager task reports per-connection readiness only after WorkerReady");
+    PortableHelperCapturedFrame task_frame;
+    require(manager_task->CaptureFrame(&task_frame, &error) &&
+                task_frame.width == 2 && task_frame.height == 2,
+            "background manager task forwards only its approved capture capability");
+    manager_task->cancel();
+    require(!manager_task->ready() && task_process != nullptr &&
+                WaitForSingleObject(task_process, 5000) == WAIT_OBJECT_0,
+            "background task cancellation waits for helper cleanup and manager exit");
+    CloseHandle(task_process);
+
+    PortableHelperInstanceId cancelled_instance{};
+    PortableHelperConnectionId cancelled_connection{};
+    require(secure_random(cancelled_instance.data(), cancelled_instance.size()) &&
+                secure_random(cancelled_connection.data(), cancelled_connection.size()),
+            "startup-cancellation test creates an isolated approval scope");
+    PortableHelperLocalApprovalGate cancelled_gate;
+    PortableHelperPendingApproval cancelled_pending;
+    PortableHelperLocalApprovalReceipt cancelled_receipt;
+    require(cancelled_gate.QueueRemoteRequest(
+                cancelled_instance, cancelled_connection, parent.session_id,
+                capture_only, &cancelled_pending, &error) &&
+                cancelled_gate.Approve(std::move(cancelled_pending), capture_only,
+                    [](const PortableHelperApprovalRequestView& request,
+                       uint32_t approved, std::string*) {
+                      return request.windows_session_id != 0 &&
+                          request.requested_operations == approved;
+                    }, &cancelled_receipt, &error),
+            "startup-cancellation test obtains a local receipt");
+    bool cancelled_arguments_canonical = false;
+    HANDLE cancelled_process = nullptr;
+    bool cancelled_connection_live = true;
+    std::mutex cancelled_launch_mutex;
+    std::condition_variable cancelled_launch_changed;
+    bool cancelled_launcher_entered = false;
+    bool allow_cancelled_launcher_return = false;
+    auto cancelled_launcher = make_launcher(
+        cancelled_instance, &cancelled_process, &cancelled_arguments_canonical,
+        [&] {
+          std::unique_lock lock(cancelled_launch_mutex);
+          cancelled_launcher_entered = true;
+          cancelled_launch_changed.notify_all();
+          cancelled_launch_changed.wait(lock, [&] {
+            return allow_cancelled_launcher_return;
+          });
+        });
+    auto cancelled_task = PortableHelperElevatedManagerTask::Start(
+        std::move(cancelled_receipt), 5000,
+        [&](std::string*) { return cancelled_connection_live; }, &error,
+        std::move(cancelled_launcher));
+    require(cancelled_task != nullptr,
+            "startup cancellation task launches through the isolated manager fixture");
+    bool launch_window_observed = false;
+    {
+      std::unique_lock lock(cancelled_launch_mutex);
+      launch_window_observed = cancelled_launch_changed.wait_for(
+          lock, 5s, [&] { return cancelled_launcher_entered; });
+    }
+    cancelled_connection_live = false;
+    cancelled_task->cancel();
+    {
+      std::lock_guard lock(cancelled_launch_mutex);
+      allow_cancelled_launcher_return = true;
+    }
+    cancelled_launch_changed.notify_all();
+    require(launch_window_observed && cancelled_arguments_canonical,
+            "startup cancellation test observes the manager launch window");
+    require(until([&] {
+              return cancelled_task->poll().code != ElevationCode::Pending;
+            }, 10s) && cancelled_task->poll().code == ElevationCode::Cancelled &&
+                cancelled_process != nullptr &&
+                WaitForSingleObject(cancelled_process, 5000) == WAIT_OBJECT_0,
+            "viewer cancellation during UAC startup prevents grant delivery and tears down the child");
+    CloseHandle(cancelled_process);
+
+    PortableHelperInstanceId disconnected_instance{};
+    PortableHelperConnectionId disconnected_connection{};
+    require(secure_random(disconnected_instance.data(), disconnected_instance.size()) &&
+                secure_random(disconnected_connection.data(), disconnected_connection.size()),
+            "post-ready disconnect test creates a fresh approval scope");
+    PortableHelperLocalApprovalGate disconnected_gate;
+    PortableHelperPendingApproval disconnected_pending;
+    PortableHelperLocalApprovalReceipt disconnected_receipt;
+    require(disconnected_gate.QueueRemoteRequest(
+                disconnected_instance, disconnected_connection,
+                parent.session_id, operations, &disconnected_pending, &error) &&
+                disconnected_gate.Approve(std::move(disconnected_pending), operations,
+                    [](const PortableHelperApprovalRequestView& request,
+                       uint32_t approved, std::string*) {
+                      return request.windows_session_id != 0 &&
+                          request.requested_operations == approved;
+                    }, &disconnected_receipt, &error),
+            "post-ready disconnect test obtains a separately approved receipt");
+    bool disconnected_connection_live = true;
+    bool disconnected_arguments_canonical = false;
+    HANDLE disconnected_process = nullptr;
+    auto disconnected_launcher = make_launcher(
+        disconnected_instance, &disconnected_process,
+        &disconnected_arguments_canonical);
+    std::unique_ptr<PortableHelperElevatedManagerSession> disconnected_session;
+    const bool disconnected_started = PortableHelperElevatedManagerSession::Start(
+        std::move(disconnected_receipt), 5000,
+        [&](std::string* revalidation_error) {
+          if (!disconnected_connection_live && revalidation_error != nullptr)
+            *revalidation_error = "the original viewer disconnected";
+          return disconnected_connection_live;
+        },
+        &disconnected_session, &error, std::move(disconnected_launcher));
+    require(disconnected_arguments_canonical && disconnected_started &&
+                disconnected_session != nullptr && disconnected_session->ready(),
+            "post-ready disconnect test starts an authenticated manager session");
+    disconnected_connection_live = false;
+    PortableHelperCapturedFrame stale_frame;
+    require(!disconnected_session->CaptureFrame(714, 5000, &stale_frame, &error) &&
+                error.find("viewer disconnected") != std::string::npos &&
+                !disconnected_session->ready(),
+            "a disconnected original viewer cannot use capture and closes the manager gate");
+    require(disconnected_process != nullptr &&
+                WaitForSingleObject(disconnected_process, 5000) == WAIT_OBJECT_0,
+            "post-ready viewer loss waits for manager cleanup and process exit");
+    DWORD disconnected_exit_code = 1;
+    const bool disconnected_exit_read =
+        GetExitCodeProcess(disconnected_process, &disconnected_exit_code) != FALSE;
+    require(disconnected_exit_read && disconnected_exit_code == ERROR_SUCCESS,
+            "post-ready disconnect cleanup is acknowledged by the manager");
+    CloseHandle(disconnected_process);
+
+    PortableHelperInstanceId stale_instance{};
+    PortableHelperConnectionId stale_connection{};
+    require(secure_random(stale_instance.data(), stale_instance.size()) &&
+                secure_random(stale_connection.data(), stale_connection.size()),
+            "stale-manager test creates a second isolated approval scope");
+    PortableHelperLocalApprovalGate stale_gate;
+    PortableHelperPendingApproval stale_pending;
+    PortableHelperLocalApprovalReceipt stale_receipt;
+    require(stale_gate.QueueRemoteRequest(stale_instance, stale_connection,
+                                          parent.session_id, operations,
+                                          &stale_pending, &error) &&
+                stale_gate.Approve(std::move(stale_pending), operations,
+                    [](const PortableHelperApprovalRequestView& request,
+                       uint32_t approved, std::string*) {
+                      return request.windows_session_id != 0 &&
+                          request.requested_operations == approved;
+                    }, &stale_receipt, &error),
+            "stale-manager test obtains a separately approved one-use receipt");
+    bool stale_connection_live = true;
+    bool stale_arguments_canonical = false;
+    HANDLE stale_process = nullptr;
+    auto stale_launcher = make_launcher(stale_instance, &stale_process,
+        &stale_arguments_canonical, [&] { stale_connection_live = false; });
+    std::unique_ptr<PortableHelperElevatedManagerSession> stale_session;
+    const bool stale_started = PortableHelperElevatedManagerSession::Start(
+        std::move(stale_receipt), 5000,
+        [&](std::string* revalidation_error) {
+          if (!stale_connection_live && revalidation_error != nullptr)
+            *revalidation_error = "the viewer disconnected while UAC was pending";
+          return stale_connection_live;
+        },
+        &stale_session, &error, std::move(stale_launcher));
+    require(stale_arguments_canonical && !stale_started &&
+                stale_session == nullptr &&
+                error.find("viewer disconnected") != std::string::npos,
+            "parent revalidates the original viewer after UAC launch and before grant delivery");
+    require(stale_process != nullptr &&
+                WaitForSingleObject(stale_process, 5000) == WAIT_OBJECT_0,
+            "stale viewer cancellation closes the manager before it can own a grant");
+    CloseHandle(stale_process);
 }
 
 void portable_helper_parent_rpc_rejection_revokes_gate() {
@@ -2501,7 +4329,117 @@ void portable_helper_service_session_worker_control_loop() {
     child.hProcess = nullptr;
 }
 
-void portable_helper_service_requires_emergency_input_release() {
+void portable_helper_service_retries_failed_input_cleanup() {
+    using namespace chast::host;
+    PortableHelperProcessIdentity parent;
+    std::string error;
+    require(current_portable_helper_process_identity(&parent, &error) &&
+                parent.session_id != 0,
+            "cleanup retry test captures the interactive parent identity");
+    PortableHelperInstanceId instance{};
+    PortableHelperConnectionId connection{};
+    require(secure_random(instance.data(), instance.size()) &&
+                secure_random(connection.data(), connection.size()),
+            "cleanup retry test creates an isolated connection generation");
+
+    const auto executable = executable_path();
+    const std::wstring command = L"\"" + executable +
+        L"\" --portable-helper-worker-retry-cleanup-control-server " +
+        widen(hex_encode(instance.data(), instance.size())) + L" " +
+        std::to_wstring(parent.process_id) + L" " +
+        std::to_wstring(parent.creation_time);
+    std::vector<wchar_t> command_line(command.begin(), command.end());
+    command_line.push_back(L'\0');
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &startup, &child) != FALSE,
+            "launch a helper whose first emergency cleanup attempt fails");
+    CloseHandle(child.hThread);
+    const auto stop_child = [&] {
+        if (WaitForSingleObject(child.hProcess, 0) != WAIT_OBJECT_0)
+            (void)TerminateProcess(child.hProcess, ERROR_CANCELLED);
+        (void)WaitForSingleObject(child.hProcess, 5000);
+        CloseHandle(child.hProcess);
+    };
+    const auto check = [&](bool condition, const char* description) {
+        if (condition) return;
+        stop_child();
+        require(false, description);
+    };
+
+    PortableHelperProcessIdentity helper;
+    check(query_portable_helper_process_identity(child.dwProcessId, &helper,
+                                                  &error),
+          "query the cleanup-retry helper identity");
+    auto control = PortableHelperPipe::ConnectClient(
+        instance, helper, 5000, &error);
+    check(control != nullptr, "connect to the cleanup-retry helper");
+
+    PortableHelperAuthorization authorization;
+    PortableHelperGrant grant;
+    const uint32_t operations =
+        static_cast<uint32_t>(PortableHelperOperation::CaptureFrames) |
+        static_cast<uint32_t>(PortableHelperOperation::SendKeyboardInput);
+    check(begin_local_approval_test_grant(
+              authorization, instance, connection, parent.session_id,
+              operations, &grant, &error),
+          "create the test-only authorized keyboard grant");
+    PortableHelperServiceConnection service_connection;
+    service_connection.instance_id = instance;
+    service_connection.channel = std::move(control);
+    const bool worker_started = start_portable_helper_session_worker(
+        service_connection, authorization, grant, 10000, &error);
+    if (!worker_started)
+        std::fprintf(stderr, "cleanup retry worker start error: %s\n",
+                     error.c_str());
+    check(worker_started,
+          "start the isolated session worker before testing cleanup retry");
+
+    PortableHelperMessage stop_worker;
+    stop_worker.type = PortableHelperMessageType::SessionWorkerStop;
+    stop_worker.request_id = 402;
+    stop_worker.payload.insert(stop_worker.payload.end(),
+                               connection.begin(), connection.end());
+    for (unsigned shift = 0; shift < 64; shift += 8)
+        stop_worker.payload.push_back(
+            static_cast<uint8_t>(grant.generation >> shift));
+    check(service_connection.channel->Send(std::move(stop_worker), 5000,
+                                            &error),
+          "request worker shutdown so the injected cleanup failure is reached");
+    PortableHelperMessage response;
+    check(service_connection.channel->Receive(&response, 10000, &error) &&
+              response.type == PortableHelperMessageType::Acknowledgement &&
+              response.request_id == 402 &&
+              response.payload == std::vector<uint8_t>{0},
+          "helper reports the first cleanup failure without claiming release");
+    check(authorization.Revoke([] { return true; }, [] { return true; },
+                               &error),
+          "parent closes its local grant gate after the failed cleanup result");
+
+    PortableHelperMessage stop_service;
+    stop_service.type = PortableHelperMessageType::Stop;
+    stop_service.request_id = 403;
+    check(service_connection.channel->Send(std::move(stop_service), 5000,
+                                            &error) &&
+              service_connection.channel->Receive(&response, 10000, &error) &&
+              response.type == PortableHelperMessageType::Acknowledgement &&
+              response.request_id == 403 &&
+              response.payload == std::vector<uint8_t>{1},
+          "service shutdown retries pending input cleanup before acknowledging Stop");
+    service_connection.Reset();
+    check(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0,
+          "helper exits after the retry confirms cleanup");
+    DWORD exit_code = 1;
+    check(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0,
+          "cleanup retry helper records exactly one failed and one successful attempt");
+    CloseHandle(child.hProcess);
+    child.hProcess = nullptr;
+}
+
+void portable_helper_service_requires_emergency_input_release(
+    bool cleanup_provider_only = false) {
     using namespace chast::host;
     PortableHelperProcessIdentity parent;
     std::string error;
@@ -2514,8 +4452,10 @@ void portable_helper_service_requires_emergency_input_release() {
                 secure_random(connection.data(), connection.size()),
             "input-release policy test creates isolated scope identifiers");
     const auto executable = executable_path();
-    const std::wstring command = L"\"" + executable +
-        L"\" --portable-helper-worker-no-release-control-server " +
+    const std::wstring command = L"\"" + executable + L"\" " +
+        (cleanup_provider_only
+             ? L"--portable-helper-worker-unvalidated-input-control-server "
+             : L"--portable-helper-worker-no-release-control-server ") +
         widen(hex_encode(instance.data(), instance.size())) + L" " +
         std::to_wstring(parent.process_id) + L" " +
         std::to_wstring(parent.creation_time);
@@ -2526,7 +4466,9 @@ void portable_helper_service_requires_emergency_input_release() {
     require(CreateProcessW(executable.c_str(), command_line.data(), nullptr,
                            nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
                            &startup, &child) != FALSE,
-            "launch a helper without an emergency input-release provider");
+            cleanup_provider_only
+                ? "launch a helper with a cleanup callback but no physical-key conflict policy"
+                : "launch a helper without an emergency input-release provider");
     CloseHandle(child.hThread);
     auto cleanup_child = [&] {
         if (WaitForSingleObject(child.hProcess, 0) != WAIT_OBJECT_0)
@@ -2586,7 +4528,7 @@ void portable_helper_service_requires_emergency_input_release() {
                                  &error),
             "parent revokes its pending grant after helper rejects unsafe input startup");
     require(rejected,
-            "helper refuses input capability until emergency release is configured");
+            "helper refuses input capability until emergency cleanup and physical-key conflict policy are validated");
 
     PortableHelperMessage stop;
     stop.type = PortableHelperMessageType::Stop;
@@ -2625,15 +4567,22 @@ void portable_helper_session_worker_pipe() {
     require(PortableHelperPipe::SessionWorkerEndpointName(
                 instance, zero_connection).empty(),
             "worker endpoint derivation rejects an empty connection scope");
+    require(PortableHelperPipe::InputCleanupEndpointName(
+                instance, connection, 0).empty(),
+            "cleanup endpoint derivation rejects an empty generation");
     const std::wstring control_name = PortableHelperPipe::EndpointName(instance);
     const std::wstring worker_name =
         PortableHelperPipe::SessionWorkerEndpointName(instance, connection);
+    const std::wstring cleanup_name =
+        PortableHelperPipe::InputCleanupEndpointName(instance, connection, 35);
     require(!control_name.empty() && !worker_name.empty() &&
-                control_name != worker_name &&
+                !cleanup_name.empty() && control_name != worker_name &&
+                cleanup_name != worker_name && cleanup_name != control_name &&
+                cleanup_name.find(L"-g0000000000000023") != std::wstring::npos &&
                 worker_name.find(widen(hex_encode(connection.data(),
                                                   connection.size()))) !=
                     std::wstring::npos,
-            "session worker endpoint is distinct and scoped to its connection");
+            "session worker and cleanup endpoints are separate and cleanup is generation-scoped");
 
     auto control = PortableHelperPipe::CreateServer(instance, logon_sid, &error);
     require(control != nullptr,
@@ -2642,12 +4591,19 @@ void portable_helper_session_worker_pipe() {
         instance, connection, logon_sid, &error);
     require(worker != nullptr,
             "create a separate authenticated endpoint for one session worker");
+    auto cleanup_endpoint = PortableHelperPipe::CreateInputCleanupServer(
+        instance, connection, 35, logon_sid, &error);
+    require(cleanup_endpoint != nullptr,
+            "create a separate cleanup-worker endpoint bound to one generation");
     PortableHelperInstanceId wrong_connection{};
     require(secure_random(wrong_connection.data(), wrong_connection.size()),
             "generate a distinct connection scope for a negative endpoint probe");
     require(!PortableHelperPipe::ConnectSessionWorkerClient(
                 instance, wrong_connection, broker, 0, &error),
             "a different connection scope cannot attach to this worker endpoint");
+    require(!PortableHelperPipe::ConnectInputCleanupClient(
+                instance, connection, 36, broker, 0, &error),
+            "a different generation cannot attach to this cleanup endpoint");
 
     const auto executable = executable_path();
     const auto launch_client = [&](bool worker_client,
@@ -3532,6 +5488,95 @@ void portable_helper_authorization_pipe() {
 
 void elevation_handoff() {
     using namespace chast::host;
+    struct ApprovalProbe final : IElevationTask {
+        ElevationState result{0, ElevationCode::Pending, {}};
+        int commits = 0;
+        int cancellations = 0;
+        ElevationState poll() override { return result; }
+        void commit() override { ++commits; }
+        void cancel() override {
+            ++cancellations;
+            result.code = ElevationCode::Cancelled;
+        }
+    };
+
+    ElevationRequestContext approval_context;
+    approval_context.connection_id = 77;
+    approval_context.request_id = 12;
+    approval_context.peer_address = "127.0.0.1:45000";
+    approval_context.mode = SessionMode::Desktop;
+    approval_context.permissions = kPermissionInput;
+    bool connection_live = true;
+    int starts = 0;
+    auto approval_probe = std::make_shared<ApprovalProbe>();
+    auto approval = LocalElevationApprovalTask::create(
+        approval_context, GetCurrentThreadId(),
+        [&](const ElevationRequestContext& context, std::string* error) {
+            if (!connection_live || context.connection_id != 77 ||
+                context.peer_address != "127.0.0.1:45000" ||
+                context.mode != SessionMode::Desktop ||
+                (context.permissions & kPermissionInput) == 0) {
+                if (error) *error = "the original input controller is no longer live";
+                return false;
+            }
+            return true;
+        },
+        [&]() -> std::shared_ptr<IElevationTask> {
+            ++starts;
+            return approval_probe;
+        });
+    require(approval && approval->poll().code == ElevationCode::Pending && starts == 0,
+            "remote elevation starts pending without opening UAC");
+    bool non_ui_approved = true;
+    std::thread non_ui_approval([&] {
+        non_ui_approved = approval->approve(nullptr);
+    });
+    non_ui_approval.join();
+    require(!non_ui_approved && approval->approval_pending() && starts == 0,
+            "only the bound local UI thread can approve and start UAC");
+    std::string approval_error;
+    require(approval->validate_for_approval(&approval_error) &&
+                approval->approve(&approval_error) && starts == 1 &&
+                approval->poll().code == ElevationCode::Pending,
+            "local approval revalidates the original connection before starting UAC");
+    approval->commit();
+    require(approval_probe->commits == 1,
+            "the local approval task forwards commit only after UAC has started");
+    approval->cancel();
+    require(approval_probe->cancellations == 1 &&
+                approval->poll().code == ElevationCode::Cancelled,
+            "disconnect or host cancellation reaches an already-started UAC task");
+
+    starts = 0;
+    connection_live = false;
+    auto stale_approval = LocalElevationApprovalTask::create(
+        approval_context, GetCurrentThreadId(),
+        [&](const ElevationRequestContext&, std::string* error) {
+            if (error) *error = "the requesting viewer disconnected";
+            return false;
+        },
+        [&]() -> std::shared_ptr<IElevationTask> {
+            ++starts;
+            return std::make_shared<ApprovalProbe>();
+        });
+    require(stale_approval &&
+                !stale_approval->validate_for_approval(&approval_error) &&
+                !stale_approval->approve(&approval_error) && starts == 0,
+            "a stale viewer cannot start the UAC handoff after the prompt was queued");
+    require(stale_approval->poll().code == ElevationCode::Cancelled,
+            "stale approval requests complete as cancelled");
+
+    auto denied_approval = LocalElevationApprovalTask::create(
+        approval_context, GetCurrentThreadId(),
+        [](const ElevationRequestContext&, std::string*) { return true; },
+        [&]() -> std::shared_ptr<IElevationTask> {
+            ++starts;
+            return std::make_shared<ApprovalProbe>();
+        });
+    require(denied_approval && denied_approval->deny() &&
+                denied_approval->poll().code == ElevationCode::Denied && starts == 0,
+            "local denial never calls the UAC starter");
+
     auto denied = ElevationHandoff::start([](const std::wstring&, DWORD& error) -> HANDLE {
         error = ERROR_CANCELLED; return nullptr;
     });
@@ -5789,13 +7834,21 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
+    if (argc >= 2 && std::string(argv[1]) ==
+                         "--portable-helper-manager-channel-server")
+        return portable_helper_manager_channel_server_child(argc, argv);
     if (argc >= 2 &&
         (std::string(argv[1]) == "--portable-helper-control-server" ||
          std::string(argv[1]) ==
              "--portable-helper-negative-input-control-server" ||
          std::string(argv[1]) == "--portable-helper-worker-control-server" ||
-         std::string(argv[1]) == "--portable-helper-worker-no-release-control-server"))
+         std::string(argv[1]) == "--portable-helper-worker-no-release-control-server" ||
+         std::string(argv[1]) == "--portable-helper-worker-unvalidated-input-control-server" ||
+         std::string(argv[1]) == "--portable-helper-worker-retry-cleanup-control-server"))
         return portable_helper_control_server_child(argc, argv);
+    if (argc >= 2 &&
+        std::string(argv[1]) == "--portable-helper-cleanup-journal-child")
+        return portable_helper_cleanup_journal_child(argc, argv);
     if (argc >= 2 && std::string(argv[1]) == "--elevated-handoff") return elevation_child(argc, argv);
     if (argc >= 2 && std::string(argv[1]) == "--portable-helper-pipe-client")
         return portable_helper_pipe_child(argc, argv);
@@ -5823,21 +7876,37 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--portable-helper-authorization") {
         run("portable helper crash-safe input journal",
             portable_helper_input_journal);
+        run("portable helper exact desktop-scoped input cleanup plan",
+            portable_helper_input_cleanup_plan);
         run("portable helper protected durable input journal store",
             portable_helper_input_journal_file_store);
+        run("portable helper cleanup child crash recovery",
+            portable_helper_cleanup_worker_crash_recovery);
         run("portable helper worker command-line validation",
             portable_helper_worker_command_line);
+        run("portable helper authenticated cleanup-worker scope validation",
+            portable_helper_input_cleanup_command_line_and_scope);
         run("portable helper generation-scoped authorization", portable_helper_authorization);
+        run("portable helper receipt-to-worker approved session",
+            portable_helper_approved_session);
         run("portable helper bounded worker revocation supervision",
             portable_helper_worker_supervision);
         run("portable helper authenticated SCM control-channel loop",
             portable_helper_service_channel_transport);
+        run("portable helper authenticated elevated-manager channel",
+            portable_helper_manager_channel_transport);
+        run("portable helper parent elevated-manager lifecycle transaction",
+            portable_helper_elevated_manager_parent_session);
         run("portable helper parent RPC rejection revokes forwarding gate",
             portable_helper_parent_rpc_rejection_revokes_gate);
         run("portable helper service session-worker control loop",
             portable_helper_service_session_worker_control_loop);
+        run("portable helper retries input cleanup before stopping the service",
+            portable_helper_service_retries_failed_input_cleanup);
         run("portable helper requires emergency input release",
-            portable_helper_service_requires_emergency_input_release);
+            [] { portable_helper_service_requires_emergency_input_release(false); });
+        run("portable helper keeps input grants disabled without physical-key conflict validation",
+            [] { portable_helper_service_requires_emergency_input_release(true); });
         run("portable helper per-session worker pipe isolation",
             portable_helper_session_worker_pipe);
         run("portable helper session-worker launch and ready handshake",
@@ -5857,21 +7926,37 @@ int main(int argc, char** argv) {
         run("portable helper protocol framing and replay protection", portable_helper_protocol);
         run("portable helper crash-safe input journal",
             portable_helper_input_journal);
+        run("portable helper exact desktop-scoped input cleanup plan",
+            portable_helper_input_cleanup_plan);
         run("portable helper protected durable input journal store",
             portable_helper_input_journal_file_store);
+        run("portable helper cleanup child crash recovery",
+            portable_helper_cleanup_worker_crash_recovery);
         run("portable helper worker command-line validation",
             portable_helper_worker_command_line);
+        run("portable helper authenticated cleanup-worker scope validation",
+            portable_helper_input_cleanup_command_line_and_scope);
         run("portable helper generation-scoped authorization", portable_helper_authorization);
+        run("portable helper receipt-to-worker approved session",
+            portable_helper_approved_session);
         run("portable helper bounded worker revocation supervision",
             portable_helper_worker_supervision);
         run("portable helper authenticated SCM control-channel loop",
             portable_helper_service_channel_transport);
+        run("portable helper authenticated elevated-manager channel",
+            portable_helper_manager_channel_transport);
+        run("portable helper parent elevated-manager lifecycle transaction",
+            portable_helper_elevated_manager_parent_session);
         run("portable helper parent RPC rejection revokes forwarding gate",
             portable_helper_parent_rpc_rejection_revokes_gate);
         run("portable helper service session-worker control loop",
             portable_helper_service_session_worker_control_loop);
+        run("portable helper retries input cleanup before stopping the service",
+            portable_helper_service_retries_failed_input_cleanup);
         run("portable helper requires emergency input release",
-            portable_helper_service_requires_emergency_input_release);
+            [] { portable_helper_service_requires_emergency_input_release(false); });
+        run("portable helper keeps input grants disabled without physical-key conflict validation",
+            [] { portable_helper_service_requires_emergency_input_release(true); });
         run("portable helper per-session worker pipe isolation",
             portable_helper_session_worker_pipe);
         run("portable helper session-worker launch and ready handshake",
@@ -5886,6 +7971,10 @@ int main(int argc, char** argv) {
             portable_helper_authorization_pipe);
         run("portable helper authenticated named-pipe transport", portable_helper_pipe_transport);
         run("elevation permission and cancellation", elevation_permissions);
+        run("per-connection helper-ready lifecycle",
+            helper_ready_state_tracks_the_viewer_lifetime);
+        run("per-viewer portable helper capture stream",
+            portable_helper_capture_uses_an_isolated_per_viewer_vp9_source);
         run("authenticated local elevation handoff", elevation_handoff);
         WSACleanup(); return failures ? 1 : 0;
     }
@@ -5959,6 +8048,10 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     run("elevation permission and cancellation", elevation_permissions);
+    run("per-connection helper-ready lifecycle",
+        helper_ready_state_tracks_the_viewer_lifetime);
+    run("per-viewer portable helper capture stream",
+        portable_helper_capture_uses_an_isolated_per_viewer_vp9_source);
     run("authenticated local elevation handoff", elevation_handoff);
     run("clipboard directions and independent file permissions", clipboard_directions);
     run("running services stop when their permission is revoked",

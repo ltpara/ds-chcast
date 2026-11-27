@@ -59,12 +59,15 @@ bool request_portable_helper_service_stop(
 // serialized through this connection. Start opens the parent request gate only after the helper's
 // correlated ACK and WorkerReady proof both validate. A failed start revokes
 // the local forwarding gate and closes the control channel so the service
-// enters its cleanup path.
+// enters its cleanup path. An optional proof output returns the exact
+// authenticated WorkerReady proof for a manager to relay to its already
+// authenticated local parent; callers must erase it after use.
 bool start_portable_helper_session_worker(
     PortableHelperServiceConnection& connection,
     PortableHelperAuthorization& authorization,
     const PortableHelperGrant& grant, uint32_t timeout_ms,
-    std::string* error);
+    std::string* error,
+    PortableHelperSecret* worker_ready_proof = nullptr);
 
 // Stop is scoped to the exact connection/generation. The helper ACK is sent
 // only after worker revocation and confirmed process exit; then the parent

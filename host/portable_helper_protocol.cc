@@ -53,7 +53,7 @@ uint64_t get64(const std::vector<uint8_t>& bytes, size_t at) {
 
 bool valid_type(uint32_t type) {
   return type >= static_cast<uint32_t>(PortableHelperMessageType::ClientHello) &&
-         type <= static_cast<uint32_t>(PortableHelperMessageType::SessionWorkerStop);
+         type <= static_cast<uint32_t>(PortableHelperMessageType::ManagerInputEventRequest);
 }
 
 bool nonzero_instance(const PortableHelperInstanceId& instance_id) {
@@ -338,6 +338,34 @@ bool current_portable_helper_process_identity(
   return process_identity(GetCurrentProcessId(), identity, error);
 }
 
+bool query_portable_helper_process_elevation(uint32_t process_id,
+                                             bool* elevated,
+                                             std::string* error) {
+  if (error != nullptr) error->clear();
+  if (elevated == nullptr || process_id == 0)
+    return fail(error, "invalid process elevation query");
+  *elevated = false;
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                               process_id);
+  if (process == nullptr)
+    return fail(error, "cannot open process for elevation query");
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+    CloseHandle(process);
+    return fail(error, "cannot open process token for elevation query");
+  }
+  TOKEN_ELEVATION token_elevation{};
+  DWORD bytes = 0;
+  const BOOL queried = GetTokenInformation(token, TokenElevation,
+      &token_elevation, sizeof(token_elevation), &bytes);
+  CloseHandle(token);
+  CloseHandle(process);
+  if (!queried || bytes != sizeof(token_elevation))
+    return fail(error, "cannot query process token elevation");
+  *elevated = token_elevation.TokenIsElevated != 0;
+  return true;
+}
+
 bool portable_helper_logon_sid_from_token(void* token,
                                           std::wstring* logon_sid,
                                           std::string* error) {
@@ -443,6 +471,25 @@ std::wstring PortableHelperPipe::SessionWorkerEndpointName(
          L"-Worker-" + hex_instance(connection_id);
 }
 
+std::wstring PortableHelperPipe::InputCleanupEndpointName(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperInstanceId& connection_id, uint64_t generation) {
+  if (!nonzero_instance(instance_id) || !nonzero_instance(connection_id) ||
+      generation == 0)
+    return {};
+  wchar_t suffix[24]{};
+  swprintf_s(suffix, L"-g%016llx",
+             static_cast<unsigned long long>(generation));
+  return L"\\\\.\\pipe\\ChastPortableHelper-" + hex_instance(instance_id) +
+         L"-Cleanup-" + hex_instance(connection_id) + suffix;
+}
+
+std::wstring PortableHelperPipe::ManagerEndpointName(
+    const PortableHelperInstanceId& instance_id) {
+  if (!nonzero_instance(instance_id)) return {};
+  return L"\\\\.\\pipe\\ChastPortableManager-" + hex_instance(instance_id);
+}
+
 std::unique_ptr<PortableHelperPipe> PortableHelperPipe::CreateServer(
     const PortableHelperInstanceId& instance_id,
     const std::wstring& authorized_logon_sid, std::string* error) {
@@ -457,6 +504,22 @@ PortableHelperPipe::CreateSessionWorkerServer(
     const std::wstring& authorized_logon_sid, std::string* error) {
   return CreateServerAt(instance_id,
                         SessionWorkerEndpointName(instance_id, connection_id),
+                        authorized_logon_sid, error);
+}
+
+std::unique_ptr<PortableHelperPipe> PortableHelperPipe::CreateInputCleanupServer(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperInstanceId& connection_id, uint64_t generation,
+    const std::wstring& authorized_logon_sid, std::string* error) {
+  return CreateServerAt(instance_id,
+      InputCleanupEndpointName(instance_id, connection_id, generation),
+      authorized_logon_sid, error);
+}
+
+std::unique_ptr<PortableHelperPipe> PortableHelperPipe::CreateManagerServer(
+    const PortableHelperInstanceId& instance_id,
+    const std::wstring& authorized_logon_sid, std::string* error) {
+  return CreateServerAt(instance_id, ManagerEndpointName(instance_id),
                         authorized_logon_sid, error);
 }
 
@@ -535,6 +598,25 @@ PortableHelperPipe::ConnectSessionWorkerClient(
   return ConnectClientAt(
       instance_id, SessionWorkerEndpointName(instance_id, connection_id),
       expected_server, timeout_ms, error);
+}
+
+std::unique_ptr<PortableHelperPipe>
+PortableHelperPipe::ConnectInputCleanupClient(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperInstanceId& connection_id, uint64_t generation,
+    const PortableHelperProcessIdentity& expected_server,
+    uint32_t timeout_ms, std::string* error) {
+  return ConnectClientAt(instance_id,
+      InputCleanupEndpointName(instance_id, connection_id, generation),
+      expected_server, timeout_ms, error);
+}
+
+std::unique_ptr<PortableHelperPipe> PortableHelperPipe::ConnectManagerClient(
+    const PortableHelperInstanceId& instance_id,
+    const PortableHelperProcessIdentity& expected_server,
+    uint32_t timeout_ms, std::string* error) {
+  return ConnectClientAt(instance_id, ManagerEndpointName(instance_id),
+                         expected_server, timeout_ms, error);
 }
 
 std::unique_ptr<PortableHelperPipe> PortableHelperPipe::ConnectClientAt(
@@ -655,6 +737,8 @@ bool PortableHelperPipe::AuthenticatedPeer(
   *identity = peer_identity_;
   return true;
 }
+
+void PortableHelperPipe::Close() noexcept { Poison(); }
 
 bool PortableHelperPipe::Send(PortableHelperMessage message,
                               uint32_t timeout_ms, std::string* error) {

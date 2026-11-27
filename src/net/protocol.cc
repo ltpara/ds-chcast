@@ -3382,7 +3382,7 @@ bool parse_elevation_request(const std::vector<uint8_t>& payload, uint32_t& requ
     return true;
 }
 std::vector<uint8_t> make_elevation_state(const ElevationState& state) {
-    if (static_cast<uint8_t>(state.code) > static_cast<uint8_t>(ElevationCode::Failed)) return {};
+    if (static_cast<uint8_t>(state.code) > static_cast<uint8_t>(ElevationCode::HelperReady)) return {};
     const auto reason = truncate_utf8_reason(state.reason, kMaxHostActionReason);
     if (reason.find('\0') != std::string::npos) return {};
     std::vector<uint8_t> payload(7 + reason.size());
@@ -3400,7 +3400,7 @@ bool parse_elevation_state(const std::vector<uint8_t>& payload, ElevationState& 
     state = {};
     if (!reader.u32(state.request_id) || !reader.u8(code) || !reader.u16(size) ||
         size > kMaxHostActionReason || !reader.string(state.reason, size) || !reader.at_end() ||
-        code > static_cast<uint8_t>(ElevationCode::Failed) || !valid_utf8(state.reason) ||
+        code > static_cast<uint8_t>(ElevationCode::HelperReady) || !valid_utf8(state.reason) ||
         state.reason.find('\0') != std::string::npos) {
         set_error(error, "malformed ElevationState"); return false;
     }

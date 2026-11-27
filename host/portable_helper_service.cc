@@ -14,6 +14,7 @@
 #include "portable_helper_recovery.h"
 #include "portable_helper_service_channel.h"
 #include "portable_helper_service_worker.h"
+#include "portable_helper_worker_session.h"
 
 namespace chast::host {
 namespace {
@@ -199,7 +200,17 @@ DWORD run_service_main(DWORD count, LPWSTR* arguments) {
   }
 
   if (exit_code == ERROR_SUCCESS) {
-    PortableHelperServiceSessionWorker session_worker(spec);
+    PortableHelperServiceSessionWorker session_worker(
+        spec, {}, [spec](const PortableHelperGrant& grant,
+                         std::string* cleanup_error) {
+          PortableHelperInputJournalScope scope;
+          scope.instance_id = grant.instance_id;
+          scope.connection_id = grant.connection_id;
+          scope.windows_session_id = grant.windows_session_id;
+          scope.generation = grant.generation;
+          return execute_portable_helper_authenticated_input_cleanup(
+              spec, scope, cleanup_error);
+        });
     const bool channel_ok = run_portable_helper_service_control_channel(
         std::move(control_channel), spec.parent, parent, stop_event,
         [stop_event] {

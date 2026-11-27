@@ -300,6 +300,34 @@ bool make_portable_helper_worker_ready_proof(
   return make_proof(grant, proof, error);
 }
 
+bool encode_portable_helper_grant_payload(
+    const PortableHelperGrant& grant, std::vector<uint8_t>* payload,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  return encode_grant_payload(grant, payload, error);
+}
+
+bool decode_portable_helper_grant_payload(
+    const std::vector<uint8_t>& payload,
+    const PortableHelperInstanceId& expected_instance,
+    uint32_t expected_windows_session_id, PortableHelperGrant* grant,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (grant != nullptr) *grant = PortableHelperGrant{};
+  if (grant == nullptr || expected_windows_session_id == 0 ||
+      !any_nonzero(expected_instance.data(), expected_instance.size()))
+    return fail(error, "portable helper grant payload has an invalid expected scope");
+  std::vector<uint8_t> secret_payload = payload;
+  ByteVectorWiper payload_wiper(secret_payload);
+  PortableHelperGrant parsed;
+  if (!decode_grant_payload(secret_payload, &parsed, error)) return false;
+  if (parsed.instance_id != expected_instance ||
+      parsed.windows_session_id != expected_windows_session_id)
+    return fail(error, "portable helper grant is outside the expected instance or session");
+  *grant = parsed;
+  return true;
+}
+
 bool send_portable_helper_grant(PortableHelperPipe& pipe,
                                const PortableHelperGrant& grant,
                                uint32_t timeout_ms, std::string* error) {

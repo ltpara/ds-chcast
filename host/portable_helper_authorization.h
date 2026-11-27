@@ -207,6 +207,17 @@ bool make_portable_helper_worker_ready_proof(
     const PortableHelperGrant& grant, PortableHelperSecret* proof,
     std::string* error);
 
+// Fixed-size grant serialization for authenticated local manager IPC only.
+// The encoded payload contains secrets; callers must wipe it after transport.
+bool encode_portable_helper_grant_payload(
+    const PortableHelperGrant& grant, std::vector<uint8_t>* payload,
+    std::string* error);
+bool decode_portable_helper_grant_payload(
+    const std::vector<uint8_t>& payload,
+    const PortableHelperInstanceId& expected_instance,
+    uint32_t expected_windows_session_id, PortableHelperGrant* grant,
+    std::string* error);
+
 // Grant/WorkerReady exchange over a PortableHelperPipe that has already
 // authenticated the exact peer process. The grant payload is fixed-size and
 // contains a local-only secret; callers must not log or forward it remotely.

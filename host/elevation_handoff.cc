@@ -293,6 +293,192 @@ void ElevationController::shutdown() {
     if (current_) current_->shutdown();
 }
 
+struct LocalElevationApprovalTask::Impl {
+    enum class Decision { Pending, Started, Denied, Cancelled, Failed };
+    mutable std::mutex mutex;
+    ElevationRequestContext context;
+    DWORD approval_thread_id = 0;
+    Revalidate revalidate;
+    Starter starter;
+    std::shared_ptr<IElevationTask> started;
+    Decision decision = Decision::Pending;
+    std::string reason;
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes(3);
+};
+
+LocalElevationApprovalTask::LocalElevationApprovalTask(
+    ElevationRequestContext context, DWORD approval_thread_id,
+    Revalidate revalidate, Starter starter)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->context = std::move(context);
+    impl_->approval_thread_id = approval_thread_id;
+    impl_->revalidate = std::move(revalidate);
+    impl_->starter = std::move(starter);
+}
+
+LocalElevationApprovalTask::~LocalElevationApprovalTask() = default;
+
+std::shared_ptr<LocalElevationApprovalTask> LocalElevationApprovalTask::create(
+    ElevationRequestContext context, DWORD approval_thread_id,
+    Revalidate revalidate, Starter starter) {
+    if (!context.connection_id || !context.request_id ||
+        context.mode != SessionMode::Desktop ||
+        (context.permissions & kPermissionInput) == 0 ||
+        !approval_thread_id || !revalidate || !starter) {
+        return {};
+    }
+    return std::shared_ptr<LocalElevationApprovalTask>(
+        new LocalElevationApprovalTask(std::move(context), approval_thread_id,
+                                       std::move(revalidate), std::move(starter)));
+}
+
+bool LocalElevationApprovalTask::approval_pending() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->decision == Impl::Decision::Pending &&
+           std::chrono::steady_clock::now() < impl_->deadline;
+}
+
+bool LocalElevationApprovalTask::validate_for_approval(std::string* error) const {
+    if (error) error->clear();
+    Revalidate revalidate;
+    ElevationRequestContext context;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->decision != Impl::Decision::Pending ||
+            std::chrono::steady_clock::now() >= impl_->deadline) {
+            if (error) *error = "the local elevation request is no longer pending";
+            return false;
+        }
+        revalidate = impl_->revalidate;
+        context = impl_->context;
+    }
+    try {
+        if (revalidate(context, error)) return true;
+    } catch (...) {
+        if (error && error->empty()) *error = "connection revalidation failed";
+    }
+    if (error && error->empty()) *error = "the requesting connection is no longer eligible";
+    return false;
+}
+
+bool LocalElevationApprovalTask::approve(std::string* error) {
+    if (error) error->clear();
+    std::lock_guard lock(impl_->mutex);
+    if (GetCurrentThreadId() != impl_->approval_thread_id) {
+        if (error) *error = "local elevation approval must run on the bound UI thread";
+        return false;
+    }
+    if (impl_->decision != Impl::Decision::Pending) {
+        if (error) *error = "the local elevation request is no longer pending";
+        return false;
+    }
+    if (std::chrono::steady_clock::now() >= impl_->deadline) {
+        impl_->decision = Impl::Decision::Cancelled;
+        impl_->reason = "the local elevation request timed out";
+        if (error) *error = impl_->reason;
+        return false;
+    }
+    try {
+        std::string reason;
+        if (!impl_->revalidate(impl_->context, &reason)) {
+            impl_->decision = Impl::Decision::Cancelled;
+            impl_->reason = reason.empty() ? "the requesting connection is no longer eligible" : reason;
+            if (error) *error = impl_->reason;
+            return false;
+        }
+        impl_->started = impl_->starter();
+        if (!impl_->started) {
+            impl_->decision = Impl::Decision::Failed;
+            impl_->reason = "the local elevation handoff is unavailable";
+            if (error) *error = impl_->reason;
+            return false;
+        }
+        impl_->decision = Impl::Decision::Started;
+        return true;
+    } catch (const std::exception& failure) {
+        impl_->decision = Impl::Decision::Failed;
+        impl_->reason = failure.what();
+    } catch (...) {
+        impl_->decision = Impl::Decision::Failed;
+        impl_->reason = "the local elevation handoff failed";
+    }
+    if (error) *error = impl_->reason;
+    return false;
+}
+
+bool LocalElevationApprovalTask::deny() {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->decision != Impl::Decision::Pending) return false;
+    impl_->decision = Impl::Decision::Denied;
+    impl_->reason = "the local operator denied the request";
+    return true;
+}
+
+ElevationState LocalElevationApprovalTask::poll() {
+    std::shared_ptr<IElevationTask> started;
+    ElevationState terminal;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->decision == Impl::Decision::Pending &&
+            std::chrono::steady_clock::now() >= impl_->deadline) {
+            impl_->decision = Impl::Decision::Cancelled;
+            impl_->reason = "the local elevation request timed out";
+        }
+        if (impl_->decision == Impl::Decision::Started) {
+            started = impl_->started;
+        } else {
+            terminal.request_id = impl_->context.request_id;
+            terminal.reason = impl_->reason;
+            switch (impl_->decision) {
+                case Impl::Decision::Pending: terminal.code = ElevationCode::Pending; break;
+                case Impl::Decision::Denied: terminal.code = ElevationCode::Denied; break;
+                case Impl::Decision::Cancelled: terminal.code = ElevationCode::Cancelled; break;
+                case Impl::Decision::Failed: terminal.code = ElevationCode::Failed; break;
+                case Impl::Decision::Started: break;
+            }
+        }
+    }
+    if (!started) return terminal;
+    auto state = started->poll();
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->decision != Impl::Decision::Started) {
+            return {impl_->context.request_id, ElevationCode::Cancelled,
+                    impl_->reason.empty() ? "the local elevation request was cancelled" : impl_->reason};
+        }
+    }
+    state.request_id = impl_->context.request_id;
+    return state;
+}
+
+void LocalElevationApprovalTask::commit() {
+    std::shared_ptr<IElevationTask> started;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->decision == Impl::Decision::Started) started = impl_->started;
+    }
+    if (started) started->commit();
+}
+
+void LocalElevationApprovalTask::cancel() {
+    std::shared_ptr<IElevationTask> started;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->decision == Impl::Decision::Pending ||
+            impl_->decision == Impl::Decision::Started) {
+            impl_->decision = Impl::Decision::Cancelled;
+            impl_->reason = "the local elevation request was cancelled";
+        }
+        started = impl_->started;
+    }
+    if (started) started->cancel();
+}
+
+const ElevationRequestContext& LocalElevationApprovalTask::context() const {
+    return impl_->context;
+}
+
 struct ElevatedChild::Impl {
     Handle parent, pipe, stop, local_stop{CreateEventW(nullptr, TRUE, FALSE, nullptr)}, instance_mutex;
 };

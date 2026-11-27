@@ -3386,7 +3386,9 @@ int elevation_probe() {
                 config.settings.codec = VideoCodec::Vp9;
                 config.encoder_backend = EncoderBackend::Software;
                 config.elevation_state = [] { return ElevationState{0, ElevationCode::Available, {}}; };
-                config.request_elevation = [task] { return task; };
+                config.request_elevation = [task](const ElevationRequestContext&) {
+                    return task;
+                };
                 config.desktop_status = [paused] {
                     return *paused ? InputDesktopStatus{InputDesktopKind::Unavailable, false, {}, "simulated local UAC"}
                                    : input_desktop_status();

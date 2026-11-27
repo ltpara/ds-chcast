@@ -28,7 +28,8 @@ class PortableHelperServiceSessionWorker final {
 
   PortableHelperServiceSessionWorker(
       PortableHelperServiceSpec spec, Launcher launcher = {},
-      EmergencyInputRelease emergency_input_release = {});
+      EmergencyInputRelease emergency_input_release = {},
+      bool physical_input_conflict_policy_validated = false);
   ~PortableHelperServiceSessionWorker();
   PortableHelperServiceSessionWorker(
       const PortableHelperServiceSessionWorker&) = delete;

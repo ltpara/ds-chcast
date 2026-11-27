@@ -13,9 +13,10 @@ namespace chast::host {
 namespace {
 
 constexpr std::array<uint8_t, 8> kMagic = {'C', 'H', 'A', 'S', 'I', 'N', 'P', '1'};
-constexpr uint16_t kVersion = 2;
+constexpr uint16_t kVersion = 3;
 constexpr size_t kMaximumKeys = 512;
 constexpr size_t kMaximumBytes = 64 * 1024;
+constexpr size_t kMaximumDesktopNameBytes = 64;
 constexpr uint16_t kJournalMouseMask = chast::kMouseLeft | chast::kMouseRight |
     chast::kMouseMiddle | chast::kMouseBack | chast::kMouseForward;
 
@@ -31,6 +32,16 @@ bool nonzero(const PortableHelperInstanceId& id) {
 bool valid_scope(const PortableHelperInputJournalScope& scope) {
   return nonzero(scope.instance_id) && nonzero(scope.connection_id) &&
          scope.windows_session_id != 0 && scope.generation != 0;
+}
+
+bool valid_desktop_name(const std::string& name, bool allow_empty) {
+  if (name.empty()) return allow_empty;
+  if (name.size() > kMaximumDesktopNameBytes) return false;
+  return std::all_of(name.begin(), name.end(), [](unsigned char value) {
+    return (value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z') ||
+        (value >= '0' && value <= '9') || value == '_' || value == '-';
+  });
 }
 
 bool key_less(const PortableHelperJournalKey& left,
@@ -86,6 +97,11 @@ bool state_equal(const PortableHelperInputJournalState& left,
   for (size_t i = 0; i < left.touches.size(); ++i)
     if (!same_touch(left.touches[i], right.touches[i])) return false;
   return !left.pen_down || same_pen(left.pen, right.pen);
+}
+
+bool state_empty(const PortableHelperInputJournalState& state) {
+  return state.keys.empty() && state.mouse_buttons == 0 &&
+      state.touches.empty() && !state.pen_down;
 }
 
 void normalize(PortableHelperInputJournalState* state) {
@@ -177,7 +193,8 @@ bool state_is_superset(const PortableHelperInputJournalState& possible,
 
 bool image_valid(const PortableHelperInputJournalImage& image,
                  std::string* error) {
-  if (!valid_scope(image.scope))
+  if (!valid_scope(image.scope) ||
+      !valid_desktop_name(image.input_desktop_name, true))
     return fail(error, "input journal scope is invalid");
   if (!valid_state(image.committed, true, error) ||
       !valid_state(image.possible, true, error))
@@ -201,8 +218,11 @@ bool image_valid(const PortableHelperInputJournalImage& image,
        image.committed.mouse_buttons != 0 || !image.committed.touches.empty() ||
        image.committed.pen_down || !image.possible.keys.empty() ||
        image.possible.mouse_buttons != 0 || !image.possible.touches.empty() ||
-       image.possible.pen_down))
+       image.possible.pen_down || !image.input_desktop_name.empty()))
     return fail(error, "released input journal still contains possible held state");
+  if ((!state_empty(image.committed) || !state_empty(image.possible)) &&
+      image.input_desktop_name.empty())
+    return fail(error, "held input journal state has no desktop identity");
   return true;
 }
 
@@ -607,6 +627,9 @@ bool encode_portable_helper_input_journal(
                   image.scope.connection_id.end());
   put32(*encoded, image.scope.windows_session_id);
   put64(*encoded, image.scope.generation);
+  put16(*encoded, static_cast<uint16_t>(image.input_desktop_name.size()));
+  encoded->insert(encoded->end(), image.input_desktop_name.begin(),
+                  image.input_desktop_name.end());
   put64(*encoded, image.last_sequence);
   put64(*encoded, image.pending_sequence);
   encoded->push_back(image.pending
@@ -627,12 +650,13 @@ bool decode_portable_helper_input_journal(
   if (error != nullptr) error->clear();
   if (image == nullptr) return fail(error, "missing input journal output");
   *image = {};
-  if (encoded.size() < 8 + 2 + 2 + 16 + 16 + 4 + 8 + 8 + 8 + 8 ||
+  if (encoded.size() < 8 + 2 + 2 + 16 + 16 + 4 + 8 + 2 + 8 + 8 + 8 + 8 ||
       encoded.size() > kMaximumBytes)
     return fail(error, "input journal size is invalid");
   Reader reader(encoded);
   std::array<uint8_t, 8> magic{};
   uint16_t version = 0, flags = 0;
+  uint16_t desktop_name_bytes = 0;
   uint8_t pending_api = 0;
   std::array<uint8_t, 7> reserved{};
   auto& candidate = *image;
@@ -645,6 +669,13 @@ bool decode_portable_helper_input_journal(
                    candidate.scope.connection_id.size()) ||
       !reader.get32(&candidate.scope.windows_session_id) ||
       !reader.get64(&candidate.scope.generation) ||
+      !reader.get16(&desktop_name_bytes) ||
+      desktop_name_bytes > kMaximumDesktopNameBytes) {
+    *image = {};
+    return fail(error, "input journal desktop identity is malformed");
+  }
+  candidate.input_desktop_name.resize(desktop_name_bytes);
+  if (!reader.take(candidate.input_desktop_name.data(), desktop_name_bytes) ||
       !reader.get64(&candidate.last_sequence) ||
       !reader.get64(&candidate.pending_sequence) ||
       !reader.get8(&pending_api) || !reader.take(reserved.data(), reserved.size()) ||
@@ -737,6 +768,13 @@ bool PortableHelperInputJournal::Prepare(
   const bool stateful = !state_equal(image_.committed, candidate);
   PortableHelperInputJournalImage prepared = image_;
   if (stateful) {
+    if (!valid_desktop_name(intent.input_desktop_name, false))
+      return fail(error, "stateful input intent has no valid desktop identity");
+    if (!state_empty(image_.committed) &&
+        image_.input_desktop_name != intent.input_desktop_name)
+      return fail(error, "input desktop changed while the journal still owns held state");
+    if (state_empty(image_.committed))
+      prepared.input_desktop_name = intent.input_desktop_name;
     prepared.pending = true;
     prepared.pending_sequence = intent.sequence;
     prepared.pending_api = intent.api;
@@ -778,6 +816,7 @@ bool PortableHelperInputJournal::Complete(
       committed.pending_api = chast::InputSideEffectApi::SendInput;
       committed.last_sequence = result.sequence;
       committed.committed = pending_.candidate;
+      if (state_empty(committed.committed)) committed.input_desktop_name.clear();
     } else {
       // A failed API result does not prove that the desktop state was
       // unchanged. Keep the durable prepare record unresolved so only the
@@ -819,6 +858,7 @@ bool PortableHelperInputJournal::MarkReleased(std::string* error) {
   released.released = true;
   released.pending_sequence = 0;
   released.pending_api = chast::InputSideEffectApi::SendInput;
+  released.input_desktop_name.clear();
   released.committed = {};
   released.possible = {};
   if (!image_valid(released, error)) return false;

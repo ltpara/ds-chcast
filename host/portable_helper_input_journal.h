@@ -55,6 +55,9 @@ struct PortableHelperInputJournalState final {
 // release from `possible`, the union of the before/after states.
 struct PortableHelperInputJournalImage final {
   PortableHelperInputJournalScope scope;
+  // The desktop identity owning `possible`. Empty only before the first
+  // stateful effect or after the state has been fully released.
+  std::string input_desktop_name;
   uint64_t last_sequence = 0;
   bool pending = false;
   bool released = false;

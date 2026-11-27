@@ -279,6 +279,14 @@ void test_publisher_signature_requires_trusted_pinned_signer() {
             L"C:\\missing\\chast-host.exe", "not-a-thumbprint", &error) &&
             error.find("hexadecimal") != std::string::npos,
         "publisher verification rejects malformed certificate pins");
+  PortableHelperServiceSpec selected_instance_spec;
+  selected_instance_spec.service_name = L"must-be-cleared";
+  PortableHelperInstanceId zero_instance_id{};
+  check(!stage_portable_helper_service_image_for_instance(
+            zero_instance_id, &selected_instance_spec, &error) &&
+            selected_instance_spec.service_name.empty() &&
+            error.find("instance ID must be nonzero") != std::string::npos,
+        "instance-bound staging rejects an empty approval scope before mutation");
   wchar_t image[MAX_PATH * 2]{};
   const DWORD image_length = GetModuleFileNameW(
       nullptr, image, static_cast<DWORD>(std::size(image)));
@@ -303,6 +311,16 @@ void test_publisher_signature_requires_trusted_pinned_signer() {
                 spec.service_name.empty() &&
                 error.find("staging is disabled") != std::string::npos,
             "an unset publisher pin rejects staging before elevation or filesystem access");
+
+      PortableHelperInstanceId approved_instance_id{};
+      approved_instance_id[0] = 0x7b;
+      spec.service_name = L"must-be-cleared";
+      error.clear();
+      check(!stage_portable_helper_service_image_for_instance(
+                approved_instance_id, &spec, &error) &&
+                spec.service_name.empty() &&
+                error.find("staging is disabled") != std::string::npos,
+            "instance-bound staging preserves fail-closed publisher policy before filesystem access");
     } else {
       check(configured_signature_ok ||
                 error.find("Authenticode validation failed") != std::string::npos,
@@ -532,6 +550,100 @@ void test_staged_image_cleanup_failure_is_visible_and_retryable() {
         "retry confirms service deletion and retries only the pending image cleanup");
 }
 
+void test_recovery_record_is_restored_when_directory_removal_fails() {
+  bool record_present = true;
+  bool directory_present = true;
+  int remove_directory_failures = 1;
+  std::vector<std::string> events;
+  auto remove_record = [&](std::string* error) {
+    events.push_back("remove-record");
+    if (!record_present) {
+      if (error) *error = "recovery record is missing";
+      return false;
+    }
+    record_present = false;
+    return true;
+  };
+  auto remove_directory = [&](std::string* error) {
+    events.push_back("remove-directory");
+    if (remove_directory_failures-- > 0) {
+      if (error) *error = "directory is temporarily in use";
+      return false;
+    }
+    if (record_present) {
+      if (error) *error = "recovery record was not restored";
+      return false;
+    }
+    directory_present = false;
+    return true;
+  };
+  auto directory_is_absent = [&](const std::wstring&, bool* absent,
+                                 std::string*) {
+    if (absent) *absent = !directory_present;
+    return absent != nullptr;
+  };
+  auto restore_record = [&](std::string* error) {
+    events.push_back("restore-record");
+    if (record_present) {
+      if (error) *error = "recovery record unexpectedly exists";
+      return false;
+    }
+    record_present = true;
+    return true;
+  };
+
+  std::string error;
+  check(!detail::remove_recovery_record_then_directory(
+            L"C:\\isolated\\helper", remove_record, remove_directory,
+            directory_is_absent, restore_record, &error) &&
+            record_present && directory_present &&
+            error.find("temporarily in use") != std::string::npos,
+        "a failed directory removal restores the recovery record and keeps cleanup pending");
+  check(events == std::vector<std::string>{
+            "remove-record", "remove-directory", "restore-record"},
+        "recovery-record restoration follows the failed directory-removal attempt");
+
+  events.clear();
+  check(detail::remove_recovery_record_then_directory(
+            L"C:\\isolated\\helper", remove_record, remove_directory,
+            directory_is_absent, restore_record, &error) &&
+            !record_present && !directory_present,
+        "a later cleanup retry removes the restored record and staging directory");
+
+  record_present = true;
+  directory_present = true;
+  remove_directory_failures = 1;
+  auto fail_restore = [](std::string* restore_error) {
+    if (restore_error) *restore_error = "recovery volume is read-only";
+    return false;
+  };
+  check(!detail::remove_recovery_record_then_directory(
+            L"C:\\isolated\\helper", remove_record, remove_directory,
+            directory_is_absent, fail_restore, &error) &&
+            error.find("temporarily in use") != std::string::npos &&
+            error.find("recovery volume is read-only") != std::string::npos,
+        "cleanup reports both the original directory error and recovery-record restoration failure");
+
+  record_present = true;
+  directory_present = true;
+  remove_directory_failures = 1;
+  auto directory_removed_during_failure = [&](std::string* remove_error) {
+    events.push_back("remove-directory-raced");
+    directory_present = false;
+    if (remove_error) *remove_error = "directory disappeared during cleanup";
+    return false;
+  };
+  check(detail::remove_recovery_record_then_directory(
+            L"C:\\isolated\\helper", remove_record,
+            directory_removed_during_failure,
+            [&](const std::wstring&, bool* absent, std::string*) {
+              if (absent) *absent = !directory_present;
+              return absent != nullptr;
+            },
+            restore_record, &error) && !directory_present && !record_present,
+        "an already absent staging directory is treated as completed cleanup");
+}
+
 void test_recovery_scan_keeps_live_parent_and_cleans_only_stale_records() {
   const auto active = test_spec();
   auto build_spec = [&](uint8_t id_byte, uint32_t process_id,
@@ -678,6 +790,7 @@ int main() {
   test_stop_failure_prevents_delete_and_can_be_retried();
   test_delete_failure_is_visible_and_retryable();
   test_staged_image_cleanup_failure_is_visible_and_retryable();
+  test_recovery_record_is_restored_when_directory_removal_fails();
   test_recovery_scan_keeps_live_parent_and_cleans_only_stale_records();
   test_recovery_stops_after_current_backend_operation_when_cancelled();
   test_create_failure_never_starts_or_deletes_a_collision();

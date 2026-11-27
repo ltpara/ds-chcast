@@ -506,6 +506,52 @@ bool remove_portable_helper_recovery_record(
   return remove_file_by_path_if_present(path, error);
 }
 
+namespace detail {
+
+bool remove_recovery_record_then_directory(
+    const std::wstring& directory,
+    const PortableHelperCleanupAction& remove_record,
+    const PortableHelperCleanupAction& remove_directory,
+    const PortableHelperDirectoryAbsentCheck& directory_is_absent,
+    const PortableHelperCleanupAction& restore_record,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (directory.empty() || !remove_record || !remove_directory ||
+      !directory_is_absent || !restore_record)
+    return fail(error, "portable helper directory cleanup transaction is incomplete");
+
+  std::string remove_record_error;
+  if (!remove_record(&remove_record_error)) {
+    if (remove_record_error.empty())
+      remove_record_error = "remove portable helper recovery record failed";
+    return fail(error, remove_record_error);
+  }
+
+  std::string remove_directory_error;
+  if (remove_directory(&remove_directory_error)) return true;
+  if (remove_directory_error.empty())
+    remove_directory_error = "remove portable helper staging directory failed";
+
+  bool absent = false;
+  std::string absence_error;
+  if (directory_is_absent(directory, &absent, &absence_error) && absent)
+    return true;
+
+  std::string restore_error;
+  if (restore_record(&restore_error))
+    return fail(error, remove_directory_error);
+  if (restore_error.empty())
+    restore_error = "restore portable helper recovery record failed";
+
+  std::string combined_error = remove_directory_error +
+      "; restoring the recovery record also failed: " + restore_error;
+  if (!absence_error.empty())
+    combined_error += "; directory absence check failed: " + absence_error;
+  return fail(error, combined_error);
+}
+
+}  // namespace detail
+
 bool recover_portable_helper_records(
     const std::vector<PortableHelperServiceSpec>& records,
     const PortableHelperParentLivenessCheck& parent_is_alive,

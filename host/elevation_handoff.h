@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include "chast/elevation.h"
+#include "chast/host_server.h"
 #include "chast/host_settings.h"
 
 namespace chast::host {
@@ -52,6 +53,35 @@ private:
     std::mutex mutex_;
     std::shared_ptr<ElevationHandoff> current_;
     bool stopping_ = false;
+};
+
+// Keeps a remote elevation request pending until the bound local UI thread
+// explicitly approves it. The request is revalidated immediately before the
+// starter is invoked, so a stale dialog cannot launch UAC for a departed or
+// no-longer-authorized viewer.
+class LocalElevationApprovalTask final : public IElevationTask {
+public:
+    using Revalidate = std::function<bool(const ElevationRequestContext&, std::string*)>;
+    using Starter = std::function<std::shared_ptr<IElevationTask>()>;
+
+    static std::shared_ptr<LocalElevationApprovalTask> create(
+        ElevationRequestContext context, DWORD approval_thread_id,
+        Revalidate revalidate, Starter starter);
+    ~LocalElevationApprovalTask() override;
+    ElevationState poll() override;
+    void commit() override;
+    void cancel() override;
+    bool approve(std::string* error);
+    bool deny();
+    bool approval_pending() const;
+    bool validate_for_approval(std::string* error) const;
+    const ElevationRequestContext& context() const;
+
+private:
+    struct Impl;
+    LocalElevationApprovalTask(ElevationRequestContext context,
+        DWORD approval_thread_id, Revalidate revalidate, Starter starter);
+    std::unique_ptr<Impl> impl_;
 };
 
 // The child authenticates the pipe server before duplicating handles or

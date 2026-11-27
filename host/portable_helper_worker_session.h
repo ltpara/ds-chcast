@@ -7,6 +7,7 @@
 #include <chast/input.h>
 
 #include "portable_helper_authorization.h"
+#include "portable_helper_input_journal.h"
 #include "portable_helper_lifecycle.h"
 
 #include <functional>
@@ -31,6 +32,14 @@ struct PortableHelperSessionWorkerLaunchArguments final {
   uint64_t broker_creation_time = 0;
 };
 
+struct PortableHelperInputCleanupLaunchArguments final {
+  PortableHelperInstanceId instance_id{};
+  PortableHelperConnectionId connection_id{};
+  uint64_t generation = 0;
+  uint32_t broker_process_id = 0;
+  uint64_t broker_creation_time = 0;
+};
+
 // Parses the exact, ordered command line emitted by the suspended launcher.
 // No optional switches or trailing arguments are accepted.
 bool parse_portable_helper_session_worker_command_line(
@@ -51,6 +60,34 @@ bool connect_portable_helper_session_worker_pipe(
     const PortableHelperSessionWorkerLaunchArguments& arguments,
     const PortableHelperProcessIdentity& broker_identity,
     uint32_t timeout_ms, std::unique_ptr<PortableHelperPipe>* channel,
+    std::string* error);
+
+bool parse_portable_helper_input_cleanup_command_line(
+    const std::vector<std::wstring>& arguments,
+    PortableHelperInputCleanupLaunchArguments* parsed, std::string* error);
+bool validate_portable_helper_input_cleanup_process_identity(
+    const PortableHelperInputCleanupLaunchArguments& arguments,
+    PortableHelperServiceSpec* recorded_spec,
+    PortableHelperProcessIdentity* worker_identity,
+    PortableHelperProcessIdentity* broker_identity, std::string* error);
+bool connect_portable_helper_input_cleanup_pipe(
+    const PortableHelperInputCleanupLaunchArguments& arguments,
+    const PortableHelperProcessIdentity& broker_identity,
+    uint32_t timeout_ms, std::unique_ptr<PortableHelperPipe>* channel,
+    std::string* error);
+
+bool make_portable_helper_input_cleanup_request(
+    const PortableHelperInputJournalScope& scope, uint64_t request_id,
+    PortableHelperMessage* request, std::string* error);
+bool validate_portable_helper_input_cleanup_request(
+    const PortableHelperMessage& request,
+    const PortableHelperInputJournalScope& expected_scope,
+    std::string* error);
+bool run_portable_helper_input_cleanup_worker(
+    PortableHelperPipe& channel,
+    const PortableHelperInputCleanupLaunchArguments& arguments,
+    const PortableHelperProcessIdentity& expected_broker,
+    const PortableHelperProcessIdentity& expected_worker,
     std::string* error);
 
 // Imports the grant only after checking the live worker identity again and
@@ -82,6 +119,21 @@ bool open_portable_helper_session_worker_token(
 bool launch_portable_helper_session_worker_process(
     const PortableHelperServiceSpec& spec, const PortableHelperGrant& grant,
     HANDLE* worker_process, std::string* error);
+
+// Launches the one-shot cleanup mode in the exact session SYSTEM token. The
+// generation is an argument only for routing and scope checks; journal state
+// is loaded by the child from the protected store after peer authentication.
+bool launch_portable_helper_input_cleanup_process(
+    const PortableHelperServiceSpec& spec,
+    const PortableHelperInputJournalScope& scope,
+    HANDLE* worker_process, std::string* error);
+
+// Runs a bounded authenticated cleanup transaction. A lost ACK is failure to
+// the caller and leaves the journal retryable; the released tombstone makes a
+// later retry idempotent if the child completed just before its ACK was lost.
+bool execute_portable_helper_authenticated_input_cleanup(
+    const PortableHelperServiceSpec& spec,
+    const PortableHelperInputJournalScope& scope, std::string* error);
 
 // Applies one received typed input request while retaining the worker-side
 // operation lease until InputInjector has attempted the SendInput operation.

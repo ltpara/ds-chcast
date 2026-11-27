@@ -449,14 +449,27 @@ bool stage_portable_helper_service_image(
   if (error != nullptr) error->clear();
   if (spec == nullptr) return fail(error, "missing portable helper service spec output");
   *spec = {};
+  PortableHelperInstanceId instance_id{};
+  if (!generate_portable_helper_instance_id(&instance_id, error)) return false;
+  return stage_portable_helper_service_image_for_instance(instance_id, spec,
+                                                          error);
+}
+
+bool stage_portable_helper_service_image_for_instance(
+    const PortableHelperInstanceId& instance_id,
+    PortableHelperServiceSpec* spec, std::string* error) {
+  if (error != nullptr) error->clear();
+  if (spec == nullptr) return fail(error, "missing portable helper service spec output");
+  *spec = {};
+  if (std::none_of(instance_id.begin(), instance_id.end(),
+                   [](uint8_t value) { return value != 0; }))
+    return fail(error, "portable helper instance ID must be nonzero");
   std::string expected_publisher;
   if (kConfiguredPublisherThumbprint[0] == '\0')
     return fail(error, "portable helper staging is disabled: configure the Authenticode publisher SHA-256 thumbprint");
   if (!normalize_thumbprint(kConfiguredPublisherThumbprint,
                             &expected_publisher, error))
     return false;
-  PortableHelperInstanceId instance_id{};
-  if (!generate_portable_helper_instance_id(&instance_id, error)) return false;
   std::wstring staging_directory, executable_path;
   if (!portable_helper_staging_paths(instance_id, &staging_directory,
                                      &executable_path, error))

@@ -22,6 +22,7 @@
 #include "portable_helper_recovery.h"
 #include "portable_helper_service_channel.h"
 #include "portable_helper_staging.h"
+#include "portable_helper_input_journal_store.h"
 
 namespace chast::host {
 namespace {
@@ -191,7 +192,43 @@ bool staging_directory_has_only_owned_files(
 bool remove_staged_image_files(const PortableHelperServiceSpec& spec,
                                std::string* error) {
   PortableHelperServiceSpec recorded;
-  if (!read_portable_helper_recovery_record(spec, &recorded, error)) return false;
+  bool recovery_record_missing = false;
+  std::string recovery_error;
+  if (!read_portable_helper_recovery_record(spec, &recorded, &recovery_error)) {
+    std::wstring recovery_path;
+    if (!portable_helper_recovery_record_path(spec, &recovery_path, error))
+      return false;
+    const DWORD recovery_attributes = GetFileAttributesW(recovery_path.c_str());
+    if (recovery_attributes != INVALID_FILE_ATTRIBUTES)
+      return fail(error, recovery_error);
+    const DWORD recovery_attribute_error = GetLastError();
+    if (recovery_attribute_error != ERROR_FILE_NOT_FOUND &&
+        recovery_attribute_error != ERROR_PATH_NOT_FOUND)
+      return fail(error, recovery_error);
+
+    const DWORD directory_attributes =
+        GetFileAttributesW(spec.staging_directory.c_str());
+    if (directory_attributes == INVALID_FILE_ATTRIBUTES) {
+      const DWORD directory_error = GetLastError();
+      if (directory_error == ERROR_FILE_NOT_FOUND ||
+          directory_error == ERROR_PATH_NOT_FOUND)
+        return true;
+      return fail(error, recovery_error);
+    }
+    if ((directory_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (directory_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+      return fail(error, recovery_error);
+    const std::filesystem::path root(spec.staging_directory);
+    if (!chast::machine_state_directory_trusted(spec.staging_directory, error) ||
+        !chast::machine_state_directory_trusted(root.parent_path().wstring(), error) ||
+        !chast::machine_state_directory_trusted(
+            root.parent_path().parent_path().wstring(), error))
+      return false;
+    recovery_record_missing = true;
+  }
+  if (!PortableHelperInputJournalFileStore::RemoveReleasedForInstance(
+          spec.instance_id, error))
+    return false;
   if (!staging_directory_has_only_owned_files(spec, error)) return false;
   const DWORD image_attributes = GetFileAttributesW(spec.executable_path.c_str());
   if (image_attributes != INVALID_FILE_ATTRIBUTES) {
@@ -252,15 +289,59 @@ bool remove_staged_image_files(const PortableHelperServiceSpec& spec,
       !chast::machine_state_directory_trusted(root.parent_path().wstring(), error) ||
       !chast::machine_state_directory_trusted(root.parent_path().parent_path().wstring(), error))
     return false;
-  if (!remove_portable_helper_recovery_record(spec, error)) return false;
-  const DWORD current_attributes = GetFileAttributesW(spec.staging_directory.c_str());
-  if (current_attributes == INVALID_FILE_ATTRIBUTES ||
-      (current_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
-          FILE_ATTRIBUTE_DIRECTORY)
-    return fail(error, "helper staging directory changed before cleanup");
-  if (!RemoveDirectoryW(spec.staging_directory.c_str()))
-    return fail(error, scm_error("RemoveDirectory(helper staging)", GetLastError()));
-  return true;
+
+  // A prior cleanup may have removed recovery.dat and then been interrupted
+  // before the directory could be removed. Recreate the validated record
+  // before attempting the final transaction so another failed attempt remains
+  // discoverable and retryable.
+  if (recovery_record_missing) {
+    if (!write_portable_helper_recovery_record(spec, error) ||
+        !read_portable_helper_recovery_record(spec, &recorded, error))
+      return false;
+  }
+
+  return detail::remove_recovery_record_then_directory(
+      spec.staging_directory,
+      [&spec](std::string* action_error) {
+        return remove_portable_helper_recovery_record(spec, action_error);
+      },
+      [&spec](std::string* action_error) {
+        const DWORD attributes = GetFileAttributesW(spec.staging_directory.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+                FILE_ATTRIBUTE_DIRECTORY)
+          return fail(action_error, "helper staging directory changed before cleanup");
+        const std::filesystem::path directory(spec.staging_directory);
+        if (!chast::machine_state_directory_trusted(
+                spec.staging_directory, action_error) ||
+            !chast::machine_state_directory_trusted(
+                directory.parent_path().wstring(), action_error) ||
+            !chast::machine_state_directory_trusted(
+                directory.parent_path().parent_path().wstring(), action_error))
+          return false;
+        if (!RemoveDirectoryW(spec.staging_directory.c_str()))
+          return fail(action_error, scm_error("RemoveDirectory(helper staging)",
+                                               GetLastError()));
+        return true;
+      },
+      [](const std::wstring& directory, bool* absent,
+         std::string* action_error) {
+        if (absent == nullptr)
+          return fail(action_error, "missing helper staging absence output");
+        *absent = false;
+        const DWORD attributes = GetFileAttributesW(directory.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES) return true;
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+          *absent = true;
+          return true;
+        }
+        return fail(action_error, scm_error("GetFileAttributes(helper staging)", code));
+      },
+      [&spec](std::string* action_error) {
+        return write_portable_helper_recovery_record(spec, action_error);
+      },
+      error);
 }
 
 bool current_process_matches_parent(const PortableHelperProcessIdentity& expected,

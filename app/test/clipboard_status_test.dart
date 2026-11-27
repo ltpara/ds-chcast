@@ -23,6 +23,8 @@ void main() {
     expect(status(4).elevationPending, isTrue);
     expect(status(2).elevationAvailable, isFalse);
     expect(status(5).elevationAvailable, isTrue);
+    expect(status(9).elevationAvailable, isFalse);
+    expect(status(9).elevationPending, isFalse);
     expect(status(8).elevationRequestId, 42);
     expect(status(8).elevationReason, 'local UAC');
     expect(status(8).elevationUpdates, 3);

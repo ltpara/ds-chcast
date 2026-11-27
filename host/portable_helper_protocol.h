@@ -41,6 +41,18 @@ enum class PortableHelperMessageType : uint32_t {
     // The helper accepts only one worker start for each service instance.
     SessionWorkerStart = 14,
     SessionWorkerStop = 15,
+    // One-shot, generation-scoped request for an authenticated target-session
+    // cleanup process to release the state in its durable journal.
+    InputCleanupExecute = 16,
+    // Dedicated authenticated host-to-elevated-manager lifecycle channel.
+    // These messages are valid only on the manager endpoint, never on SCM or
+    // worker endpoints.
+    ManagerStart = 17,
+    ManagerReady = 18,
+    ManagerStop = 19,
+    ManagerStopped = 20,
+    ManagerCaptureFrameRequest = 21,
+    ManagerInputEventRequest = 22,
 };
 
 struct PortableHelperMessage {
@@ -95,6 +107,11 @@ bool query_portable_helper_process_identity(
     std::string* error);
 bool current_portable_helper_process_identity(
     PortableHelperProcessIdentity* identity, std::string* error);
+// A successful query may set `elevated` to false; callers decide whether that
+// process is acceptable for the current operation.
+bool query_portable_helper_process_elevation(uint32_t process_id,
+                                             bool* elevated,
+                                             std::string* error);
 
 // A single local, message-mode named pipe bound to one helper instance. The
 // caller must pass the expected peer identity from the authenticated SCM /
@@ -111,6 +128,13 @@ class PortableHelperPipe final {
       const PortableHelperInstanceId& instance_id,
       const PortableHelperInstanceId& connection_id,
       const std::wstring& authorized_logon_sid, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> CreateInputCleanupServer(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperInstanceId& connection_id, uint64_t generation,
+      const std::wstring& authorized_logon_sid, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> CreateManagerServer(
+      const PortableHelperInstanceId& instance_id,
+      const std::wstring& authorized_logon_sid, std::string* error);
   static std::unique_ptr<PortableHelperPipe> ConnectClient(
       const PortableHelperInstanceId& instance_id,
       const PortableHelperProcessIdentity& expected_server,
@@ -118,6 +142,15 @@ class PortableHelperPipe final {
   static std::unique_ptr<PortableHelperPipe> ConnectSessionWorkerClient(
       const PortableHelperInstanceId& instance_id,
       const PortableHelperInstanceId& connection_id,
+      const PortableHelperProcessIdentity& expected_server,
+      uint32_t timeout_ms, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> ConnectInputCleanupClient(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperInstanceId& connection_id, uint64_t generation,
+      const PortableHelperProcessIdentity& expected_server,
+      uint32_t timeout_ms, std::string* error);
+  static std::unique_ptr<PortableHelperPipe> ConnectManagerClient(
+      const PortableHelperInstanceId& instance_id,
       const PortableHelperProcessIdentity& expected_server,
       uint32_t timeout_ms, std::string* error);
   ~PortableHelperPipe();
@@ -129,11 +162,18 @@ class PortableHelperPipe final {
   static std::wstring SessionWorkerEndpointName(
       const PortableHelperInstanceId& instance_id,
       const PortableHelperInstanceId& connection_id);
+  static std::wstring InputCleanupEndpointName(
+      const PortableHelperInstanceId& instance_id,
+      const PortableHelperInstanceId& connection_id, uint64_t generation);
+  static std::wstring ManagerEndpointName(
+      const PortableHelperInstanceId& instance_id);
 
   bool Accept(const PortableHelperProcessIdentity& expected_client,
               uint32_t timeout_ms, std::string* error);
   bool AuthenticatedPeer(PortableHelperProcessIdentity* identity,
                          std::string* error) const;
+  // Closes and poisons this channel so a failed RPC cannot be reused.
+  void Close() noexcept;
   bool Send(PortableHelperMessage message, uint32_t timeout_ms,
             std::string* error);
   bool Receive(PortableHelperMessage* message, uint32_t timeout_ms,

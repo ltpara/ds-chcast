@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <thread>
 #include <utility>
@@ -83,6 +85,172 @@ HostRecordingOptions make_recording_options(
     }
     return options;
 }
+
+UINT scaled_helper_dimension(UINT dimension, UINT percent) {
+    const uint64_t scaled = (static_cast<uint64_t>(dimension) * percent + 50u) / 100u;
+    return std::max<UINT>(2u, static_cast<UINT>(scaled)) & ~1u;
+}
+
+class ElevationFrameCapturer final : public IDxgiCapturer {
+public:
+    ElevationFrameCapturer(DisplayInfo display, std::shared_ptr<IElevationTask> task)
+        : display_(std::move(display)), task_(std::move(task)),
+          worker_([this] { capture_loop(); }) {}
+
+    ~ElevationFrameCapturer() override {
+        {
+            std::lock_guard lock(pending_mutex_);
+            stopping_ = true;
+        }
+        pending_wake_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    CaptureResult capture(std::chrono::milliseconds timeout) override {
+        std::unique_lock lock(pending_mutex_);
+        if (pending_serial_ == delivered_serial_ && timeout.count() > 0) {
+            pending_wake_.wait_for(lock, timeout, [&] {
+                return stopping_ || pending_serial_ != delivered_serial_ ||
+                    !pending_error_.empty();
+            });
+        }
+        if (!pending_error_.empty()) {
+            error_ = Error(Status::CaptureFailed, std::move(pending_error_));
+            pending_error_.clear();
+        }
+        if (stopping_ || pending_serial_ == delivered_serial_ || !pending_frame_)
+            return CaptureResult::NoNewFrame;
+        ElevationCaptureFrame captured = std::move(*pending_frame_);
+        pending_frame_.reset();
+        delivered_serial_ = pending_serial_;
+        lock.unlock();
+
+        const uint64_t pixel_count = static_cast<uint64_t>(captured.width) *
+            static_cast<uint64_t>(captured.height);
+        if (captured.width < 2 || captured.height < 2 || captured.width > 8192 ||
+            captured.height > 8192 || pixel_count > 32ull * 1024ull * 1024ull ||
+            captured.frame_number == 0 || captured.bgra.size() != pixel_count * 4u) {
+            error_ = Error(Status::CaptureFailed,
+                           "portable helper frame violates the bounded BGRA contract");
+            return CaptureResult::FatalError;
+        }
+
+        display_.width = captured.width;
+        display_.height = captured.height;
+        display_.rect.right = display_.rect.left + static_cast<LONG>(captured.width);
+        display_.rect.bottom = display_.rect.top + static_cast<LONG>(captured.height);
+        display_.rotation_degrees = 0;
+        frame_ = {};
+        frame_.cpu_bgra = std::make_shared<const std::vector<uint8_t>>(
+            std::move(captured.bgra));
+        frame_.cpu_image = true;
+        frame_.width = captured.width;
+        frame_.height = captured.height;
+        frame_.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        frame_.frame_number = captured.frame_number;
+        frame_.desktop_updated = true;
+        frame_.nv12_updated = true;
+        frame_.nv12_width = scaled_helper_dimension(captured.width, scale_percent_);
+        frame_.nv12_height = scaled_helper_dimension(captured.height, scale_percent_);
+        error_ = Error::success();
+        return CaptureResult::Frame;
+    }
+
+    const FrameInfo& frame() const override { return frame_; }
+    const CursorInfo& cursor() const override { return cursor_; }
+    const DisplayInfo& display() const override { return display_; }
+    AdapterDevice adapter_device() const override { return {}; }
+    const char* implementation() const noexcept override { return "portable-helper"; }
+    UINT max_framerate() const override { return 5; }
+
+    Error reinitialize() override {
+        frame_ = {};
+        cursor_ = {};
+        error_ = Error::success();
+        std::lock_guard lock(pending_mutex_);
+        pending_frame_.reset();
+        delivered_serial_ = pending_serial_;
+        return Error::success();
+    }
+
+    Error set_nv12_scale(UINT percent) override {
+        if (percent == 0 || percent > 100)
+            return Error(Status::InvalidCall, "capture scale must be from 1 to 100 percent");
+        scale_percent_ = percent;
+        if (frame_.width != 0 && frame_.height != 0) {
+            frame_.nv12_width = scaled_helper_dimension(frame_.width, percent);
+            frame_.nv12_height = scaled_helper_dimension(frame_.height, percent);
+            frame_.nv12_updated = true;
+        }
+        return Error::success();
+    }
+
+    UINT nv12_scale_percent() const override { return scale_percent_; }
+    const Error& last_error() const override { return error_; }
+
+private:
+    void capture_loop() {
+        using Clock = std::chrono::steady_clock;
+        const HRESULT com_initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(com_initialized)) {
+            {
+                std::lock_guard lock(pending_mutex_);
+                pending_error_ = "portable helper capture worker could not initialize COM";
+            }
+            pending_wake_.notify_all();
+            return;
+        }
+        struct ComUninitializer {
+            ~ComUninitializer() { CoUninitialize(); }
+        } com_uninitializer;
+        for (;;) {
+            {
+                std::unique_lock lock(pending_mutex_);
+                if (pending_wake_.wait_for(lock, std::chrono::milliseconds(50),
+                                            [&] { return stopping_; }))
+                    return;
+            }
+            if (!task_ || !task_->capture_ready()) continue;
+
+            const auto started = Clock::now();
+            ElevationCaptureFrame captured;
+            std::string failure;
+            const bool ok = task_->capture_frame(&captured, &failure);
+            {
+                std::lock_guard lock(pending_mutex_);
+                if (stopping_) return;
+                if (ok) {
+                    pending_frame_ = std::move(captured);
+                    ++pending_serial_;
+                    if (pending_serial_ == 0) ++pending_serial_;
+                    pending_error_.clear();
+                } else {
+                    pending_error_ = failure.empty()
+                        ? "portable helper capture failed" : std::move(failure);
+                }
+            }
+            pending_wake_.notify_all();
+            const auto due = started + std::chrono::milliseconds(200);
+            std::unique_lock lock(pending_mutex_);
+            if (pending_wake_.wait_until(lock, due, [&] { return stopping_; }))
+                return;
+        }
+    }
+
+    DisplayInfo display_;
+    std::shared_ptr<IElevationTask> task_;
+    FrameInfo frame_;
+    CursorInfo cursor_;
+    Error error_ = Error::success();
+    UINT scale_percent_ = 100;
+    std::mutex pending_mutex_;
+    std::condition_variable pending_wake_;
+    std::optional<ElevationCaptureFrame> pending_frame_;
+    std::string pending_error_;
+    uint64_t pending_serial_ = 0, delivered_serial_ = 0;
+    bool stopping_ = false;
+    std::thread worker_;
+};
 }
 
 // Defined here, where the audio pipeline types are complete: the header only
@@ -2775,6 +2943,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
 bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
+    helper_capture_supported_ = false;
+    helper_capture_unavailable_reason_.clear();
     stats.audio_active = false;
     stats.privacy_mode_active = false;
     stats.privacy_mode_changes = 0;
@@ -2872,6 +3042,22 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
     }
 
+    const bool selected_primary = !merged_requested && display_index < attached.size() &&
+        attached[display_index].primary;
+    const bool primary_present = std::any_of(attached.begin(), attached.end(),
+        [](const DisplayInfo& display) { return display.primary; });
+    const bool viewer_supports_helper_codec =
+        (session_->decoding_codecs() & kVideoCodecVp9) != 0;
+    helper_capture_supported_ = selected_primary && primary_present &&
+        viewer_supports_helper_codec;
+    if (!viewer_supports_helper_codec) {
+        helper_capture_unavailable_reason_ =
+            "the viewer does not support the portable helper's VP9 capture format";
+    } else if (!selected_primary || !primary_present) {
+        helper_capture_unavailable_reason_ =
+            "portable helper capture is limited to this connection's primary display";
+    }
+
     CaptureConfig capture;
     capture.want_hdr = config_.want_hdr;
     capture.capture_cursor = config_.capture_cursor;
@@ -2881,6 +3067,19 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
 
     DesktopStreamPool standalone_streams;
     auto& streams = registry_ ? registry_->desktop_streams : standalone_streams;
+    // The elevated source is deliberately isolated from the host-wide display
+    // pool: it is CPU-only software VP9 and must never force another viewer's
+    // shared display codec to VP9.
+    DesktopStreamPool helper_streams;
+    const VideoCodecMask helper_vp9_decoders =
+        session_->decoding_codecs() & kVideoCodecVp9;
+    auto helper_codec_peer = helper_vp9_decoders
+        ? helper_streams.connect_codecs(helper_vp9_decoders, VideoCodec::Vp9,
+              session_->decoding_444() & helper_vp9_decoders, VideoChroma::Yuv420)
+        : std::shared_ptr<DesktopStreamPool::CodecPeer>{};
+    auto helper_quality_peer = helper_streams.connect_quality(
+        std::min<uint32_t>(settings_.framerate ? settings_.framerate : 30u, 5u),
+        settings_.quality, config_.adaptive_bitrate, config_.adaptive_fps);
     // One policy participant per connection, retained across display changes.
     auto quality_peer = streams.connect_quality(settings_.framerate, settings_.quality,
                                                 config_.adaptive_bitrate, config_.adaptive_fps);
@@ -2912,6 +3111,33 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }, config_.encoder_factory, failure, config_.follow_desktop, session_->decoding_codecs(), codec_peer,
            make_recording_options(settings_, config_.log),
            cfg.capture_cursor ? config_.cursor_sampler : DesktopStreamPool::CursorSampler{});
+    };
+
+    size_t helper_display_index = attached.size();
+    for (size_t i = 0; i < attached.size(); ++i) {
+        if (attached[i].primary) {
+            helper_display_index = i;
+            break;
+        }
+    }
+    auto subscribe_helper = [&](std::string* failure) -> std::unique_ptr<IDxgiCapturer> {
+        if (!helper_codec_peer || helper_display_index >= attached.size()) {
+            if (failure) *failure = "portable helper capture needs a primary display and VP9 decoder";
+            return nullptr;
+        }
+        const auto task = elevation_task_;
+        const DisplayInfo display = attached[helper_display_index];
+        const std::wstring key = L"portable-helper:" +
+            std::to_wstring(connection_id_.load()) + L":" + display.device_name;
+        return helper_streams.subscribe(key,
+            [task, display](std::string* create_error) -> std::unique_ptr<IDxgiCapturer> {
+                if (!task || !task->capture_ready()) {
+                    if (create_error) *create_error = "portable helper is not ready";
+                    return nullptr;
+                }
+                return std::make_unique<ElevationFrameCapturer>(display, task);
+            }, config_.encoder_factory, failure, {}, helper_vp9_decoders,
+            helper_codec_peer, HostRecordingOptions{}, {});
     };
 
     struct DesktopVideo {
@@ -3035,6 +3261,88 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // Extra displays must never replace that description or those grants.
         return pumping_extra ? Error::success() : session_->refresh_stream(info);
     };
+
+    EncoderConfig encoder_config;
+    encoder_config.codec = settings_.codec;
+    encoder_config.bitrate = settings_.bitrate_kbps * 1000u;
+    encoder_config.framerate = settings_.framerate;
+    encoder_config.quality_ratio = settings_.quality;
+    encoder_config.gop_size = 0;
+    encoder_config.backend = config_.encoder_backend;
+
+    std::unique_ptr<IDxgiCapturer> fallback_capture;
+    std::unique_ptr<IVideoEncoder> fallback_encoder;
+    std::unique_ptr<IDxgiCapturer> helper_candidate;
+    std::unique_ptr<IVideoEncoder> helper_candidate_encoder;
+    EncoderConfig normal_encoder_config = encoder_config;
+    EncoderConfig helper_encoder_config{};
+    bool helper_capture_active = false;
+    bool initial_helper_capture = false;
+    IDxgiCapturer* active_helper_capture = nullptr;
+    auto prepare_helper_candidate = [&]() -> bool {
+        if (!elevation_task_ || !elevation_task_->capture_ready()) {
+            helper_candidate_encoder.reset();
+            helper_candidate.reset();
+            return false;
+        }
+        if (!helper_codec_peer || helper_display_index >= attached.size()) return false;
+        if (!helper_candidate) {
+            std::string failure;
+            helper_candidate = subscribe_helper(&failure);
+            if (!helper_candidate) {
+                if (!failure.empty()) log("portable helper capture setup failed: " + failure);
+                return false;
+            }
+            if (resolution_request != 100) {
+                const Error scaled = helper_candidate->set_nv12_scale(resolution_request);
+                if (!scaled.ok()) {
+                    log("portable helper cannot apply the current resolution scale: " +
+                        scaled.to_string());
+                    helper_candidate.reset();
+                    return false;
+                }
+            }
+        }
+        if (helper_candidate_encoder) return true;
+        const CaptureResult captured = helper_candidate->capture(std::chrono::milliseconds(0));
+        if (captured == CaptureResult::ReinitNeeded) {
+            (void)helper_candidate->reinitialize();
+            return false;
+        }
+        if (captured == CaptureResult::FatalError) {
+            log("portable helper capture failed: " +
+                helper_candidate->last_error().to_string());
+            helper_candidate.reset();
+            return false;
+        }
+        if (captured != CaptureResult::Frame ||
+            !helper_candidate->frame().has_video_image()) return false;
+        const FrameInfo frame = helper_candidate->frame();
+        if (!frame.cpu_bgra || frame.rotation_degrees != 0 ||
+            frame.nv12_width == 0 || frame.nv12_height == 0) {
+            log("portable helper frame did not satisfy the CPU VP9 input contract");
+            helper_candidate.reset();
+            return false;
+        }
+        helper_encoder_config = encoder_config;
+        helper_encoder_config.codec = VideoCodec::Vp9;
+        helper_encoder_config.chroma = VideoChroma::Yuv420;
+        helper_encoder_config.backend = EncoderBackend::Software;
+        helper_encoder_config.width = frame.nv12_width;
+        helper_encoder_config.height = frame.nv12_height;
+        helper_encoder_config.framerate = std::min<uint32_t>(
+            std::max<uint32_t>(1u, encoder_config.framerate), 5u);
+        std::string failure;
+        helper_candidate_encoder = DesktopStreamPool::encoder(
+            *helper_candidate, helper_encoder_config, &failure);
+        if (!helper_candidate_encoder) {
+            log("portable helper VP9 encoder setup failed: " + failure);
+            helper_candidate.reset();
+            return false;
+        }
+        return true;
+    };
+
     if (merged_requested) {
         std::string merged_error;
         capturer = subscribe_merged(attached, capture, &merged_error);
@@ -3060,11 +3368,66 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     } else {
         capturer = subscribe_display(attached[display_index], capture, error);
     }
+    std::string local_capture_error = error ? *error : std::string();
     if (!capturer) {
-        *error = "capturer creation failed: " + *error;
-        return false;
+        log("local desktop capture is not ready: " +
+            (local_capture_error.empty() ? std::string("capturer creation failed")
+                                         : local_capture_error));
+        if (error) error->clear();
     }
-    if (!wait_for_usable_frame(*capturer, true, stopping_, std::chrono::seconds(30), error)) {
+    bool initial_frame_ready = false;
+    const auto initial_deadline = Clock::now() + std::chrono::seconds(30);
+    auto wait_deadline = initial_deadline;
+    auto next_local_reinitialize = Clock::now();
+    while (!stopping_.load() && !disconnect_requested_.load()) {
+        if (!handle_elevation_requests(error)) return false;
+        wait_deadline = initial_deadline;
+        if (elevation_task_ && elevation_deadline_ > wait_deadline)
+            wait_deadline = elevation_deadline_ + std::chrono::seconds(5);
+
+        if (prepare_helper_candidate()) {
+            fallback_capture = std::move(capturer);
+            fallback_encoder = std::move(encoder);
+            capturer = std::move(helper_candidate);
+            encoder = std::move(helper_candidate_encoder);
+            encoder_config = helper_encoder_config;
+            helper_capture_active = initial_helper_capture = true;
+            active_helper_capture = capturer.get();
+            break;
+        }
+
+        if (capturer) {
+            const CaptureResult result = capturer->capture(std::chrono::milliseconds(5));
+            if (result == CaptureResult::Frame && capturer->frame().has_video_image()) {
+                if (capturer->frame().rotation_degrees != 0) {
+                    *error = "the encoder cannot carry " +
+                        std::to_string(capturer->frame().rotation_degrees) +
+                        "-degree output and capture could not rotate the desktop";
+                    return false;
+                }
+                initial_frame_ready = true;
+                break;
+            }
+            if ((result == CaptureResult::ReinitNeeded ||
+                 result == CaptureResult::FatalError) &&
+                Clock::now() >= next_local_reinitialize) {
+                const Error rebuilt = capturer->reinitialize();
+                next_local_reinitialize = Clock::now() + std::chrono::seconds(1);
+                if (!rebuilt.ok()) {
+                    local_capture_error = rebuilt.to_string();
+                    if (result == CaptureResult::FatalError)
+                        log("local desktop capture retry: " + local_capture_error);
+                }
+            }
+        }
+        if (Clock::now() >= wait_deadline) break;
+        if (!capturer) sleep_unless_stopping(std::chrono::milliseconds(5));
+    }
+    if (!initial_frame_ready && !initial_helper_capture) {
+        *error = local_capture_error.empty()
+            ? "no usable desktop frame arrived before the capture startup deadline"
+            : "local capture and portable helper did not produce a usable frame: " +
+                  local_capture_error;
         return false;
     }
     const FrameInfo first = capturer->frame();
@@ -3099,20 +3462,16 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     }
     log(std::string("capture backend: ") + capturer->implementation());
 
-    EncoderConfig encoder_config;
-    encoder_config.codec = settings_.codec;
-    encoder_config.bitrate = settings_.bitrate_kbps * 1000u;
-    encoder_config.framerate = settings_.framerate;
-    encoder_config.quality_ratio = settings_.quality;
-    encoder_config.gop_size = 0;
     encoder_config.width = first.nv12_width;
     encoder_config.height = first.nv12_height;
-    encoder_config.backend = config_.encoder_backend;
-    encoder = DesktopStreamPool::encoder(*capturer, encoder_config, error);
     if (!encoder) {
-        *error = "encoder creation failed: " + *error;
-        return false;
+        encoder = DesktopStreamPool::encoder(*capturer, encoder_config, error);
+        if (!encoder) {
+            *error = "encoder creation failed: " + *error;
+            return false;
+        }
     }
+    if (!helper_capture_active) normal_encoder_config = encoder_config;
     if (encoder->codec() != settings_.codec) {
         log(std::string("global codec negotiation selected ") + codec_name(encoder->codec()));
     }
@@ -4459,6 +4818,14 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             have_input = false;
         }
         if (!capturer && !other_videos.empty()) focus_video(other_videos.begin()->first);
+        helper_capture_supported_ = helper_vp9_decoders != 0 && other_videos.empty() &&
+            capturer && !capturer->merged() && capturer->display().primary;
+        if (!helper_capture_supported_ && helper_vp9_decoders == 0)
+            helper_capture_unavailable_reason_ =
+                "the viewer does not support the portable helper's VP9 capture format";
+        else if (!helper_capture_supported_)
+            helper_capture_unavailable_reason_ =
+                "portable helper capture is limited to one primary display per connection";
         if (!refresh_adapters()) return false;
         if (!send_subscriptions(request.request_id, DisplaySwitchCode::Ok, {})) return false;
         publish_current(stream_info);
@@ -5224,16 +5591,28 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         auto vote_quality = [&] {
             if (!quality_change) {
                 quality_peer->options(options.max_fps, std::nullopt);
+                if (helper_capture_active)
+                    helper_quality_peer->options(std::min<uint32_t>(
+                        options.max_fps ? options.max_fps : configured_fps, 5u), std::nullopt);
             } else if (custom_quality) {
                 quality_peer->options(options.max_fps, std::nullopt,
                                       options.quality_percent / 50.0f);
+                if (helper_capture_active)
+                    helper_quality_peer->options(std::min<uint32_t>(
+                        options.max_fps ? options.max_fps : configured_fps, 5u), std::nullopt,
+                        options.quality_percent / 50.0f);
             } else {
+                const auto quality = options.quality == StreamQuality::High
+                    ? VideoQos::Quality::High
+                    : options.quality == StreamQuality::Balanced
+                        ? VideoQos::Quality::Balanced : VideoQos::Quality::Smooth;
                 quality_peer->options(
                     options.max_fps,
-                    std::optional<VideoQos::Quality>(
-                        options.quality == StreamQuality::High ? VideoQos::Quality::High :
-                        options.quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced :
-                        VideoQos::Quality::Smooth));
+                    std::optional<VideoQos::Quality>(quality));
+                if (helper_capture_active)
+                    helper_quality_peer->options(std::min<uint32_t>(
+                        options.max_fps ? options.max_fps : configured_fps, 5u),
+                        std::optional<VideoQos::Quality>(quality));
             }
         };
         if (!quality_change && !cap_change && !preference_change) {
@@ -5261,6 +5640,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             std::string codec_error;
             auto wanted = encoder_config;
             wanted.chroma = options.chroma;
+            if (helper_capture_active &&
+                !DesktopStreamPool::vote_peer(*codec_peer, codec_vote(options.codec),
+                                               &codec_error, options.chroma))
+                return refuse(StreamOptionsCode::Failed, codec_error);
             auto replacement = DesktopStreamPool::vote_codec(*capturer, wanted,
                 codec_vote(options.codec), &codec_error);
             if (!replacement) return refuse(StreamOptionsCode::Failed, codec_error);
@@ -5275,6 +5658,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             }
             encoder_config.codec = encoder->codec();
             encoder_config.chroma = encoder->chroma();
+            if (helper_capture_active) {
+                if (const auto requested_codec = codec_vote(options.codec))
+                    normal_encoder_config.codec = *requested_codec;
+                normal_encoder_config.chroma = options.chroma;
+                normal_encoder_config.backend = config_.encoder_backend;
+            }
             codec_preference = options.codec;
             chroma_preference = options.chroma;
         }
@@ -5407,9 +5796,14 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         const auto delay = std::max({latency.rtt_us, video_delay, latency.video_pending_us});
         const bool fresh = latency.replies != qos_replies || latency.video_replies != video_replies;
         const bool sample_due = now >= next_qos_sample;
-        quality_peer->feedback(static_cast<uint32_t>(std::min<uint64_t>(delay / 1000, UINT32_MAX)),
-                               std::max(latency.pending_us, latency.video_pending_us) / 1000,
-                               fresh && sample_due);
+        const uint32_t feedback_delay = static_cast<uint32_t>(
+            std::min<uint64_t>(delay / 1000, UINT32_MAX));
+        const uint64_t feedback_pending =
+            std::max(latency.pending_us, latency.video_pending_us) / 1000;
+        quality_peer->feedback(feedback_delay, feedback_pending, fresh && sample_due);
+        if (helper_capture_active)
+            helper_quality_peer->feedback(feedback_delay, feedback_pending,
+                                          fresh && sample_due);
         if (fresh && sample_due) {
             qos_replies = latency.replies;
             video_replies = latency.video_replies;
@@ -6008,6 +6402,116 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             pending.offset += bytes;
         }
     };
+
+    auto helper_capture_scope_valid = [&] {
+        return helper_display_index < attached.size() &&
+            attached[helper_display_index].primary && other_videos.empty() &&
+            capturer && !capturer->merged() && capturer->display().primary &&
+            capturer->display().device_name ==
+                attached[helper_display_index].device_name;
+    };
+    auto activate_helper_capture = [&]() -> bool {
+        if (helper_capture_active || !helper_capture_scope_valid() ||
+            !prepare_helper_candidate()) return true;
+
+        normal_encoder_config = encoder_config;
+        fallback_capture = std::move(capturer);
+        fallback_encoder = std::move(encoder);
+        capturer = std::move(helper_candidate);
+        encoder = std::move(helper_candidate_encoder);
+        helper_capture_active = true;
+        active_helper_capture = capturer.get();
+        encoder_config = helper_encoder_config;
+
+        const uint16_t helper_fps = static_cast<uint16_t>(std::min<uint32_t>(
+            std::max<uint32_t>(1u, fps_ceiling()), 5u));
+        if (stream_quality == StreamQuality::Custom) {
+            helper_quality_peer->options(helper_fps, std::nullopt,
+                                         stream_quality_percent / 50.0f);
+        } else {
+            helper_quality_peer->options(helper_fps,
+                std::optional<VideoQos::Quality>(
+                    stream_quality == StreamQuality::High ? VideoQos::Quality::High :
+                    stream_quality == StreamQuality::Balanced ? VideoQos::Quality::Balanced :
+                    VideoQos::Quality::Smooth));
+        }
+        const Error rate_applied = encoder->set_rate(0, 0);
+        if (!rate_applied.ok())
+            log("portable helper video rate update: " + rate_applied.to_string());
+        DesktopStreamPool::reserve_audio(*capturer, bitrate_reserve(audio_info));
+        stats.target_bitrate = encoder->bitrate();
+        stats.framerate = static_cast<uint16_t>(encoder->framerate());
+        stats.resolution_percent = static_cast<uint16_t>(capturer->nv12_scale_percent());
+        framerate = encoder->framerate();
+        have_input = false;
+        cached_nv12.reset();
+        cached_frame = {};
+        force_keyframe = true;
+        extra_idrs = 1;
+        frames_without_nv12 = 0;
+        video.needs_resync = false;
+        video.recovery_at = {};
+        if (video.cursor) {
+            video.cursor->detach();
+            video.cursor.reset();
+        }
+
+        const FrameInfo frame = capturer->frame();
+        stream_info = describe_stream(attached, *capturer, *encoder, frame.width,
+            frame.height, static_cast<uint16_t>(framerate), session_->permissions(),
+            audio_info, settings_.allow_terminal_persist);
+        publish_current(stream_info);
+        if (config_.stream_announced) config_.stream_announced(stream_info);
+        const Error refreshed = refresh_video(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "portable helper stream update: " + refreshed.to_string();
+            }
+            return false;
+        }
+        ++stats.stream_updates;
+        publish_stats(stats);
+        log("per-viewer portable helper capture is active on the primary display at " +
+            std::to_string(framerate) + " fps");
+        return true;
+    };
+    auto deactivate_helper_capture = [&]() -> bool {
+        if (!helper_capture_active || capturer.get() != active_helper_capture) return true;
+
+        std::unique_ptr<IDxgiCapturer> stopped_helper = std::move(capturer);
+        encoder.reset();
+        active_helper_capture = nullptr;
+        helper_capture_active = false;
+        if (fallback_capture) {
+            capturer = std::move(fallback_capture);
+            fallback_encoder.reset();
+        } else if (helper_display_index < attached.size()) {
+            std::string failure;
+            capturer = subscribe_display(attached[helper_display_index], capture, &failure);
+            if (!capturer && !failure.empty())
+                log("local capture restore is pending: " + failure);
+        }
+        encoder_config = normal_encoder_config;
+        have_input = false;
+        cached_nv12.reset();
+        cached_frame = {};
+        force_keyframe = true;
+        frames_without_nv12 = 0;
+        video.recovery_at = capturer ? Clock::now() + std::chrono::milliseconds(100)
+                                     : Clock::time_point{};
+        if (video.cursor) {
+            video.cursor->detach();
+            video.cursor.reset();
+        }
+        stopped_helper.reset();
+        log("per-viewer portable helper capture stopped; restoring local capture");
+        return true;
+    };
+
     while (!stopping_.load() && !disconnect_requested_.load()) {
         const auto now = Clock::now();
         if (!apply_ticket_renewals(error)) return false;
@@ -6016,6 +6520,25 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return error->empty();
         }
         if (!handle_elevation_requests(error)) return false;
+        if (helper_capture_active && capturer.get() != active_helper_capture) {
+            if (elevation_task_) elevation_task_->cancel();
+            helper_capture_active = false;
+            active_helper_capture = nullptr;
+            fallback_capture.reset();
+            fallback_encoder.reset();
+            encoder_config = normal_encoder_config;
+        }
+        if (helper_capture_active && !helper_capture_scope_valid()) {
+            if (elevation_task_) elevation_task_->cancel();
+            if (!deactivate_helper_capture()) return false;
+        }
+        if (helper_capture_active &&
+            (!elevation_task_ || !elevation_task_->capture_ready())) {
+            if (!deactivate_helper_capture()) return false;
+        } else if (!helper_capture_active && elevation_task_ &&
+                   elevation_task_->capture_ready()) {
+            if (!activate_helper_capture()) return false;
+        }
         if (now >= next_desktop_check) {
             next_desktop_check = now + std::chrono::seconds(1);
             if (!sync_desktop(false)) {
@@ -6052,6 +6575,10 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         CaptureDisplaysRequest display_subscriptions;
         if (session_->take_capture_displays_request(display_subscriptions)) {
             touch_viewer_activity();
+            if (helper_capture_active) {
+                if (elevation_task_) elevation_task_->cancel();
+                if (!deactivate_helper_capture()) return false;
+            }
             if (!capture_displays(display_subscriptions)) { drain_peer(stats); return error->empty(); }
         }
         pump_screenshot();
@@ -9673,6 +10200,18 @@ bool HostServer::handle_elevation_requests(std::string* error) {
         if (!sent.ok()) { *error = "elevation: " + sent.to_string(); return false; }
         return true;
     };
+    const auto log_transition = [&](const ElevationState& state) {
+        if (state.code == ElevationCode::HelperReady) {
+            log("per-connection portable helper is ready; capture is limited to its approved primary display");
+        } else if (state.code == ElevationCode::Failed ||
+                   state.code == ElevationCode::Cancelled ||
+                   state.code == ElevationCode::Denied) {
+            const char* result = state.code == ElevationCode::Failed ? "failed" :
+                state.code == ElevationCode::Cancelled ? "cancelled" : "denied";
+            log("per-connection elevation ended (" + std::string(result) + ")" +
+                (state.reason.empty() ? std::string() : ": " + state.reason));
+        }
+    };
     uint32_t request = 0;
     while (session_->take_elevation_request(request)) {
         touch_viewer_activity();
@@ -9690,7 +10229,23 @@ bool HostServer::handle_elevation_requests(std::string* error) {
             if (state.code == ElevationCode::Available || state.code == ElevationCode::Failed ||
                 state.code == ElevationCode::Cancelled) {
                 try {
-                    elevation_task_ = config_.request_elevation ? config_.request_elevation() : nullptr;
+                    const ElevationRequestContext context{
+                        connection_id_.load(), request, session_->client_address(),
+                        session_->requested_mode(), session_->permissions(),
+                        helper_capture_supported_,
+                        helper_capture_unavailable_reason_};
+                    if (config_.portable_helper_mode &&
+                        !context.helper_capture_supported) {
+                        state.code = ElevationCode::Denied;
+                        state.reason = context.helper_capture_unavailable_reason.empty()
+                            ? "portable helper capture is unavailable for this display"
+                            : context.helper_capture_unavailable_reason;
+                        if (!send(state)) return false;
+                        continue;
+                    }
+                    elevation_task_ = config_.request_elevation
+                        ? config_.request_elevation(context)
+                        : nullptr;
                     if (elevation_task_) {
                         state = elevation_task_->poll();
                         state.request_id = elevation_request_ = request;
@@ -9698,6 +10253,7 @@ bool HostServer::handle_elevation_requests(std::string* error) {
                         if (state.code == ElevationCode::Restarting) state.code = ElevationCode::Pending;
                         elevation_last_code_ = state.code;
                         elevation_deadline_ = Clock::now() + std::chrono::minutes(3);
+                        log_transition(state);
                     } else state.code = ElevationCode::Unsupported;
                 } catch (const std::exception& failure) {
                     state.code = ElevationCode::Failed; state.reason = failure.what();
@@ -9707,21 +10263,26 @@ bool HostServer::handle_elevation_requests(std::string* error) {
         if (!send(state)) return false;
     }
     if (!elevation_task_) return true;
-    auto state = elevation_task_->poll();
-    state.request_id = elevation_request_;
     if (elevation_last_code_ == ElevationCode::Restarting) return true;
-    if (!allowed() || Clock::now() >= elevation_deadline_) {
+    ElevationState state{elevation_request_, ElevationCode::Pending, {}};
+    const bool request_allowed = allowed();
+    if (!request_allowed || Clock::now() >= elevation_deadline_) {
         elevation_task_->cancel();
-        state.code = allowed() ? ElevationCode::Cancelled : ElevationCode::Denied;
-        state.reason = allowed() ? "the elevation request timed out" : "input control was revoked";
+        state.code = request_allowed ? ElevationCode::Cancelled : ElevationCode::Denied;
+        state.reason = request_allowed ? "the elevation request timed out" : "input control was revoked";
+    } else {
+        state = elevation_task_->poll();
+        state.request_id = elevation_request_;
     }
     if (state.code != elevation_last_code_) {
         if (!send(state)) return false;
         elevation_last_code_ = state.code;
+        log_transition(state);
     }
     if (state.code == ElevationCode::Restarting) {
         elevation_task_->commit();
-    } else if (state.code != ElevationCode::Pending) {
+    } else if (state.code != ElevationCode::Pending &&
+               state.code != ElevationCode::HelperReady) {
         elevation_task_->cancel();
         elevation_task_.reset();
     }

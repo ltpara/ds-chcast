@@ -205,6 +205,23 @@ public:
         out.push_back({{0, 0, 0, 1, 0x65, static_cast<uint8_t>(width() / 16)}, pts, key, key});
         return Error::success();
     }
+    Error encode_cpu_bgra(const uint8_t* pixels, UINT width, UINT height,
+                          uint64_t pts, bool key,
+                          std::vector<EncodedPacket>& out) override {
+        check_thread();
+        if (!pixels || !width || !height)
+            return Error(Status::InvalidCall, "missing CPU BGRA image");
+        ++state_->encodes;
+        if (state_->fail_444 && config_.chroma == VideoChroma::Yuv444)
+            return Error(Status::Unavailable, "simulated encoder failure");
+        if (state_->fail_encode_codecs & video_codec_bit(config_.codec))
+            return Error(Status::Unavailable, "simulated encoder failure");
+        if (state_->silent_codecs & video_codec_bit(config_.codec)) return Error::success();
+        if (key) ++state_->idrs;
+        out.push_back({{0, 0, 0, 1, 0x65, static_cast<uint8_t>(this->width() / 16)},
+                       pts, key, key});
+        return Error::success();
+    }
     Error encode_repeat(uint64_t pts, bool key, std::vector<EncodedPacket>& out) override {
         check_thread();
         if (!have_input_ || !state_->repeat_supported) {

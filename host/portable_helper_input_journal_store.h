@@ -15,6 +15,9 @@ std::unique_ptr<PortableHelperInputJournalFileStore>
 open_portable_helper_input_journal_file_store_for_test(
     const PortableHelperInputJournalScope& scope,
     const std::wstring& trusted_instance_directory, std::string* error);
+bool remove_released_portable_helper_input_journals_for_test(
+    const PortableHelperInstanceId& instance_id,
+    const std::wstring& trusted_instance_directory, std::string* error);
 }
 
 // Durable Windows file backend for one instance/connection/session/generation
@@ -24,6 +27,11 @@ class PortableHelperInputJournalFileStore final {
  public:
   static std::unique_ptr<PortableHelperInputJournalFileStore> OpenForInstance(
       const PortableHelperInputJournalScope& scope, std::string* error);
+  // Removes all journal artifacts for an instance only after every durable
+  // record is a released tombstone. Intended for final helper-instance
+  // teardown, after the service and its workers have stopped.
+  static bool RemoveReleasedForInstance(
+      const PortableHelperInstanceId& instance_id, std::string* error);
   ~PortableHelperInputJournalFileStore();
 
   PortableHelperInputJournalFileStore(
@@ -56,6 +64,9 @@ class PortableHelperInputJournalFileStore final {
   detail::open_portable_helper_input_journal_file_store_for_test(
       const PortableHelperInputJournalScope& scope,
       const std::wstring& trusted_instance_directory, std::string* error);
+  friend bool detail::remove_released_portable_helper_input_journals_for_test(
+      const PortableHelperInstanceId& instance_id,
+      const std::wstring& trusted_instance_directory, std::string* error);
 
   PortableHelperInputJournalFileStore(
       PortableHelperInputJournalScope scope, std::wstring directory,
@@ -68,6 +79,9 @@ class PortableHelperInputJournalFileStore final {
   static std::unique_ptr<PortableHelperInputJournalFileStore>
   OpenAtDirectory(const PortableHelperInputJournalScope& scope,
                   const std::wstring& directory, std::string* error);
+  static bool RemoveReleasedAtDirectory(
+      const PortableHelperInstanceId& instance_id,
+      const std::wstring& directory, std::string* error);
 
   PortableHelperInputJournalScope scope_;
   std::wstring directory_;

@@ -79,9 +79,11 @@ bool accept_acknowledgement(PortableHelperPipe& channel, uint64_t request_id,
 struct PortableHelperServiceSessionWorker::Impl final {
   explicit Impl(PortableHelperServiceSpec service_spec,
                 Launcher worker_launcher,
-                EmergencyInputRelease input_release)
+                EmergencyInputRelease input_release,
+                bool conflict_policy_validated)
       : spec(std::move(service_spec)), launcher(std::move(worker_launcher)),
-        emergency_input_release(std::move(input_release)) {}
+        emergency_input_release(std::move(input_release)),
+        physical_input_conflict_policy_validated(conflict_policy_validated) {}
 
   ~Impl() {
     std::string ignored;
@@ -163,9 +165,11 @@ struct PortableHelperServiceSessionWorker::Impl final {
         authorization.AcceptParentAuthorizedGrant(
             grant, spec.parent.session_id, &start_error);
     if (granted && has_input_operations(grant.operations) &&
-        !emergency_input_release) {
-      start_error =
-          "keyboard/pointer worker grants require an external input release callback";
+        (!emergency_input_release ||
+         !physical_input_conflict_policy_validated)) {
+      start_error = !emergency_input_release
+          ? "keyboard/pointer worker grants require an external input release callback"
+          : "keyboard/pointer worker grants remain disabled until physical-input conflict handling is validated";
       std::string revoke_error;
       (void)authorization.Revoke([] { return true; }, [] { return true; },
                                 &revoke_error);
@@ -300,6 +304,20 @@ struct PortableHelperServiceSessionWorker::Impl final {
     if (worker_process == nullptr || worker_process == INVALID_HANDLE_VALUE) {
       worker_channel_.reset();
       worker_active_ = false;
+      if (input_cleanup_pending_) {
+        if (!emergency_input_release)
+          return fail(error, "input cleanup remains pending without an executor");
+        try {
+          if (!emergency_input_release(grant, error)) {
+            if (error != nullptr && error->empty())
+              *error = "authenticated input cleanup remains pending for retry";
+            return false;
+          }
+        } catch (...) {
+          return fail(error, "authenticated input cleanup retry raised an exception");
+        }
+        input_cleanup_pending_ = false;
+      }
       return true;
     }
     if (!worker_active_) return ReapFailedStart(error);
@@ -307,12 +325,23 @@ struct PortableHelperServiceSessionWorker::Impl final {
     PortableHelperWorkerRevocationCallbacks callbacks;
     auto graceful_acknowledgement =
         std::make_shared<std::atomic<bool>>(false);
+    auto input_cleanup_confirmed =
+        std::make_shared<std::atomic<bool>>(false);
+    input_cleanup_pending_ = has_input_operations(grant.operations);
     std::string callback_error;
     if (!make_win32_portable_helper_revocation_callbacks(
             worker_process, worker_channel_,
-            [this, graceful_acknowledgement](std::string* release_error) {
-              if (emergency_input_release)
-                return emergency_input_release(grant, release_error);
+            [this, graceful_acknowledgement,
+             input_cleanup_confirmed](std::string* release_error) {
+              if (emergency_input_release) {
+                const bool released = emergency_input_release(grant, release_error);
+                if (released) {
+                  input_cleanup_confirmed->store(true,
+                                                  std::memory_order_release);
+                  input_cleanup_pending_ = false;
+                }
+                return released;
+              }
               if (!has_input_operations(grant.operations) ||
                   graceful_acknowledgement->load(std::memory_order_acquire))
                 return true;
@@ -343,6 +372,8 @@ struct PortableHelperServiceSessionWorker::Impl final {
       worker_active_ = false;
       worker_identity = {};
     }
+    if (input_cleanup_confirmed->load(std::memory_order_acquire))
+      input_cleanup_pending_ = false;
     if (!revoked)
       return fail(error, callback_error.empty()
                              ? "session worker did not complete a clean revocation"
@@ -383,6 +414,7 @@ struct PortableHelperServiceSessionWorker::Impl final {
   PortableHelperServiceSpec spec;
   Launcher launcher;
   EmergencyInputRelease emergency_input_release;
+  bool physical_input_conflict_policy_validated = false;
   PortableHelperAuthorization authorization;
   PortableHelperGrant grant;
   std::unique_ptr<PortableHelperPipe> worker_channel_;
@@ -390,13 +422,16 @@ struct PortableHelperServiceSessionWorker::Impl final {
   PortableHelperProcessIdentity worker_identity;
   bool start_attempted_ = false;
   bool worker_active_ = false;
+  bool input_cleanup_pending_ = false;
 };
 
 PortableHelperServiceSessionWorker::PortableHelperServiceSessionWorker(
     PortableHelperServiceSpec spec, Launcher launcher,
-    EmergencyInputRelease emergency_input_release)
+    EmergencyInputRelease emergency_input_release,
+    bool physical_input_conflict_policy_validated)
     : impl_(std::make_unique<Impl>(std::move(spec), std::move(launcher),
-                                   std::move(emergency_input_release))) {}
+                                   std::move(emergency_input_release),
+                                   physical_input_conflict_policy_validated)) {}
 
 PortableHelperServiceSessionWorker::~PortableHelperServiceSessionWorker() = default;
 

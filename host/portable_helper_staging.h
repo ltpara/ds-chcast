@@ -13,6 +13,14 @@ namespace chast::host {
 bool stage_portable_helper_service_image(
     PortableHelperServiceSpec* spec, std::string* error);
 
+// Stages the same trusted image under a caller-selected, already-authorized
+// instance ID. This binds the installed service name and recovery record to
+// the instance scope captured by a local approval gate. The ID is still
+// validated and the instance directory is created exclusively.
+bool stage_portable_helper_service_image_for_instance(
+    const PortableHelperInstanceId& instance_id,
+    PortableHelperServiceSpec* spec, std::string* error);
+
 // Requires a valid Authenticode chain and an exact SHA-256 signer-certificate
 // thumbprint match. The thumbprint is public policy, normally set at configure
 // time with CHAST_PORTABLE_HELPER_PUBLISHER_CERT_SHA256.

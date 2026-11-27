@@ -590,6 +590,27 @@ bool InputInjector::prepare_side_effect(InputSideEffectIntent& intent) {
     }
     intent.sequence = ++side_effect_sequence_;
     if (!side_effect_observer_.prepare) return true;
+    if (dry_run_) {
+        // The test boundary never reaches a desktop. Give journal tests a
+        // deterministic synthetic desktop identity instead of depending on
+        // the caller's Window Station or interactive desktop permissions.
+        intent.input_desktop_name = "Default";
+        try {
+            if (side_effect_observer_.prepare(intent)) return true;
+        } catch (...) {
+        }
+        operation_side_effects_succeeded_ = false;
+        side_effect_observer_failed_ = true;
+        return false;
+    }
+    const InputDesktopStatus desktop = input_desktop_status();
+    if (desktop.kind == InputDesktopKind::Unavailable || desktop.name.empty() ||
+        !on_input_desktop()) {
+        operation_side_effects_succeeded_ = false;
+        side_effect_observer_failed_ = true;
+        return false;
+    }
+    intent.input_desktop_name = desktop.name;
     try {
         if (side_effect_observer_.prepare(intent)) return true;
     } catch (...) {

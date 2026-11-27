@@ -86,6 +86,7 @@ class RemoteToolbar extends StatelessWidget {
     this.elevationAvailable = false,
     this.elevationPending = false,
     this.elevated = false,
+    this.elevationHelperReady = false,
     this.onElevation,
     this.remoteConfigAvailable = false,
     this.onRemoteConfig,
@@ -262,6 +263,7 @@ class RemoteToolbar extends StatelessWidget {
   final bool elevationAvailable;
   final bool elevationPending;
   final bool elevated;
+  final bool elevationHelperReady;
   final VoidCallback? onElevation;
   final VoidCallback? onSessionSelect;
 
@@ -1151,13 +1153,15 @@ class RemoteToolbar extends StatelessWidget {
               ),
               _BarButton(
                 icon: Icons.admin_panel_settings_outlined,
-                tooltip: elevated
+                tooltip: elevationHelperReady
+                    ? tr('主机已为此连接启动提权辅助会话')
+                    : elevated
                     ? tr('主机已取得管理员权限')
                     : elevationPending
                     ? tr('等待主机本地确认 UAC…')
                     : tr('请求管理员权限'),
                 disabled: !elevationAvailable,
-                active: elevated || elevationPending,
+                active: elevated || elevationPending || elevationHelperReady,
                 onTap: onElevation,
               ),
               _HostPowerButton(

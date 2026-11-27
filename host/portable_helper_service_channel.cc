@@ -326,9 +326,11 @@ bool start_portable_helper_session_worker(
     PortableHelperServiceConnection& connection,
     PortableHelperAuthorization& authorization,
     const PortableHelperGrant& grant, uint32_t timeout_ms,
-    std::string* error) {
+    std::string* error, PortableHelperSecret* worker_ready_proof) {
   std::lock_guard rpc_lock(connection.rpc_mutex);
   if (error != nullptr) error->clear();
+  if (worker_ready_proof != nullptr)
+    SecureZeroMemory(worker_ready_proof->data(), worker_ready_proof->size());
   if (authorization.state() !=
       PortableHelperAuthorizationState::AwaitingWorkerReady) {
     if (error != nullptr)
@@ -388,14 +390,16 @@ bool start_portable_helper_session_worker(
   SecureZeroMemory(ready.payload.data(), ready.payload.size());
   const bool confirmed = authorization.ConfirmBrokerManagedWorkerReady(
       grant, proof, &rpc_error);
-  SecureZeroMemory(proof.data(), proof.size());
   if (!confirmed) {
+    SecureZeroMemory(proof.data(), proof.size());
     revoke_parent_forwarding_gate(connection, authorization,
         rpc_error.empty() ? "portable helper WorkerReady proof was rejected"
                           : rpc_error,
         error);
     return false;
   }
+  if (worker_ready_proof != nullptr) *worker_ready_proof = proof;
+  SecureZeroMemory(proof.data(), proof.size());
   return true;
 }
 

@@ -47,6 +47,7 @@
 #include "chast/host_client_strategy.h"
 #include "chast/host_settings.h"
 #include "chast/input.h"
+#include "chast/png.h"
 #include "chast/live_connection.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
@@ -64,6 +65,10 @@
 #include "portable_helper_input_journal.h"
 #include "portable_helper_input_journal_store.h"
 #include "portable_helper_worker_session.h"
+#include "portable_helper_manager_channel.h"
+#include "portable_helper_manager_task.h"
+#include "portable_helper_authorization.h"
+#include "chast/security.h"
 
 namespace {
 
@@ -93,8 +98,11 @@ constexpr UINT kSecurityPageMessage = WM_APP + 7;
 constexpr UINT kChatMessage = WM_APP + 8;
 constexpr UINT kPasswordHashMessage = WM_APP + 9;
 constexpr UINT kSettingsMessage = WM_APP + 10;
+constexpr UINT kElevationApprovalMessage = WM_APP + 11;
 constexpr UINT_PTR kStatusTimer = 1;
+constexpr UINT_PTR kElevationApprovalTimer = 2;
 constexpr UINT kTrayIconId = 1;
+constexpr size_t kMaxQueuedElevationApprovals = 16;
 
 enum ControlId {
     kStateLabel = 1000,
@@ -149,6 +157,22 @@ struct ViewerChatMessage {
     std::string text;
 };
 
+struct ElevationApprovalDialogState;
+struct HostLifetime {
+    std::mutex mutex;
+    bool active = true;
+};
+
+struct QueuedElevationApproval {
+    ElevationRequestContext context;
+    std::function<bool()> pending;
+    std::function<bool(std::string*)> validate;
+    std::function<bool(std::string*)> approve;
+    std::function<bool()> deny;
+    std::function<void()> cancel;
+    bool portable_helper = false;
+};
+
 struct HostApp {
     HINSTANCE instance = nullptr;
     HWND window = nullptr;
@@ -179,6 +203,7 @@ struct HostApp {
     // host thread.
     std::atomic<bool> quitting{false};
     std::atomic<bool> server_stopping{false};
+    DWORD ui_thread_id = 0;
     std::wstring tray_tip;
 
     std::string config_path;
@@ -188,11 +213,18 @@ struct HostApp {
     bool machine_settings_editor = false;
     bool service_handoff = false;
     std::shared_ptr<chast::host::ElevationController> elevation = std::make_shared<chast::host::ElevationController>();
+    std::shared_ptr<chast::host::PortableHelperLocalApprovalGate> portable_helper_approval_gate;
+    std::shared_ptr<HostLifetime> lifetime = std::make_shared<HostLifetime>();
     std::unique_ptr<chast::host::ElevatedChild> elevated_child;
     std::shared_ptr<void> identity_user_token;
     HANDLE instance_mutex = nullptr;
     bool elevation_transferring = false;
     std::shared_ptr<chast::host::ElevationHandoff> handled_elevation;
+    std::mutex elevation_approval_mutex;
+    std::deque<std::shared_ptr<QueuedElevationApproval>> elevation_approval_queue;
+    std::shared_ptr<QueuedElevationApproval> active_elevation_approval;
+    std::shared_ptr<ElevationApprovalDialogState> active_elevation_dialog;
+    HWND elevation_approval_window = nullptr;
     HostSettings settings;
     HostSettings effective_settings;
     HostClientStrategy managed_strategy;
@@ -545,6 +577,578 @@ LRESULT CALLBACK approval_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             break;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+constexpr wchar_t kElevationApprovalClass[] = L"ChastElevationApprovalWindow";
+enum ElevationApprovalControlId { kElevationAllow = 4300, kElevationDeny };
+
+struct ElevationApprovalDialogState {
+    HWND window = nullptr;
+    std::shared_ptr<QueuedElevationApproval> approval;
+};
+
+bool elevation_request_is_live(const ElevationRequestContext& context,
+                               std::string* error) {
+    const auto fail = [error](const char* reason) {
+        if (error) *error = reason;
+        return false;
+    };
+    if (g_app == nullptr || g_app->quitting.load() ||
+        g_app->server_stopping.load() || !g_app->server) {
+        return fail("the host or requesting connection is stopping");
+    }
+    if (context.connection_id == 0 || context.mode != SessionMode::Desktop ||
+        (context.permissions & kPermissionInput) == 0) {
+        return fail("elevation requires the original desktop input controller");
+    }
+    for (const HostViewer& viewer : g_app->server->viewers()) {
+        if (viewer.id != context.connection_id) continue;
+        if (viewer.disconnecting || viewer.peer_address != context.peer_address ||
+            viewer.mode != SessionMode::Desktop || !viewer.controls_input ||
+            (viewer.permissions & kPermissionInput) == 0) {
+            return fail("the viewer lost its desktop input control");
+        }
+        return true;
+    }
+    return fail("the requesting viewer disconnected");
+}
+
+bool manager_elevation_request_is_live(
+    const ElevationRequestContext& context,
+    const std::shared_ptr<HostLifetime>& lifetime, std::string* error) {
+    if (!lifetime) {
+        if (error) *error = "the host approval lifetime has ended";
+        return false;
+    }
+    std::lock_guard lock(lifetime->mutex);
+    if (!lifetime->active || g_app == nullptr) {
+        if (error) *error = "the host or requesting connection is stopping";
+        return false;
+    }
+    return elevation_request_is_live(context, error);
+}
+
+class PortableHelperLocalApprovalTask final : public IElevationTask {
+ public:
+    static std::shared_ptr<PortableHelperLocalApprovalTask> create(
+        ElevationRequestContext context,
+        std::shared_ptr<chast::host::PortableHelperLocalApprovalGate> gate,
+        std::string* error) {
+        if (error) error->clear();
+        if (!gate || context.connection_id == 0) {
+            if (error) *error = "portable helper approval gate is unavailable";
+            return {};
+        }
+        DWORD session_id = 0;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &session_id) ||
+            session_id == 0) {
+            if (error) *error = "cannot determine the host Windows session";
+            return {};
+        }
+        chast::host::PortableHelperInstanceId instance_id{};
+        chast::host::PortableHelperConnectionId helper_connection_id{};
+        if (!chast::secure_random(instance_id.data(), instance_id.size()) ||
+            !chast::secure_random(helper_connection_id.data(),
+                                  helper_connection_id.size())) {
+            if (error) *error = "cannot create a helper authorization scope";
+            return {};
+        }
+        constexpr uint32_t operations = static_cast<uint32_t>(
+            chast::host::PortableHelperOperation::CaptureFrames);
+        chast::host::PortableHelperPendingApproval pending;
+        if (!gate->QueueRemoteRequest(instance_id, helper_connection_id,
+                                      session_id, operations, &pending, error))
+            return {};
+        return std::shared_ptr<PortableHelperLocalApprovalTask>(
+            new PortableHelperLocalApprovalTask(
+                std::move(context), std::move(gate),
+                std::move(helper_connection_id), session_id,
+                std::move(pending)));
+    }
+
+    ~PortableHelperLocalApprovalTask() override { cancel(); }
+
+    ElevationState poll() override {
+        std::shared_ptr<chast::host::PortableHelperElevatedManagerTask> manager;
+        {
+            std::lock_guard lock(mutex_);
+            if (phase_ == Phase::AwaitingApproval)
+                return {context_.request_id, ElevationCode::Pending, {}};
+            if (phase_ == Phase::Denied)
+                return {context_.request_id, ElevationCode::Denied, reason_};
+            if (phase_ == Phase::Cancelled)
+                return {context_.request_id, ElevationCode::Cancelled, reason_};
+            if (phase_ == Phase::Failed)
+                return {context_.request_id, ElevationCode::Failed, reason_};
+            manager = manager_;
+        }
+        if (!manager)
+            return {context_.request_id, ElevationCode::Failed,
+                    "portable helper manager task was lost"};
+        auto state = manager->poll();
+        state.request_id = context_.request_id;
+        return state;
+    }
+
+    void commit() override {}
+
+    void cancel() override {
+        std::shared_ptr<chast::host::PortableHelperElevatedManagerTask> manager;
+        {
+            std::lock_guard lock(mutex_);
+            if (phase_ == Phase::AwaitingApproval || phase_ == Phase::Starting) {
+                phase_ = Phase::Cancelled;
+                if (reason_.empty())
+                    reason_ = "the approved viewer request was cancelled";
+            }
+            manager = manager_;
+        }
+        if (gate_) gate_->CancelConnection(helper_connection_id_);
+        if (manager) manager->cancel();
+    }
+
+    bool capture_ready() const override {
+        std::shared_ptr<chast::host::PortableHelperElevatedManagerTask> manager;
+        {
+            std::lock_guard lock(mutex_);
+            if (phase_ != Phase::Starting) return false;
+            manager = manager_;
+        }
+        return manager && manager->ready();
+    }
+
+    bool capture_frame(ElevationCaptureFrame* frame, std::string* error) override {
+        if (error) error->clear();
+        if (!frame) {
+            if (error) *error = "missing portable helper frame output";
+            return false;
+        }
+        std::shared_ptr<chast::host::PortableHelperElevatedManagerTask> manager;
+        {
+            std::lock_guard lock(mutex_);
+            if (phase_ != Phase::Starting || !manager_) {
+                if (error) *error = "portable helper capture is not ready";
+                return false;
+            }
+            manager = manager_;
+        }
+        const auto reject_frame = [this, manager, error](std::string reason) {
+            {
+                std::lock_guard lock(mutex_);
+                if (phase_ == Phase::Starting) {
+                    phase_ = Phase::Failed;
+                    reason_ = reason;
+                }
+            }
+            if (error) *error = std::move(reason);
+            manager->cancel();
+            return false;
+        };
+        chast::host::PortableHelperCapturedFrame captured;
+        if (!manager->CaptureFrame(&captured, error)) return false;
+        const uint64_t pixel_count = static_cast<uint64_t>(captured.width) *
+            static_cast<uint64_t>(captured.height);
+        if (captured.width == 0 || captured.height == 0 ||
+            captured.width > 8192 || captured.height > 8192 ||
+            pixel_count > 32ull * 1024ull * 1024ull || captured.frame_number == 0) {
+            return reject_frame(
+                "portable helper returned invalid capture dimensions or frame number");
+        }
+        uint32_t decoded_width = 0, decoded_height = 0;
+        std::vector<uint8_t> bgra;
+        if (!chast::decode_png_bgra(captured.png.data(), captured.png.size(),
+                                    decoded_width, decoded_height, bgra, error)) {
+            const std::string failure = error && !error->empty()
+                ? *error : "portable helper returned an invalid PNG frame";
+            return reject_frame(failure);
+        }
+        const uint64_t expected_bytes = pixel_count * 4u;
+        if (decoded_width != captured.width || decoded_height != captured.height ||
+            bgra.size() != expected_bytes || expected_bytes > 128ull * 1024ull * 1024ull) {
+            return reject_frame(
+                "portable helper PNG dimensions do not match its bounded metadata");
+        }
+        frame->width = decoded_width;
+        frame->height = decoded_height;
+        frame->frame_number = captured.frame_number;
+        frame->bgra = std::move(bgra);
+        return true;
+    }
+
+    bool approval_pending() const {
+        std::lock_guard lock(mutex_);
+        return phase_ == Phase::AwaitingApproval &&
+            static_cast<bool>(pending_);
+    }
+
+    bool validate_for_approval(std::string* error) const {
+        if (!approval_pending()) {
+            if (error) *error = "portable helper approval is no longer pending";
+            return false;
+        }
+        return elevation_request_is_live(context_, error);
+    }
+
+    bool approve(std::string* error) {
+        if (error) error->clear();
+        std::lock_guard lock(mutex_);
+        if (phase_ != Phase::AwaitingApproval || !pending_) {
+            if (error) *error = "portable helper approval is no longer pending";
+            return false;
+        }
+        constexpr uint32_t operations = static_cast<uint32_t>(
+            chast::host::PortableHelperOperation::CaptureFrames);
+        chast::host::PortableHelperLocalApprovalReceipt receipt;
+        const auto request_context = context_;
+        if (!gate_->Approve(
+                std::move(pending_), operations,
+                [this, request_context](
+                    const chast::host::PortableHelperApprovalRequestView& view,
+                    uint32_t approved_operations, std::string* live_error) {
+                    return view.connection_id == helper_connection_id_ &&
+                        view.windows_session_id == windows_session_id_ &&
+                        approved_operations == operations &&
+                        elevation_request_is_live(request_context, live_error);
+                },
+                &receipt, error)) {
+            phase_ = Phase::Failed;
+            reason_ = error && !error->empty()
+                ? *error : "local approval receipt could not be issued";
+            return false;
+        }
+        auto manager = chast::host::PortableHelperElevatedManagerTask::Start(
+            std::move(receipt), 120000,
+            [request_context, lifetime = g_app->lifetime](std::string* live_error) {
+                return manager_elevation_request_is_live(
+                    request_context, lifetime, live_error);
+            }, error);
+        if (!manager) {
+            phase_ = Phase::Failed;
+            reason_ = error && !error->empty()
+                ? *error : "elevated helper manager could not be started";
+            return false;
+        }
+        manager_ = std::move(manager);
+        phase_ = Phase::Starting;
+        return true;
+    }
+
+    bool deny() {
+        std::lock_guard lock(mutex_);
+        if (phase_ != Phase::AwaitingApproval || !pending_) return false;
+        chast::host::PortableHelperPendingApproval denied(std::move(pending_));
+        std::string ignored;
+        (void)gate_->Deny(std::move(denied), &ignored);
+        phase_ = Phase::Denied;
+        reason_ = "the local user denied the portable helper request";
+        return true;
+    }
+
+    const ElevationRequestContext& context() const { return context_; }
+
+ private:
+    enum class Phase { AwaitingApproval, Starting, Denied, Cancelled, Failed };
+
+    PortableHelperLocalApprovalTask(
+        ElevationRequestContext context,
+        std::shared_ptr<chast::host::PortableHelperLocalApprovalGate> gate,
+        chast::host::PortableHelperConnectionId helper_connection_id,
+        uint32_t windows_session_id,
+        chast::host::PortableHelperPendingApproval pending)
+        : context_(std::move(context)), gate_(std::move(gate)),
+          helper_connection_id_(std::move(helper_connection_id)),
+          windows_session_id_(windows_session_id),
+          pending_(std::move(pending)) {}
+
+    ElevationRequestContext context_;
+    std::shared_ptr<chast::host::PortableHelperLocalApprovalGate> gate_;
+    chast::host::PortableHelperConnectionId helper_connection_id_{};
+    uint32_t windows_session_id_ = 0;
+    mutable std::mutex mutex_;
+    chast::host::PortableHelperPendingApproval pending_;
+    std::shared_ptr<chast::host::PortableHelperElevatedManagerTask> manager_;
+    Phase phase_ = Phase::AwaitingApproval;
+    std::string reason_;
+};
+
+std::shared_ptr<QueuedElevationApproval> make_approval_queue_item(
+    const std::shared_ptr<chast::host::LocalElevationApprovalTask>& task) {
+    if (!task) return {};
+    auto item = std::make_shared<QueuedElevationApproval>();
+    item->context = task->context();
+    item->pending = [task] { return task->approval_pending(); };
+    item->validate = [task](std::string* error) {
+        return task->validate_for_approval(error);
+    };
+    item->approve = [task](std::string* error) { return task->approve(error); };
+    item->deny = [task] { return task->deny(); };
+    item->cancel = [task] { task->cancel(); };
+    return item;
+}
+
+std::shared_ptr<QueuedElevationApproval> make_approval_queue_item(
+    const std::shared_ptr<PortableHelperLocalApprovalTask>& task) {
+    if (!task) return {};
+    auto item = std::make_shared<QueuedElevationApproval>();
+    item->context = task->context();
+    item->pending = [task] { return task->approval_pending(); };
+    item->validate = [task](std::string* error) {
+        return task->validate_for_approval(error);
+    };
+    item->approve = [task](std::string* error) { return task->approve(error); };
+    item->deny = [task] { return task->deny(); };
+    item->cancel = [task] { task->cancel(); };
+    item->portable_helper = true;
+    return item;
+}
+
+void finish_elevation_approval(ElevationApprovalDialogState* dialog,
+                               bool approved, bool denied) {
+    if (dialog == nullptr || dialog->approval == nullptr) return;
+    if (approved) {
+        std::string error;
+        if (!dialog->approval->validate(&error) ||
+            !dialog->approval->approve(&error)) {
+            dialog->approval->cancel();
+            append_log_line(tr(L"提权请求已取消：") + widen(error));
+        } else if (dialog->approval->portable_helper) {
+            append_log_line(tr(L"已批准此连接的临时桌面辅助能力；正在等待 Windows UAC 确认"));
+        } else {
+            append_log_line(tr(L"已在本机批准提权请求；正在等待 Windows UAC 确认"));
+        }
+    } else if (denied) {
+        if (!dialog->approval->deny()) dialog->approval->cancel();
+        append_log_line(tr(L"已在本机拒绝提权请求"));
+    } else {
+        dialog->approval->cancel();
+    }
+    if (dialog->window != nullptr && IsWindow(dialog->window)) {
+        KillTimer(dialog->window, kElevationApprovalTimer);
+        DestroyWindow(dialog->window);
+    }
+}
+
+LRESULT CALLBACK elevation_approval_dialog_proc(HWND hwnd, UINT message,
+                                                 WPARAM wparam, LPARAM lparam) {
+    auto* dialog = reinterpret_cast<ElevationApprovalDialogState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        dialog = static_cast<ElevationApprovalDialogState*>(create->lpCreateParams);
+        dialog->window = hwnd;
+        g_app->elevation_approval_window = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(dialog));
+        return TRUE;
+    }
+    if (dialog == nullptr) return DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        case WM_COMMAND:
+            if (LOWORD(wparam) == kElevationAllow) {
+                finish_elevation_approval(dialog, true, false);
+                return 0;
+            }
+            if (LOWORD(wparam) == kElevationDeny || LOWORD(wparam) == IDCANCEL) {
+                finish_elevation_approval(dialog, false, true);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            finish_elevation_approval(dialog, false,
+                                      dialog->approval->pending());
+            return 0;
+        case WM_TIMER: {
+            std::string error;
+            if (g_app->quitting.load() || g_app->server_stopping.load() ||
+                !dialog->approval->pending() ||
+                !dialog->approval->validate(&error)) {
+                dialog->approval->cancel();
+                if (!error.empty()) {
+                    append_log_line(tr(L"提权请求已取消：") + widen(error));
+                }
+                finish_elevation_approval(dialog, false, false);
+            }
+            return 0;
+        }
+        case WM_NCDESTROY: {
+            KillTimer(hwnd, kElevationApprovalTimer);
+            dialog->window = nullptr;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            // Keep the state alive until this message handler returns, then
+            // release the app's active-window reference.
+            auto keep_alive = g_app->active_elevation_dialog;
+            if (keep_alive.get() == dialog) {
+                g_app->active_elevation_dialog.reset();
+                g_app->active_elevation_approval.reset();
+                g_app->elevation_approval_window = nullptr;
+                if (!g_app->quitting.load() && IsWindow(g_app->window)) {
+                    PostMessageW(g_app->window, kElevationApprovalMessage, 0, 0);
+                }
+            }
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool queue_elevation_approval(
+    const std::shared_ptr<QueuedElevationApproval>& approval) {
+    if (!approval || g_app == nullptr || g_app->window == nullptr ||
+        g_app->quitting.load() || g_app->ui_thread_id == 0) {
+        if (approval && approval->cancel) approval->cancel();
+        return false;
+    }
+    const HWND window = g_app->window;
+    {
+        std::lock_guard lock(g_app->elevation_approval_mutex);
+        if (g_app->quitting.load() ||
+            g_app->elevation_approval_queue.size() >= kMaxQueuedElevationApprovals ||
+            std::any_of(g_app->elevation_approval_queue.begin(),
+                        g_app->elevation_approval_queue.end(), [&](const auto& queued) {
+                            return queued && queued->context.connection_id ==
+                                                 approval->context.connection_id;
+                        })) {
+            approval->cancel();
+            return false;
+        }
+        g_app->elevation_approval_queue.push_back(approval);
+    }
+    if (PostMessageW(window, kElevationApprovalMessage, 0, 0)) return true;
+    {
+        std::lock_guard lock(g_app->elevation_approval_mutex);
+        const auto found = std::find(g_app->elevation_approval_queue.begin(),
+                                     g_app->elevation_approval_queue.end(), approval);
+        if (found != g_app->elevation_approval_queue.end()) {
+            g_app->elevation_approval_queue.erase(found);
+        }
+    }
+    approval->cancel();
+    return false;
+}
+
+void show_next_elevation_approval() {
+    if (g_app == nullptr || g_app->quitting.load() ||
+        g_app->active_elevation_dialog != nullptr) return;
+
+    static bool class_ready = false;
+    if (!class_ready) {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.style = CS_HREDRAW | CS_VREDRAW;
+        window_class.lpfnWndProc = elevation_approval_dialog_proc;
+        window_class.hInstance = g_app->instance;
+        window_class.hIcon = LoadIconW(nullptr, IDI_WARNING);
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        window_class.lpszClassName = kElevationApprovalClass;
+        if (RegisterClassExW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::deque<std::shared_ptr<QueuedElevationApproval>> pending;
+            {
+                std::lock_guard lock(g_app->elevation_approval_mutex);
+                pending.swap(g_app->elevation_approval_queue);
+            }
+            for (const auto& item : pending) if (item && item->cancel) item->cancel();
+            append_log_line(tr(L"无法创建本机提权审批窗口；请求已拒绝"));
+            return;
+        }
+        class_ready = true;
+    }
+
+    std::shared_ptr<QueuedElevationApproval> approval;
+    for (;;) {
+        {
+            std::lock_guard lock(g_app->elevation_approval_mutex);
+            if (g_app->elevation_approval_queue.empty()) return;
+            approval = std::move(g_app->elevation_approval_queue.front());
+            g_app->elevation_approval_queue.pop_front();
+        }
+        std::string error;
+        if (approval && approval->pending() && approval->validate(&error)) break;
+        if (approval && approval->cancel) approval->cancel();
+        if (!error.empty()) append_log_line(tr(L"提權請求已取消：") + widen(error));
+    }
+
+    auto dialog = std::make_shared<ElevationApprovalDialogState>();
+    dialog->approval = approval;
+    g_app->active_elevation_approval = approval;
+    g_app->active_elevation_dialog = dialog;
+
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT frame{0, 0, px(520), px(236)};
+    AdjustWindowRectEx(&frame, style, FALSE, WS_EX_TOPMOST | WS_EX_DLGMODALFRAME);
+    const int width = frame.right - frame.left;
+    const int height = frame.bottom - frame.top;
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int x = work.left + ((work.right - work.left) - width) / 2;
+    const int y = work.top + ((work.bottom - work.top) - height) / 2;
+    dialog->window = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, kElevationApprovalClass,
+        tr(L"提权请求需要本机确认"), style, x, y, width, height,
+        g_app->window, nullptr, g_app->instance, dialog.get());
+    if (dialog->window == nullptr) {
+        if (approval->cancel) approval->cancel();
+        g_app->active_elevation_dialog.reset();
+        g_app->active_elevation_approval.reset();
+        append_log_line(tr(L"无法创建本机提权审批窗口；请求已取消"));
+        if (!g_app->quitting.load()) {
+            PostMessageW(g_app->window, kElevationApprovalMessage, 0, 0);
+        }
+        return;
+    }
+    const auto add = [&dialog](const wchar_t* cls, const wchar_t* text,
+                               DWORD control_style, int left, int top,
+                               int control_width, int control_height, int id) {
+        HWND control = CreateWindowExW(
+            0, cls, text, WS_CHILD | WS_VISIBLE | control_style, px(left), px(top),
+            px(control_width), px(control_height), dialog->window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app->instance, nullptr);
+        if (control) SendMessageW(control, WM_SETFONT,
+            reinterpret_cast<WPARAM>(g_app->font), TRUE);
+        return control;
+    };
+    const auto& context = approval->context;
+    const std::wstring peer = context.peer_address.empty()
+        ? std::wstring(tr(L"未知地址")) : widen(context.peer_address);
+    add(L"STATIC", approval->portable_helper
+            ? tr(L"远端查看器请求为此连接启动临时桌面辅助服务，仅采集当前主显示器。")
+            : tr(L"远端查看器请求启动主机提权流程。"), SS_LEFT,
+        20, 20, 470, 24, 0);
+    add(L"STATIC", (std::wstring(tr(L"请求来源：")) + peer).c_str(), SS_LEFT,
+        20, 54, 470, 24, 0);
+    add(L"STATIC", approval->portable_helper
+            ? tr(L"允许后会启动 Windows UAC 确认。连接断开、失去控制权或超时会取消；此能力仅供该连接读取主显示器画面。")
+            : tr(L"允许后会启动 Windows UAC 确认；连接断开、失去桌面键鼠控制权或等待超时都会取消。"),
+        SS_LEFT | SS_WORDELLIPSIS, 20, 88, 470, 48, 0);
+    add(L"STATIC", approval->portable_helper
+            ? tr(L"不会切换整台主机，也不会授予远程键盘或鼠标输入。")
+            : tr(L"此确认仅允许继续现有提权流程，不会单独授予远程输入能力。"),
+        SS_LEFT, 20, 142, 470, 24, 0);
+    add(L"BUTTON", tr(L"允许并继续"), BS_PUSHBUTTON | WS_TABSTOP,
+        300, 178, 100, 32, kElevationAllow);
+    HWND deny = add(L"BUTTON", tr(L"拒绝"), BS_PUSHBUTTON | WS_TABSTOP,
+        410, 178, 80, 32, kElevationDeny);
+    SetTimer(dialog->window, kElevationApprovalTimer, 200, nullptr);
+    ShowWindow(dialog->window, SW_SHOW);
+    SetForegroundWindow(dialog->window);
+    if (deny) SetFocus(deny);
+}
+
+void cancel_elevation_approval_ui() {
+    if (g_app == nullptr) return;
+    std::deque<std::shared_ptr<QueuedElevationApproval>> queued;
+    {
+        std::lock_guard lock(g_app->elevation_approval_mutex);
+        queued.swap(g_app->elevation_approval_queue);
+    }
+    for (const auto& item : queued) if (item && item->cancel) item->cancel();
+    if (g_app->active_elevation_approval &&
+        g_app->active_elevation_approval->cancel)
+        g_app->active_elevation_approval->cancel();
+    if (g_app->elevation_approval_window && IsWindow(g_app->elevation_approval_window)) {
+        SendMessageW(g_app->elevation_approval_window, WM_CLOSE, 0, 0);
+    }
 }
 
 std::wstring platform_label(uint8_t platform) {
@@ -948,6 +1552,7 @@ void tick_live_connections() {
 }
 
 void stop_server() {
+    cancel_elevation_approval_ui();
     stop_tunnel();
     g_app->strategy_server_ready = false;
     if (!g_app->server) {
@@ -963,7 +1568,10 @@ void stop_server() {
         std::string error;
         g_app->live_connections->publish_terminal(*g_app->server, &error);
     }
-    g_app->server.reset();
+    {
+        std::lock_guard lifetime_lock(g_app->lifetime->mutex);
+        g_app->server.reset();
+    }
     append_log_line(tr(L"共享已停止"));
 }
 
@@ -1255,11 +1863,45 @@ void start_server() {
     }
     if (g_app->elevated_child) config.expected_identity_fingerprint = g_app->elevated_child->snapshot.fingerprint;
     const auto elevation = g_app->elevation;
-    config.elevation_state = [elevation] { return elevation->state(); };
-    config.request_elevation = [elevation] { return elevation->request(); };
+    const bool portable_helper_mode = g_app->portable && !g_app->elevated_child;
+    config.elevation_state = [elevation, portable_helper_mode] {
+        if (portable_helper_mode)
+            return ElevationState{0, ElevationCode::Available, {}};
+        return elevation->state();
+    };
+    config.portable_helper_mode = portable_helper_mode;
+    config.request_elevation = [elevation, portable_helper_mode](const ElevationRequestContext& context)
+        -> std::shared_ptr<IElevationTask> {
+        if (portable_helper_mode) {
+            std::string error;
+            auto helper = PortableHelperLocalApprovalTask::create(
+                context, g_app ? g_app->portable_helper_approval_gate : nullptr,
+                &error);
+            if (!helper) return {};
+            if (!queue_elevation_approval(make_approval_queue_item(helper)))
+                return {};
+            return helper;
+        }
+        const auto approval = chast::host::LocalElevationApprovalTask::create(
+            context, g_app ? g_app->ui_thread_id : 0,
+            [](const ElevationRequestContext& request, std::string* error) {
+                return elevation_request_is_live(request, error);
+            },
+            [elevation] {
+                const auto state = elevation->state();
+                if (state.code != ElevationCode::Available) return std::shared_ptr<IElevationTask>{};
+                return elevation->request();
+            });
+        if (!approval || !queue_elevation_approval(make_approval_queue_item(approval))) return {};
+        return approval;
+    };
     std::string error;
     g_app->strategy_server_failed = false;
-    g_app->server = HostServer::create(std::move(config), &error);
+    auto created_server = HostServer::create(std::move(config), &error);
+    {
+        std::lock_guard lifetime_lock(g_app->lifetime->mutex);
+        g_app->server = std::move(created_server);
+    }
     if (!g_app->server) {
         g_app->strategy_server_failed = true;
         write_managed_strategy_receipt();
@@ -1271,7 +1913,10 @@ void start_server() {
     g_app->server->set_strategy_admission_allowed(!g_app->strategy_start_blocked);
     if (g_app->elevated_child && g_app->server->status().fingerprint != g_app->elevated_child->snapshot.fingerprint) {
         append_log_line(L"Elevation failed: the original device identity could not be retained.");
-        g_app->server.reset();
+        {
+            std::lock_guard lifetime_lock(g_app->lifetime->mutex);
+            g_app->server.reset();
+        }
         return;
     }
     g_app->listener_microphone = effective.allow_microphone;
@@ -4724,6 +5369,7 @@ void handle_command(int id) {
                 stop_server();
             } else {
                 if (g_app->server) {
+                    std::lock_guard lifetime_lock(g_app->lifetime->mutex);
                     g_app->server.reset();
                 }
                 start_server();
@@ -4749,6 +5395,15 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
     switch (message) {
         case WM_CREATE:
             g_app->window = hwnd;
+            g_app->ui_thread_id = GetCurrentThreadId();
+            if (g_app->portable && !g_app->elevated_child) {
+                try {
+                    g_app->portable_helper_approval_gate =
+                        std::make_shared<chast::host::PortableHelperLocalApprovalGate>();
+                } catch (...) {
+                    g_app->portable_helper_approval_gate.reset();
+                }
+            }
             create_fonts();
             create_controls();
             SendMessageW(hwnd, WM_SETICON, ICON_BIG,
@@ -4803,6 +5458,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             delete text;
             return 0;
         }
+        case kElevationApprovalMessage:
+            show_next_elevation_approval();
+            return 0;
         case kTokenMessage: {
             auto* token = reinterpret_cast<std::string*>(lparam);
             g_app->settings.access_token = *token;
@@ -4879,13 +5537,19 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kStatusTimer);
-            g_app->elevation->shutdown();
             g_app->quitting.store(true);
+            {
+                std::lock_guard lifetime_lock(g_app->lifetime->mutex);
+                g_app->lifetime->active = false;
+            }
+            cancel_elevation_approval_ui();
+            g_app->elevation->shutdown();
             g_app->connections.reset();
             g_app->tunnel.stop();
             if (g_app->server) {
                 g_app->server_stopping.store(true);
                 g_app->server->stop();
+                std::lock_guard lifetime_lock(g_app->lifetime->mutex);
                 g_app->server.reset();
             }
             remove_tray_icon();
@@ -4978,9 +5642,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (early_argv == nullptr) return ERROR_NOT_ENOUGH_MEMORY;
     if (early_argv != nullptr && early_argc > 1 &&
         std::wstring(early_argv[1]) == L"--portable-helper-worker") {
-        // The helper service does not yet launch this mode from its control
-        // loop. If invoked, validate the exact staged worker/broker identities
-        // and grant before any desktop access.
+        // The helper service launches this mode only after validating the
+        // staged worker/broker identities and the single-use session grant.
+        // Repeat those checks here before opening desktop resources.
         std::vector<std::wstring> arguments;
         chast::host::PortableHelperSessionWorkerLaunchArguments parsed;
         chast::host::PortableHelperProcessIdentity worker_identity;
@@ -5122,6 +5786,42 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return worker_stopped ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
     }
     if (early_argv != nullptr && early_argc > 1 &&
+        std::wstring(early_argv[1]) == L"--portable-helper-cleanup-worker") {
+        std::vector<std::wstring> arguments;
+        chast::host::PortableHelperInputCleanupLaunchArguments parsed;
+        chast::host::PortableHelperServiceSpec recorded_spec;
+        chast::host::PortableHelperProcessIdentity worker_identity;
+        chast::host::PortableHelperProcessIdentity broker_identity;
+        std::string error;
+        bool parsed_ok = false;
+        try {
+            arguments.reserve(static_cast<size_t>(early_argc));
+            for (int index = 0; index < early_argc; ++index)
+                arguments.emplace_back(early_argv[index]);
+            parsed_ok = chast::host::parse_portable_helper_input_cleanup_command_line(
+                arguments, &parsed, &error);
+        } catch (...) {
+            LocalFree(early_argv);
+            return ERROR_NOT_ENOUGH_MEMORY;
+        }
+        const bool identity_ok = parsed_ok &&
+            chast::host::validate_portable_helper_input_cleanup_process_identity(
+                parsed, &recorded_spec, &worker_identity, &broker_identity,
+                &error);
+        std::unique_ptr<chast::host::PortableHelperPipe> cleanup_channel;
+        const bool connected = identity_ok &&
+            chast::host::connect_portable_helper_input_cleanup_pipe(
+                parsed, broker_identity, 5000, &cleanup_channel, &error);
+        LocalFree(early_argv);
+        if (!parsed_ok) return ERROR_INVALID_PARAMETER;
+        if (!identity_ok || !connected) return ERROR_ACCESS_DENIED;
+        const bool released =
+            chast::host::run_portable_helper_input_cleanup_worker(
+                *cleanup_channel, parsed, broker_identity, worker_identity,
+                &error);
+        return released ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+    }
+    if (early_argv != nullptr && early_argc > 1 &&
         std::wstring(early_argv[1]) == L"--service-name") {
         const bool valid = early_argc == 3 && early_argv[2][0] != L'\0';
         const std::wstring service_name = valid ? early_argv[2] : L"";
@@ -5131,7 +5831,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (early_argv != nullptr) {
         for (int index = 1; index < early_argc; ++index) {
             if (std::wstring(early_argv[index]) == L"--service-name" ||
-                std::wstring(early_argv[index]) == L"--portable-helper-worker") {
+                std::wstring(early_argv[index]) == L"--portable-helper-worker" ||
+                std::wstring(early_argv[index]) == L"--portable-helper-cleanup-worker") {
                 LocalFree(early_argv);
                 return 2;
             }
@@ -5154,9 +5855,48 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     std::wstring elevation_id;
     DWORD elevation_parent = 0;
     uint64_t elevation_birth = 0;
+    bool portable_helper_manager = false;
+    chast::host::PortableHelperInstanceId helper_manager_instance{};
+    DWORD helper_manager_parent_pid = 0;
+    uint64_t helper_manager_parent_birth = 0;
     for (int i = 1; argv != nullptr && i < argc; ++i) {
         const std::wstring arg = argv[i];
-        if (arg == L"--elevated-handoff") {
+        if (arg == L"--portable-helper-manager") {
+            if (argc != 5 || i != 1) { LocalFree(argv); return 87; }
+            const std::string encoded_instance = narrow(argv[++i]);
+            std::vector<uint8_t> decoded_instance;
+            if (encoded_instance.size() != 32 ||
+                !chast::hex_decode(encoded_instance, decoded_instance) ||
+                decoded_instance.size() != helper_manager_instance.size() ||
+                chast::hex_encode(decoded_instance) != encoded_instance) {
+                LocalFree(argv);
+                return 87;
+            }
+            std::copy(decoded_instance.begin(), decoded_instance.end(),
+                      helper_manager_instance.begin());
+            wchar_t* end = nullptr;
+            const std::wstring parent_pid_text = argv[++i];
+            const unsigned long parsed_parent_pid =
+                wcstoul(parent_pid_text.c_str(), &end, 10);
+            if (end == nullptr || *end != L'\0' || parsed_parent_pid == 0 ||
+                parsed_parent_pid > MAXDWORD ||
+                std::to_wstring(parsed_parent_pid) != parent_pid_text) {
+                LocalFree(argv);
+                return 87;
+            }
+            helper_manager_parent_pid = static_cast<DWORD>(parsed_parent_pid);
+            const std::wstring parent_birth_text = argv[++i];
+            end = nullptr;
+            helper_manager_parent_birth =
+                _wcstoui64(parent_birth_text.c_str(), &end, 10);
+            if (end == nullptr || *end != L'\0' ||
+                helper_manager_parent_birth == 0 ||
+                std::to_wstring(helper_manager_parent_birth) != parent_birth_text) {
+                LocalFree(argv);
+                return 87;
+            }
+            portable_helper_manager = true;
+        } else if (arg == L"--elevated-handoff") {
             if (argc != 5 || i != 1) { LocalFree(argv); return 2; }
             elevation_id = argv[++i];
             wchar_t* end = nullptr;
@@ -5222,6 +5962,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
     LocalFree(argv);
+    if (portable_helper_manager) {
+        std::string error;
+        const int result = chast::host::run_portable_helper_elevated_manager(
+            helper_manager_instance, helper_manager_parent_pid,
+            helper_manager_parent_birth, &error);
+        if (!error.empty()) {
+            const std::wstring message = L"Portable helper manager: " + widen(error);
+            OutputDebugStringW(message.c_str());
+        }
+        return result;
+    }
     if (!elevation_id.empty()) {
         std::string error;
         app.elevated_child = chast::host::ElevatedChild::receive(elevation_id, elevation_parent, elevation_birth, &error);

@@ -18,6 +18,8 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The tunnel agent did not return an emergency access ticket',
   '请求管理员权限': 'Request administrator access',
   '主机已取得管理员权限': 'The host has administrator access',
+  '主机已为此连接启动提权辅助会话':
+      'An elevated helper session is ready for this connection',
   '等待主机本地确认 UAC…': 'Waiting for local UAC approval on the host…',
   '主机正在取得管理员权限，即将重新连接…': 'The host is elevating; reconnecting shortly…',
   '主机本地取消了提权请求': 'The local elevation request was cancelled',

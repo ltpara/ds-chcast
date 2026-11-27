@@ -336,6 +336,21 @@ struct HostViewer {
     bool disconnecting = false;
 };
 
+// The live, permission-checked connection that asked for elevation. A local
+// approval/lifecycle provider must revalidate this identity before creating a
+// capability; remote request IDs are included only for response correlation.
+struct ElevationRequestContext {
+    uint64_t connection_id = 0;
+    uint32_t request_id = 0;
+    std::string peer_address;
+    SessionMode mode = SessionMode::Desktop;
+    PermissionMask permissions = 0;
+    // A portable helper currently captures one primary display and encodes
+    // CPU BGRA through software VP9. Other elevation providers may ignore this.
+    bool helper_capture_supported = false;
+    std::string helper_capture_unavailable_reason;
+};
+
 struct HostServerConfig {
     HostSettings settings;
     // Held only after admission and released on every session exit. Tests
@@ -371,7 +386,12 @@ struct HostServerConfig {
     std::shared_ptr<void> identity_user_token;
     std::string expected_identity_fingerprint;
     std::function<ElevationState()> elevation_state;
-    std::function<std::shared_ptr<IElevationTask>()> request_elevation;
+    std::function<std::shared_ptr<IElevationTask>(const ElevationRequestContext&)>
+        request_elevation;
+    // Portable helper mode uses a per-viewer elevated capture task instead of
+    // the legacy whole-host UAC handoff. It also gates requests whose selected
+    // display/decoder cannot be represented by the helper worker.
+    bool portable_helper_mode = false;
     // Machine worker: no temporary password. By default it requires a
     // permanent password; service_approval can enable an operator channel.
     bool service_mode = false;
@@ -800,6 +820,8 @@ private:
     uint32_t elevation_request_ = 0;
     ElevationCode elevation_last_code_ = ElevationCode::Unsupported;
     std::chrono::steady_clock::time_point elevation_deadline_{};
+    bool helper_capture_supported_ = false;
+    std::string helper_capture_unavailable_reason_;
     bool sleep_unless_stopping(std::chrono::milliseconds duration);
     void log(const std::string& message);
     void publish_state(HostState state, const std::string& error = {});

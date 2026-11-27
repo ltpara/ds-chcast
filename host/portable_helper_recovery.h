@@ -31,6 +31,26 @@ bool read_portable_helper_recovery_record_for_instance(
 bool remove_portable_helper_recovery_record(
     const PortableHelperServiceSpec& expected, std::string* error);
 
+namespace detail {
+
+using PortableHelperCleanupAction =
+    std::function<bool(std::string* error)>;
+using PortableHelperDirectoryAbsentCheck = std::function<bool(
+    const std::wstring& directory, bool* absent, std::string* error)>;
+
+// Removes the durable recovery record only for the final directory removal.
+// If directory removal fails, the record is restored so a later lifecycle
+// retry can still identify and clean this instance.
+bool remove_recovery_record_then_directory(
+    const std::wstring& directory,
+    const PortableHelperCleanupAction& remove_record,
+    const PortableHelperCleanupAction& remove_directory,
+    const PortableHelperDirectoryAbsentCheck& directory_is_absent,
+    const PortableHelperCleanupAction& restore_record,
+    std::string* error);
+
+}  // namespace detail
+
 struct PortableHelperRecoveryReport {
   size_t inspected = 0;
   size_t active = 0;

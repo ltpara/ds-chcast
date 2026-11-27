@@ -86,6 +86,10 @@ enum class InputSideEffectApi : uint8_t {
 struct InputSideEffectIntent {
     uint64_t sequence = 0;
     InputSideEffectApi api = InputSideEffectApi::SendInput;
+    // Name of the WinSta0 desktop to which the injector thread is attached
+    // when this API call is prepared. Safety-sensitive journals use it to
+    // prevent recovery from releasing old-desktop state on a new desktop.
+    std::string input_desktop_name;
     std::vector<INPUT> inputs;
     std::vector<POINTER_TOUCH_INFO> touch_contacts;
     std::vector<POINTER_TYPE_INFO> pointer_inputs;
